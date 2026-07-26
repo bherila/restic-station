@@ -4,6 +4,9 @@ Three layers: unit tests (Core, run everywhere including Linux CI), an integrati
 
 ## Layer 1 — unit tests (`swift test --package-path Core`)
 
+### Framework: Swift Testing (not XCTest)
+All Core tests use **Swift Testing** (`import Testing`, `@Test`, `#expect`/`#require`, parameterized `@Test(arguments:)` for the table-driven suites) — never XCTest. Reasons: parameterized tests fit the scenario/table specs naturally, it runs identically on Linux, and it works with a bare Swift toolchain. **Development-machine note:** the primary dev machine has Command Line Tools but no Xcode.app — `xcodebuild` (app/helper builds) runs only in CI or on machines with full Xcode; Core tests run locally via a Homebrew Swift toolchain (`brew install swift`, then the `swift` binary inside `/opt/homebrew/Cellar/swift/*/Swift-*.xctoolchain/usr/bin/`), which supports Swift Testing but not XCTest. Structure every task so its logic is verifiable by `swift test --package-path Core` alone; xcodebuild-dependent acceptance criteria are verified by CI.
+
 ### Linux compatibility requirement
 Core MUST compile and its tests pass on Linux (CI runs them on an `ubuntu-24.04-arm` runner in a `swift:6.1` container — cheap and fast for public repos). Practical rules:
 - Darwin-only API (`DistributedNotificationCenter`, anything from AppKit/ServiceManagement) is wrapped in `#if os(macOS)` or lives in the App target, not Core.

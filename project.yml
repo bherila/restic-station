@@ -1,0 +1,55 @@
+name: ResticStation
+
+options:
+  bundleIdPrefix: net.herila
+  deploymentTarget:
+    macOS: "14.0"
+
+packages:
+  ResticStationCore:
+    path: Core
+  swift-argument-parser:
+    url: https://github.com/apple/swift-argument-parser
+    from: 1.3.0
+
+targets:
+  "Restic Station":
+    type: application
+    platform: macOS
+    sources:
+      - path: App/Sources
+      - path: App/Resources/Assets.xcassets
+      - path: App/Resources/net.herila.ResticStation.helper.plist
+        buildPhase:
+          copyFiles:
+            destination: wrapper
+            subpath: Contents/Library/LaunchAgents
+    settings:
+      base:
+        PRODUCT_NAME: "Restic Station"
+        PRODUCT_BUNDLE_IDENTIFIER: net.herila.ResticStation
+        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.utilities
+        CODE_SIGN_ENTITLEMENTS: App/ResticStation.entitlements
+        GENERATE_INFOPLIST_FILE: YES
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+    dependencies:
+      - package: ResticStationCore
+      - target: restic-station-helper
+        embed: true
+        codeSign: true
+        copy:
+          destination: executables
+
+  restic-station-helper:
+    type: tool
+    platform: macOS
+    sources:
+      - path: Helper/Sources
+    settings:
+      base:
+        PRODUCT_NAME: restic-station-helper
+    dependencies:
+      - package: ResticStationCore
+      - package: swift-argument-parser
+        product: ArgumentParser

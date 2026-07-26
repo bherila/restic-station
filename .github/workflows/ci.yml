@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  core-linux:
+    runs-on: ubuntu-24.04-arm
+    container: swift:6.1
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Core unit tests
+        run: swift test --package-path Core
+
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: brew install xcodegen restic
+      - name: Generate Xcode project
+        run: xcodegen generate
+      - name: Build
+        run: xcodebuild -scheme "Restic Station" build CODE_SIGNING_ALLOWED=NO
+      - name: Run Core unit tests
+        run: swift test --package-path Core
