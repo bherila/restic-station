@@ -1,0 +1,1 @@
+{"message_type":"exit_error","code":11,"message":"unable to create lock in backend: repository is already locked by PID 97063 on example-mac.local by user (UID 501, GID 20)\nlock was created at 2026-07-26 16:57:07 (12.437716s ago)\nstorage ID 27c9b4f8\nthe `unlock` command can be used to remove stale locks"}

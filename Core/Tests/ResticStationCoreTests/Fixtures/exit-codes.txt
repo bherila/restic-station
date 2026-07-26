@@ -1,0 +1,2 @@
+no-repo exit: 10
+wrong-pw exit: 12
