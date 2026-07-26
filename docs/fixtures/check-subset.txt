@@ -1,0 +1,9 @@
+using temporary cache in /var/folders/ln/3_6448dn3cv1k9jng5xjh9vr0000gn/T/restic-check-cache-739698565
+create exclusive lock for repository
+load indexes
+check all packs
+check snapshots, trees and blobs
+[0:00] 100.00%  2 / 2 snapshots
+read group #1 of 2 data packs (out of total 4 packs in 5 groups)
+[0:00] 100.00%  2 / 2 packs
+no errors were found

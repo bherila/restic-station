@@ -1,0 +1,87 @@
+# UI specification
+
+This spec fixes **information architecture, controls, states, and copy**. Visual layout, spacing, and composition are left to the implementing agent's judgment — build idiomatic macOS SwiftUI (forms, tables, inspectors, sheets) that would feel at home next to System Settings. Use SF Symbols throughout. Support light + dark mode (automatic — no custom colors that break either).
+
+## Shell
+
+- `NavigationSplitView`. Sidebar sections: **Backup Sets**, **Runs**, **Restore**, **Maintenance**, **Settings** (Settings also reachable via the standard ⌘, Settings scene).
+- Window title "Restic Station". Min size ~ 900×560.
+- `AppModel` (ObservableObject, injected via environment) owns: `AppConfig` (via ConfigStore), live state (via StateWatcher), and helper invocation. All mutations go config-edit → save → (if schedule-relevant) kickstart tick.
+
+## Menu bar (`MenuBarExtra`, style `.menu`, `isInserted:` bound to `showMenuBarIcon`)
+
+Icon (template, SF Symbols):
+- Idle/healthy: `externaldrive.badge.checkmark`
+- Running: `externaldrive.badge.timemachine` (any run in flight)
+- Warning: `externaldrive.badge.exclamationmark` (last run of any set failed, OR any destination stale, OR FDA/agent problem)
+
+Menu content (top to bottom):
+1. One line per set (disabled item): `"<SetName> — <relative last backup> <✓|⚠|✕>"`, e.g. "Projects — 2 hours ago ✓". Never run: "Projects — never backed up".
+2. If a run is in flight: `"Backing up <SetName>… 42%"` (disabled, updates on menu reopen — NSMenu items don't live-update reliably while open; accepted).
+3. Divider. `Back Up Now ▸` submenu with one item per set (disabled while that set is running/busy).
+4. Divider. `Open Restic Station` (activates app, opens main window), `Quit Restic Station`.
+
+Quitting the app does NOT stop scheduled backups (they're launchd's job) — the Quit item's tooltip/help says so.
+
+## Backup Sets
+
+**List** (sidebar selection → content): table/list of sets: name, source count, primary destination label + kind icon, schedule summary ("Daily 02:30"), last run status badge, next due time (via ScheduleMath, display only). Toolbar: add set, delete set (confirmation: "Deletes the backup set configuration. Repositories and snapshots are NOT touched."). Empty state: short explainer + "Create your first backup set".
+
+**Set editor** (form):
+- Name.
+- **Sources**: list of absolute paths; add via `NSOpenPanel` (directories + files, multi-select), remove; warn inline (yellow) on nested/duplicate paths.
+- **Excludes**: editable string list; caption linking restic exclude-pattern syntax (`https://restic.readthedocs.io/en/stable/040_backup.html#excluding-files`).
+- **Schedule**: picker for kind (Every N minutes / Hourly / Daily / Weekly) with contextual fields (N stepper ≥5; minute; hour+minute; weekday+hour+minute).
+- **Staleness warning**: stepper, days, default 14.
+- **Retention** (optional section, off = never forget): steppers/optional fields for keep-last/hourly/daily/weekly/monthly/yearly; default suggestion when enabling: 7 daily / 4 weekly / 12 monthly / 2 yearly. Footnote: "Applied to the primary after each backup, and mirrored to each secondary after it syncs."
+- **Integrity checks** (optional): toggle + slice count (default 20). Footnote: "Weekly `restic check`; over 20 weeks the entire repository's data is read and verified."
+- **Destinations**: table (label, repo, kind badge, PRIMARY tag, status dot reachable/offline/stale + "last synced N days ago"). Exactly-one-primary enforced by radio-style selection; changing primary shows an explanatory confirmation (new primary must already contain the data or the next backup re-uploads everything).
+  - **Destination editor** (sheet): label; kind picker driving the form:
+    - *Local folder*: path picker; inline warning if under `~/Library/Mobile Documents` ("iCloud may evict repository files with Optimize Mac Storage — this can corrupt reads; consider a non-synced location. Sync folders replicate deletions — treat this as a convenience copy, not your only backup."); note when under `/Volumes` ("Removable volume — will be skipped when not mounted" — for secondaries this is normal).
+    - *S3-compatible*: endpoint URL (placeholder `https://<accountid>.r2.cloudflarestorage.com` / empty = AWS), bucket, path prefix, region (optional, "auto" hint for R2), Access Key ID (→ keychain env blob), Secret Access Key (SecureField → keychain env blob). The form assembles `repoURL = s3:<endpoint>/<bucket>/<prefix>`; show the assembled URL read-only.
+    - *SFTP / REST / Other*: raw repo URL field + free-form non-secret env key/value table + secret env key/value table (values in SecureFields → keychain blob). Caption: "Anything restic accepts after `-r`."
+    - Repository password: SecureField + "generate" button (32 random chars) + **prominent copy**: "Store this password somewhere safe outside this Mac. Without it the backup is unreadable. Restic Station keeps it in your login keychain only."
+    - Buttons: *Test connection* (probe-repo via helper; spinner → reachable/version or error), *Initialize repository* (primary: plain init; secondary: init --from-repo primary --copy-chunker-params via helper `init-secondary`, progress sheet). If probe says "repo does not exist" (exit 10), surface Initialize prominently.
+  - Adding a secondary when it's not initialized → offer initialization; a secondary that was never initialized shows an error badge.
+
+## Runs
+
+- **List**: newest-first, grouped by `groupId` (a scheduled run shows backup + its copies/prunes nested). Columns: time, set, kind icon, destination, status badge, duration, data added. Filter bar: set, kind, status. A `running` run shows a progress bar fed by `current-run-<setId>.json`.
+- **Detail**: metadata header (status, trigger, snapshot id monospaced+copyable, files new/changed/unmodified, data added (packed), total processed, duration); scrolling monospaced log view — tail -f while running (re-read on StateWatcher events), full content when finished. "Reveal log in Finder" button.
+- Toolbar: **Back Up Now** (per-set picker or context), disabled with explanation while that set is busy.
+
+## Restore
+
+Flow: pick destination (any repo, incl. secondaries — grouped picker "Set ▸ Destination") → snapshot list (`snapshots --json`, newest first: time, short id, paths summary, data added; copied snapshots show "mirrored" badge via `original`) → **browser**: lazy expandable tree starting at `/` via `ls --json` (folder icons, name, size, mtime; expand loads children on demand); multi-select; breadcrumb path.
+- **Search** field above the browser: runs `find --json` (default: within the selected snapshot; toggle "search all snapshots"); results list (path, size, snapshot) → select for restore.
+- **Restore action** (sheet):
+  - Target: "Original location" or "Choose folder…" (NSOpenPanel).
+  - Overwrite mode picker mapping to `--overwrite`: Always / Only if changed / Only if newer / Never overwrite. Default **Always**.
+  - If target = original location: warning banner "Files at the original location will be overwritten." + inline suggestion with button: "Consider backing up first — Back Up Now". Restoring to a chosen empty folder shows no warning.
+  - Runs helper `restore`; progress from status NDJSON; completion shows files/bytes restored + "Reveal in Finder".
+- **Mount** section: if macFUSE present (`/Library/Filesystems/macfuse.fs`): "Mount snapshot browser" button → `restic mount` child process, path shown + "Show in Finder" + "Unmount". If absent: disabled card: "Mounting requires macFUSE (macfuse.github.io). You can browse and restore without it." Mount is per-destination, one at a time.
+
+## Maintenance
+
+Per set (picker or sections):
+- **Repository size cards** per destination: raw-data total_size ("on disk"), restore-size ("protected data"), snapshot count; Refresh button (stats are cached in-memory per app session, cheap staleness).
+- **Retention**: shows the set's policy (edit jumps to set editor); **Preview cleanup** (forget --dry-run → keep/remove table); **Apply retention now** (confirmation listing counts from dry-run first: "This will permanently delete N snapshots from <dest>."; then helper `run-set --kind prune`).
+- **Integrity**: last check result + date per destination; **Check now** (structure-only toggle vs with-data-slice); shows slice cursor progress "verified slices 7/20".
+- **Staleness**: per-destination "last synced" with stale highlighting.
+- **Unlock**: small footer utility "Repository reports locked? Remove stale locks" → helper runs `restic unlock` (safe: only removes locks of dead processes).
+
+## Settings
+
+- **General**: show menu-bar icon toggle; launch at login note (the *agent* runs regardless; this is only about the app UI).
+- **restic binary**: discovered path + version chip; "Locate manually…" file picker; states: OK (green, "restic 0.18.1"), too old (yellow, "0.16 found — 0.17+ required"), missing (red, "Install with `brew install restic`").
+- **Permissions & background**:
+  - FDA card: two badges — App: granted/denied; Background agent: granted/denied/unknown (from `fda-check.json`; "Re-check" button kickstarts the helper). "Open Full Disk Access settings" button (deep link). Help disclosure with the fallback instructions (add helper binary manually — path shown, copyable).
+  - Background agent card: SMAppService status (Enabled / Requires approval → "Open Login Items settings" button / Not registered → "Enable" button). Caption: "Runs backups on schedule even when Restic Station is closed."
+
+## Onboarding (first launch, no config)
+
+Sheet/wizard, 4 steps, skippable except where noted: 1) Welcome + restic discovery (blocks if restic missing — install instructions); 2) Enable background agent (SMAppService register + approval guidance); 3) Grant Full Disk Access (both probes, live-updating badges); 4) "Create your first backup set" → opens set editor. Re-runnable from Settings → "Setup assistant…".
+
+## Copy/tone rules
+
+Plain, specific, no jargon-for-jargon's-sake; restic terms (snapshot, repository, prune) are used and briefly explained in captions on first use per screen. Destructive confirmations state exactly what is and is not deleted. Every error surfaced to the user includes: what failed (set/destination), the mapped reason (from ResticError), and one next step.
