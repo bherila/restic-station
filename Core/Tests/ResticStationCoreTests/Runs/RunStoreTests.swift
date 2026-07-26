@@ -1,0 +1,347 @@
+import Foundation
+import Testing
+@testable import ResticStationCore
+
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
+
+/// Tiny mutable counter usable from a `@Sendable` closure. `RunStore`'s
+/// `now` closure is `@Sendable` (the store itself is `Sendable`), so a
+/// plain captured `var` doesn't compile — tests that need a monotonically
+/// increasing clock use this instead. Not thread-safe, but these tests
+/// call the store synchronously from a single thread.
+private final class TickCounter: @unchecked Sendable {
+    private(set) var value = 0
+    func next() -> Int {
+        value += 1
+        return value
+    }
+}
+
+@Suite struct RunStoreTests {
+    private func makePaths() -> AppPaths {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-runstore-test-\(UUID().uuidString)")
+        return AppPaths(root: root)
+    }
+
+    private func cleanup(_ paths: AppPaths) {
+        try? FileManager.default.removeItem(at: paths.root)
+    }
+
+    // MARK: - runId format
+
+    @Test func runIdFormatMatchesArchitectureSpec() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+
+        let calendar = Calendar(identifier: .gregorian)
+        var components = DateComponents()
+        components.timeZone = TimeZone(identifier: "UTC")
+        components.year = 2026
+        components.month = 7
+        components.day = 26
+        components.hour = 20
+        components.minute = 57
+        components.second = 4
+        let knownDate = calendar.date(from: components)!
+
+        let setId = UUID(uuidString: "6F9619FF-8B86-D011-B42D-00C04FC964FF")!
+        let destId = UUID()
+        let store = RunStore(paths: paths, now: { knownDate })
+
+        let run = try store.begin(kind: .backup, setId: setId, destId: destId, trigger: .scheduled)
+
+        #expect(run.runId == "20260726T205704Z-backup-6f9619ff")
+    }
+
+    @Test func runIdCollisionWithinSameSecondGetsNumericSuffix() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+
+        let calendar = Calendar(identifier: .gregorian)
+        var components = DateComponents()
+        components.timeZone = TimeZone(identifier: "UTC")
+        components.year = 2026
+        components.month = 1
+        components.day = 1
+        components.hour = 0
+        components.minute = 0
+        components.second = 0
+        let knownDate = calendar.date(from: components)!
+
+        let setId = UUID(uuidString: "6F9619FF-8B86-D011-B42D-00C04FC964FF")!
+        let destId = UUID()
+        let store = RunStore(paths: paths, now: { knownDate })
+
+        let first = try store.begin(kind: .backup, setId: setId, destId: destId, trigger: .manual)
+        let second = try store.begin(kind: .backup, setId: setId, destId: destId, trigger: .manual)
+        let third = try store.begin(kind: .backup, setId: setId, destId: destId, trigger: .manual)
+
+        #expect(first.runId == "20260101T000000Z-backup-6f9619ff")
+        #expect(second.runId == "20260101T000000Z-backup-6f9619ff-2")
+        #expect(third.runId == "20260101T000000Z-backup-6f9619ff-3")
+    }
+
+    // MARK: - begin/finish round trip
+
+    @Test func beginFinishRoundTripsMetadataAndIndex() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+
+        let tick = TickCounter()
+        let start = Date(timeIntervalSince1970: 2_000_000_000)
+        let store = RunStore(paths: paths, now: {
+            start.addingTimeInterval(TimeInterval(tick.next()))
+        })
+
+        let setId = UUID()
+        let destId = UUID()
+
+        var run = try store.begin(kind: .backup, setId: setId, destId: destId, trigger: .scheduled)
+        run.argvRedacted = ["restic", "backup", "/src", "--json"]
+
+        // Initial metadata: running, no end, pid = our own pid.
+        let running = try store.metadata(runId: run.runId)
+        #expect(running.status == .running)
+        #expect(running.end == nil)
+        #expect(running.pid == getpid())
+        #expect(running.groupId == run.runId)
+        #expect(running.setId == setId)
+        #expect(running.destId == destId)
+
+        let stats = BackupSummary(
+            filesNew: 3,
+            filesChanged: 1,
+            filesUnmodified: 10,
+            dirsNew: 1,
+            dirsChanged: 0,
+            dirsUnmodified: 5,
+            dataBlobs: 2,
+            treeBlobs: 1,
+            dataAdded: 67_860,
+            dataAddedPacked: 50_000,
+            totalFilesProcessed: 14,
+            totalBytesProcessed: 100_000,
+            totalDuration: 1.5,
+            backupStart: start,
+            backupEnd: start.addingTimeInterval(1),
+            snapshotId: "f391ba97c096"
+        )
+
+        try store.finish(run, status: .success, stats: stats, errorSummary: nil, resticExitCode: 0)
+
+        let finished = try store.metadata(runId: run.runId)
+        #expect(finished.status == .success)
+        #expect(finished.end != nil)
+        #expect(finished.resticExitCode == 0)
+        #expect(finished.argvRedacted == ["restic", "backup", "/src", "--json"])
+        #expect(finished.snapshotId == "f391ba97c096")
+        #expect(finished.filesNew == 3)
+        #expect(finished.filesChanged == 1)
+        #expect(finished.dataAdded == 67_860)
+        #expect(finished.stats == stats)
+        #expect(finished.groupId == run.runId)
+
+        let index = try store.recentRuns(limit: 10)
+        #expect(index.count == 1)
+        let entry = try #require(index.first)
+        #expect(entry.runId == run.runId)
+        #expect(entry.kind == .backup)
+        #expect(entry.setId == setId)
+        #expect(entry.destId == destId)
+        #expect(entry.status == .success)
+        #expect(entry.trigger == .scheduled)
+        #expect(entry.snapshotId == "f391ba97c096")
+        #expect(entry.filesNew == 3)
+        #expect(entry.filesChanged == 1)
+        #expect(entry.dataAdded == 67_860)
+        #expect(entry.errorSummary == nil)
+        #expect(entry.groupId == run.runId)
+    }
+
+    @Test func groupIdPropagatesAcrossRunsInAGroup() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+
+        let store = RunStore(paths: paths, now: { Date() })
+        let setId = UUID()
+        let primaryDest = UUID()
+        let secondaryDest = UUID()
+
+        let backupRun = try store.begin(kind: .backup, setId: setId, destId: primaryDest, trigger: .scheduled)
+        try store.finish(backupRun, status: .success)
+
+        // The copy run's groupId is explicitly the backup's runId.
+        let copyRun = try store.begin(
+            kind: .copy,
+            setId: setId,
+            destId: secondaryDest,
+            trigger: .scheduled,
+            groupId: backupRun.groupId
+        )
+        try store.finish(copyRun, status: .success)
+
+        #expect(backupRun.groupId == backupRun.runId)
+        #expect(copyRun.groupId == backupRun.runId)
+
+        let index = try store.recentRuns(limit: 10)
+        #expect(index.count == 2)
+        #expect(Set(index.map(\.groupId)) == [backupRun.runId])
+    }
+
+    // MARK: - Crash recovery
+
+    @Test func recoverInterruptedRewritesDeadPidRunsAsFailed() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+
+        let store = RunStore(paths: paths, now: { Date() })
+        let setId = UUID()
+        let destId = UUID()
+
+        let run = try store.begin(kind: .backup, setId: setId, destId: destId, trigger: .scheduled)
+
+        // Overwrite the metadata's pid with a pid that (almost certainly)
+        // does not exist, simulating a crashed process.
+        var stuck = try store.metadata(runId: run.runId)
+        stuck.pid = 999_999
+        try writeRawMetadata(stuck, paths: paths)
+
+        let recovered = try store.recoverInterrupted()
+
+        #expect(recovered == [run.runId])
+
+        let after = try store.metadata(runId: run.runId)
+        #expect(after.status == .failed)
+        #expect(after.errorSummary == "interrupted")
+        #expect(after.end != nil)
+
+        let index = try store.recentRuns(limit: 10)
+        #expect(index.count == 1)
+        #expect(index[0].status == .failed)
+        #expect(index[0].errorSummary == "interrupted")
+    }
+
+    @Test func recoverInterruptedLeavesLivePidRunsUntouched() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+
+        let store = RunStore(paths: paths, now: { Date() })
+        let setId = UUID()
+        let destId = UUID()
+
+        // begin() stamps pid = getpid() (our own, very much alive) and
+        // leaves status running (never finished).
+        let run = try store.begin(kind: .backup, setId: setId, destId: destId, trigger: .scheduled)
+
+        let recovered = try store.recoverInterrupted()
+
+        #expect(recovered.isEmpty)
+
+        let after = try store.metadata(runId: run.runId)
+        #expect(after.status == .running)
+        #expect(after.end == nil)
+
+        // No index line should have been written for an untouched run.
+        let index = try store.recentRuns(limit: 10)
+        #expect(index.isEmpty)
+    }
+
+    // MARK: - Index corruption tolerance
+
+    @Test func recentRunsSkipsCorruptLinesButReadsOthers() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+
+        let store = RunStore(paths: paths, now: { Date() })
+        let setId = UUID()
+        let destId = UUID()
+
+        let run1 = try store.begin(kind: .backup, setId: setId, destId: destId, trigger: .manual)
+        try store.finish(run1, status: .success)
+
+        // Simulate a crash mid-append: a garbage / truncated line appended
+        // after the good one.
+        let handle = try FileHandle(forWritingTo: paths.runsIndexFile)
+        try handle.seekToEnd()
+        handle.write(Data("{\"runId\":\"garbage\", this is not valid json\n".utf8))
+        try handle.close()
+
+        let run2 = try store.begin(kind: .backup, setId: setId, destId: destId, trigger: .manual)
+        try store.finish(run2, status: .warning)
+
+        let entries = try store.recentRuns(limit: 10)
+        #expect(entries.count == 2)
+        #expect(entries.map(\.runId).sorted() == [run1.runId, run2.runId].sorted())
+    }
+
+    // MARK: - lastRun filtering
+
+    @Test func lastRunFiltersBySetIdAndKindAndReturnsMostRecent() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+
+        let tick = TickCounter()
+        let store = RunStore(paths: paths, now: {
+            Date(timeIntervalSince1970: 3_000_000_000 + Double(tick.next()))
+        })
+
+        let setA = UUID()
+        let setB = UUID()
+        let destId = UUID()
+
+        let a1 = try store.begin(kind: .backup, setId: setA, destId: destId, trigger: .manual)
+        try store.finish(a1, status: .success)
+
+        let bBackup = try store.begin(kind: .backup, setId: setB, destId: destId, trigger: .manual)
+        try store.finish(bBackup, status: .success)
+
+        let aCheck = try store.begin(kind: .check, setId: setA, destId: destId, trigger: .manual)
+        try store.finish(aCheck, status: .success)
+
+        let a2 = try store.begin(kind: .backup, setId: setA, destId: destId, trigger: .manual)
+        try store.finish(a2, status: .warning)
+
+        let lastABackup = try store.lastRun(setId: setA, kind: .backup)
+        #expect(lastABackup?.runId == a2.runId)
+        #expect(lastABackup?.status == .warning)
+
+        let lastACheck = try store.lastRun(setId: setA, kind: .check)
+        #expect(lastACheck?.runId == aCheck.runId)
+
+        let lastBCopy = try store.lastRun(setId: setB, kind: .copy)
+        #expect(lastBCopy == nil)
+    }
+
+    // MARK: - logURL
+
+    @Test func logURLMatchesAppPaths() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+        let store = RunStore(paths: paths)
+        #expect(store.logURL(runId: "abc") == paths.runLogFile(runId: "abc"))
+    }
+
+    // MARK: - helpers
+
+    /// Writes `metadata` directly to its `metadata.json` path, bypassing
+    /// `RunStore`'s own atomic-write machinery, purely to simulate an
+    /// existing on-disk record (e.g. one left by a process that crashed
+    /// with a stale pid) for the crash-recovery test above.
+    private func writeRawMetadata(_ metadata: RunMetadata, paths: AppPaths) throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .prettyPrinted]
+        encoder.dateEncodingStrategy = .custom { date, encoder in
+            var container = encoder.singleValueContainer()
+            let formatter = ISO8601DateFormatter()
+            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            try container.encode(formatter.string(from: date))
+        }
+        let data = try encoder.encode(metadata)
+        try data.write(to: paths.runMetadataFile(runId: metadata.runId))
+    }
+}
