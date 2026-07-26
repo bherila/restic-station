@@ -22,6 +22,13 @@ jobs:
       - name: Generate Xcode project
         run: xcodegen generate
       - name: Build
-        run: xcodebuild -scheme "Restic Station" build CODE_SIGNING_ALLOWED=NO
+        run: xcodebuild -scheme "Restic Station" build CODE_SIGNING_ALLOWED=NO -derivedDataPath dd
+      - name: Verify bundle layout
+        run: |
+          APP="dd/Build/Products/Debug/Restic Station.app"
+          test -x "$APP/Contents/MacOS/restic-station-helper"
+          plutil -lint "$APP/Contents/Library/LaunchAgents/net.herila.ResticStation.helper.plist"
+          OUT=$("$APP/Contents/MacOS/restic-station-helper" version)
+          echo "$OUT" | grep -q "restic-station-helper 0.1.0"
       - name: Run Core unit tests
         run: swift test --package-path Core
