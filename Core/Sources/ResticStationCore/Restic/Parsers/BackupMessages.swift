@@ -29,7 +29,11 @@ public struct BackupStatus: Decodable, Equatable, Sendable {
 /// (fixture `backup.ndjson` / `backup2.ndjson`). Distinct from
 /// ``RestoreSummary``, which shares the same `message_type` but different
 /// fields — ``ResticMessageDecoder`` disambiguates by field presence.
-public struct BackupSummary: Decodable, Equatable, Sendable {
+///
+/// `Codable` (not just `Decodable`) because `RunMetadata` (see
+/// `Runs/RunRecord.swift`) persists a captured summary verbatim as
+/// `RunMetadata.stats`.
+public struct BackupSummary: Codable, Equatable, Sendable {
     public let filesNew: Int?
     public let filesChanged: Int?
     public let filesUnmodified: Int?
