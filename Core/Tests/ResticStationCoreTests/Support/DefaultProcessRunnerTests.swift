@@ -85,8 +85,16 @@ struct DefaultProcessRunnerTests {
         await #expect(throws: CancellationError.self) {
             _ = try await task.value
         }
-        // SIGINT, not the 10 s grace period + SIGKILL: `sleep` dies at once.
+        // On macOS, SIGINT kills `sleep` at once — assert the fast path.
+        // In Linux CI containers the child inherits an ignored-SIGINT
+        // disposition from the runner, so termination legitimately falls
+        // through to the 10 s grace + SIGKILL fallback; only assert that the
+        // fallback actually terminated it. Production only runs on macOS.
+        #if os(macOS)
         #expect(Date().timeIntervalSince(started) < 5)
+        #else
+        #expect(Date().timeIntervalSince(started) < 15)
+        #endif
     }
 
     @Test("throws ProcessRunnerError.timeout and stops a long-running process via SIGINT")
