@@ -40,6 +40,9 @@ public protocol ProcessRunning: Sendable {
     /// newline-terminated line as it arrives (for NDJSON streaming).
     /// Throws ProcessRunnerError.timeout after sending SIGINT (then SIGKILL
     /// after a 10 s grace period) if `timeout` elapses.
+    ///
+    /// Cancelling the calling task stops the subprocess the same way (SIGINT,
+    /// 10 s grace, SIGKILL) and throws `CancellationError`.
     func run(
         _ argv: [String],
         env: [String: String]?,
@@ -96,46 +99,76 @@ public struct DefaultProcessRunner: ProcessRunning {
         let stderrTask = Task { await Self.readPipeToCompletion(stderrPipe, onLine: onStderrLine) }
 
         let timeoutFlag = TimeoutFlag()
+        let cancellationFlag = CancellationFlag()
+        let processBox = ProcessBox(process: process)
 
-        if let timeout {
-            await withTaskGroup(of: Void.self) { group in
-                group.addTask {
-                    _ = await stdoutTask.value
-                    _ = await stderrTask.value
+        // Task cancellation is handled with the same stop sequence as a
+        // timeout (SIGINT, 10 s grace, SIGKILL). SIGINT rather than SIGTERM
+        // because restic installs a SIGINT handler that removes the
+        // repository lock it holds before exiting — a cancelled run must not
+        // leave a stale lock behind.
+        let (outData, errData) = await withTaskCancellationHandler {
+            if let timeout {
+                await withTaskGroup(of: Void.self) { group in
+                    group.addTask {
+                        _ = await stdoutTask.value
+                        _ = await stderrTask.value
+                    }
+                    group.addTask {
+                        do {
+                            try await Task.sleep(nanoseconds: UInt64(max(0, timeout) * 1_000_000_000))
+                        } catch {
+                            // Cancelled: the process already exited before the
+                            // deadline, or the caller cancelled (handled by
+                            // the cancellation handler below).
+                            return
+                        }
+                        await timeoutFlag.trigger()
+                        await Self.stopAfterGracePeriod(processBox)
+                    }
+                    await group.next()
+                    group.cancelAll()
                 }
-                group.addTask {
-                    do {
-                        try await Task.sleep(nanoseconds: UInt64(max(0, timeout) * 1_000_000_000))
-                    } catch {
-                        // Cancelled: the process already exited before the deadline.
-                        return
-                    }
-                    await timeoutFlag.trigger()
-                    Self.sendSignal(SIGINT, to: process)
-                    // Grace period: give the process up to 10s to exit after SIGINT.
-                    var waited: TimeInterval = 0
-                    while process.isRunning && waited < 10 {
-                        try? await Task.sleep(nanoseconds: 100_000_000)
-                        waited += 0.1
-                    }
-                    if process.isRunning {
-                        Self.sendSignal(SIGKILL, to: process)
-                    }
-                }
-                await group.next()
-                group.cancelAll()
+            }
+
+            let out = await stdoutTask.value
+            let err = await stderrTask.value
+            process.waitUntilExit()
+            return (out, err)
+        } onCancel: {
+            cancellationFlag.mark()
+            // Synchronous part first so the signal lands immediately; the
+            // grace period + SIGKILL run detached (this closure cannot await).
+            Self.sendSignal(SIGINT, to: processBox.process)
+            Task.detached {
+                await Self.stopAfterGracePeriod(processBox, sendInitialInterrupt: false)
             }
         }
 
-        let outData = await stdoutTask.value
-        let errData = await stderrTask.value
-        process.waitUntilExit()
-
+        if cancellationFlag.isCancelled {
+            throw CancellationError()
+        }
         if await timeoutFlag.triggered {
             throw ProcessRunnerError.timeout
         }
 
         return ProcessResult(exitCode: process.terminationStatus, stdout: outData, stderr: errData)
+    }
+
+    /// SIGINT (optional — already sent by the cancellation handler), then up
+    /// to 10 s of grace, then SIGKILL.
+    private static func stopAfterGracePeriod(_ box: ProcessBox, sendInitialInterrupt: Bool = true) async {
+        if sendInitialInterrupt {
+            sendSignal(SIGINT, to: box.process)
+        }
+        var waited: TimeInterval = 0
+        while box.process.isRunning && waited < 10 {
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            waited += 0.1
+        }
+        if box.process.isRunning {
+            sendSignal(SIGKILL, to: box.process)
+        }
     }
 
     private static func sendSignal(_ signal: Int32, to process: Process) {
@@ -190,6 +223,34 @@ public struct DefaultProcessRunner: ProcessRunning {
 /// cross the `@Sendable` closure boundary without a data race.
 private struct PipeBox: @unchecked Sendable {
     let pipe: Pipe
+}
+
+/// Same reasoning as `PipeBox`: `Process` is not `Sendable`, but the only
+/// members touched across concurrency domains here are `isRunning`,
+/// `processIdentifier` and signal delivery, which are safe to read from the
+/// cancellation handler while the launching task awaits the process.
+private struct ProcessBox: @unchecked Sendable {
+    let process: Process
+}
+
+/// Records — synchronously, from `withTaskCancellationHandler`'s handler —
+/// that the calling task was cancelled. Cannot be an `actor`: the handler is
+/// a non-async closure.
+private final class CancellationFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+
+    var isCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelled
+    }
+
+    func mark() {
+        lock.lock()
+        defer { lock.unlock() }
+        cancelled = true
+    }
 }
 
 /// Tiny actor used to record, from a concurrently-running timeout task,
