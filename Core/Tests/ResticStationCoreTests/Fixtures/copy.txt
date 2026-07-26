@@ -1,0 +1,12 @@
+
+snapshot e9ffc5cb of [/Users/user/example/src] at 2026-07-26 16:57:04.634751 -0400 EDT by user@example-mac.local
+  copy started, this may take a while...
+[0:00] 100.00%  2 / 2 packs copied
+
+snapshot a231ccb7 saved
+
+snapshot f391ba97 of [/Users/user/example/src] at 2026-07-26 16:57:05.440731 -0400 EDT by user@example-mac.local
+  copy started, this may take a while...
+[0:00] 100.00%  2 / 2 packs copied
+
+snapshot a23f5c0e saved
