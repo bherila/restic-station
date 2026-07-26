@@ -50,8 +50,11 @@ public struct ResticOutcome: Sendable {
 /// win):
 ///
 /// 1. minimal base — `HOME`, `USER`, `TMPDIR` passed through when present
-///    (restic and `security` need them). Note there is deliberately no
-///    `PATH`: every program we name is absolute.
+///    (restic and `security` need them), plus a fixed system `PATH`
+///    (`/usr/bin:/bin:/usr/sbin:/sbin`): restic's `sftp:` backend locates
+///    `ssh` via PATH lookup. Every program *we* spawn is named absolutely;
+///    the PATH exists solely for restic's own children, and a destination's
+///    `nonSecretEnv` may override it (e.g. to reach a Homebrew `rclone`).
 /// 2. from-destination's `nonSecretEnv`, then its keychain secret-env blob
 /// 3. destination's `nonSecretEnv`, then its keychain secret-env blob —
 ///    **so on a key collision the destination (the `-r` repo) wins over the
@@ -196,6 +199,9 @@ public final class ResticRunner: Sendable {
                 env[key] = value
             }
         }
+        // Fixed, not inherited: restic's sftp backend execs `ssh` via PATH.
+        // Merged before nonSecretEnv, so destinations can override it.
+        env["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"
         env["RESTIC_CACHE_DIR"] = paths.resticCacheDir.path
         return env
     }

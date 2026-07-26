@@ -8,6 +8,7 @@ Everything in this document was **verified against restic 0.18.1 on macOS (arm64
 - Repository selection: always explicit `-r <repoURL>` (equivalently `RESTIC_REPOSITORY`; we use `-r` so argv is self-describing in logs).
 - Environment assembled per destination, replacing the inherited env with a minimal one:
   - `HOME`, `USER`, `TMPDIR` passed through (restic/keychain need them)
+  - `PATH=/usr/bin:/bin:/usr/sbin:/sbin` — fixed, not inherited; restic's `sftp:` backend locates `ssh` via PATH. Overridable per destination via `nonSecretEnv` (e.g. prepend `/opt/homebrew/bin` for an `rclone:` backend)
   - `RESTIC_PASSWORD_COMMAND=/usr/bin/security find-generic-password -s restic-station -a <dest-uuid-lowercase> -w`
   - `RESTIC_CACHE_DIR=~/Library/Caches/net.herila.ResticStation/restic` (expanded)
   - `Destination.nonSecretEnv` entries

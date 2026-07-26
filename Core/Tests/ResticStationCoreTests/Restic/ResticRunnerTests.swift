@@ -106,12 +106,12 @@ struct ResticRunnerTests {
         #expect(env["AWS_SECRET_ACCESS_KEY"] == "primary-secret")
         #expect(env["AWS_DEFAULT_REGION"] == "auto")
 
-        // The inherited environment is REPLACED, not extended: PATH (always
-        // set in the test process) must not appear, and no key outside the
-        // documented set may.
-        #expect(env["PATH"] == nil)
+        // The inherited environment is REPLACED, not extended: PATH is the
+        // FIXED system path (never the test process's inherited one), and no
+        // key outside the documented set may appear.
+        #expect(env["PATH"] == "/usr/bin:/bin:/usr/sbin:/sbin")
         let allowed: Set<String> = [
-            "HOME", "USER", "TMPDIR",
+            "HOME", "USER", "TMPDIR", "PATH",
             "RESTIC_CACHE_DIR", "RESTIC_PASSWORD_COMMAND",
             "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_DEFAULT_REGION",
         ]
@@ -178,7 +178,7 @@ struct ResticRunnerTests {
         #expect(env["AWS_DEFAULT_REGION"] == "us-east-1")
         // …while non-conflicting from-destination values survive.
         #expect(env["PRIMARY_ONLY"] == "yes")
-        #expect(env["PATH"] == nil)
+        #expect(env["PATH"] == "/usr/bin:/bin:/usr/sbin:/sbin")
     }
 
     @Test("nonSecretEnv cannot hijack the restic-controlling variables")
@@ -208,6 +208,26 @@ struct ResticRunnerTests {
         // configured — documented behavior; only the variables we set are
         // protected.
         #expect(env["RESTIC_PASSWORD"] == "pwned")
+    }
+
+    @Test("nonSecretEnv can override the fixed PATH (rclone escape hatch)")
+    func nonSecretEnvOverridesPath() async throws {
+        let destination = Destination(
+            id: Self.primaryId,
+            label: "Custom PATH",
+            repoURL: "rclone:remote:bucket",
+            isPrimary: true,
+            nonSecretEnv: ["PATH": "/opt/homebrew/bin:/usr/bin:/bin"]
+        )
+        let fake = FakeProcessRunner(script:
+            Self.keychainScript(for: Self.primaryId)
+                + [.init(argvPrefix: [Self.resticPath, "-r", "rclone:remote:bucket", "snapshots", "--json"])]
+        )
+        let runner = Self.makeRunner(fake)
+        _ = try await runner.run(.snapshots(repo: "rclone:remote:bucket"), for: ResticInvocation(destination: destination))
+
+        let env = try #require(fake.invocations[2].env)
+        #expect(env["PATH"] == "/opt/homebrew/bin:/usr/bin:/bin")
     }
 
     @Test("keychain secret env wins over nonSecretEnv for the same destination")
@@ -248,7 +268,7 @@ struct ResticRunnerTests {
         let env = try #require(fake.invocations[0].env)
         #expect(env["RESTIC_PASSWORD_COMMAND"] == nil)
         #expect(env["RESTIC_CACHE_DIR"] == Self.paths().resticCacheDir.path)
-        #expect(env["PATH"] == nil)
+        #expect(env["PATH"] == "/usr/bin:/bin:/usr/sbin:/sbin")
     }
 
     // MARK: - Keychain pre-flight
