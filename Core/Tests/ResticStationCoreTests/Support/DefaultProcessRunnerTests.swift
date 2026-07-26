@@ -64,6 +64,31 @@ struct DefaultProcessRunnerTests {
         #expect(output.contains("MARKER=present"))
     }
 
+    @Test("task cancellation stops the process via SIGINT and throws CancellationError")
+    func cancellationStopsProcess() async throws {
+        let runner = DefaultProcessRunner()
+
+        let started = Date()
+        let task = Task {
+            try await runner.run(
+                ["/bin/sleep", "30"],
+                env: nil,
+                currentDirectory: nil,
+                onStdoutLine: nil,
+                onStderrLine: nil,
+                timeout: nil
+            )
+        }
+        try await Task.sleep(nanoseconds: 300_000_000)
+        task.cancel()
+
+        await #expect(throws: CancellationError.self) {
+            _ = try await task.value
+        }
+        // SIGINT, not the 10 s grace period + SIGKILL: `sleep` dies at once.
+        #expect(Date().timeIntervalSince(started) < 5)
+    }
+
     @Test("throws ProcessRunnerError.timeout and stops a long-running process via SIGINT")
     func timeoutSendsSIGINT() async throws {
         let runner = DefaultProcessRunner()

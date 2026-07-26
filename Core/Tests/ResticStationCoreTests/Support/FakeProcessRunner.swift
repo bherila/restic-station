@@ -19,19 +19,25 @@ final class FakeProcessRunner: ProcessRunning, @unchecked Sendable {
         let stderr: String
         let exitCode: Int32
         let delay: TimeInterval?
+        /// When set, `run(...)` throws this instead of returning a result —
+        /// how tests reach the `ProcessRunnerError.timeout` / `.launchFailed`
+        /// paths that a scripted exit code cannot express.
+        let failure: ProcessRunnerError?
 
         init(
             argvPrefix: [String],
             stdoutLines: [String] = [],
             stderr: String = "",
             exitCode: Int32 = 0,
-            delay: TimeInterval? = nil
+            delay: TimeInterval? = nil,
+            failure: ProcessRunnerError? = nil
         ) {
             self.argvPrefix = argvPrefix
             self.stdoutLines = stdoutLines
             self.stderr = stderr
             self.exitCode = exitCode
             self.delay = delay
+            self.failure = failure
         }
     }
 
@@ -80,6 +86,10 @@ final class FakeProcessRunner: ProcessRunning, @unchecked Sendable {
 
         if let delay = expectation.delay {
             try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+        }
+
+        if let failure = expectation.failure {
+            throw failure
         }
 
         var stdoutData = Data()
