@@ -1,0 +1,95 @@
+import SwiftUI
+
+/// The app shell (`docs/ui-spec.md` §Shell): a `NavigationSplitView` whose
+/// sidebar routes to one root view per section. Each root view lives in its
+/// own file under `Views/` and is replaced wholesale by T14–T17 — this file
+/// should not need to change again.
+///
+/// Settings is a sidebar row like the others but opens the standard
+/// `Settings` scene (⌘,) via `SettingsLink`, rather than being a fifth
+/// detail pane: one settings surface, reachable two ways.
+struct MainWindow: View {
+    @SceneStorage("sidebarSelection") private var storedSelection: String?
+    /// Optional because that is the shape `List` single-selection takes;
+    /// the detail pane falls back to Backup Sets if it is ever cleared.
+    @State private var selection: SidebarSection? = .backupSets
+
+    var body: some View {
+        NavigationSplitView {
+            List(selection: $selection) {
+                Section {
+                    ForEach(SidebarSection.allCases) { section in
+                        Label(section.title, systemImage: section.symbolName)
+                            .tag(section)
+                    }
+                }
+                Section {
+                    SettingsLink {
+                        Label("Settings", systemImage: "gearshape")
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .navigationSplitViewColumnWidth(min: 190, ideal: 215, max: 320)
+        } detail: {
+            detail
+                .frame(minWidth: 640, minHeight: 480)
+        }
+        .navigationTitle("Restic Station")
+        // ui-spec: min size ~900×560.
+        .frame(minWidth: 900, minHeight: 560)
+        .onAppear {
+            if let storedSelection, let restored = SidebarSection(rawValue: storedSelection) {
+                selection = restored
+            }
+        }
+        .onChange(of: selection) { _, newValue in
+            storedSelection = newValue?.rawValue
+        }
+    }
+
+    @ViewBuilder
+    private var detail: some View {
+        switch selection ?? .backupSets {
+        case .backupSets:
+            BackupSetsRootView()
+        case .runs:
+            RunsRootView()
+        case .restore:
+            RestoreRootView()
+        case .maintenance:
+            MaintenanceRootView()
+        }
+    }
+}
+
+// MARK: - SidebarSection
+
+/// The four routed sections. "Settings" is deliberately not a case: it is a
+/// `SettingsLink`, not a detail pane.
+enum SidebarSection: String, CaseIterable, Identifiable, Hashable {
+    case backupSets
+    case runs
+    case restore
+    case maintenance
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .backupSets: return "Backup Sets"
+        case .runs: return "Runs"
+        case .restore: return "Restore"
+        case .maintenance: return "Maintenance"
+        }
+    }
+
+    var symbolName: String {
+        switch self {
+        case .backupSets: return "externaldrive"
+        case .runs: return "clock.arrow.circlepath"
+        case .restore: return "arrow.uturn.backward.circle"
+        case .maintenance: return "wrench.and.screwdriver"
+        }
+    }
+}
