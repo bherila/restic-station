@@ -87,6 +87,19 @@ public struct DefaultProcessRunner: ProcessRunning {
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
 
+        // Termination is observed via `terminationHandler` (delivered on an
+        // internal Foundation queue), NEVER `waitUntilExit()`: waitUntilExit
+        // delivers through the spawning thread's runloop, and Swift
+        // concurrency cooperative threads don't run one — the notification
+        // can be lost and the wait then hangs forever with a zombie child.
+        // Observed in practice (T19): a hung helper holds its flocks until
+        // killed, silently stopping all scheduled backups. The handler MUST
+        // be installed before `run()` so a fast-exiting child can't race it.
+        let terminationSignal = TerminationSignal()
+        process.terminationHandler = { _ in
+            terminationSignal.fire()
+        }
+
         do {
             try process.run()
         } catch {
@@ -133,7 +146,7 @@ public struct DefaultProcessRunner: ProcessRunning {
 
             let out = await stdoutTask.value
             let err = await stderrTask.value
-            process.waitUntilExit()
+            await terminationSignal.wait()
             return (out, err)
         } onCancel: {
             cancellationFlag.mark()
@@ -250,6 +263,37 @@ private final class CancellationFlag: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         cancelled = true
+    }
+}
+
+/// One-shot latching signal bridging `Process.terminationHandler` (fired on
+/// a Foundation-internal queue) to async/await. `fire()` may happen before,
+/// during, or after `wait()`; the single waiter always resumes exactly once.
+private final class TerminationSignal: @unchecked Sendable {
+    private let lock = NSLock()
+    private var fired = false
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    func fire() {
+        lock.lock()
+        fired = true
+        let waiter = continuation
+        continuation = nil
+        lock.unlock()
+        waiter?.resume()
+    }
+
+    func wait() async {
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            lock.lock()
+            if fired {
+                lock.unlock()
+                cont.resume()
+                return
+            }
+            continuation = cont
+            lock.unlock()
+        }
     }
 }
 
