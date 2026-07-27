@@ -314,14 +314,16 @@ struct BackupEngineTests {
         // secondary's copy succeeds; `docs/testing.md`'s row-1 shorthand
         // ("copy ×2 → forget ×3") groups by command type, which is not the
         // order the normative step-6 text describes.
-        #expect(env.resticArgvs == [
-            [Self.resticPath] + Self.backupArgv(primaryRepo),
-            [Self.resticPath] + Self.copyArgv(to: secA, from: primaryRepo),
-            [Self.resticPath] + Self.forgetArgv(secA),
-            [Self.resticPath] + Self.copyArgv(to: secB, from: primaryRepo),
-            [Self.resticPath] + Self.forgetArgv(secB),
-            [Self.resticPath] + Self.forgetArgv(primaryRepo),
-        ])
+        // Built stepwise: a single nested-literal expression exceeds the
+        // Swift 6.1 type checker's budget (CI), though 6.3 handles it.
+        var expectedArgvs: [[String]] = []
+        expectedArgvs.append([Self.resticPath] + Self.backupArgv(primaryRepo))
+        expectedArgvs.append([Self.resticPath] + Self.copyArgv(to: secA, from: primaryRepo))
+        expectedArgvs.append([Self.resticPath] + Self.forgetArgv(secA))
+        expectedArgvs.append([Self.resticPath] + Self.copyArgv(to: secB, from: primaryRepo))
+        expectedArgvs.append([Self.resticPath] + Self.forgetArgv(secB))
+        expectedArgvs.append([Self.resticPath] + Self.forgetArgv(primaryRepo))
+        #expect(env.resticArgvs == expectedArgvs)
 
         guard case .completed(let status, let groupId, let children) = outcome else {
             Issue.record("expected .completed, got \(outcome)")
@@ -415,12 +417,13 @@ struct BackupEngineTests {
 
         let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
 
-        #expect(env.resticArgvs == [
-            [Self.resticPath] + Self.backupArgv(env.primary.repoURL),
-            [Self.resticPath] + Self.copyArgv(to: online.repoURL, from: env.primary.repoURL),
-            [Self.resticPath] + Self.forgetArgv(online.repoURL),
-            [Self.resticPath] + Self.forgetArgv(env.primary.repoURL),
-        ])
+        // Built stepwise for the Swift 6.1 type-checker budget (see row 1).
+        var expectedArgvs: [[String]] = []
+        expectedArgvs.append([Self.resticPath] + Self.backupArgv(env.primary.repoURL))
+        expectedArgvs.append([Self.resticPath] + Self.copyArgv(to: online.repoURL, from: env.primary.repoURL))
+        expectedArgvs.append([Self.resticPath] + Self.forgetArgv(online.repoURL))
+        expectedArgvs.append([Self.resticPath] + Self.forgetArgv(env.primary.repoURL))
+        #expect(env.resticArgvs == expectedArgvs)
         guard case .completed(let status, _, _) = outcome else {
             Issue.record("expected .completed, got \(outcome)")
             return
