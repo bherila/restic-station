@@ -1,0 +1,229 @@
+import Foundation
+
+/// Everything about *how the app talks to `restic-station-helper`* that can
+/// be decided without touching the filesystem, `Process`, or launchd —
+/// extracted into Core so it is unit-testable (`docs/tasks/T11-launchd.md`:
+/// "unit-testing argv construction by extracting a pure `argv(for:)`
+/// function"). The App-side `HelperInvoker` is then a thin spawn-and-map
+/// shell over these values.
+///
+/// The flag spellings below are the merged helper's actual
+/// `@Option(name: .long)` declarations (`Helper/Sources/Commands/*.swift`);
+/// a mismatch is a runtime bug no compiler can catch, since the two sides
+/// only meet across an `execve` boundary. `HelperCommandTests` pins every
+/// one of them.
+public enum HelperCommand: Equatable, Sendable {
+    /// `tick` — one scheduling pass. Normally launchd's job; the app spawns
+    /// it directly only in debug/diagnostic paths (the *supported* way for
+    /// the app to force a tick is `launchctl kickstart`, see
+    /// `LaunchctlCommand`, so the tick keeps running in the launchd context
+    /// its TCC attribution depends on).
+    case tick
+    /// `run-set --set <uuid> --kind backup` — "Back Up Now".
+    case backUpNow(setId: UUID)
+    /// `run-set --set <uuid> --kind prune`.
+    case prune(setId: UUID)
+    /// `run-set --set <uuid> --kind check`.
+    case check(setId: UUID)
+    /// `init-secondary --set <uuid> --dest <uuid>`.
+    case initSecondary(setId: UUID, destId: UUID)
+    /// `probe-repo --set <uuid> --dest <uuid>` (exit 3 = offline).
+    case probeRepo(setId: UUID, destId: UUID)
+    /// `restore --set … --dest … --snapshot … --target … [--sub …]
+    /// [--include …]… [--overwrite …]`.
+    case restore(HelperRestoreArgs)
+    /// `fda-check --context <label>` — the Full Disk Access probe
+    /// (`docs/keychain-and-fda.md` §2). `context` is recorded verbatim in
+    /// `state/fda-check.json` so the UI can tell *which* process context
+    /// produced a result.
+    case fdaCheck(context: String)
+    /// `version`.
+    case version
+
+    /// The helper's argument vector **excluding argv[0]** — exactly what
+    /// goes into `Process.arguments` (the executable itself is
+    /// `HelperInvoker.helperURL`).
+    public var argv: [String] {
+        switch self {
+        case .tick:
+            return ["tick"]
+        case .backUpNow(let setId):
+            return Self.runSet(setId: setId, kind: "backup")
+        case .prune(let setId):
+            return Self.runSet(setId: setId, kind: "prune")
+        case .check(let setId):
+            return Self.runSet(setId: setId, kind: "check")
+        case .initSecondary(let setId, let destId):
+            return ["init-secondary", "--set", Self.render(setId), "--dest", Self.render(destId)]
+        case .probeRepo(let setId, let destId):
+            return ["probe-repo", "--set", Self.render(setId), "--dest", Self.render(destId)]
+        case .restore(let args):
+            return Self.restoreArgv(args)
+        case .fdaCheck(let context):
+            return ["fda-check", "--context", context]
+        case .version:
+            return ["version"]
+        }
+    }
+
+    /// The subcommand name (`argv[0]` of `argv`), i.e. what
+    /// `HelperMain.configuration.subcommands` must contain.
+    public var subcommandName: String {
+        argv[0]
+    }
+
+    // MARK: - Builders
+
+    /// `RunSet.Kind` defaults to `.backup` in the helper, and
+    /// `docs/scheduling.md` §What the app does writes the short form
+    /// (`run-set --set <uuid>`). We nevertheless always pass `--kind`
+    /// explicitly: the default lives in a *different target* that the app
+    /// links no code from, so relying on it would let a future change of
+    /// that default silently re-point "Back Up Now". Same command, no
+    /// cross-target coupling.
+    private static func runSet(setId: UUID, kind: String) -> [String] {
+        ["run-set", "--set", render(setId), "--kind", kind]
+    }
+
+    private static func restoreArgv(_ args: HelperRestoreArgs) -> [String] {
+        var argv = ["restore"]
+        argv.append(contentsOf: ["--set", render(args.setId)])
+        argv.append(contentsOf: ["--dest", render(args.destId)])
+        argv.append(contentsOf: ["--snapshot", args.snapshotID])
+        argv.append(contentsOf: ["--target", args.targetPath])
+        if let subpath = args.subpath {
+            argv.append(contentsOf: ["--sub", subpath])
+        }
+        for include in args.includes {
+            // `@Option var include: [String]` — repeatable, one `--include`
+            // per value (ArgumentParser has no comma-separated form here).
+            argv.append(contentsOf: ["--include", include])
+        }
+        if let overwriteMode = args.overwriteMode {
+            argv.append(contentsOf: ["--overwrite", overwriteMode.rawValue])
+        }
+        return argv
+    }
+
+    /// `UUID` is parsed helper-side by `UUID(uuidString:)` (see the
+    /// `ExpressibleByArgument` conformance in
+    /// `Helper/Sources/HelperContext.swift`), which is case-insensitive;
+    /// `uuidString` (canonical uppercase) is what we send.
+    private static func render(_ id: UUID) -> String {
+        id.uuidString
+    }
+}
+
+// MARK: - HelperRestoreArgs
+
+/// The app-side parameters of a `restore` invocation. Deliberately *not*
+/// `RestoreRequest` (Core's engine-side type): that one is scoped to a set
+/// already resolved by the caller and carries no `setId`, whereas the CLI
+/// needs both ids on the command line.
+public struct HelperRestoreArgs: Equatable, Sendable {
+    public let setId: UUID
+    public let destId: UUID
+    public let snapshotID: String
+    /// Filesystem path to restore *into* (`--target`).
+    public let targetPath: String
+    /// **In-snapshot** path (`--sub`); `nil` restores the whole snapshot.
+    public let subpath: String?
+    /// Repeatable `--include` patterns.
+    public let includes: [String]
+    /// `nil` = restic's own default (`always`) — the flag is omitted.
+    public let overwriteMode: ResticCommand.OverwriteMode?
+
+    public init(
+        setId: UUID,
+        destId: UUID,
+        snapshotID: String,
+        targetPath: String,
+        subpath: String? = nil,
+        includes: [String] = [],
+        overwriteMode: ResticCommand.OverwriteMode? = nil
+    ) {
+        self.setId = setId
+        self.destId = destId
+        self.snapshotID = snapshotID
+        self.targetPath = targetPath
+        self.subpath = subpath
+        self.includes = includes
+        self.overwriteMode = overwriteMode
+    }
+}
+
+// MARK: - Exit codes
+
+/// The helper's exit-code contract (`docs/tasks/T10-helper-cli.md`, echoed
+/// in `HelperMain`'s abstract): 0 ok, 1 error, 2 busy, 3 offline.
+public enum HelperExitCode: Int32, Sendable, CaseIterable {
+    case ok = 0
+    case error = 1
+    case busy = 2
+    /// `probe-repo` only: the destination is not reachable right now. Not
+    /// an error — the expected state of an unplugged external drive.
+    case offline = 3
+
+    /// Maps a raw process exit status onto the contract. Any code outside
+    /// the contract (ArgumentParser's own usage errors, a crash's `128+n`,
+    /// …) is a failure — never silently treated as success.
+    ///
+    /// - Important: callers must first check that the process actually
+    ///   *exited* rather than being killed by a signal. On Darwin a
+    ///   signalled `Process` reports the signal number in
+    ///   `terminationStatus`, so a `SIGINT`-killed helper would otherwise
+    ///   be misread as exit 2 ("busy"). `HelperInvoker` does this check.
+    public static func interpret(_ code: Int32) -> HelperResultKind {
+        switch HelperExitCode(rawValue: code) {
+        case .ok: return .ok
+        case .busy: return .busy
+        case .offline: return .offline
+        case .error, nil: return .failed
+        }
+    }
+}
+
+/// The outcome classes a helper invocation can land in — the pure half of
+/// the App's `HelperResult` (which additionally carries captured output).
+public enum HelperResultKind: Equatable, Sendable, CaseIterable {
+    case ok
+    case busy
+    case offline
+    case failed
+}
+
+// MARK: - launchctl
+
+/// `launchctl` invocations the app makes. Pure argv construction, kept here
+/// so `docs/keychain-and-fda.md` §3's "kickstart argv exactly
+/// `gui/<uid>/<label>`, no `-k` by default" rule is unit-tested rather than
+/// eyeballed.
+public enum LaunchctlCommand {
+    public static let executablePath = "/bin/launchctl"
+
+    /// The LaunchAgent's label. MUST equal the embedded plist's filename
+    /// minus `.plist` (`docs/scheduling.md` §plist) — see
+    /// `App/Resources/net.herila.ResticStation.helper.plist`.
+    public static let helperLabel = "net.herila.ResticStation.helper"
+    public static let helperPlistName = "net.herila.ResticStation.helper.plist"
+
+    /// `kickstart [-k] gui/<uid>/<label>` — arguments only, excluding
+    /// `executablePath`.
+    ///
+    /// - Parameter restart: `-k` kills a running instance first. **Only**
+    ///   for the FDA re-check flow: the default path must never interrupt a
+    ///   backup that is already running (on a busy service, plain
+    ///   `kickstart` is a no-op).
+    public static func kickstartArgv(
+        label: String = helperLabel,
+        uid: UInt32,
+        restart: Bool = false
+    ) -> [String] {
+        var argv = ["kickstart"]
+        if restart {
+            argv.append("-k")
+        }
+        argv.append("gui/\(uid)/\(label)")
+        return argv
+    }
+}
