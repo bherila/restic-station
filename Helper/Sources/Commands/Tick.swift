@@ -24,6 +24,12 @@ struct Tick: AsyncParsableCommand {
         }
         defer { lock.release() }
 
+        // Record launchd-context FDA evidence on every tick, before any
+        // config gating: the Settings "Re-check" flow and the Background-
+        // agent badge depend on this file being fresh, and it must be
+        // written even when no sets or restic are configured yet.
+        FdaCheck.probeAndRecord(context: "launchd", stateStore: StateStore(paths: paths))
+
         // ── Step 2: load config; no config or no sets → exit 0. ─────────
         let configStore = ConfigStore(paths: paths)
         let config: AppConfig

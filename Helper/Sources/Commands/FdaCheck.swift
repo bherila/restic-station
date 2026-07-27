@@ -22,9 +22,16 @@ struct FdaCheck: AsyncParsableCommand {
     var context: String = "launchd"
 
     func run() async throws {
-        let paths = AppPaths.default()
-        let stateStore = StateStore(paths: paths)
+        let result = Self.probeAndRecord(context: context, stateStore: StateStore(paths: AppPaths.default()))
+        print("full disk access: \(result.hasFullDiskAccess ? "granted" : "not granted") (probed \(result.probedPath), context: \(context))")
+    }
 
+    /// Probes and records in one step. Also called by `tick` on every firing,
+    /// so the "Background agent" badge always has fresh launchd-context
+    /// evidence (docs/keychain-and-fda.md §2 — the app deliberately never
+    /// writes this file itself).
+    @discardableResult
+    static func probeAndRecord(context: String, stateStore: StateStore) -> FdaCheckResult {
         let home = FileManager.default.homeDirectoryForCurrentUser
         let safari = home.appendingPathComponent("Library/Safari", isDirectory: true)
         let mail = home.appendingPathComponent("Library/Mail", isDirectory: true)
@@ -45,7 +52,6 @@ struct FdaCheck: AsyncParsableCommand {
         } catch {
             FileHandle.standardError.write(Data("fda-check: could not write state: \(error)\n".utf8))
         }
-
-        print("full disk access: \(hasAccess ? "granted" : "not granted") (probed \(probedPath), context: \(context))")
+        return result
     }
 }
