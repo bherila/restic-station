@@ -1,13 +1,9 @@
 import SwiftUI
 
-/// Placeholder for the Restore section — replaced by T16
-/// (`Views/Restore/`). `MainWindow` routes to this name.
+/// The Restore section's entry point. `MainWindow` routes to this name; the
+/// screen itself is `Views/Restore/RestoreView.swift` (T16).
 struct RestoreRootView: View {
     var body: some View {
-        PlaceholderDetailView(
-            title: "Restore",
-            symbolName: "arrow.uturn.backward.circle",
-            message: "Browsing snapshots and restoring files will happen here."
-        )
+        RestoreView()
     }
 }
