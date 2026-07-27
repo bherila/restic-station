@@ -13,3 +13,6 @@ Core/.swiftpm/
 
 # macOS
 .DS_Store
+
+# Claude Code session state (agent worktrees etc.)
+.claude/
