@@ -57,6 +57,16 @@ service.unregister()
   - CI never exercises SMAppService (no GUI session); it is covered by the manual checklist in testing.md.
 - After config changes that affect scheduling, the app kicks an immediate tick: `launchctl kickstart gui/<uid>/net.herila.ResticStation.helper` (no `-k`; don't kill a running backup). Get uid via `getuid()`.
 
+## Troubleshooting (from T11/T18 implementation evidence)
+
+Findings observed during implementation and review — not speculation:
+
+- **"Background agent" badge shows *unknown*, not denied.** By design the agent badge never trusts stale evidence: it reports *unknown* whenever `state/fda-check.json` is absent, stale, recorded from the wrong context (`"app"` instead of `"launchd"`), or unreadable. A green agent badge therefore always reflects a *recent launchd-context probe*. If it sticks at unknown: confirm the agent is actually registered and running (`launchctl print gui/$UID/net.herila.ResticStation.helper`) — every tick records fresh launchd-context FDA evidence, so with a live agent the badge resolves within one tick (≤2 min) or via the Re-check button.
+- **Re-check appears to do nothing.** Re-check uses `launchctl kickstart -k` and is deliberately gated: it will not fire while a backup is running (kickstarting with `-k` would kill it). Wait for the run to finish, or just wait for the next natural tick — it records the same evidence without `-k`.
+- **App badge granted, agent badge denied.** Expected edge case with ad-hoc/dev-signed builds or an app moved after registration (TCC attribution). Fallback: add the helper binary itself in the FDA pane — `Restic Station.app/Contents/MacOS/restic-station-helper` (⌘⇧G in the file picker).
+- **Badges wrong after moving/rebuilding the app.** SMAppService registration binds to the app path; run from `/Applications` only. Reset with `sfltool resetbtm`, then re-register from onboarding.
+- **Keychain prompt appears, or headless backup hangs on password.** The item was created without `security` in its ACL (e.g. by hand or via `SecItemAdd`). `-U` cannot fix an ACL — delete and re-create: `security delete-generic-password -s restic-station -a <uuid>` then re-enter the password in the app.
+
 ## 4. Signing & distribution (v1 posture)
 
 Local builds: ad-hoc/dev signing, works for personal use (with the dev-workflow caveats above). CI: `CODE_SIGNING_ALLOWED=NO`, build-only. Distribution to others (later): Developer ID + hardened runtime + notarization — no entitlement exceptions needed (we load no plugins, no JIT); steps live in `docs/release.md` (T20). The app is **not sandboxed** by design: it must spawn `/usr/bin/security`, an arbitrary user-configured restic binary, `launchctl`, and take `flock`s — all incompatible with App Sandbox. Consequence: no Mac App Store; accepted.
