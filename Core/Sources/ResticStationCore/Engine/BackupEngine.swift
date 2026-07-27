@@ -329,7 +329,12 @@ public final class BackupEngine: Sendable {
     /// `checkSliceCursor` (and the secondary-rotation counter) are persisted
     /// **only** when the primary check succeeded — a failed check must
     /// re-verify the same slice next time rather than skip past it.
-    public func runCheck(_ set: BackupSet) async -> RunStatus {
+    ///
+    /// - Parameter trigger: defaults to ``RunTrigger/scheduled`` — `tick`'s
+    ///   call sites are unaffected. `run-set --kind check` passes
+    ///   ``RunTrigger/manual`` so the run record reflects a manual trigger
+    ///   (issue #9's close: this is the one permitted post-T09 Core change).
+    public func runCheck(_ set: BackupSet, trigger: RunTrigger = .scheduled) async -> RunStatus {
         guard let primary = set.destinations.first(where: { $0.isPrimary }) else {
             logWarning("BackupEngine: backup set \"\(set.name)\" has no primary destination — cannot check")
             return .failed
@@ -338,7 +343,7 @@ public final class BackupEngine: Sendable {
 
         let lock = makeSetLock(setId: set.id)
         guard lock.tryAcquire() else {
-            recordSkipped(kind: .check, setId: set.id, destId: primary.id, trigger: .scheduled)
+            recordSkipped(kind: .check, setId: set.id, destId: primary.id, trigger: trigger)
             return .skipped
         }
         defer { lock.release() }
@@ -362,7 +367,7 @@ public final class BackupEngine: Sendable {
             kind: .check,
             setId: set.id,
             destination: primary,
-            trigger: .scheduled,
+            trigger: trigger,
             groupId: nil,
             phase: "checking",
             command: .check(repo: primary.repoURL, readDataSubset: "\(slice.n)/\(totalSlices)"),
@@ -390,7 +395,7 @@ public final class BackupEngine: Sendable {
                         kind: .check,
                         setId: set.id,
                         destination: secondary,
-                        trigger: .scheduled,
+                        trigger: trigger,
                         groupId: primaryCheck.child.runId,
                         phase: "checking",
                         // Structure-only: no `--read-data-subset`.
