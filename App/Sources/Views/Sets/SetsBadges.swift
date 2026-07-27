@@ -116,7 +116,7 @@ struct StatusDot: View {
 // MARK: - RunStatusBadge
 
 /// The set list's "last run status badge".
-struct RunStatusBadge: View {
+struct SetHealthBadge: View {
     let health: SetHealth
 
     var body: some View {

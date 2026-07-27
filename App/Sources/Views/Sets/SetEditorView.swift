@@ -43,7 +43,7 @@ struct SetEditorView: View {
 
             stalenessSection
 
-            RetentionSection(retention: $draft.retention)
+            RetentionEditorSection(retention: $draft.retention)
 
             CheckPolicySection(
                 checkPolicy: $draft.checkPolicy,

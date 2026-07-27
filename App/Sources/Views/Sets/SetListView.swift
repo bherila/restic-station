@@ -108,7 +108,7 @@ struct SetListView: View {
 
             TableColumn("Last backup") { set in
                 if let health = model.setHealth(for: set.id) {
-                    RunStatusBadge(health: health)
+                    SetHealthBadge(health: health)
                 } else {
                     Text("—").foregroundStyle(.secondary)
                 }

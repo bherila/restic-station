@@ -341,7 +341,7 @@ struct ScheduleSection: View {
 /// "**Retention** (optional section, off = never forget) … default
 /// suggestion when enabling: 7 daily / 4 weekly / 12 monthly / 2 yearly."
 /// (`docs/ui-spec.md` §Backup Sets)
-struct RetentionSection: View {
+struct RetentionEditorSection: View {
     @Binding var retention: RetentionPolicy?
 
     /// The suggestion the spec pins, applied the moment the section is

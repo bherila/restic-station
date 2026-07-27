@@ -213,35 +213,5 @@ enum MaintenanceFormat {
 
 // MARK: - RunStatus presentation
 
-extension RunStatus {
-    /// Badge glyph + adaptive color. Semantic SwiftUI colors only, so both
-    /// appearances stay legible (`docs/ui-spec.md` §Shell).
-    var symbolName: String {
-        switch self {
-        case .success: return "checkmark.circle.fill"
-        case .warning: return "exclamationmark.triangle.fill"
-        case .failed: return "xmark.octagon.fill"
-        case .skipped: return "minus.circle.fill"
-        case .running: return "arrow.triangle.2.circlepath"
-        }
-    }
-
-    var tint: Color {
-        switch self {
-        case .success: return .green
-        case .warning: return .orange
-        case .failed: return .red
-        case .skipped, .running: return .secondary
-        }
-    }
-
-    var label: String {
-        switch self {
-        case .success: return "Succeeded"
-        case .warning: return "Completed with warnings"
-        case .failed: return "Failed"
-        case .skipped: return "Skipped"
-        case .running: return "Running"
-        }
-    }
-}
+// RunStatus presentation (label/symbolName/tint) lives in
+// Views/Runs/RunHistory.swift — one canonical extension for all screens.
