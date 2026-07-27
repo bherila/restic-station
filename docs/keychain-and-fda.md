@@ -46,7 +46,7 @@ A `RunAtLoad` tick can fire before the login keychain is unlocked; `find-generic
 ```swift
 let service = SMAppService.agent(plistName: "net.herila.ResticStation.helper.plist")
 try service.register()          // may throw; check service.status
-SMAppService.openSystemSettingsLoginItemsSettings()   // when .requiresApproval
+SMAppService.openSystemSettingsLoginItems()   // when .requiresApproval
 service.unregister()
 ```
 
