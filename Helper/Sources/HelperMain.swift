@@ -12,6 +12,7 @@ struct HelperMain: AsyncParsableCommand {
             InitSecondary.self,
             Restore.self,
             ProbeRepo.self,
+            Unlock.self,
             FdaCheck.self,
             Version.self,
         ]

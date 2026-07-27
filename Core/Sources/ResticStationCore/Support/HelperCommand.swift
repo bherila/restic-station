@@ -29,6 +29,17 @@ public enum HelperCommand: Equatable, Sendable {
     case initSecondary(setId: UUID, destId: UUID)
     /// `probe-repo --set <uuid> --dest <uuid>` (exit 3 = offline).
     case probeRepo(setId: UUID, destId: UUID)
+    /// `unlock --set <uuid> --dest <uuid>` — the Maintenance screen's
+    /// "Remove stale locks" utility (`docs/ui-spec.md` §Maintenance).
+    ///
+    /// Unlike every other repository-touching command here, this one writes
+    /// **no run record**: `RunKind` has no case for it, and borrowing
+    /// `check`/`prune` would put a wrong "what happened last" line into
+    /// `runs/index.jsonl`. The reasoning is spelled out in the helper
+    /// subcommand's own abstract (`Helper/Sources/Commands/Unlock.swift`);
+    /// callers therefore get their feedback from the printed result line,
+    /// not from the Runs screen.
+    case unlock(setId: UUID, destId: UUID)
     /// `restore --set … --dest … --snapshot … --target … [--sub …]
     /// [--include …]… [--overwrite …]`.
     case restore(HelperRestoreArgs)
@@ -57,6 +68,8 @@ public enum HelperCommand: Equatable, Sendable {
             return ["init-secondary", "--set", Self.render(setId), "--dest", Self.render(destId)]
         case .probeRepo(let setId, let destId):
             return ["probe-repo", "--set", Self.render(setId), "--dest", Self.render(destId)]
+        case .unlock(let setId, let destId):
+            return ["unlock", "--set", Self.render(setId), "--dest", Self.render(destId)]
         case .restore(let args):
             return Self.restoreArgv(args)
         case .fdaCheck(let context):
