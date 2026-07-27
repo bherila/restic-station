@@ -1,0 +1,1308 @@
+import Foundation
+import Testing
+@testable import ResticStationCore
+
+// MARK: - Test doubles
+
+/// Injectable clock. `now` is deliberately a stored closure so the same
+/// clock instance drives the engine, the `RunStore` (runId timestamps) and
+/// the `LogWriter`.
+final class TestClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var current: Date
+
+    init(_ start: Date) {
+        self.current = start
+    }
+
+    var now: @Sendable () -> Date {
+        { [self] in
+            lock.lock()
+            defer { lock.unlock() }
+            return current
+        }
+    }
+
+    func advance(_ seconds: TimeInterval) {
+        lock.lock()
+        current = current.addingTimeInterval(seconds)
+        lock.unlock()
+    }
+}
+
+/// Wraps `FakeProcessRunner` and calls `onSpawn` *before* delegating, so a
+/// test can observe on-disk state (notably `state/current-run-<setId>.json`)
+/// at the exact moment a given restic child is spawned — the only way to
+/// watch the live-progress file, which a finished set run deletes.
+final class ObservingProcessRunner: ProcessRunning, @unchecked Sendable {
+    let inner: FakeProcessRunner
+    private let onSpawn: @Sendable ([String]) -> Void
+
+    init(inner: FakeProcessRunner, onSpawn: @escaping @Sendable ([String]) -> Void) {
+        self.inner = inner
+        self.onSpawn = onSpawn
+    }
+
+    func run(
+        _ argv: [String],
+        env: [String: String]?,
+        currentDirectory: String?,
+        onStdoutLine: (@Sendable (String) -> Void)?,
+        onStderrLine: (@Sendable (String) -> Void)?,
+        timeout: TimeInterval?
+    ) async throws -> ProcessResult {
+        onSpawn(argv)
+        return try await inner.run(
+            argv,
+            env: env,
+            currentDirectory: currentDirectory,
+            onStdoutLine: onStdoutLine,
+            onStderrLine: onStderrLine,
+            timeout: timeout
+        )
+    }
+}
+
+// MARK: - Suite
+
+@Suite("BackupEngine: runSet sequence, checks, prune, restore, init")
+struct BackupEngineTests {
+
+    // MARK: Fixed identifiers / clock
+
+    static let resticPath = "/opt/homebrew/bin/restic"
+    static let setId = UUID(uuidString: "6F9619FF-8B86-D011-B42D-00C04FC964FF")!
+    static let primaryId = UUID(uuidString: "0A1B2C3D-8B86-D011-B42D-00C04FC964FF")!
+    static let secondaryAId = UUID(uuidString: "1B2C3D4E-8B86-D011-B42D-00C04FC964FF")!
+    static let secondaryBId = UUID(uuidString: "2C3D4E5F-8B86-D011-B42D-00C04FC964FF")!
+    static let source = "/Users/test/proj"
+    static let t0 = Date(timeIntervalSince1970: 1_784_000_000) // 2026-07-13T…Z, fixed
+
+    // MARK: Environment
+
+    /// Everything one engine test needs, wired to a temp data dir. Local
+    /// destinations are used throughout so `Reachability` answers from the
+    /// filesystem and every spawned argv in `fake.invocations` is either a
+    /// keychain read or a restic command the engine itself issued.
+    struct Env {
+        let root: URL
+        let paths: AppPaths
+        let clock: TestClock
+        let fake: FakeProcessRunner
+        let runStore: RunStore
+        let stateStore: StateStore
+        let engine: BackupEngine
+        let set: BackupSet
+        let primary: Destination
+        let secondaries: [Destination]
+
+        var resticArgvs: [[String]] {
+            fake.invocations.map(\.argv).filter { $0.first == BackupEngineTests.resticPath }
+        }
+
+        var indexEntries: [RunIndexEntry] {
+            ((try? runStore.recentRuns(limit: 1000)) ?? []).reversed()
+        }
+
+        func entries(kind: RunKind) -> [RunIndexEntry] {
+            indexEntries.filter { $0.kind == kind }
+        }
+
+        func repoStatus(_ destination: Destination) -> RepoStatus? {
+            stateStore.readRepoStatus(destId: destination.id)
+        }
+
+        func log(runId: String) -> String {
+            (try? String(contentsOf: paths.runLogFile(runId: runId), encoding: .utf8)) ?? ""
+        }
+
+        func cleanUp() {
+            try? FileManager.default.removeItem(at: root)
+        }
+    }
+
+    /// - Parameters:
+    ///   - reachableSecondaries: one flag per secondary; an unreachable one
+    ///     simply has no repository directory on disk.
+    static func makeEnv(
+        script: [FakeProcessRunner.Expectation],
+        retention: RetentionPolicy? = RetentionPolicy(keepLast: 3),
+        checkPolicy: CheckPolicy? = nil,
+        primaryReachable: Bool = true,
+        reachableSecondaries: [Bool] = [true, true],
+        startingAt: Date = t0,
+        onSpawn: (@Sendable ([String]) -> Void)? = nil
+    ) -> Env {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-engine-\(UUID().uuidString)", isDirectory: true)
+        let repos = root.appendingPathComponent("repos", isDirectory: true)
+        try? FileManager.default.createDirectory(at: repos, withIntermediateDirectories: true)
+
+        func repo(_ name: String, exists: Bool) -> String {
+            let url = repos.appendingPathComponent(name, isDirectory: true)
+            if exists {
+                try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+            }
+            return url.path
+        }
+
+        let primary = Destination(
+            id: primaryId,
+            label: "Primary",
+            repoURL: repo("primary", exists: primaryReachable),
+            isPrimary: true
+        )
+        let secondaryIds = [secondaryAId, secondaryBId]
+        let secondaries = reachableSecondaries.enumerated().map { index, reachable in
+            Destination(
+                id: secondaryIds[index],
+                label: "Mirror \(index + 1)",
+                repoURL: repo("secondary-\(index)", exists: reachable),
+                isPrimary: false
+            )
+        }
+
+        let set = BackupSet(
+            id: setId,
+            name: "Projects",
+            sources: [source],
+            schedule: .daily(hour: 2, minute: 30),
+            retention: retention,
+            checkPolicy: checkPolicy,
+            destinations: [primary] + secondaries
+        )
+        let config = AppConfig(resticPath: resticPath, sets: [set])
+
+        let paths = AppPaths(root: root)
+        let clock = TestClock(startingAt)
+        let fake = FakeProcessRunner(script: script)
+        let processRunner: ProcessRunning = onSpawn.map {
+            ObservingProcessRunner(inner: fake, onSpawn: $0)
+        } ?? fake
+        let keychain = KeychainClient(runner: processRunner)
+        let restic = ResticRunner(
+            resticPath: resticPath,
+            paths: paths,
+            keychain: keychain,
+            runner: processRunner
+        )
+        let runStore = RunStore(paths: paths, now: clock.now)
+        let stateStore = StateStore(paths: paths)
+
+        let engine = BackupEngine(
+            config: config,
+            paths: paths,
+            restic: restic,
+            keychain: keychain,
+            runStore: runStore,
+            stateStore: stateStore,
+            reachability: Reachability(restic: restic),
+            now: clock.now
+        )
+
+        return Env(
+            root: root,
+            paths: paths,
+            clock: clock,
+            fake: fake,
+            runStore: runStore,
+            stateStore: stateStore,
+            engine: engine,
+            set: set,
+            primary: primary,
+            secondaries: secondaries
+        )
+    }
+
+    // MARK: Scripting helpers
+
+    static func securityRead(_ account: String) -> [String] {
+        ["/usr/bin/security", "find-generic-password", "-s", "restic-station", "-a", account]
+    }
+
+    /// The engine's own step-1 pre-flight read (and every other
+    /// `keychainAvailable` read): one `find-generic-password` per destination.
+    static func keychainPassword(_ id: UUID, exitCode: Int32 = 0) -> FakeProcessRunner.Expectation {
+        .init(
+            argvPrefix: securityRead(id.uuidString.lowercased()),
+            stdoutLines: exitCode == 0 ? ["repo-password"] : [],
+            stderr: exitCode == 0 ? "" : "SecKeychainSearchCopyNext: User interaction is not allowed.",
+            exitCode: exitCode
+        )
+    }
+
+    static func keychainEnv(_ id: UUID) -> FakeProcessRunner.Expectation {
+        .init(argvPrefix: securityRead("\(id.uuidString.lowercased())-env"), exitCode: 44)
+    }
+
+    /// The keychain reads `ResticRunner` performs before one spawn: the
+    /// destination pre-flight, the from-destination pre-flight (copy /
+    /// init --from-repo only), then the secret-env blobs (from-destination
+    /// first, destination last — see `ResticRunner.environment(for:)`).
+    static func keychainReads(dest: UUID, from: UUID? = nil) -> [FakeProcessRunner.Expectation] {
+        guard let from else {
+            return [keychainPassword(dest), keychainEnv(dest)]
+        }
+        return [keychainPassword(dest), keychainPassword(from), keychainEnv(from), keychainEnv(dest)]
+    }
+
+    /// One scripted restic spawn: the keychain reads it triggers, then the
+    /// reply itself. `argv` is matched in full (prefix == whole argv).
+    static func resticCall(
+        _ argv: [String],
+        dest: UUID,
+        from: UUID? = nil,
+        stdoutLines: [String] = [],
+        stderr: String = "",
+        exitCode: Int32 = 0
+    ) -> [FakeProcessRunner.Expectation] {
+        keychainReads(dest: dest, from: from) + [
+            .init(
+                argvPrefix: [resticPath] + argv,
+                stdoutLines: stdoutLines,
+                stderr: stderr,
+                exitCode: exitCode
+            ),
+        ]
+    }
+
+    static func backupArgv(_ repo: String) -> [String] {
+        ["-r", repo, "backup", "--json", source]
+    }
+
+    static func copyArgv(to secondary: String, from primary: String) -> [String] {
+        ["-r", secondary, "copy", "--from-repo", primary]
+    }
+
+    static func forgetArgv(_ repo: String, keepLast: Int = 3) -> [String] {
+        ["-r", repo, "forget", "--json", "--keep-last", String(keepLast), "--prune"]
+    }
+
+    static func backupStream() -> [String] {
+        (try? FixtureLoader.lines("backup.ndjson")) ?? []
+    }
+
+    // MARK: - Row 1 — happy path
+
+    @Test("row 1: primary + 2 reachable secondaries + retention → backup, 2 copies, 3 prunes, one group")
+    func rowOneHappyPath() async throws {
+        var script = [Self.keychainPassword(Self.primaryId)]
+        let env = Self.makeEnv(script: [])
+        defer { env.cleanUp() }
+        let primaryRepo = env.primary.repoURL
+        let secA = env.secondaries[0].repoURL
+        let secB = env.secondaries[1].repoURL
+
+        script += Self.resticCall(
+            Self.backupArgv(primaryRepo), dest: Self.primaryId, stdoutLines: Self.backupStream()
+        )
+        script += Self.resticCall(
+            Self.copyArgv(to: secA, from: primaryRepo), dest: Self.secondaryAId, from: Self.primaryId
+        )
+        script += Self.resticCall(Self.forgetArgv(secA), dest: Self.secondaryAId)
+        script += Self.resticCall(
+            Self.copyArgv(to: secB, from: primaryRepo), dest: Self.secondaryBId, from: Self.primaryId
+        )
+        script += Self.resticCall(Self.forgetArgv(secB), dest: Self.secondaryBId)
+        script += Self.resticCall(Self.forgetArgv(primaryRepo), dest: Self.primaryId)
+        env.fake.script = script
+
+        let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
+
+        // Exact spawned restic argv sequence. NOTE the interleaving: T09
+        // step 6 applies retention to a secondary immediately after that
+        // secondary's copy succeeds; `docs/testing.md`'s row-1 shorthand
+        // ("copy ×2 → forget ×3") groups by command type, which is not the
+        // order the normative step-6 text describes.
+        #expect(env.resticArgvs == [
+            [Self.resticPath] + Self.backupArgv(primaryRepo),
+            [Self.resticPath] + Self.copyArgv(to: secA, from: primaryRepo),
+            [Self.resticPath] + Self.forgetArgv(secA),
+            [Self.resticPath] + Self.copyArgv(to: secB, from: primaryRepo),
+            [Self.resticPath] + Self.forgetArgv(secB),
+            [Self.resticPath] + Self.forgetArgv(primaryRepo),
+        ])
+
+        guard case .completed(let status, let groupId, let children) = outcome else {
+            Issue.record("expected .completed, got \(outcome)")
+            return
+        }
+        #expect(status == .success)
+        #expect(children.count == 6)
+
+        let entries = env.indexEntries
+        #expect(entries.count == 6)
+        #expect(entries.map(\.kind) == [.backup, .copy, .prune, .copy, .prune, .prune])
+        #expect(entries.allSatisfy { $0.status == .success })
+        #expect(entries.allSatisfy { $0.groupId == groupId })
+        #expect(entries.allSatisfy { $0.trigger == .scheduled })
+        #expect(entries[0].runId == groupId, "groupId is the primary backup's runId")
+        #expect(entries[0].snapshotId?.hasPrefix("e9ffc5cb") == true)
+
+        // lastSyncedAt updated for all three destinations.
+        for destination in [env.primary] + env.secondaries {
+            #expect(env.repoStatus(destination)?.lastSyncedAt == Self.t0)
+            #expect(env.repoStatus(destination)?.reachable == true)
+        }
+        // current-run deleted when the group finished.
+        #expect(env.stateStore.readCurrentRun(setId: Self.setId) == nil)
+        #expect(env.stateStore.readScheduleState()?.sets[Self.setId]?.lastBackupStart == Self.t0)
+    }
+
+    // MARK: - Row 2 — primary unreachable
+
+    @Test("row 2: primary unreachable → failed backup record, no restic at all, lastBackupStart still updated")
+    func rowTwoPrimaryUnreachable() async throws {
+        let env = Self.makeEnv(
+            script: [Self.keychainPassword(Self.primaryId)],
+            primaryReachable: false
+        )
+        defer { env.cleanUp() }
+
+        let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
+
+        #expect(env.resticArgvs.isEmpty, "no restic child may be spawned once the primary probe fails")
+        guard case .completed(let status, _, let children) = outcome else {
+            Issue.record("expected .completed, got \(outcome)")
+            return
+        }
+        #expect(status == .failed)
+        #expect(children.count == 1)
+
+        let entries = env.indexEntries
+        #expect(entries.count == 1)
+        #expect(entries[0].kind == .backup)
+        #expect(entries[0].status == .failed)
+        #expect(entries[0].errorSummary?.contains("primary unreachable") == true)
+        #expect(env.entries(kind: .copy).isEmpty)
+        #expect(env.entries(kind: .prune).isEmpty)
+
+        // Attempt semantics: the attempt counts even though it failed.
+        #expect(env.stateStore.readScheduleState()?.sets[Self.setId]?.lastBackupStart == Self.t0)
+        #expect(env.repoStatus(env.primary)?.reachable == false)
+        #expect(env.stateStore.readCurrentRun(setId: Self.setId) == nil)
+    }
+
+    // MARK: - Row 3 — secondary offline
+
+    @Test("row 3: offline secondary gets no run record, only repo-status; its old lastSyncedAt survives")
+    func rowThreeSecondaryOffline() async throws {
+        let env = Self.makeEnv(script: [], reachableSecondaries: [false, true])
+        defer { env.cleanUp() }
+        let offline = env.secondaries[0]
+        let online = env.secondaries[1]
+
+        // Seed a stale lastSyncedAt for the offline mirror: staleness must be
+        // computed from it, so the engine must not clear or overwrite it.
+        let staleSync = Self.t0.addingTimeInterval(-30 * 24 * 3600)
+        try env.stateStore.updateRepoStatus(destId: offline.id) { status in
+            status.reachable = true
+            status.lastSyncedAt = staleSync
+        }
+
+        var script = [Self.keychainPassword(Self.primaryId)]
+        script += Self.resticCall(
+            Self.backupArgv(env.primary.repoURL), dest: Self.primaryId, stdoutLines: Self.backupStream()
+        )
+        script += Self.resticCall(
+            Self.copyArgv(to: online.repoURL, from: env.primary.repoURL),
+            dest: Self.secondaryBId,
+            from: Self.primaryId
+        )
+        script += Self.resticCall(Self.forgetArgv(online.repoURL), dest: Self.secondaryBId)
+        script += Self.resticCall(Self.forgetArgv(env.primary.repoURL), dest: Self.primaryId)
+        env.fake.script = script
+
+        let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
+
+        #expect(env.resticArgvs == [
+            [Self.resticPath] + Self.backupArgv(env.primary.repoURL),
+            [Self.resticPath] + Self.copyArgv(to: online.repoURL, from: env.primary.repoURL),
+            [Self.resticPath] + Self.forgetArgv(online.repoURL),
+            [Self.resticPath] + Self.forgetArgv(env.primary.repoURL),
+        ])
+        guard case .completed(let status, _, _) = outcome else {
+            Issue.record("expected .completed, got \(outcome)")
+            return
+        }
+        #expect(status == .success)
+
+        // No run record of any kind mentions the offline destination.
+        #expect(env.indexEntries.allSatisfy { $0.destId != offline.id })
+        let offlineStatus = try #require(env.repoStatus(offline))
+        #expect(offlineStatus.reachable == false)
+        #expect(offlineStatus.lastSyncedAt == staleSync, "staleness still derives from the old sync time")
+        #expect(env.repoStatus(online)?.lastSyncedAt == Self.t0)
+    }
+
+    // MARK: - Row 4 — backup exit 3
+
+    @Test("row 4: backup exit 3 is a warning and the copy still runs (the snapshot exists)")
+    func rowFourExitThreeWarning() async throws {
+        let env = Self.makeEnv(script: [], retention: nil, reachableSecondaries: [true])
+        defer { env.cleanUp() }
+        let secondary = env.secondaries[0]
+
+        var script = [Self.keychainPassword(Self.primaryId)]
+        script += Self.resticCall(
+            Self.backupArgv(env.primary.repoURL),
+            dest: Self.primaryId,
+            stdoutLines: Self.backupStream(),
+            stderr: "error: lstat /Users/test/proj/secret: permission denied",
+            exitCode: 3
+        )
+        script += Self.resticCall(
+            Self.copyArgv(to: secondary.repoURL, from: env.primary.repoURL),
+            dest: Self.secondaryAId,
+            from: Self.primaryId
+        )
+        env.fake.script = script
+
+        let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
+
+        guard case .completed(let status, _, let children) = outcome else {
+            Issue.record("expected .completed, got \(outcome)")
+            return
+        }
+        #expect(status == .warning, "worst child status: warning (backup) vs success (copy)")
+        #expect(children.map(\.status) == [.warning, .success])
+        #expect(env.entries(kind: .backup).first?.status == .warning)
+        #expect(env.entries(kind: .copy).first?.status == .success)
+        #expect(env.repoStatus(env.primary)?.lastSyncedAt == Self.t0, "exit 3 still produced a snapshot")
+    }
+
+    // MARK: - Row 5 — backup exit 1
+
+    @Test("row 5: backup exit 1 stops the sequence — no copies, no retention")
+    func rowFiveExitOneStops() async throws {
+        let env = Self.makeEnv(script: [])
+        defer { env.cleanUp() }
+
+        var script = [Self.keychainPassword(Self.primaryId)]
+        script += Self.resticCall(
+            Self.backupArgv(env.primary.repoURL),
+            dest: Self.primaryId,
+            stderr: "Fatal: unable to open repository",
+            exitCode: 1
+        )
+        env.fake.script = script
+
+        let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
+
+        #expect(env.resticArgvs == [[Self.resticPath] + Self.backupArgv(env.primary.repoURL)])
+        guard case .completed(let status, _, let children) = outcome else {
+            Issue.record("expected .completed, got \(outcome)")
+            return
+        }
+        #expect(status == .failed)
+        #expect(children.count == 1)
+        #expect(env.entries(kind: .backup).first?.status == .failed)
+        #expect(env.entries(kind: .copy).isEmpty)
+        #expect(env.entries(kind: .prune).isEmpty)
+        #expect(env.repoStatus(env.primary)?.lastSyncedAt == nil)
+        #expect(env.stateStore.readCurrentRun(setId: Self.setId) == nil, "current-run cleared on the failure path too")
+    }
+
+    // MARK: - Row 6 / Row 12 — copy failure isolates that mirror
+
+    @Test("rows 6+12: a failed copy is recorded, its mirror is never forgotten, the other mirror proceeds")
+    func rowSixCopyFailureIsolated() async throws {
+        let env = Self.makeEnv(script: [])
+        defer { env.cleanUp() }
+        let failing = env.secondaries[0]
+        let healthy = env.secondaries[1]
+
+        var script = [Self.keychainPassword(Self.primaryId)]
+        script += Self.resticCall(
+            Self.backupArgv(env.primary.repoURL), dest: Self.primaryId, stdoutLines: Self.backupStream()
+        )
+        script += Self.resticCall(
+            Self.copyArgv(to: failing.repoURL, from: env.primary.repoURL),
+            dest: Self.secondaryAId,
+            from: Self.primaryId,
+            stderr: "Fatal: unable to open repository",
+            exitCode: 1
+        )
+        script += Self.resticCall(
+            Self.copyArgv(to: healthy.repoURL, from: env.primary.repoURL),
+            dest: Self.secondaryBId,
+            from: Self.primaryId
+        )
+        script += Self.resticCall(Self.forgetArgv(healthy.repoURL), dest: Self.secondaryBId)
+        script += Self.resticCall(Self.forgetArgv(env.primary.repoURL), dest: Self.primaryId)
+        env.fake.script = script
+
+        let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
+
+        // SAFETY: no forget argv anywhere targets the mirror whose copy failed.
+        let forgets = env.resticArgvs.filter { $0.contains("forget") }
+        #expect(forgets.allSatisfy { !$0.contains(failing.repoURL) })
+        #expect(forgets.count == 2)
+
+        guard case .completed(let status, _, _) = outcome else {
+            Issue.record("expected .completed, got \(outcome)")
+            return
+        }
+        // T09 step 8 is literal: group outcome = worst child status, and a
+        // failed copy child is `.failed`. (`docs/testing.md` row 6 says the
+        // group is "shown as warning" — that is a UI-presentation statement:
+        // the primary snapshot exists, only a mirror lagged.)
+        #expect(status == .failed)
+        #expect(env.entries(kind: .backup).first?.status == .success)
+
+        let copies = env.entries(kind: .copy)
+        #expect(copies.count == 2)
+        #expect(copies.first(where: { $0.destId == failing.id })?.status == .failed)
+        #expect(copies.first(where: { $0.destId == healthy.id })?.status == .success)
+
+        #expect(env.repoStatus(failing)?.lastSyncedAt == nil, "a failed copy must not refresh lastSyncedAt")
+        #expect(env.repoStatus(healthy)?.lastSyncedAt == Self.t0)
+        #expect(env.entries(kind: .prune).allSatisfy { $0.destId != failing.id })
+    }
+
+    // MARK: - Row 7 — repo locked, stale lock
+
+    @Test("row 7: exit 11 → unlock → exactly one retry that succeeds; the log holds both attempts")
+    func rowSevenLockedStale() async throws {
+        let env = Self.makeEnv(script: [], retention: nil, reachableSecondaries: [])
+        defer { env.cleanUp() }
+        let lockedError = (try? FixtureLoader.string("locked-error.json").trimmingCharacters(in: .newlines)) ?? ""
+
+        var script = [Self.keychainPassword(Self.primaryId)]
+        script += Self.resticCall(
+            Self.backupArgv(env.primary.repoURL),
+            dest: Self.primaryId,
+            stdoutLines: [lockedError],
+            exitCode: 11
+        )
+        script += Self.resticCall(
+            ["-r", env.primary.repoURL, "unlock"],
+            dest: Self.primaryId,
+            stdoutLines: ["successfully removed 1 locks"]
+        )
+        script += Self.resticCall(
+            Self.backupArgv(env.primary.repoURL), dest: Self.primaryId, stdoutLines: Self.backupStream()
+        )
+        env.fake.script = script
+
+        let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
+
+        #expect(env.resticArgvs == [
+            [Self.resticPath] + Self.backupArgv(env.primary.repoURL),
+            [Self.resticPath, "-r", env.primary.repoURL, "unlock"],
+            [Self.resticPath] + Self.backupArgv(env.primary.repoURL),
+        ])
+        guard case .completed(let status, let groupId, let children) = outcome else {
+            Issue.record("expected .completed, got \(outcome)")
+            return
+        }
+        #expect(status == .success)
+        #expect(children.count == 1, "the retry is part of the same run record, not a second one")
+
+        let log = env.log(runId: groupId)
+        #expect(log.contains("repository is already locked"), "attempt 1's raw output")
+        #expect(log.contains("successfully removed 1 locks"), "the unlock child's raw output")
+        #expect(log.contains("retrying after unlock"))
+        #expect(log.contains("\"message_type\":\"summary\""), "attempt 2's raw output")
+    }
+
+    // MARK: - Row 8 — repo locked, live lock
+
+    @Test("row 8: still locked after unlock + retry → failed, and no third attempt")
+    func rowEightLockedLive() async throws {
+        let env = Self.makeEnv(script: [], retention: nil, reachableSecondaries: [])
+        defer { env.cleanUp() }
+
+        var script = [Self.keychainPassword(Self.primaryId)]
+        script += Self.resticCall(
+            Self.backupArgv(env.primary.repoURL), dest: Self.primaryId, exitCode: 11
+        )
+        script += Self.resticCall(["-r", env.primary.repoURL, "unlock"], dest: Self.primaryId)
+        script += Self.resticCall(
+            Self.backupArgv(env.primary.repoURL), dest: Self.primaryId, exitCode: 11
+        )
+        env.fake.script = script
+
+        let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
+
+        #expect(env.resticArgvs.count == 3, "exactly one retry — never a loop")
+        guard case .completed(let status, _, _) = outcome else {
+            Issue.record("expected .completed, got \(outcome)")
+            return
+        }
+        #expect(status == .failed)
+        let backup = try #require(env.entries(kind: .backup).first)
+        #expect(backup.status == .failed)
+        #expect(backup.errorSummary?.contains("locked") == true)
+    }
+
+    // MARK: - Row 9 — keychain locked pre-flight (safety: no trace at all)
+
+    @Test("row 9: a locked keychain leaves NO run record, NO lastBackupStart, NO lock file")
+    func rowNineKeychainLocked() async throws {
+        let env = Self.makeEnv(script: [Self.keychainPassword(Self.primaryId, exitCode: 1)])
+        defer { env.cleanUp() }
+
+        let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
+
+        guard case .retryable = outcome else {
+            Issue.record("expected .retryable, got \(outcome)")
+            return
+        }
+        // Exactly one process was ever spawned: the pre-flight read itself.
+        #expect(env.fake.invocations.count == 1)
+        #expect(env.fake.invocations[0].argv == Self.securityRead(Self.primaryId.uuidString.lowercased()) + ["-w"])
+        #expect(env.indexEntries.isEmpty)
+        #expect(env.stateStore.readScheduleState() == nil, "no schedule-state write at all")
+        #expect(
+            !FileManager.default.fileExists(atPath: env.paths.setLockFile(setId: Self.setId).path),
+            "the set lock must not even be created before the pre-flight passes"
+        )
+        #expect(env.stateStore.readCurrentRun(setId: Self.setId) == nil)
+    }
+
+    // MARK: - Row 10 — set lock busy
+
+    @Test("row 10: set lock busy → one .skipped record and nothing else (no lastBackupStart)")
+    func rowTenLockBusy() async throws {
+        let env = Self.makeEnv(script: [Self.keychainPassword(Self.primaryId)])
+        defer { env.cleanUp() }
+        try env.paths.ensureDirectories()
+
+        // A separate FileLock (separate open file description) genuinely
+        // contends, even in-process — see FileLock's documentation.
+        let holder = FileLock(path: env.paths.setLockFile(setId: Self.setId))
+        #expect(holder.tryAcquire())
+        defer { holder.release() }
+
+        let outcome = await env.engine.runSet(env.set, trigger: .manual)
+
+        #expect(outcome == .skipped)
+        #expect(env.resticArgvs.isEmpty)
+        let entries = env.indexEntries
+        #expect(entries.count == 1)
+        #expect(entries[0].kind == .backup)
+        #expect(entries[0].status == .skipped)
+        #expect(entries[0].trigger == .manual)
+        #expect(
+            env.stateStore.readScheduleState()?.sets[Self.setId]?.lastBackupStart == nil,
+            "step 3 happens after the lock is taken — a busy lock must not consume the schedule slot"
+        )
+    }
+
+    // MARK: - Row 11 — empty / absent retention
+
+    @Test(
+        "row 11: forget is never invoked without a non-empty retention policy",
+        arguments: [nil, RetentionPolicy()] as [RetentionPolicy?]
+    )
+    func rowElevenEmptyRetention(retention: RetentionPolicy?) async throws {
+        let env = Self.makeEnv(script: [], retention: retention, reachableSecondaries: [true])
+        defer { env.cleanUp() }
+        let secondary = env.secondaries[0]
+
+        var script = [Self.keychainPassword(Self.primaryId)]
+        script += Self.resticCall(
+            Self.backupArgv(env.primary.repoURL), dest: Self.primaryId, stdoutLines: Self.backupStream()
+        )
+        script += Self.resticCall(
+            Self.copyArgv(to: secondary.repoURL, from: env.primary.repoURL),
+            dest: Self.secondaryAId,
+            from: Self.primaryId
+        )
+        env.fake.script = script
+
+        let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
+
+        #expect(env.resticArgvs.allSatisfy { !$0.contains("forget") })
+        #expect(env.entries(kind: .prune).isEmpty)
+        guard case .completed(let status, _, let children) = outcome else {
+            Issue.record("expected .completed, got \(outcome)")
+            return
+        }
+        #expect(status == .success)
+        #expect(children.map(\.kind) == [.backup, .copy])
+    }
+
+    // MARK: - Safety invariant: forget never targets an un-copied mirror
+
+    @Test("safety: a mirror whose copy failed is never a forget target, even as the only secondary")
+    func forgetNeverTargetsFailedCopy() async throws {
+        let env = Self.makeEnv(script: [], reachableSecondaries: [true])
+        defer { env.cleanUp() }
+        let secondary = env.secondaries[0]
+
+        var script = [Self.keychainPassword(Self.primaryId)]
+        script += Self.resticCall(
+            Self.backupArgv(env.primary.repoURL), dest: Self.primaryId, stdoutLines: Self.backupStream()
+        )
+        script += Self.resticCall(
+            Self.copyArgv(to: secondary.repoURL, from: env.primary.repoURL),
+            dest: Self.secondaryAId,
+            from: Self.primaryId,
+            exitCode: 1
+        )
+        script += Self.resticCall(Self.forgetArgv(env.primary.repoURL), dest: Self.primaryId)
+        env.fake.script = script
+
+        _ = await env.engine.runSet(env.set, trigger: .scheduled)
+
+        #expect(env.resticArgvs == [
+            [Self.resticPath] + Self.backupArgv(env.primary.repoURL),
+            [Self.resticPath] + Self.copyArgv(to: secondary.repoURL, from: env.primary.repoURL),
+            [Self.resticPath] + Self.forgetArgv(env.primary.repoURL),
+        ])
+    }
+
+    // MARK: - Safety invariant: every child's raw output reaches the run log
+
+    @Test("safety: stdout AND stderr of every restic child land in that run's log")
+    func rawOutputAlwaysLogged() async throws {
+        let env = Self.makeEnv(script: [], retention: nil, reachableSecondaries: [])
+        defer { env.cleanUp() }
+
+        var script = [Self.keychainPassword(Self.primaryId)]
+        script += Self.resticCall(
+            Self.backupArgv(env.primary.repoURL),
+            dest: Self.primaryId,
+            stdoutLines: Self.backupStream(),
+            stderr: "warning: could not read /Users/test/proj/socket",
+            exitCode: 3
+        )
+        env.fake.script = script
+
+        let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
+        guard case .completed(_, let groupId, _) = outcome else {
+            Issue.record("expected .completed, got \(outcome)")
+            return
+        }
+
+        let log = env.log(runId: groupId)
+        #expect(log.contains("$ \(Self.resticPath) -r \(env.primary.repoURL) backup --json \(Self.source)"))
+        for line in Self.backupStream() {
+            #expect(log.contains(line))
+        }
+        #expect(log.contains("warning: could not read /Users/test/proj/socket"))
+    }
+
+    // MARK: - current-run lifecycle + throttling
+
+    @Test("current-run is live during the run (phase per child) and deleted afterwards")
+    func currentRunLifecycle() async throws {
+        // Captured at the moment each restic child is spawned.
+        final class Observed: @unchecked Sendable {
+            let lock = NSLock()
+            var states: [(argv: [String], state: CurrentRunState?)] = []
+        }
+        let observed = Observed()
+        let statesBox = observed
+
+        let paths = Box<AppPaths?>(nil)
+        let env = Self.makeEnv(
+            script: [],
+            reachableSecondaries: [true],
+            onSpawn: { argv in
+                guard argv.first == Self.resticPath, let paths = paths.value else { return }
+                let state = StateStore(paths: paths).readCurrentRun(setId: Self.setId)
+                statesBox.lock.lock()
+                statesBox.states.append((argv, state))
+                statesBox.lock.unlock()
+            }
+        )
+        paths.value = env.paths
+        defer { env.cleanUp() }
+        let secondary = env.secondaries[0]
+
+        var script = [Self.keychainPassword(Self.primaryId)]
+        script += Self.resticCall(
+            Self.backupArgv(env.primary.repoURL), dest: Self.primaryId, stdoutLines: Self.backupStream()
+        )
+        script += Self.resticCall(
+            Self.copyArgv(to: secondary.repoURL, from: env.primary.repoURL),
+            dest: Self.secondaryAId,
+            from: Self.primaryId
+        )
+        script += Self.resticCall(Self.forgetArgv(secondary.repoURL), dest: Self.secondaryAId)
+        script += Self.resticCall(Self.forgetArgv(env.primary.repoURL), dest: Self.primaryId)
+        env.fake.script = script
+
+        let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
+        guard case .completed(let status, let groupId, _) = outcome else {
+            Issue.record("expected .completed, got \(outcome)")
+            return
+        }
+        #expect(status == .success)
+
+        let phases = observed.states.map { $0.state?.phase }
+        #expect(phases == [
+            "backing-up-primary",
+            "copying-\(secondary.id.uuidString)",
+            "retention",
+            "retention",
+        ])
+        #expect(observed.states.first?.state?.runId == groupId)
+        // …and gone once the group finished.
+        #expect(env.stateStore.readCurrentRun(setId: Self.setId) == nil)
+    }
+
+    @Test("progress writes are throttled to at most one per 1.5 s (injected clock)")
+    func progressThrottling() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-throttle-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = AppPaths(root: root)
+        let stateStore = StateStore(paths: paths)
+        let clock = TestClock(Self.t0)
+        let reporter = ProgressReporter(
+            stateStore: stateStore,
+            setId: Self.setId,
+            runId: "20260713T000000Z-backup-6f9619ff",
+            kind: .backup,
+            phase: "backing-up-primary",
+            now: clock.now
+        )
+
+        func status(_ percent: Double) -> BackupStatus {
+            let line = "{\"message_type\":\"status\",\"percent_done\":\(percent),\"bytes_done\":10}"
+            guard case .status(let value) = ResticMessageDecoder().decodeLine(line) else {
+                fatalError("fixture-shaped status line failed to decode")
+            }
+            return value
+        }
+
+        // A flood of ten status lines inside one 1.5 s window: only the first
+        // reaches disk.
+        for index in 1...10 {
+            reporter.record(status(Double(index) / 10))
+        }
+        #expect(stateStore.readCurrentRun(setId: Self.setId)?.percentDone == 0.1)
+        #expect(stateStore.readCurrentRun(setId: Self.setId)?.updatedAt == Self.t0)
+
+        // Still inside the window (1.4 s) — still throttled.
+        clock.advance(1.4)
+        reporter.record(status(0.5))
+        #expect(stateStore.readCurrentRun(setId: Self.setId)?.percentDone == 0.1)
+
+        // Past the window — the next status lands.
+        clock.advance(0.1)
+        reporter.record(status(0.7))
+        #expect(stateStore.readCurrentRun(setId: Self.setId)?.percentDone == 0.7)
+        #expect(stateStore.readCurrentRun(setId: Self.setId)?.updatedAt == Self.t0.addingTimeInterval(1.5))
+    }
+
+    @Test("shouldWriteProgress: first write allowed, window enforced, backwards clock does not stall")
+    func throttlePredicate() {
+        #expect(BackupEngine.shouldWriteProgress(lastWriteAt: nil, now: Self.t0))
+        #expect(!BackupEngine.shouldWriteProgress(lastWriteAt: Self.t0, now: Self.t0.addingTimeInterval(1.49)))
+        #expect(BackupEngine.shouldWriteProgress(lastWriteAt: Self.t0, now: Self.t0.addingTimeInterval(1.5)))
+        #expect(BackupEngine.shouldWriteProgress(lastWriteAt: Self.t0, now: Self.t0.addingTimeInterval(-60)))
+    }
+
+    // MARK: - Worst-status aggregation
+
+    @Test("worstStatus picks failed > warning > success > skipped")
+    func worstStatusAggregation() {
+        #expect(BackupEngine.worstStatus([]) == .success)
+        #expect(BackupEngine.worstStatus([.success, .success]) == .success)
+        #expect(BackupEngine.worstStatus([.success, .warning]) == .warning)
+        #expect(BackupEngine.worstStatus([.warning, .failed, .success]) == .failed)
+        #expect(BackupEngine.worstStatus([.skipped, .success]) == .success)
+    }
+
+    // MARK: - Manual trigger
+
+    @Test("a manual run also consumes the schedule slot and records trigger=manual")
+    func manualRunUpdatesLastBackupStart() async throws {
+        let env = Self.makeEnv(script: [], retention: nil, reachableSecondaries: [])
+        defer { env.cleanUp() }
+
+        var script = [Self.keychainPassword(Self.primaryId)]
+        script += Self.resticCall(
+            Self.backupArgv(env.primary.repoURL), dest: Self.primaryId, stdoutLines: Self.backupStream()
+        )
+        env.fake.script = script
+
+        _ = await env.engine.runSet(env.set, trigger: .manual)
+
+        #expect(env.stateStore.readScheduleState()?.sets[Self.setId]?.lastBackupStart == Self.t0)
+        #expect(env.entries(kind: .backup).first?.trigger == .manual)
+    }
+
+    // MARK: - runCheck
+
+    @Test("runCheck: slice rotation from the cursor, cursor persisted on success")
+    func checkAdvancesCursorOnSuccess() async throws {
+        let env = Self.makeEnv(
+            script: [],
+            checkPolicy: CheckPolicy(enabled: true, readDataSubsetSlices: 20),
+            reachableSecondaries: []
+        )
+        defer { env.cleanUp() }
+        try env.stateStore.updateScheduleState(setId: Self.setId) { state in
+            state.checkSliceCursor = 7
+            state.checkCount = 1
+        }
+
+        var script = [Self.keychainPassword(Self.primaryId)]
+        script += Self.resticCall(
+            ["-r", env.primary.repoURL, "check", "--read-data-subset=8/20"],
+            dest: Self.primaryId,
+            stdoutLines: ["no errors were found"]
+        )
+        env.fake.script = script
+
+        let status = await env.engine.runCheck(env.set)
+
+        #expect(status == .success)
+        #expect(env.resticArgvs == [
+            [Self.resticPath, "-r", env.primary.repoURL, "check", "--read-data-subset=8/20"],
+        ])
+        let state = try #require(env.stateStore.readScheduleState()?.sets[Self.setId])
+        #expect(state.checkSliceCursor == 8)
+        #expect(state.checkCount == 2)
+        #expect(state.lastCheckStart == Self.t0)
+        let entry = try #require(env.entries(kind: .check).first)
+        #expect(entry.status == .success)
+        #expect(entry.destId == Self.primaryId)
+        #expect(env.stateStore.readCurrentRun(setId: Self.setId) == nil)
+    }
+
+    @Test("safety: a failed check does NOT advance checkSliceCursor")
+    func checkDoesNotAdvanceCursorOnFailure() async throws {
+        let env = Self.makeEnv(
+            script: [],
+            checkPolicy: CheckPolicy(enabled: true, readDataSubsetSlices: 20),
+            reachableSecondaries: []
+        )
+        defer { env.cleanUp() }
+        try env.stateStore.updateScheduleState(setId: Self.setId) { state in
+            state.checkSliceCursor = 7
+            state.checkCount = 1
+        }
+
+        var script = [Self.keychainPassword(Self.primaryId)]
+        script += Self.resticCall(
+            ["-r", env.primary.repoURL, "check", "--read-data-subset=8/20"],
+            dest: Self.primaryId,
+            stderr: "Fatal: repository contains errors",
+            exitCode: 1
+        )
+        env.fake.script = script
+
+        let status = await env.engine.runCheck(env.set)
+
+        #expect(status == .failed)
+        let state = try #require(env.stateStore.readScheduleState()?.sets[Self.setId])
+        #expect(state.checkSliceCursor == 7, "the same slice must be re-verified next time")
+        #expect(state.checkCount == 1)
+        #expect(state.lastCheckStart == Self.t0, "the attempt still counts for scheduling")
+        #expect(env.entries(kind: .check).first?.status == .failed)
+    }
+
+    @Test("runCheck: every 4th successful check also checks reachable secondaries, structure-only")
+    func checkRotatesToSecondaries() async throws {
+        let env = Self.makeEnv(
+            script: [],
+            checkPolicy: CheckPolicy(enabled: true, readDataSubsetSlices: 20),
+            reachableSecondaries: [true, false]
+        )
+        defer { env.cleanUp() }
+        let reachable = env.secondaries[0]
+        try env.stateStore.updateScheduleState(setId: Self.setId) { state in
+            state.checkSliceCursor = 3
+            state.checkCount = 3 // this run is the 4th
+        }
+
+        var script = [Self.keychainPassword(Self.primaryId)]
+        script += Self.resticCall(
+            ["-r", env.primary.repoURL, "check", "--read-data-subset=4/20"],
+            dest: Self.primaryId,
+            stdoutLines: ["no errors were found"]
+        )
+        script += Self.resticCall(
+            ["-r", reachable.repoURL, "check"],
+            dest: Self.secondaryAId,
+            stdoutLines: ["no errors were found"]
+        )
+        env.fake.script = script
+
+        let status = await env.engine.runCheck(env.set)
+
+        #expect(status == .success)
+        #expect(env.resticArgvs == [
+            [Self.resticPath, "-r", env.primary.repoURL, "check", "--read-data-subset=4/20"],
+            [Self.resticPath, "-r", reachable.repoURL, "check"],
+        ], "secondaries are checked structure-only (no --read-data-subset), and only when reachable")
+
+        let checks = env.entries(kind: .check)
+        #expect(checks.count == 2)
+        #expect(checks.allSatisfy { $0.groupId == checks[0].runId })
+        #expect(env.stateStore.readScheduleState()?.sets[Self.setId]?.checkCount == 4)
+    }
+
+    @Test("runCheck: set lock busy → .skipped record, no restic")
+    func checkLockBusy() async throws {
+        let env = Self.makeEnv(script: [Self.keychainPassword(Self.primaryId)], reachableSecondaries: [])
+        defer { env.cleanUp() }
+        try env.paths.ensureDirectories()
+        let holder = FileLock(path: env.paths.setLockFile(setId: Self.setId))
+        #expect(holder.tryAcquire())
+        defer { holder.release() }
+
+        let status = await env.engine.runCheck(env.set)
+
+        #expect(status == .skipped)
+        #expect(env.resticArgvs.isEmpty)
+        #expect(env.entries(kind: .check).first?.status == .skipped)
+        #expect(env.stateStore.readScheduleState()?.sets[Self.setId]?.lastCheckStart == nil)
+    }
+
+    // MARK: - runPrune
+
+    @Test("runPrune: primary plus only mirrors that are at least as fresh as the primary")
+    func pruneSkipsStaleMirrors() async throws {
+        let env = Self.makeEnv(script: [])
+        defer { env.cleanUp() }
+        let stale = env.secondaries[0]
+        let fresh = env.secondaries[1]
+
+        try env.stateStore.updateRepoStatus(destId: env.primary.id) { $0.lastSyncedAt = Self.t0 }
+        try env.stateStore.updateRepoStatus(destId: stale.id) {
+            $0.lastSyncedAt = Self.t0.addingTimeInterval(-3600)
+        }
+        try env.stateStore.updateRepoStatus(destId: fresh.id) { $0.lastSyncedAt = Self.t0 }
+
+        var script = [Self.keychainPassword(Self.primaryId)]
+        script += Self.resticCall(Self.forgetArgv(env.primary.repoURL), dest: Self.primaryId)
+        script += Self.resticCall(Self.forgetArgv(fresh.repoURL), dest: Self.secondaryBId)
+        env.fake.script = script
+
+        let status = await env.engine.runPrune(env.set)
+
+        #expect(status == .success)
+        #expect(env.stateStore.readCurrentRun(setId: Self.setId) == nil, "live progress is cleared afterwards")
+        // SAFETY: the mirror that is behind the primary is never forgotten.
+        #expect(env.resticArgvs == [
+            [Self.resticPath] + Self.forgetArgv(env.primary.repoURL),
+            [Self.resticPath] + Self.forgetArgv(fresh.repoURL),
+        ])
+        let prunes = env.entries(kind: .prune)
+        #expect(prunes.count == 2)
+        #expect(prunes.allSatisfy { $0.groupId == prunes[0].runId })
+        #expect(prunes.allSatisfy { $0.trigger == .manual })
+        #expect(prunes.allSatisfy { $0.destId != stale.id })
+    }
+
+    @Test("safety: no mirror is pruned when the primary has never completed a backup")
+    func pruneSkipsAllMirrorsWithoutPrimarySync() async throws {
+        let env = Self.makeEnv(script: [])
+        defer { env.cleanUp() }
+        // Mirrors claim a sync time; the primary has none.
+        for secondary in env.secondaries {
+            try env.stateStore.updateRepoStatus(destId: secondary.id) { $0.lastSyncedAt = Self.t0 }
+        }
+
+        var script = [Self.keychainPassword(Self.primaryId)]
+        script += Self.resticCall(Self.forgetArgv(env.primary.repoURL), dest: Self.primaryId)
+        env.fake.script = script
+
+        let status = await env.engine.runPrune(env.set)
+
+        #expect(status == .success)
+        #expect(env.resticArgvs == [[Self.resticPath] + Self.forgetArgv(env.primary.repoURL)])
+    }
+
+    @Test(
+        "safety: runPrune with an empty or absent policy spawns nothing at all",
+        arguments: [nil, RetentionPolicy()] as [RetentionPolicy?]
+    )
+    func pruneRefusesEmptyPolicy(retention: RetentionPolicy?) async throws {
+        let env = Self.makeEnv(script: [], retention: retention)
+        defer { env.cleanUp() }
+
+        let status = await env.engine.runPrune(env.set)
+
+        #expect(status == .skipped)
+        #expect(env.fake.invocations.isEmpty, "not even a keychain read — the guard is the first thing checked")
+        #expect(env.indexEntries.isEmpty)
+    }
+
+    // MARK: - runRestore
+
+    @Test("runRestore: exact argv, .restore record, set lock taken")
+    func restoreHappyPath() async throws {
+        let env = Self.makeEnv(script: [], reachableSecondaries: [true])
+        defer { env.cleanUp() }
+        let target = env.root.appendingPathComponent("restore-target", isDirectory: true).path
+
+        var script = [Self.keychainPassword(Self.primaryId)]
+        script += Self.resticCall(
+            [
+                "-r", env.primary.repoURL, "restore", "--json", "abc123:/proj/src",
+                "--target", target, "--include", "*.txt", "--overwrite", "if-newer",
+            ],
+            dest: Self.primaryId,
+            stdoutLines: (try? FixtureLoader.lines("restore.ndjson")) ?? []
+        )
+        env.fake.script = script
+
+        let status = await env.engine.runRestore(request: RestoreRequest(
+            destId: Self.primaryId,
+            snapshotID: "abc123",
+            subpath: "/proj/src",
+            targetPath: target,
+            includes: ["*.txt"],
+            overwriteMode: .ifNewer
+        ))
+
+        #expect(status == .success)
+        #expect(env.resticArgvs == [[
+            Self.resticPath, "-r", env.primary.repoURL, "restore", "--json", "abc123:/proj/src",
+            "--target", target, "--include", "*.txt", "--overwrite", "if-newer",
+        ]])
+        let entry = try #require(env.entries(kind: .restore).first)
+        #expect(entry.status == .success)
+        #expect(entry.trigger == .manual)
+        #expect(entry.destId == Self.primaryId)
+        #expect(env.stateStore.readCurrentRun(setId: Self.setId) == nil, "live progress is cleared afterwards")
+    }
+
+    @Test("safety: a restore cannot start while the set lock is held by a backup")
+    func restoreRespectsSetLock() async throws {
+        let env = Self.makeEnv(script: [Self.keychainPassword(Self.primaryId)])
+        defer { env.cleanUp() }
+        try env.paths.ensureDirectories()
+        let holder = FileLock(path: env.paths.setLockFile(setId: Self.setId))
+        #expect(holder.tryAcquire())
+        defer { holder.release() }
+
+        let status = await env.engine.runRestore(request: RestoreRequest(
+            destId: Self.primaryId,
+            snapshotID: "abc123",
+            targetPath: "/tmp/target"
+        ))
+
+        #expect(status == .skipped)
+        #expect(env.resticArgvs.isEmpty)
+        #expect(env.entries(kind: .restore).first?.status == .skipped)
+    }
+
+    @Test("runRestore: per-item error messages downgrade an exit-0 restore to .warning")
+    func restoreWithItemErrorsIsWarning() async throws {
+        let env = Self.makeEnv(script: [], reachableSecondaries: [])
+        defer { env.cleanUp() }
+
+        var script = [Self.keychainPassword(Self.primaryId)]
+        script += Self.resticCall(
+            ["-r", env.primary.repoURL, "restore", "--json", "abc123", "--target", "/tmp/target"],
+            dest: Self.primaryId,
+            stdoutLines: [
+                "{\"message_type\":\"error\",\"error\":{\"message\":\"permission denied\"},\"item\":\"/x\"}",
+                "{\"message_type\":\"summary\",\"total_files\":4,\"files_restored\":3,"
+                    + "\"total_bytes\":10,\"bytes_restored\":8}",
+            ]
+        )
+        env.fake.script = script
+
+        let status = await env.engine.runRestore(request: RestoreRequest(
+            destId: Self.primaryId,
+            snapshotID: "abc123",
+            targetPath: "/tmp/target"
+        ))
+
+        #expect(status == .warning)
+        #expect(env.entries(kind: .restore).first?.status == .warning)
+    }
+
+    // MARK: - initSecondary
+
+    @Test("initSecondary: --from-repo + --copy-chunker-params, run record kind .init")
+    func initSecondaryUsesChunkerParams() async throws {
+        let env = Self.makeEnv(script: [], reachableSecondaries: [true])
+        defer { env.cleanUp() }
+        let secondary = env.secondaries[0]
+
+        var script = [Self.keychainPassword(Self.secondaryAId), Self.keychainPassword(Self.primaryId)]
+        script += Self.resticCall(
+            [
+                "-r", secondary.repoURL, "init", "--json",
+                "--from-repo", env.primary.repoURL, "--copy-chunker-params",
+            ],
+            dest: Self.secondaryAId,
+            from: Self.primaryId,
+            stdoutLines: [(try? FixtureLoader.string("init-secondary.json").trimmingCharacters(in: .newlines)) ?? ""]
+        )
+        env.fake.script = script
+
+        let status = await env.engine.initSecondary(env.set, dest: secondary)
+
+        #expect(status == .success)
+        #expect(env.resticArgvs == [[
+            Self.resticPath, "-r", secondary.repoURL, "init", "--json",
+            "--from-repo", env.primary.repoURL, "--copy-chunker-params",
+        ]])
+        let entry = try #require(env.entries(kind: .`init`).first)
+        #expect(entry.status == .success)
+        #expect(entry.destId == secondary.id)
+        #expect(entry.trigger == .manual)
+        #expect(env.repoStatus(secondary)?.reachable == true)
+        #expect(env.repoStatus(secondary)?.lastSyncedAt == nil, "an init is not a sync")
+        #expect(env.stateStore.readCurrentRun(setId: Self.setId) == nil, "live progress is cleared afterwards")
+    }
+
+    @Test("initSecondary refuses to target the primary")
+    func initSecondaryRefusesPrimary() async throws {
+        let env = Self.makeEnv(script: [], reachableSecondaries: [])
+        defer { env.cleanUp() }
+
+        let status = await env.engine.initSecondary(env.set, dest: env.primary)
+
+        #expect(status == .failed)
+        #expect(env.fake.invocations.isEmpty)
+    }
+
+    // MARK: - Misconfiguration
+
+    @Test("a set without a primary destination is refused before anything is spawned or written")
+    func setWithoutPrimaryIsRefused() async throws {
+        let env = Self.makeEnv(script: [], reachableSecondaries: [true])
+        defer { env.cleanUp() }
+        var broken = env.set
+        broken.destinations = broken.destinations.filter { !$0.isPrimary }
+
+        let outcome = await env.engine.runSet(broken, trigger: .scheduled)
+
+        guard case .misconfigured = outcome else {
+            Issue.record("expected .misconfigured, got \(outcome)")
+            return
+        }
+        #expect(env.fake.invocations.isEmpty)
+        #expect(env.indexEntries.isEmpty)
+    }
+}
+
+// MARK: - Box
+
+/// Minimal mutable holder used to hand the freshly built `AppPaths` to a
+/// spawn observer that must be constructed before the environment exists.
+final class Box<T>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: T
+
+    init(_ value: T) {
+        self.storage = value
+    }
+
+    var value: T {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return storage
+        }
+        set {
+            lock.lock()
+            storage = newValue
+            lock.unlock()
+        }
+    }
+}

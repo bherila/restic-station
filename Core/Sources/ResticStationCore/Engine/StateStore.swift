@@ -64,19 +64,33 @@ public struct SetScheduleState: Codable, Equatable, Sendable {
     /// The `n` most recently used in `--read-data-subset=n/t`. `nil` before
     /// any check has run.
     public var checkSliceCursor: Int?
+    /// Number of **successful** checks of this set's primary so far, used
+    /// only to decide when the secondaries get their structure-only check
+    /// ("every 4th check", `docs/scheduling.md` §Check scheduling). `nil`
+    /// before any check has succeeded.
+    ///
+    /// Added by T09 (`BackupEngine.runCheck`) — the rotation rule needs a
+    /// counter and `docs/data-model.md` §schedule-state.json documents no
+    /// field for it. Optional, so a `schedule-state.json` written by an
+    /// earlier build (which has no `checkCount` key) still decodes: state
+    /// files carry no version and are regenerable caches
+    /// (`docs/data-model.md` §Versioning & migration).
+    public var checkCount: Int?
 
     public init(
         lastBackupStart: Date? = nil,
         lastCheckStart: Date? = nil,
-        checkSliceCursor: Int? = nil
+        checkSliceCursor: Int? = nil,
+        checkCount: Int? = nil
     ) {
         self.lastBackupStart = lastBackupStart
         self.lastCheckStart = lastCheckStart
         self.checkSliceCursor = checkSliceCursor
+        self.checkCount = checkCount
     }
 
     private enum CodingKeys: String, CodingKey {
-        case lastBackupStart, lastCheckStart, checkSliceCursor
+        case lastBackupStart, lastCheckStart, checkSliceCursor, checkCount
     }
 
     // Explicit `null` for nil optionals — see AppConfig.encode(to:).
@@ -85,6 +99,7 @@ public struct SetScheduleState: Codable, Equatable, Sendable {
         try container.encode(lastBackupStart, forKey: .lastBackupStart)
         try container.encode(lastCheckStart, forKey: .lastCheckStart)
         try container.encode(checkSliceCursor, forKey: .checkSliceCursor)
+        try container.encode(checkCount, forKey: .checkCount)
     }
 }
 
