@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install tools
-        run: brew install xcodegen restic
+        run: brew install xcodegen restic jq
       - name: Generate Xcode project
         run: xcodegen generate
       - name: Build
@@ -32,6 +32,8 @@ jobs:
           echo "$OUT" | grep -q "restic-station-helper 0.1.0"
       - name: Run Core unit tests
         run: swift test --package-path Core
+      - name: Run integration test
+        run: scripts/integration-test.sh
       - name: Ad-hoc sign and package app artifact
         run: |
           APP="dd/Build/Products/Debug/Restic Station.app"
