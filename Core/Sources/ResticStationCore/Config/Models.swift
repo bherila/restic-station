@@ -17,22 +17,31 @@ public struct AppConfig: Codable, Equatable, Sendable {
     /// `nil` = not yet discovered.
     public var resticPath: String?
     public var showMenuBarIcon: Bool
+    /// `true` once the first-launch setup assistant has been completed or
+    /// skipped (`docs/ui-spec.md` §Onboarding). `nil` — the value in every
+    /// config written before this field existed — means "never ran", which
+    /// is why it is an `Optional<Bool>` rather than a defaulted `Bool`: the
+    /// three states (never ran / ran / explicitly reset) stay distinguishable
+    /// and old configs keep decoding unchanged.
+    public var onboardingCompleted: Bool?
     public var sets: [BackupSet]
 
     public init(
         version: Int = AppConfig.currentVersion,
         resticPath: String? = nil,
         showMenuBarIcon: Bool = true,
+        onboardingCompleted: Bool? = nil,
         sets: [BackupSet] = []
     ) {
         self.version = version
         self.resticPath = resticPath
         self.showMenuBarIcon = showMenuBarIcon
+        self.onboardingCompleted = onboardingCompleted
         self.sets = sets
     }
 
     private enum CodingKeys: String, CodingKey {
-        case version, resticPath, showMenuBarIcon, sets
+        case version, resticPath, showMenuBarIcon, onboardingCompleted, sets
     }
 
     // Custom encode so `resticPath == nil` encodes as JSON `null` rather
@@ -40,11 +49,21 @@ public struct AppConfig: Codable, Equatable, Sendable {
     // `encodeIfPresent`, which omits it). Decoding is left to the
     // synthesized `init(from:)`, which treats a missing key and an
     // explicit `null` identically.
+    //
+    // `onboardingCompleted` is the one deliberate exception: it uses
+    // `encodeIfPresent`, so a config that has never seen the setup assistant
+    // is byte-identical to one written by a build that predates the field.
+    // Emitting `"onboardingCompleted": null` would instead rewrite every
+    // existing config.json on the first save and change the documented
+    // example in `docs/data-model.md` §config.json (which this file's
+    // round-trip tests pin byte-for-byte modulo key order). Absent and
+    // `null` decode identically either way, so nothing else has to care.
     public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(version, forKey: .version)
         try container.encode(resticPath, forKey: .resticPath)
         try container.encode(showMenuBarIcon, forKey: .showMenuBarIcon)
+        try container.encodeIfPresent(onboardingCompleted, forKey: .onboardingCompleted)
         try container.encode(sets, forKey: .sets)
     }
 }

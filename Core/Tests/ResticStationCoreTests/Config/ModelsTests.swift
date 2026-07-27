@@ -369,3 +369,69 @@ let dataModelExampleConfigJSON = """
         #expect(RetentionPolicy(keepYearly: 1).isEmpty == false)
     }
 }
+
+// MARK: - onboardingCompleted (T18)
+
+/// `AppConfig.onboardingCompleted` was added after v1 configs were already on
+/// disk, so the field carries a decode/encode compatibility contract:
+/// a config written by an older build (no such key) must still decode, and a
+/// config that has never run the setup assistant must still *encode* without
+/// the key — otherwise the first save after upgrading would rewrite every
+/// user's `config.json` and diverge from the documented example.
+@Suite struct AppConfigOnboardingCompletedCompatibilityTests {
+    @Test func decodesLegacyConfigWithoutTheKey() throws {
+        // The documented v1 example — no `onboardingCompleted` anywhere.
+        let config = try ConfigStore.makeDecoder().decode(
+            AppConfig.self,
+            from: Data(dataModelExampleConfigJSON.utf8)
+        )
+        #expect(config.onboardingCompleted == nil)
+        try config.validate()
+    }
+
+    @Test func decodesExplicitNullAsNil() throws {
+        let json = #"{"version":1,"resticPath":null,"showMenuBarIcon":true,"onboardingCompleted":null,"sets":[]}"#
+        let config = try ConfigStore.makeDecoder().decode(AppConfig.self, from: Data(json.utf8))
+        #expect(config.onboardingCompleted == nil)
+    }
+
+    @Test(arguments: [true, false])
+    func decodesBothBooleanValues(flag: Bool) throws {
+        let json = #"{"version":1,"resticPath":null,"showMenuBarIcon":true,"onboardingCompleted":\#(flag),"sets":[]}"#
+        let config = try ConfigStore.makeDecoder().decode(AppConfig.self, from: Data(json.utf8))
+        #expect(config.onboardingCompleted == flag)
+    }
+
+    @Test func nilOmitsTheKeyWhileSetValuesRoundTrip() throws {
+        let encoder = ConfigStore.makeEncoder()
+        let decoder = ConfigStore.makeDecoder()
+
+        let never = AppConfig()
+        #expect(never.onboardingCompleted == nil)
+        let neverJSON = try JSONSerialization.jsonObject(with: encoder.encode(never)) as? [String: Any]
+        #expect(neverJSON?.keys.contains("onboardingCompleted") == false)
+
+        for flag in [true, false] {
+            var config = AppConfig()
+            config.onboardingCompleted = flag
+            let data = try encoder.encode(config)
+            let object = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+            #expect(object?["onboardingCompleted"] as? Bool == flag)
+            #expect(try decoder.decode(AppConfig.self, from: data) == config)
+        }
+    }
+
+    /// Round-trips through the real `ConfigStore` (temp dir), which is the
+    /// path the Settings/onboarding UI actually takes.
+    @Test func survivesASaveLoadCycle() throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("restic-station-onboarding-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let store = ConfigStore(paths: AppPaths(root: root))
+        var config = AppConfig()
+        config.onboardingCompleted = true
+        try store.save(config)
+        #expect(try store.load().onboardingCompleted == true)
+    }
+}
