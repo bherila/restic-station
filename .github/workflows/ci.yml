@@ -32,3 +32,14 @@ jobs:
           echo "$OUT" | grep -q "restic-station-helper 0.1.0"
       - name: Run Core unit tests
         run: swift test --package-path Core
+      - name: Ad-hoc sign and package app artifact
+        run: |
+          APP="dd/Build/Products/Debug/Restic Station.app"
+          codesign --force --deep --sign - "$APP"
+          ditto -c -k --keepParent "$APP" "Restic-Station.zip"
+      - name: Upload app artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Restic-Station-app
+          path: Restic-Station.zip
+          retention-days: 14
