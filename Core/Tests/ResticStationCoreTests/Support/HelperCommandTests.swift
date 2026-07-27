@@ -20,6 +20,7 @@ import Testing
 //                       @Option(name: .long) var set: UUID          → --set
 //                       @Option(name: .long) var dest: UUID         → --dest
 //   ProbeRepo.swift     commandName: "probe-repo"   (--set, --dest)
+//   Unlock.swift        commandName: "unlock"       (--set, --dest)
 //   Restore.swift       commandName: "restore"
 //                       @Option(name: .long) var set: UUID          → --set
 //                       @Option(name: .long) var dest: UUID         → --dest
@@ -85,6 +86,27 @@ private let destId = UUID(uuidString: "0B7A50D4-9C3E-4F5B-9A0E-8E1F2C3D4A5B")!
         #expect(HelperCommand.probeRepo(setId: setId, destId: destId).argv == expected)
     }
 
+    /// The Maintenance screen's "Remove stale locks" footer utility (T17).
+    /// Same `--set`/`--dest` shape as `probe-repo`/`init-secondary`, and —
+    /// unlike them — deliberately paired with a helper subcommand that
+    /// writes no run record (see `Helper/Sources/Commands/Unlock.swift`).
+    @Test func unlock() {
+        var expected = ["unlock", "--set"]
+        expected.append("6B29FC40-CA47-1067-B31D-00DD010662DA")
+        expected.append(contentsOf: ["--dest", "0B7A50D4-9C3E-4F5B-9A0E-8E1F2C3D4A5B"])
+        #expect(HelperCommand.unlock(setId: setId, destId: destId).argv == expected)
+    }
+
+    /// `unlock` must never be spelled as a `run-set --kind`: there is no such
+    /// kind, and inventing one would be an off-contract argv the helper's
+    /// parser rejects with a usage error at runtime.
+    @Test func unlockIsItsOwnSubcommand() {
+        let argv = HelperCommand.unlock(setId: setId, destId: destId).argv
+        #expect(HelperCommand.unlock(setId: setId, destId: destId).subcommandName == "unlock")
+        #expect(!argv.contains("run-set"))
+        #expect(!argv.contains("--kind"))
+    }
+
     /// The app spawns `fda-check` with its own context label so the
     /// resulting `state/fda-check.json` is distinguishable from the
     /// launchd-context probe (`docs/keychain-and-fda.md` §2 shows both as
@@ -99,7 +121,7 @@ private let destId = UUID(uuidString: "0B7A50D4-9C3E-4F5B-9A0E-8E1F2C3D4A5B")!
     /// side only.
     @Test func everySubcommandNameIsRegistered() {
         let registered: Set<String> = [
-            "tick", "run-set", "init-secondary", "restore", "probe-repo", "fda-check", "version",
+            "tick", "run-set", "init-secondary", "restore", "probe-repo", "unlock", "fda-check", "version",
         ]
         let restoreArgs = HelperRestoreArgs(
             setId: setId,
@@ -114,6 +136,7 @@ private let destId = UUID(uuidString: "0B7A50D4-9C3E-4F5B-9A0E-8E1F2C3D4A5B")!
             .check(setId: setId),
             .initSecondary(setId: setId, destId: destId),
             .probeRepo(setId: setId, destId: destId),
+            .unlock(setId: setId, destId: destId),
             .restore(restoreArgs),
             .fdaCheck(context: "app-spawned"),
             .version,

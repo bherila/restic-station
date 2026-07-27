@@ -1,0 +1,295 @@
+import ResticStationCore
+import SwiftUI
+
+/// Retention (`docs/ui-spec.md` §Maintenance): the set's policy, a
+/// **Preview cleanup** that renders `forget --dry-run` as a keep/remove
+/// table, and **Apply retention now**.
+///
+/// The two halves are deliberately asymmetric, because only one of them
+/// deletes anything:
+///
+/// - The preview is an app-direct `forget --json --dry-run`
+///   (`docs/architecture.md`'s read-only exception). It writes nothing and
+///   produces no run record.
+/// - Apply runs a **fresh** dry-run of its own, quotes those counts in the
+///   confirmation, and then hands the real work to the helper
+///   (`run-set --kind prune`). The numbers the user agrees to are therefore
+///   never the ones from a preview taken minutes ago against a repository
+///   that has since gained snapshots.
+struct RetentionSection: View {
+    @EnvironmentObject private var model: AppModel
+    let backupSet: BackupSet
+    @ObservedObject var maintenance: MaintenanceModel
+
+    private var hasPolicy: Bool {
+        guard let retention = backupSet.retention else { return false }
+        return !retention.isEmpty
+    }
+
+    private var isPruning: Bool {
+        maintenance.isBusy(.prune(setId: backupSet.id))
+    }
+
+    var body: some View {
+        MaintenanceSection(
+            "Retention",
+            systemImage: "calendar.badge.clock",
+            caption: "Retention decides which snapshots are kept. Cleaning up applies the policy and then "
+                + "prunes the repository, which is what actually frees space. It is applied to the primary "
+                + "after each backup, and mirrored to each secondary after it syncs."
+        ) {
+            VStack(alignment: .leading, spacing: 12) {
+                policySummary
+                actions
+                previewResult
+            }
+        }
+        .alert(
+            "Apply retention to \(backupSet.name)?",
+            isPresented: confirmationBinding,
+            presenting: maintenance.prunePlan
+        ) { plan in
+            Button("Delete Snapshots", role: .destructive) {
+                maintenance.confirmApplyRetention(plan, in: model)
+            }
+            .disabled(plan.totalRemoveCount == 0)
+            Button("Cancel", role: .cancel) {
+                maintenance.cancelApplyRetention()
+            }
+        } message: { plan in
+            Text(plan.confirmationMessage)
+        }
+    }
+
+    // MARK: - Policy
+
+    private var policySummary: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                Image(systemName: hasPolicy ? "checklist" : "infinity")
+                    .foregroundStyle(.secondary)
+                    .accessibilityHidden(true)
+                Text(MaintenanceFormat.retentionSummary(backupSet.retention))
+                    .font(.body)
+            }
+            // "edit jumps to set editor" — named rather than linked: the
+            // sidebar's selection is `MainWindow`'s private state, and the
+            // Backup Sets screen owns its own routing.
+            Text("Edit this policy in Backup Sets ▸ \(backupSet.name) ▸ Retention.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    // MARK: - Actions
+
+    private var actions: some View {
+        HStack(spacing: 10) {
+            Button {
+                maintenance.previewCleanup(for: backupSet, in: model)
+            } label: {
+                if case .loading = maintenance.retentionPreview {
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.small)
+                        Text("Preview cleanup")
+                    }
+                } else {
+                    Label("Preview cleanup", systemImage: "eye")
+                }
+            }
+            .disabled(!hasPolicy || isPreviewing || maintenance.isPreparingPrune)
+
+            Button {
+                maintenance.prepareApplyRetention(for: backupSet, in: model)
+            } label: {
+                if maintenance.isPreparingPrune || isPruning {
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.small)
+                        Text(isPruning ? "Cleaning up…" : "Checking…")
+                    }
+                } else {
+                    Label("Apply retention now", systemImage: "trash")
+                }
+            }
+            .disabled(!hasPolicy || isPruning || maintenance.isPreparingPrune || isPreviewing)
+
+            Spacer(minLength: 0)
+        }
+        .help(hasPolicy
+            ? "Preview is read-only. Applying deletes snapshots and cannot be undone."
+            : "This backup set keeps every snapshot. Add a retention policy in the set editor first.")
+    }
+
+    private var isPreviewing: Bool {
+        if case .loading = maintenance.retentionPreview { return true }
+        return false
+    }
+
+    /// `.alert(_:isPresented:presenting:)` needs a `Bool` binding; the plan
+    /// itself is the source of truth, and dismissing it (Escape, clicking
+    /// away) must cancel rather than silently leave a stale plan armed.
+    private var confirmationBinding: Binding<Bool> {
+        Binding(
+            get: { maintenance.prunePlan != nil },
+            set: { isPresented in
+                if !isPresented { maintenance.cancelApplyRetention() }
+            }
+        )
+    }
+
+    // MARK: - Preview result
+
+    @ViewBuilder
+    private var previewResult: some View {
+        switch maintenance.retentionPreview {
+        case .idle:
+            EmptyView()
+        case .loading:
+            Text("Asking each destination which snapshots the policy would remove…")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+        case .failed(let message):
+            Label(message, systemImage: "exclamationmark.triangle")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        case .ready(let previews, let at):
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Dry run at \(MaintenanceFormat.absolute(at)) — nothing has been deleted.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                ForEach(previews) { preview in
+                    ForgetPreviewTable(preview: preview)
+                }
+            }
+        }
+    }
+}
+
+// MARK: - ForgetPreviewTable
+
+/// One destination's keep/remove table, built from `ForgetResult` (T05).
+struct ForgetPreviewTable: View {
+    let preview: DestinationForgetPreview
+
+    /// Enough rows to see the shape of the policy without turning the
+    /// section into an endless list; the counts above always describe the
+    /// full result.
+    private static let rowLimit = 25
+
+    private var rows: [ForgetPreviewRow] {
+        let keepRows = preview.keep.map { ForgetPreviewRow(snapshot: $0, isRemoved: false) }
+        let removeRows = preview.remove.map { ForgetPreviewRow(snapshot: $0, isRemoved: true) }
+        return (keepRows + removeRows)
+            .sorted { $0.time > $1.time }
+            .prefix(Self.rowLimit)
+            .map { $0 }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Text(preview.label)
+                    .font(.subheadline.weight(.semibold))
+                if preview.isPrimary {
+                    Text("PRIMARY")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 8)
+                if preview.failure == nil {
+                    Text("\(preview.keepCount) keep · \(preview.removeCount) remove")
+                        .font(.callout)
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            if let failure = preview.failure {
+                Label(failure, systemImage: "exclamationmark.triangle")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else if rows.isEmpty {
+                Text("This repository has no snapshots yet.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            } else {
+                grid
+                if preview.keepCount + preview.removeCount > Self.rowLimit {
+                    Text("Showing the \(Self.rowLimit) newest snapshots of "
+                        + "\(preview.keepCount + preview.removeCount).")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    /// A `Grid`, not a `Table`: this sits inside the screen's `ScrollView`,
+    /// and a `Table` brings its own scroller — nesting the two means a
+    /// two-finger scroll over the snapshot list stops moving the page, which
+    /// is exactly the kind of thing that feels broken. A grid is a plain
+    /// laid-out block, so the outer scroll view stays in charge.
+    private var grid: some View {
+        Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 4) {
+            GridRow {
+                Text("Snapshot")
+                Text("Taken")
+                Text("Paths")
+                Text("Action")
+            }
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(.secondary)
+
+            Divider().gridCellUnsizedAxes(.horizontal)
+
+            ForEach(rows) { row in
+                GridRow {
+                    Text(row.shortId)
+                        .font(.system(.callout, design: .monospaced))
+                        .textSelection(.enabled)
+                    Text(MaintenanceFormat.absolute(row.time))
+                        .font(.callout)
+                        .monospacedDigit()
+                    Text(row.paths)
+                        .font(.callout)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .help(row.paths)
+                    Label(
+                        row.isRemoved ? "Remove" : "Keep",
+                        systemImage: row.isRemoved ? "trash" : "checkmark"
+                    )
+                    .font(.callout)
+                    .foregroundStyle(row.isRemoved ? Color.orange : Color.secondary)
+                }
+            }
+        }
+    }
+}
+
+/// A row in the keep/remove table. `Snapshot` (Core) is `Decodable` but not
+/// `Identifiable`; this wrapper adds the identity `ForEach` needs and
+/// flattens the fields it shows.
+struct ForgetPreviewRow: Identifiable {
+    let id: String
+    let shortId: String
+    let time: Date
+    let paths: String
+    let isRemoved: Bool
+
+    init(snapshot: Snapshot, isRemoved: Bool) {
+        // A snapshot can legitimately appear in both a `keep` and a `remove`
+        // group of different policy groups, so the disposition is part of
+        // the identity.
+        self.id = "\(snapshot.id)-\(isRemoved ? "remove" : "keep")"
+        self.shortId = snapshot.shortId
+        self.time = snapshot.time
+        self.paths = snapshot.paths.joined(separator: ", ")
+        self.isRemoved = isRemoved
+    }
+}
