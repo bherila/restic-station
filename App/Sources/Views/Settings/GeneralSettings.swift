@@ -95,7 +95,9 @@ struct GeneralSettings: View {
             )
             CopyablePath(text: status.linkPath, helpText: "Copy the CLI path")
             Picker("Install for", selection: $cliPrefix) {
-                Text("Just me (\(CLIInstaller.Prefix.user.directory(homeDirectory: FileManager.default.homeDirectoryForCurrentUser).path))")
+                let userDirectory = CLIInstaller.Prefix.user
+                    .directory(homeDirectory: FileManager.default.homeDirectoryForCurrentUser)
+                Text("Just me (\(userDirectory.path))")
                     .tag(CLIInstaller.Prefix.user)
                 Text("All users (/usr/local/bin)")
                     .tag(CLIInstaller.Prefix.system)
