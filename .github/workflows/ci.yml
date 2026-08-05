@@ -145,20 +145,35 @@ jobs:
           sed 's|<HELPER_PATH>|/bin/true|' \
             packaging/linux/systemd/restic-station.service > "$WORK/restic-station.service"
           cp packaging/linux/systemd/restic-station.timer "$WORK/restic-station.timer"
+          # `verify` exits 0 even for a directive it could not parse (it just
+          # says "ignoring"), so the exit code alone would let a malformed
+          # unit through. Gate on the diagnostics instead, discarding only the
+          # one benign complaint this container always makes.
+          verify() {
+            systemd-analyze --user verify "$@" 2>&1 \
+              | grep -v "Failed to connect to system bus" || true
+          }
+
           # The units a unit test already pins as byte-identical to what
           # `timer install` writes, so verifying these verifies both.
-          systemd-analyze --user verify "$WORK/restic-station.service" "$WORK/restic-station.timer"
-          # Negative control. `verify` is silent and exits 0 on success, which
-          # is indistinguishable from a check that quietly did nothing —
-          # especially here, where it warns about the absent system bus first.
-          # Prove it still has teeth on this host before trusting the pass.
-          printf '[Service]\nType=definitely-not-a-type\nExecStart=/bin/true\n' \
-            > "$WORK/broken.service"
-          systemd-analyze --user verify "$WORK/broken.service" && {
-            echo "systemd-analyze accepted an invalid unit — the check above proves nothing"
+          OUT=$(verify "$WORK/restic-station.service" "$WORK/restic-station.timer")
+          if [ -n "$OUT" ]; then
+            echo "$OUT"
+            echo "systemd-analyze reported problems with the shipped units"
             exit 1
-          }
-          echo "systemd-analyze rejected the deliberately invalid unit, as expected"
+          fi
+          echo "shipped units verified clean"
+
+          # Negative control: silence is also what a check that did nothing at
+          # all looks like, so prove the verifier still has teeth on this host.
+          BAD=$(printf '[Service]\nType=definitely-not-a-type\nExecStart=/bin/true\n' \
+            > "$WORK/broken.service"; verify "$WORK/broken.service")
+          if [ -z "$BAD" ]; then
+            echo "systemd-analyze said nothing about a deliberately invalid unit —"
+            echo "the clean result above therefore proves nothing"
+            exit 1
+          fi
+          echo "negative control OK: $BAD"
 
   macos:
     runs-on: macos-15
