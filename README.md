@@ -38,6 +38,28 @@ Running from `/Applications` matters: the background agent (SMAppService) and Fu
 2. Grant **Full Disk Access**: System Settings → Privacy & Security → Full Disk Access → add **Restic Station**. There is no prompt for this — macOS requires you to do it manually, and backups of Mail/Safari/Messages data silently fail without it. Onboarding shows two badges (**App** and **Background agent**) and both must go green; if the agent badge stays denied, see the [troubleshooting section](docs/keychain-and-fda.md#troubleshooting-from-t11t18-implementation-evidence).
 3. Create a Backup Set: sources, a primary repository (with password — stored in your Keychain), optional mirrors, a schedule, and a retention policy.
 
+## Command line
+
+Restic Station is GUI **and** CLI. The tool itself ships embedded inside the app bundle at `Restic Station.app/Contents/MacOS/restic-station-helper` — install a friendly `restic-station` symlink on your `PATH` and use that instead of typing the bundle path:
+
+```sh
+restic-station-helper cli install --user   # ~/.local/bin, no sudo; drop --user for /usr/local/bin
+restic-station status                      # or from Settings → General → Command line, Install button
+```
+
+`cli install` always creates a **symlink**, never a copy — the embedded binary's location matters (it's what `SMAppService` registration and Full Disk Access attribution bind to; see [`docs/keychain-and-fda.md`](docs/keychain-and-fda.md)), and a symlink is transparent to both because the kernel resolves it before anything runs. `cli status` reports whether it's installed and where it points; `cli uninstall` removes it. All three are idempotent and refuse to touch a file at the target path that isn't one of their own symlinks. The same install/uninstall is one click away in **Settings → General → Command line**.
+
+A few representative commands once installed:
+
+```sh
+restic-station status --json          # headless equivalent of the menu bar; exit 1 if any set needs attention
+restic-station sets list              # configured backup sets on this machine
+restic-station runs list --limit 20   # recent run history
+restic-station config show --json     # effective, per-machine-resolved configuration
+```
+
+Run `restic-station --help` for the full subcommand list (`config`, `status`, `sets`, `runs`, `secret`, `cli`, and the mutating commands `tick`/`run-set`/`restore`/… that the app and the background agent use themselves). Out of scope for now: a Homebrew formula, man pages, and shell completions (ArgumentParser can generate the last one cheaply — see the open follow-up issue if you want to pick it up).
+
 ## Building from source
 
 ```sh
@@ -56,7 +78,7 @@ Three components (full detail in [`docs/architecture.md`](docs/architecture.md))
 | Component | Role |
 |---|---|
 | `ResticStationCore` (Swift package) | All logic: config, restic process runner + JSON parsers, schedule math, run store, backup engine. Fully unit-testable. |
-| `restic-station-helper` (CLI, embedded in the app bundle) | The single code path for all mutating restic operations. Invoked by `launchd` every 2 minutes in `tick` mode and by the app for manual actions. |
+| `restic-station-helper` (CLI, embedded in the app bundle) | The single code path for all mutating restic operations. Invoked by `launchd` every 2 minutes in `tick` mode, by the app for manual actions, and directly by users via the `restic-station` `PATH` symlink (see [Command line](#command-line) above). |
 | `Restic Station.app` (SwiftUI) | Menu bar status + management window (sets, runs, restore, maintenance, settings). |
 
 Repository passwords and secret environment variables (e.g. S3 keys) live in the macOS Keychain, never in config files. See [`docs/keychain-and-fda.md`](docs/keychain-and-fda.md) for how headless keychain access works.

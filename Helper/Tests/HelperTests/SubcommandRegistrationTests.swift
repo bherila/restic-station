@@ -37,6 +37,7 @@ import Testing
             "status",
             "sets",
             "runs",
+            "cli",
             "print-password",
             "timer",
             "version",
@@ -57,6 +58,7 @@ import Testing
             "status",
             "sets",
             "runs",
+            "cli",
             "print-password",
             "version",
         ]
@@ -98,6 +100,14 @@ import Testing
         subcommand.configuration.commandName
     }
     #expect(names == ["list", "show"])
+}
+
+/// T28 (issue #30): the `restic-station` PATH symlink manager.
+@Test func cliExposesItsThreeSubcommands() {
+    let names: [String?] = Cli.configuration.subcommands.map { subcommand in
+        subcommand.configuration.commandName
+    }
+    #expect(names == ["install", "uninstall", "status"])
 }
 
 /// `print-password` is registered but must stay out of `--help`: it is the
