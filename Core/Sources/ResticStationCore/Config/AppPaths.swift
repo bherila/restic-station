@@ -71,6 +71,24 @@ public struct AppPaths: Equatable, Sendable {
         root.appendingPathComponent("config.json", isDirectory: false)
     }
 
+    /// `config.v1.backup.json` — the untouched copy of a schema-v1
+    /// `config.json` that `ConfigStore` writes once, immediately before the
+    /// first v2 write (`docs/data-model.md` §Versioning & migration). Never
+    /// overwritten.
+    public var configV1BackupFile: URL {
+        root.appendingPathComponent("config.v1.backup.json", isDirectory: false)
+    }
+
+    // MARK: - machine.json
+
+    /// `machine.json` — this host's `MachineConfig`. **Host-local: never
+    /// copy or sync it between machines** (`docs/data-model.md`
+    /// §machine.json). `config.json` is the shared file; this one is what
+    /// makes a shared `config.json` mean the right thing here.
+    public var machineFile: URL {
+        root.appendingPathComponent("machine.json", isDirectory: false)
+    }
+
     // MARK: - runs/
 
     public var runsDir: URL {

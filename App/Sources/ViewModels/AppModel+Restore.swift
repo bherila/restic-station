@@ -42,8 +42,17 @@ extension AppModel {
     /// Every configured repository, primary first within each set. The
     /// Restore screen lists secondaries too: a mirror is a full repository
     /// and is exactly what you browse when the primary is a dead disk.
+    ///
+    /// Built from ``AppModel/addressableConfig``, never from raw `config`:
+    /// the destinations here carry this machine's `repoURL` and
+    /// `nonSecretEnv` overrides, so browsing lists snapshots from the
+    /// repository the helper actually writes to, and a restore submitted by
+    /// id cannot target a different one. `addressable` rather than
+    /// `resolvedConfig` because a set this machine does not back up is still
+    /// a set it can restore *from* — that is the whole point of a
+    /// restore-only host.
     var restoreRepositories: [RestoreRepository] {
-        config.sets.flatMap { set in
+        addressableConfig.config.sets.flatMap { set in
             set.destinations
                 .sorted { lhs, rhs in
                     // Stable: primary first, then config order.
@@ -77,7 +86,7 @@ extension AppModel {
     /// flow reports — swallowing it here would leave the Restore pane showing
     /// a bare "No snapshots" with no hint of the cause.
     func makeBrowsingRunner() throws -> ResticRunner? {
-        guard let path = config.resticPath, !path.isEmpty else { return nil }
+        guard let path = resticPath, !path.isEmpty else { return nil }
         let processRunner = DefaultProcessRunner()
         return ResticRunner(
             resticPath: path,

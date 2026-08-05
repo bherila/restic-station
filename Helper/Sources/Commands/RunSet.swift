@@ -26,7 +26,17 @@ struct RunSet: AsyncParsableCommand {
 
     func run() async throws {
         let context = await HelperContext.make()
-        guard let backupSet = context.config.sets.first(where: { $0.id == set }) else {
+        // `scheduled`: backup, check and prune are all things this machine
+        // *does to* a set, so a set disabled here must not run — unlike the
+        // repository utilities, which use `addressable`.
+        guard let backupSet = context.scheduled.set(id: set) else {
+            // The set may exist in the shared `config.json` but not run on
+            // this machine (T24). Say which, instead of "no such set" — a
+            // per-machine omission is the one thing a scoping mistake looks
+            // like from the outside.
+            if let omission = context.scheduled.omissions.first(where: { $0.id == set }) {
+                HelperExit.fail("\(omission) (\"\(context.scheduled.machineId)\")")
+            }
             HelperExit.fail("no backup set with id \(set)")
         }
 

@@ -48,7 +48,7 @@ struct ResticSettings: View {
 
             Section {
                 LabeledContent("Path") {
-                    if let path = model.config.resticPath, !path.isEmpty {
+                    if let path = model.resticPath, !path.isEmpty {
                         Text(path)
                             .font(.system(.body, design: .monospaced))
                             .textSelection(.enabled)
@@ -145,7 +145,7 @@ struct ResticSettings: View {
 
 /// Transient state for the pane: whether a search is running and what the
 /// last one/last manual pick concluded. Nothing here is persisted —
-/// `config.resticPath` and `AppModel.resticStatus` remain the truth.
+/// `AppModel.resticPath` and `AppModel.resticStatus` remain the truth.
 @MainActor
 final class ResticSettingsModel: ObservableObject {
     @Published private(set) var isSearching = false
@@ -156,7 +156,7 @@ final class ResticSettingsModel: ObservableObject {
     /// but did **not** persist.
     @Published private(set) var discoveryStatus: ResticStatus?
 
-    /// `AppModel.resticStatus` only ever describes `config.resticPath`, and
+    /// `AppModel.resticStatus` only ever describes `AppModel.resticPath`, and
     /// discovery deliberately refuses to persist a too-old binary — so
     /// without this, "restic 0.16.4 is installed but unsupported" would
     /// render as the same red "Missing" chip as "no restic at all", losing

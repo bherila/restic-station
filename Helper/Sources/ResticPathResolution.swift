@@ -4,15 +4,15 @@ import ResticStationCore
 /// How the helper decides *which* restic binary to run (T25).
 ///
 /// Kept out of `HelperContext.swift` so the wiring there stays a single
-/// `await resolveResticPath(config:)` line.
+/// `await resolveResticPath(resolved:)` line.
 extension HelperContext {
 
     /// Resolves the restic binary this invocation should use.
     ///
     /// Order:
     ///
-    /// 1. **`machine.json` `resticPath`** — the per-machine override. Not
-    ///    implemented yet; see the `TODO(#26)` below.
+    /// 1. **`machine.json` `resticPath`** — the per-machine value, which is
+    ///    where a binary path belongs (T24).
     /// 2. **`AppConfig.resticPath`** — deprecated. `config.json` is shared
     ///    across machines (it is the file a user syncs), so a path that is
     ///    correct on one host is wrong on the next. Still honoured because
@@ -21,21 +21,24 @@ extension HelperContext {
     ///    `PATH`, running each candidate (`ResticDiscovery`). This is what
     ///    makes a headless Linux host work with no configuration at all.
     ///
+    /// Steps 1 and 2 arrive here already collapsed, in that order, into
+    /// `resolved.config.resticPath`: `AppConfig.resolved(for: MachineConfig)`
+    /// prefers `machine.json`'s value and falls back to the deprecated one.
+    /// That is why this takes a `ResolvedConfig` rather than an `AppConfig`
+    /// — passing a config that has *not* been resolved for this machine
+    /// would silently skip step 1, and the type makes that impossible.
+    ///
     /// A discovered path is deliberately **not** written back into
     /// `config.json`: that file is shared across machines, and persisting
     /// one host's `/usr/bin/restic` there would break the next one. It is
     /// logged once instead, so `journalctl`/`log show` can answer "which
     /// restic did it actually run?".
     static func resolveResticPath(
-        config: AppConfig,
+        resolved: ResolvedConfig,
         discovery: ResticDiscovery = ResticDiscovery(),
         log: @Sendable (String) -> Void = { HelperLog.info($0) }
     ) async -> String? {
-        // TODO(#26): machine.json `resticPath` is checked here, ahead of the
-        // deprecated config.json fallback below. One line:
-        //     if let machinePath = machine.resticPath, !machinePath.isEmpty { return machinePath }
-
-        if let configured = config.resticPath, !configured.isEmpty {
+        if let configured = resolved.config.resticPath, !configured.isEmpty {
             return configured
         }
 
@@ -60,13 +63,12 @@ extension HelperContext {
         #if os(macOS)
         return "restic not configured — open Restic Station"
         #else
-        // TODO(#26): once machine.json exists, point at
-        // `paths.machineFile.path` rather than config.json — a per-machine
-        // override is the right place for a per-machine binary path.
+        // `machine.json`, not `config.json`: a binary path is per-machine,
+        // and `config.json` is the file the user shares between hosts.
         return """
             restic not found. Searched \(discovery.searchedDescription).
             Install restic (for example `apt install restic` or \
-            `dnf install restic`), or set "resticPath" in \(paths.configFile.path).
+            `dnf install restic`), or set "resticPath" in \(paths.machineFile.path).
             """
         #endif
     }

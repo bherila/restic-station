@@ -335,6 +335,13 @@ build_helper() {
 # =========================================================================
 
 # write_config <retention-json-or-null>
+#
+# Deliberately written at schema **version 1**, with `resticPath` in
+# config.json: every helper invocation below therefore runs the real v1 → v2
+# migration (docs/data-model.md §Versioning & migration) against a real
+# restic, which `assert_migration` checks once up front. Rewriting the file
+# at v1 again between scenarios is fine — migration is idempotent and never
+# overwrites the backup it already took.
 write_config() {
     local retention_json="$1"
     local restic_bin
@@ -539,6 +546,52 @@ assert_run4() {
     log "$step OK (groupId=$group_id)"
 }
 
+# T24: end-to-end proof that a real v1 config, loaded by the real helper,
+# migrates non-destructively and keeps backing up exactly what it did before.
+# Runs after the first backup, so migration has definitely happened.
+assert_migration() {
+    local step="migration (v1 -> v2, resticPath relocated, v1 backed up)"
+    log "$step"
+
+    local version restic_in_config machine_id machine_restic
+    version="$(jq -r '.version' "$DATA_DIR/config.json")"
+    restic_in_config="$(jq -r '.resticPath' "$DATA_DIR/config.json")"
+    [[ "$version" == "2" ]] || fail "$step" "expected config.json at version 2, got '$version'"
+    [[ "$restic_in_config" == "null" ]] || fail "$step" "expected resticPath cleared, got '$restic_in_config'"
+
+    # No `machines` keys invented: absence already means "runs everywhere".
+    local machines_count
+    machines_count="$(jq '[.sets[] | select(has("machines"))] | length' "$DATA_DIR/config.json")"
+    [[ "$machines_count" -eq 0 ]] || fail "$step" "migration invented $machines_count machines keys"
+
+    [[ -f "$DATA_DIR/machine.json" ]] || fail "$step" "machine.json was not created"
+    machine_id="$(jq -r '.machineId' "$DATA_DIR/machine.json")"
+    machine_restic="$(jq -r '.resticPath' "$DATA_DIR/machine.json")"
+    [[ "$machine_id" =~ ^[a-z0-9-]+$ ]] || fail "$step" "invalid generated machineId '$machine_id'"
+    [[ "$machine_restic" == "$(command -v restic)" ]] \
+        || fail "$step" "expected machine.json resticPath '$(command -v restic)', got '$machine_restic'"
+
+    [[ -f "$DATA_DIR/config.v1.backup.json" ]] || fail "$step" "config.v1.backup.json was not written"
+    local backup_version
+    backup_version="$(jq -r '.version' "$DATA_DIR/config.v1.backup.json")"
+    [[ "$backup_version" == "1" ]] || fail "$step" "backup should hold the untouched v1 file, got version '$backup_version'"
+
+    # RESTIC_STATION_MACHINE_ID is documented as non-persistent. Run the real
+    # helper under it against a v1 config, so the migration's write path to
+    # machine.json fires while the override is in effect: the host's identity
+    # on disk must not change. Baking a temporary profile id in here would
+    # outlive the variable and silently rebind which `machines` overrides this
+    # host applies.
+    write_config "null"
+    RESTIC_STATION_MACHINE_ID=second-profile "$HELPER" tick >/dev/null 2>&1 || true
+    local machine_id_after
+    machine_id_after="$(jq -r '.machineId' "$DATA_DIR/machine.json")"
+    [[ "$machine_id_after" == "$machine_id" ]] \
+        || fail "$step" "RESTIC_STATION_MACHINE_ID was persisted: machineId became '$machine_id_after'"
+
+    log "$step OK (machineId=$machine_id)"
+}
+
 assert_retention() {
     local step="retention (keep-last 2 via run-set --kind prune)"
     log "$step"
@@ -652,6 +705,7 @@ main() {
     init_secondary
 
     assert_run1
+    assert_migration
     assert_run2
     assert_run3
     assert_run4

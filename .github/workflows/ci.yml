@@ -73,9 +73,19 @@ jobs:
           echo "$OUT"
           echo "$OUT" | grep -q "restic not found"
           echo "$OUT" | grep -q "/usr/bin/restic"
-          echo "$OUT" | grep -q "$RESTIC_STATION_DATA_DIR/config.json"
+          # machine.json, not config.json: a binary path is per-machine, and
+          # config.json is the file that is shared between hosts (T24).
+          echo "$OUT" | grep -q "$RESTIC_STATION_DATA_DIR/machine.json"
           # "open Restic Station" is impossible advice on a headless host.
           ! echo "$OUT" | grep -q "open Restic Station"
+
+          # The v1 config written above was migrated in place by that first
+          # load: version bumped, backup taken verbatim, machine identity
+          # created (T24). grep rather than jq — the Swift container has no
+          # jq, and the JSON separator spacing differs between platforms.
+          grep -qE '"version"[[:space:]]*:[[:space:]]*2' "$RESTIC_STATION_DATA_DIR/config.json"
+          grep -qE '"version"[[:space:]]*:[[:space:]]*1' "$RESTIC_STATION_DATA_DIR/config.v1.backup.json"
+          grep -qE '"machineId"[[:space:]]*:[[:space:]]*"[a-z0-9-]+"' "$RESTIC_STATION_DATA_DIR/machine.json"
 
           # 2. A restic on PATH is discovered and used, with no configuration
           #    at all — the "headless host" acceptance criterion. Note it is

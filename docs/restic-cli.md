@@ -4,7 +4,7 @@ Everything in this document was **verified against restic 0.18.1 on macOS (arm64
 
 ## General invocation rules
 
-- The restic binary path comes from `AppConfig.resticPath` (absolute). Never rely on `PATH` — GUI/launchd processes get `/usr/bin:/bin:/usr/sbin:/sbin`.
+- The restic binary path is resolved once, at load: `machine.json`'s `resticPath` → the deprecated `AppConfig.resticPath` → discovery (`data-model.md` §machine.json). Always absolute. Never rely on `PATH` — GUI/launchd processes get `/usr/bin:/bin:/usr/sbin:/sbin`.
 - Repository selection: always explicit `-r <repoURL>` (equivalently `RESTIC_REPOSITORY`; we use `-r` so argv is self-describing in logs).
 - Environment assembled per destination, replacing the inherited env with a minimal one:
   - `HOME`, `USER`, `TMPDIR` passed through (restic/keychain need them)

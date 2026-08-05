@@ -30,13 +30,23 @@ struct Tick: AsyncParsableCommand {
         // written even when no sets or restic are configured yet.
         FdaCheck.probeAndRecord(context: "launchd", stateStore: StateStore(paths: paths))
 
-        // ── Step 2: load config; no config or no sets → exit 0. ─────────
+        // ── Step 2: load config, resolve it for this machine; no config or
+        // no sets that run here → exit 0. ────────────────────────────────
         let configStore = ConfigStore(paths: paths)
-        let config: AppConfig
+        let views: HelperContext.Views
         do {
-            config = try configStore.load()
+            views = try HelperContext.loadViews(paths: paths, configStore: configStore)
         } catch {
             HelperExit.fail("tick: could not load configuration: \(error)")
+        }
+        // The scheduling view throughout: tick decides what to *back up*.
+        let scheduled = views.scheduled
+        let config = scheduled.config
+        // Say *why* nothing ran rather than printing a bare "no backup sets"
+        // for a config that plainly has some — an omission is the one thing
+        // a scoping mistake looks like from the outside.
+        for omission in scheduled.omissions {
+            print("skipping \(omission) (machine \"\(scheduled.machineId)\")")
         }
         guard !config.sets.isEmpty else {
             print("no backup sets")
@@ -44,7 +54,7 @@ struct Tick: AsyncParsableCommand {
         }
         guard let context = await HelperContext.makeTolerant(
             paths: paths,
-            config: config,
+            views: views,
             configStore: configStore
         ) else {
             // RunAtLoad tolerance: nothing usable configured yet, and

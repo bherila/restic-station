@@ -33,8 +33,17 @@ enum HelperExit {
 
 /// Shared bootstrapping for every helper subcommand that touches the engine
 /// (`docs/tasks/T10-helper-cli.md`): builds `AppPaths` (env override
-/// respected via `AppPaths.default()`), loads `config.json`, and wires up
-/// every Core collaborator `BackupEngine` needs.
+/// respected via `AppPaths.default()`), loads `config.json` + `machine.json`,
+/// **resolves the per-machine view once, here**, and wires up every Core
+/// collaborator `BackupEngine` needs.
+///
+/// **Two views, and every subcommand must say which one it means.** There is
+/// deliberately no bare `config` property here: "what do I back up?" and
+/// "which repositories can I address?" differ on a machine that disables a
+/// set, and answering the second with the first is how a restore-only host
+/// loses the ability to restore. See `ResolvedConfig.Scope`.
+///
+/// Nothing downstream of this type knows that `machineId` exists.
 struct HelperContext {
     let paths: AppPaths
     let configStore: ConfigStore
@@ -44,7 +53,35 @@ struct HelperContext {
     let restic: ResticRunner
     let reachability: Reachability
     let engine: BackupEngine
-    let config: AppConfig
+    /// What this machine backs up: `tick` and `run-set` (backup, check,
+    /// prune). Carries the omissions to explain.
+    let scheduled: ResolvedConfig
+    /// Every repository this machine can address: `restore`, `probe-repo`,
+    /// `unlock`, `init-secondary`. Drops nothing.
+    let addressable: ResolvedConfig
+
+    /// The two per-machine views of `config.json`, resolved once. The single
+    /// place resolution happens on the helper side.
+    struct Views {
+        let scheduled: ResolvedConfig
+        let addressable: ResolvedConfig
+    }
+
+    /// Loads `config.json` + `machine.json` and resolves both views.
+    ///
+    /// Order matters: `configStore.load()` may run the v1 → v2 migration,
+    /// which writes `resticPath` into `machine.json` and clears it from the
+    /// config it returns. Reading the machine identity *after* the load is
+    /// what makes the migrated path visible on the very first run rather
+    /// than one invocation later.
+    static func loadViews(paths: AppPaths, configStore: ConfigStore) throws -> Views {
+        let config = try configStore.load()
+        let machine = try MachineStore(paths: paths).load()
+        return Views(
+            scheduled: config.resolved(for: machine),
+            addressable: config.addressable(for: machine)
+        )
+    }
 
     /// The strict entry point used by every subcommand except `tick`:
     /// loads config from disk (a hard I/O/decode/version error → exit 1),
@@ -53,13 +90,13 @@ struct HelperContext {
     static func make() async -> HelperContext {
         let paths = AppPaths.default()
         let configStore = ConfigStore(paths: paths)
-        let config: AppConfig
+        let views: Views
         do {
-            config = try configStore.load()
+            views = try loadViews(paths: paths, configStore: configStore)
         } catch {
             HelperExit.fail("could not load configuration: \(error)")
         }
-        guard let context = await makeTolerant(paths: paths, config: config, configStore: configStore) else {
+        guard let context = await makeTolerant(paths: paths, views: views, configStore: configStore) else {
             HelperExit.fail(resticNotFoundMessage(paths: paths))
         }
         return context
@@ -69,8 +106,12 @@ struct HelperContext {
     /// always, except a hard config-load error" (`docs/scheduling.md`
     /// §Tick algorithm) — an unresolvable restic path must not be treated as
     /// a hard error there, so this returns `nil` instead of exiting.
-    static func makeTolerant(paths: AppPaths, config: AppConfig, configStore: ConfigStore) async -> HelperContext? {
-        guard let resticPath = await resolveResticPath(config: config) else {
+    static func makeTolerant(
+        paths: AppPaths,
+        views: Views,
+        configStore: ConfigStore
+    ) async -> HelperContext? {
+        guard let resticPath = await resolveResticPath(resolved: views.scheduled) else {
             return nil
         }
         let processRunner = DefaultProcessRunner()
@@ -79,8 +120,15 @@ struct HelperContext {
         let runStore = RunStore(paths: paths)
         let stateStore = StateStore(paths: paths)
         let reachability = Reachability(restic: restic)
+        // The **addressable** view: the engine's only use of its config is
+        // `locate(destId:)`, which maps a destination back to its owning set
+        // so a restore takes that set's lock. A restore into a set this
+        // machine does not back up is legitimate and must still be
+        // serialized correctly, so the engine needs the superset. What the
+        // engine *backs up* is decided by the `BackupSet` its callers hand
+        // to `runSet`, and those come from `scheduled`.
         let engine = BackupEngine(
-            config: config,
+            config: views.addressable.config,
             paths: paths,
             restic: restic,
             secrets: secrets,
@@ -97,7 +145,8 @@ struct HelperContext {
             restic: restic,
             reachability: reachability,
             engine: engine,
-            config: config
+            scheduled: views.scheduled,
+            addressable: views.addressable
         )
     }
 

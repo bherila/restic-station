@@ -11,10 +11,18 @@ import Foundation
 /// key order.
 public struct AppConfig: Codable, Equatable, Sendable {
     /// Current config schema version. Bump on breaking schema change.
-    public static let currentVersion = 1
+    ///
+    /// - 1: the original single-machine schema.
+    /// - 2: per-machine scoping — `machines` overrides on `BackupSet` and
+    ///   `Destination`, and `resticPath` relocated to `machine.json`.
+    public static let currentVersion = 2
 
     public var version: Int
-    /// `nil` = not yet discovered.
+    /// **Deprecated** — superseded by `MachineConfig.resticPath`, because
+    /// the path to a binary is host-local and `config.json` is shared across
+    /// every machine. Still read (and still written by builds that predate
+    /// schema v2) as the fallback when `machine.json` has no `resticPath`,
+    /// so a v1 config keeps working untouched. `nil` = not yet discovered.
     public var resticPath: String?
     public var showMenuBarIcon: Bool
     /// `true` once the first-launch setup assistant has been completed or
@@ -86,6 +94,13 @@ public struct BackupSet: Codable, Equatable, Identifiable, Sendable {
     public var stalenessWarningDays: Int
     /// Invariant: exactly one `isPrimary`.
     public var destinations: [Destination]
+    /// Per-machine overrides, keyed by `MachineConfig.machineId` (schema v2).
+    ///
+    /// `nil`, or a map with no entry for this machine, means **inherit the
+    /// values above and run** — which is why an existing single-machine
+    /// config behaves exactly as it did before v2, and why adding a second
+    /// machine is purely additive.
+    public var machines: [String: BackupSetMachineOverride]?
 
     public init(
         id: UUID,
@@ -96,7 +111,8 @@ public struct BackupSet: Codable, Equatable, Identifiable, Sendable {
         retention: RetentionPolicy? = nil,
         checkPolicy: CheckPolicy? = nil,
         stalenessWarningDays: Int = 14,
-        destinations: [Destination]
+        destinations: [Destination],
+        machines: [String: BackupSetMachineOverride]? = nil
     ) {
         self.id = id
         self.name = name
@@ -107,13 +123,21 @@ public struct BackupSet: Codable, Equatable, Identifiable, Sendable {
         self.checkPolicy = checkPolicy
         self.stalenessWarningDays = stalenessWarningDays
         self.destinations = destinations
+        self.machines = machines
     }
 
     private enum CodingKeys: String, CodingKey {
         case id, name, sources, excludes, schedule, retention, checkPolicy, stalenessWarningDays, destinations
+        case machines
     }
 
     // See AppConfig.encode(to:) — explicit null for `retention`/`checkPolicy`.
+    //
+    // `machines` is the second deliberate `encodeIfPresent` exception (after
+    // `onboardingCompleted`): absence is the "runs everywhere" default, so a
+    // config with no per-machine overrides — every config written before v2 —
+    // stays byte-identical apart from its `version` number instead of gaining
+    // a `"machines": null` on every set and destination.
     public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(id, forKey: .id)
@@ -125,6 +149,59 @@ public struct BackupSet: Codable, Equatable, Identifiable, Sendable {
         try container.encode(checkPolicy, forKey: .checkPolicy)
         try container.encode(stalenessWarningDays, forKey: .stalenessWarningDays)
         try container.encode(destinations, forKey: .destinations)
+        try container.encodeIfPresent(machines, forKey: .machines)
+    }
+}
+
+// MARK: - BackupSetMachineOverride
+
+/// What one machine changes about a `BackupSet` (schema v2).
+///
+/// **Overrides replace, they never merge**: an override `sources` array
+/// replaces the top-level array wholesale. Merging arrays produces
+/// surprising unions and offers no way to express a removal.
+///
+/// Every field is optional and `nil` means "inherit". Unlike the rest of
+/// `config.json`, absent fields are encoded as *absent* rather than as
+/// explicit `null` — an override is a sparse patch, and `"sources": null`
+/// inside one reads like "override to no sources" when it means the opposite.
+public struct BackupSetMachineOverride: Codable, Equatable, Sendable {
+    /// `false` skips this set entirely on this machine — scheduling, backup,
+    /// check and prune alike. `nil`/`true` = run it.
+    public var enabled: Bool?
+    /// Replaces `BackupSet.sources` wholesale. An empty array is legal and
+    /// means "nothing to back up here"; resolution drops the set with a
+    /// recorded reason rather than running a sourceless backup.
+    public var sources: [String]?
+    /// Replaces `BackupSet.schedule`.
+    public var schedule: Schedule?
+
+    public init(enabled: Bool? = nil, sources: [String]? = nil, schedule: Schedule? = nil) {
+        self.enabled = enabled
+        self.sources = sources
+        self.schedule = schedule
+    }
+}
+
+// MARK: - DestinationMachineOverride
+
+/// What one machine changes about a `Destination` (schema v2). Same
+/// replace-not-merge and sparse-encoding rules as
+/// ``BackupSetMachineOverride``.
+public struct DestinationMachineOverride: Codable, Equatable, Sendable {
+    /// `false` excludes this destination from this machine's runs — the way
+    /// a Mac-local external drive stops being probed by the Linux host.
+    /// `nil`/`true` = use it.
+    public var enabled: Bool?
+    /// Replaces `Destination.repoURL`.
+    public var repoURL: String?
+    /// Replaces `Destination.nonSecretEnv` wholesale.
+    public var nonSecretEnv: [String: String]?
+
+    public init(enabled: Bool? = nil, repoURL: String? = nil, nonSecretEnv: [String: String]? = nil) {
+        self.enabled = enabled
+        self.repoURL = repoURL
+        self.nonSecretEnv = nonSecretEnv
     }
 }
 
@@ -139,19 +216,41 @@ public struct Destination: Codable, Equatable, Identifiable, Sendable {
     public var isPrimary: Bool
     /// Extra env, non-secret only.
     public var nonSecretEnv: [String: String]
+    /// Per-machine overrides, keyed by `MachineConfig.machineId` (schema v2).
+    /// `nil`, or no entry for this machine, means inherit and use.
+    public var machines: [String: DestinationMachineOverride]?
 
     public init(
         id: UUID,
         label: String,
         repoURL: String,
         isPrimary: Bool,
-        nonSecretEnv: [String: String] = [:]
+        nonSecretEnv: [String: String] = [:],
+        machines: [String: DestinationMachineOverride]? = nil
     ) {
         self.id = id
         self.label = label
         self.repoURL = repoURL
         self.isPrimary = isPrimary
         self.nonSecretEnv = nonSecretEnv
+        self.machines = machines
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, label, repoURL, isPrimary, nonSecretEnv, machines
+    }
+
+    // `machines` uses `encodeIfPresent` for the same reason as
+    // `BackupSet.encode(to:)`; the remaining fields are non-optional, so the
+    // synthesized behaviour is already what the house convention asks for.
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(label, forKey: .label)
+        try container.encode(repoURL, forKey: .repoURL)
+        try container.encode(isPrimary, forKey: .isPrimary)
+        try container.encode(nonSecretEnv, forKey: .nonSecretEnv)
+        try container.encodeIfPresent(machines, forKey: .machines)
     }
 
     /// Derived from `repoURL`'s scheme prefix. Not encoded.
@@ -340,6 +439,14 @@ public enum ConfigError: Error, Equatable, Sendable, CustomStringConvertible {
     case invalidStalenessWarningDays(setId: UUID, value: Int)
     /// Invariant 5: `checkPolicy.readDataSubsetSlices` not in `2...100`.
     case invalidReadDataSubsetSlices(setId: UUID, value: Int)
+    /// Invariant 6: a `machines` key is not a valid `machineId` slug.
+    case invalidMachineIdKey(setId: UUID, machineId: String)
+    /// Invariant 6: an override `sources` entry is not an absolute path.
+    case relativeOverrideSourcePath(setId: UUID, machineId: String, path: String)
+    /// Invariant 7: after resolving for `machineId`, a set that still runs
+    /// there does not have exactly one primary destination — e.g. a config
+    /// that disables the primary on some machine without disabling the set.
+    case notExactlyOnePrimaryDestinationForMachine(setId: UUID, machineId: String, count: Int)
 
     public var description: String {
         switch self {
@@ -359,6 +466,14 @@ public enum ConfigError: Error, Equatable, Sendable, CustomStringConvertible {
             return "backup set \(setId) has invalid stalenessWarningDays \(value) (must be >= 1)"
         case .invalidReadDataSubsetSlices(let setId, let value):
             return "backup set \(setId) has invalid checkPolicy.readDataSubsetSlices \(value) (must be in 2...100)"
+        case .invalidMachineIdKey(let setId, let machineId):
+            return "backup set \(setId) has an invalid machines key \"\(machineId)\" — a machineId must be "
+                + "non-empty and use only lowercase letters, digits and '-'"
+        case .relativeOverrideSourcePath(let setId, let machineId, let path):
+            return "backup set \(setId) has a non-absolute source path for machine \"\(machineId)\": \(path)"
+        case .notExactlyOnePrimaryDestinationForMachine(let setId, let machineId, let count):
+            return "backup set \(setId) must have exactly one primary destination on machine \"\(machineId)\", "
+                + "found \(count) — disable the whole set for that machine instead of its primary destination"
         }
     }
 }
@@ -370,7 +485,7 @@ extension ConfigError: LocalizedError {
 // MARK: - AppConfig.validate()
 
 extension AppConfig {
-    /// Enforces the five invariants documented in `docs/data-model.md`
+    /// Enforces the seven invariants documented in `docs/data-model.md`
     /// §Invariants. Called on every save and after every load.
     public func validate() throws {
         var seenIDs = Set<UUID>()
@@ -412,6 +527,85 @@ extension AppConfig {
             }
             if let checkPolicy = set.checkPolicy, !(2...100).contains(checkPolicy.readDataSubsetSlices) {
                 throw ConfigError.invalidReadDataSubsetSlices(setId: set.id, value: checkPolicy.readDataSubsetSlices)
+            }
+
+            // Invariant 6: per-machine override keys and values.
+            try Self.validateOverrides(in: set)
+        }
+
+        // Invariant 7: the per-set invariants that only mean something once
+        // the overrides are applied.
+        try validateResolutions()
+    }
+
+    // MARK: Invariant 6 — override shape
+
+    /// Every `machines` key on a set or on one of its destinations must be a
+    /// valid `machineId` slug, and the values an override supplies get the
+    /// *same* checks the fields they replace already get.
+    private static func validateOverrides(in set: BackupSet) throws {
+        for (machineId, override) in set.machines ?? [:] {
+            guard MachineIdentity.isValid(machineId) else {
+                throw ConfigError.invalidMachineIdKey(setId: set.id, machineId: machineId)
+            }
+            // Same rule as invariant 3 for the array it replaces. An *empty*
+            // override array is deliberately allowed where an empty
+            // top-level array is not: it is how a machine says "nothing to
+            // back up here", and resolution drops the set with a recorded
+            // reason rather than running a sourceless backup.
+            for source in override.sources ?? [] where !source.hasPrefix("/") {
+                throw ConfigError.relativeOverrideSourcePath(setId: set.id, machineId: machineId, path: source)
+            }
+            // Same rule as invariant 4 for the schedule it replaces.
+            if let schedule = override.schedule {
+                try validateSchedule(schedule, setId: set.id)
+            }
+        }
+
+        for destination in set.destinations {
+            for machineId in (destination.machines ?? [:]).keys {
+                guard MachineIdentity.isValid(machineId) else {
+                    throw ConfigError.invalidMachineIdKey(setId: set.id, machineId: machineId)
+                }
+            }
+        }
+    }
+
+    // MARK: Invariant 7 — post-resolution
+
+    /// "Exactly one primary destination" has to hold **per machine**, not
+    /// just on the shared values: a config where a machine disables the
+    /// primary but leaves the set running resolves to a set with nowhere to
+    /// back up to, which the engine can only report as misconfigured at run
+    /// time — on a headless host, with no one watching.
+    ///
+    /// The rule is deliberately stated on the set *before* resolution drops
+    /// anything: **if a set runs on a machine, its primary must be enabled
+    /// there.** Disabling the primary is never a legitimate way to say "do
+    /// not run this here" — `"machines": {"<id>": {"enabled": false}}` on the
+    /// set is, and it says so unambiguously. Checking after the drop would
+    /// let "every destination disabled" quietly become "set skipped", which
+    /// is the same silence this invariant exists to prevent.
+    ///
+    /// Checked for every `machineId` the config mentions. Machines with no
+    /// overrides at all need no check: they see the shared values, which
+    /// invariant 1 has already validated.
+    private func validateResolutions() throws {
+        for machineId in referencedMachineIds {
+            for set in sets {
+                // A set this machine does not run has no destinations to
+                // require.
+                if set.machines?[machineId]?.enabled == false {
+                    continue
+                }
+                let primaryCount = set.destinations.filter { destination in
+                    destination.isPrimary && destination.machines?[machineId]?.enabled != false
+                }.count
+                if primaryCount != 1 {
+                    throw ConfigError.notExactlyOnePrimaryDestinationForMachine(
+                        setId: set.id, machineId: machineId, count: primaryCount
+                    )
+                }
             }
         }
     }

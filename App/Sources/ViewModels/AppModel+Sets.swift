@@ -231,12 +231,16 @@ extension AppModel {
     /// cannot corrupt data. The fix is a helper `init-primary` subcommand;
     /// this method should then collapse into `HelperInvoker`.
     func initializeRepository(setId: UUID, destId: UUID) async -> DestinationInitOutcome {
-        guard let set = config.sets.first(where: { $0.id == setId }),
-              let destination = set.destinations.first(where: { $0.id == destId }) else {
+        // The **addressable** view, so the repository this creates is the one
+        // this machine backs up to. A raw `config` destination would init
+        // `/Volumes/Big/…` on a host whose override says `/mnt/big/…` —
+        // creating (or probing) a repository nothing ever writes to.
+        guard let found = addressableConfig.destination(id: destId), found.set.id == setId else {
             return .failed(
                 "This destination has not been saved yet. Save the backup set, then initialize."
             )
         }
+        let destination = found.destination
 
         if destination.isPrimary {
             return await initializePrimaryRepository(destination)
@@ -262,7 +266,7 @@ extension AppModel {
     /// argv from `ResticCommand.initRepo`, env and the secret pre-flight
     /// from `ResticRunner`.
     private func initializePrimaryRepository(_ destination: Destination) async -> DestinationInitOutcome {
-        guard let resticPath = config.resticPath, !resticPath.isEmpty else {
+        guard let resticPath = resticPath, !resticPath.isEmpty else {
             return .failed("No restic binary is configured. Set the restic path in Settings, then try again.")
         }
         guard let secrets = self.secrets else {

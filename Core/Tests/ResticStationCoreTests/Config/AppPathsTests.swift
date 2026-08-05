@@ -211,6 +211,8 @@ struct AppPathsEnvTests {
 
         let rootPath = root.path
         #expect(paths.configFile.path == "\(rootPath)/config.json")
+        #expect(paths.configV1BackupFile.path == "\(rootPath)/config.v1.backup.json")
+        #expect(paths.machineFile.path == "\(rootPath)/machine.json")
         #expect(paths.runsDir.path == "\(rootPath)/runs")
         #expect(paths.runsIndexFile.path == "\(rootPath)/runs/index.jsonl")
         #expect(paths.runDir(runId: "r1").path == "\(rootPath)/runs/r1")
@@ -248,6 +250,8 @@ struct AppPathsEnvTests {
         func members(_ paths: AppPaths) -> [String] {
             [
                 paths.configFile.path,
+                paths.configV1BackupFile.path,
+                paths.machineFile.path,
                 paths.runsDir.path,
                 paths.runsIndexFile.path,
                 paths.runDir(runId: "r1").path,
@@ -270,6 +274,8 @@ struct AppPathsEnvTests {
         #expect(relativeA == relativeB)
         #expect(relativeA == [
             "config.json",
+            "config.v1.backup.json",
+            "machine.json",
             "runs",
             "runs/index.jsonl",
             "runs/r1",

@@ -8,9 +8,13 @@ import Testing
 /// fail to decode. They are replaced here with valid UUIDs that keep the
 /// doc's recognizable prefix. Every other byte — keys, values, nesting,
 /// including the `retention` block's explicit `null`s — matches the doc.
+///
+/// It is a schema-v2 config with **no** `machines` keys — the shape the vast
+/// majority of installs have, and the one the compatibility guarantee is
+/// about: absent `machines` means inherit and run everywhere.
 let dataModelExampleConfigJSON = """
 {
-  "version": 1,
+  "version": 2,
   "resticPath": "/opt/homebrew/bin/restic",
   "showMenuBarIcon": true,
   "sets": [
@@ -61,7 +65,7 @@ let dataModelExampleConfigJSON = """
         try config.validate()
 
         // Field-for-field checks against the documented example.
-        #expect(config.version == 1)
+        #expect(config.version == 2)
         #expect(config.resticPath == "/opt/homebrew/bin/restic")
         #expect(config.showMenuBarIcon == true)
         #expect(config.sets.count == 1)
@@ -314,6 +318,117 @@ let dataModelExampleConfigJSON = """
     }
 }
 
+// MARK: - T24: per-machine overrides
+
+/// The worked example from `docs/data-model.md` §Per-machine scoping, pinned
+/// the same way the v1 example is: it must decode, validate, and re-encode
+/// to exactly these keys — no `"machines": null` sprayed over the entries
+/// that have no overrides, and no override field materialising as an
+/// explicit `null`.
+let dataModelMachinesExampleJSON = """
+{
+  "version": 2,
+  "resticPath": null,
+  "showMenuBarIcon": true,
+  "sets": [
+    {
+      "id": "6F9619FF-8B86-D011-B42D-00C04FC964FF",
+      "name": "Documents",
+      "sources": ["/Users/bwh/Documents"],
+      "excludes": [],
+      "schedule": { "kind": "daily", "hour": 2, "minute": 30 },
+      "retention": null,
+      "checkPolicy": null,
+      "stalenessWarningDays": 14,
+      "machines": {
+        "linux-nas": { "enabled": true, "sources": ["/srv/data"] },
+        "old-laptop": { "enabled": false }
+      },
+      "destinations": [
+        {
+          "id": "0A1B2C3D-4E5F-4A1B-8C1D-000000000001",
+          "label": "Big Drive",
+          "repoURL": "/Volumes/Big/repo",
+          "isPrimary": true,
+          "nonSecretEnv": {},
+          "machines": { "linux-nas": { "repoURL": "/mnt/big/repo" } }
+        }
+      ]
+    }
+  ]
+}
+"""
+
+@Suite struct ModelsMachineOverrideCodingTests {
+
+    @Test func documentedOverrideExampleDecodesAndValidates() throws {
+        let config = try ConfigStore.makeDecoder().decode(
+            AppConfig.self,
+            from: Data(dataModelMachinesExampleJSON.utf8)
+        )
+        try config.validate()
+
+        let set = config.sets[0]
+        #expect(set.machines?["linux-nas"] == BackupSetMachineOverride(enabled: true, sources: ["/srv/data"]))
+        #expect(set.machines?["old-laptop"] == BackupSetMachineOverride(enabled: false))
+        #expect(set.destinations[0].machines?["linux-nas"] == DestinationMachineOverride(repoURL: "/mnt/big/repo"))
+    }
+
+    @Test func documentedOverrideExampleRoundTripsStructurally() throws {
+        let decoder = ConfigStore.makeDecoder()
+        let config = try decoder.decode(AppConfig.self, from: Data(dataModelMachinesExampleJSON.utf8))
+        let data = try ConfigStore.makeEncoder().encode(config)
+
+        #expect(try decoder.decode(AppConfig.self, from: data) == config)
+
+        let actual = try JSONSerialization.jsonObject(with: data) as? NSDictionary
+        let expected = try JSONSerialization.jsonObject(
+            with: Data(dataModelMachinesExampleJSON.utf8)
+        ) as? NSDictionary
+        #expect(actual == expected)
+    }
+
+    /// The compatibility rule that keeps every existing `config.json`
+    /// byte-identical apart from its version number: a set or destination
+    /// with no overrides must not gain a `machines` key on save.
+    @Test func absentOverridesAreEncodedAsAbsentNotNull() throws {
+        let config = AppConfig(sets: [BackupSet(
+            id: UUID(),
+            name: "Plain",
+            sources: ["/src"],
+            schedule: .daily(hour: 1, minute: 0),
+            destinations: [Destination(id: UUID(), label: "Primary", repoURL: "/repo", isPrimary: true)]
+        )])
+        let object = try JSONSerialization.jsonObject(
+            with: ConfigStore.makeEncoder().encode(config)
+        ) as? [String: Any]
+        let sets = object?["sets"] as? [[String: Any]]
+        #expect(sets?[0].keys.contains("machines") == false)
+        let destinations = sets?[0]["destinations"] as? [[String: Any]]
+        #expect(destinations?[0].keys.contains("machines") == false)
+    }
+
+    /// A sparse override is written sparsely: `{"enabled": false}` does not
+    /// become `{"enabled": false, "sources": null, "schedule": null}`.
+    @Test func overrideFieldsThatAreNilAreOmitted() throws {
+        var config = AppConfig(sets: [BackupSet(
+            id: UUID(),
+            name: "Plain",
+            sources: ["/src"],
+            schedule: .daily(hour: 1, minute: 0),
+            destinations: [Destination(id: UUID(), label: "Primary", repoURL: "/repo", isPrimary: true)]
+        )])
+        config.sets[0].machines = ["old-laptop": BackupSetMachineOverride(enabled: false)]
+
+        let object = try JSONSerialization.jsonObject(
+            with: ConfigStore.makeEncoder().encode(config)
+        ) as? [String: Any]
+        let sets = object?["sets"] as? [[String: Any]]
+        let machines = sets?[0]["machines"] as? [String: [String: Any]]
+        #expect(machines?["old-laptop"]?.keys.sorted() == ["enabled"])
+    }
+}
+
 @Suite struct ScheduleCodingTests {
     @Test(arguments: [
         (Schedule.everyMinutes(30), #"{"kind":"everyMinutes","minutes":30}"#),
@@ -380,7 +495,7 @@ let dataModelExampleConfigJSON = """
 /// user's `config.json` and diverge from the documented example.
 @Suite struct AppConfigOnboardingCompletedCompatibilityTests {
     @Test func decodesLegacyConfigWithoutTheKey() throws {
-        // The documented v1 example — no `onboardingCompleted` anywhere.
+        // The documented example — no `onboardingCompleted` anywhere.
         let config = try ConfigStore.makeDecoder().decode(
             AppConfig.self,
             from: Data(dataModelExampleConfigJSON.utf8)

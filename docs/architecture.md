@@ -115,11 +115,13 @@ All runtime paths come from one type, `AppPaths` (in `Config/`), never hard-code
 
 State — not config — is the right XDG base dir for `root`: `config.json` is the smallest part of it, and the directory is dominated by `runs/`, `state/`, and `locks/`. Per the XDG Base Directory Specification an `XDG_*` value that is not an absolute path is ignored and the fallback applies as if it were unset.
 
-**`root` and the restic cache are the only platform-dependent members.** Everything below `root` is byte-identical across platforms — `config export`/`import` and rsync-ing a data directory between hosts depend on this, and a test asserts it.
+**`root` and the restic cache are the only platform-dependent members.** Everything below `root` is byte-identical across platforms — `config export`/`import` and rsync-ing a data directory between hosts depend on this, and a test asserts it. One caveat when copying a data directory to a second host: delete `machine.json` there and let it regenerate, or both hosts claim the same `machineId` and the same per-machine overrides (`data-model.md` §machine.json).
 
 | Path (relative to `root`) | Contents |
 |---|---|
-| `config.json` | `AppConfig` (see `data-model.md`) |
+| `config.json` | `AppConfig` (see `data-model.md`) — **shared across every machine** |
+| `config.v1.backup.json` | untouched copy of a schema-v1 `config.json`, written once before the first v2 write |
+| `machine.json` | `MachineConfig`: this host's `machineId` and restic path — **host-local, never copy it between machines** |
 | `runs/<runId>/metadata.json` | one `RunMetadata` per run |
 | `runs/<runId>/log.txt` | full streamed log of the run |
 | `runs/index.jsonl` | append-only, one summary JSON line per finished run |

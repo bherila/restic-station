@@ -16,9 +16,18 @@ public enum ConfigDiff {
 
     /// `true` when the change between `old` and `new` can affect what the
     /// next tick does: sets added/removed, or any set's schedule, sources,
-    /// excludes, destinations, retention or check policy changed — plus the
-    /// restic path, since a config that just gained a usable restic binary
-    /// should start backing up immediately rather than in two minutes.
+    /// excludes, destinations, retention, check policy or **per-machine
+    /// overrides** changed — plus the restic path, since a config that just
+    /// gained a usable restic binary should start backing up immediately
+    /// rather than in two minutes.
+    ///
+    /// Per-machine overrides count even when they belong to *another*
+    /// machine. This projection compares the shared config, not the resolved
+    /// one, and it does not know which machine it is running on; treating a
+    /// `machines` edit as relevant errs the way the rest of this type errs —
+    /// towards an extra tick that finds nothing due, rather than towards a
+    /// missed one. It also means the app's change summary can never silently
+    /// omit a per-machine edit.
     ///
     /// Deliberately **not** relevant: `showMenuBarIcon`, a set's `name`,
     /// `stalenessWarningDays` (display-only warning threshold), and pure
@@ -39,7 +48,8 @@ public enum ConfigDiff {
                 excludes: set.excludes,
                 retention: set.retention,
                 checkPolicy: set.checkPolicy,
-                destinations: set.destinations
+                destinations: set.destinations,
+                machines: set.machines
             )
         }
         return Projection(resticPath: config.resticPath, sets: sets)
@@ -58,7 +68,12 @@ public enum ConfigDiff {
         let retention: RetentionPolicy?
         let checkPolicy: CheckPolicy?
         /// Whole destinations, not just ids: a changed `repoURL` or a moved
-        /// PRIMARY flag changes what the tick backs up to.
+        /// PRIMARY flag changes what the tick backs up to. `Destination`
+        /// carries its own `machines` map, so destination-level per-machine
+        /// edits are covered by this field.
         let destinations: [Destination]
+        /// Set-level per-machine overrides — an `enabled`, `sources` or
+        /// `schedule` override changes what this machine's tick does.
+        let machines: [String: BackupSetMachineOverride]?
     }
 }

@@ -197,6 +197,37 @@ enum SetsCopy {
             return (.staleness, "The staleness warning must be at least 1 day.")
         case .invalidReadDataSubsetSlices:
             return (.checks, "The number of check slices must be between 2 and 100.")
+
+        // Per-machine overrides (schema v2). There is no per-machine editing
+        // UI yet — these keys are hand-written in `config.json` — so the
+        // messages name the file and the fix rather than pointing at a field
+        // that does not exist. They are mapped explicitly, not defaulted, so
+        // adding a future override field forces this decision again.
+        case .invalidMachineIdKey(_, let machineId):
+            return (
+                .general,
+                "“\(machineId)” is not a valid machine name in this set's per-machine settings. "
+                    + "Machine names use lowercase letters, digits and hyphens only. "
+                    + "Edit config.json to fix it."
+            )
+        case .relativeOverrideSourcePath(_, let machineId, let path):
+            return (
+                .sources,
+                "Sources must be absolute paths — “\(path)”, set for machine “\(machineId)” in config.json, is not."
+            )
+        case .notExactlyOnePrimaryDestinationForMachine(_, let machineId, let count):
+            if count == 0 {
+                return (
+                    .destinations,
+                    "This set's primary destination is turned off for machine “\(machineId)” in config.json. "
+                        + "Turn the whole set off for that machine instead, or re-enable the primary."
+                )
+            }
+            return (
+                .destinations,
+                "Machine “\(machineId)” ends up with \(count) primary destinations for this set. "
+                    + "Exactly one destination must be the primary on every machine."
+            )
         }
     }
 

@@ -65,13 +65,16 @@ struct MaintenanceView: View {
 
     private func header(for set: BackupSet) -> some View {
         HStack(spacing: 12) {
+            // The same view `MaintenanceLookup.set` resolves the selection
+            // against, so the picker cannot offer a set the screen then
+            // fails to find.
             Picker("Backup set", selection: setSelection) {
-                ForEach(model.config.sets) { candidate in
+                ForEach(model.addressableConfig.config.sets) { candidate in
                     Text(candidate.name).tag(candidate.id)
                 }
             }
             .fixedSize()
-            .disabled(model.config.sets.count <= 1)
+            .disabled(model.addressableConfig.config.sets.count <= 1)
 
             Spacer(minLength: 0)
 
