@@ -1,6 +1,27 @@
 # Scheduling
 
-## Model: launchd tick + anacron-style due computation
+## Model: a host-scheduled tick + anacron-style due computation
+
+Restic Station schedules nothing itself. The host's own scheduler fires
+`restic-station-helper tick` every 2 minutes, and **the tick is the entire
+scheduling contract** — due-ness, catch-up after downtime, and "backup wins
+over check" are all decided inside it from `state/schedule-state.json`, never
+from the scheduler's own notion of time. The scheduler only has to fire often
+enough.
+
+That is what makes the two supported platforms behaviourally equivalent
+despite using completely different mechanisms:
+
+| platform | scheduler | registered by | see |
+|---|---|---|---|
+| macOS | launchd LaunchAgent, `StartInterval` 120 | the app, via `SMAppService` | §launchd below |
+| Linux | systemd `--user` timer | the helper, via `timer install` | §Linux below |
+
+The pure vocabulary of both — argv and unit text — lives in
+`Core/Sources/ResticStationCore/Support/SchedulerCommand.swift`, conditionally
+compiled per platform.
+
+## launchd (macOS)
 
 One **static** LaunchAgent, registered by the app via `SMAppService.agent(plistName:)`, plist embedded in the bundle at `Contents/Library/LaunchAgents/net.herila.ResticStation.helper.plist`:
 
@@ -24,7 +45,128 @@ Notes: `Label` MUST equal the plist filename minus `.plist`. `BundleProgram` (bu
 
 launchd behavior we rely on (no code needed): `StartInterval` fires are **skipped during sleep and coalesced into a single fire on wake** — combined with due-computation below this yields anacron semantics. `RunAtLoad` gives a tick at login/registration.
 
+## Linux: systemd user timer
+
+There is no app on Linux, so scheduling is installed from the helper itself:
+
+```
+restic-station-helper timer install [--interval <minutes>]   # default 2
+restic-station-helper timer uninstall
+restic-station-helper timer status
+```
+
+`timer` is compiled `#if os(Linux)` and does not appear in `--help` on macOS.
+Both subcommands are idempotent: `install` overwrites the units in place (so
+re-running with a different `--interval` just changes the interval), and
+`uninstall` exits 0 with nothing installed.
+
+### The two units
+
+Shipped as templates in `packaging/linux/systemd/` for hand-installation and
+distro packaging; `timer install` renders exactly the same text with
+`<HELPER_PATH>` replaced. A unit test asserts the two cannot drift apart.
+
+```ini
+# restic-station.service
+[Service]
+Type=oneshot
+ExecStart=<HELPER_PATH> tick
+```
+
+```ini
+# restic-station.timer
+[Timer]
+Unit=restic-station.service
+OnBootSec=2min
+OnUnitActiveSec=2min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+- **`Type=oneshot`, no `Restart=`.** The tick is a batch job that exits, not a
+  daemon. A `Restart=` on a timer-driven oneshot would retry a failing backup
+  in a tight loop; a genuinely failing set is retried at its next scheduled
+  slot instead (§Due computation).
+- **No `[Install]` on the service.** It is activated by the timer. Enabling it
+  directly would tick once per boot and never again.
+- **`OnBootSec=` + `OnUnitActiveSec=` are what give Linux macOS's catch-up.**
+  A machine that was off for a week ticks 2 minutes after it comes back, and
+  that tick finds every set overdue from `schedule-state.json` — the same
+  single catch-up run macOS gets from launchd coalescing missed
+  `StartInterval` fires on wake.
+- **`Persistent=true` is kept deliberately, and is not what does that.**
+  `systemd.timer(5)` scopes `Persistent=` to `OnCalendar=` timers, so with the
+  monotonic pair above it has no effect of its own. It stays because it states
+  the intent (*missed runs are caught up, never skipped*) and is the switch
+  that carries that intent unchanged the moment the interval is expressed as a
+  calendar expression. **Do not delete it as dead configuration** — deleting
+  it would silently change behaviour for anyone who does make that switch.
+
+### User units, never system units
+
+Units go in `~/.config/systemd/user/` (or `$XDG_CONFIG_HOME/systemd/user/`).
+The helper's state is `$HOME`-scoped — `AppPaths.default()` resolves under
+`$XDG_STATE_HOME` — and its secrets are `0600` and owned by one user. A
+root-run system unit would resolve a *different* data directory and then be
+unable to read the secrets it found. Nothing the tick does needs privilege.
+
+**No secrets in a unit or an `EnvironmentFile`.** Unit files are
+world-readable; restic credentials come from the secret store at run time. The
+only environment variable a unit ever carries is `RESTIC_STATION_DATA_DIR`,
+and only when the user had it set in the shell they ran `timer install` from.
+
+### Lingering — the failure mode that generates the bug reports
+
+Without `loginctl enable-linger <user>`, systemd stops a user's units when
+that user logs out. On a headless box everything reports healthy right up
+until the ssh session ends, and then backups silently stop. `timer install`
+checks `loginctl show-user <user> --property=Linger` (falling back to reading
+`/var/lib/systemd/linger/<user>`, since `show-user` fails for a user with no
+session) and prints a prominent warning with the exact fix:
+
+```
+sudo loginctl enable-linger <user>
+```
+
+It is **never run automatically**: it needs root, and a backup tool that
+escalates privilege behind the user's back is a worse bug than the warning.
+
+### No systemd: the cron fallback
+
+`timer install` detects the absence of systemd — no `systemctl` binary, or
+`/run/systemd/system` missing, i.e. `sd_booted(3)`'s own test, because a
+container image can ship `systemctl` while PID 1 is something else — and fails
+with the fallback rather than a confusing `systemctl: command not found`.
+Nothing is written on such a host. The fallback is one crontab line and no
+tooling:
+
+```cron
+*/2 * * * * /path/to/restic-station-helper tick
+```
+
+The one behavioural difference: cron has no equivalent of `OnBootSec=`, so a
+tick missed while the machine was off is not replayed at boot — the next
+scheduled tick picks it up instead. That delays catch-up by up to one interval
+and **loses nothing**, because due-ness comes from `schedule-state.json`, not
+from cron slots.
+
+### `timer status`
+
+The headless equivalent of glancing at the menu bar icon: whether both units
+exist, whether the timer is enabled and active, the interval actually
+installed (read back from the unit, not assumed), the linger state, the next
+firing from `systemctl --user list-timers`, and what the tick has been doing
+from `state/schedule-state.json` and `runs/index.jsonl`. Exits 0 when
+scheduled backups really will happen and 1 otherwise, so it works as a health
+check.
+
 ## Tick algorithm (`restic-station-helper tick`)
+
+Identical on every platform — this is the code path launchd's `StartInterval`
+and systemd's `restic-station.timer` both invoke, and neither passes it any
+scheduling information.
 
 ```
 1. acquire locks/tick.lock (flock LOCK_EX|LOCK_NB); busy → exit 0 silently (previous tick still evaluating/running)
@@ -90,6 +232,12 @@ For every destination: `stale ⟺ now − lastSyncedAt > stalenessWarningDays` (
 
 ## What the app does (and doesn't)
 
+The app is macOS-only; on Linux the helper is the whole product.
+
 The app never computes schedules. It renders `schedule-state.json` + `repo-status-*.json` + `nextDue()` (calling ScheduleMath for display only), registers/unregisters the LaunchAgent, and invokes the helper for manual actions:
 - `Back Up Now` → `restic-station-helper run-set --set <uuid>`
 - kick a tick early (after config edits) → `launchctl kickstart gui/<uid>/net.herila.ResticStation.helper`
+
+The Linux equivalent of that last line is `systemctl --user start
+restic-station.service`, but nothing in the project runs it: there is no UI to
+edit config from, so there is no moment at which a tick needs forcing.

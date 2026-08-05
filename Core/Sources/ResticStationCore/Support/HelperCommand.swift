@@ -13,11 +13,12 @@ import Foundation
 /// only meet across an `execve` boundary. `HelperCommandTests` pins every
 /// one of them.
 public enum HelperCommand: Equatable, Sendable {
-    /// `tick` — one scheduling pass. Normally launchd's job; the app spawns
-    /// it directly only in debug/diagnostic paths (the *supported* way for
-    /// the app to force a tick is `launchctl kickstart`, see
-    /// `LaunchctlCommand`, so the tick keeps running in the launchd context
-    /// its TCC attribution depends on).
+    /// `tick` — one scheduling pass. Normally the host scheduler's job
+    /// (launchd on macOS, a systemd `--user` timer on Linux — see
+    /// `SchedulerCommand.swift`); the app spawns it directly only in
+    /// debug/diagnostic paths (the *supported* way for the app to force a
+    /// tick is `launchctl kickstart`, see `LaunchctlCommand`, so the tick
+    /// keeps running in the launchd context its TCC attribution depends on).
     case tick
     /// `run-set --set <uuid> --kind backup` — "Back Up Now".
     case backUpNow(setId: UUID)
@@ -205,38 +206,9 @@ public enum HelperResultKind: Equatable, Sendable, CaseIterable {
     case failed
 }
 
-// MARK: - launchctl
-
-/// `launchctl` invocations the app makes. Pure argv construction, kept here
-/// so `docs/keychain-and-fda.md` §3's "kickstart argv exactly
-/// `gui/<uid>/<label>`, no `-k` by default" rule is unit-tested rather than
-/// eyeballed.
-public enum LaunchctlCommand {
-    public static let executablePath = "/bin/launchctl"
-
-    /// The LaunchAgent's label. MUST equal the embedded plist's filename
-    /// minus `.plist` (`docs/scheduling.md` §plist) — see
-    /// `App/Resources/net.herila.ResticStation.helper.plist`.
-    public static let helperLabel = "net.herila.ResticStation.helper"
-    public static let helperPlistName = "net.herila.ResticStation.helper.plist"
-
-    /// `kickstart [-k] gui/<uid>/<label>` — arguments only, excluding
-    /// `executablePath`.
-    ///
-    /// - Parameter restart: `-k` kills a running instance first. **Only**
-    ///   for the FDA re-check flow: the default path must never interrupt a
-    ///   backup that is already running (on a busy service, plain
-    ///   `kickstart` is a no-op).
-    public static func kickstartArgv(
-        label: String = helperLabel,
-        uid: UInt32,
-        restart: Bool = false
-    ) -> [String] {
-        var argv = ["kickstart"]
-        if restart {
-            argv.append("-k")
-        }
-        argv.append("gui/\(uid)/\(label)")
-        return argv
-    }
-}
+// MARK: - Scheduler vocabulary
+//
+// `LaunchctlCommand` used to live here. It now sits in `SchedulerCommand.swift`
+// next to its Linux counterpart `SystemdCommand`, both conditionally compiled:
+// everything in *this* file is portable (the helper's own argv is identical on
+// every platform), whereas how the tick gets *fired* is not.

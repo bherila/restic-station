@@ -20,7 +20,8 @@ jobs:
         run: |
           OUT=$(.build/debug/restic-station-helper --help)
           echo "$OUT"
-          for sub in tick run-set init-secondary restore probe-repo unlock fda-check version; do
+          # `timer` is Linux-only (T26); the macos job asserts its absence.
+          for sub in tick run-set init-secondary restore probe-repo unlock fda-check timer version; do
             echo "$OUT" | grep -qE "^  $sub( |$)" || { echo "missing subcommand: $sub"; exit 1; }
           done
       # SwiftPM does not run a path dependency's test targets, so Core's
@@ -85,6 +86,65 @@ jobs:
           #    that step 2 exercises, via `makeTolerant`.)
           env PATH="$FAKEBIN" .build/debug/restic-station-helper tick
 
+      # T26 acceptance criteria reachable without a live systemd. This
+      # container is NOT booted with systemd (`/run/systemd/system` is
+      # absent), which makes it the perfect host for the "no systemd" paths —
+      # the ones a developer's Mac cannot exercise at all.
+      - name: timer install refuses cleanly on a host without systemd
+        run: |
+          export HOME=$(mktemp -d)
+          export XDG_CONFIG_HOME="$HOME/.config"
+          OUT=$(.build/debug/restic-station-helper timer install 2>&1) && {
+            echo "$OUT"; echo "expected timer install to fail without systemd"; exit 1
+          }
+          echo "$OUT"
+          echo "$OUT" | grep -q "systemd is not available"
+          echo "$OUT" | grep -q "crontab -e"
+          echo "$OUT" | grep -qE '\*/2 \* \* \* \* .*restic-station-helper tick'
+          # A confusing `systemctl: command not found` is exactly what this
+          # detection exists to prevent.
+          ! echo "$OUT" | grep -q "command not found"
+          # Nothing written on a host that would never act on it.
+          test ! -e "$XDG_CONFIG_HOME/systemd/user/restic-station.timer"
+
+      - name: timer status and uninstall are safe with nothing installed
+        run: |
+          export HOME=$(mktemp -d)
+          export RESTIC_STATION_DATA_DIR=$(mktemp -d)
+          # status exits 1 when scheduled backups will NOT happen.
+          OUT=$(.build/debug/restic-station-helper timer status 2>&1) && {
+            echo "$OUT"; echo "expected timer status to exit non-zero"; exit 1
+          }
+          echo "$OUT"
+          echo "$OUT" | grep -q "systemd     not available"
+          # uninstall is idempotent: exit 0 when nothing is installed.
+          .build/debug/restic-station-helper timer uninstall
+
+      - name: Rendered systemd units parse
+        run: |
+          # The Swift image does not ship systemd; install just the tooling if
+          # the archives allow it. If it cannot be had, say so loudly rather
+          # than pretending the units were verified.
+          if ! command -v systemd-analyze >/dev/null 2>&1; then
+            apt-get update -qq \
+              && apt-get install -y -qq --no-install-recommends systemd \
+              || echo "apt could not install systemd"
+          fi
+          if ! command -v systemd-analyze >/dev/null 2>&1; then
+            echo "::warning::systemd-analyze unavailable in this container — units NOT parse-verified"
+            exit 0
+          fi
+          systemd-analyze --version
+          WORK=$(mktemp -d)
+          # `<HELPER_PATH>` is a placeholder, and `verify` checks that the
+          # ExecStart binary exists; /bin/true stands in for the helper.
+          sed 's|<HELPER_PATH>|/bin/true|' \
+            packaging/linux/systemd/restic-station.service > "$WORK/restic-station.service"
+          cp packaging/linux/systemd/restic-station.timer "$WORK/restic-station.timer"
+          # The units a unit test already pins as byte-identical to what
+          # `timer install` writes, so verifying these verifies both.
+          systemd-analyze --user verify "$WORK/restic-station.service" "$WORK/restic-station.timer"
+
   macos:
     runs-on: macos-15
     steps:
@@ -102,6 +162,15 @@ jobs:
           plutil -lint "$APP/Contents/Library/LaunchAgents/net.herila.ResticStation.helper.plist"
           OUT=$("$APP/Contents/MacOS/restic-station-helper" version)
           echo "$OUT" | grep -q "restic-station-helper 0.1.0"
+      # T26: `timer` is Linux-only. A subcommand that exists on macOS and
+      # always errors would be a worse --help than one that is honestly absent.
+      - name: timer is absent from --help on macOS
+        run: |
+          APP="dd/Build/Products/Debug/Restic Station.app"
+          OUT=$("$APP/Contents/MacOS/restic-station-helper" --help)
+          echo "$OUT"
+          ! echo "$OUT" | grep -qE "^  timer( |$)"
+          ! "$APP/Contents/MacOS/restic-station-helper" timer status 2>/dev/null
       - name: Run Core unit tests
         run: swift test --package-path Core
       - name: Run integration test
