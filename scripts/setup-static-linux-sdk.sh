@@ -119,7 +119,28 @@ fi
 "$SWIFT_BIN" --version >&2
 
 # ── 2. Static Linux SDK ──────────────────────────────────────────────────
-if "$SWIFT_BIN" sdk list 2>/dev/null | grep -qF "$STATIC_SDK_BUNDLE_ID"; then
+#
+# Idempotency check. `swift sdk list` prints the *bundle* name on Swift
+# 6.3.3 (verified: it emits exactly "swift-6.3.3-RELEASE_static-linux-0.1.0"),
+# but its own --help says it prints "IDs", and on some versions that means
+# the per-target ids `x86_64-swift-linux-musl` / `aarch64-swift-linux-musl`.
+# The output shape is not a contract, and SWIFT_VERSION is overridable, so
+# accept either form rather than pinning this script to one toolchain's
+# formatting. Matching on the wrong shape would send an already-provisioned
+# machine into `swift sdk install`, which then fails on the duplicate.
+sdk_already_installed() {
+    local listing
+    listing="$("$SWIFT_BIN" sdk list 2>/dev/null)" || return 1
+    grep -qF "$STATIC_SDK_BUNDLE_ID" <<<"$listing" && return 0
+    # Per-target ids: require both arches, so a half-installed bundle still
+    # takes the install path.
+    grep -qF "x86_64-swift-linux-musl" <<<"$listing" \
+        && grep -qF "aarch64-swift-linux-musl" <<<"$listing" \
+        && return 0
+    return 1
+}
+
+if sdk_already_installed; then
     log "Static Linux SDK already installed: $STATIC_SDK_BUNDLE_ID"
 else
     SDK_PATH="$CACHE_DIR/${STATIC_SDK_BUNDLE_ID}.artifactbundle.tar.gz"
@@ -129,7 +150,17 @@ else
         mv "$SDK_PATH.partial" "$SDK_PATH"
     fi
     log "installing Static Linux SDK (checksum-verified by swift sdk install)"
-    "$SWIFT_BIN" sdk install "$SDK_PATH" --checksum "$STATIC_SDK_CHECKSUM" >&2
+    # Tolerate "already installed": if the listing shape changes again, a
+    # re-run must not hard-fail a machine that is in fact ready. Any other
+    # failure still aborts, because the build cannot proceed without the SDK.
+    if ! "$SWIFT_BIN" sdk install "$SDK_PATH" --checksum "$STATIC_SDK_CHECKSUM" >&2; then
+        if sdk_already_installed; then
+            log "SDK install reported failure but the SDK is present — continuing"
+        else
+            echo "FATAL: could not install the Static Linux SDK" >&2
+            exit 1
+        fi
+    fi
 fi
 
 # The one line of real stdout output — everything else above went to stderr.
