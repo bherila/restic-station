@@ -81,9 +81,18 @@ restic exit code mapping (verified against restic 0.18.1 — see `restic-cli.md`
 
 ## AppPaths
 
-All runtime paths come from one type, `AppPaths` (in `Config/`), never hard-coded elsewhere. Root defaults to `~/Library/Application Support/ResticStation` and is overridable via init parameter and via the environment variable `RESTIC_STATION_DATA_DIR` (used by tests and the integration script).
+All runtime paths come from one type, `AppPaths` (in `Config/`), never hard-coded elsewhere. `root` is overridable via init parameter and via the environment variable `RESTIC_STATION_DATA_DIR` (used by tests and the integration script), which takes precedence on every platform. Otherwise it resolves per-platform:
 
-| Path | Contents |
+| | macOS | Linux |
+|---|---|---|
+| `root` | `~/Library/Application Support/ResticStation` | `$XDG_STATE_HOME/restic-station`, else `~/.local/state/restic-station` |
+| restic cache | `~/Library/Caches/net.herila.ResticStation/restic` | `$XDG_CACHE_HOME/restic-station/restic`, else `~/.cache/restic-station/restic` |
+
+State — not config — is the right XDG base dir for `root`: `config.json` is the smallest part of it, and the directory is dominated by `runs/`, `state/`, and `locks/`. Per the XDG Base Directory Specification an `XDG_*` value that is not an absolute path is ignored and the fallback applies as if it were unset.
+
+**`root` and the restic cache are the only platform-dependent members.** Everything below `root` is byte-identical across platforms — `config export`/`import` and rsync-ing a data directory between hosts depend on this, and a test asserts it.
+
+| Path (relative to `root`) | Contents |
 |---|---|
 | `config.json` | `AppConfig` (see `data-model.md`) |
 | `runs/<runId>/metadata.json` | one `RunMetadata` per run |
@@ -94,8 +103,11 @@ All runtime paths come from one type, `AppPaths` (in `Config/`), never hard-code
 | `state/repo-status-<destId>.json` | reachability + last-synced info per destination |
 | `state/fda-check.json` | result of the helper's Full Disk Access probe |
 | `locks/tick.lock`, `locks/set-<setId>.lock` | flock files (see `scheduling.md`) |
+| `mounts/<destId>/` | `restic mount` mountpoint (see `restic-cli.md` §mount) |
 
-restic's cache is redirected via `RESTIC_CACHE_DIR` to `~/Library/Caches/net.herila.ResticStation/restic`.
+restic's cache is redirected via `RESTIC_CACHE_DIR` to the location in the table above. It is deliberately independent of `root` — it is a regenerable cache, not app state.
+
+`mounts/<destId>/` is defined on both platforms but is macOS-only in practice: `restic mount` requires macFUSE on macOS and FUSE on Linux, which a headless Linux host generally does not have.
 
 `runId` format: `<ISO8601 basic UTC>-<kind>-<first 8 chars of set UUID>`, e.g. `20260726T205704Z-backup-a1b2c3d4`.
 
