@@ -30,7 +30,7 @@ enum MaintenanceLookup {
     /// query that happens to be spelled with a destructive verb. The
     /// *unqualified* `forget` is never built anywhere in this target.
     static func resticRunner(_ model: AppModel) throws -> ResticRunner {
-        guard let resticPath = model.config.resticPath, !resticPath.isEmpty else {
+        guard let resticPath = model.resticPath, !resticPath.isEmpty else {
             throw MaintenanceError.resticNotConfigured
         }
         guard FileManager.default.isExecutableFile(atPath: resticPath) else {

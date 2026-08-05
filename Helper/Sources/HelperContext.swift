@@ -33,8 +33,14 @@ enum HelperExit {
 
 /// Shared bootstrapping for every helper subcommand that touches the engine
 /// (`docs/tasks/T10-helper-cli.md`): builds `AppPaths` (env override
-/// respected via `AppPaths.default()`), loads `config.json`, and wires up
-/// every Core collaborator `BackupEngine` needs.
+/// respected via `AppPaths.default()`), loads `config.json` + `machine.json`,
+/// **resolves the per-machine view once, here**, and wires up every Core
+/// collaborator `BackupEngine` needs.
+///
+/// `config` below is the *resolved* config (`docs/data-model.md`
+/// §Resolution): overrides applied, sets and destinations this machine does
+/// not run already removed. Nothing downstream of this type knows that
+/// `machineId` exists.
 struct HelperContext {
     let paths: AppPaths
     let configStore: ConfigStore
@@ -44,7 +50,19 @@ struct HelperContext {
     let restic: ResticRunner
     let reachability: Reachability
     let engine: BackupEngine
+    /// The effective config for this machine — `resolved.config`.
     let config: AppConfig
+    /// The full resolution, including the omissions to explain.
+    let resolved: ResolvedConfig
+
+    /// Loads `config.json` and `machine.json` and resolves the effective
+    /// config for this host. The single place resolution happens on the
+    /// helper side.
+    static func loadResolvedConfig(paths: AppPaths, configStore: ConfigStore) throws -> ResolvedConfig {
+        let config = try configStore.load()
+        let machine = try MachineStore(paths: paths).load()
+        return config.resolved(for: machine)
+    }
 
     /// The strict entry point used by every subcommand except `tick`:
     /// loads config from disk (a hard I/O/decode/version error → exit 1),
@@ -53,13 +71,13 @@ struct HelperContext {
     static func make() async -> HelperContext {
         let paths = AppPaths.default()
         let configStore = ConfigStore(paths: paths)
-        let config: AppConfig
+        let resolved: ResolvedConfig
         do {
-            config = try configStore.load()
+            resolved = try loadResolvedConfig(paths: paths, configStore: configStore)
         } catch {
             HelperExit.fail("could not load configuration: \(error)")
         }
-        guard let context = await makeTolerant(paths: paths, config: config, configStore: configStore) else {
+        guard let context = await makeTolerant(paths: paths, resolved: resolved, configStore: configStore) else {
             HelperExit.fail(resticNotFoundMessage(paths: paths))
         }
         return context
@@ -69,8 +87,13 @@ struct HelperContext {
     /// always, except a hard config-load error" (`docs/scheduling.md`
     /// §Tick algorithm) — an unresolvable restic path must not be treated as
     /// a hard error there, so this returns `nil` instead of exiting.
-    static func makeTolerant(paths: AppPaths, config: AppConfig, configStore: ConfigStore) async -> HelperContext? {
-        guard let resticPath = await resolveResticPath(config: config) else {
+    static func makeTolerant(
+        paths: AppPaths,
+        resolved: ResolvedConfig,
+        configStore: ConfigStore
+    ) async -> HelperContext? {
+        let config = resolved.config
+        guard let resticPath = await resolveResticPath(resolved: resolved) else {
             return nil
         }
         let processRunner = DefaultProcessRunner()
@@ -97,7 +120,8 @@ struct HelperContext {
             restic: restic,
             reachability: reachability,
             engine: engine,
-            config: config
+            config: config,
+            resolved: resolved
         )
     }
 

@@ -96,6 +96,54 @@ private func baseConfig() -> AppConfig {
         new.resticPath = "/usr/local/bin/restic"
         #expect(ConfigDiff.isScheduleRelevantChange(from: baseConfig(), to: new))
     }
+
+    // MARK: T24 — per-machine overrides
+
+    @Test func addingASetLevelMachineOverrideIsRelevant() {
+        var new = baseConfig()
+        new.sets[0].machines = ["linux-nas": BackupSetMachineOverride(sources: ["/srv/data"])]
+        #expect(ConfigDiff.isScheduleRelevantChange(from: baseConfig(), to: new))
+    }
+
+    @Test func changingASetLevelMachineOverrideIsRelevant() {
+        var old = baseConfig()
+        old.sets[0].machines = ["linux-nas": BackupSetMachineOverride(sources: ["/srv/data"])]
+        var new = old
+        new.sets[0].machines = ["linux-nas": BackupSetMachineOverride(sources: ["/srv/other"])]
+        #expect(ConfigDiff.isScheduleRelevantChange(from: old, to: new))
+    }
+
+    @Test func disablingASetForAMachineIsRelevant() {
+        var new = baseConfig()
+        new.sets[0].machines = ["linux-nas": BackupSetMachineOverride(enabled: false)]
+        #expect(ConfigDiff.isScheduleRelevantChange(from: baseConfig(), to: new))
+    }
+
+    @Test func removingASetLevelMachineOverrideIsRelevant() {
+        var old = baseConfig()
+        old.sets[0].machines = ["linux-nas": BackupSetMachineOverride(enabled: false)]
+        var new = old
+        new.sets[0].machines = nil
+        #expect(ConfigDiff.isScheduleRelevantChange(from: old, to: new))
+    }
+
+    @Test func destinationLevelMachineOverridesAreRelevant() {
+        var new = baseConfig()
+        new.sets[0].destinations[0].machines = ["linux-nas": DestinationMachineOverride(repoURL: "/mnt/big")]
+        #expect(ConfigDiff.isScheduleRelevantChange(from: baseConfig(), to: new))
+
+        var disabled = baseConfig()
+        disabled.sets[0].destinations[0].machines = ["linux-nas": DestinationMachineOverride(enabled: false)]
+        #expect(ConfigDiff.isScheduleRelevantChange(from: baseConfig(), to: disabled))
+    }
+
+    /// An empty map is not the same as no map: it is a shape change the
+    /// summary must not swallow.
+    @Test func anEmptyMachinesMapDiffersFromNoMap() {
+        var new = baseConfig()
+        new.sets[0].machines = [:]
+        #expect(ConfigDiff.isScheduleRelevantChange(from: baseConfig(), to: new))
+    }
 }
 
 @Suite struct ConfigDiffIrrelevantTests {

@@ -1,0 +1,124 @@
+{
+  "onboardingCompleted" : true,
+  "resticPath" : null,
+  "sets" : [
+    {
+      "checkPolicy" : {
+        "enabled" : true,
+        "readDataSubsetSlices" : 20
+      },
+      "destinations" : [
+        {
+          "id" : "0A1B2C3D-4E5F-4A1B-8C1D-000000000001",
+          "isPrimary" : true,
+          "label" : "Big Drive",
+          "machines" : {
+            "linux-nas" : {
+              "repoURL" : "/mnt/big/documents.restic"
+            }
+          },
+          "nonSecretEnv" : {},
+          "repoURL" : "/Volumes/Big/documents.restic"
+        },
+        {
+          "id" : "1B2C3D4E-5F60-4A1B-8C1D-000000000002",
+          "isPrimary" : false,
+          "label" : "R2 mirror",
+          "nonSecretEnv" : {
+            "AWS_DEFAULT_REGION" : "auto"
+          },
+          "repoURL" : "s3:https://accountid.r2.cloudflarestorage.com/backups/documents"
+        },
+        {
+          "id" : "2C3D4E5F-6061-4A1B-8C1D-000000000003",
+          "isPrimary" : false,
+          "label" : "Mac-only external HDD",
+          "machines" : {
+            "linux-nas" : {
+              "enabled" : false
+            }
+          },
+          "nonSecretEnv" : {},
+          "repoURL" : "/Volumes/Scratch/documents.restic"
+        }
+      ],
+      "excludes" : [
+        "node_modules",
+        ".build",
+        "*.tmp"
+      ],
+      "id" : "6F9619FF-8B86-D011-B42D-00C04FC964FF",
+      "machines" : {
+        "linux-nas" : {
+          "schedule" : {
+            "hour" : 4,
+            "kind" : "daily",
+            "minute" : 0
+          },
+          "sources" : [
+            "/srv/data"
+          ]
+        },
+        "old-laptop" : {
+          "enabled" : false
+        }
+      },
+      "name" : "Documents",
+      "retention" : {
+        "keepDaily" : 7,
+        "keepHourly" : null,
+        "keepLast" : null,
+        "keepMonthly" : 12,
+        "keepWeekly" : 4,
+        "keepYearly" : 2
+      },
+      "schedule" : {
+        "hour" : 2,
+        "kind" : "daily",
+        "minute" : 30
+      },
+      "sources" : [
+        "/Users/bwh/Documents"
+      ],
+      "stalenessWarningDays" : 14
+    },
+    {
+      "checkPolicy" : null,
+      "destinations" : [
+        {
+          "id" : "3D4E5F60-6162-4A1B-8C1D-000000000004",
+          "isPrimary" : true,
+          "label" : "Big Drive",
+          "machines" : {
+            "linux-nas" : {
+              "repoURL" : "/mnt/big/photos.restic"
+            }
+          },
+          "nonSecretEnv" : {},
+          "repoURL" : "/Volumes/Big/photos.restic"
+        }
+      ],
+      "excludes" : [],
+      "id" : "7A8B9C0D-1E2F-4A3B-8C4D-000000000010",
+      "machines" : {
+        "linux-nas" : {
+          "enabled" : false
+        }
+      },
+      "name" : "Photos",
+      "retention" : null,
+      "schedule" : {
+        "hour" : 3,
+        "kind" : "weekly",
+        "minute" : 0,
+        "weekday" : 1
+      },
+      "sources" : [
+        "/Users/bwh/Pictures"
+      ],
+      "stalenessWarningDays" : 30
+    }
+  ],
+  "showMenuBarIcon" : true,
+  "version" : 2
+}

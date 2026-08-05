@@ -27,6 +27,13 @@ struct RunSet: AsyncParsableCommand {
     func run() async throws {
         let context = await HelperContext.make()
         guard let backupSet = context.config.sets.first(where: { $0.id == set }) else {
+            // The set may exist in the shared `config.json` but not run on
+            // this machine (T24). Say which, instead of "no such set" — a
+            // per-machine omission is the one thing a scoping mistake looks
+            // like from the outside.
+            if let omission = context.resolved.omissions.first(where: { $0.id == set }) {
+                HelperExit.fail("\(omission) (\"\(context.resolved.machineId)\")")
+            }
             HelperExit.fail("no backup set with id \(set)")
         }
 

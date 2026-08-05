@@ -77,14 +77,14 @@ struct MountSection: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             Button("Mount snapshot browser") {
-                guard let repository, let resticPath = model.config.resticPath else { return }
+                guard let repository, let resticPath = model.resticPath else { return }
                 Task {
                     isWorking = true
                     await mounts.mount(repository: repository, resticPath: resticPath, paths: model.paths)
                     isWorking = false
                 }
             }
-            .disabled(repository == nil || model.config.resticPath == nil || isOtherRepositoryMounted || isWorking)
+            .disabled(repository == nil || model.resticPath == nil || isOtherRepositoryMounted || isWorking)
 
             if isOtherRepositoryMounted {
                 Text("Another repository is mounted. Unmount it first — restic mounts one repository at a time.")

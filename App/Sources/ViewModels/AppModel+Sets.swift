@@ -262,7 +262,7 @@ extension AppModel {
     /// argv from `ResticCommand.initRepo`, env and the secret pre-flight
     /// from `ResticRunner`.
     private func initializePrimaryRepository(_ destination: Destination) async -> DestinationInitOutcome {
-        guard let resticPath = config.resticPath, !resticPath.isEmpty else {
+        guard let resticPath = resticPath, !resticPath.isEmpty else {
             return .failed("No restic binary is configured. Set the restic path in Settings, then try again.")
         }
         guard let secrets = self.secrets else {

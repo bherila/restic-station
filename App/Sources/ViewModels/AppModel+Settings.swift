@@ -20,7 +20,13 @@ extension AppModel {
 
     /// Searches the well-known locations and `PATH`, and — only if the
     /// search found a binary that actually runs and meets the minimum
-    /// version — records its absolute path in `config.resticPath`.
+    /// version — records its absolute path in `machine.json`.
+    ///
+    /// `machine.json`, not `config.json`: a binary path is host-local, and
+    /// `config.json` is shared with every other machine in the fleet
+    /// (`docs/data-model.md` §machine.json). The deprecated
+    /// `AppConfig.resticPath` is still *read* as the fallback, so a config
+    /// written before schema v2 keeps working; nothing writes it any more.
     ///
     /// Deliberately **does not persist a rejected candidate**. `resticPath`
     /// is read by the helper running headless from launchd; writing a binary
@@ -35,7 +41,7 @@ extension AppModel {
                 + "\(ResticDiscovery.minimumVersion) vs \(Self.minimumResticVersion)."
         )
         let result = await ResticDiscovery().discover()
-        if let chosen = result.chosen, chosen.path != config.resticPath {
+        if let chosen = result.chosen, chosen.path != resticPath {
             persistResticPath(chosen.path)
         }
         await refreshResticInfo()
@@ -56,11 +62,10 @@ extension AppModel {
 
     private func persistResticPath(_ path: String) {
         do {
-            try updateConfig { $0.resticPath = path }
+            try updateMachine { $0.resticPath = path }
         } catch {
-            // `saveConfig` already recorded the reason in `lastConfigError`
-            // (the only way this throws is an unreadable config on disk,
-            // which the panes surface separately).
+            // `updateMachine` already recorded the reason in
+            // `lastConfigError`; the panes surface it separately.
         }
     }
 }

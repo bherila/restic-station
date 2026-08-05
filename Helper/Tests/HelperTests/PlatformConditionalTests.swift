@@ -99,6 +99,38 @@ import ResticStationCore
         return (binary.path, { try? FileManager.default.removeItem(at: dir) })
     }
 
+    /// The resolver takes a `ResolvedConfig` (T24), so every case below goes
+    /// through the same machine-resolution step the helper does. `test-host`
+    /// has no overrides in any of these configs, so resolution is the
+    /// identity on the sets — only `resticPath` is affected.
+    private func resolve(config: AppConfig, machine: MachineConfig? = nil) -> ResolvedConfig {
+        config.resolved(for: machine ?? MachineConfig(machineId: "test-host"))
+    }
+
+    @Test("machine.json's resticPath wins over the deprecated config.json one")
+    func machinePathWinsOverConfigPath() async throws {
+        let resolved = await HelperContext.resolveResticPath(
+            resolved: resolve(
+                config: AppConfig(resticPath: "/opt/homebrew/bin/restic"),
+                machine: MachineConfig(machineId: "linux-nas", resticPath: "/usr/bin/restic")
+            ),
+            log: { _ in Issue.record("nothing should be logged when a path is already configured") }
+        )
+        #expect(resolved == "/usr/bin/restic")
+    }
+
+    @Test("an empty machine.json resticPath falls back to the config.json one")
+    func emptyMachinePathFallsBackToConfigPath() async throws {
+        let resolved = await HelperContext.resolveResticPath(
+            resolved: resolve(
+                config: AppConfig(resticPath: "/opt/homebrew/bin/restic"),
+                machine: MachineConfig(machineId: "linux-nas", resticPath: "")
+            ),
+            log: { _ in Issue.record("nothing should be logged when a path is already configured") }
+        )
+        #expect(resolved == "/opt/homebrew/bin/restic")
+    }
+
     @Test("a configured resticPath wins without running discovery at all")
     func configuredPathWins() async throws {
         let fake = try makeFakeRestic()
@@ -112,7 +144,7 @@ import ResticStationCore
             runner: OneGoodBinary(goodPath: fake.path)
         )
         let resolved = await HelperContext.resolveResticPath(
-            config: AppConfig(resticPath: "/configured/restic"),
+            resolved: resolve(config: AppConfig(resticPath: "/configured/restic")),
             discovery: discovery,
             log: { _ in Issue.record("nothing should be logged when config already has a path") }
         )
@@ -131,7 +163,7 @@ import ResticStationCore
         )
         let logged = LogSink()
         let resolved = await HelperContext.resolveResticPath(
-            config: AppConfig(resticPath: nil),
+            resolved: resolve(config: AppConfig(resticPath: nil)),
             discovery: discovery,
             log: { logged.append($0) }
         )
@@ -151,7 +183,7 @@ import ResticStationCore
             runner: OneGoodBinary(goodPath: fake.path)
         )
         let resolved = await HelperContext.resolveResticPath(
-            config: AppConfig(resticPath: ""),
+            resolved: resolve(config: AppConfig(resticPath: "")),
             discovery: discovery,
             log: { _ in }
         )
@@ -170,7 +202,7 @@ import ResticStationCore
             runner: OneGoodBinary(goodPath: "/nowhere/restic")
         )
         let resolved = await HelperContext.resolveResticPath(
-            config: AppConfig(resticPath: nil),
+            resolved: resolve(config: AppConfig(resticPath: nil)),
             discovery: discovery,
             log: { _ in Issue.record("nothing should be logged when nothing was found") }
         )
@@ -196,7 +228,9 @@ import ResticStationCore
         #expect(message.contains("/opt/restic/bin/restic"))
         #expect(message.contains("every directory on PATH"))
         #expect(message.contains("install restic") || message.contains("Install restic"))
-        #expect(message.contains(paths.configFile.path))
+        // machine.json, not config.json: the binary path is per-machine (T24).
+        #expect(message.contains(paths.machineFile.path))
+        #expect(!message.contains(paths.configFile.path))
         #expect(!message.contains("open Restic Station"))
         #endif
     }

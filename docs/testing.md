@@ -37,7 +37,9 @@ Secrets are injected as a `FakeSecretStore`, not scripted as `/usr/bin/security`
 `scripts/secret-cli-test.sh` is the Layer-2 test for secrets: it drives the real helper binary with `RESTIC_STATION_SECRET_BACKEND=file`, asserts `secrets.json` is `0600`, asserts `print-password` returns the exact bytes with `cmp`/`od`, and (when restic is on PATH) runs a real backup and then greps the whole data directory to prove the password reached no log, run record or state file.
 
 ### Fixture conventions
-`Core/Tests/ResticStationCoreTests/Fixtures/` — copied verbatim from `docs/fixtures/` (captured from restic 0.18.1; see restic-cli.md). Load via `Bundle.module` (declare `resources: [.copy("Fixtures")]` in Package.swift). Every parser has a test decoding its fixture; NDJSON parsers additionally get a partial-line-buffering test (feed the fixture in random-sized chunks, expect identical parse) and an unknown-`message_type` tolerance test.
+`Core/Tests/ResticStationCoreTests/Fixtures/` — restic output fixtures are copied verbatim from `docs/fixtures/` (captured from restic 0.18.1; see restic-cli.md). Load via `Bundle.module` (declare `resources: [.copy("Fixtures")]` in Package.swift). Every parser has a test decoding its fixture; NDJSON parsers additionally get a partial-line-buffering test (feed the fixture in random-sized chunks, expect identical parse) and an unknown-`message_type` tolerance test.
+
+The same directory also holds **our own** persisted-file fixtures, which have no `docs/fixtures/` counterpart because they are not restic output: `config-v1.json` (a realistic pre-schema-v2 `config.json`, the input to the migration tests) and `config-v2.json` (the same fleet with per-machine overrides, the input to the resolution tests).
 
 ### BackupEngine scenario table (implemented as one parameterized test per row)
 

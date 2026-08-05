@@ -32,7 +32,7 @@ struct RestoreView: View {
                     Text("Create a backup set with a destination first — every repository you back up to "
                         + "can be browsed and restored from here.")
                 }
-            } else if model.config.resticPath == nil {
+            } else if model.resticPath == nil {
                 ContentUnavailableView {
                     Label("restic is not configured", systemImage: "terminal")
                 } description: {

@@ -1,0 +1,89 @@
+{
+  "onboardingCompleted" : true,
+  "resticPath" : "/opt/homebrew/bin/restic",
+  "sets" : [
+    {
+      "checkPolicy" : {
+        "enabled" : true,
+        "readDataSubsetSlices" : 20
+      },
+      "destinations" : [
+        {
+          "id" : "0A1B2C3D-4E5F-4A1B-8C1D-000000000001",
+          "isPrimary" : true,
+          "label" : "iCloud",
+          "nonSecretEnv" : {},
+          "repoURL" : "/Users/bwh/Library/Mobile Documents/com~apple~CloudDocs/Backups/documents.restic"
+        },
+        {
+          "id" : "1B2C3D4E-5F60-4A1B-8C1D-000000000002",
+          "isPrimary" : false,
+          "label" : "R2 mirror",
+          "nonSecretEnv" : {
+            "AWS_DEFAULT_REGION" : "auto"
+          },
+          "repoURL" : "s3:https://accountid.r2.cloudflarestorage.com/backups/documents"
+        },
+        {
+          "id" : "2C3D4E5F-6061-4A1B-8C1D-000000000003",
+          "isPrimary" : false,
+          "label" : "Big Drive",
+          "nonSecretEnv" : {},
+          "repoURL" : "/Volumes/Big/documents.restic"
+        }
+      ],
+      "excludes" : [
+        "node_modules",
+        ".build",
+        "*.tmp"
+      ],
+      "id" : "6F9619FF-8B86-D011-B42D-00C04FC964FF",
+      "name" : "Documents",
+      "retention" : {
+        "keepDaily" : 7,
+        "keepHourly" : null,
+        "keepLast" : null,
+        "keepMonthly" : 12,
+        "keepWeekly" : 4,
+        "keepYearly" : 2
+      },
+      "schedule" : {
+        "hour" : 2,
+        "kind" : "daily",
+        "minute" : 30
+      },
+      "sources" : [
+        "/Users/bwh/Documents"
+      ],
+      "stalenessWarningDays" : 14
+    },
+    {
+      "checkPolicy" : null,
+      "destinations" : [
+        {
+          "id" : "3D4E5F60-6162-4A1B-8C1D-000000000004",
+          "isPrimary" : true,
+          "label" : "Big Drive",
+          "nonSecretEnv" : {},
+          "repoURL" : "/Volumes/Big/photos.restic"
+        }
+      ],
+      "excludes" : [],
+      "id" : "7A8B9C0D-1E2F-4A3B-8C4D-000000000010",
+      "name" : "Photos",
+      "retention" : null,
+      "schedule" : {
+        "kind" : "weekly",
+        "hour" : 3,
+        "minute" : 0,
+        "weekday" : 1
+      },
+      "sources" : [
+        "/Users/bwh/Pictures"
+      ],
+      "stalenessWarningDays" : 30
+    }
+  ],
+  "showMenuBarIcon" : true,
+  "version" : 1
+}

@@ -77,7 +77,7 @@ extension AppModel {
     /// flow reports — swallowing it here would leave the Restore pane showing
     /// a bare "No snapshots" with no hint of the cause.
     func makeBrowsingRunner() throws -> ResticRunner? {
-        guard let path = config.resticPath, !path.isEmpty else { return nil }
+        guard let path = resticPath, !path.isEmpty else { return nil }
         let processRunner = DefaultProcessRunner()
         return ResticRunner(
             resticPath: path,

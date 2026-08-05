@@ -12,8 +12,15 @@ import Glibc
 public struct ConfigStore: Sendable {
     public let paths: AppPaths
 
+    /// Collaborator for the one part of v1 → v2 migration that leaves
+    /// `config.json`: relocating `resticPath` into `machine.json`. Held
+    /// rather than constructed per call so the store stays a value with a
+    /// single `paths` source of truth.
+    private let machineStore: MachineStore
+
     public init(paths: AppPaths) {
         self.paths = paths
+        self.machineStore = MachineStore(paths: paths)
     }
 
     /// The temp file `save(_:)` writes before `rename(2)`-ing it over
@@ -26,8 +33,13 @@ public struct ConfigStore: Sendable {
     }
 
     /// Missing file → default empty config. Version newer than this build
-    /// supports → `ConfigError.newerVersion`. Otherwise decodes and
-    /// validates (`AppConfig.validate()` is called on every load).
+    /// supports → `ConfigError.newerVersion`. Otherwise decodes, validates
+    /// (`AppConfig.validate()` is called on every load) and, for an older
+    /// schema version, migrates — see ``migrateToCurrentVersion(_:original:)``.
+    ///
+    /// The returned config still carries every `machines` override key: it
+    /// is the *shared*, machine-agnostic view. Call
+    /// `AppConfig.resolved(for:)` to get the effective one for this host.
     public func load() throws -> AppConfig {
         let fileManager = FileManager.default
         guard fileManager.fileExists(atPath: paths.configFile.path) else {
@@ -41,8 +53,97 @@ public struct ConfigStore: Sendable {
             throw ConfigError.newerVersion(found: config.version, supported: AppConfig.currentVersion)
         }
 
+        // Validate the file as it was written, before migrating: a config
+        // that is not valid at its own version is a hard error, and must not
+        // cause a backup file or a rewritten config.json to be produced.
         try config.validate()
-        return config
+
+        guard config.version < AppConfig.currentVersion else {
+            return config
+        }
+        return migrateToCurrentVersion(config, original: data)
+    }
+
+    // MARK: - Migration
+
+    /// v1 → v2 (`docs/data-model.md` §Versioning & migration).
+    ///
+    /// The schema change itself needs no data change: an absent `machines`
+    /// key already means "this set/destination runs everywhere", so a v1
+    /// config *is* a valid v2 config once the version number is bumped. The
+    /// only value that moves is `resticPath`, which is inherently host-local
+    /// and belongs in `machine.json`.
+    ///
+    /// Non-destructive, in this order:
+    /// 1. Adopt `resticPath` into `machine.json` (only if it has none), and
+    ///    clear it from the config **only once that write succeeded**.
+    /// 2. Copy the untouched v1 bytes to `config.v1.backup.json` — never
+    ///    overwriting an existing backup, so a second migration cannot
+    ///    clobber the first one's copy.
+    /// 3. Only if the backup exists, write the v2 config.
+    ///
+    /// Every persistence step is best-effort: a data directory that cannot
+    /// be written must not stop the helper from *running* backups, and the
+    /// in-memory result is correct either way (the migration is a pure
+    /// function of the file, so an unwritten migration simply reruns next
+    /// load). What is *not* best-effort is the ordering — the v1 file is
+    /// never overwritten unless a backup of it exists.
+    private func migrateToCurrentVersion(_ loaded: AppConfig, original: Data) -> AppConfig {
+        var migrated = loaded
+        migrated.version = AppConfig.currentVersion
+
+        if let configResticPath = loaded.resticPath, !configResticPath.isEmpty {
+            do {
+                var machine = try machineStore.load()
+                if machine.resticPath?.isEmpty ?? true {
+                    machine.resticPath = configResticPath
+                    try machineStore.save(machine)
+                }
+                // Recorded host-locally (either just now, or by an earlier
+                // run / the user) — the deprecated top-level field can go.
+                migrated.resticPath = nil
+            } catch {
+                // Leave `resticPath` where it is: as a v2 field it is still
+                // read as the fallback when `machine.json` has none, so the
+                // config keeps working exactly as it did.
+                Self.warn("could not move resticPath into machine.json: \(error)")
+            }
+        }
+
+        do {
+            try writeV1BackupIfAbsent(original)
+        } catch {
+            Self.warn("could not write \(paths.configV1BackupFile.lastPathComponent): \(error). "
+                + "Leaving config.json at version \(loaded.version).")
+            return migrated
+        }
+
+        do {
+            try save(migrated)
+        } catch {
+            Self.warn("could not write the migrated config.json: \(error)")
+        }
+        return migrated
+    }
+
+    /// Copies the pre-migration bytes verbatim. `O_EXCL` is what makes
+    /// "never overwrite an existing backup" a property of the filesystem
+    /// rather than of a check-then-write race: a second migration finds the
+    /// file there and leaves it alone.
+    private func writeV1BackupIfAbsent(_ original: Data) throws {
+        guard !FileManager.default.fileExists(atPath: paths.configV1BackupFile.path) else {
+            return
+        }
+        try paths.ensureDirectories()
+        do {
+            try original.write(to: paths.configV1BackupFile, options: .withoutOverwriting)
+        } catch let error as NSError where error.code == NSFileWriteFileExistsError {
+            return // lost a race with another process; its copy is just as good
+        }
+    }
+
+    private static func warn(_ message: String) {
+        FileHandle.standardError.write(Data("restic-station: config migration: \(message)\n".utf8))
     }
 
     /// Validates, encodes (`.sortedKeys` + `.prettyPrinted` + ISO 8601 with
@@ -55,19 +156,7 @@ public struct ConfigStore: Sendable {
 
         let data = try Self.makeEncoder().encode(config)
         try data.write(to: tempConfigFile)
-
-        let fromPath = tempConfigFile.path
-        let toPath = paths.configFile.path
-        let renameResult = fromPath.withCString { fromC in
-            toPath.withCString { toC in
-                rename(fromC, toC)
-            }
-        }
-        if renameResult != 0 {
-            let renameErrno = errno
-            try? FileManager.default.removeItem(at: tempConfigFile)
-            throw ConfigStoreError.renameFailed(errno: renameErrno, from: fromPath, to: toPath)
-        }
+        try AtomicFile.rename(from: tempConfigFile, to: paths.configFile)
     }
 
     // MARK: - Encoding
@@ -107,6 +196,35 @@ public struct ConfigStore: Sendable {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return formatter
+    }
+}
+
+// MARK: - AtomicFile
+
+/// The `rename(2)` half of the "write a temp file in the same directory,
+/// then rename over the target" convention every writer in this package
+/// follows. Shared by `ConfigStore` and `MachineStore` so the two files get
+/// byte-identical atomicity guarantees.
+enum AtomicFile {
+    /// Renames `from` over `to`, removing the temp file on failure so a
+    /// half-written leftover cannot be mistaken for a valid file.
+    static func rename(from source: URL, to destination: URL) throws {
+        let fromPath = source.path
+        let toPath = destination.path
+        let renameResult = fromPath.withCString { fromC in
+            toPath.withCString { toC in
+                #if canImport(Darwin)
+                Darwin.rename(fromC, toC)
+                #else
+                Glibc.rename(fromC, toC)
+                #endif
+            }
+        }
+        if renameResult != 0 {
+            let renameErrno = errno
+            try? FileManager.default.removeItem(at: source)
+            throw ConfigStoreError.renameFailed(errno: renameErrno, from: fromPath, to: toPath)
+        }
     }
 }
 

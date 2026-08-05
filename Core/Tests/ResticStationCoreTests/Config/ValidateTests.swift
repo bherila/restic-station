@@ -208,3 +208,148 @@ private func makeValidConfig() -> AppConfig {
         try config.validate()
     }
 }
+
+// MARK: - T24: per-machine invariants
+
+/// Invariants 6 (override shape) and 7 (the post-resolution primary rule).
+@Suite struct ValidateMachineOverrideTests {
+
+    // Invariant 6: machineId keys.
+
+    @Test(arguments: ["linux-nas", "nas01", "a", "studio-mac"])
+    func validMachineIdKeysAreAccepted(machineId: String) throws {
+        var config = makeValidConfig()
+        config.sets[0].machines = [machineId: BackupSetMachineOverride(sources: ["/srv/data"])]
+        try config.validate()
+    }
+
+    @Test(arguments: ["", "Linux-NAS", "linux_nas", "linux nas", "linux.nas"])
+    func invalidMachineIdKeyOnASetThrows(machineId: String) {
+        var config = makeValidConfig()
+        config.sets[0].machines = [machineId: BackupSetMachineOverride(enabled: false)]
+        #expect(throws: ConfigError.invalidMachineIdKey(setId: config.sets[0].id, machineId: machineId)) {
+            try config.validate()
+        }
+    }
+
+    @Test func invalidMachineIdKeyOnADestinationThrows() {
+        var config = makeValidConfig()
+        config.sets[0].destinations[0].machines = ["Bad Id": DestinationMachineOverride(repoURL: "/mnt/x")]
+        #expect(throws: ConfigError.invalidMachineIdKey(setId: config.sets[0].id, machineId: "Bad Id")) {
+            try config.validate()
+        }
+    }
+
+    /// "Machines come and go, and the config is shared": a key no machine in
+    /// the fleet claims is a warning for `config validate` (T27), not an
+    /// error here.
+    @Test func anUnknownMachineKeyIsAccepted() throws {
+        var config = makeValidConfig()
+        config.sets[0].machines = ["a-machine-that-never-existed": BackupSetMachineOverride(enabled: false)]
+        try config.validate()
+        #expect(config.referencedMachineIds == ["a-machine-that-never-existed"])
+    }
+
+    // Invariant 6: override values get the same checks as what they replace.
+
+    @Test func relativeOverrideSourcePathThrows() {
+        var config = makeValidConfig()
+        config.sets[0].machines = ["linux-nas": BackupSetMachineOverride(sources: ["srv/data"])]
+        #expect(throws: ConfigError.relativeOverrideSourcePath(
+            setId: config.sets[0].id, machineId: "linux-nas", path: "srv/data"
+        )) {
+            try config.validate()
+        }
+    }
+
+    /// Deliberately *not* the same as the top-level rule: an empty override
+    /// array is legal and means "nothing to back up here". Resolution drops
+    /// the set with a recorded reason.
+    @Test func emptyOverrideSourcesAreAccepted() throws {
+        var config = makeValidConfig()
+        config.sets[0].machines = ["linux-nas": BackupSetMachineOverride(sources: [])]
+        try config.validate()
+        #expect(config.resolved(for: "linux-nas").omissions.map { $0.reason } == [.noSources])
+    }
+
+    @Test func outOfRangeOverrideScheduleThrows() {
+        var config = makeValidConfig()
+        config.sets[0].machines = ["linux-nas": BackupSetMachineOverride(schedule: .daily(hour: 24, minute: 0))]
+        do {
+            try config.validate()
+            Issue.record("expected validate() to throw")
+        } catch let error as ConfigError {
+            guard case .invalidSchedule = error else {
+                Issue.record("expected .invalidSchedule, got \(error)")
+                return
+            }
+        } catch {
+            Issue.record("expected ConfigError, got \(error)")
+        }
+    }
+
+    // Invariant 7: exactly one primary, per machine, after resolution.
+
+    /// The dangerous shape: the machine keeps the set but loses its primary,
+    /// so it would resolve to a set with nowhere to back up to.
+    @Test func disablingThePrimaryWithoutDisablingTheSetIsRejected() {
+        var config = makeValidConfig()
+        config.sets[0].destinations[0].machines = ["linux-nas": DestinationMachineOverride(enabled: false)]
+
+        #expect(throws: ConfigError.notExactlyOnePrimaryDestinationForMachine(
+            setId: config.sets[0].id, machineId: "linux-nas", count: 0
+        )) {
+            try config.validate()
+        }
+    }
+
+    /// The correct way to say "this machine does not run this set".
+    @Test func disablingTheWholeSetForThatMachineIsFine() throws {
+        var config = makeValidConfig()
+        config.sets[0].machines = ["linux-nas": BackupSetMachineOverride(enabled: false)]
+        config.sets[0].destinations[0].machines = ["linux-nas": DestinationMachineOverride(enabled: false)]
+        try config.validate()
+    }
+
+    /// Disabling a *secondary* is exactly the intended use — the Mac-local
+    /// external drive that the Linux host must not probe.
+    @Test func disablingASecondaryIsFine() throws {
+        var config = makeValidConfig()
+        config.sets[0].destinations.append(
+            Destination(id: UUID(), label: "Mac-only HDD", repoURL: "/Volumes/Big", isPrimary: false)
+        )
+        config.sets[0].destinations[1].machines = ["linux-nas": DestinationMachineOverride(enabled: false)]
+        try config.validate()
+
+        let resolved = config.resolved(for: "linux-nas")
+        #expect(resolved.config.sets[0].destinations.count == 1)
+        #expect(resolved.config.sets[0].destinations[0].isPrimary)
+    }
+
+    /// Every mentioned machine is checked, not just the first one.
+    @Test func aBadPrimaryOnTheSecondMachineIsStillCaught() {
+        var config = makeValidConfig()
+        config.sets[0].destinations[0].machines = [
+            "linux-nas": DestinationMachineOverride(repoURL: "/mnt/big"),
+            "old-laptop": DestinationMachineOverride(enabled: false),
+        ]
+
+        #expect(throws: ConfigError.notExactlyOnePrimaryDestinationForMachine(
+            setId: config.sets[0].id, machineId: "old-laptop", count: 0
+        )) {
+            try config.validate()
+        }
+    }
+
+    /// A config with no `machines` keys at all must not pay for invariant 7
+    /// in behaviour: it is exactly as valid (or invalid) as it was before v2.
+    @Test func aConfigWithoutOverridesIsUnaffected() throws {
+        try makeValidConfig().validate()
+
+        var broken = makeValidConfig()
+        broken.sets[0].destinations[0].isPrimary = false
+        #expect(throws: ConfigError.notExactlyOnePrimaryDestination(setId: broken.sets[0].id, count: 0)) {
+            try broken.validate()
+        }
+    }
+}
