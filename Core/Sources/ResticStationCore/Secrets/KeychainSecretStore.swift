@@ -1,15 +1,10 @@
+#if os(macOS)
 import Foundation
 
-/// Typed errors surfaced by `KeychainClient`.
-public enum KeychainError: Error, Sendable, Equatable {
-    /// `security`'s documented exit code 44 — no matching item.
-    case itemNotFound
-    /// Any other nonzero exit from `/usr/bin/security`, with its stderr.
-    case securityCommandFailed(String)
-}
-
-/// All keychain I/O for Restic Station, exactly per `docs/keychain-and-fda.md` §1:
-/// every read AND write goes through the `/usr/bin/security` command-line
+/// The macOS ``SecretStore`` backend: all keychain I/O for Restic Station,
+/// exactly per `docs/keychain-and-fda.md` §1.
+///
+/// Every read AND write goes through the `/usr/bin/security` command-line
 /// tool (never `SecItemAdd`/the Security framework), and every item we
 /// create is created with `-T /usr/bin/security` so a headless launchd
 /// context can read it back without a GUI consent prompt.
@@ -24,10 +19,17 @@ public enum KeychainError: Error, Sendable, Equatable {
 /// Note (documented, not "fixed" — see keychain-and-fda.md): passing
 /// `-w <value>` puts the secret in `security`'s argv, momentarily visible
 /// to `ps` on the local machine. Accepted tradeoff for a single-user
-/// machine; there is no programmatic non-interactive alternative.
-public struct KeychainClient: Sendable {
+/// machine; there is no programmatic non-interactive alternative. It is
+/// specific to `security(1)` and is deliberately **not** reproduced by
+/// ``FileSecretStore``, which never puts a secret in any argv.
+///
+/// Gated to macOS: `/usr/bin/security` does not exist elsewhere, and offering
+/// a backend that can only fail is worse than not offering it at all.
+public struct KeychainSecretStore: SecretStore {
     private static let securityPath = "/usr/bin/security"
     private static let service = "restic-station"
+
+    public let backend = SecretBackend.keychain
 
     private let runner: ProcessRunning
 
@@ -37,16 +39,16 @@ public struct KeychainClient: Sendable {
 
     // MARK: - Repo password
 
-    public func setPassword(_ pw: String, destId: UUID) async throws {
-        try await setValue(pw, account: Self.account(destId))
+    public func setPassword(_ password: String, destId: UUID) async throws {
+        try await setValue(password, account: SecretAccount.password(destId))
     }
 
     public func password(destId: UUID) async throws -> String {
-        try await readValue(account: Self.account(destId))
+        try await readValue(account: SecretAccount.password(destId))
     }
 
     public func deletePassword(destId: UUID) async throws {
-        try await deleteValueTolerant(account: Self.account(destId))
+        try await deleteValueTolerant(account: SecretAccount.password(destId))
     }
 
     // MARK: - Secret env (e.g. S3 keys)
@@ -56,16 +58,8 @@ public struct KeychainClient: Sendable {
     /// password, not arbitrary env vars — `ResticRunner` reads this blob
     /// itself and injects the real env vars.
     public func setSecretEnv(_ env: [String: String], destId: UUID) async throws {
-        let data: Data
-        do {
-            data = try JSONEncoder().encode(env)
-        } catch {
-            throw KeychainError.securityCommandFailed("failed to encode secret env as JSON: \(error)")
-        }
-        guard let json = String(data: data, encoding: .utf8) else {
-            throw KeychainError.securityCommandFailed("failed to encode secret env as UTF-8 JSON")
-        }
-        try await setValue(json, account: Self.envAccount(destId))
+        let json = try SecretEnvBlob.encode(env)
+        try await setValue(json, account: SecretAccount.secretEnv(destId))
     }
 
     /// A missing item is not an error here — it just means no secret env
@@ -73,22 +67,15 @@ public struct KeychainClient: Sendable {
     public func secretEnv(destId: UUID) async throws -> [String: String] {
         let json: String
         do {
-            json = try await readValue(account: Self.envAccount(destId))
-        } catch KeychainError.itemNotFound {
+            json = try await readValue(account: SecretAccount.secretEnv(destId))
+        } catch SecretStoreError.itemNotFound {
             return [:]
         }
-        guard let data = json.data(using: .utf8) else {
-            return [:]
-        }
-        do {
-            return try JSONDecoder().decode([String: String].self, from: data)
-        } catch {
-            throw KeychainError.securityCommandFailed("failed to decode secret env JSON: \(error)")
-        }
+        return try SecretEnvBlob.decode(json)
     }
 
     public func deleteSecretEnv(destId: UUID) async throws {
-        try await deleteValueTolerant(account: Self.envAccount(destId))
+        try await deleteValueTolerant(account: SecretAccount.secretEnv(destId))
     }
 
     // MARK: - Documented command string
@@ -96,22 +83,9 @@ public struct KeychainClient: Sendable {
     /// The exact command restic itself is configured to run via
     /// `RESTIC_PASSWORD_COMMAND` (see restic-cli.md). Our own reads use the
     /// same argv shape (via `readValue`), just invoked through `ProcessRunning`
-    /// instead of a shell string.
-    public static func passwordCommand(destId: UUID) -> String {
-        "\(securityPath) find-generic-password -s \(service) -a \(account(destId)) -w"
-    }
-
-    // MARK: - Account naming
-
-    /// Destination UUIDs never change (architecture.md §Identifiers) — the
-    /// destination UUID *is* the keychain account key, lowercased for a
-    /// stable, predictable account string.
-    private static func account(_ destId: UUID) -> String {
-        destId.uuidString.lowercased()
-    }
-
-    private static func envAccount(_ destId: UUID) -> String {
-        "\(account(destId))-env"
+    /// instead of a shell string. Contains no character needing quoting.
+    public func passwordCommand(destId: UUID) -> String {
+        "\(Self.securityPath) find-generic-password -s \(Self.service) -a \(SecretAccount.password(destId)) -w"
     }
 
     // MARK: - security subprocess plumbing
@@ -119,7 +93,7 @@ public struct KeychainClient: Sendable {
     private func setValue(_ value: String, account: String) async throws {
         do {
             try await deleteValue(account: account)
-        } catch KeychainError.itemNotFound {
+        } catch SecretStoreError.itemNotFound {
             // Nothing to delete — proceed straight to add.
         }
 
@@ -132,7 +106,7 @@ public struct KeychainClient: Sendable {
         ]
         let result = try await runSecurity(argv)
         guard result.exitCode == 0 else {
-            throw KeychainError.securityCommandFailed(Self.trimmedStderr(result))
+            throw SecretStoreError.backendFailed(Self.trimmedStderr(result))
         }
     }
 
@@ -145,10 +119,10 @@ public struct KeychainClient: Sendable {
         ]
         let result = try await runSecurity(argv)
         if result.exitCode == 44 {
-            throw KeychainError.itemNotFound
+            throw SecretStoreError.itemNotFound
         }
         guard result.exitCode == 0 else {
-            throw KeychainError.securityCommandFailed(Self.trimmedStderr(result))
+            throw SecretStoreError.backendFailed(Self.trimmedStderr(result))
         }
         var raw = String(decoding: result.stdout, as: UTF8.self)
         if raw.hasSuffix("\n") {
@@ -157,7 +131,7 @@ public struct KeychainClient: Sendable {
         return raw
     }
 
-    /// Deletes the item, throwing `KeychainError.itemNotFound` (typed) if
+    /// Deletes the item, throwing `SecretStoreError.itemNotFound` (typed) if
     /// there wasn't one. Used both directly and by the tolerant wrapper.
     private func deleteValue(account: String) async throws {
         let argv = [
@@ -167,10 +141,10 @@ public struct KeychainClient: Sendable {
         ]
         let result = try await runSecurity(argv)
         if result.exitCode == 44 {
-            throw KeychainError.itemNotFound
+            throw SecretStoreError.itemNotFound
         }
         guard result.exitCode == 0 else {
-            throw KeychainError.securityCommandFailed(Self.trimmedStderr(result))
+            throw SecretStoreError.backendFailed(Self.trimmedStderr(result))
         }
     }
 
@@ -179,7 +153,7 @@ public struct KeychainClient: Sendable {
     private func deleteValueTolerant(account: String) async throws {
         do {
             try await deleteValue(account: account)
-        } catch KeychainError.itemNotFound {
+        } catch SecretStoreError.itemNotFound {
             // Already gone.
         }
     }
@@ -199,3 +173,4 @@ public struct KeychainClient: Sendable {
         String(decoding: result.stderr, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
+#endif

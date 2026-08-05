@@ -90,15 +90,32 @@ struct ResticErrorTests {
     @Test("ResticRunnerError categories follow architecture.md's taxonomy")
     func runnerErrorCategories() {
         let destinationId = UUID()
-        #expect(ResticRunnerError.keychainUnavailable(destinationId: destinationId).category == .retryable)
+        #expect(ResticRunnerError.secretsUnavailable(destinationId: destinationId).category == .retryable)
         #expect(ResticRunnerError.launchFailed("no such file").category == .terminal)
         #expect(ResticRunnerError.timedOut.category == .terminal)
+    }
+
+    /// Regression test for the review finding that this message branched on
+    /// `#if os(macOS)`. It has no store to ask (it is a property on an error
+    /// value), so it follows the *configured* backend — which in production
+    /// is the same environment every store is built from.
+    @Test("secretsUnavailable is worded for the configured backend, not the host OS")
+    func secretsUnavailableWordingFollowsTheBackend() {
+        let message = ResticRunnerError.secretsUnavailable(destinationId: UUID()).userFacingMessage
+        let backend = SecretBackend.configured
+        #expect(message == "\(backend.unavailableSummary) \(backend.unavailableAdvice)")
+
+        // Both backends produce a "what happened" + "one next step" pair, and
+        // neither borrows the other's remediation.
+        #expect(SecretBackend.file.unavailableSummary.contains("secrets file"))
+        #expect(!SecretBackend.file.unavailableAdvice.lowercased().contains("keychain"))
+        #expect(SecretBackend.keychain.unavailableAdvice.contains("Unlock your login keychain"))
     }
 
     @Test("ResticRunnerError descriptions never carry secret material")
     func runnerErrorDescriptions() {
         let destinationId = UUID()
-        let error = ResticRunnerError.keychainUnavailable(destinationId: destinationId)
+        let error = ResticRunnerError.secretsUnavailable(destinationId: destinationId)
         #expect(error.description.contains(destinationId.uuidString))
         #expect(!error.userFacingMessage.isEmpty)
     }

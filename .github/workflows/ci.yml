@@ -21,13 +21,29 @@ jobs:
           OUT=$(.build/debug/restic-station-helper --help)
           echo "$OUT"
           # `timer` is Linux-only (T26); the macos job asserts its absence.
-          for sub in tick run-set init-secondary restore probe-repo unlock fda-check timer version; do
+          for sub in tick run-set init-secondary restore probe-repo unlock fda-check secret timer version; do
             echo "$OUT" | grep -qE "^  $sub( |$)" || { echo "missing subcommand: $sub"; exit 1; }
           done
+          # print-password is registered but deliberately hidden: it is the
+          # machinery behind RESTIC_PASSWORD_COMMAND, not a user action.
+          if echo "$OUT" | grep -qE "^  print-password( |$)"; then
+            echo "print-password must not appear in --help"
+            exit 1
+          fi
+          # …hidden, but reachable.
+          .build/debug/restic-station-helper print-password --help >/dev/null
+          .build/debug/restic-station-helper secret --help
       # SwiftPM does not run a path dependency's test targets, so Core's
       # suite still needs its own invocation.
       - name: Run Core unit tests
         run: swift test --package-path Core
+      # The Linux secret backend, end to end against the real binary. restic
+      # is not installed in this container, so the script skips its restic
+      # half (T29 owns the Linux restic matrix) and still asserts the file
+      # modes, the exact print-password bytes, and that `secret list` prints
+      # no secret value.
+      - name: Secret CLI + FileSecretStore end to end
+        run: scripts/secret-cli-test.sh
 
       # T25 acceptance criteria that only a real Linux run can show.
       - name: fda-check is a no-op on Linux
@@ -205,6 +221,12 @@ jobs:
         run: swift test --package-path Core
       - name: Run integration test
         run: scripts/integration-test.sh
+      # Forces the Linux file backend on macOS, where restic IS installed —
+      # so this run also proves the acceptance criterion "restic
+      # authenticates via RESTIC_PASSWORD_COMMAND against FileSecretStore",
+      # against the helper inside the real app bundle.
+      - name: Secret CLI + FileSecretStore end to end (file backend on macOS)
+        run: scripts/secret-cli-test.sh "dd/Build/Products/Debug/Restic Station.app/Contents/MacOS/restic-station-helper"
       - name: Ad-hoc sign and package app artifact
         run: |
           APP="dd/Build/Products/Debug/Restic Station.app"

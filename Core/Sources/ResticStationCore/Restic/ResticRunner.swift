@@ -42,7 +42,7 @@ public struct ResticOutcome: Sendable {
 // MARK: - ResticRunner
 
 /// The single place restic is executed. Builds the environment, performs the
-/// keychain pre-flight, streams NDJSON, and maps exit codes.
+/// secret-store pre-flight, streams NDJSON, and maps exit codes.
 ///
 /// **Environment (docs/restic-cli.md §General).** The inherited environment
 /// is *replaced*, never extended: a scheduled launchd invocation and a
@@ -55,17 +55,19 @@ public struct ResticOutcome: Sendable {
 ///    `ssh` via PATH lookup. Every program *we* spawn is named absolutely;
 ///    the PATH exists solely for restic's own children, and a destination's
 ///    `nonSecretEnv` may override it (e.g. to reach a Homebrew `rclone`).
-/// 2. from-destination's `nonSecretEnv`, then its keychain secret-env blob
-/// 3. destination's `nonSecretEnv`, then its keychain secret-env blob —
+/// 2. from-destination's `nonSecretEnv`, then its stored secret-env blob
+/// 3. destination's `nonSecretEnv`, then its stored secret-env blob —
 ///    **so on a key collision the destination (the `-r` repo) wins over the
 ///    from-repo.** Two S3 destinations in one set needing *different*
 ///    credentials is a known v1 limitation (restic-cli.md §init secondary).
-///    Within one destination the keychain blob wins over `nonSecretEnv`, so
+///    Within one destination the stored blob wins over `nonSecretEnv`, so
 ///    a non-secret config entry can never shadow a stored credential.
-/// 4. `RESTIC_CACHE_DIR`, `RESTIC_PASSWORD_COMMAND` and (when a
-///    from-destination is present) `RESTIC_FROM_PASSWORD_COMMAND` — written
-///    last so no user-supplied `nonSecretEnv` entry can hijack how restic
-///    obtains a password or where it caches.
+/// 4. `RESTIC_CACHE_DIR`, the secret store's own
+///    `passwordCommandEnvironment` (empty on the keychain backend),
+///    `RESTIC_PASSWORD_COMMAND` and (when a from-destination is present)
+///    `RESTIC_FROM_PASSWORD_COMMAND` — written last so no user-supplied
+///    `nonSecretEnv` entry can hijack how restic obtains a password or where
+///    it caches.
 ///
 /// **Secrets.** Passwords never appear in argv (`ResticCommand` guarantees
 /// this) and are never logged: the pre-flight read is discarded, and no env
@@ -82,14 +84,14 @@ public final class ResticRunner: Sendable {
 
     private let resticPath: String
     private let paths: AppPaths
-    private let keychain: KeychainClient
+    private let secrets: any SecretStore
     private let runner: ProcessRunning
     private let decoder = ResticMessageDecoder()
 
-    public init(resticPath: String, paths: AppPaths, keychain: KeychainClient, runner: ProcessRunning) {
+    public init(resticPath: String, paths: AppPaths, secrets: any SecretStore, runner: ProcessRunning) {
         self.resticPath = resticPath
         self.paths = paths
-        self.keychain = keychain
+        self.secrets = secrets
         self.runner = runner
     }
 
@@ -116,12 +118,13 @@ public final class ResticRunner: Sendable {
         try Task.checkCancellation()
 
         // Pre-flight: read every password we are about to make restic read,
-        // so a locked keychain is a clean, retryable error instead of a
+        // so an unreadable secret store (a locked keychain, a secrets file
+        // with the wrong mode) is a clean, retryable error instead of a
         // confusing restic failure mid-run (T09 scenario 9). The values are
         // discarded immediately — only reachability is being tested.
-        try await preflightKeychain(destination: inv.destination)
+        try await preflightSecrets(destination: inv.destination)
         if let fromDestination = inv.fromDestination {
-            try await preflightKeychain(destination: fromDestination)
+            try await preflightSecrets(destination: fromDestination)
         }
 
         let env = try await environment(for: inv)
@@ -130,7 +133,7 @@ public final class ResticRunner: Sendable {
 
     /// Runs a command that targets no repository — currently only
     /// `.version`, used to validate a discovered restic binary before any
-    /// destination exists. No keychain pre-flight, no password env.
+    /// destination exists. No secret-store pre-flight, no password env.
     @discardableResult
     public func runWithoutRepository(
         _ cmd: ResticCommand,
@@ -146,16 +149,25 @@ public final class ResticRunner: Sendable {
         return try await execute(cmd, env: baseEnvironment(), onLine: onLine, onRawLine: onRawLine, timeout: timeout)
     }
 
-    // MARK: - Keychain pre-flight
+    /// Which secret backend this runner reads passwords from.
+    ///
+    /// Exposed so collaborators that only hold a `ResticRunner` — notably
+    /// `Reachability` — can word a secret-store failure for the store
+    /// actually in use rather than for the host OS.
+    public var secretBackend: SecretBackend {
+        secrets.backend
+    }
 
-    private func preflightKeychain(destination: Destination) async throws {
+    // MARK: - Secret-store pre-flight
+
+    private func preflightSecrets(destination: Destination) async throws {
         do {
-            _ = try await keychain.password(destId: destination.id)
+            _ = try await secrets.password(destId: destination.id)
         } catch {
-            // The underlying `security` failure text is intentionally dropped
+            // The underlying backend failure text is intentionally dropped
             // here rather than wrapped: it is of no use to the user and this
             // error string ends up in run logs.
-            throw ResticRunnerError.keychainUnavailable(destinationId: destination.id)
+            throw ResticRunnerError.secretsUnavailable(destinationId: destination.id)
         }
     }
 
@@ -174,20 +186,25 @@ public final class ResticRunner: Sendable {
 
         // Written last: these must not be overridable by configured env.
         env["RESTIC_CACHE_DIR"] = paths.resticCacheDir.path
-        env["RESTIC_PASSWORD_COMMAND"] = KeychainClient.passwordCommand(destId: inv.destination.id)
+        // What the password command's child needs to find the same store —
+        // empty for the keychain backend, so macOS's assembled environment is
+        // exactly what it was before T23. See
+        // `SecretStore.passwordCommandEnvironment`.
+        env.merge(secrets.passwordCommandEnvironment) { _, new in new }
+        env["RESTIC_PASSWORD_COMMAND"] = secrets.passwordCommand(destId: inv.destination.id)
         if let fromDestination = inv.fromDestination {
-            env["RESTIC_FROM_PASSWORD_COMMAND"] = KeychainClient.passwordCommand(destId: fromDestination.id)
+            env["RESTIC_FROM_PASSWORD_COMMAND"] = secrets.passwordCommand(destId: fromDestination.id)
         }
         return env
     }
 
     private func secretEnv(for destination: Destination) async throws -> [String: String] {
         do {
-            return try await keychain.secretEnv(destId: destination.id)
+            return try await secrets.secretEnv(destId: destination.id)
         } catch {
-            // Same reasoning as the pre-flight: a keychain that cannot be
+            // Same reasoning as the pre-flight: a secret store that cannot be
             // read is retryable, and the raw failure text never propagates.
-            throw ResticRunnerError.keychainUnavailable(destinationId: destination.id)
+            throw ResticRunnerError.secretsUnavailable(destinationId: destination.id)
         }
     }
 

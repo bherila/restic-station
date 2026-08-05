@@ -28,6 +28,10 @@ struct HelperMain: AsyncParsableCommand {
             ProbeRepo.self,
             Unlock.self,
             FdaCheck.self,
+            Secret.self,
+            // Hidden from --help (`shouldDisplay: false`): it exists for
+            // RESTIC_PASSWORD_COMMAND, not for people.
+            PrintPassword.self,
         ]
         #if os(Linux)
         subcommands.append(TimerCommand.self)

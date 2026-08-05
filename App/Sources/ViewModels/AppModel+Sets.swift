@@ -15,11 +15,37 @@ extension AppModel {
 
     // MARK: - Collaborators
 
-    /// A keychain client bound to the same `security(1)` mechanics the helper
-    /// uses (`docs/keychain-and-fda.md` §1). Cheap to build — it is a struct
-    /// wrapping a process runner.
-    var keychain: KeychainClient {
-        KeychainClient(runner: DefaultProcessRunner())
+    /// The secret store this app writes destination passwords into — the
+    /// same one the helper reads (`docs/keychain-and-fda.md`): the login
+    /// keychain by default, or `secrets.json` when
+    /// `RESTIC_STATION_SECRET_BACKEND=file`. Cheap to build.
+    ///
+    /// **The helper path is not this process.** With the file backend the
+    /// store bakes an executable into `RESTIC_PASSWORD_COMMAND`, and restic
+    /// runs it as a child to read the password. Naming the app binary there
+    /// would hand restic a SwiftUI app that cannot print a password and
+    /// would try to open a UI, so every app-side store names the *embedded
+    /// helper* — the same binary `HelperInvoker` and the LaunchAgent use.
+    /// The factory requires this explicitly, so a new app-side call site
+    /// cannot forget it.
+    ///
+    /// Throws only when the `RESTIC_STATION_SECRET_BACKEND` override is
+    /// unrecognised — deliberately a hard error rather than a silent
+    /// fallback to the wrong store.
+    func makeSecretStore() throws -> any SecretStore {
+        try SecretStoreFactory.make(
+            paths: paths,
+            runner: DefaultProcessRunner(),
+            helperExecutablePath: HelperInvoker.helperURL.path
+        )
+    }
+
+    /// `makeSecretStore()` for the call sites that can only degrade (reading
+    /// back a password to pre-fill an editor, deleting a destination's
+    /// secrets). Every site that can *report* the failure calls the throwing
+    /// form instead.
+    var secrets: (any SecretStore)? {
+        try? makeSecretStore()
     }
 
     // MARK: - Sets
@@ -106,15 +132,15 @@ extension AppModel {
         password: String?,
         secretEnv: [String: String]?
     ) async throws {
-        let keychain = self.keychain
+        let store = try makeSecretStore()
         if let password, !password.isEmpty {
-            try await keychain.setPassword(password, destId: destId)
+            try await store.setPassword(password, destId: destId)
         }
         if let secretEnv {
             if secretEnv.isEmpty {
-                try await keychain.deleteSecretEnv(destId: destId)
+                try await store.deleteSecretEnv(destId: destId)
             } else {
-                try await keychain.setSecretEnv(secretEnv, destId: destId)
+                try await store.setSecretEnv(secretEnv, destId: destId)
             }
         }
     }
@@ -123,18 +149,18 @@ extension AppModel {
     /// password is not an error here (a destination can exist before its
     /// password was ever stored) — the caller shows "leave blank to keep".
     func loadDestinationSecrets(destId: UUID) async -> (password: String?, secretEnv: [String: String]) {
-        let keychain = self.keychain
-        let password = try? await keychain.password(destId: destId)
-        let env = (try? await keychain.secretEnv(destId: destId)) ?? [:]
+        guard let store = self.secrets else { return (nil, [:]) }
+        let password = try? await store.password(destId: destId)
+        let env = (try? await store.secretEnv(destId: destId)) ?? [:]
         return (password, env)
     }
 
-    /// Both keychain items for a destination, as promised by the remove
-    /// confirmation copy. Deletes are idempotent in `KeychainClient`.
+    /// Both stored secrets for a destination, as promised by the remove
+    /// confirmation copy. Deletes are idempotent in every `SecretStore`.
     func deleteDestinationSecrets(destId: UUID) async {
-        let keychain = self.keychain
-        try? await keychain.deletePassword(destId: destId)
-        try? await keychain.deleteSecretEnv(destId: destId)
+        guard let store = self.secrets else { return }
+        try? await store.deletePassword(destId: destId)
+        try? await store.deleteSecretEnv(destId: destId)
     }
 
     // MARK: - Probe
@@ -233,16 +259,22 @@ extension AppModel {
 
     /// See `initializeRepository(setId:destId:)` for why this bypasses the
     /// helper. Everything else about the invocation is the shared Core path:
-    /// argv from `ResticCommand.initRepo`, env and the keychain pre-flight
+    /// argv from `ResticCommand.initRepo`, env and the secret pre-flight
     /// from `ResticRunner`.
     private func initializePrimaryRepository(_ destination: Destination) async -> DestinationInitOutcome {
         guard let resticPath = config.resticPath, !resticPath.isEmpty else {
             return .failed("No restic binary is configured. Set the restic path in Settings, then try again.")
         }
+        guard let secrets = self.secrets else {
+            return .failed(
+                "Secret storage is misconfigured (check \(SecretBackend.environmentKey)), "
+                    + "so the repository password could not be read."
+            )
+        }
         let runner = ResticRunner(
             resticPath: resticPath,
             paths: paths,
-            keychain: keychain,
+            secrets: secrets,
             runner: DefaultProcessRunner()
         )
         do {

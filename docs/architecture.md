@@ -61,7 +61,7 @@ public protocol ProcessRunning: Sendable {
 }
 ```
 
-The production implementation (`DefaultProcessRunner`) wraps `Process` + pipes. Tests inject `FakeProcessRunner` (see `testing.md`). `KeychainClient`, `ResticRunner`, and `Reachability` all take a `ProcessRunning` in their initializers.
+The production implementation (`DefaultProcessRunner`) wraps `Process` + pipes. Tests inject `FakeProcessRunner` (see `testing.md`). `KeychainSecretStore`, `ResticRunner`, and `Reachability` all take a `ProcessRunning` in their initializers. Secret storage itself is behind the `SecretStore` protocol (`KeychainSecretStore` on macOS, `FileSecretStore` elsewhere — see `keychain-and-fda.md`); `ResticRunner` and `BackupEngine` take `any SecretStore`, not a concrete backend.
 
 ## restic discovery
 

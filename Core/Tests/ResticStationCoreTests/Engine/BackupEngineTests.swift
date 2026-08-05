@@ -83,7 +83,7 @@ struct BackupEngineTests {
     /// Everything one engine test needs, wired to a temp data dir. Local
     /// destinations are used throughout so `Reachability` answers from the
     /// filesystem and every spawned argv in `fake.invocations` is either a
-    /// keychain read or a restic command the engine itself issued.
+    /// restic command the engine itself issued.
     struct Env {
         let root: URL
         let paths: AppPaths
@@ -125,6 +125,8 @@ struct BackupEngineTests {
     ///   - reachableSecondaries: one flag per secondary; an unreachable one
     ///     simply has no repository directory on disk.
     static func makeEnv(
+        secretsUnavailableFor: [UUID] = [],
+        secretBackend: SecretBackend = .platformDefault,
         script: [FakeProcessRunner.Expectation],
         retention: RetentionPolicy? = RetentionPolicy(keepLast: 3),
         checkPolicy: CheckPolicy? = nil,
@@ -179,11 +181,14 @@ struct BackupEngineTests {
         let processRunner: ProcessRunning = onSpawn.map {
             ObservingProcessRunner(inner: fake, onSpawn: $0)
         } ?? fake
-        let keychain = KeychainClient(runner: processRunner)
+        let secrets = FakeSecretStore(defaultPassword: "repo-password", backend: secretBackend)
+        for id in secretsUnavailableFor {
+            secrets.failPassword(for: id)
+        }
         let restic = ResticRunner(
             resticPath: resticPath,
             paths: paths,
-            keychain: keychain,
+            secrets: secrets,
             runner: processRunner
         )
         let runStore = RunStore(paths: paths, now: clock.now)
@@ -193,7 +198,7 @@ struct BackupEngineTests {
             config: config,
             paths: paths,
             restic: restic,
-            keychain: keychain,
+            secrets: secrets,
             runStore: runStore,
             stateStore: stateStore,
             reachability: Reachability(restic: restic),
@@ -216,38 +221,14 @@ struct BackupEngineTests {
 
     // MARK: Scripting helpers
 
-    static func securityRead(_ account: String) -> [String] {
-        ["/usr/bin/security", "find-generic-password", "-s", "restic-station", "-a", account]
-    }
-
-    /// The engine's own step-1 pre-flight read (and every other
-    /// `keychainAvailable` read): one `find-generic-password` per destination.
-    static func keychainPassword(_ id: UUID, exitCode: Int32 = 0) -> FakeProcessRunner.Expectation {
-        .init(
-            argvPrefix: securityRead(id.uuidString.lowercased()),
-            stdoutLines: exitCode == 0 ? ["repo-password"] : [],
-            stderr: exitCode == 0 ? "" : "SecKeychainSearchCopyNext: User interaction is not allowed.",
-            exitCode: exitCode
-        )
-    }
-
-    static func keychainEnv(_ id: UUID) -> FakeProcessRunner.Expectation {
-        .init(argvPrefix: securityRead("\(id.uuidString.lowercased())-env"), exitCode: 44)
-    }
-
-    /// The keychain reads `ResticRunner` performs before one spawn: the
-    /// destination pre-flight, the from-destination pre-flight (copy /
-    /// init --from-repo only), then the secret-env blobs (from-destination
-    /// first, destination last — see `ResticRunner.environment(for:)`).
-    static func keychainReads(dest: UUID, from: UUID? = nil) -> [FakeProcessRunner.Expectation] {
-        guard let from else {
-            return [keychainPassword(dest), keychainEnv(dest)]
-        }
-        return [keychainPassword(dest), keychainPassword(from), keychainEnv(from), keychainEnv(dest)]
-    }
-
-    /// One scripted restic spawn: the keychain reads it triggers, then the
-    /// reply itself. `argv` is matched in full (prefix == whole argv).
+    /// One scripted restic spawn. `argv` is matched in full (prefix == whole
+    /// argv).
+    ///
+    /// Before T23 this also had to script the four `/usr/bin/security` reads
+    /// each spawn triggered; secrets now come from an injected
+    /// `FakeSecretStore`, so the process script is restic and nothing else.
+    /// `dest`/`from` are kept in the signature because they document which
+    /// destinations a call reads secrets for.
     static func resticCall(
         _ argv: [String],
         dest: UUID,
@@ -256,7 +237,7 @@ struct BackupEngineTests {
         stderr: String = "",
         exitCode: Int32 = 0
     ) -> [FakeProcessRunner.Expectation] {
-        keychainReads(dest: dest, from: from) + [
+        [
             .init(
                 argvPrefix: [resticPath] + argv,
                 stdoutLines: stdoutLines,
@@ -286,7 +267,7 @@ struct BackupEngineTests {
 
     @Test("row 1: primary + 2 reachable secondaries + retention → backup, 2 copies, 3 prunes, one group")
     func rowOneHappyPath() async throws {
-        var script = [Self.keychainPassword(Self.primaryId)]
+        var script: [FakeProcessRunner.Expectation] = []
         let env = Self.makeEnv(script: [])
         defer { env.cleanUp() }
         let primaryRepo = env.primary.repoURL
@@ -356,7 +337,7 @@ struct BackupEngineTests {
     @Test("row 2: primary unreachable → failed backup record, no restic at all, lastBackupStart still updated")
     func rowTwoPrimaryUnreachable() async throws {
         let env = Self.makeEnv(
-            script: [Self.keychainPassword(Self.primaryId)],
+            script: [],
             primaryReachable: false
         )
         defer { env.cleanUp() }
@@ -402,7 +383,7 @@ struct BackupEngineTests {
             status.lastSyncedAt = staleSync
         }
 
-        var script = [Self.keychainPassword(Self.primaryId)]
+        var script: [FakeProcessRunner.Expectation] = []
         script += Self.resticCall(
             Self.backupArgv(env.primary.repoURL), dest: Self.primaryId, stdoutLines: Self.backupStream()
         )
@@ -446,7 +427,7 @@ struct BackupEngineTests {
         defer { env.cleanUp() }
         let secondary = env.secondaries[0]
 
-        var script = [Self.keychainPassword(Self.primaryId)]
+        var script: [FakeProcessRunner.Expectation] = []
         script += Self.resticCall(
             Self.backupArgv(env.primary.repoURL),
             dest: Self.primaryId,
@@ -481,7 +462,7 @@ struct BackupEngineTests {
         let env = Self.makeEnv(script: [])
         defer { env.cleanUp() }
 
-        var script = [Self.keychainPassword(Self.primaryId)]
+        var script: [FakeProcessRunner.Expectation] = []
         script += Self.resticCall(
             Self.backupArgv(env.primary.repoURL),
             dest: Self.primaryId,
@@ -515,7 +496,7 @@ struct BackupEngineTests {
         let failing = env.secondaries[0]
         let healthy = env.secondaries[1]
 
-        var script = [Self.keychainPassword(Self.primaryId)]
+        var script: [FakeProcessRunner.Expectation] = []
         script += Self.resticCall(
             Self.backupArgv(env.primary.repoURL), dest: Self.primaryId, stdoutLines: Self.backupStream()
         )
@@ -571,7 +552,7 @@ struct BackupEngineTests {
         defer { env.cleanUp() }
         let lockedError = (try? FixtureLoader.string("locked-error.json").trimmingCharacters(in: .newlines)) ?? ""
 
-        var script = [Self.keychainPassword(Self.primaryId)]
+        var script: [FakeProcessRunner.Expectation] = []
         script += Self.resticCall(
             Self.backupArgv(env.primary.repoURL),
             dest: Self.primaryId,
@@ -616,7 +597,7 @@ struct BackupEngineTests {
         let env = Self.makeEnv(script: [], retention: nil, reachableSecondaries: [])
         defer { env.cleanUp() }
 
-        var script = [Self.keychainPassword(Self.primaryId)]
+        var script: [FakeProcessRunner.Expectation] = []
         script += Self.resticCall(
             Self.backupArgv(env.primary.repoURL), dest: Self.primaryId, exitCode: 11
         )
@@ -639,11 +620,11 @@ struct BackupEngineTests {
         #expect(backup.errorSummary?.contains("locked") == true)
     }
 
-    // MARK: - Row 9 — keychain locked pre-flight (safety: no trace at all)
+    // MARK: - Row 9 — unreadable secret store (safety: no trace at all)
 
-    @Test("row 9: a locked keychain leaves NO run record, NO lastBackupStart, NO lock file")
-    func rowNineKeychainLocked() async throws {
-        let env = Self.makeEnv(script: [Self.keychainPassword(Self.primaryId, exitCode: 1)])
+    @Test("row 9: an unreadable secret store leaves NO run record, NO lastBackupStart, NO lock file")
+    func rowNineSecretsUnavailable() async throws {
+        let env = Self.makeEnv(secretsUnavailableFor: [Self.primaryId], script: [])
         defer { env.cleanUp() }
 
         let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
@@ -652,9 +633,9 @@ struct BackupEngineTests {
             Issue.record("expected .retryable, got \(outcome)")
             return
         }
-        // Exactly one process was ever spawned: the pre-flight read itself.
-        #expect(env.fake.invocations.count == 1)
-        #expect(env.fake.invocations[0].argv == Self.securityRead(Self.primaryId.uuidString.lowercased()) + ["-w"])
+        // Nothing was spawned at all — the pre-flight is not a subprocess,
+        // and it runs before anything else the engine does.
+        #expect(env.fake.invocations.isEmpty)
         #expect(env.indexEntries.isEmpty)
         #expect(env.stateStore.readScheduleState() == nil, "no schedule-state write at all")
         #expect(
@@ -664,11 +645,38 @@ struct BackupEngineTests {
         #expect(env.stateStore.readCurrentRun(setId: Self.setId) == nil)
     }
 
+    /// Regression test for the review finding that the engine's wording
+    /// branched on `#if os(macOS)`. The `.retryable` reason is shown to the
+    /// user and logged; on a host running the file backend it must point at
+    /// the secrets file, not at a login keychain the host may not even have.
+    @Test("row 9: the retryable reason names the store in use, not the host OS")
+    func rowNineReasonFollowsTheBackend() async throws {
+        for backend in SecretBackend.allCases {
+            let env = Self.makeEnv(
+                secretsUnavailableFor: [Self.primaryId],
+                secretBackend: backend,
+                script: []
+            )
+            defer { env.cleanUp() }
+
+            let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
+
+            guard case .retryable(let reason) = outcome else {
+                Issue.record("expected .retryable, got \(outcome)")
+                return
+            }
+            #expect(reason.hasPrefix(backend.displayName), "reason was: \(reason)")
+            if backend == .file {
+                #expect(!reason.lowercased().contains("keychain"), "reason was: \(reason)")
+            }
+        }
+    }
+
     // MARK: - Row 10 — set lock busy
 
     @Test("row 10: set lock busy → one .skipped record and nothing else (no lastBackupStart)")
     func rowTenLockBusy() async throws {
-        let env = Self.makeEnv(script: [Self.keychainPassword(Self.primaryId)])
+        let env = Self.makeEnv(script: [])
         defer { env.cleanUp() }
         try env.paths.ensureDirectories()
 
@@ -704,7 +712,7 @@ struct BackupEngineTests {
         defer { env.cleanUp() }
         let secondary = env.secondaries[0]
 
-        var script = [Self.keychainPassword(Self.primaryId)]
+        var script: [FakeProcessRunner.Expectation] = []
         script += Self.resticCall(
             Self.backupArgv(env.primary.repoURL), dest: Self.primaryId, stdoutLines: Self.backupStream()
         )
@@ -735,7 +743,7 @@ struct BackupEngineTests {
         defer { env.cleanUp() }
         let secondary = env.secondaries[0]
 
-        var script = [Self.keychainPassword(Self.primaryId)]
+        var script: [FakeProcessRunner.Expectation] = []
         script += Self.resticCall(
             Self.backupArgv(env.primary.repoURL), dest: Self.primaryId, stdoutLines: Self.backupStream()
         )
@@ -764,7 +772,7 @@ struct BackupEngineTests {
         let env = Self.makeEnv(script: [], retention: nil, reachableSecondaries: [])
         defer { env.cleanUp() }
 
-        var script = [Self.keychainPassword(Self.primaryId)]
+        var script: [FakeProcessRunner.Expectation] = []
         script += Self.resticCall(
             Self.backupArgv(env.primary.repoURL),
             dest: Self.primaryId,
@@ -816,7 +824,7 @@ struct BackupEngineTests {
         defer { env.cleanUp() }
         let secondary = env.secondaries[0]
 
-        var script = [Self.keychainPassword(Self.primaryId)]
+        var script: [FakeProcessRunner.Expectation] = []
         script += Self.resticCall(
             Self.backupArgv(env.primary.repoURL), dest: Self.primaryId, stdoutLines: Self.backupStream()
         )
@@ -919,7 +927,7 @@ struct BackupEngineTests {
         let env = Self.makeEnv(script: [], retention: nil, reachableSecondaries: [])
         defer { env.cleanUp() }
 
-        var script = [Self.keychainPassword(Self.primaryId)]
+        var script: [FakeProcessRunner.Expectation] = []
         script += Self.resticCall(
             Self.backupArgv(env.primary.repoURL), dest: Self.primaryId, stdoutLines: Self.backupStream()
         )
@@ -946,7 +954,7 @@ struct BackupEngineTests {
             state.checkCount = 1
         }
 
-        var script = [Self.keychainPassword(Self.primaryId)]
+        var script: [FakeProcessRunner.Expectation] = []
         script += Self.resticCall(
             ["-r", env.primary.repoURL, "check", "--read-data-subset=8/20"],
             dest: Self.primaryId,
@@ -983,7 +991,7 @@ struct BackupEngineTests {
             state.checkCount = 1
         }
 
-        var script = [Self.keychainPassword(Self.primaryId)]
+        var script: [FakeProcessRunner.Expectation] = []
         script += Self.resticCall(
             ["-r", env.primary.repoURL, "check", "--read-data-subset=8/20"],
             dest: Self.primaryId,
@@ -1016,7 +1024,7 @@ struct BackupEngineTests {
             state.checkCount = 3 // this run is the 4th
         }
 
-        var script = [Self.keychainPassword(Self.primaryId)]
+        var script: [FakeProcessRunner.Expectation] = []
         script += Self.resticCall(
             ["-r", env.primary.repoURL, "check", "--read-data-subset=4/20"],
             dest: Self.primaryId,
@@ -1045,7 +1053,7 @@ struct BackupEngineTests {
 
     @Test("runCheck: set lock busy → .skipped record, no restic")
     func checkLockBusy() async throws {
-        let env = Self.makeEnv(script: [Self.keychainPassword(Self.primaryId)], reachableSecondaries: [])
+        let env = Self.makeEnv(script: [], reachableSecondaries: [])
         defer { env.cleanUp() }
         try env.paths.ensureDirectories()
         let holder = FileLock(path: env.paths.setLockFile(setId: Self.setId))
@@ -1075,7 +1083,7 @@ struct BackupEngineTests {
         }
         try env.stateStore.updateRepoStatus(destId: fresh.id) { $0.lastSyncedAt = Self.t0 }
 
-        var script = [Self.keychainPassword(Self.primaryId)]
+        var script: [FakeProcessRunner.Expectation] = []
         script += Self.resticCall(Self.forgetArgv(env.primary.repoURL), dest: Self.primaryId)
         script += Self.resticCall(Self.forgetArgv(fresh.repoURL), dest: Self.secondaryBId)
         env.fake.script = script
@@ -1105,7 +1113,7 @@ struct BackupEngineTests {
             try env.stateStore.updateRepoStatus(destId: secondary.id) { $0.lastSyncedAt = Self.t0 }
         }
 
-        var script = [Self.keychainPassword(Self.primaryId)]
+        var script: [FakeProcessRunner.Expectation] = []
         script += Self.resticCall(Self.forgetArgv(env.primary.repoURL), dest: Self.primaryId)
         env.fake.script = script
 
@@ -1126,7 +1134,7 @@ struct BackupEngineTests {
         let status = await env.engine.runPrune(env.set)
 
         #expect(status == .skipped)
-        #expect(env.fake.invocations.isEmpty, "not even a keychain read — the guard is the first thing checked")
+        #expect(env.fake.invocations.isEmpty, "nothing spawned — the guard is the first thing checked")
         #expect(env.indexEntries.isEmpty)
     }
 
@@ -1138,7 +1146,7 @@ struct BackupEngineTests {
         defer { env.cleanUp() }
         let target = env.root.appendingPathComponent("restore-target", isDirectory: true).path
 
-        var script = [Self.keychainPassword(Self.primaryId)]
+        var script: [FakeProcessRunner.Expectation] = []
         script += Self.resticCall(
             [
                 "-r", env.primary.repoURL, "restore", "--json", "abc123:/proj/src",
@@ -1172,7 +1180,7 @@ struct BackupEngineTests {
 
     @Test("safety: a restore cannot start while the set lock is held by a backup")
     func restoreRespectsSetLock() async throws {
-        let env = Self.makeEnv(script: [Self.keychainPassword(Self.primaryId)])
+        let env = Self.makeEnv(script: [])
         defer { env.cleanUp() }
         try env.paths.ensureDirectories()
         let holder = FileLock(path: env.paths.setLockFile(setId: Self.setId))
@@ -1195,7 +1203,7 @@ struct BackupEngineTests {
         let env = Self.makeEnv(script: [], reachableSecondaries: [])
         defer { env.cleanUp() }
 
-        var script = [Self.keychainPassword(Self.primaryId)]
+        var script: [FakeProcessRunner.Expectation] = []
         script += Self.resticCall(
             ["-r", env.primary.repoURL, "restore", "--json", "abc123", "--target", "/tmp/target"],
             dest: Self.primaryId,
@@ -1225,7 +1233,7 @@ struct BackupEngineTests {
         defer { env.cleanUp() }
         let secondary = env.secondaries[0]
 
-        var script = [Self.keychainPassword(Self.secondaryAId), Self.keychainPassword(Self.primaryId)]
+        var script: [FakeProcessRunner.Expectation] = []
         script += Self.resticCall(
             [
                 "-r", secondary.repoURL, "init", "--json",

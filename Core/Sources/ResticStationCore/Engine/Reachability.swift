@@ -87,10 +87,15 @@ public struct Reachability: Sendable {
             return .error(outcome.status)
         } catch let error as ResticRunnerError {
             switch error {
-            case .keychainUnavailable:
+            case .secretsUnavailable:
                 // Retryable, not alarming — see docs/architecture.md
-                // §Error taxonomy and ResticRunnerError.keychainUnavailable.
-                return .offline(reason: "keychain locked")
+                // §Error taxonomy and ResticRunnerError.secretsUnavailable.
+                // This string is persisted to `repo-status-<destId>.json` and
+                // matched by the app's badge heuristic (`SetsBadges`). Taken
+                // from the store actually in use, so a macOS host running the
+                // file backend does not record "keychain locked"; the
+                // keychain backend's string is unchanged from before T23.
+                return .offline(reason: restic.secretBackend.unavailableProbeReason)
             case .timedOut:
                 return .offline(reason: "timed out")
             case .launchFailed(let reason):

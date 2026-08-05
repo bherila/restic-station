@@ -90,11 +90,16 @@ enum DestinationStatus: Equatable, Sendable {
     }
 
     /// `Reachability` records environmental failures ("volume not mounted",
-    /// "timed out", "keychain locked") as offline; anything else it recorded
-    /// came from restic itself and needs attention.
+    /// "timed out", "keychain locked", "secret store unavailable") as
+    /// offline; anything else it recorded came from restic itself and needs
+    /// attention. The last of those is what a file-backend host records —
+    /// the app can read a `repo-status` file written by a helper using
+    /// either secret backend.
     private static func offlineOrError(_ lastError: String?) -> DestinationStatus {
         guard let lastError else { return .offline }
-        let environmental = ["volume not mounted", "timed out", "keychain locked", "could not"]
+        let environmental = [
+            "volume not mounted", "timed out", "keychain locked", "secret store unavailable", "could not",
+        ]
         let lowercased = lastError.lowercased()
         return environmental.contains(where: lowercased.contains) ? .offline : .error
     }

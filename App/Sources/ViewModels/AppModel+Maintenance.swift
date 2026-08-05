@@ -40,7 +40,7 @@ enum MaintenanceLookup {
         return ResticRunner(
             resticPath: resticPath,
             paths: model.paths,
-            keychain: KeychainClient(runner: processRunner),
+            secrets: try model.makeSecretStore(),
             runner: processRunner
         )
     }

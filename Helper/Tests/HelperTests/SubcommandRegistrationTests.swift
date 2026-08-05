@@ -32,6 +32,8 @@ import Testing
             "probe-repo",
             "unlock",
             "fda-check",
+            "secret",
+            "print-password",
             "timer",
             "version",
         ]
@@ -46,9 +48,32 @@ import Testing
             "probe-repo",
             "unlock",
             "fda-check",
+            "secret",
+            "print-password",
             "version",
         ]
     )
     #expect(!names.contains("timer"))
     #endif
+}
+
+/// `print-password` is registered but must stay out of `--help`: it is the
+/// machinery behind `RESTIC_PASSWORD_COMMAND`, not a user-facing action.
+@Test func printPasswordIsHiddenFromHelp() {
+    #expect(PrintPassword.configuration.shouldDisplay == false)
+    // Everything else is visible.
+    for subcommand in HelperMain.configuration.subcommands
+    where subcommand.configuration.commandName != "print-password" {
+        #expect(
+            subcommand.configuration.shouldDisplay,
+            "\(subcommand.configuration.commandName ?? "?") should appear in --help"
+        )
+    }
+}
+
+@Test func secretExposesItsFourSubcommands() {
+    let names: [String?] = Secret.configuration.subcommands.map { subcommand in
+        subcommand.configuration.commandName
+    }
+    #expect(names == ["set", "set-env", "rm", "list"])
 }
