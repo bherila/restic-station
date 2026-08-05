@@ -136,6 +136,10 @@ jobs:
           fi
           systemd-analyze --version
           WORK=$(mktemp -d)
+          # `systemd-analyze --user` spins up a throwaway user manager to
+          # resolve specifiers, and that needs a runtime directory; without
+          # one it dies with "Failed to initialize manager".
+          export XDG_RUNTIME_DIR=$(mktemp -d)
           # `<HELPER_PATH>` is a placeholder, and `verify` checks that the
           # ExecStart binary exists; /bin/true stands in for the helper.
           sed 's|<HELPER_PATH>|/bin/true|' \
