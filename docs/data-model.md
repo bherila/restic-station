@@ -371,3 +371,121 @@ Migration is **idempotent**: the second load sees `version: 2` and does nothing.
 A v1 config that fails `validate()` at its own version is a hard error: it produces no backup file and no rewritten `config.json`.
 
 The net effect on an existing single-machine install is that `"version": 1` becomes `"version": 2`, `"resticPath"` becomes `null`, and everything the engine acts on — sources, destinations, schedules, retention, the effective restic binary — is unchanged.
+
+## Headless CLI `--json` shapes (T27)
+
+`config show`, `status`, `sets list`, `runs list` and `runs show` all accept `--json`. This is documented **as an interface**, not as debug output: a script that pipes one of these into `jq` today must keep working across releases the same way `runs/index.jsonl` does. The conventions from the preamble apply identically — `.sortedKeys` + `.prettyPrinted`, ISO 8601 dates with fractional seconds, every optional field encoded as explicit `null` rather than omitted (`ConfigStore.makeEncoder()`, reused verbatim by the CLI's `CLIJSON.print(_:)`).
+
+Every `--json` mode writes *only* JSON to stdout; diagnostics go to stderr. `runs list --json` and `runs show --json` reuse `RunIndexEntry` and `RunMetadata` verbatim (§runs/index.jsonl, §runs/\<runId\>/metadata.json above) — no separate shape to document.
+
+### `config show --json` / the "effective plan" section of `config validate`
+
+Both commands build the identical report (`EffectiveConfigReport`, `Helper/Sources/EffectiveConfigReport.swift`) from **both** resolution views: `.addressable` supplies every set and destination this machine can address (nothing dropped), `.scheduling` supplies `enabledHere` and the `excludedHere` list with reasons. Building the report from the addressable view is what guarantees a set excluded here is still *shown*, marked as excluded, rather than silently missing — reading only the scheduling view would defeat the entire anti-silent-failure point of `config validate`.
+
+```json
+{
+  "machineId": "studio-mac",
+  "version": 2,
+  "resticPath": null,
+  "sets": [
+    {
+      "id": "6F9619FF-8B86-D011-B42D-00C04FC964FF",
+      "name": "Projects",
+      "enabledHere": true,
+      "sources": ["/Users/user/proj"],
+      "excludes": ["node_modules"],
+      "schedule": { "kind": "daily", "hour": 2, "minute": 30 },
+      "retention": null,
+      "checkPolicy": null,
+      "stalenessWarningDays": 14,
+      "destinations": [
+        {
+          "id": "0A1B2C3D-...-PRIMARY",
+          "label": "iCloud",
+          "repoURL": "/Users/user/.../proj.restic",
+          "isPrimary": true,
+          "nonSecretEnv": {},
+          "enabledHere": true
+        }
+      ]
+    }
+  ],
+  "excludedHere": [
+    {
+      "subject": "backupSet",
+      "setId": "6F9619FF-...",
+      "id": "6F9619FF-...",
+      "name": "Photos",
+      "reason": "disabledForMachine",
+      "description": "backup set \"Photos\" is disabled on this machine"
+    }
+  ]
+}
+```
+
+`excludedHere[].reason` is one of `ResolvedOmission.Reason`'s three raw cases (`disabledForMachine` | `noEnabledDestinations` | `noSources`); `description` is the same one-line prose `tick` prints for the same omission, included so a `--json` consumer never has to re-derive it from `reason` + `name`. `excludedHere[].subject` is `"backupSet"` or `"destination"`; for a destination, `setId` names the owning set and `id` the destination.
+
+Never a secret: `nonSecretEnv` is exactly `Destination.nonSecretEnv` (never the keychain/secrets.json value), and no field here can hold a repository password.
+
+### `status --json`
+
+Reads only existing state (`state/schedule-state.json`, `state/current-run-*.json`, `state/repo-status-*.json`, `runs/index.jsonl`) — no restic invocation. `health` reuses `HealthDerivation.appHealth` verbatim (`Core/Sources/ResticStationCore/Support/HealthDerivation.swift`), so the CLI and the app's menu bar can never disagree about what counts as a warning. One documented gap: `status` has no view into whether the scheduler itself (`SMAppService` on macOS, the systemd `--user` timer on Linux — see `timer status`) is actually registered, so `backgroundAgentEnabled` is passed as `true` (neutral) rather than guessed; this is unlike the app, which knows its own `SMAppService` state.
+
+```json
+{
+  "machineId": "studio-mac",
+  "generatedAt": "2026-07-26T20:57:30.000Z",
+  "health": "warning",
+  "fullDiskAccessDenied": false,
+  "sets": [
+    {
+      "id": "6F9619FF-8B86-D011-B42D-00C04FC964FF",
+      "name": "Projects",
+      "needsAttention": true,
+      "isRunning": false,
+      "lastBackup": {
+        "runId": "20260726T205704Z-backup-6f9619ff",
+        "status": "failed",
+        "start": "2026-07-26T20:57:04.000Z",
+        "end": "2026-07-26T20:58:11.000Z",
+        "ageSeconds": 19
+      },
+      "lastCheck": null,
+      "lastPrune": null,
+      "currentRun": null,
+      "nextDue": "2026-07-27T02:30:00.000Z",
+      "destinations": [
+        {
+          "id": "0A1B2C3D-...-PRIMARY",
+          "label": "iCloud",
+          "isPrimary": true,
+          "reachable": true,
+          "stale": false,
+          "lastSyncedAt": "2026-07-25T02:31:00.000Z",
+          "lastError": null
+        }
+      ]
+    }
+  ],
+  "excludedHere": []
+}
+```
+
+`health`: `"idle"` | `"running"` | `"warning"` (`AppHealth.rawValue`). Exit code: **0** for `idle`/`running`, **1** for `warning` — usable directly as a Nagios/Icinga-style check. `lastBackup`/`lastCheck`/`lastPrune` are `null` before any attempt of that kind; `reachable` is `null` — never `false` — for a destination that has not been probed yet (`state/repo-status-<destId>.json` absent), the same "absent means not yet known, never a definite negative" rule `fda-check.json` uses. `excludedHere` has the same shape as `config show`'s.
+
+### `sets list --json`
+
+One entry per backup set, from the `.addressable` view (an inventory command must list every set this machine knows about, marking each `enabledHere` — never silently omitting an excluded one).
+
+```json
+[
+  {
+    "id": "6F9619FF-8B86-D011-B42D-00C04FC964FF",
+    "name": "Projects",
+    "enabledHere": true,
+    "sources": ["/Users/user/proj"],
+    "destinationCount": 2,
+    "schedule": { "kind": "daily", "hour": 2, "minute": 30 }
+  }
+]
+```

@@ -21,7 +21,10 @@ jobs:
           OUT=$(.build/debug/restic-station-helper --help)
           echo "$OUT"
           # `timer` is Linux-only (T26); the macos job asserts its absence.
-          for sub in tick run-set init-secondary restore probe-repo unlock fda-check secret timer version; do
+          # config/status/sets/runs (T27) are on every platform — the
+          # headless CLI surface is identical macOS/Linux by design.
+          for sub in tick run-set init-secondary restore probe-repo unlock fda-check secret \
+                     config status sets runs timer version; do
             echo "$OUT" | grep -qE "^  $sub( |$)" || { echo "missing subcommand: $sub"; exit 1; }
           done
           # print-password is registered but deliberately hidden: it is the
@@ -44,6 +47,25 @@ jobs:
       # no secret value.
       - name: Secret CLI + FileSecretStore end to end
         run: scripts/secret-cli-test.sh
+
+      # `--json` output is asserted by piping through jq; the Swift image
+      # does not ship it. Best-effort, matching the systemd install step
+      # below — if apt cannot provide it, fail loudly with a clear cause
+      # rather than a confusing "jq: command not found" mid-script.
+      - name: Install jq (for --json assertions)
+        run: |
+          if ! command -v jq >/dev/null 2>&1; then
+            apt-get update -qq && apt-get install -y -qq --no-install-recommends jq
+          fi
+          jq --version
+      # T27 — headless CLI ergonomics (config export/import/validate/show,
+      # status, sets list, runs list/show): end to end against the real
+      # binary. restic is not installed in this container, so the script
+      # skips its real-backup half and still covers every other assertion,
+      # including the anti-silent-failure `config validate` report and the
+      # full-suite secret-leak grep.
+      - name: Headless CLI (config/status/sets/runs) end to end
+        run: scripts/headless-cli-test.sh
 
       # T25 acceptance criteria that only a real Linux run can show.
       - name: fda-check is a no-op on Linux
@@ -227,6 +249,11 @@ jobs:
           echo "$OUT"
           ! echo "$OUT" | grep -qE "^  timer( |$)"
           ! "$APP/Contents/MacOS/restic-station-helper" timer status 2>/dev/null
+          # T27: the headless CLI surface is identical on macOS and Linux —
+          # present here too, not just registered on the Linux side.
+          for sub in config status sets runs; do
+            echo "$OUT" | grep -qE "^  $sub( |$)" || { echo "missing subcommand: $sub"; exit 1; }
+          done
       - name: Run Core unit tests
         run: swift test --package-path Core
       - name: Run integration test
@@ -237,6 +264,12 @@ jobs:
       # against the helper inside the real app bundle.
       - name: Secret CLI + FileSecretStore end to end (file backend on macOS)
         run: scripts/secret-cli-test.sh "dd/Build/Products/Debug/Restic Station.app/Contents/MacOS/restic-station-helper"
+      # T27 — headless CLI ergonomics, against the real app-bundled helper.
+      # restic and jq are both installed on this runner, so this also
+      # exercises the real-backup half (secret set → run-set → status
+      # reflects it) that the Linux job cannot.
+      - name: Headless CLI (config/status/sets/runs) end to end
+        run: scripts/headless-cli-test.sh "dd/Build/Products/Debug/Restic Station.app/Contents/MacOS/restic-station-helper"
       - name: Ad-hoc sign and package app artifact
         run: |
           APP="dd/Build/Products/Debug/Restic Station.app"

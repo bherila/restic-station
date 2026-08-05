@@ -146,6 +146,71 @@ private func baseConfig() -> AppConfig {
     }
 }
 
+// MARK: - Summary (config import, T27)
+
+@Suite struct ConfigDiffSummaryTests {
+    @Test func identicalConfigsProduceAnEmptySummary() {
+        let summary = ConfigDiff.summarize(from: baseConfig(), to: baseConfig())
+        #expect(summary.isEmpty)
+        #expect(summary.lines.isEmpty)
+    }
+
+    @Test func addedAndRemovedSetsAreReported() {
+        var new = baseConfig()
+        var extra = baseSet()
+        extra.id = UUID(uuidString: "66666666-6666-6666-6666-666666666666")!
+        extra.name = "Photos"
+        extra.destinations[0].id = UUID(uuidString: "77777777-7777-7777-7777-777777777777")!
+        new.sets.append(extra)
+
+        let addedSummary = ConfigDiff.summarize(from: baseConfig(), to: new)
+        #expect(addedSummary.added.map(\.name) == ["Photos"])
+        #expect(addedSummary.removed.isEmpty)
+        #expect(addedSummary.lines.contains { $0.contains("added set \"Photos\"") })
+
+        let removedSummary = ConfigDiff.summarize(from: new, to: baseConfig())
+        #expect(removedSummary.removed.map(\.name) == ["Photos"])
+        #expect(removedSummary.lines.contains { $0.contains("removed set \"Photos\"") })
+    }
+
+    @Test func aChangedSetNamesEveryDifferingField() {
+        var new = baseConfig()
+        new.sets[0].schedule = .hourly(minute: 5)
+        new.sets[0].sources.append("/Users/someone/Documents")
+
+        let summary = ConfigDiff.summarize(from: baseConfig(), to: new)
+        #expect(summary.changed.count == 1)
+        #expect(summary.changed[0].id == setId)
+        #expect(Set(summary.changed[0].changedFields) == ["schedule", "sources"])
+    }
+
+    /// Unlike `isScheduleRelevantChange`, a bare rename IS reported here —
+    /// this summary is for a human deciding whether an import looks right,
+    /// not for the scheduler.
+    @Test func aRenameIsReportedAsChanged() {
+        var new = baseConfig()
+        new.sets[0].name = "Work Projects"
+        let summary = ConfigDiff.summarize(from: baseConfig(), to: new)
+        #expect(summary.changed.map(\.changedFields) == [["name"]])
+    }
+
+    @Test func resticPathChangeIsReportedSeparatelyFromSets() {
+        var new = baseConfig()
+        new.resticPath = "/usr/local/bin/restic"
+        let summary = ConfigDiff.summarize(from: baseConfig(), to: new)
+        #expect(summary.resticPathChanged)
+        #expect(summary.changed.isEmpty)
+        #expect(summary.lines == ["~ resticPath changed"])
+    }
+
+    @Test func machineOverrideChangesAreReportedOnTheSet() {
+        var new = baseConfig()
+        new.sets[0].machines = ["linux-nas": BackupSetMachineOverride(enabled: false)]
+        let summary = ConfigDiff.summarize(from: baseConfig(), to: new)
+        #expect(summary.changed.map(\.changedFields) == [["machines"]])
+    }
+}
+
 @Suite struct ConfigDiffIrrelevantTests {
     @Test func menuBarToggleIsNotRelevant() {
         var new = baseConfig()

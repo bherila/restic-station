@@ -29,6 +29,15 @@ struct HelperMain: AsyncParsableCommand {
             Unlock.self,
             FdaCheck.self,
             Secret.self,
+            // T27 — headless CLI ergonomics: move config.json between
+            // machines and inspect what happens on this one, without the
+            // app. Available on every platform (`docs/tasks/T27`'s
+            // acceptance criteria: identical CLI surface on macOS and
+            // Linux) — T28 is what makes them reachable from the macOS app.
+            Config.self,
+            Status.self,
+            Sets.self,
+            Runs.self,
             // Hidden from --help (`shouldDisplay: false`): it exists for
             // RESTIC_PASSWORD_COMMAND, not for people.
             PrintPassword.self,

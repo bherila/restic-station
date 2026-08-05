@@ -298,6 +298,51 @@ struct StateStoreTests {
         try store.clearCurrentRun(setId: UUID())
     }
 
+    // MARK: - currentRunSetIDs (T27 `status`)
+
+    @Test("currentRunSetIDs finds every live current-run file, by filename, ignoring other state files")
+    func currentRunSetIDsFindsLiveRuns() throws {
+        let (store, root) = makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let running1 = UUID()
+        let running2 = UUID()
+        let finished = UUID()
+        try store.writeCurrentRun(setId: running1, Self.sampleCurrentRun(setId: running1))
+        try store.writeCurrentRun(setId: running2, Self.sampleCurrentRun(setId: running2))
+        // A repo-status file must not be mistaken for a current-run file.
+        try store.updateRepoStatus(destId: UUID()) { $0.reachable = true }
+        // A run that finished (file deleted) must not still count.
+        try store.writeCurrentRun(setId: finished, Self.sampleCurrentRun(setId: finished))
+        try store.clearCurrentRun(setId: finished)
+
+        let ids = Set(store.currentRunSetIDs())
+        #expect(ids == [running1, running2])
+    }
+
+    /// The documented contract this exists for: a set no longer in
+    /// `config.json` but with a run still in flight must still be counted —
+    /// discovery is by filename, never by cross-referencing the config.
+    @Test("a run for a set no longer in config.json is still discovered")
+    func currentRunSetIDsDoesNotConsultConfig() throws {
+        let (store, root) = makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let deletedSetId = UUID()
+        try store.writeCurrentRun(setId: deletedSetId, Self.sampleCurrentRun(setId: deletedSetId))
+
+        #expect(store.currentRunSetIDs() == [deletedSetId])
+    }
+
+    @Test("an absent state/ directory yields an empty list, not a throw")
+    func currentRunSetIDsOnMissingStateDirectory() {
+        let (store, root) = makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        // `makeStore()` never calls `ensureDirectories()`, so `state/` does
+        // not exist yet.
+        #expect(store.currentRunSetIDs().isEmpty)
+    }
+
     @Test("writeFdaCheck round-trips")
     func writeFdaCheckRoundTrips() throws {
         let (store, root) = makeStore()

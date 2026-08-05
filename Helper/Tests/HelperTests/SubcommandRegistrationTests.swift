@@ -33,6 +33,10 @@ import Testing
             "unlock",
             "fda-check",
             "secret",
+            "config",
+            "status",
+            "sets",
+            "runs",
             "print-password",
             "timer",
             "version",
@@ -49,12 +53,51 @@ import Testing
             "unlock",
             "fda-check",
             "secret",
+            "config",
+            "status",
+            "sets",
+            "runs",
             "print-password",
             "version",
         ]
     )
     #expect(!names.contains("timer"))
     #endif
+}
+
+/// T27 (issue #29): the headless CLI surface is available and identical on
+/// both platforms — this is the "identical CLI surface on macOS and Linux"
+/// acceptance criterion, pinned as a registration-list assertion the same
+/// way `exposesEverySubcommand()` above pins `timer`'s asymmetry. Unlike
+/// `timer`, none of these four are platform-conditional.
+@Test func headlessCLICommandsAreRegisteredOnEveryPlatform() {
+    let names: [String?] = HelperMain.configuration.subcommands.map { subcommand in
+        subcommand.configuration.commandName
+    }
+    for name in ["config", "status", "sets", "runs"] {
+        #expect(names.contains(name), "\(name) should be registered on every platform")
+    }
+}
+
+@Test func configExposesItsFourSubcommands() {
+    let names: [String?] = Config.configuration.subcommands.map { subcommand in
+        subcommand.configuration.commandName
+    }
+    #expect(names == ["export", "import", "validate", "show"])
+}
+
+@Test func setsExposesListOnly() {
+    let names: [String?] = Sets.configuration.subcommands.map { subcommand in
+        subcommand.configuration.commandName
+    }
+    #expect(names == ["list"])
+}
+
+@Test func runsExposesListAndShow() {
+    let names: [String?] = Runs.configuration.subcommands.map { subcommand in
+        subcommand.configuration.commandName
+    }
+    #expect(names == ["list", "show"])
 }
 
 /// `print-password` is registered but must stay out of `--help`: it is the

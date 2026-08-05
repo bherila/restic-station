@@ -79,6 +79,16 @@ public struct AppPaths: Equatable, Sendable {
         root.appendingPathComponent("config.v1.backup.json", isDirectory: false)
     }
 
+    /// `config.import-backup-<suffix>.json` — the verbatim copy `config
+    /// import` (T27) writes of whatever `config.json` held immediately
+    /// before an import overwrites it. Distinct from `configV1BackupFile`,
+    /// which is a one-time, migration-only copy: this one is written before
+    /// *every* import that finds an existing `config.json`, regardless of
+    /// schema version, so an import can always be undone by hand.
+    public func configImportBackupFile(suffix: String) -> URL {
+        root.appendingPathComponent("config.import-backup-\(suffix).json", isDirectory: false)
+    }
+
     // MARK: - machine.json
 
     /// `machine.json` — this host's `MachineConfig`. **Host-local: never

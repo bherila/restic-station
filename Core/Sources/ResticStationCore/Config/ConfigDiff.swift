@@ -37,6 +37,108 @@ public enum ConfigDiff {
         projection(old) != projection(new)
     }
 
+    // MARK: - Summary (config import)
+
+    /// A human-readable summary of what changed between two configs — sets
+    /// added, removed, or changed, and whether the deprecated `resticPath`
+    /// moved. For `config import` (T27), which must show what it is about to
+    /// overwrite *before* it does, and for `--dry-run`, which shows the same
+    /// summary and stops.
+    ///
+    /// Deliberately coarser than ``isScheduleRelevantChange(from:to:)``:
+    /// that projection exists to answer one yes/no question (does the
+    /// scheduler need an early tick?) and does not care what changed, only
+    /// whether something schedule-relevant did. This type names *which*
+    /// fields differ, for a person to read.
+    public struct Summary: Equatable, Sendable {
+        public struct SetSummary: Equatable, Sendable {
+            public let id: UUID
+            public let name: String
+        }
+
+        public struct ChangedSet: Equatable, Sendable {
+            public let id: UUID
+            /// The set's name in the *new* config — the one about to be
+            /// installed, which is what a reader deciding whether to
+            /// proceed cares about.
+            public let name: String
+            /// Which top-level `BackupSet` fields differ, in a fixed,
+            /// deterministic order (declaration order below) — never a
+            /// dictionary/set, so output is stable across runs.
+            public let changedFields: [String]
+        }
+
+        public let added: [SetSummary]
+        public let removed: [SetSummary]
+        public let changed: [ChangedSet]
+        /// The deprecated top-level `resticPath` differs. Surfaced
+        /// separately from `changed` because it is a config-wide field, not
+        /// a per-set one, and because a v1→v2 import always trips this (the
+        /// migration clears it) — worth naming explicitly rather than
+        /// leaving a reader to wonder why no set explains it.
+        public let resticPathChanged: Bool
+
+        public var isEmpty: Bool {
+            added.isEmpty && removed.isEmpty && changed.isEmpty && !resticPathChanged
+        }
+
+        /// One line per change, in the order: added, removed, changed,
+        /// `resticPath`. Empty when ``isEmpty``.
+        public var lines: [String] {
+            var result: [String] = []
+            for set in added {
+                result.append("+ added set \"\(set.name)\" (\(set.id.uuidString.lowercased()))")
+            }
+            for set in removed {
+                result.append("- removed set \"\(set.name)\" (\(set.id.uuidString.lowercased()))")
+            }
+            for set in changed {
+                result.append("~ changed set \"\(set.name)\": \(set.changedFields.joined(separator: ", "))")
+            }
+            if resticPathChanged {
+                result.append("~ resticPath changed")
+            }
+            return result
+        }
+    }
+
+    /// Computes ``Summary`` between `old` and `new`. Sets are matched by
+    /// `id`; a name change alone is reported as a `changed` entry (unlike
+    /// ``isScheduleRelevantChange(from:to:)``, which ignores renames — that
+    /// projection only cares whether the *scheduler* needs to notice, and a
+    /// rename never affects what runs).
+    public static func summarize(from old: AppConfig, to new: AppConfig) -> Summary {
+        let oldByID = Dictionary(uniqueKeysWithValues: old.sets.map { ($0.id, $0) })
+        let newByID = Dictionary(uniqueKeysWithValues: new.sets.map { ($0.id, $0) })
+
+        let added = new.sets
+            .filter { oldByID[$0.id] == nil }
+            .map { Summary.SetSummary(id: $0.id, name: $0.name) }
+        let removed = old.sets
+            .filter { newByID[$0.id] == nil }
+            .map { Summary.SetSummary(id: $0.id, name: $0.name) }
+
+        var changed: [Summary.ChangedSet] = []
+        for newSet in new.sets {
+            guard let oldSet = oldByID[newSet.id] else { continue }
+            var fields: [String] = []
+            if oldSet.name != newSet.name { fields.append("name") }
+            if oldSet.sources != newSet.sources { fields.append("sources") }
+            if oldSet.excludes != newSet.excludes { fields.append("excludes") }
+            if oldSet.schedule != newSet.schedule { fields.append("schedule") }
+            if oldSet.retention != newSet.retention { fields.append("retention") }
+            if oldSet.checkPolicy != newSet.checkPolicy { fields.append("checkPolicy") }
+            if oldSet.stalenessWarningDays != newSet.stalenessWarningDays { fields.append("stalenessWarningDays") }
+            if oldSet.destinations != newSet.destinations { fields.append("destinations") }
+            if oldSet.machines != newSet.machines { fields.append("machines") }
+            if !fields.isEmpty {
+                changed.append(Summary.ChangedSet(id: newSet.id, name: newSet.name, changedFields: fields))
+            }
+        }
+
+        return Summary(added: added, removed: removed, changed: changed, resticPathChanged: old.resticPath != new.resticPath)
+    }
+
     // MARK: - Projection
 
     private static func projection(_ config: AppConfig) -> Projection {

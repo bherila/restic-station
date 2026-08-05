@@ -318,6 +318,38 @@ public struct StateStore: Sendable {
         try write(result, to: paths.fdaCheckFile)
     }
 
+    // MARK: - state/ enumeration
+
+    /// Every `BackupSet.id` with a live `state/current-run-<setId>.json` —
+    /// discovered by filename pattern (the same convention the app's
+    /// `StateWatcher` uses to populate its `currentRuns` dictionary), not by
+    /// cross-referencing `config.json`. That is what makes this correct for
+    /// `HealthDerivation.appHealth(anyRunInFlight:...)`'s documented
+    /// contract: a run that started before its set was deleted is still
+    /// "in flight". A missing or momentarily-unreadable `state/` directory
+    /// yields an empty list rather than throwing — state is a regenerable
+    /// cache (`docs/data-model.md` §Versioning).
+    public func currentRunSetIDs() -> [UUID] {
+        guard let entries = try? FileManager.default.contentsOfDirectory(
+            at: paths.stateDir,
+            includingPropertiesForKeys: nil
+        ) else {
+            return []
+        }
+        return entries.compactMap { entry in
+            Self.extractUUID(from: entry.lastPathComponent, prefix: "current-run-", suffix: ".json")
+        }
+    }
+
+    private static func extractUUID(from filename: String, prefix: String, suffix: String) -> UUID? {
+        guard filename.hasPrefix(prefix), filename.hasSuffix(suffix) else { return nil }
+        guard filename.count >= prefix.count + suffix.count else { return nil }
+        let start = filename.index(filename.startIndex, offsetBy: prefix.count)
+        let end = filename.index(filename.endIndex, offsetBy: -suffix.count)
+        guard start <= end else { return nil }
+        return UUID(uuidString: String(filename[start..<end]))
+    }
+
     // MARK: - Generic read/write
 
     private func read<T: Decodable>(_ type: T.Type, from url: URL) -> T? {
