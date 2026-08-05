@@ -42,8 +42,17 @@ extension AppModel {
     /// Every configured repository, primary first within each set. The
     /// Restore screen lists secondaries too: a mirror is a full repository
     /// and is exactly what you browse when the primary is a dead disk.
+    ///
+    /// Built from ``AppModel/addressableConfig``, never from raw `config`:
+    /// the destinations here carry this machine's `repoURL` and
+    /// `nonSecretEnv` overrides, so browsing lists snapshots from the
+    /// repository the helper actually writes to, and a restore submitted by
+    /// id cannot target a different one. `addressable` rather than
+    /// `resolvedConfig` because a set this machine does not back up is still
+    /// a set it can restore *from* — that is the whole point of a
+    /// restore-only host.
     var restoreRepositories: [RestoreRepository] {
-        config.sets.flatMap { set in
+        addressableConfig.config.sets.flatMap { set in
             set.destinations
                 .sorted { lhs, rhs in
                     // Stable: primary first, then config order.

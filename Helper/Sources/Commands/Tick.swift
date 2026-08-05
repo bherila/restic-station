@@ -33,18 +33,20 @@ struct Tick: AsyncParsableCommand {
         // ── Step 2: load config, resolve it for this machine; no config or
         // no sets that run here → exit 0. ────────────────────────────────
         let configStore = ConfigStore(paths: paths)
-        let resolved: ResolvedConfig
+        let views: HelperContext.Views
         do {
-            resolved = try HelperContext.loadResolvedConfig(paths: paths, configStore: configStore)
+            views = try HelperContext.loadViews(paths: paths, configStore: configStore)
         } catch {
             HelperExit.fail("tick: could not load configuration: \(error)")
         }
-        let config = resolved.config
+        // The scheduling view throughout: tick decides what to *back up*.
+        let scheduled = views.scheduled
+        let config = scheduled.config
         // Say *why* nothing ran rather than printing a bare "no backup sets"
         // for a config that plainly has some — an omission is the one thing
         // a scoping mistake looks like from the outside.
-        for omission in resolved.omissions {
-            print("skipping \(omission) (machine \"\(resolved.machineId)\")")
+        for omission in scheduled.omissions {
+            print("skipping \(omission) (machine \"\(scheduled.machineId)\")")
         }
         guard !config.sets.isEmpty else {
             print("no backup sets")
@@ -52,7 +54,7 @@ struct Tick: AsyncParsableCommand {
         }
         guard let context = await HelperContext.makeTolerant(
             paths: paths,
-            resolved: resolved,
+            views: views,
             configStore: configStore
         ) else {
             // RunAtLoad tolerance: nothing usable configured yet, and

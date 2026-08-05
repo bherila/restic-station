@@ -37,14 +37,25 @@ final class AppModel: ObservableObject {
     /// Read-only to views; edits go through `saveConfig(_:)` /
     /// `updateConfig(_:)`.
     @Published private(set) var config: AppConfig
-    /// `config` resolved for this machine (`docs/data-model.md`
-    /// §Resolution): overrides applied, sets and destinations this machine
-    /// does not run removed, `resticPath` filled in from `machine.json`.
+    /// **What this machine backs up** (`ResolvedConfig.Scope.scheduling`):
+    /// overrides applied, sets and destinations this machine does not run
+    /// removed, `resticPath` filled in from `machine.json`.
     ///
-    /// Everything *derived* reads this one — health, staleness, the restic
-    /// chip — so the app shows what this machine actually does. Everything
-    /// *edited* reads `config`. Resolution happens once, here.
+    /// Health, staleness and the menu bar read this one, so the app shows
+    /// what this machine actually does. Anything that *names a repository*
+    /// reads ``addressableConfig`` instead; anything *edited* reads `config`.
     @Published private(set) var resolvedConfig: AppConfig
+    /// **Every repository this machine can address**
+    /// (`ResolvedConfig.Scope.addressable`): the same overrides applied, but
+    /// nothing dropped.
+    ///
+    /// Every read-only query and utility that names a repository goes
+    /// through this — the restore browser, maintenance sizes and
+    /// `forget --dry-run`, "Initialize repository". Using `config` there
+    /// would address the *shared* `repoURL` instead of this machine's, and
+    /// using `resolvedConfig` would hide repositories on a host that
+    /// disables its sets.
+    @Published private(set) var addressableConfig: ResolvedConfig
     /// This host's `machine.json`. Never shared between machines.
     @Published private(set) var machine: MachineConfig
     /// Non-`nil` when `config.json` exists but could not be loaded (corrupt,
@@ -52,6 +63,12 @@ final class AppModel: ObservableObject {
     /// overwriting a config we failed to understand would destroy the user's
     /// backup definitions.
     @Published private(set) var configLoadError: String?
+    /// Non-`nil` when `machine.json` exists but could not be read. Tracked
+    /// separately from `configLoadError` because it blocks a *different*
+    /// write: `machine` is only a generated fallback while this is set, so
+    /// persisting it — which restic discovery in Settings would otherwise do
+    /// on its own — would overwrite the user's real `machineId` with a guess.
+    @Published private(set) var machineLoadError: String?
     /// Last save/validation failure, for surfacing in the UI.
     @Published private(set) var lastConfigError: String?
 
@@ -119,20 +136,12 @@ final class AppModel: ObservableObject {
         self.calendar = calendar
         self.now = now
 
-        // `machine.json` first: `ConfigStore.load()`'s v1 → v2 migration
-        // relocates `resticPath` into it, so it must be readable before the
-        // config is resolved against it. A machine identity we cannot read
-        // is not fatal — the app still shows and edits the shared config —
-        // but it means no overrides can apply, so it is reported like a
-        // config load failure and blocks writes for the same reason.
-        let loadedMachine: MachineConfig
-        do {
-            loadedMachine = try machineStore.load()
-        } catch {
-            loadedMachine = MachineConfig(machineId: MachineIdentity.generate())
-            self.configLoadError = Self.describe(machineLoadFailure: error, path: paths.machineFile.path)
-        }
-
+        // **Config first, machine second.** `ConfigStore.load()` may run the
+        // v1 → v2 migration, which moves `resticPath` out of `config.json`
+        // and into `machine.json`. Reading the machine identity beforehand
+        // would capture it without that path, so the first session after an
+        // upgrade would resolve `resticPath == nil` and report restic as
+        // missing until the app was restarted.
         let loadedConfig: AppConfig
         do {
             loadedConfig = try configStore.load()
@@ -143,9 +152,25 @@ final class AppModel: ObservableObject {
             self.configLoadError = Self.describe(configLoadFailure: error, path: paths.configFile.path)
         }
 
+        // A machine identity we cannot read is not fatal — the app still
+        // shows and edits the shared config — but no overrides can apply, so
+        // it blocks writes to both files for the same reason a bad config
+        // does. `machineLoadError` is what stops `updateMachine(_:)` from
+        // overwriting the unreadable file with the generated fallback below.
+        let loadedMachine: MachineConfig
+        do {
+            loadedMachine = try machineStore.load()
+        } catch {
+            loadedMachine = MachineConfig(machineId: MachineIdentity.generate())
+            let description = Self.describe(machineLoadFailure: error, path: paths.machineFile.path)
+            self.machineLoadError = description
+            self.configLoadError = description
+        }
+
         self.machine = loadedMachine
         self.config = loadedConfig
         self.resolvedConfig = loadedConfig.resolved(for: loadedMachine).config
+        self.addressableConfig = loadedConfig.addressable(for: loadedMachine)
 
         observeCollaborators()
 
@@ -207,6 +232,7 @@ final class AppModel: ObservableObject {
         let previousResticPath = resticPath
         config = newConfig
         resolvedConfig = newConfig.resolved(for: machine).config
+        addressableConfig = newConfig.addressable(for: machine)
         lastConfigError = nil
         recomputeDerivedState()
 
@@ -224,6 +250,17 @@ final class AppModel: ObservableObject {
     /// `config.json` is shared across every machine, this one never leaves
     /// the host.
     func updateMachine(_ mutate: (inout MachineConfig) -> Void) throws {
+        // While `machine.json` is unreadable, `machine` is a *generated
+        // fallback*, not the user's identity. Writing it back would replace
+        // a `machineId` we merely failed to parse with one we invented, and
+        // every per-machine override keyed to the real id would silently
+        // stop applying. Restic discovery in Settings reaches this path on
+        // its own, without the user asking to save anything, so the guard
+        // has to live here rather than in the callers.
+        if let machineLoadError {
+            throw AppModelError.machineUnreadable(machineLoadError)
+        }
+
         var draft = machine
         mutate(&draft)
         guard draft != machine else { return }
@@ -238,6 +275,7 @@ final class AppModel: ObservableObject {
         let previousResticPath = resticPath
         machine = draft
         resolvedConfig = config.resolved(for: draft).config
+        addressableConfig = config.addressable(for: draft)
         lastConfigError = nil
         recomputeDerivedState()
 
@@ -474,11 +512,15 @@ struct HelperMessage: Equatable, Sendable, Identifiable {
 
 enum AppModelError: LocalizedError {
     case configUnreadable(String)
+    case machineUnreadable(String)
 
     var errorDescription: String? {
         switch self {
         case .configUnreadable(let detail):
             return "Restic Station cannot save changes while the existing configuration is unreadable.\n\n\(detail)"
+        case .machineUnreadable(let detail):
+            return "Restic Station cannot save this machine's settings while machine.json is unreadable — "
+                + "writing it now would replace this machine's identity with a generated one.\n\n\(detail)"
         }
     }
 }

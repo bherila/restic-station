@@ -16,11 +16,18 @@ public struct ConfigStore: Sendable {
     /// `config.json`: relocating `resticPath` into `machine.json`. Held
     /// rather than constructed per call so the store stays a value with a
     /// single `paths` source of truth.
+    ///
+    /// Deliberately the **persistent-identity** store: migration does a
+    /// load-mutate-save round trip on `machine.json`, and going through the
+    /// override-aware store would write back whatever
+    /// `RESTIC_STATION_MACHINE_ID` happened to say, permanently rebinding
+    /// the host to a temporary profile. Migration only cares about
+    /// `resticPath`; the id it round-trips must be the one already on disk.
     private let machineStore: MachineStore
 
     public init(paths: AppPaths) {
         self.paths = paths
-        self.machineStore = MachineStore(paths: paths)
+        self.machineStore = MachineStore.persistentIdentity(paths: paths)
     }
 
     /// The temp file `save(_:)` writes before `rename(2)`-ing it over

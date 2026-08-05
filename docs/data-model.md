@@ -175,7 +175,7 @@ public struct MachineConfig: Codable, Equatable {
 
 - **`machineId`** is generated on first load from the hostname: lowercase, every character outside `[a-z0-9-]` becomes `-`, runs of `-` collapse, leading/trailing `-` are trimmed. `Studio-Mac.local` → `studio-mac-local`. The hostname's dots are not special-cased into a domain strip — that would be a guess, and a `machineId` is a stable key. If the hostname is empty or slugifies to nothing, a fresh lowercased UUID is used instead (itself a valid slug). Rename it by hand whenever you like; it is just a key.
 - **Validation:** non-empty and `[a-z0-9-]` only. A file with an invalid `machineId`, or one written by a newer build, is a hard error rather than a silent regeneration — a `machineId` that matches no `machines` key resolves to "no overrides", which is exactly the silent-wrong-backup failure this design exists to prevent.
-- **`RESTIC_STATION_MACHINE_ID`**, when set and non-empty, replaces the `machineId` for that process. It is applied after the file is read and is never written back, so it is safe for tests and for a user who wants two profiles on one host.
+- **`RESTIC_STATION_MACHINE_ID`**, when set and non-empty, replaces the `machineId` for that process. It is applied after the file is read and **is never written back**, so it is safe for tests and for a user who wants two profiles on one host. Any code path that *writes* `machine.json` for a reason unrelated to identity — today only the migration relocating `resticPath` — must go through `MachineStore.persistentIdentity(paths:)`, which ignores the variable. A load-mutate-save round trip through the normal store would bake a temporary profile id into the file, and the host would keep applying that profile's `machines` overrides long after the variable was unset.
 - **`resticPath`** lives here because a binary path is inherently host-local. `AppConfig.resticPath` remains in the schema as a deprecated fallback (see §Versioning & migration); the helper's full resolution order is `machine.json` → `AppConfig.resticPath` → discovery.
 - **Auto-creation** on first load is best-effort: a host whose data directory is not writable still gets a usable identity in memory, and the generated id is a deterministic function of the hostname, so it stays stable across runs anyway.
 
@@ -184,6 +184,21 @@ public struct MachineConfig: Codable, Equatable {
 One `config.json` describes the whole fleet. Each machine reads it through `AppConfig.resolved(for:)`, which produces a `ResolvedConfig`: an effective, **override-free** `AppConfig` plus the list of things this machine does not act on and why.
 
 **Resolution happens once, at load.** `BackupEngine`, `ScheduleMath`, `RunStore`, the helper subcommands and the app's health derivation all consume the resolved config and never see a `machineId`. Every `machines` map is stripped from the resolved value, so it cannot be resolved twice, and cannot be saved back over the shared file's overrides.
+
+### Two views
+
+"What do I back up here?" and "which repositories can I address from here?" are different questions, and answering the second with the first is a real bug — so there are two named accessors, and `ResolvedConfig.scope` says which one a value is.
+
+| | `AppConfig.resolved(for:)` — `.scheduling` | `AppConfig.addressable(for:)` — `.addressable` |
+|---|---|---|
+| Overrides applied | yes | yes |
+| `enabled: false` drops things | **yes** | **no** |
+| `omissions` | populated | always empty |
+| Used by | `tick`, `run-set` (backup/check/prune), health/staleness derivation | `restore`, `probe-repo`, `unlock`, `init-secondary`, the restore browser, maintenance sizes and `forget --dry-run`, "Initialize repository" |
+
+`enabled: false` means "do not back this up here". It does not mean "pretend this repository does not exist": a host set up as a restore/mirror target by disabling every set must still be able to restore from, probe, and unlock every repository in the shared config — that is the whole point of the arrangement. Both views apply *identical* overrides, so they can never disagree about what a repository **is**, only about which ones this machine backs up.
+
+Anything that builds a restic invocation must go through one of these two views. Reading the raw `AppConfig` there would address the *shared* `repoURL` rather than this machine's — browsing, measuring, or initialising a different repository than the one the scheduler writes to.
 
 ### The algorithm
 
@@ -194,6 +209,8 @@ For each set, in config order:
 3. Drop the set if its effective `enabled` is `false`. Nothing about its destinations is even evaluated.
 4. For each destination, in config order: apply `destination.machines[machineId]` the same way, and drop the destination if its effective `enabled` is `false`.
 5. Drop the set if it ends up with zero enabled destinations, or with zero sources while still enabled.
+
+Steps 3–5 are the `.scheduling` view only; `.addressable` stops after step 2 (plus the destination-override half of step 4).
 
 Every drop in 3–5 is recorded as a `ResolvedOmission` (`disabledForMachine` | `noEnabledDestinations` | `noSources`) so the CLI can *explain* the omission instead of silently doing nothing. `tick` prints one line per omission.
 
@@ -245,7 +262,11 @@ A host that stores copies and can restore from them, but has nothing of its own 
 ]
 ```
 
-`tick` on `mirror-box` prints one `skipping backup set "…" is disabled on this machine` line per set and exits 0. Note the alternative spelling — disabling every *destination* instead — is rejected by invariant 7: it would leave a set that runs with no primary to write to, which is the silent failure the invariant exists to catch.
+`tick` on `mirror-box` prints one `skipping backup set "…" is disabled on this machine` line per set and exits 0.
+
+**Everything else still works there**, because every repository utility reads the `.addressable` view: `restore --set … --dest …` finds its repository, `probe-repo` reports reachability, `unlock` clears a stale lock, and the app's Restore and Maintenance screens list and measure all of it. Only backing up is off. A host whose `machines` entries also override `repoURL` gets those overrides in both views, so what the Restore browser lists is the same repository the scheduler writes to.
+
+Note the alternative spelling — disabling every *destination* instead — is rejected by invariant 7: it would leave a set that runs with no primary to write to, which is the silent failure the invariant exists to catch.
 
 ## Keychain items (see keychain-and-fda.md for access mechanics)
 

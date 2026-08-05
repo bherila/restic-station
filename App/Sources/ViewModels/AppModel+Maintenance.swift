@@ -45,8 +45,16 @@ enum MaintenanceLookup {
         )
     }
 
+    /// The set Maintenance operates on, from the **addressable** view.
+    ///
+    /// Every query on this screen names a repository — `stats` for the size
+    /// cards, `forget --dry-run` for the retention preview — so the
+    /// destinations it hands to restic must carry this machine's `repoURL`
+    /// and `nonSecretEnv` overrides. Raw `config` destinations would let a
+    /// size card, or a "will delete N snapshots" count, describe another
+    /// machine's repository while the confirm action prunes this one's.
     static func set(_ model: AppModel, id: UUID) -> BackupSet? {
-        model.config.sets.first { $0.id == id }
+        model.addressableConfig.set(id: id)
     }
 
     /// Newest finished `check` run for one destination — the "last check
@@ -330,7 +338,8 @@ final class MaintenanceModel: ObservableObject {
         if let selectedSetId, let match = MaintenanceLookup.set(model, id: selectedSetId) {
             return match
         }
-        return model.config.sets.first
+        // Addressable, for the same reason as `MaintenanceLookup.set`.
+        return model.addressableConfig.config.sets.first
     }
 
     func isBusy(_ action: MaintenanceAction) -> Bool {

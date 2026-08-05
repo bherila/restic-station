@@ -40,7 +40,10 @@ struct Restore: AsyncParsableCommand {
 
     func run() async throws {
         let context = await HelperContext.make()
-        guard let backupSet = context.config.sets.first(where: { $0.id == set }) else {
+        // Repository utilities address every repository in the shared config,
+        // including sets this machine does not back up (T24): `addressable`,
+        // not `scheduled`.
+        guard let backupSet = context.addressable.set(id: set) else {
             HelperExit.fail("no backup set with id \(set)")
         }
         guard backupSet.destinations.contains(where: { $0.id == dest }) else {

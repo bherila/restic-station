@@ -2,6 +2,12 @@ import Foundation
 import Testing
 @testable import ResticStationCore
 
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
+
 // T24: v1 → v2 migration, driven by a realistic pre-change `config.json`
 // (`Fixtures/config-v1.json` — two sets, three destinations, a Homebrew
 // restic path, exactly what the macOS app writes today).
@@ -11,30 +17,30 @@ import Testing
 // them", plus the non-destructiveness rules: back up before the first v2
 // write, never overwrite an existing backup, idempotent on a second run.
 
+private func makeStore() throws -> (store: ConfigStore, paths: AppPaths, cleanup: () -> Void) {
+    let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        .appendingPathComponent("restic-station-migration-\(UUID().uuidString)", isDirectory: true)
+    let paths = AppPaths(root: root)
+    try paths.ensureDirectories()
+    return (ConfigStore(paths: paths), paths, { try? FileManager.default.removeItem(at: root) })
+}
+
+/// Installs the v1 fixture as the store's `config.json`.
+@discardableResult
+private func installV1Fixture(at paths: AppPaths) throws -> Data {
+    let data = try FixtureLoader.data("config-v1.json")
+    try data.write(to: paths.configFile)
+    return data
+}
+
+/// The machine identity the migrated `resticPath` lands in. Created up front
+/// so the tests do not depend on this host's hostname.
+private func installMachine(at paths: AppPaths, resticPath: String? = nil) throws {
+    try MachineStore(paths: paths, environment: [:])
+        .save(MachineConfig(machineId: "studio-mac", resticPath: resticPath))
+}
+
 @Suite struct ConfigMigrationTests {
-
-    private func makeStore() throws -> (store: ConfigStore, paths: AppPaths, cleanup: () -> Void) {
-        let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
-            .appendingPathComponent("restic-station-migration-\(UUID().uuidString)", isDirectory: true)
-        let paths = AppPaths(root: root)
-        try paths.ensureDirectories()
-        return (ConfigStore(paths: paths), paths, { try? FileManager.default.removeItem(at: root) })
-    }
-
-    /// Installs the v1 fixture as the store's `config.json`.
-    @discardableResult
-    private func installV1Fixture(at paths: AppPaths) throws -> Data {
-        let data = try FixtureLoader.data("config-v1.json")
-        try data.write(to: paths.configFile)
-        return data
-    }
-
-    /// The machine identity the migrated `resticPath` lands in. Created up
-    /// front so the tests do not depend on this host's hostname.
-    private func installMachine(at paths: AppPaths, resticPath: String? = nil) throws {
-        try MachineStore(paths: paths, environment: [:])
-            .save(MachineConfig(machineId: "studio-mac", resticPath: resticPath))
-    }
 
     // MARK: - The happy path
 
@@ -223,6 +229,15 @@ import Testing
         #expect(machine.resticPath == "/opt/homebrew/bin/restic")
     }
 
+    /// The seam the migration path relies on, in isolation.
+    @Test func persistentIdentityStoreIgnoresTheEnvironmentOverride() throws {
+        let (_, paths, cleanup) = try makeStore()
+        defer { cleanup() }
+        try installMachine(at: paths)
+
+        #expect(try MachineStore.persistentIdentity(paths: paths).load().machineId == "studio-mac")
+    }
+
     // MARK: - No migration where none is due
 
     @Test func aV2ConfigIsNotMigratedAndProducesNoBackup() throws {
@@ -248,5 +263,103 @@ import Testing
             _ = try store.load()
         }
         #expect(!FileManager.default.fileExists(atPath: paths.configV1BackupFile.path))
+    }
+}
+
+// MARK: - The environment override must never be persisted
+
+/// `RESTIC_STATION_MACHINE_ID` is documented as non-persistent: it changes the
+/// `machineId` a process *uses*, never the one on disk.
+///
+/// Migration is the one code path that does a load-mutate-save round trip on
+/// `machine.json` for a reason unrelated to identity (relocating
+/// `resticPath`), so it is the one place that promise can be broken. If it
+/// were, the host would be permanently rebound to a temporary test/profile
+/// id and would apply the wrong `machines` overrides ever after — the
+/// variable does not need to still be set for the damage to persist.
+///
+/// These tests genuinely set the process variable: injecting it would not
+/// reproduce the bug, because the code under test reads `ProcessInfo`.
+/// `.serialized` for the usual reason — nothing else may observe the
+/// mutation. `MachineStore` is the only reader of this variable, and every
+/// other test in the package injects its environment explicitly.
+@Suite(.serialized)
+struct ConfigMigrationEnvironmentOverrideTests {
+
+    private func withMachineIdOverride<T>(_ value: String, _ body: () throws -> T) rethrows -> T {
+        let original = ProcessInfo.processInfo.environment[MachineIdentity.environmentOverrideKey]
+        func apply(_ newValue: String?) {
+            if let newValue {
+                setenv(MachineIdentity.environmentOverrideKey, newValue, 1)
+            } else {
+                unsetenv(MachineIdentity.environmentOverrideKey)
+            }
+        }
+        apply(value)
+        defer { apply(original) }
+        return try body()
+    }
+
+    /// `machine.json` already exists: its `machineId` must survive migration.
+    @Test func migrationKeepsTheOnDiskIdentityWhenTheOverrideIsSet() throws {
+        let (_, paths, cleanup) = try makeStore()
+        defer { cleanup() }
+        try installV1Fixture(at: paths)
+        try installMachine(at: paths) // machineId "studio-mac", no resticPath
+
+        // The `ConfigStore` is built *inside* the override, because
+        // `MachineStore` snapshots the environment at construction. A real
+        // helper or app process is launched with the variable already set,
+        // so building it beforehand would not reproduce the bug.
+        //
+        // Assertions live outside the closure: `#expect` cannot carry a `try`
+        // across the `rethrows` boundary.
+        let idSeenUnderOverride = try withMachineIdOverride("second-profile") { () -> String in
+            let seen = try MachineStore(paths: paths).load().machineId
+            _ = try ConfigStore(paths: paths).load()
+            return seen
+        }
+        // Precondition: the override really was visible to a normal store.
+        #expect(idSeenUnderOverride == "second-profile")
+
+        let onDisk = try MachineStore.persistentIdentity(paths: paths).load()
+        #expect(onDisk.machineId == "studio-mac")               // not "second-profile"
+        #expect(onDisk.resticPath == "/opt/homebrew/bin/restic") // migration still ran
+    }
+
+    /// `machine.json` does not exist yet: the identity created during
+    /// migration must be the generated one, not the override.
+    @Test func migrationCreatesTheGeneratedIdentityWhenTheOverrideIsSet() throws {
+        let (_, paths, cleanup) = try makeStore()
+        defer { cleanup() }
+        try installV1Fixture(at: paths)
+
+        try withMachineIdOverride("second-profile") {
+            _ = try ConfigStore(paths: paths).load()
+        }
+
+        let onDisk = try MachineStore.persistentIdentity(paths: paths).load()
+        #expect(onDisk.machineId != "second-profile")
+        #expect(MachineIdentity.isValid(onDisk.machineId))
+        #expect(onDisk.resticPath == "/opt/homebrew/bin/restic")
+    }
+
+    /// And the override still does what it is for: it changes the id this
+    /// process resolves against, without touching the file.
+    @Test func theOverrideStillAppliesInMemoryOnly() throws {
+        let (_, paths, cleanup) = try makeStore()
+        defer { cleanup() }
+        try installMachine(at: paths)
+
+        let underOverride = try withMachineIdOverride("second-profile") { () -> (String, String) in
+            (
+                try MachineStore(paths: paths).load().machineId,
+                try MachineStore.persistentIdentity(paths: paths).load().machineId
+            )
+        }
+        #expect(underOverride.0 == "second-profile")
+        #expect(underOverride.1 == "studio-mac")
+        // Once the variable is gone, the normal store sees the real identity.
+        #expect(try MachineStore(paths: paths).load().machineId == "studio-mac")
     }
 }

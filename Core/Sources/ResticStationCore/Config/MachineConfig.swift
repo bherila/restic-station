@@ -169,6 +169,20 @@ public struct MachineStore: Sendable {
         self.environment = environment
     }
 
+    /// A store that ignores `RESTIC_STATION_MACHINE_ID` entirely — it reads
+    /// and writes the host's **persistent, on-disk identity**.
+    ///
+    /// Use this for any path that *writes* `machine.json` for a reason
+    /// unrelated to identity, the v1 → v2 migration's `resticPath`
+    /// relocation being the only one today. The override is documented as
+    /// non-persistent; a load-mutate-save round trip through the normal
+    /// store would quietly bake a temporary test/profile id into the file,
+    /// and the host would keep applying that profile's `machines` overrides
+    /// long after the variable was unset.
+    public static func persistentIdentity(paths: AppPaths) -> MachineStore {
+        MachineStore(paths: paths, environment: [:])
+    }
+
     /// Temp file for the atomic write — fixed, not randomized, for the same
     /// reason as `ConfigStore.tempConfigFile`.
     var tempMachineFile: URL {

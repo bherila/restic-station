@@ -103,7 +103,10 @@ struct RestoreView: View {
     private var repositoryPicker: some View {
         HStack(spacing: 12) {
             Picker("Restore from", selection: $selectedRepositoryID) {
-                ForEach(model.config.sets) { set in
+                // Section headers only, but taken from the same view the
+                // repositories themselves come from, so the two can never
+                // disagree about which sets exist here.
+                ForEach(model.addressableConfig.config.sets) { set in
                     Section(set.name) {
                         ForEach(repositories(in: set)) { repository in
                             Text(repository.destination.label

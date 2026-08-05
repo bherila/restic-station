@@ -466,6 +466,174 @@ private func baseConfig() -> AppConfig {
     }
 }
 
+// MARK: - The addressable view
+
+/// The second view (`ResolvedConfig.Scope.addressable`): same overrides, but
+/// `enabled` drops nothing.
+///
+/// This suite exists because of a real bug: every repository *utility* —
+/// restore, probe, unlock, init, the app's size and retention-preview
+/// queries — was reading the scheduling view, which meant a host configured
+/// as restore/mirror-only (every set disabled) could not address any of its
+/// own repositories, and a host with a `repoURL` override could browse,
+/// measure and initialize a *different* repository than the one the helper
+/// backs up to.
+@Suite struct AddressableResolutionTests {
+
+    /// The headline case for the whole milestone: a mirror/restore-only host
+    /// disables every set, and must still see every repository.
+    @Test func disabledSetsSurviveInTheAddressableView() {
+        var config = baseConfig()
+        config.sets[0].machines = ["mirror-box": BackupSetMachineOverride(enabled: false)]
+
+        let scheduled = config.resolved(for: "mirror-box")
+        let addressable = config.addressable(for: "mirror-box")
+
+        #expect(scheduled.config.sets.isEmpty)
+        #expect(addressable.config.sets.count == 1)
+        #expect(addressable.config.sets[0].destinations.count == 3)
+        #expect(addressable.omissions.isEmpty)
+        #expect(addressable.scope == .addressable)
+        #expect(scheduled.scope == .scheduling)
+    }
+
+    @Test func disabledDestinationsSurviveInTheAddressableView() {
+        var config = baseConfig()
+        config.sets[0].destinations[2].machines = ["linux-nas": DestinationMachineOverride(enabled: false)]
+
+        #expect(config.resolved(for: "linux-nas").config.sets[0].destinations.count == 2)
+        #expect(config.addressable(for: "linux-nas").config.sets[0].destinations.count == 3)
+    }
+
+    /// A set that would be dropped for having no sources here is still
+    /// addressable — you restore *into* a machine that has nothing to back up.
+    @Test func setsWithNoSourcesHereSurviveInTheAddressableView() {
+        var config = baseConfig()
+        config.sets[0].machines = ["mirror-box": BackupSetMachineOverride(sources: [])]
+
+        #expect(config.resolved(for: "mirror-box").config.sets.isEmpty)
+        #expect(config.addressable(for: "mirror-box").config.sets.count == 1)
+    }
+
+    /// The two views must never disagree about what a repository *is* — only
+    /// about which ones are backed up here.
+    @Test func bothViewsApplyTheSameOverrides() {
+        var config = baseConfig()
+        config.sets[0].machines = ["linux-nas": BackupSetMachineOverride(
+            sources: ["/srv/data"], schedule: .everyMinutes(30)
+        )]
+        config.sets[0].destinations[0].machines = ["linux-nas": DestinationMachineOverride(
+            repoURL: "/mnt/big/docs.restic", nonSecretEnv: ["AWS_DEFAULT_REGION": "us-east-1"]
+        )]
+
+        let scheduled = config.resolved(for: "linux-nas").config.sets[0]
+        let addressable = config.addressable(for: "linux-nas").config.sets[0]
+
+        #expect(scheduled.sources == ["/srv/data"])
+        #expect(addressable.sources == ["/srv/data"])
+        #expect(scheduled.schedule == .everyMinutes(30))
+        #expect(addressable.schedule == .everyMinutes(30))
+        #expect(scheduled.destinations[0].repoURL == "/mnt/big/docs.restic")
+        #expect(addressable.destinations[0].repoURL == "/mnt/big/docs.restic")
+        #expect(addressable.destinations[0].nonSecretEnv == ["AWS_DEFAULT_REGION": "us-east-1"])
+    }
+
+    /// The class-of-bug guard: with every destination overridden, **no raw
+    /// `repoURL` or `nonSecretEnv` may survive into either view**. Anything
+    /// that builds a restic invocation from a `ResolvedConfig` therefore
+    /// cannot reach a shared value by accident; the only remaining way to
+    /// get one is to read the raw `AppConfig`, which is what the consumers
+    /// were fixed to stop doing.
+    @Test func noRawDestinationValueSurvivesInEitherView() {
+        var config = baseConfig()
+        for index in config.sets[0].destinations.indices {
+            config.sets[0].destinations[index].machines = [
+                "linux-nas": DestinationMachineOverride(
+                    repoURL: "/mnt/overridden/\(index)",
+                    nonSecretEnv: ["OVERRIDDEN": "\(index)"]
+                )
+            ]
+        }
+        let rawRepoURLs = Set(config.sets[0].destinations.map { $0.repoURL })
+
+        for view in [config.resolved(for: "linux-nas"), config.addressable(for: "linux-nas")] {
+            #expect(!view.config.sets.isEmpty)
+            for (_, destination) in view.destinations {
+                #expect(!rawRepoURLs.contains(destination.repoURL))
+                #expect(destination.repoURL.hasPrefix("/mnt/overridden/"))
+                #expect(destination.nonSecretEnv["OVERRIDDEN"] != nil)
+                #expect(destination.machines == nil)
+            }
+        }
+    }
+
+    // MARK: Lookup helpers — the one sanctioned way consumers find a repo
+
+    @Test func lookupsReturnOverriddenValues() {
+        var config = baseConfig()
+        config.sets[0].destinations[0].machines = [
+            "linux-nas": DestinationMachineOverride(repoURL: "/mnt/big/docs.restic")
+        ]
+        let view = config.addressable(for: "linux-nas")
+
+        #expect(view.set(id: setId)?.name == "Documents")
+        #expect(view.set(id: UUID()) == nil)
+
+        let found = view.destination(id: primaryId)
+        #expect(found?.set.id == setId)
+        #expect(found?.destination.repoURL == "/mnt/big/docs.restic")
+        #expect(view.destination(id: UUID()) == nil)
+    }
+
+    @Test func lookupsSeeDisabledSetsInTheAddressableViewOnly() {
+        var config = baseConfig()
+        config.sets[0].machines = ["mirror-box": BackupSetMachineOverride(enabled: false)]
+
+        #expect(config.addressable(for: "mirror-box").set(id: setId) != nil)
+        #expect(config.addressable(for: "mirror-box").destination(id: primaryId) != nil)
+        #expect(config.resolved(for: "mirror-box").set(id: setId) == nil)
+        #expect(config.resolved(for: "mirror-box").destination(id: primaryId) == nil)
+    }
+
+    @Test func destinationsEnumeratesEveryRepositoryWithItsOwningSet() {
+        let view = baseConfig().addressable(for: "mac-a")
+        #expect(view.destinations.map { $0.destination.id } == [primaryId, mirrorId, localOnlyId])
+        #expect(view.destinations.allSatisfy { $0.set.id == setId })
+    }
+
+    // MARK: resticPath and platform independence carry over
+
+    @Test func addressableViewAlsoTakesTheMachineResticPath() {
+        let machine = MachineConfig(machineId: "linux-nas", resticPath: "/usr/bin/restic")
+        #expect(baseConfig().addressable(for: machine).config.resticPath == "/usr/bin/restic")
+    }
+
+    /// Same invariant as the scheduling view, asserted on both platforms.
+    @Test func addressableResolutionIsDeterministicAndMachineDependentOnly() throws {
+        var config = baseConfig()
+        config.sets[0].destinations[0].machines = [
+            "linux-nas": DestinationMachineOverride(repoURL: "/mnt/big/docs.restic")
+        ]
+        let encoder = ConfigStore.makeEncoder()
+
+        for machineId in ["mac-a", "linux-nas"] {
+            let first = try encoder.encode(config.addressable(for: machineId).config)
+            let second = try encoder.encode(config.addressable(for: machineId).config)
+            #expect(first == second)
+        }
+        #expect(try encoder.encode(config.addressable(for: "mac-a").config)
+            != (try encoder.encode(config.addressable(for: "linux-nas").config)))
+    }
+
+    /// A config with no overrides at all: both views are the config itself,
+    /// so nothing about the existing single-machine behaviour changes.
+    @Test func withoutOverridesBothViewsAreTheConfigItself() {
+        let config = baseConfig()
+        #expect(config.resolved(for: "anything").config == config)
+        #expect(config.addressable(for: "anything").config == config)
+    }
+}
+
 // MARK: - Fixtures
 
 @Suite struct ResolutionFixtureTests {
