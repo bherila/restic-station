@@ -209,6 +209,117 @@ private func makeTempPaths() -> (AppPaths, () -> Void) {
         #expect(!FileManager.default.fileExists(atPath: paths.machineFile.path))
     }
 
+    // MARK: savePreservingIdentity — the override must never round-trip
+
+    /// The blocker Fable caught: every write path that is *not* creating or
+    /// renaming an identity has to keep the on-disk `machineId`.
+    ///
+    /// The app's restic discovery reaches `AppModel.updateMachine` on its own
+    /// — a `.task` on the Settings pane, no user action — and it holds a
+    /// `MachineConfig` whose id came from `RESTIC_STATION_MACHINE_ID`. A
+    /// plain `save` there bakes the temporary profile name into the file, and
+    /// the damage outlives the variable: once unset, the host keeps resolving
+    /// that profile's `machines` overrides and can silently back up the wrong
+    /// sources, unattended, from launchd.
+    ///
+    /// This is the whole `updateMachine` sequence, at `MachineStore` level.
+    @Test func savePreservingIdentityKeepsTheOnDiskMachineId() throws {
+        let (paths, cleanup) = makeTempPaths()
+        defer { cleanup() }
+
+        try MachineStore(paths: paths, environment: [:])
+            .save(MachineConfig(machineId: "studio-mac"))
+
+        // Exactly what the app holds while the override is in effect.
+        let overrideAware = MachineStore(
+            paths: paths,
+            environment: [MachineIdentity.environmentOverrideKey: "second-profile"]
+        )
+        var draft = try overrideAware.load()
+        #expect(draft.machineId == "second-profile") // precondition
+        draft.resticPath = "/usr/bin/restic"
+
+        let written = try overrideAware.savePreservingIdentity(draft)
+
+        // The host's identity is untouched…
+        #expect(written.machineId == "studio-mac")
+        #expect(try MachineStore.persistentIdentity(paths: paths).load().machineId == "studio-mac")
+        // …and the change the caller actually wanted did land.
+        #expect(try MachineStore.persistentIdentity(paths: paths).load().resticPath == "/usr/bin/restic")
+        // The override still applies in memory, which is what it is for.
+        #expect(try overrideAware.load().machineId == "second-profile")
+        #expect(try overrideAware.load().resticPath == "/usr/bin/restic")
+    }
+
+    /// Not just the environment override: **any** `machineId` in the value
+    /// handed to `savePreservingIdentity` is ignored. The guarantee is a
+    /// property of the method, not of how the caller obtained its value.
+    @Test func savePreservingIdentityIgnoresAnyMachineIdInTheValue() throws {
+        let (paths, cleanup) = makeTempPaths()
+        defer { cleanup() }
+
+        let store = MachineStore(paths: paths, environment: [:])
+        try store.save(MachineConfig(machineId: "studio-mac"))
+
+        try store.savePreservingIdentity(
+            MachineConfig(machineId: "something-else-entirely", resticPath: "/opt/restic")
+        )
+
+        let onDisk = try store.load()
+        #expect(onDisk.machineId == "studio-mac")
+        #expect(onDisk.resticPath == "/opt/restic")
+    }
+
+    /// Every non-identity field is carried through, so a field added to
+    /// `MachineConfig` later cannot be silently dropped by this path.
+    @Test func savePreservingIdentityCarriesEveryOtherField() throws {
+        let (paths, cleanup) = makeTempPaths()
+        defer { cleanup() }
+
+        let store = MachineStore(paths: paths, environment: [:])
+        try store.save(MachineConfig(machineId: "studio-mac", resticPath: "/old/restic"))
+
+        let desired = MachineConfig(machineId: "ignored", resticPath: "/new/restic")
+        let written = try store.savePreservingIdentity(desired)
+
+        var expected = desired
+        expected.machineId = "studio-mac"
+        #expect(written == expected)
+        #expect(try store.load() == expected)
+    }
+
+    /// With no `machine.json` yet, the identity to preserve is the generated
+    /// one the load creates — never the override.
+    @Test func savePreservingIdentityCreatesTheGeneratedIdentityWhenAbsent() throws {
+        let (paths, cleanup) = makeTempPaths()
+        defer { cleanup() }
+
+        let overrideAware = MachineStore(
+            paths: paths,
+            environment: [MachineIdentity.environmentOverrideKey: "second-profile"]
+        )
+        let written = try overrideAware.savePreservingIdentity(
+            MachineConfig(machineId: "second-profile", resticPath: "/usr/bin/restic")
+        )
+
+        #expect(written.machineId != "second-profile")
+        #expect(MachineIdentity.isValid(written.machineId))
+        #expect(try MachineStore.persistentIdentity(paths: paths).load().machineId == written.machineId)
+    }
+
+    /// `save(_:)` remains the identity-setting primitive — creating and
+    /// deliberately renaming both still work, which is why the two methods
+    /// exist rather than one.
+    @Test func plainSaveStillWritesTheIdentityVerbatim() throws {
+        let (paths, cleanup) = makeTempPaths()
+        defer { cleanup() }
+
+        let store = MachineStore(paths: paths, environment: [:])
+        try store.save(MachineConfig(machineId: "studio-mac"))
+        try store.save(MachineConfig(machineId: "renamed-mac"))
+        #expect(try store.load().machineId == "renamed-mac")
+    }
+
     @Test func newerVersionThrows() throws {
         let (paths, cleanup) = makeTempPaths()
         defer { cleanup() }

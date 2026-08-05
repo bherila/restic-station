@@ -104,7 +104,15 @@ public struct ConfigStore: Sendable {
                 var machine = try machineStore.load()
                 if machine.resticPath?.isEmpty ?? true {
                     machine.resticPath = configResticPath
-                    try machineStore.save(machine)
+                    // `savePreservingIdentity`, not `save`: relocating a
+                    // restic path is not an identity change, so it goes
+                    // through the one write path that cannot alter the
+                    // host's `machineId` — the same rule the app's
+                    // `updateMachine(_:)` follows. `machineStore` is already
+                    // the persistent-identity store, so this is belt and
+                    // braces; the point is that no reader has to check which
+                    // store it is to know the write is safe.
+                    try machineStore.savePreservingIdentity(machine)
                 }
                 // Recorded host-locally (either just now, or by an earlier
                 // run / the user) — the deprecated top-level field can go.

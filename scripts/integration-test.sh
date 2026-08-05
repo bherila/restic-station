@@ -576,6 +576,19 @@ assert_migration() {
     backup_version="$(jq -r '.version' "$DATA_DIR/config.v1.backup.json")"
     [[ "$backup_version" == "1" ]] || fail "$step" "backup should hold the untouched v1 file, got version '$backup_version'"
 
+    # RESTIC_STATION_MACHINE_ID is documented as non-persistent. Run the real
+    # helper under it against a v1 config, so the migration's write path to
+    # machine.json fires while the override is in effect: the host's identity
+    # on disk must not change. Baking a temporary profile id in here would
+    # outlive the variable and silently rebind which `machines` overrides this
+    # host applies.
+    write_config "null"
+    RESTIC_STATION_MACHINE_ID=second-profile "$HELPER" tick >/dev/null 2>&1 || true
+    local machine_id_after
+    machine_id_after="$(jq -r '.machineId' "$DATA_DIR/machine.json")"
+    [[ "$machine_id_after" == "$machine_id" ]] \
+        || fail "$step" "RESTIC_STATION_MACHINE_ID was persisted: machineId became '$machine_id_after'"
+
     log "$step OK (machineId=$machine_id)"
 }
 

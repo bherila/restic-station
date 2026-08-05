@@ -233,8 +233,47 @@ public struct MachineStore: Sendable {
         return machine
     }
 
+    /// Writes `desired` back to `machine.json` while **keeping the host's
+    /// persistent `machineId`**, whatever `desired.machineId` says and
+    /// whatever `RESTIC_STATION_MACHINE_ID` says.
+    ///
+    /// This is the only sanctioned way to persist a change to `machine.json`
+    /// outside of creating or deliberately renaming an identity. ``save(_:)``
+    /// writes the value it is given verbatim, which is right for those two
+    /// cases and wrong for every other: a caller that loaded through the
+    /// override-aware store holds a `machineId` that is a *temporary profile
+    /// name*, and writing it back rebinds the host permanently. The damage
+    /// outlives the variable — once it is unset, the host keeps resolving
+    /// that profile's `machines` overrides, and can silently back up the
+    /// wrong sources, or nothing at all, unattended from launchd/systemd.
+    ///
+    /// The identity is re-applied *after* the caller's value is taken, so
+    /// there is no way to change it through this method even by accident,
+    /// and every other field — including ones added later — is carried
+    /// through automatically.
+    ///
+    /// - Returns: what was actually written, so callers can see the
+    ///   persistent identity rather than assume theirs was used.
+    @discardableResult
+    public func savePreservingIdentity(_ desired: MachineConfig) throws -> MachineConfig {
+        // `persistentIdentity`, not `self`: this must be override-proof even
+        // when called on an override-aware store, which is exactly the case
+        // that produced the bug.
+        let identityStore = MachineStore.persistentIdentity(paths: paths)
+        let onDisk = try identityStore.load()
+
+        var updated = desired
+        updated.machineId = onDisk.machineId
+        try identityStore.save(updated)
+        return updated
+    }
+
     /// Validates the `machineId`, then writes atomically (temp file +
     /// `rename(2)`), creating the data directory if needed.
+    ///
+    /// Writes `machine` **verbatim, including its `machineId`** — so it is
+    /// for creating an identity or deliberately renaming one. To persist any
+    /// other change, use ``savePreservingIdentity(_:)``.
     public func save(_ machine: MachineConfig) throws {
         guard MachineIdentity.isValid(machine.machineId) else {
             throw MachineError.invalidMachineId(machine.machineId)

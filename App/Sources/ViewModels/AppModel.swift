@@ -142,6 +142,12 @@ final class AppModel: ObservableObject {
         // would capture it without that path, so the first session after an
         // upgrade would resolve `resticPath == nil` and report restic as
         // missing until the app was restarted.
+        //
+        // Failures are accumulated locally: `self.configLoadError` cannot be
+        // *read* until every stored property is initialized, and the machine
+        // branch below needs to append to whatever the config branch found.
+        var loadFailures: [String] = []
+
         let loadedConfig: AppConfig
         do {
             loadedConfig = try configStore.load()
@@ -149,7 +155,7 @@ final class AppModel: ObservableObject {
             // A default, empty config keeps the UI alive and explainable;
             // `configLoadError` blocks writes so nothing is clobbered.
             loadedConfig = AppConfig()
-            self.configLoadError = Self.describe(configLoadFailure: error, path: paths.configFile.path)
+            loadFailures.append(Self.describe(configLoadFailure: error, path: paths.configFile.path))
         }
 
         // A machine identity we cannot read is not fatal — the app still
@@ -164,8 +170,14 @@ final class AppModel: ObservableObject {
             loadedMachine = MachineConfig(machineId: MachineIdentity.generate())
             let description = Self.describe(machineLoadFailure: error, path: paths.machineFile.path)
             self.machineLoadError = description
-            self.configLoadError = description
+            // Appended, not assigned: when *both* files failed, the config
+            // diagnosis is the one that explains why the user's backup sets
+            // have vanished from the UI, and overwriting it would leave them
+            // reading about machine.json instead.
+            loadFailures.append(description)
         }
+
+        self.configLoadError = loadFailures.isEmpty ? nil : loadFailures.joined(separator: "\n\n")
 
         self.machine = loadedMachine
         self.config = loadedConfig
@@ -249,6 +261,15 @@ final class AppModel: ObservableObject {
     /// from `saveConfig(_:)` because the two files have different lifetimes:
     /// `config.json` is shared across every machine, this one never leaves
     /// the host.
+    ///
+    /// **This method never writes an identity.** `machine.machineId` here may
+    /// be `RESTIC_STATION_MACHINE_ID`'s temporary value — the two-profiles
+    /// feature — and this path is reached *automatically* by restic
+    /// discovery, not by a user asking to save anything, so persisting it
+    /// would silently and permanently rebind the host to a profile it was
+    /// only visiting. `savePreservingIdentity(_:)` writes every other field
+    /// and keeps the id that is already on disk; the override keeps applying
+    /// in memory, which is the whole point of it.
     func updateMachine(_ mutate: (inout MachineConfig) -> Void) throws {
         // While `machine.json` is unreadable, `machine` is a *generated
         // fallback*, not the user's identity. Writing it back would replace
@@ -265,17 +286,24 @@ final class AppModel: ObservableObject {
         mutate(&draft)
         guard draft != machine else { return }
 
+        let persisted: MachineConfig
         do {
-            try machineStore.save(draft)
+            persisted = try machineStore.savePreservingIdentity(draft)
         } catch {
             lastConfigError = "\(error)"
             throw error
         }
 
+        // Take every field from what was actually written, then restore the
+        // in-memory (possibly overridden) id — so this machine keeps
+        // resolving against the profile it was launched with.
+        var updated = persisted
+        updated.machineId = machine.machineId
+
         let previousResticPath = resticPath
-        machine = draft
-        resolvedConfig = config.resolved(for: draft).config
-        addressableConfig = config.addressable(for: draft)
+        machine = updated
+        resolvedConfig = config.resolved(for: updated).config
+        addressableConfig = config.addressable(for: updated)
         lastConfigError = nil
         recomputeDerivedState()
 
