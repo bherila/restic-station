@@ -149,6 +149,15 @@ public final class ResticRunner: Sendable {
         return try await execute(cmd, env: baseEnvironment(), onLine: onLine, onRawLine: onRawLine, timeout: timeout)
     }
 
+    /// Which secret backend this runner reads passwords from.
+    ///
+    /// Exposed so collaborators that only hold a `ResticRunner` — notably
+    /// `Reachability` — can word a secret-store failure for the store
+    /// actually in use rather than for the host OS.
+    public var secretBackend: SecretBackend {
+        secrets.backend
+    }
+
     // MARK: - Secret-store pre-flight
 
     private func preflightSecrets(destination: Destination) async throws {

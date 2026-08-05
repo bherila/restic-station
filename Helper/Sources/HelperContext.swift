@@ -109,9 +109,18 @@ struct HelperContext {
     /// "exit 0 unless config itself is broken": a helper that cannot tell
     /// which store holds the passwords must not guess, and guessing wrong
     /// looks exactly like "all my passwords disappeared".
+    /// `helperExecutablePath` is *this* binary: the helper is the one process
+    /// for which "the current executable" really is the right target for the
+    /// file backend's `RESTIC_PASSWORD_COMMAND` — the app must pass its
+    /// embedded helper's path instead, which is why the factory has no
+    /// default.
     static func makeSecretStore(paths: AppPaths, runner: ProcessRunning) -> any SecretStore {
         do {
-            return try SecretStoreFactory.make(paths: paths, runner: runner)
+            return try SecretStoreFactory.make(
+                paths: paths,
+                runner: runner,
+                helperExecutablePath: FileSecretStore.currentExecutablePath()
+            )
         } catch {
             HelperExit.fail("secret storage is misconfigured: \(error)")
         }

@@ -39,7 +39,8 @@ extension SecretStoreError: LocalizedError {
 /// Two backends implement this (see `docs/keychain-and-fda.md`):
 /// ``KeychainSecretStore`` (macOS, `/usr/bin/security`) and
 /// ``FileSecretStore`` (Linux default, `<AppPaths.root>/secrets.json`).
-/// ``SecretStoreFactory/make(paths:runner:environment:)`` picks one.
+/// ``SecretStoreFactory/make(paths:runner:helperExecutablePath:environment:)``
+/// picks one.
 ///
 /// **Semantics every backend must preserve** — these are load-bearing and
 /// each has a shared conformance test in `SecretStoreConformanceTests`:
@@ -60,6 +61,18 @@ extension SecretStoreError: LocalizedError {
 /// each backend produces its own `RESTIC_PASSWORD_COMMAND` string, and the
 /// file backend's depends on where *this* executable lives.
 public protocol SecretStore: Sendable {
+
+    /// Which backend this store is.
+    ///
+    /// Exists so every user-facing string about secret storage is chosen by
+    /// **the store actually in use**, not by the host OS: macOS with
+    /// `RESTIC_STATION_SECRET_BACKEND=file` is a supported configuration, and
+    /// telling that user to "unlock your login keychain" when their
+    /// `secrets.json` has the wrong mode sends them down the wrong path at
+    /// exactly the wrong moment. The wording itself lives on
+    /// ``SecretBackend`` so the two backends cannot describe themselves
+    /// inconsistently.
+    var backend: SecretBackend { get }
 
     // MARK: Repository password
 

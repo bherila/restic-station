@@ -20,11 +20,32 @@ extension AppModel {
     /// keychain by default, or `secrets.json` when
     /// `RESTIC_STATION_SECRET_BACKEND=file`. Cheap to build.
     ///
-    /// `nil` only when the backend override is unrecognised, which the
-    /// callers surface as "the password could not be saved" rather than
-    /// silently writing to the wrong store.
+    /// **The helper path is not this process.** With the file backend the
+    /// store bakes an executable into `RESTIC_PASSWORD_COMMAND`, and restic
+    /// runs it as a child to read the password. Naming the app binary there
+    /// would hand restic a SwiftUI app that cannot print a password and
+    /// would try to open a UI, so every app-side store names the *embedded
+    /// helper* — the same binary `HelperInvoker` and the LaunchAgent use.
+    /// The factory requires this explicitly, so a new app-side call site
+    /// cannot forget it.
+    ///
+    /// Throws only when the `RESTIC_STATION_SECRET_BACKEND` override is
+    /// unrecognised — deliberately a hard error rather than a silent
+    /// fallback to the wrong store.
+    func makeSecretStore() throws -> any SecretStore {
+        try SecretStoreFactory.make(
+            paths: paths,
+            runner: DefaultProcessRunner(),
+            helperExecutablePath: HelperInvoker.helperURL.path
+        )
+    }
+
+    /// `makeSecretStore()` for the call sites that can only degrade (reading
+    /// back a password to pre-fill an editor, deleting a destination's
+    /// secrets). Every site that can *report* the failure calls the throwing
+    /// form instead.
     var secrets: (any SecretStore)? {
-        try? SecretStoreFactory.make(paths: paths, runner: DefaultProcessRunner())
+        try? makeSecretStore()
     }
 
     // MARK: - Sets
@@ -111,7 +132,7 @@ extension AppModel {
         password: String?,
         secretEnv: [String: String]?
     ) async throws {
-        let store = try SecretStoreFactory.make(paths: paths, runner: DefaultProcessRunner())
+        let store = try makeSecretStore()
         if let password, !password.isEmpty {
             try await store.setPassword(password, destId: destId)
         }

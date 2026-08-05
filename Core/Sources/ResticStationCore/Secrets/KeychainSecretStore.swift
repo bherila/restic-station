@@ -29,6 +29,8 @@ public struct KeychainSecretStore: SecretStore {
     private static let securityPath = "/usr/bin/security"
     private static let service = "restic-station"
 
+    public let backend = SecretBackend.keychain
+
     private let runner: ProcessRunning
 
     public init(runner: ProcessRunning) {

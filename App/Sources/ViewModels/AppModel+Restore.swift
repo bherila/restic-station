@@ -69,14 +69,20 @@ extension AppModel {
     ///
     /// Returns `nil` when no restic binary is configured yet; the caller
     /// renders that as an explained empty state rather than an error.
-    func makeBrowsingRunner() -> ResticRunner? {
+    ///
+    /// **Throws** when secret storage itself is misconfigured (a mistyped
+    /// `RESTIC_STATION_SECRET_BACKEND`). That is deliberately not folded into
+    /// the `nil` case: "restic is not set up yet" is an empty state, while
+    /// "your secret storage setting is wrong" is a real error every other
+    /// flow reports — swallowing it here would leave the Restore pane showing
+    /// a bare "No snapshots" with no hint of the cause.
+    func makeBrowsingRunner() throws -> ResticRunner? {
         guard let path = config.resticPath, !path.isEmpty else { return nil }
         let processRunner = DefaultProcessRunner()
-        guard let secrets = try? SecretStoreFactory.make(paths: paths, runner: processRunner) else { return nil }
         return ResticRunner(
             resticPath: path,
             paths: paths,
-            secrets: secrets,
+            secrets: try makeSecretStore(),
             runner: processRunner
         )
     }
@@ -173,11 +179,19 @@ final class RestoreBrowser: ObservableObject {
 
     /// Points the browser at a repository. Re-configuring with the same
     /// repository is a no-op, so it is safe to call from `onChange`.
-    func configure(repository: RestoreRepository?, runner: ResticRunner?) {
+    ///
+    /// - Parameter unavailableReason: why there is no runner, when the
+    ///   reason is a *misconfiguration* rather than "restic is not set up
+    ///   yet". Surfaced through `snapshotsError`, so the pane explains
+    ///   itself instead of showing a bare "No snapshots".
+    func configure(repository: RestoreRepository?, runner: ResticRunner?, unavailableReason: String? = nil) {
         guard repository?.id != self.repository?.id else {
             // Same repository, but the restic path (and therefore the
             // runner) may have changed in Settings.
             self.runner = runner
+            if let unavailableReason {
+                snapshotsError = unavailableReason
+            }
             return
         }
         snapshotsTask?.cancel()
@@ -185,7 +199,9 @@ final class RestoreBrowser: ObservableObject {
         self.repository = repository
         self.runner = runner
         snapshots = []
-        snapshotsError = nil
+        // Set after the reset, not before: `loadSnapshots` bails out early
+        // without a runner, so this is the only thing that will be showing.
+        snapshotsError = unavailableReason
         isLoadingSnapshots = false
         searchResults = []
         searchState = .idle

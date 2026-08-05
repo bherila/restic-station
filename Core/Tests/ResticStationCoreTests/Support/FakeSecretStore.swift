@@ -25,11 +25,22 @@ final class FakeSecretStore: SecretStore, @unchecked Sendable {
     private var _failingSecretEnvs: Set<UUID> = []
     private let defaultPassword: String?
 
-    /// - Parameter defaultPassword: returned for any destination with no
-    ///   explicitly stored password. `nil` makes the store behave like a real
-    ///   empty one (`itemNotFound`).
-    init(defaultPassword: String? = FakeSecretStore.standardPassword) {
+    /// Which backend this fake stands in for. Defaults to the platform's, so
+    /// a test that does not care gets the wording a real host would produce.
+    let backend: SecretBackend
+
+    /// - Parameters:
+    ///   - defaultPassword: returned for any destination with no explicitly
+    ///     stored password. `nil` makes the store behave like a real empty
+    ///     one (`itemNotFound`).
+    ///   - backend: the backend this fake reports as, for the user-facing
+    ///     wording derived from it.
+    init(
+        defaultPassword: String? = FakeSecretStore.standardPassword,
+        backend: SecretBackend = .platformDefault
+    ) {
         self.defaultPassword = defaultPassword
+        self.backend = backend
     }
 
     // MARK: - Test configuration

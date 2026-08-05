@@ -395,7 +395,20 @@ struct RestoreView: View {
     }
 
     private func configureBrowser() {
-        browser.configure(repository: repository, runner: model.makeBrowsingRunner())
+        do {
+            browser.configure(repository: repository, runner: try model.makeBrowsingRunner())
+        } catch {
+            // Secret storage is misconfigured (a mistyped
+            // RESTIC_STATION_SECRET_BACKEND). Say so here rather than letting
+            // the pane fall through to "No snapshots", which would look like
+            // an empty repository.
+            browser.configure(
+                repository: repository,
+                runner: nil,
+                unavailableReason: "Secret storage is misconfigured, so this repository's password "
+                    + "cannot be read: \(error). Fix \(SecretBackend.environmentKey), then try again."
+            )
+        }
         browser.loadSnapshots()
     }
 }

@@ -53,18 +53,27 @@ public struct FileSecretStore: SecretStore {
     static let lockTimeout: TimeInterval = 10
     private static let lockPollNanoseconds: UInt64 = 25_000_000
 
+    public let backend = SecretBackend.file
+
     private let paths: AppPaths
     private let helperPath: String
 
     /// - Parameters:
     ///   - paths: supplies `root` (the secrets file's directory) and
     ///     `locksDir`.
-    ///   - helperPath: the absolute path baked into
-    ///     ``passwordCommand(destId:)``. Defaults to *this* executable,
-    ///     resolved from `/proc/self/exe` on Linux — deliberately **not**
+    ///   - helperPath: absolute path of the `restic-station-helper` binary,
+    ///     baked into ``passwordCommand(destId:)``.
+    ///
+    ///     Required, with **no default**. "This executable" is the right
+    ///     answer only inside the helper; the app process builds a store too
+    ///     (restore browsing, `mount`, primary `init`), and a default there
+    ///     would point `RESTIC_PASSWORD_COMMAND` at the SwiftUI app binary.
+    ///     See `SecretStoreFactory.make(paths:runner:helperExecutablePath:environment:)`.
+    ///     The helper passes ``currentExecutablePath()``, which reads
+    ///     `/proc/self/exe` — deliberately **not**
     ///     `CommandLine.arguments[0]`, which is whatever the caller chose to
     ///     put in `argv[0]` and is trivially spoofable.
-    public init(paths: AppPaths, helperPath: String = FileSecretStore.currentExecutablePath()) {
+    public init(paths: AppPaths, helperPath: String) {
         self.paths = paths
         self.helperPath = helperPath
     }

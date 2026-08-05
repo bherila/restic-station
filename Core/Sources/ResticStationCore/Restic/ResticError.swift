@@ -178,16 +178,19 @@ public enum ResticRunnerError: Error, Equatable, Sendable, CustomStringConvertib
     public var userFacingMessage: String {
         switch self {
         case .secretsUnavailable:
-            // Platform-split rather than a vague joint sentence, so each host
-            // gets exactly one next step (`docs/ui-spec.md` §Voice). The macOS
-            // wording is unchanged from before the SecretStore abstraction.
-            #if os(macOS)
-            return "The password for this destination could not be read from the keychain. "
-                + "Unlock your login keychain, then run the backup again."
-            #else
-            return "The password for this destination could not be read from secure storage. "
-                + "Check the permissions on the secrets file, then run the backup again."
-            #endif
+            // Worded for the backend actually in use, not for the host OS:
+            // macOS with `RESTIC_STATION_SECRET_BACKEND=file` is supported,
+            // and "unlock your login keychain" is the wrong next step for a
+            // `secrets.json` whose mode was widened.
+            //
+            // This is the one place that reads the *configured* backend
+            // rather than a store's own `backend`: it is a property on an
+            // error value, which has no store to ask. In production the two
+            // always agree — every store is built by `SecretStoreFactory`
+            // from this same environment. Callers that do hold a store
+            // (`BackupEngine`, `Reachability`) use the store's backend.
+            let backend = SecretBackend.configured
+            return "\(backend.unavailableSummary) \(backend.unavailableAdvice)"
         case .launchFailed:
             return "The restic program could not be started. "
                 + "Check the restic path in Settings."

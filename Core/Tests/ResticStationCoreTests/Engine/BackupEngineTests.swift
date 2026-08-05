@@ -126,6 +126,7 @@ struct BackupEngineTests {
     ///     simply has no repository directory on disk.
     static func makeEnv(
         secretsUnavailableFor: [UUID] = [],
+        secretBackend: SecretBackend = .platformDefault,
         script: [FakeProcessRunner.Expectation],
         retention: RetentionPolicy? = RetentionPolicy(keepLast: 3),
         checkPolicy: CheckPolicy? = nil,
@@ -180,7 +181,7 @@ struct BackupEngineTests {
         let processRunner: ProcessRunning = onSpawn.map {
             ObservingProcessRunner(inner: fake, onSpawn: $0)
         } ?? fake
-        let secrets = FakeSecretStore(defaultPassword: "repo-password")
+        let secrets = FakeSecretStore(defaultPassword: "repo-password", backend: secretBackend)
         for id in secretsUnavailableFor {
             secrets.failPassword(for: id)
         }
@@ -642,6 +643,33 @@ struct BackupEngineTests {
             "the set lock must not even be created before the pre-flight passes"
         )
         #expect(env.stateStore.readCurrentRun(setId: Self.setId) == nil)
+    }
+
+    /// Regression test for the review finding that the engine's wording
+    /// branched on `#if os(macOS)`. The `.retryable` reason is shown to the
+    /// user and logged; on a host running the file backend it must point at
+    /// the secrets file, not at a login keychain the host may not even have.
+    @Test("row 9: the retryable reason names the store in use, not the host OS")
+    func rowNineReasonFollowsTheBackend() async throws {
+        for backend in SecretBackend.allCases {
+            let env = Self.makeEnv(
+                secretsUnavailableFor: [Self.primaryId],
+                secretBackend: backend,
+                script: []
+            )
+            defer { env.cleanUp() }
+
+            let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
+
+            guard case .retryable(let reason) = outcome else {
+                Issue.record("expected .retryable, got \(outcome)")
+                return
+            }
+            #expect(reason.hasPrefix(backend.displayName), "reason was: \(reason)")
+            if backend == .file {
+                #expect(!reason.lowercased().contains("keychain"), "reason was: \(reason)")
+            }
+        }
     }
 
     // MARK: - Row 10 — set lock busy

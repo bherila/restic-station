@@ -40,7 +40,7 @@ enum MaintenanceLookup {
         return ResticRunner(
             resticPath: resticPath,
             paths: model.paths,
-            secrets: try SecretStoreFactory.make(paths: model.paths, runner: processRunner),
+            secrets: try model.makeSecretStore(),
             runner: processRunner
         )
     }

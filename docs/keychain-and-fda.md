@@ -13,6 +13,8 @@ Secret storage sits behind `SecretStore` (`Core/Sources/ResticStationCore/Secret
 
 `RESTIC_STATION_SECRET_BACKEND=keychain|file` overrides the platform default; an unrecognised value is a hard error, never a silent fallback. Both backends key on the destination UUID lowercased, and on `"<uuid>-env"` for the secret-env JSON blob, so the two are structurally comparable. §1–§4 below are macOS; §5 is the file backend.
 
+**Every user-facing string about secret storage is chosen by the backend in use, not by the host OS.** `SecretStore.backend` reports which one a store is, and all the wording (`displayName`, `unavailableSummary`, `unavailableAdvice`, `unavailableProbeReason`) lives on `SecretBackend`. This matters because macOS-with-the-file-backend is a supported configuration: telling that user to "unlock your login keychain" when their `secrets.json` mode was widened sends them down the wrong path during an incident. The one exception is `ResticRunnerError.userFacingMessage`, a property on an error value with no store to ask — it uses `SecretBackend.configured`, which reads the same environment every store is built from.
+
 ## 1. Keychain: the `security`-CLI ACL strategy
 
 ### The trap
@@ -156,7 +158,10 @@ A tick and an interactive `secret set` can run at the same time. Every read-modi
 
 Same seam as macOS — `RESTIC_PASSWORD_COMMAND` / `RESTIC_FROM_PASSWORD_COMMAND`, deliberately *not* a plain `RESTIC_PASSWORD` env var (restic's support for a `RESTIC_FROM_PASSWORD` non-`_COMMAND` variant is not something to assume, and the command seam is already proven here). The command is `<absolute-helper-path> print-password --dest <uuid>`; restic runs it as a child and reads the password off its stdout, with no trailing newline.
 
-The helper's own path comes from `/proc/self/exe` on Linux — the kernel's answer, correct even when invoked through a symlink or a `PATH` lookup — and **never** from `CommandLine.arguments[0]`, which is attacker-controlled and would be a straightforward code-execution hole in a string restic is about to execute.
+**Which binary goes in that command is the caller's decision, not a default.** `SecretStoreFactory.make(paths:runner:helperExecutablePath:environment:)` requires the path, because "this executable" is right only inside the helper. The app process builds a store too — restore browsing, `mount`, primary `init` — and a default there would name the SwiftUI app binary, handing restic a child that cannot print a password and might try to open a UI. So:
+
+- the **helper** passes `FileSecretStore.currentExecutablePath()`, which reads `/proc/self/exe` on Linux (the kernel's answer, correct even when invoked through a symlink or a `PATH` lookup) and `_NSGetExecutablePath` + `realpath` on Darwin. **Never** `CommandLine.arguments[0]`, which is attacker-controlled and would be a straightforward code-execution hole in a string restic is about to execute; and never `Bundle.main.executablePath`, which for a tool inside an `.app` bundle's `Contents/MacOS/` names the *app*.
+- the **app** passes `HelperInvoker.helperURL.path` — the embedded `restic-station-helper`, the same binary the LaunchAgent's `BundleProgram` points at.
 
 Because `ResticRunner` *replaces* restic's environment, that child would otherwise resolve the default data directory with the platform-default backend. `FileSecretStore.passwordCommandEnvironment` therefore contributes `RESTIC_STATION_DATA_DIR` and `RESTIC_STATION_SECRET_BACKEND=file` to the assembled environment (the keychain backend contributes nothing, which is why macOS's environment is byte-identical to what it was before this abstraction existed).
 

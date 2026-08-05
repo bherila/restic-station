@@ -312,7 +312,14 @@ final class MountController: ObservableObject {
         environment["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"
         environment.merge(destination.nonSecretEnv) { _, new in new }
 
-        let secrets = try SecretStoreFactory.make(paths: paths, runner: DefaultProcessRunner())
+        // The embedded helper, never this process: with the file backend the
+        // store bakes this executable into `RESTIC_PASSWORD_COMMAND`, and
+        // `restic mount` would otherwise be handed the SwiftUI app binary.
+        let secrets = try SecretStoreFactory.make(
+            paths: paths,
+            runner: DefaultProcessRunner(),
+            helperExecutablePath: HelperInvoker.helperURL.path
+        )
         let secretEnv = try await secrets.secretEnv(destId: destination.id)
         environment.merge(secretEnv) { _, new in new }
 

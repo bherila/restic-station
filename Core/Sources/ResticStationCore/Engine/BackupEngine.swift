@@ -185,7 +185,7 @@ public final class BackupEngine: Sendable {
         do {
             _ = try await secrets.password(destId: primary.id)
         } catch {
-            let reason = "\(Self.secretStoreDescription) could not be read for destination \"\(primary.label)\""
+            let reason = "\(secretStoreDescription) could not be read for destination \"\(primary.label)\""
             logWarning("BackupEngine: \(reason) — skipping this run (retryable, nothing recorded)")
             return .retryable(reason: reason)
         }
@@ -989,14 +989,16 @@ public final class BackupEngine: Sendable {
         }
     }
 
-    /// How the engine names the secret store in its user-visible log lines.
-    /// Platform-split so the macOS wording is byte-for-byte what it was
-    /// before the `SecretStore` abstraction landed.
-    #if os(macOS)
-    static let secretStoreDescription = "the login keychain"
-    #else
-    static let secretStoreDescription = "the secrets file"
-    #endif
+    /// How the engine names the secret store in its user-visible log lines
+    /// and in `.retryable` reasons.
+    ///
+    /// Taken from the store actually in use, not from the host OS: a macOS
+    /// host running `RESTIC_STATION_SECRET_BACKEND=file` must not be told its
+    /// login keychain is the problem. The keychain wording is byte-for-byte
+    /// what it was before the `SecretStore` abstraction landed.
+    private var secretStoreDescription: String {
+        secrets.backend.displayName
+    }
 
     /// The engine's own pre-flight for the non-`runSet` entry points: an
     /// unreadable secret store is retryable, so those methods return
@@ -1008,7 +1010,7 @@ public final class BackupEngine: Sendable {
                 _ = try await secrets.password(destId: destination.id)
             } catch {
                 logWarning(
-                    "BackupEngine: \(Self.secretStoreDescription) could not be read for destination "
+                    "BackupEngine: \(secretStoreDescription) could not be read for destination "
                         + "\"\(destination.label)\" — skipping (retryable, nothing recorded)"
                 )
                 return false

@@ -24,15 +24,12 @@ struct ReachabilityTests {
         return Reachability(restic: runner)
     }
 
-    /// The `offline` reason `ResticRunner`'s secret pre-flight produces.
-    /// Platform-split in `Reachability` so the macOS wording — which the
-    /// app's badge heuristic matches on — is unchanged by T23.
+    /// The `offline` reason `ResticRunner`'s secret pre-flight produces —
+    /// taken from the **store in use**, not from the host OS. The keychain
+    /// wording (which the app's badge heuristic matches on) is unchanged by
+    /// T23.
     static var secretsUnavailableReason: String {
-        #if os(macOS)
-        return "keychain locked"
-        #else
-        return "secret store unavailable"
-        #endif
+        SecretBackend.platformDefault.unavailableProbeReason
     }
 
     // MARK: - Local: present / missing
@@ -177,6 +174,25 @@ struct ReachabilityTests {
         #expect(result == .offline(reason: Self.secretsUnavailableReason))
         // restic itself was never spawned.
         #expect(fake.invocations.isEmpty)
+    }
+
+    /// Regression test for the review finding that this reason branched on
+    /// `#if os(macOS)`. A macOS host running `RESTIC_STATION_SECRET_BACKEND=file`
+    /// must not record "keychain locked" in `repo-status-<destId>.json`, and
+    /// a keychain host must still record exactly that (the app's badge
+    /// heuristic matches on it).
+    @Test("the offline reason names the store in use, on every host")
+    func secretPreflightReasonFollowsTheBackend() async throws {
+        let dest = Destination(id: Self.destId, label: "R2", repoURL: "s3:https://x/bucket", isPrimary: false)
+
+        for backend in SecretBackend.allCases {
+            let secrets = FakeSecretStore(defaultPassword: Self.password, backend: backend)
+            secrets.failPassword(for: Self.destId)
+            let reachability = Self.makeReachability(FakeProcessRunner(), secrets: secrets)
+
+            let result = await reachability.probe(dest)
+            #expect(result == .offline(reason: backend.unavailableProbeReason))
+        }
     }
 
     @Test("remote destination: launch failure is offline with the launch failure reason")
