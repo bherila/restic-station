@@ -6,6 +6,8 @@ import Testing
 import Darwin
 #elseif canImport(Glibc)
 import Glibc
+#elseif canImport(Musl)
+import Musl
 #endif
 
 /// Tiny mutable counter usable from a `@Sendable` closure. `RunStore`'s

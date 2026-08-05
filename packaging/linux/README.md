@@ -72,9 +72,16 @@ tells you and prints the line to add to your shell profile.
      (falls back to `~/.local/state/restic-station/config.json`) — see
      `docs/data-model.md` in the source repository for the schema.
 3. Store each destination's password (never on the command line — reads
-   from stdin):
+   from stdin). Prefer the interactive form, which leaves no trace in your
+   shell history:
    ```sh
-   printf '%s' 'the-repo-password' | restic-station-helper secret set --dest <destination-id>
+   restic-station-helper secret set --dest <destination-id>
+   ```
+   For scripted setup, pipe it in — but note that typing the password
+   inline persists it to `~/.bash_history`, so read it from a file or a
+   secret manager instead:
+   ```sh
+   your-secret-manager get repo-password | restic-station-helper secret set --dest <destination-id>
    ```
 4. Check what will actually run on *this* machine before scheduling
    anything — this also explains any set or destination that per-machine
