@@ -199,6 +199,8 @@ Superset of the index line, plus: `pid`, `resticExitCode`, `argvRedacted` (argv 
 { "checkedAt": "2026-07-26T20:57:00Z", "hasFullDiskAccess": true, "probedPath": "~/Library/Safari", "context": "launchd" }
 ```
 
+**macOS only, and absence is meaningful.** The file is written only by the macOS `fda-check` probe; on other platforms the subcommand writes nothing at all. An absent file means "not applicable / not yet known", **never** "denied" — see `keychain-and-fda.md` §2 for the normative rule and `HealthDerivation.fullDiskAccessDenied(from:)` for its single implementation.
+
 ## Versioning & migration
 
 `AppConfig.version` starts at 1. Loader behavior: version > current → refuse with clear error ("config written by a newer Restic Station"); version < current → run in-code migration chain then save. State/run files carry no version field — they are regenerable caches/history; on decode failure, skip the record and log, never crash.

@@ -17,7 +17,7 @@ Shared state on disk: ~/Library/Application Support/ResticStation/
 Secrets: macOS login Keychain (service "restic-station")
 ```
 
-1. **`ResticStationCore`** — local Swift package at `Core/`. Contains **all** logic: config model + store, keychain client, restic runner + command builders + parsers, schedule math, run store, file locking, backup engine, reachability, state store. No UI. Depends only on Foundation (+ swift-argument-parser is *not* here; it's a Helper dependency). `Package.swift` declares `platforms: [.macOS(.v14)]` so `swift test --package-path Core` works standalone.
+1. **`ResticStationCore`** — local Swift package at `Core/`. Contains **all** logic: config model + store, keychain client, restic runner + command builders + parsers, restic discovery, schedule math, run store, file locking, backup engine, reachability, state store. No UI. Depends only on Foundation (+ swift-argument-parser is *not* here; it's a Helper dependency). `Package.swift` declares `platforms: [.macOS(.v14)]` so `swift test --package-path Core` works standalone.
 2. **`restic-station-helper`** — command-line executable target, embedded in the app bundle at `Contents/MacOS/restic-station-helper`. Uses swift-argument-parser. Subcommands: `tick`, `run-set`, `init-secondary`, `probe-repo`, `restore`, `fda-check`, `version`. Each invocation does its work and **exits** — it never daemonizes. launchd re-fires it via `StartInterval`.
 3. **`Restic Station.app`** — SwiftUI app. Regular app (Dock icon + windows) plus a `MenuBarExtra`. Registers the helper's LaunchAgent via `SMAppService`.
 
@@ -62,6 +62,31 @@ public protocol ProcessRunning: Sendable {
 ```
 
 The production implementation (`DefaultProcessRunner`) wraps `Process` + pipes. Tests inject `FakeProcessRunner` (see `testing.md`). `KeychainClient`, `ResticRunner`, and `Reachability` all take a `ProcessRunning` in their initializers.
+
+## restic discovery
+
+`ResticDiscovery` (`Core/Sources/ResticStationCore/Restic/ResticDiscovery.swift`) finds a usable restic binary. It lives in **Core**, not `App/`: the helper needs it too, and `App/` is macOS-only.
+
+Search order: the platform's well-known package-manager locations first, then one `<dir>/restic` per `PATH` entry.
+
+| Platform | Well-known locations (in order) |
+| --- | --- |
+| macOS | `/opt/homebrew/bin/restic`, `/usr/local/bin/restic`, `/opt/local/bin/restic` |
+| Linux | `/usr/bin/restic`, `/usr/local/bin/restic`, `/opt/restic/bin/restic` |
+
+Three rules, all load-bearing:
+
+1. **A candidate is "found" only if it *ran*.** Existence plus the `+x` bit is a filter, never the answer — a Homebrew shim for an uninstalled formula, an x86 binary with no Rosetta, a distro wrapper for an uninstalled package, and a dangling symlink all pass `isExecutableFile` and fail to execute. Every reported version comes from a real `restic version --json` round trip, compared against the documented minimum (0.17.0, `restic-cli.md` §version).
+2. **Per-candidate timeout** (5 s) so a binary on an unresponsive network mount cannot stall onboarding, and a **cap of 24 candidates executed per search** so a pathological `PATH` cannot either.
+3. **Only absolute paths.** Relative `PATH` entries (including the empty entry POSIX shells read as the current directory) are dropped: the resolved path is consumed by a helper running headless with an unrelated working directory.
+
+**Who resolves what.** The app persists a user-chosen or discovered path into `config.json`'s `resticPath` and shows the rejected candidates in Settings. The helper resolves independently, in this order:
+
+1. `machine.json` `resticPath` — the per-machine override (T24; not implemented yet, see the `TODO(#26)` in `Helper/Sources/ResticPathResolution.swift`).
+2. `config.json` `resticPath` — deprecated. `config.json` is shared across machines, so a path correct on one host is wrong on the next.
+3. Discovery.
+
+A discovered path is logged once at info level and deliberately **not** written back into `config.json`. When nothing resolves, macOS prints the T10 wording ("restic not configured — open Restic Station"); Linux, where there is no app to open, prints what was searched and how to fix it.
 
 ## Error taxonomy
 

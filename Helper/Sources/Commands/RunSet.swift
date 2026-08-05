@@ -25,7 +25,7 @@ struct RunSet: AsyncParsableCommand {
     var kind: Kind = .backup
 
     func run() async throws {
-        let context = HelperContext.make()
+        let context = await HelperContext.make()
         guard let backupSet = context.config.sets.first(where: { $0.id == set }) else {
             HelperExit.fail("no backup set with id \(set)")
         }

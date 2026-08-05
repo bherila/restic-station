@@ -35,11 +35,31 @@ A `RunAtLoad` tick can fire before the login keychain is unlocked; `find-generic
 
 ## 2. Full Disk Access (TCC)
 
+**macOS only.** TCC is a macOS mechanism; on Linux there is no equivalent and ordinary file permissions govern access to everything. Everything in this section applies to the macOS build alone.
+
 - Reading `~/Library/Mail`, `~/Library/Safari`, Messages, etc. requires FDA. **There is no prompt and no request API** — the user must add the app in System Settings → Privacy & Security → Full Disk Access. Deep link: `x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles`.
 - **Attribution:** processes launched by launchd are normally self-responsible for TCC. But an SMAppService agent whose plist uses `BundleProgram` runs with the containing app as the responsible bundle — so granting FDA to **Restic Station.app** is expected to cover the embedded helper. This is the designed behavior on macOS 14/15, but it has real-world edge cases (unsigned dev builds, app relocated after registration), so we verify empirically instead of assuming:
 - **Verification protocol:** the helper has an `fda-check` subcommand: attempt `FileManager.contentsOfDirectory` on `~/Library/Safari` (fall back to `~/Library/Mail` if Safari dir absent); write `{hasFullDiskAccess, probedPath, checkedAt, context:"launchd"}` to `state/fda-check.json`. The app (a) runs the same probe in-process (`context:"app"`), and (b) triggers a real launchd-context probe via `launchctl kickstart -k gui/<uid>/net.herila.ResticStation.helper` and reads the state file. Onboarding shows BOTH results as separate badges — "App" and "Background agent" — because they can genuinely differ.
 - **Troubleshooting fallback (docs + onboarding help text):** if the app has FDA but the launchd probe still reports denied, add the helper binary itself via the "+" button in the FDA pane: `Restic Station.app/Contents/MacOS/restic-station-helper` (⌘⇧G to type the path).
 - Sources the user picks via `NSOpenPanel` are readable without FDA only by the app process (powerbox), NOT by the helper — so FDA is effectively required for any real backup of user data. Onboarding must treat FDA as a required step, not optional polish.
+
+### `fda-check` on non-macOS platforms
+
+The `fda-check` subcommand exists on **every** platform, so scripts, docs and the launchd/systemd unit stay uniform. Off macOS it prints "not applicable on this platform" and exits 0 **without writing `state/fda-check.json`**.
+
+Writing a synthetic `{"hasFullDiskAccess": true}` record was rejected deliberately: it would make the file's meaning platform-dependent and put a claim about a privacy mechanism that does not exist into a file other code reads.
+
+### Absent-file semantics (normative)
+
+**An absent `state/fda-check.json` means "not applicable / not yet known" — never "denied".** It is absent in two legitimate situations:
+
+- macOS, before the first `fda-check` has run (a fresh install, up to the first tick).
+- Linux, always.
+
+Every reader must honour this:
+
+- `HealthDerivation.fullDiskAccessDenied(from:)` (Core) is the single definition — `nil` → `false`; only an explicit `hasFullDiskAccess == false` is a denial. `AppModel` feeds `appHealth(…)` through it, so an absent file never paints the menu bar icon yellow and never degrades a set's health.
+- The Permissions pane reports an absent record as **unknown**, with its own staleness rule (evidence older than an hour is not evidence — FDA is revocable at any time).
 
 ## 3. SMAppService
 

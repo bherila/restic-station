@@ -48,9 +48,9 @@ struct HelperContext {
 
     /// The strict entry point used by every subcommand except `tick`:
     /// loads config from disk (a hard I/O/decode/version error → exit 1),
-    /// then requires a configured restic path (missing → exit 1, "restic
-    /// not configured — open Restic Station" per the T10 task file).
-    static func make() -> HelperContext {
+    /// then resolves a restic path (unresolvable → exit 1 with
+    /// `resticNotFoundMessage`).
+    static func make() async -> HelperContext {
         let paths = AppPaths.default()
         let configStore = ConfigStore(paths: paths)
         let config: AppConfig
@@ -59,18 +59,18 @@ struct HelperContext {
         } catch {
             HelperExit.fail("could not load configuration: \(error)")
         }
-        guard let context = makeTolerant(paths: paths, config: config, configStore: configStore) else {
-            HelperExit.fail("restic not configured — open Restic Station")
+        guard let context = await makeTolerant(paths: paths, config: config, configStore: configStore) else {
+            HelperExit.fail(resticNotFoundMessage(paths: paths))
         }
         return context
     }
 
     /// The lenient constructor `tick` uses: `tick`'s own contract is "exit 0
     /// always, except a hard config-load error" (`docs/scheduling.md`
-    /// §Tick algorithm) — a missing restic path must not be treated as a
-    /// hard error there, so this returns `nil` instead of exiting.
-    static func makeTolerant(paths: AppPaths, config: AppConfig, configStore: ConfigStore) -> HelperContext? {
-        guard let resticPath = config.resticPath, !resticPath.isEmpty else {
+    /// §Tick algorithm) — an unresolvable restic path must not be treated as
+    /// a hard error there, so this returns `nil` instead of exiting.
+    static func makeTolerant(paths: AppPaths, config: AppConfig, configStore: ConfigStore) async -> HelperContext? {
+        guard let resticPath = await resolveResticPath(config: config) else {
             return nil
         }
         let processRunner = DefaultProcessRunner()

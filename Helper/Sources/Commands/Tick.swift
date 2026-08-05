@@ -42,10 +42,15 @@ struct Tick: AsyncParsableCommand {
             print("no backup sets")
             return
         }
-        guard let context = HelperContext.makeTolerant(paths: paths, config: config, configStore: configStore) else {
-            // RunAtLoad tolerance: nothing usable configured yet (no restic
-            // path) — not a hard error, tick just has nothing to do.
-            print("restic not configured — open Restic Station")
+        guard let context = await HelperContext.makeTolerant(
+            paths: paths,
+            config: config,
+            configStore: configStore
+        ) else {
+            // RunAtLoad tolerance: nothing usable configured yet, and
+            // discovery found no restic either — not a hard error, tick just
+            // has nothing to do.
+            print(HelperContext.resticNotFoundMessage(paths: paths))
             return
         }
 

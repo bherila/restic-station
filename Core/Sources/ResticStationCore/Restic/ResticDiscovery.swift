@@ -1,42 +1,68 @@
 import Foundation
-import ResticStationCore
 
 /// Finds a usable `restic` binary (`docs/architecture.md` §restic discovery,
-/// `docs/restic-cli.md` §version): probe the three package-manager locations
-/// first, then whatever the app's inherited `PATH` offers, and validate each
+/// `docs/restic-cli.md` §version): probe the package-manager locations for
+/// this platform first, then whatever `PATH` offers, and validate each
 /// candidate by actually running `restic version --json` and comparing the
 /// reported version against the documented minimum.
+///
+/// Lives in Core (moved out of `App/` in T25) because the *helper* needs it
+/// too: on a headless Linux host there is no app to open, so
+/// `HelperContext.make()` discovers restic itself rather than telling the
+/// user to launch a GUI that isn't there.
 ///
 /// Three rules this type exists to enforce:
 ///
 /// 1. **A candidate is only "found" if it ran.** Existence and the +x bit are
 ///    a filter, never the answer: a Homebrew shim for an uninstalled formula,
-///    an x86 binary on an Apple-silicon Mac with no Rosetta, or a broken
-///    symlink all pass `isExecutableFile` and fail to execute. Everything the
-///    UI shows comes from a real `version --json` round trip.
-/// 2. **Only absolute paths are ever persisted.** `config.resticPath` is
-///    consumed by the *helper*, running from launchd with a minimal
+///    an x86 binary on an Apple-silicon Mac with no Rosetta, a distro
+///    wrapper script for an uninstalled package, or a broken symlink all pass
+///    `isExecutableFile` and fail to execute. Everything the UI shows — and
+///    everything the helper acts on — comes from a real `version --json`
+///    round trip.
+/// 2. **Only absolute paths are ever persisted.** A resolved path is consumed
+///    by the *helper*, running from launchd/systemd with a minimal
 ///    environment and an unrelated working directory — a relative path from
 ///    a `PATH` entry like `.` or `bin` would resolve differently (or
 ///    dangerously) there, so such entries are skipped outright.
 /// 3. **No environment is passed to the probe.** `restic version` needs
-///    none, and inheriting the app's environment keeps the probe faithful to
-///    how a user would run the binary in a shell.
+///    none, and inheriting the caller's environment keeps the probe faithful
+///    to how a user would run the binary in a shell.
 ///
 /// Deliberately free of SwiftUI/AppKit imports: the type is plain
 /// `Foundation` + Core so it can be exercised (and was, during T18) by a
 /// throwaway command-line probe compiled against the real Homebrew restic.
-struct ResticDiscovery: Sendable {
+public struct ResticDiscovery: Sendable {
 
     // MARK: - Configuration
 
-    /// Package-manager install locations, in preference order: Homebrew on
-    /// Apple silicon, Homebrew on Intel, MacPorts.
-    static let wellKnownPaths = [
+    /// Package-manager install locations on macOS, in preference order:
+    /// Homebrew on Apple silicon, Homebrew on Intel, MacPorts.
+    public static let macOSWellKnownPaths = [
         "/opt/homebrew/bin/restic",
         "/usr/local/bin/restic",
         "/opt/local/bin/restic"
     ]
+
+    /// Package-manager install locations on Linux, in preference order:
+    /// distro package (`apt`/`dnf`/`pacman` all land in `/usr/bin`), a
+    /// locally installed release tarball, and the `/opt` convention some
+    /// images use for hand-placed tooling.
+    public static let linuxWellKnownPaths = [
+        "/usr/bin/restic",
+        "/usr/local/bin/restic",
+        "/opt/restic/bin/restic"
+    ]
+
+    /// The well-known list for the platform this binary was built for.
+    /// `PATH` scanning happens on both platforms and is not affected.
+    public static var wellKnownPaths: [String] {
+        #if os(macOS)
+        return macOSWellKnownPaths
+        #else
+        return linuxWellKnownPaths
+        #endif
+    }
 
     /// The minimum restic the docs require — the first version with the
     /// current exit-code contract (`docs/restic-cli.md` §version).
@@ -47,21 +73,26 @@ struct ResticDiscovery: Sendable {
     /// `AppModel.discoverResticBinary()`, so a future edit to one without
     /// the other trips in debug builds instead of quietly disagreeing about
     /// which binaries are acceptable.
-    static let minimumVersion = "0.17.0"
+    public static let minimumVersion = "0.17.0"
 
     /// Per-candidate probe timeout. Short on purpose: this runs while the
     /// user waits on a Settings pane or the onboarding sheet, and a hung
     /// candidate (a binary on an unresponsive network mount) must not stall
     /// the whole search. `DefaultProcessRunner` SIGINTs, then SIGKILLs.
-    static let probeTimeout: TimeInterval = 5
+    public static let probeTimeout: TimeInterval = 5
 
     /// Upper bound on how many candidates are executed in one search, so a
     /// pathological `PATH` (hundreds of entries, e.g. a misconfigured shell
     /// profile) cannot turn discovery into a minute-long stall.
-    static let maxCandidates = 24
+    public static let maxCandidates = 24
 
-    /// `PATH` as the app inherited it. Injectable so the candidate list can
-    /// be reasoned about without depending on the developer's shell.
+    /// The well-known locations searched ahead of `PATH`. Injectable so the
+    /// candidate list can be reasoned about in tests without depending on
+    /// what happens to be installed on the machine running them.
+    private let wellKnownPaths: [String]
+
+    /// `PATH` as the process inherited it. Injectable so the candidate list
+    /// can be reasoned about without depending on the developer's shell.
     private let environment: [String: String]
     private let runner: any ProcessRunning
 
@@ -70,19 +101,27 @@ struct ResticDiscovery: Sendable {
     /// detached probe task from the main actor.
     private var fileManager: FileManager { .default }
 
-    init(
+    public init(
+        wellKnownPaths: [String] = ResticDiscovery.wellKnownPaths,
         environment: [String: String] = ProcessInfo.processInfo.environment,
         runner: any ProcessRunning = DefaultProcessRunner()
     ) {
+        self.wellKnownPaths = wellKnownPaths
         self.environment = environment
         self.runner = runner
     }
 
+    /// A human-readable list of what a failed search looked at, for the
+    /// "restic not found" message the helper prints on a headless host.
+    public var searchedDescription: String {
+        wellKnownPaths.joined(separator: ", ") + ", and every directory on PATH"
+    }
+
     // MARK: - Candidates
 
-    /// The ordered, de-duplicated list of paths worth executing: the three
-    /// well-known locations first (so a Homebrew restic wins over whatever a
-    /// user's shell profile happens to shadow it with), then one
+    /// The ordered, de-duplicated list of paths worth executing: the
+    /// well-known locations first (so a package-manager restic wins over
+    /// whatever a user's shell profile happens to shadow it with), then one
     /// `<dir>/restic` per `PATH` entry.
     ///
     /// Filtering is intentionally conservative — relative `PATH` entries are
@@ -91,7 +130,7 @@ struct ResticDiscovery: Sendable {
     /// and a `~/bin/restic` symlink pointing at it are the same binary, and
     /// probing both would double the wait for no new information. The
     /// *reported* path stays the one the user would recognize.
-    func candidatePaths() -> [String] {
+    public func candidatePaths() -> [String] {
         var ordered: [String] = []
         var seenResolved = Set<String>()
 
@@ -110,7 +149,7 @@ struct ResticDiscovery: Sendable {
             ordered.append(path)
         }
 
-        for path in Self.wellKnownPaths {
+        for path in wellKnownPaths {
             consider(path)
         }
         for directory in pathEntries() {
@@ -141,7 +180,7 @@ struct ResticDiscovery: Sendable {
     /// Runs `<path> version --json` and classifies the result. Used both by
     /// `discover()` and by "Locate manually…", so a hand-picked binary is
     /// held to exactly the same standard as a discovered one.
-    func probe(path: String) async -> ResticProbe {
+    public func probe(path: String) async -> ResticProbe {
         guard path.hasPrefix("/") else {
             return ResticProbe(path: path, outcome: .unusable(
                 reason: "Restic Station needs the full path to the restic binary (starting with “/”)."
@@ -209,7 +248,7 @@ struct ResticDiscovery: Sendable {
     /// rather than a bare "not found", and a newer restic further down `PATH`
     /// should still win. Same for unusable candidates, which are reported so
     /// the "found something, couldn't run it" case is never silent.
-    func discover() async -> ResticDiscoveryResult {
+    public func discover() async -> ResticDiscoveryResult {
         var rejected: [ResticProbe] = []
         for path in candidatePaths() {
             let probe = await probe(path: path)
@@ -227,11 +266,11 @@ struct ResticDiscovery: Sendable {
 // MARK: - ResticProbe
 
 /// One candidate binary and what running it proved.
-struct ResticProbe: Equatable, Sendable {
-    let path: String
-    let outcome: Outcome
+public struct ResticProbe: Equatable, Sendable {
+    public let path: String
+    public let outcome: Outcome
 
-    enum Outcome: Equatable, Sendable {
+    public enum Outcome: Equatable, Sendable {
         /// Ran, reported a version, and meets the minimum.
         case ok(version: String)
         /// Ran and reported a version below `ResticDiscovery.minimumVersion`.
@@ -240,60 +279,45 @@ struct ResticProbe: Equatable, Sendable {
         case unusable(reason: String)
     }
 
-    var version: String? {
+    public init(path: String, outcome: Outcome) {
+        self.path = path
+        self.outcome = outcome
+    }
+
+    public var version: String? {
         switch outcome {
         case .ok(let version), .tooOld(let version): return version
         case .unusable: return nil
         }
     }
 
-    var isUsable: Bool {
+    public var isUsable: Bool {
         if case .ok = outcome { return true }
         return false
-    }
-
-    /// Maps a probe onto the status vocabulary the Settings chip and the
-    /// menu-bar health derivation already speak (`AppModel.resticStatus`).
-    var status: ResticStatus {
-        switch outcome {
-        case .ok(let version):
-            return .ok(path: path, version: version)
-        case .tooOld(let version):
-            return .tooOld(path: path, version: version, minimum: ResticDiscovery.minimumVersion)
-        case .unusable(let reason):
-            return .unavailable(path: path, reason: reason)
-        }
     }
 }
 
 // MARK: - ResticDiscoveryResult
 
-struct ResticDiscoveryResult: Equatable, Sendable {
+public struct ResticDiscoveryResult: Equatable, Sendable {
     /// The first candidate that ran and met the minimum version, if any.
-    let chosen: ResticProbe?
+    public let chosen: ResticProbe?
     /// Candidates that were found and executed but rejected, in probe order
     /// — the raw material for "0.16.4 found, 0.17.0+ required".
-    let rejected: [ResticProbe]
+    public let rejected: [ResticProbe]
 
-    /// The best thing we can say about this search, in the vocabulary of the
-    /// Settings chip: a working binary, else the first too-old one we found
-    /// (candidates are probed in preference order, so this is the binary the
-    /// user is most likely to think of as "their" restic), else the first
-    /// unusable candidate, else "nothing on this Mac".
-    var status: ResticStatus {
-        if let chosen {
-            return chosen.status
-        }
-        let firstTooOld = rejected.first {
+    public init(chosen: ResticProbe?, rejected: [ResticProbe]) {
+        self.chosen = chosen
+        self.rejected = rejected
+    }
+
+    /// The first rejected candidate that at least *ran* but was too old —
+    /// candidates are probed in preference order, so this is the binary the
+    /// user is most likely to think of as "their" restic.
+    public var firstTooOld: ResticProbe? {
+        rejected.first {
             if case .tooOld = $0.outcome { return true }
             return false
         }
-        if let firstTooOld {
-            return firstTooOld.status
-        }
-        if let firstUnusable = rejected.first {
-            return firstUnusable.status
-        }
-        return .notConfigured
     }
 }
