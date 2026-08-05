@@ -148,6 +148,17 @@ jobs:
           # The units a unit test already pins as byte-identical to what
           # `timer install` writes, so verifying these verifies both.
           systemd-analyze --user verify "$WORK/restic-station.service" "$WORK/restic-station.timer"
+          # Negative control. `verify` is silent and exits 0 on success, which
+          # is indistinguishable from a check that quietly did nothing —
+          # especially here, where it warns about the absent system bus first.
+          # Prove it still has teeth on this host before trusting the pass.
+          printf '[Service]\nType=definitely-not-a-type\nExecStart=/bin/true\n' \
+            > "$WORK/broken.service"
+          systemd-analyze --user verify "$WORK/broken.service" && {
+            echo "systemd-analyze accepted an invalid unit — the check above proves nothing"
+            exit 1
+          }
+          echo "systemd-analyze rejected the deliberately invalid unit, as expected"
 
   macos:
     runs-on: macos-15
