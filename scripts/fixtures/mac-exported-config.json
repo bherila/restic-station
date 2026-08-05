@@ -1,0 +1,56 @@
+{
+  "version": 2,
+  "resticPath": null,
+  "showMenuBarIcon": true,
+  "onboardingCompleted": true,
+  "sets": [
+    {
+      "id": "f1000000-0000-4000-8000-000000000001",
+      "name": "Projects",
+      "sources": ["__SOURCE_DIR__"],
+      "excludes": [],
+      "schedule": {"kind": "everyMinutes", "minutes": 5},
+      "retention": null,
+      "checkPolicy": null,
+      "stalenessWarningDays": 14,
+      "destinations": [
+        {
+          "id": "f1000000-0000-4000-8000-000000000002",
+          "label": "NAS Primary",
+          "repoURL": "__PRIMARY_REPO__",
+          "isPrimary": true,
+          "nonSecretEnv": {}
+        },
+        {
+          "id": "f1000000-0000-4000-8000-000000000003",
+          "label": "Offsite Mirror",
+          "repoURL": "__MIRROR_REPO__",
+          "isPrimary": false,
+          "nonSecretEnv": {}
+        }
+      ]
+    },
+    {
+      "id": "f1000000-0000-4000-8000-000000000004",
+      "name": "Mac Photos Library",
+      "sources": ["/Users/author/Pictures/Photos Library.photoslibrary"],
+      "excludes": [],
+      "schedule": {"kind": "daily", "hour": 2, "minute": 30},
+      "retention": null,
+      "checkPolicy": null,
+      "stalenessWarningDays": 14,
+      "destinations": [
+        {
+          "id": "f1000000-0000-4000-8000-000000000005",
+          "label": "NAS Primary",
+          "repoURL": "/Volumes/BackupNAS/photos-repo",
+          "isPrimary": true,
+          "nonSecretEnv": {}
+        }
+      ],
+      "machines": {
+        "__MACHINE_ID__": {"enabled": false}
+      }
+    }
+  ]
+}

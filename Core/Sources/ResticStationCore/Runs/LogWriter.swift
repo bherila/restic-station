@@ -4,6 +4,8 @@ import Foundation
 import Darwin
 #elseif canImport(Glibc)
 import Glibc
+#elseif canImport(Musl)
+import Musl
 #endif
 
 /// Line-append handle to `runs/<runId>/log.txt` (see `docs/data-model.md`
@@ -57,6 +59,8 @@ public final class LogWriter: @unchecked Sendable {
         _ = Darwin.close(fd)
         #elseif canImport(Glibc)
         _ = Glibc.close(fd)
+        #elseif canImport(Musl)
+        _ = Musl.close(fd)
         #endif
         fd = -1
     }
