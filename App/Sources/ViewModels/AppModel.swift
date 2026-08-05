@@ -232,10 +232,11 @@ final class AppModel: ObservableObject {
             setHealths: setHealths,
             anyRunInFlight: !stateWatcher.currentRuns.isEmpty,
             // Only a *definite* denial is a warning: a missing
-            // `fda-check.json` means the probe has never run, which the
-            // Permissions pane reports as "unknown" (T18) rather than as a
-            // problem.
-            fullDiskAccessDenied: stateWatcher.fdaCheck.map { !$0.hasFullDiskAccess } ?? false,
+            // `fda-check.json` means the probe has never run (or does not
+            // apply on this platform), which the Permissions pane reports as
+            // "unknown" (T18) rather than as a problem. The rule lives in
+            // Core so the Linux build is held to it too (T25).
+            fullDiskAccessDenied: HealthDerivation.fullDiskAccessDenied(from: stateWatcher.fdaCheck),
             backgroundAgentEnabled: launchd.isEnabled
         )
     }

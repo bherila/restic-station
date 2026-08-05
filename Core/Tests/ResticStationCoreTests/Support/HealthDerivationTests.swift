@@ -500,6 +500,39 @@ private func currentRun(percentDone: Double, phase: String = "backing-up-primary
         ) == .warning)
     }
 
+    // MARK: fda-check.json absent-file semantics (T25)
+
+    @Test("an absent fda-check.json is 'not applicable', never 'denied'")
+    func absentFdaCheckIsNotADenial() {
+        // Absent on Linux always (no TCC, so `fda-check` writes nothing) and
+        // on macOS until the first probe runs.
+        #expect(HealthDerivation.fullDiskAccessDenied(from: nil) == false)
+        #expect(HealthDerivation.appHealth(
+            setHealths: [health()],
+            anyRunInFlight: false,
+            fullDiskAccessDenied: HealthDerivation.fullDiskAccessDenied(from: nil),
+            backgroundAgentEnabled: true
+        ) == .idle)
+    }
+
+    @Test("only an explicit hasFullDiskAccess == false is a denial")
+    func onlyAnExplicitDenialCounts() {
+        let granted = FdaCheckResult(
+            checkedAt: Date(timeIntervalSince1970: 1_800_000_000),
+            hasFullDiskAccess: true,
+            probedPath: "~/Library/Safari",
+            context: "launchd"
+        )
+        let denied = FdaCheckResult(
+            checkedAt: Date(timeIntervalSince1970: 1_800_000_000),
+            hasFullDiskAccess: false,
+            probedPath: "~/Library/Safari",
+            context: "launchd"
+        )
+        #expect(HealthDerivation.fullDiskAccessDenied(from: granted) == false)
+        #expect(HealthDerivation.fullDiskAccessDenied(from: denied) == true)
+    }
+
     @Test func disabledBackgroundAgentIsAWarning() {
         #expect(HealthDerivation.appHealth(
             setHealths: [health()],

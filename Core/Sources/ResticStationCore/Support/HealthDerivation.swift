@@ -234,15 +234,36 @@ public enum HealthDerivation {
 
     // MARK: Global
 
+    /// Interprets `state/fda-check.json` for `appHealth(…)`'s
+    /// `fullDiskAccessDenied` parameter — the one place the absent-file
+    /// semantics are defined.
+    ///
+    /// **Absent means "not applicable", never "denied".** The file is absent
+    /// in two situations and neither is a problem:
+    ///
+    /// - macOS, before the first `fda-check` has run (fresh install).
+    /// - Linux, always: there is no TCC, so `fda-check` deliberately writes
+    ///   nothing (T25). A fake "granted" record would make the file's
+    ///   meaning platform-dependent, so the helper writes no record at all
+    ///   and readers must not infer a denial from its absence.
+    ///
+    /// Only a record that explicitly says `hasFullDiskAccess == false` is a
+    /// denial.
+    public static func fullDiskAccessDenied(from record: FdaCheckResult?) -> Bool {
+        guard let record else { return false }
+        return !record.hasFullDiskAccess
+    }
+
     /// The menu bar icon's state.
     ///
     /// - Parameters:
     ///   - anyRunInFlight: `true` when *any* `current-run-*.json` exists,
     ///     including one belonging to a set that is no longer in the config
     ///     (a run started before the set was deleted is still running).
-    ///   - fullDiskAccessDenied: from `state/fda-check.json`. Pass `false`
-    ///     when the probe has never run — "not yet known" must not paint the
-    ///     icon yellow, only a definite `hasFullDiskAccess == false` does.
+    ///   - fullDiskAccessDenied: from `state/fda-check.json`, via
+    ///     `fullDiskAccessDenied(from:)` — "not yet known" (or "not
+    ///     applicable on this platform") must not paint the icon yellow,
+    ///     only a definite `hasFullDiskAccess == false` does.
     ///   - backgroundAgentEnabled: `SMAppService.Status == .enabled`.
     ///     Anything else means scheduled backups are not running.
     public static func appHealth(

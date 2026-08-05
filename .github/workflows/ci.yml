@@ -28,6 +28,63 @@ jobs:
       - name: Run Core unit tests
         run: swift test --package-path Core
 
+      # T25 acceptance criteria that only a real Linux run can show.
+      - name: fda-check is a no-op on Linux
+        run: |
+          export RESTIC_STATION_DATA_DIR=$(mktemp -d)
+          OUT=$(.build/debug/restic-station-helper fda-check)
+          echo "$OUT"
+          echo "$OUT" | grep -q "not applicable on this platform"
+          # A fake "granted" record would make the file's meaning
+          # platform-dependent — nothing may be written at all.
+          test ! -e "$RESTIC_STATION_DATA_DIR/state/fda-check.json"
+
+      - name: restic discovery resolves the helper's binary on Linux
+        run: |
+          export RESTIC_STATION_DATA_DIR=$(mktemp -d)
+          mkdir -p "$RESTIC_STATION_DATA_DIR"
+          # No resticPath configured and no sets: enough to exercise
+          # HelperContext.make()'s resolution, which runs before anything else.
+          echo '{"version":1,"resticPath":null,"showMenuBarIcon":true,"sets":[]}' \
+            > "$RESTIC_STATION_DATA_DIR/config.json"
+          UUID=00000000-0000-0000-0000-000000000001
+
+          # 1. Nothing installed anywhere: an actionable message, not "open
+          #    Restic Station".
+          OUT=$(env PATH=/nonexistent .build/debug/restic-station-helper \
+            probe-repo --set $UUID --dest $UUID 2>&1 || true)
+          echo "$OUT"
+          echo "$OUT" | grep -q "restic not found"
+          echo "$OUT" | grep -q "/usr/bin/restic"
+          echo "$OUT" | grep -q "$RESTIC_STATION_DATA_DIR/config.json"
+          # "open Restic Station" is impossible advice on a headless host.
+          ! echo "$OUT" | grep -q "open Restic Station"
+
+          # 2. A restic on PATH is discovered and used, with no configuration
+          #    at all — the "headless host" acceptance criterion. Note it is
+          #    only "found" because it *runs*: an inert +x file would not do.
+          FAKEBIN=$(mktemp -d)
+          cat > "$FAKEBIN/restic" <<'SH'
+          #!/bin/sh
+          if [ "$1" = "version" ]; then
+            echo '{"version":"0.18.1","go_version":"go1.22.0","go_os":"linux","go_arch":"arm64"}'
+            exit 0
+          fi
+          exit 1
+          SH
+          chmod +x "$FAKEBIN/restic"
+          OUT=$(env PATH="$FAKEBIN" .build/debug/restic-station-helper \
+            probe-repo --set $UUID --dest $UUID 2>&1 || true)
+          echo "$OUT"
+          echo "$OUT" | grep -q "discovered $FAKEBIN/restic"
+          # Got past restic resolution and on to the real (absent) set.
+          echo "$OUT" | grep -q "no backup set with id"
+
+          # 3. tick still exits 0 on a host with nothing configured.
+          #    (tick resolves restic through the same `resolveResticPath`
+          #    that step 2 exercises, via `makeTolerant`.)
+          env PATH="$FAKEBIN" .build/debug/restic-station-helper tick
+
   macos:
     runs-on: macos-15
     steps:
