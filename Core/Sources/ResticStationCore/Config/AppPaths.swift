@@ -3,9 +3,18 @@ import Foundation
 /// Single source of truth for every runtime path Restic Station reads or
 /// writes. Never hard-code a path elsewhere — go through `AppPaths`.
 ///
-/// `root` defaults to `~/Library/Application Support/ResticStation` and is
-/// overridable via `init(root:)` and via the `RESTIC_STATION_DATA_DIR`
-/// environment variable (used by tests and `scripts/integration-test.sh`).
+/// `root` is platform-dependent:
+/// - macOS: `~/Library/Application Support/ResticStation`
+/// - Linux: `$XDG_STATE_HOME/restic-station`, falling back to
+///   `~/.local/state/restic-station`
+///
+/// It is overridable via `init(root:)` and via the `RESTIC_STATION_DATA_DIR`
+/// environment variable (used by tests and `scripts/integration-test.sh`),
+/// which takes precedence on both platforms.
+///
+/// **Everything below `root` is byte-identical across platforms** — only
+/// `root` and `resticCacheDir` branch on the OS. `config export`/`import`
+/// and rsync-ing a data directory between hosts depend on this.
 ///
 /// See `docs/architecture.md` §AppPaths for the full table this mirrors.
 public struct AppPaths: Equatable, Sendable {
@@ -16,17 +25,45 @@ public struct AppPaths: Equatable, Sendable {
     }
 
     /// Resolves the root from `RESTIC_STATION_DATA_DIR` if set (non-empty),
-    /// else `~/Library/Application Support/ResticStation`.
+    /// else the platform default: `~/Library/Application Support/ResticStation`
+    /// on macOS, `$XDG_STATE_HOME/restic-station` (or
+    /// `~/.local/state/restic-station`) on Linux.
     public static func `default`() -> AppPaths {
         if let override = ProcessInfo.processInfo.environment["RESTIC_STATION_DATA_DIR"], !override.isEmpty {
             return AppPaths(root: URL(fileURLWithPath: override, isDirectory: true))
         }
+        #if os(Linux)
+        return AppPaths(root: xdgBaseDirectory(
+            variable: "XDG_STATE_HOME",
+            fallbackHomeRelativeComponents: [".local", "state"]
+        ).appendingPathComponent("restic-station", isDirectory: true))
+        #else
         let appSupport = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library", isDirectory: true)
             .appendingPathComponent("Application Support", isDirectory: true)
             .appendingPathComponent("ResticStation", isDirectory: true)
         return AppPaths(root: appSupport)
+        #endif
     }
+
+    #if os(Linux)
+    /// Resolves an XDG base directory per the XDG Base Directory Specification:
+    /// the environment variable is honoured only when set, non-empty, **and**
+    /// an absolute path; anything else falls back to the home-relative default
+    /// as if the variable were unset.
+    static func xdgBaseDirectory(variable: String, fallbackHomeRelativeComponents: [String]) -> URL {
+        if let value = ProcessInfo.processInfo.environment[variable],
+           !value.isEmpty,
+           value.hasPrefix("/") {
+            return URL(fileURLWithPath: value, isDirectory: true)
+        }
+        var url = FileManager.default.homeDirectoryForCurrentUser
+        for component in fallbackHomeRelativeComponents {
+            url = url.appendingPathComponent(component, isDirectory: true)
+        }
+        return url
+    }
+    #endif
 
     // MARK: - config.json
 
@@ -105,6 +142,11 @@ public struct AppPaths: Equatable, Sendable {
     // MARK: - mounts/ (docs/restic-cli.md §mount)
 
     /// `mounts/<destId>/` — `restic mount` mountpoint for browsing a repo.
+    ///
+    /// The path is defined on every platform (it is `root`-relative like all
+    /// the others), but mounting is macOS-only in practice: `restic mount`
+    /// needs macFUSE there and FUSE on Linux, which a headless host generally
+    /// does not have.
     public func mountsDir(destId: UUID) -> URL {
         root.appendingPathComponent("mounts", isDirectory: true)
             .appendingPathComponent(destId.uuidString, isDirectory: true)
@@ -112,16 +154,25 @@ public struct AppPaths: Equatable, Sendable {
 
     // MARK: - restic cache
 
-    /// restic's cache, redirected via `RESTIC_CACHE_DIR`. Fixed at
-    /// `~/Library/Caches/net.herila.ResticStation/restic` per
-    /// `docs/architecture.md` and `docs/restic-cli.md` — independent of
-    /// `root`, since it is a regenerable cache, not app state.
+    /// restic's cache, redirected via `RESTIC_CACHE_DIR`. Per
+    /// `docs/architecture.md` and `docs/restic-cli.md` this is deliberately
+    /// **independent of `root`**, since it is a regenerable cache, not app
+    /// state:
+    /// - macOS: `~/Library/Caches/net.herila.ResticStation/restic`
+    /// - Linux: `$XDG_CACHE_HOME/restic-station/restic`, falling back to
+    ///   `~/.cache/restic-station/restic`
     public var resticCacheDir: URL {
+        #if os(Linux)
+        Self.xdgBaseDirectory(variable: "XDG_CACHE_HOME", fallbackHomeRelativeComponents: [".cache"])
+            .appendingPathComponent("restic-station", isDirectory: true)
+            .appendingPathComponent("restic", isDirectory: true)
+        #else
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library", isDirectory: true)
             .appendingPathComponent("Caches", isDirectory: true)
             .appendingPathComponent("net.herila.ResticStation", isDirectory: true)
             .appendingPathComponent("restic", isDirectory: true)
+        #endif
     }
 
     // MARK: - Directory creation
