@@ -72,10 +72,11 @@ extension AppModel {
     func makeBrowsingRunner() -> ResticRunner? {
         guard let path = config.resticPath, !path.isEmpty else { return nil }
         let processRunner = DefaultProcessRunner()
+        guard let secrets = try? SecretStoreFactory.make(paths: paths, runner: processRunner) else { return nil }
         return ResticRunner(
             resticPath: path,
             paths: paths,
-            keychain: KeychainClient(runner: processRunner),
+            secrets: secrets,
             runner: processRunner
         )
     }

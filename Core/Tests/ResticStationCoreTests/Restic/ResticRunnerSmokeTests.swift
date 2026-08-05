@@ -1,3 +1,9 @@
+#if os(macOS)
+// Keychain-backed by construction: this is the macOS end-to-end proof that
+// `RESTIC_PASSWORD_COMMAND` works prompt-free from our own process. The
+// equivalent proof for `FileSecretStore` needs the real helper binary (its
+// password command names an executable), so it lives in
+// `scripts/secret-cli-test.sh` rather than here.
 import Foundation
 import Testing
 @testable import ResticStationCore
@@ -31,7 +37,7 @@ struct ResticRunnerSmokeTests {
     @Test("version, init, backup and snapshots against a throwaway local repo")
     func realResticRoundTrip() async throws {
         let processRunner = DefaultProcessRunner()
-        let keychain = KeychainClient(runner: processRunner)
+        let keychain = KeychainSecretStore(runner: processRunner)
 
         let destinationId = UUID()
         let scratch = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
@@ -63,12 +69,12 @@ struct ResticRunnerSmokeTests {
         let runner = ResticRunner(
             resticPath: Self.resticPath,
             paths: AppPaths(root: scratch.appendingPathComponent("data", isDirectory: true)),
-            keychain: keychain,
+            secrets: keychain,
             runner: processRunner
         )
         let invocation = ResticInvocation(destination: destination)
 
-        // 1. version (no repository, no keychain).
+        // 1. version (no repository, no secrets).
         let version = try await runner.runWithoutRepository(.version, timeout: 30)
         #expect(version.status == .success)
         let versionInfo = try makeResticJSONDecoder().decode(
@@ -106,3 +112,4 @@ struct ResticRunnerSmokeTests {
         try await keychain.deletePassword(destId: destinationId)
     }
 }
+#endif

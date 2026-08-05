@@ -312,13 +312,16 @@ final class MountController: ObservableObject {
         environment["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"
         environment.merge(destination.nonSecretEnv) { _, new in new }
 
-        let keychain = KeychainClient(runner: DefaultProcessRunner())
-        let secretEnv = try await keychain.secretEnv(destId: destination.id)
+        let secrets = try SecretStoreFactory.make(paths: paths, runner: DefaultProcessRunner())
+        let secretEnv = try await secrets.secretEnv(destId: destination.id)
         environment.merge(secretEnv) { _, new in new }
 
-        // Written last — not overridable by configured env.
+        // Written last — not overridable by configured env. Mirrors
+        // `ResticRunner.environment(for:)`, including the store's own
+        // password-command environment (empty on the keychain backend).
         environment["RESTIC_CACHE_DIR"] = paths.resticCacheDir.path
-        environment["RESTIC_PASSWORD_COMMAND"] = KeychainClient.passwordCommand(destId: destination.id)
+        environment.merge(secrets.passwordCommandEnvironment) { _, new in new }
+        environment["RESTIC_PASSWORD_COMMAND"] = secrets.passwordCommand(destId: destination.id)
         return environment
     }
 

@@ -1,0 +1,307 @@
+import Foundation
+import Testing
+@testable import ResticStationCore
+
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
+
+/// `FileSecretStore` specifics: permissions, atomicity, locking, and the
+/// `RESTIC_PASSWORD_COMMAND` string.
+///
+/// Deliberately **not** gated to Linux. The file backend is Linux's default
+/// but works everywhere, and running this suite on macOS (locally and in the
+/// macOS CI job) is the only way this repository gets real coverage of the
+/// Linux secrets path before T29 adds a Linux integration matrix.
+@Suite("FileSecretStore")
+struct FileSecretStoreTests {
+    static let destId = UUID(uuidString: "A1B2C3D4-E5F6-4789-A012-3456789ABCDE")!
+    static let otherId = UUID(uuidString: "B1B2C3D4-E5F6-4789-A012-3456789ABCDE")!
+
+    /// A store over a fresh temp root, and the root so the caller can clean up.
+    static func makeStore(helperPath: String = "/opt/restic-station/restic-station-helper")
+        -> (store: FileSecretStore, root: URL) {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("restic-station-file-secrets-\(UUID().uuidString)", isDirectory: true)
+        return (FileSecretStore(paths: AppPaths(root: root), helperPath: helperPath), root)
+    }
+
+    static func permissions(of url: URL) throws -> UInt32 {
+        var info = stat()
+        let ok = url.path.withCString { stat($0, &info) }
+        try #require(ok == 0, "stat failed for \(url.path)")
+        return UInt32(info.st_mode) & 0o777
+    }
+
+    // MARK: - Permissions at creation
+
+    @Test("the secrets file is created 0600 and its directory 0700, at creation time")
+    func createsWithTightModes() async throws {
+        let (store, root) = Self.makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        #expect(!FileManager.default.fileExists(atPath: root.path))
+
+        try await store.setPassword("hunter2", destId: Self.destId)
+
+        #expect(try Self.permissions(of: store.fileURL) == 0o600)
+        #expect(try Self.permissions(of: root) == 0o700)
+    }
+
+    @Test("the temp file a write goes through is itself created 0600")
+    func tempFileIsAlsoTight() async throws {
+        let (store, root) = Self.makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        // Pre-create the temp path world-readable, exactly as a crashed write
+        // under a permissive umask might have left it. The next write must
+        // unlink it and create a fresh 0600 one rather than reuse it (open(2)
+        // ignores `mode` for an existing file).
+        try store.prepareDirectories()
+        FileManager.default.createFile(
+            atPath: store.tempFileURL.path,
+            contents: Data("stale".utf8),
+            attributes: [.posixPermissions: 0o644]
+        )
+        #expect(try Self.permissions(of: store.tempFileURL) == 0o644)
+
+        try await store.setPassword("hunter2", destId: Self.destId)
+
+        #expect(try Self.permissions(of: store.fileURL) == 0o600)
+        #expect(try await store.password(destId: Self.destId) == "hunter2")
+    }
+
+    // MARK: - Permissions on read
+
+    @Test("a 0644 secrets file is refused on read, with the file name and the chmod to run")
+    func refusesWorldReadableFile() async throws {
+        let (store, root) = Self.makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        try await store.setPassword("hunter2", destId: Self.destId)
+        _ = store.fileURL.path.withCString { chmod($0, 0o644) }
+
+        do {
+            _ = try await store.password(destId: Self.destId)
+            Issue.record("expected a group/world-readable secrets file to be refused")
+        } catch let error as SecretStoreError {
+            guard case .backendFailed(let message) = error else {
+                Issue.record("expected .backendFailed, got \(error)")
+                return
+            }
+            #expect(message.contains(store.fileURL.path))
+            #expect(message.contains("chmod 600"))
+            #expect(message.contains("0644"))
+            // Never the secret itself.
+            #expect(!message.contains("hunter2"))
+        }
+    }
+
+    @Test("a group-readable (0640) secrets file is refused too")
+    func refusesGroupReadableFile() async throws {
+        let (store, root) = Self.makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        try await store.setPassword("hunter2", destId: Self.destId)
+        _ = store.fileURL.path.withCString { chmod($0, 0o640) }
+
+        await #expect(throws: SecretStoreError.self) {
+            _ = try await store.password(destId: Self.destId)
+        }
+    }
+
+    @Test("0400 is accepted — the rule is 'no group/other bits', not 'exactly 0600'")
+    func acceptsOwnerOnlyReadOnly() async throws {
+        let (store, root) = Self.makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        try await store.setPassword("hunter2", destId: Self.destId)
+        _ = store.fileURL.path.withCString { chmod($0, 0o400) }
+
+        #expect(try await store.password(destId: Self.destId) == "hunter2")
+    }
+
+    @Test("a symlink in place of the secrets file is refused, never followed")
+    func refusesSymlink() async throws {
+        let (store, root) = Self.makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        try store.prepareDirectories()
+        let decoy = root.appendingPathComponent("decoy.json", isDirectory: false)
+        try Data(#"{"version":1,"secrets":{}}"#.utf8).write(to: decoy)
+        try FileManager.default.createSymbolicLink(at: store.fileURL, withDestinationURL: decoy)
+
+        do {
+            _ = try await store.password(destId: Self.destId)
+            Issue.record("expected a symlinked secrets file to be refused")
+        } catch let error as SecretStoreError {
+            guard case .backendFailed(let message) = error else {
+                Issue.record("expected .backendFailed, got \(error)")
+                return
+            }
+            #expect(message.contains("symbolic link"))
+        }
+    }
+
+    // MARK: - Atomicity
+
+    @Test("a stale temp file left by a crashed write does not corrupt the real file")
+    func staleTempFileIsHarmless() async throws {
+        let (store, root) = Self.makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        try await store.setPassword("original", destId: Self.destId)
+
+        // Simulate a crash between the temp write and the rename: half a JSON
+        // document sitting at the temp path.
+        try Data(#"{"version":1,"secrets":{"broken"#.utf8).write(to: store.tempFileURL)
+
+        // The previous generation is still intact and readable…
+        #expect(try await store.password(destId: Self.destId) == "original")
+
+        // …and the next write overwrites the leftover rather than tripping on it.
+        try await store.setPassword("replacement", destId: Self.destId)
+        #expect(try await store.password(destId: Self.destId) == "replacement")
+        #expect(!FileManager.default.fileExists(atPath: store.tempFileURL.path))
+    }
+
+    @Test("a file written by a newer format version is refused rather than overwritten")
+    func refusesNewerVersion() async throws {
+        let (store, root) = Self.makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        try store.prepareDirectories()
+        try Data(#"{"version":99,"secrets":{}}"#.utf8).write(to: store.fileURL)
+        _ = store.fileURL.path.withCString { chmod($0, 0o600) }
+
+        await #expect(throws: SecretStoreError.self) {
+            _ = try await store.password(destId: Self.destId)
+        }
+    }
+
+    // MARK: - Concurrency
+
+    @Test("concurrent writers under FileLock do not lose an entry")
+    func concurrentWritesKeepEveryEntry() async throws {
+        let (store, root) = Self.makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let ids = (0..<12).map { _ in UUID() }
+        await withTaskGroup(of: Void.self) { group in
+            for (index, id) in ids.enumerated() {
+                group.addTask {
+                    // Each writer is its own read-modify-write of the whole
+                    // file; without the lock the last one in would clobber the
+                    // others.
+                    try? await store.setPassword("pw-\(index)", destId: id)
+                }
+            }
+        }
+
+        let document = try store.load()
+        #expect(document.secrets.count == ids.count)
+        for (index, id) in ids.enumerated() {
+            #expect(try await store.password(destId: id) == "pw-\(index)")
+        }
+    }
+
+    @Test("a concurrent delete and set both survive")
+    func concurrentDeleteAndSet() async throws {
+        let (store, root) = Self.makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        try await store.setPassword("doomed", destId: Self.destId)
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask { try? await store.deletePassword(destId: Self.destId) }
+            group.addTask { try? await store.setPassword("kept", destId: Self.otherId) }
+        }
+
+        #expect(try await store.password(destId: Self.otherId) == "kept")
+        await #expect(throws: SecretStoreError.itemNotFound) {
+            _ = try await store.password(destId: Self.destId)
+        }
+    }
+
+    // MARK: - passwordCommand
+
+    @Test("passwordCommand names the helper absolutely and passes the uuid, not the secret")
+    func passwordCommandShape() {
+        let (store, _) = Self.makeStore(helperPath: "/opt/restic-station/restic-station-helper")
+        #expect(
+            store.passwordCommand(destId: Self.destId)
+                == "/opt/restic-station/restic-station-helper print-password "
+                + "--dest a1b2c3d4-e5f6-4789-a012-3456789abcde"
+        )
+    }
+
+    /// restic splits `RESTIC_PASSWORD_COMMAND` itself with a shell-like
+    /// splitter that understands quotes but not backslash escapes (verified
+    /// against restic 0.18.1 — see `docs/restic-cli.md` §General).
+    @Test("passwordCommand double-quotes a helper path that needs it, and leaves plain paths bare")
+    func passwordCommandQuoting() {
+        #expect(FileSecretStore.quoteForRestic("/usr/local/bin/restic-station-helper")
+            == "/usr/local/bin/restic-station-helper")
+        #expect(FileSecretStore.quoteForRestic("/Applications/Restic Station.app/Contents/MacOS/helper")
+            == "\"/Applications/Restic Station.app/Contents/MacOS/helper\"")
+        #expect(FileSecretStore.quoteForRestic("/opt/it's/helper") == "\"/opt/it's/helper\"")
+        #expect(FileSecretStore.quoteForRestic("/opt/$HOME/helper") == "\"/opt/$HOME/helper\"")
+    }
+
+    /// The password command spawns another copy of the helper, which
+    /// re-resolves the store from *its own* environment — and `ResticRunner`
+    /// replaces restic's environment wholesale. Without these two variables
+    /// that child reads the default data directory with the platform-default
+    /// backend, i.e. the wrong store.
+    @Test("passwordCommandEnvironment points the child at this store, and holds no secret")
+    func passwordCommandEnvironmentPointsAtThisStore() async throws {
+        let (store, root) = Self.makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        try await store.setPassword("hunter2", destId: Self.destId)
+        let env = store.passwordCommandEnvironment
+        #expect(env["RESTIC_STATION_DATA_DIR"] == root.path)
+        #expect(env[SecretBackend.environmentKey] == "file")
+        #expect(env.count == 2)
+        #expect(!env.values.contains("hunter2"))
+    }
+
+    @Test("the keychain backend needs no password-command environment")
+    func keychainNeedsNoPasswordCommandEnvironment() {
+        #if os(macOS)
+        #expect(KeychainSecretStore(runner: FakeProcessRunner()).passwordCommandEnvironment.isEmpty)
+        #endif
+    }
+
+    @Test("currentExecutablePath is absolute and is not argv[0]")
+    func currentExecutablePathIsAbsolute() {
+        let path = FileSecretStore.currentExecutablePath()
+        #expect(path.hasPrefix("/"), "expected an absolute path, got \(path)")
+    }
+
+    // MARK: - No secret ever leaves except through a read
+
+    @Test("nothing but the password itself carries the password: file bytes are the only copy")
+    func errorsAndPathsNeverCarrySecrets() async throws {
+        let (store, root) = Self.makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let secret = "s3cr3t-\(UUID().uuidString)"
+        try await store.setPassword(secret, destId: Self.destId)
+        try await store.setSecretEnv(["AWS_SECRET_ACCESS_KEY": secret], destId: Self.destId)
+
+        #expect(!store.passwordCommand(destId: Self.destId).contains(secret))
+        #expect(!store.fileURL.path.contains(secret))
+        #expect(!store.lockFileURL.path.contains(secret))
+
+        // And the failure path: a widened mode reports the problem without
+        // quoting the contents it refused to read.
+        _ = store.fileURL.path.withCString { chmod($0, 0o644) }
+        do {
+            _ = try await store.password(destId: Self.destId)
+            Issue.record("expected the widened mode to be refused")
+        } catch {
+            #expect(!"\(error)".contains(secret))
+        }
+    }
+}

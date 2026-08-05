@@ -139,14 +139,15 @@ public enum ResticExitClass: Equatable, Sendable {
 /// Failures that stop `ResticRunner` from producing a `ResticOutcome` at all
 /// — i.e. restic either never ran or did not run to completion.
 public enum ResticRunnerError: Error, Equatable, Sendable, CustomStringConvertible {
-    /// The keychain pre-flight failed for this destination: the repo
+    /// The secret-store pre-flight failed for this destination: the repo
     /// password could not be read, so restic's `RESTIC_PASSWORD_COMMAND`
-    /// would fail too (typically a locked keychain at a pre-login tick).
+    /// would fail too (typically a locked login keychain at a pre-login tick
+    /// on macOS, or a `secrets.json` whose mode has been widened on Linux).
     /// **Retryable** per architecture.md — no `.failed` run record.
     ///
-    /// Deliberately carries only the destination id: the underlying
-    /// `security` output is not embedded anywhere it could reach a log.
-    case keychainUnavailable(destinationId: UUID)
+    /// Deliberately carries only the destination id: the backend's own
+    /// output is not embedded anywhere it could reach a log.
+    case secretsUnavailable(destinationId: UUID)
     /// The restic binary could not be spawned (missing/not executable).
     case launchFailed(String)
     /// The caller's timeout elapsed. `ProcessRunning` has already sent
@@ -155,8 +156,8 @@ public enum ResticRunnerError: Error, Equatable, Sendable, CustomStringConvertib
 
     public var description: String {
         switch self {
-        case .keychainUnavailable(let destinationId):
-            return "keychain unavailable for destination \(destinationId)"
+        case .secretsUnavailable(let destinationId):
+            return "secret store unavailable for destination \(destinationId)"
         case .launchFailed(let reason):
             return "failed to launch restic: \(reason)"
         case .timedOut:
@@ -166,7 +167,7 @@ public enum ResticRunnerError: Error, Equatable, Sendable, CustomStringConvertib
 
     public var category: ResticErrorCategory {
         switch self {
-        case .keychainUnavailable:
+        case .secretsUnavailable:
             return .retryable
         case .launchFailed, .timedOut:
             return .terminal
@@ -176,9 +177,17 @@ public enum ResticRunnerError: Error, Equatable, Sendable, CustomStringConvertib
     /// See ``ResticExitClass/userFacingMessage`` for the "one next step" rule.
     public var userFacingMessage: String {
         switch self {
-        case .keychainUnavailable:
+        case .secretsUnavailable:
+            // Platform-split rather than a vague joint sentence, so each host
+            // gets exactly one next step (`docs/ui-spec.md` §Voice). The macOS
+            // wording is unchanged from before the SecretStore abstraction.
+            #if os(macOS)
             return "The password for this destination could not be read from the keychain. "
                 + "Unlock your login keychain, then run the backup again."
+            #else
+            return "The password for this destination could not be read from secure storage. "
+                + "Check the permissions on the secrets file, then run the backup again."
+            #endif
         case .launchFailed:
             return "The restic program could not be started. "
                 + "Check the restic path in Settings."

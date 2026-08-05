@@ -40,7 +40,7 @@ struct HelperContext {
     let configStore: ConfigStore
     let stateStore: StateStore
     let runStore: RunStore
-    let keychain: KeychainClient
+    let secrets: any SecretStore
     let restic: ResticRunner
     let reachability: Reachability
     let engine: BackupEngine
@@ -74,8 +74,8 @@ struct HelperContext {
             return nil
         }
         let processRunner = DefaultProcessRunner()
-        let keychain = KeychainClient(runner: processRunner)
-        let restic = ResticRunner(resticPath: resticPath, paths: paths, keychain: keychain, runner: processRunner)
+        let secrets = makeSecretStore(paths: paths, runner: processRunner)
+        let restic = ResticRunner(resticPath: resticPath, paths: paths, secrets: secrets, runner: processRunner)
         let runStore = RunStore(paths: paths)
         let stateStore = StateStore(paths: paths)
         let reachability = Reachability(restic: restic)
@@ -83,7 +83,7 @@ struct HelperContext {
             config: config,
             paths: paths,
             restic: restic,
-            keychain: keychain,
+            secrets: secrets,
             runStore: runStore,
             stateStore: stateStore,
             reachability: reachability
@@ -93,11 +93,70 @@ struct HelperContext {
             configStore: configStore,
             stateStore: stateStore,
             runStore: runStore,
-            keychain: keychain,
+            secrets: secrets,
             restic: restic,
             reachability: reachability,
             engine: engine,
             config: config
         )
+    }
+
+    /// The one place the helper decides which secret backend to use:
+    /// keychain on macOS, `secrets.json` elsewhere, overridable with
+    /// `RESTIC_STATION_SECRET_BACKEND` (`docs/keychain-and-fda.md` §5).
+    ///
+    /// A bad override is fatal even for `tick`, whose contract is otherwise
+    /// "exit 0 unless config itself is broken": a helper that cannot tell
+    /// which store holds the passwords must not guess, and guessing wrong
+    /// looks exactly like "all my passwords disappeared".
+    static func makeSecretStore(paths: AppPaths, runner: ProcessRunning) -> any SecretStore {
+        do {
+            return try SecretStoreFactory.make(paths: paths, runner: runner)
+        } catch {
+            HelperExit.fail("secret storage is misconfigured: \(error)")
+        }
+    }
+}
+
+/// The minimal context the `secret` subcommands need: a secret store and
+/// (for the ones that name destinations) the configuration.
+///
+/// Deliberately *not* `HelperContext`: entering a password must work before
+/// a restic binary has ever been configured, and `HelperContext.make()`
+/// exits 1 when `resticPath` is missing.
+struct SecretContext {
+    let paths: AppPaths
+    let store: any SecretStore
+    let config: AppConfig
+
+    static func make() -> SecretContext {
+        let paths = AppPaths.default()
+        let config: AppConfig
+        do {
+            config = try ConfigStore(paths: paths).load()
+        } catch {
+            HelperExit.fail("could not load configuration: \(error)")
+        }
+        return SecretContext(
+            paths: paths,
+            store: HelperContext.makeSecretStore(paths: paths, runner: DefaultProcessRunner()),
+            config: config
+        )
+    }
+
+    /// Every configured destination, in config order, with its owning set's
+    /// name for display.
+    var destinations: [(setName: String, destination: Destination)] {
+        config.sets.flatMap { set in
+            set.destinations.map { (setName: set.name, destination: $0) }
+        }
+    }
+
+    /// Resolves `--dest`, or exits 1 per the T10 contract.
+    func destination(_ destId: UUID) -> Destination {
+        guard let match = destinations.first(where: { $0.destination.id == destId })?.destination else {
+            HelperExit.fail("no configured destination with id \(destId)")
+        }
+        return match
     }
 }

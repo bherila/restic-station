@@ -1,16 +1,18 @@
+#if os(macOS)
 import Foundation
 import Testing
 @testable import ResticStationCore
 
-@Suite("KeychainClient")
-struct KeychainClientTests {
+@Suite("KeychainSecretStore")
+struct KeychainSecretStoreTests {
     private static let destId = UUID(uuidString: "A1B2C3D4-E5F6-4789-A012-3456789ABCDE")!
     private static let account = "a1b2c3d4-e5f6-4789-a012-3456789abcde"
 
     @Test("passwordCommand matches the documented restic RESTIC_PASSWORD_COMMAND string byte-for-byte")
     func passwordCommandExactString() {
         let expected = "/usr/bin/security find-generic-password -s restic-station -a \(Self.account) -w"
-        #expect(KeychainClient.passwordCommand(destId: Self.destId) == expected)
+        let client = KeychainSecretStore(runner: FakeProcessRunner())
+        #expect(client.passwordCommand(destId: Self.destId) == expected)
     }
 
     @Test("setPassword deletes then adds, with -T on the create path, and ignores a not-found delete")
@@ -19,7 +21,7 @@ struct KeychainClientTests {
             .init(argvPrefix: ["/usr/bin/security", "delete-generic-password"], exitCode: 44),
             .init(argvPrefix: ["/usr/bin/security", "add-generic-password"], exitCode: 0),
         ])
-        let client = KeychainClient(runner: runner)
+        let client = KeychainSecretStore(runner: runner)
 
         try await client.setPassword("hunter2", destId: Self.destId)
 
@@ -50,7 +52,7 @@ struct KeychainClientTests {
             .init(argvPrefix: ["/usr/bin/security", "delete-generic-password"], exitCode: 0),
             .init(argvPrefix: ["/usr/bin/security", "add-generic-password"], exitCode: 0),
         ])
-        let client = KeychainClient(runner: runner)
+        let client = KeychainSecretStore(runner: runner)
 
         try await client.setPassword("newpw", destId: Self.destId)
 
@@ -64,9 +66,9 @@ struct KeychainClientTests {
         let runner = FakeProcessRunner(script: [
             .init(argvPrefix: ["/usr/bin/security", "delete-generic-password"], stderr: "boom", exitCode: 1),
         ])
-        let client = KeychainClient(runner: runner)
+        let client = KeychainSecretStore(runner: runner)
 
-        await #expect(throws: KeychainError.securityCommandFailed("boom")) {
+        await #expect(throws: SecretStoreError.backendFailed("boom")) {
             try await client.setPassword("pw", destId: Self.destId)
         }
         // add must never have been attempted.
@@ -78,7 +80,7 @@ struct KeychainClientTests {
         let runner = FakeProcessRunner(script: [
             .init(argvPrefix: ["/usr/bin/security", "find-generic-password"], stdoutLines: ["hunter2"], exitCode: 0),
         ])
-        let client = KeychainClient(runner: runner)
+        let client = KeychainSecretStore(runner: runner)
 
         let pw = try await client.password(destId: Self.destId)
 
@@ -91,26 +93,26 @@ struct KeychainClientTests {
         ])
     }
 
-    @Test("password() surfaces exit 44 as KeychainError.itemNotFound")
+    @Test("password() surfaces exit 44 as SecretStoreError.itemNotFound")
     func passwordNotFound() async throws {
         let runner = FakeProcessRunner(script: [
             .init(argvPrefix: ["/usr/bin/security", "find-generic-password"], exitCode: 44),
         ])
-        let client = KeychainClient(runner: runner)
+        let client = KeychainSecretStore(runner: runner)
 
-        await #expect(throws: KeychainError.itemNotFound) {
+        await #expect(throws: SecretStoreError.itemNotFound) {
             _ = try await client.password(destId: Self.destId)
         }
     }
 
-    @Test("password() surfaces other nonzero exits as KeychainError.securityCommandFailed with stderr")
+    @Test("password() surfaces other nonzero exits as SecretStoreError.backendFailed with stderr")
     func passwordOtherFailure() async throws {
         let runner = FakeProcessRunner(script: [
             .init(argvPrefix: ["/usr/bin/security", "find-generic-password"], stderr: "keychain locked", exitCode: 1),
         ])
-        let client = KeychainClient(runner: runner)
+        let client = KeychainSecretStore(runner: runner)
 
-        await #expect(throws: KeychainError.securityCommandFailed("keychain locked")) {
+        await #expect(throws: SecretStoreError.backendFailed("keychain locked")) {
             _ = try await client.password(destId: Self.destId)
         }
     }
@@ -120,7 +122,7 @@ struct KeychainClientTests {
         let runner = FakeProcessRunner(script: [
             .init(argvPrefix: ["/usr/bin/security", "delete-generic-password"], exitCode: 44),
         ])
-        let client = KeychainClient(runner: runner)
+        let client = KeychainSecretStore(runner: runner)
 
         // Must not throw.
         try await client.deletePassword(destId: Self.destId)
@@ -132,9 +134,9 @@ struct KeychainClientTests {
         let runner = FakeProcessRunner(script: [
             .init(argvPrefix: ["/usr/bin/security", "delete-generic-password"], stderr: "denied", exitCode: 1),
         ])
-        let client = KeychainClient(runner: runner)
+        let client = KeychainSecretStore(runner: runner)
 
-        await #expect(throws: KeychainError.securityCommandFailed("denied")) {
+        await #expect(throws: SecretStoreError.backendFailed("denied")) {
             try await client.deletePassword(destId: Self.destId)
         }
     }
@@ -147,7 +149,7 @@ struct KeychainClientTests {
             .init(argvPrefix: ["/usr/bin/security", "delete-generic-password"], exitCode: 44),
             .init(argvPrefix: ["/usr/bin/security", "add-generic-password"], exitCode: 0),
         ])
-        let setClient = KeychainClient(runner: setRunner)
+        let setClient = KeychainSecretStore(runner: setRunner)
         try await setClient.setSecretEnv(envVars, destId: Self.destId)
 
         // Account for the env blob is "<uuid>-env".
@@ -169,7 +171,7 @@ struct KeychainClientTests {
         let getRunner = FakeProcessRunner(script: [
             .init(argvPrefix: ["/usr/bin/security", "find-generic-password"], stdoutLines: [writtenJSON], exitCode: 0),
         ])
-        let getClient = KeychainClient(runner: getRunner)
+        let getClient = KeychainSecretStore(runner: getRunner)
         let roundTripped = try await getClient.secretEnv(destId: Self.destId)
 
         #expect(roundTripped == envVars)
@@ -186,7 +188,7 @@ struct KeychainClientTests {
         let runner = FakeProcessRunner(script: [
             .init(argvPrefix: ["/usr/bin/security", "find-generic-password"], exitCode: 44),
         ])
-        let client = KeychainClient(runner: runner)
+        let client = KeychainSecretStore(runner: runner)
 
         let result = try await client.secretEnv(destId: Self.destId)
         #expect(result.isEmpty)
@@ -197,7 +199,7 @@ struct KeychainClientTests {
         let runner = FakeProcessRunner(script: [
             .init(argvPrefix: ["/usr/bin/security", "delete-generic-password"], exitCode: 44),
         ])
-        let client = KeychainClient(runner: runner)
+        let client = KeychainSecretStore(runner: runner)
 
         try await client.deleteSecretEnv(destId: Self.destId)
         #expect(runner.invocations[0].argv == [
@@ -215,11 +217,12 @@ struct KeychainClientTests {
         let runner = FakeProcessRunner(script: [
             .init(argvPrefix: ["/usr/bin/security", "find-generic-password"], exitCode: 44),
         ])
-        let client = KeychainClient(runner: runner)
+        let client = KeychainSecretStore(runner: runner)
 
-        await #expect(throws: KeychainError.itemNotFound) {
+        await #expect(throws: SecretStoreError.itemNotFound) {
             _ = try await client.password(destId: mixedCaseId)
         }
         #expect(runner.invocations[0].argv.contains(Self.account))
     }
 }
+#endif

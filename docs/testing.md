@@ -30,7 +30,11 @@ final class FakeProcessRunner: ProcessRunning, @unchecked Sendable {
 }
 ```
 
-Conventions: every ResticRunner/KeychainClient/Engine test asserts BOTH the argv/env sent AND the behavior given the scripted reply. Env assertions always check: `RESTIC_PASSWORD_COMMAND` exact string, secret-env injection, `RESTIC_CACHE_DIR` presence, and that the inherited environment was NOT passed through.
+Conventions: every ResticRunner/SecretStore/Engine test asserts BOTH the argv/env sent AND the behavior given the scripted reply. Env assertions always check: `RESTIC_PASSWORD_COMMAND` exact string, secret-env injection, `RESTIC_CACHE_DIR` presence, and that the inherited environment was NOT passed through.
+
+Secrets are injected as a `FakeSecretStore`, not scripted as `/usr/bin/security` subprocesses: since T23 the store is behind the `SecretStore` protocol, so a runner/engine test's process script contains restic calls and nothing else. The keychain backend's own argv is asserted in `KeychainSecretStoreTests` (macOS only); the shared semantics both backends must honour are in `SecretStoreConformanceTests`, which runs `FileSecretStore` on **every** platform — that is how the Linux secrets path gets real coverage from a macOS run.
+
+`scripts/secret-cli-test.sh` is the Layer-2 test for secrets: it drives the real helper binary with `RESTIC_STATION_SECRET_BACKEND=file`, asserts `secrets.json` is `0600`, asserts `print-password` returns the exact bytes with `cmp`/`od`, and (when restic is on PATH) runs a real backup and then greps the whole data directory to prove the password reached no log, run record or state file.
 
 ### Fixture conventions
 `Core/Tests/ResticStationCoreTests/Fixtures/` — copied verbatim from `docs/fixtures/` (captured from restic 0.18.1; see restic-cli.md). Load via `Bundle.module` (declare `resources: [.copy("Fixtures")]` in Package.swift). Every parser has a test decoding its fixture; NDJSON parsers additionally get a partial-line-buffering test (feed the fixture in random-sized chunks, expect identical parse) and an unknown-`message_type` tolerance test.

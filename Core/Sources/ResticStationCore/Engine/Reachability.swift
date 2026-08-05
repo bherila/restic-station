@@ -87,10 +87,17 @@ public struct Reachability: Sendable {
             return .error(outcome.status)
         } catch let error as ResticRunnerError {
             switch error {
-            case .keychainUnavailable:
+            case .secretsUnavailable:
                 // Retryable, not alarming — see docs/architecture.md
-                // §Error taxonomy and ResticRunnerError.keychainUnavailable.
+                // §Error taxonomy and ResticRunnerError.secretsUnavailable.
+                // This string is persisted to `repo-status-<destId>.json` and
+                // matched by the app's badge heuristic (`SetsBadges`), so the
+                // macOS wording stays exactly what it was before T23.
+                #if os(macOS)
                 return .offline(reason: "keychain locked")
+                #else
+                return .offline(reason: "secret store unavailable")
+                #endif
             case .timedOut:
                 return .offline(reason: "timed out")
             case .launchFailed(let reason):

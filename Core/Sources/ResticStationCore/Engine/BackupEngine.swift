@@ -64,7 +64,7 @@ public struct SetRunChild: Equatable, Sendable {
 /// - ``skipped`` — the set lock was busy; exactly one `.skipped` index
 ///   record was written and nothing else happened (**retryable**).
 /// - ``retryable(reason:)`` — an environmental failure *before* anything was
-///   recorded (keychain locked): NO run record, NO `lastBackupStart` update,
+///   recorded (secret store unreadable): NO run record, NO `lastBackupStart` update,
 ///   NO lock taken, so the next tick simply tries again.
 /// - ``misconfigured(reason:)`` — defensive only: the set has no primary
 ///   destination, which `AppConfig.validate()` rejects on load and save.
@@ -124,7 +124,7 @@ public final class BackupEngine: Sendable {
     private let config: AppConfig
     private let paths: AppPaths
     private let restic: ResticRunner
-    private let keychain: KeychainClient
+    private let secrets: any SecretStore
     private let runStore: RunStore
     private let stateStore: StateStore
     private let reachability: Reachability
@@ -134,7 +134,7 @@ public final class BackupEngine: Sendable {
         config: AppConfig,
         paths: AppPaths,
         restic: ResticRunner,
-        keychain: KeychainClient,
+        secrets: any SecretStore,
         runStore: RunStore,
         stateStore: StateStore,
         reachability: Reachability,
@@ -143,7 +143,7 @@ public final class BackupEngine: Sendable {
         self.config = config
         self.paths = paths
         self.restic = restic
-        self.keychain = keychain
+        self.secrets = secrets
         self.runStore = runStore
         self.stateStore = stateStore
         self.reachability = reachability
@@ -154,7 +154,7 @@ public final class BackupEngine: Sendable {
 
     /// The eight-step set-run sequence from `docs/tasks/T09-backup-engine.md`.
     ///
-    /// 1. keychain pre-flight for the primary — failure returns
+    /// 1. secret-store pre-flight for the primary — failure returns
     ///    ``SetRunOutcome/retryable(reason:)`` leaving *no* trace;
     /// 2. `locks/set-<id>.lock` — busy writes one `.skipped` record and stops;
     /// 3. `lastBackupStart = now()` (attempt semantics, scheduled *and*
@@ -176,15 +176,16 @@ public final class BackupEngine: Sendable {
             return .misconfigured(reason: reason)
         }
 
-        // ── Step 1: keychain pre-flight ─────────────────────────────────
+        // ── Step 1: secret-store pre-flight ─────────────────────────────
         // Deliberately the engine's own read, *before* the lock and before
         // any state mutation: `ResticRunner` performs the same pre-flight,
         // but only once a run record and `lastBackupStart` would already
-        // have been written. A locked keychain must leave no trace at all.
+        // have been written. An unreadable secret store must leave no trace
+        // at all.
         do {
-            _ = try await keychain.password(destId: primary.id)
+            _ = try await secrets.password(destId: primary.id)
         } catch {
-            let reason = "the login keychain could not be read for destination \"\(primary.label)\""
+            let reason = "\(Self.secretStoreDescription) could not be read for destination \"\(primary.label)\""
             logWarning("BackupEngine: \(reason) — skipping this run (retryable, nothing recorded)")
             return .retryable(reason: reason)
         }
@@ -339,7 +340,7 @@ public final class BackupEngine: Sendable {
             logWarning("BackupEngine: backup set \"\(set.name)\" has no primary destination — cannot check")
             return .failed
         }
-        guard await keychainAvailable(for: [primary]) else { return .skipped }
+        guard await secretsAvailable(for: [primary]) else { return .skipped }
 
         let lock = makeSetLock(setId: set.id)
         guard lock.tryAcquire() else {
@@ -439,7 +440,7 @@ public final class BackupEngine: Sendable {
             )
             return .skipped
         }
-        guard await keychainAvailable(for: [primary]) else { return .skipped }
+        guard await secretsAvailable(for: [primary]) else { return .skipped }
 
         let lock = makeSetLock(setId: set.id)
         guard lock.tryAcquire() else {
@@ -507,7 +508,7 @@ public final class BackupEngine: Sendable {
             logWarning("BackupEngine: no configured destination with id \(request.destId) — cannot restore")
             return .failed
         }
-        guard await keychainAvailable(for: [destination]) else { return .skipped }
+        guard await secretsAvailable(for: [destination]) else { return .skipped }
 
         let lock = makeSetLock(setId: set.id)
         guard lock.tryAcquire() else {
@@ -559,7 +560,7 @@ public final class BackupEngine: Sendable {
         }
         // Both repositories' passwords are needed (`RESTIC_PASSWORD_COMMAND`
         // and `RESTIC_FROM_PASSWORD_COMMAND`).
-        guard await keychainAvailable(for: [dest, primary]) else { return .skipped }
+        guard await secretsAvailable(for: [dest, primary]) else { return .skipped }
 
         let lock = makeSetLock(setId: set.id)
         guard lock.tryAcquire() else {
@@ -748,7 +749,7 @@ public final class BackupEngine: Sendable {
     private enum ExecuteResult {
         case ranToCompletion(ResticOutcome)
         /// restic produced no outcome at all (launch failure, timeout,
-        /// keychain read failure mid-run, cancellation).
+        /// secret read failure mid-run, cancellation).
         case didNotRun(reason: String)
 
         var outcome: ResticOutcome? {
@@ -988,16 +989,26 @@ public final class BackupEngine: Sendable {
         }
     }
 
-    /// The engine's own pre-flight for the non-`runSet` entry points: a
-    /// locked keychain is retryable, so those methods return `.skipped`
-    /// without writing a run record (`docs/architecture.md` §Error taxonomy).
-    private func keychainAvailable(for destinations: [Destination]) async -> Bool {
+    /// How the engine names the secret store in its user-visible log lines.
+    /// Platform-split so the macOS wording is byte-for-byte what it was
+    /// before the `SecretStore` abstraction landed.
+    #if os(macOS)
+    static let secretStoreDescription = "the login keychain"
+    #else
+    static let secretStoreDescription = "the secrets file"
+    #endif
+
+    /// The engine's own pre-flight for the non-`runSet` entry points: an
+    /// unreadable secret store is retryable, so those methods return
+    /// `.skipped` without writing a run record (`docs/architecture.md`
+    /// §Error taxonomy).
+    private func secretsAvailable(for destinations: [Destination]) async -> Bool {
         for destination in destinations {
             do {
-                _ = try await keychain.password(destId: destination.id)
+                _ = try await secrets.password(destId: destination.id)
             } catch {
                 logWarning(
-                    "BackupEngine: the login keychain could not be read for destination "
+                    "BackupEngine: \(Self.secretStoreDescription) could not be read for destination "
                         + "\"\(destination.label)\" — skipping (retryable, nothing recorded)"
                 )
                 return false

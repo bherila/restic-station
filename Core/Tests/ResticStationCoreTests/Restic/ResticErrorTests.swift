@@ -90,7 +90,7 @@ struct ResticErrorTests {
     @Test("ResticRunnerError categories follow architecture.md's taxonomy")
     func runnerErrorCategories() {
         let destinationId = UUID()
-        #expect(ResticRunnerError.keychainUnavailable(destinationId: destinationId).category == .retryable)
+        #expect(ResticRunnerError.secretsUnavailable(destinationId: destinationId).category == .retryable)
         #expect(ResticRunnerError.launchFailed("no such file").category == .terminal)
         #expect(ResticRunnerError.timedOut.category == .terminal)
     }
@@ -98,7 +98,7 @@ struct ResticErrorTests {
     @Test("ResticRunnerError descriptions never carry secret material")
     func runnerErrorDescriptions() {
         let destinationId = UUID()
-        let error = ResticRunnerError.keychainUnavailable(destinationId: destinationId)
+        let error = ResticRunnerError.secretsUnavailable(destinationId: destinationId)
         #expect(error.description.contains(destinationId.uuidString))
         #expect(!error.userFacingMessage.isEmpty)
     }

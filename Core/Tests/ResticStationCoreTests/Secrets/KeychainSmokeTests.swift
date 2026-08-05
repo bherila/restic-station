@@ -1,3 +1,4 @@
+#if os(macOS)
 import Foundation
 import Testing
 @testable import ResticStationCore
@@ -73,20 +74,20 @@ struct KeychainSmokeTests {
         #expect(readAfterDelete.exitCode == 44)
     }
 
-    /// Also exercises `KeychainClient` itself (via `DefaultProcessRunner`)
+    /// Also exercises `KeychainSecretStore` itself (via `DefaultProcessRunner`)
     /// end to end against the real keychain, using the same test service by
     /// constructing a throwaway client whose account happens to route
     /// through the same `/usr/bin/security` binary — the account/service
     /// strings are what matter here, not which client issued the call, so
-    /// this proves `DefaultProcessRunner` + `KeychainClient`'s exact argv
+    /// this proves `DefaultProcessRunner` + `KeychainSecretStore`'s exact argv
     /// really works against the real tool, prompt-free.
-    @Test("KeychainClient (DefaultProcessRunner) round-trips a real item, prompt-free")
+    @Test("KeychainSecretStore (DefaultProcessRunner) round-trips a real item, prompt-free")
     func keychainClientAgainstRealSecurity() async throws {
-        // KeychainClient hardcodes service "restic-station"; to keep this
+        // KeychainSecretStore hardcodes service "restic-station"; to keep this
         // smoke test isolated from any real app data we don't use
-        // KeychainClient's public API against the real service. Instead we
+        // KeychainSecretStore's public API against the real service. Instead we
         // reuse DefaultProcessRunner directly with the same argv shape
-        // KeychainClient uses, targeted at the test service — this is the
+        // KeychainSecretStore uses, targeted at the test service — this is the
         // most faithful way to smoke-test the production process runner
         // without ever touching service "restic-station".
         let runner = DefaultProcessRunner()
@@ -157,3 +158,4 @@ struct KeychainSmokeTests {
         )
     }
 }
+#endif

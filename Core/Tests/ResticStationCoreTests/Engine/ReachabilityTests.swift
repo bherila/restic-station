@@ -11,31 +11,28 @@ struct ReachabilityTests {
         AppPaths(root: URL(fileURLWithPath: "/tmp/restic-station-reachability-tests", isDirectory: true))
     }
 
-    static func makeReachability(_ fake: FakeProcessRunner) -> Reachability {
+    static func makeReachability(
+        _ fake: FakeProcessRunner,
+        secrets: FakeSecretStore = FakeSecretStore(defaultPassword: password)
+    ) -> Reachability {
         let runner = ResticRunner(
             resticPath: "/usr/local/bin/restic",
             paths: paths(),
-            keychain: KeychainClient(runner: fake),
+            secrets: secrets,
             runner: fake
         )
         return Reachability(restic: runner)
     }
 
-    static func securityRead(_ account: String) -> [String] {
-        ["/usr/bin/security", "find-generic-password", "-s", "restic-station", "-a", account]
-    }
-
-    static func passwordAccount(_ id: UUID) -> String { id.uuidString.lowercased() }
-    static func envAccount(_ id: UUID) -> String { "\(id.uuidString.lowercased())-env" }
-
-    /// Scripted keychain replies for the pre-flight (password) + env-blob
-    /// reads `ResticRunner.run` performs before invoking restic itself —
-    /// same shape as `ResticRunnerTests.keychainScript`.
-    static func keychainScript(for id: UUID) -> [FakeProcessRunner.Expectation] {
-        [
-            .init(argvPrefix: securityRead(passwordAccount(id)), stdoutLines: [password]),
-            .init(argvPrefix: securityRead(envAccount(id)), exitCode: 44),
-        ]
+    /// The `offline` reason `ResticRunner`'s secret pre-flight produces.
+    /// Platform-split in `Reachability` so the macOS wording — which the
+    /// app's badge heuristic matches on — is unchanged by T23.
+    static var secretsUnavailableReason: String {
+        #if os(macOS)
+        return "keychain locked"
+        #else
+        return "secret store unavailable"
+        #endif
     }
 
     // MARK: - Local: present / missing
@@ -91,8 +88,7 @@ struct ReachabilityTests {
     @Test("remote destination: exit 0 is reachable")
     func remoteExitZeroIsReachable() async throws {
         let dest = Destination(id: Self.destId, label: "R2", repoURL: "s3:https://x/bucket", isPrimary: false)
-        let fake = FakeProcessRunner(script:
-            Self.keychainScript(for: Self.destId) + [
+        let fake = FakeProcessRunner(script: [
                 .init(argvPrefix: ["/usr/local/bin/restic", "-r", dest.repoURL, "cat", "config"], exitCode: 0),
             ]
         )
@@ -109,8 +105,7 @@ struct ReachabilityTests {
     @Test("remote destination: a ProcessRunning timeout is offline, not error")
     func remoteTimeoutIsOffline() async throws {
         let dest = Destination(id: Self.destId, label: "R2", repoURL: "s3:https://x/bucket", isPrimary: false)
-        let fake = FakeProcessRunner(script:
-            Self.keychainScript(for: Self.destId) + [
+        let fake = FakeProcessRunner(script: [
                 .init(argvPrefix: ["/usr/local/bin/restic", "-r", dest.repoURL, "cat", "config"], failure: .timeout),
             ]
         )
@@ -130,8 +125,7 @@ struct ReachabilityTests {
         // confirm Reachability still surfaces the timeout mapping when the
         // fake takes some (bounded) time before throwing.
         let dest = Destination(id: Self.destId, label: "R2", repoURL: "s3:https://x/bucket", isPrimary: false)
-        let fake = FakeProcessRunner(script:
-            Self.keychainScript(for: Self.destId) + [
+        let fake = FakeProcessRunner(script: [
                 .init(
                     argvPrefix: ["/usr/local/bin/restic", "-r", dest.repoURL, "cat", "config"],
                     delay: 0.05,
@@ -148,8 +142,7 @@ struct ReachabilityTests {
     @Test("remote destination: exit 10 (repo does not exist) is .error, not .offline")
     func remoteExitTenIsError() async throws {
         let dest = Destination(id: Self.destId, label: "R2", repoURL: "s3:https://x/bucket", isPrimary: false)
-        let fake = FakeProcessRunner(script:
-            Self.keychainScript(for: Self.destId) + [
+        let fake = FakeProcessRunner(script: [
                 .init(argvPrefix: ["/usr/local/bin/restic", "-r", dest.repoURL, "cat", "config"], exitCode: 10),
             ]
         )
@@ -162,8 +155,7 @@ struct ReachabilityTests {
     @Test("remote destination: exit 12 (wrong password) is .error, not .offline")
     func remoteExitTwelveIsError() async throws {
         let dest = Destination(id: Self.destId, label: "R2", repoURL: "s3:https://x/bucket", isPrimary: false)
-        let fake = FakeProcessRunner(script:
-            Self.keychainScript(for: Self.destId) + [
+        let fake = FakeProcessRunner(script: [
                 .init(argvPrefix: ["/usr/local/bin/restic", "-r", dest.repoURL, "cat", "config"], exitCode: 12),
             ]
         )
@@ -173,29 +165,24 @@ struct ReachabilityTests {
         #expect(result == .error(.wrongPassword))
     }
 
-    @Test("remote destination: keychain pre-flight failure is offline('keychain locked'), never .error")
-    func remoteKeychainPreflightFailureIsOffline() async throws {
+    @Test("remote destination: secret pre-flight failure is offline, never .error")
+    func remoteSecretPreflightFailureIsOffline() async throws {
         let dest = Destination(id: Self.destId, label: "R2", repoURL: "s3:https://x/bucket", isPrimary: false)
-        let fake = FakeProcessRunner(script: [
-            .init(
-                argvPrefix: Self.securityRead(Self.passwordAccount(Self.destId)),
-                stderr: "SecKeychainSearchCopyNext: User interaction is not allowed.",
-                exitCode: 1
-            ),
-        ])
-        let reachability = Self.makeReachability(fake)
+        let fake = FakeProcessRunner()
+        let secrets = FakeSecretStore(defaultPassword: Self.password)
+        secrets.failPassword(for: Self.destId)
+        let reachability = Self.makeReachability(fake, secrets: secrets)
 
         let result = await reachability.probe(dest)
-        #expect(result == .offline(reason: "keychain locked"))
+        #expect(result == .offline(reason: Self.secretsUnavailableReason))
         // restic itself was never spawned.
-        #expect(fake.invocations.count == 1)
+        #expect(fake.invocations.isEmpty)
     }
 
     @Test("remote destination: launch failure is offline with the launch failure reason")
     func remoteLaunchFailureIsOffline() async throws {
         let dest = Destination(id: Self.destId, label: "R2", repoURL: "s3:https://x/bucket", isPrimary: false)
-        let fake = FakeProcessRunner(script:
-            Self.keychainScript(for: Self.destId) + [
+        let fake = FakeProcessRunner(script: [
                 .init(
                     argvPrefix: ["/usr/local/bin/restic", "-r", dest.repoURL, "cat", "config"],
                     failure: .launchFailed("No such file or directory")

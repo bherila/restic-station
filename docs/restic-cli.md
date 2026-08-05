@@ -9,11 +9,28 @@ Everything in this document was **verified against restic 0.18.1 on macOS (arm64
 - Environment assembled per destination, replacing the inherited env with a minimal one:
   - `HOME`, `USER`, `TMPDIR` passed through (restic/keychain need them)
   - `PATH=/usr/bin:/bin:/usr/sbin:/sbin` — fixed, not inherited; restic's `sftp:` backend locates `ssh` via PATH. Overridable per destination via `nonSecretEnv` (e.g. prepend `/opt/homebrew/bin` for an `rclone:` backend)
-  - `RESTIC_PASSWORD_COMMAND=/usr/bin/security find-generic-password -s restic-station -a <dest-uuid-lowercase> -w`
+  - `RESTIC_PASSWORD_COMMAND` — produced by the active `SecretStore` (T23), **not** hard-coded:
+    - keychain backend (macOS default): `/usr/bin/security find-generic-password -s restic-station -a <dest-uuid-lowercase> -w`
+    - file backend (Linux default; opt-in on macOS via `RESTIC_STATION_SECRET_BACKEND=file`): `<absolute-helper-path> print-password --dest <dest-uuid-lowercase>`
+  - the active `SecretStore`'s `passwordCommandEnvironment` — empty for the keychain backend, and `RESTIC_STATION_DATA_DIR` + `RESTIC_STATION_SECRET_BACKEND=file` for the file backend. **This is load-bearing:** we replace restic's environment, restic's password-command child inherits the replaced environment, and that child is another copy of our own helper which resolves its store from its own environment. Without these two variables it would read the *default* data directory with the *platform-default* backend and fail to find a password this process just read successfully.
   - `RESTIC_CACHE_DIR=~/Library/Caches/net.herila.ResticStation/restic` (expanded)
   - `Destination.nonSecretEnv` entries
-  - secret env from keychain item `<uuid>-env` (a JSON dict, fetched by our code and injected as real env vars — restic's password-command mechanism only covers the repo password, not e.g. `AWS_SECRET_ACCESS_KEY`)
-- `RESTIC_PASSWORD_COMMAND` is word-split by restic itself (not `sh -c`); the fixed form above contains no characters needing quoting. Never build it from user input.
+  - secret env from the store's `<uuid>-env` item (a JSON dict, fetched by our code and injected as real env vars — restic's password-command mechanism only covers the repo password, not e.g. `AWS_SECRET_ACCESS_KEY`)
+- `RESTIC_PASSWORD_COMMAND` is word-split by restic itself (not `sh -c`). Never build it from user input.
+
+  **Splitting rules, verified empirically against restic 0.18.1 (T23)** — restic uses its own shell-like splitter, so the exact capabilities matter once a path can contain a space:
+
+  | Form | Result |
+  |---|---|
+  | `/usr/bin/security find-generic-password …` (no metacharacters) | works — this is the keychain backend's fixed form |
+  | `"/path/with spaces/helper" print-password --dest <uuid>` | **works**; a double-quoted argument may contain spaces, single quotes, `$` and `\` literally, and unquoted arguments may follow it |
+  | `'/path/with spaces/helper'` | works — single quotes behave the same |
+  | `/path/with spaces/helper` (unquoted) | fails: `fork/exec /path/with: no such file or directory` |
+  | `'/path/it'\''s/helper'` (POSIX escape) | **fails** — restic's splitter has no backslash escape |
+  | `"/path/with a \" quote/helper"` | fails: `double-quoted string not terminated` — a path containing `"` cannot be expressed at all |
+
+  `FileSecretStore.quoteForRestic(_:)` therefore double-quotes the helper path only when it contains a character outside `[A-Za-z0-9/._+=:,@-]`, so the common case emits the same unquoted shape the keychain backend does. A helper path containing a literal `"` is unrepresentable and is documented as such rather than worked around.
+- restic trims a trailing newline from the password command's output, but `print-password` deliberately emits none: a password that legitimately ends in a newline must round-trip through `secret set` → `print-password` unchanged.
 - Add `--json` to every command that supports it. `check` and `unlock` have no JSON mode — capture text.
 - Never pass `--no-lock`.
 
