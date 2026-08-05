@@ -1,8 +1,9 @@
-#!/bin/bash -euo pipefail
-# shellcheck disable=SC2096
-# ^ see scripts/integration-test.sh's identical header comment: this packs
-# -euo pipefail into the shebang per project convention; the `set -euo
-# pipefail` below is what actually takes effect on every OS.
+#!/usr/bin/env bash
+# See scripts/integration-test.sh's header for why this is not
+# `#!/bin/bash -euo pipefail`: Linux passes the shebang remainder as one
+# argument and bash dies with "invalid option name" before the script runs.
+# This script is invoked on macOS today, but it is Linux tooling and a
+# contributor will eventually run it there. `set -euo pipefail` is below.
 # scripts/package-linux.sh — builds a fully static `restic-station-helper`
 # for one or more Linux architectures and packages each into
 # `restic-station-linux-<arch>.tar.gz` (T29 / issue #31).

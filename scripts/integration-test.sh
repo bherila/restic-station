@@ -1,9 +1,12 @@
-#!/bin/bash -euo pipefail
-# shellcheck disable=SC2096
-# ^ the shebang above intentionally packs -euo pipefail into one shebang
-# line per docs/tasks/T19-integration-test.md ("#!/bin/bash -euo pipefail");
-# not every OS splits that into three flags, which is exactly why the `set
-# -euo pipefail` a few lines down is the one that actually matters.
+#!/usr/bin/env bash
+# Deliberately NOT `#!/bin/bash -euo pipefail`, which this script used until
+# it first ran on Linux. Darwin splits a shebang's argument string on
+# whitespace, so bash there receives `-e -u -o pipefail` and it works; the
+# Linux kernel passes the whole remainder as a *single* argument, so bash
+# gets one `-euo pipefail` token, consumes the script path as `-o`'s option
+# name, and dies with "invalid option name" — at the shebang, before a line
+# of this script runs. The `set -euo pipefail` below is the portable way to
+# get the same flags, and is now the only thing setting them.
 # scripts/integration-test.sh — Layer 2 integration test (docs/testing.md
 # §Layer 2, docs/tasks/T19-integration-test.md): builds the real app/helper
 # (macOS) or uses an already-built one (Linux — see the override below),

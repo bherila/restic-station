@@ -1,8 +1,8 @@
-#!/bin/bash -euo pipefail
-# shellcheck disable=SC2096
-# ^ see scripts/integration-test.sh's identical header comment: this packs
-# -euo pipefail into the shebang per project convention; the `set -euo
-# pipefail` below is what actually takes effect on every OS.
+#!/usr/bin/env bash
+# See scripts/integration-test.sh's header for why this is not
+# `#!/bin/bash -euo pipefail`: Linux passes the shebang remainder as one
+# argument and bash dies with "invalid option name" before the script runs.
+# `set -euo pipefail` is below.
 # scripts/setup-static-linux-sdk.sh — installs (idempotently, no sudo) the
 # exact toolchain + Swift SDK combination `scripts/package-linux.sh` uses to
 # cross-compile a fully static `restic-station-helper` for Linux (T29 /
