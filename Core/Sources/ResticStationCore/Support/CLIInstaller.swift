@@ -29,13 +29,11 @@ public enum CLIInstaller {
     /// `restic-station` on `PATH`.
     public static let linkName = "restic-station"
 
-    /// The basename ownership is checked against. Any symlink at the
-    /// target path whose destination ends in this name is treated as
-    /// "ours" — installed by this feature, possibly stale (pointing at a
-    /// bundle that has since moved or been rebuilt) — and is safe to
-    /// repair or remove. Anything else (a plain file, a directory, or a
-    /// symlink to something differently named) is a foreign entry this
-    /// code refuses to touch.
+    /// The basename a symlink's destination must have before it is even
+    /// *considered* ours — necessary but never sufficient. See `isOwned`
+    /// for the full ownership rule: basename alone is not enough to tell
+    /// "our symlink, bundle moved" apart from "a foreign binary that
+    /// happens to share our helper's name."
     public static let ownedTargetBasename = "restic-station-helper"
 
     // MARK: - Prefix
@@ -55,6 +53,22 @@ public enum CLIInstaller {
             }
         }
     }
+
+    /// The prefix a GUI install button should default to.
+    ///
+    /// `cli install` at the command line defaults to `.system`
+    /// (`/usr/local/bin`) because that is what most users on a
+    /// Homebrew-provisioned Mac expect and it happens to already be
+    /// user-writable there — Homebrew itself takes ownership of
+    /// `/usr/local` on Intel Macs. But a Settings button is clicked from
+    /// Finder/launchd, not a Homebrew shell, and on a clean or
+    /// non-Homebrew Mac `/usr/local/bin` is root-owned or does not exist
+    /// at all: the one-click install would silently fail every time. `.user`
+    /// (`~/.local/bin`) never needs elevated privileges on any Mac, so it is
+    /// the default that actually works out of the box. The Settings row
+    /// still lets a user pick `.system` explicitly if they know their
+    /// machine supports it.
+    public static func recommendedGUIPrefix() -> Prefix { .user }
 
     // MARK: - Foreign entry
 
@@ -107,7 +121,7 @@ public enum CLIInstaller {
         let linkPath = directory.appendingPathComponent(linkName, isDirectory: false).path
 
         if let existingDestination = symlinkDestination(at: linkPath, fileManager: fileManager) {
-            guard isOwned(existingDestination) else {
+            guard isOwned(existingDestination, expectedTarget: target, fileManager: fileManager) else {
                 throw ForeignEntryError(path: linkPath)
             }
             if existingDestination == target {
@@ -136,17 +150,21 @@ public enum CLIInstaller {
     /// Idempotent removal: a target that is not there is success, not an
     /// error.
     ///
+    /// - Parameter target: the caller's current expected target (same value
+    ///   `install` would use right now) — required so ownership can be
+    ///   verified against a real path, not just a basename. See `isOwned`.
     /// - Throws: ``ForeignEntryError`` if something exists there that this
     ///   code did not create. Never removes it.
     @discardableResult
     public static func uninstall(
+        target: String,
         directory: URL,
         fileManager: FileManager = .default
     ) throws -> UninstallOutcome {
         let linkPath = directory.appendingPathComponent(linkName, isDirectory: false).path
 
         if let existingDestination = symlinkDestination(at: linkPath, fileManager: fileManager) {
-            guard isOwned(existingDestination) else {
+            guard isOwned(existingDestination, expectedTarget: target, fileManager: fileManager) else {
                 throw ForeignEntryError(path: linkPath)
             }
             try fileManager.removeItem(atPath: linkPath)
@@ -191,7 +209,9 @@ public enum CLIInstaller {
     ) -> Status {
         let linkPath = directory.appendingPathComponent(linkName, isDirectory: false).path
         let existingDestination = symlinkDestination(at: linkPath, fileManager: fileManager)
-        let owned = existingDestination.map(isOwned) ?? false
+        let owned = existingDestination.map {
+            isOwned($0, expectedTarget: currentTarget, fileManager: fileManager)
+        } ?? false
         let foreignEntryPresent = !owned
             && (existingDestination != nil || fileManager.fileExists(atPath: linkPath))
         return Status(
@@ -217,10 +237,105 @@ public enum CLIInstaller {
         }
     }
 
+    // MARK: - Failure advice
+
+    /// A user-facing explanation for an error thrown by `install`/
+    /// `uninstall`, for the GUI (`App/Sources/ViewModels/AppModel+CLI.swift`)
+    /// to show instead of a bare `"\(error)"`. Lives in Core, not the App
+    /// target, so it is unit-testable — the App target has no test target
+    /// of its own (issue #40).
+    ///
+    /// The case this exists for: `.system` (`/usr/local/bin`) is root-owned
+    /// or absent on a clean Mac, so a Finder-launched app's install button
+    /// fails there with a raw permission error that does not say what to
+    /// do. `recommendedGUIPrefix()` already defaults the button away from
+    /// that prefix, but a user can still pick `.system` explicitly (or a
+    /// `--user` home directory can itself be unwritable in unusual setups),
+    /// so the failure path still needs to explain itself rather than just
+    /// print the underlying `NSError`.
+    public static func installFailureAdvice(error: Error, directory: URL, prefix: Prefix) -> String {
+        if let foreign = error as? ForeignEntryError {
+            return foreign.description
+        }
+        let description = (error as NSError).localizedDescription
+        let looksLikePermissionError = description.localizedCaseInsensitiveContains("permission")
+            || description.localizedCaseInsensitiveContains("not permitted")
+        guard looksLikePermissionError else {
+            return "Couldn't install to \(directory.path): \(description)"
+        }
+        switch prefix {
+        case .system:
+            let userPrefixHint = Prefix.user.directory(homeDirectory: FileManager.default.homeDirectoryForCurrentUser)
+            return "Couldn't write to \(directory.path) — it needs administrator privileges on this Mac. "
+                + "Switch to the \"Just me\" location (\(userPrefixHint.path)) instead, which never needs "
+                + "elevated permissions."
+        case .user:
+            return "Couldn't write to \(directory.path): \(description). Check that your home directory is "
+                + "writable, or install from Terminal instead."
+        }
+    }
+
     // MARK: - Ownership
 
-    private static func isOwned(_ destination: String) -> Bool {
-        (destination as NSString).lastPathComponent == ownedTargetBasename
+    /// Whether the symlink whose destination is `destination` is "ours" —
+    /// safe for `install`/`uninstall` to repoint or remove without asking.
+    ///
+    /// A basename match alone is **not** enough: a `restic-station` entry
+    /// pointing at *any* other executable named `restic-station-helper` —
+    /// a second checkout, a duplicate app bundle, an unrelated tool that
+    /// happens to share the name — would incorrectly be judged ours, and
+    /// `install`/`uninstall` would then repoint or delete a symlink that
+    /// belongs to something else entirely. That was the bug: basename is
+    /// attacker- and coincidence-controlled, so it cannot be the whole
+    /// story for a check that gates deleting or overwriting someone else's
+    /// entry.
+    ///
+    /// The rule, in order:
+    ///   1. The basename must match `ownedTargetBasename` at all — this is
+    ///      the cheap pre-filter, still necessary, just not sufficient.
+    ///   2. If `destination` is exactly `expectedTarget` (the caller's
+    ///      current, real, in-bundle path), it is unambiguously ours: this
+    ///      is precisely what a fresh `install` from *this* bundle would
+    ///      have written.
+    ///   3. Otherwise, it is ours only if `destination` does not currently
+    ///      exist on disk at all (a dangling symlink).
+    ///
+    /// Step 3 is what makes repair possible: `install`/`uninstall` are
+    /// always called with *today's* target, but a stale symlink of ours
+    /// points at *yesterday's* bundle path, which by definition is not
+    /// `expectedTarget` anymore. When a `.app` bundle moves or is deleted
+    /// out from under a symlink, the old path stops existing — nothing
+    /// else could be depending on a path with nothing at the end of it, so
+    /// repairing or removing that symlink is safe. A foreign symlink from
+    /// a live, distinct install is never in this state: something real is
+    /// still sitting at its destination, by construction of "distinct and
+    /// live."
+    ///
+    /// This does leave one case genuinely ambiguous, and it is called out
+    /// here rather than silently guessed: if the *same* app is present at
+    /// two live locations (e.g. a duplicate `.app` bundle, or a second
+    /// build left behind after a move-and-rebuild) and the symlink points
+    /// at the other, still-existing copy, this rule cannot distinguish
+    /// "our own stale symlink, pointing at another real copy of
+    /// ourselves" from "a genuinely foreign live binary that happens to
+    /// share our helper's basename" — both present as a basename match, a
+    /// real file at the other end, and a destination that is not
+    /// `expectedTarget`. We resolve that ambiguity in favor of the
+    /// non-destructive answer: such a symlink is treated as foreign, and
+    /// `install`/`uninstall` refuse and explain rather than guess. A user
+    /// in that situation removes the old copy (or the symlink) by hand.
+    private static func isOwned(
+        _ destination: String,
+        expectedTarget: String,
+        fileManager: FileManager
+    ) -> Bool {
+        guard (destination as NSString).lastPathComponent == ownedTargetBasename else {
+            return false
+        }
+        if destination == expectedTarget {
+            return true
+        }
+        return !fileManager.fileExists(atPath: destination)
     }
 
     /// The existing entry's symlink target, or `nil` if the path is absent

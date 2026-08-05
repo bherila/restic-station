@@ -26,40 +26,48 @@ extension AppModel {
         HelperInvoker.helperURL.resolvingSymlinksInPath().path
     }
 
-    /// The default, no-privileges-required location — `/usr/local/bin`,
-    /// matching `cli install`'s own default (user-writable on a default
-    /// macOS install; there is no sandboxing concern here that would make
-    /// `--user`'s `~/.local/bin` preferable as the GUI's default).
-    var cliInstallDirectory: URL {
-        CLIInstaller.Prefix.system.directory(homeDirectory: FileManager.default.homeDirectoryForCurrentUser)
+    /// Where the GUI's install button would put the symlink for a given
+    /// prefix choice. Unlike `cli install`'s own default (`.system`,
+    /// `/usr/local/bin` — fine from a Homebrew-provisioned shell), a
+    /// Settings row is clicked from a Finder-launched, non-shell process:
+    /// on a clean or non-Homebrew Mac `/usr/local/bin` is root-owned or
+    /// absent, so a button that always targets it fails there every time.
+    /// Callers should default to ``CLIInstaller/recommendedGUIPrefix()``
+    /// (`.user`, `~/.local/bin` — never needs elevated privileges) and let
+    /// the Settings row offer `.system` as an explicit opt-in.
+    func cliInstallDirectory(prefix: CLIInstaller.Prefix) -> URL {
+        prefix.directory(homeDirectory: FileManager.default.homeDirectoryForCurrentUser)
     }
 
-    /// Read-only snapshot of the symlink's current state. Recomputed fresh
-    /// every time it is read (a handful of syscalls) rather than cached —
-    /// the same "just re-probe it" approach `PermissionsPaneModel` and
-    /// `appFullDiskAccess` take, since the ground truth lives on disk and
-    /// can change behind the app's back (a user deleting the symlink by
-    /// hand, or moving the app).
-    var cliInstallStatus: CLIInstaller.Status {
+    /// Read-only snapshot of the symlink's current state for `prefix`.
+    /// Recomputed fresh every time it is read (a handful of syscalls)
+    /// rather than cached — the same "just re-probe it" approach
+    /// `PermissionsPaneModel` and `appFullDiskAccess` take, since the
+    /// ground truth lives on disk and can change behind the app's back (a
+    /// user deleting the symlink by hand, or moving the app).
+    func cliInstallStatus(prefix: CLIInstaller.Prefix) -> CLIInstaller.Status {
         CLIInstaller.status(
-            directory: cliInstallDirectory,
+            directory: cliInstallDirectory(prefix: prefix),
             currentTarget: cliInstallTarget,
             pathEnvironment: ProcessInfo.processInfo.environment["PATH"]
         )
     }
 
     /// Installs (or repairs) the `restic-station` symlink at
-    /// ``cliInstallDirectory``. Mirrors `cli install`'s contract exactly —
-    /// never a copy, refuses rather than overwriting a foreign entry.
+    /// ``cliInstallDirectory(prefix:)``. Mirrors `cli install`'s contract
+    /// exactly — never a copy, refuses rather than overwriting a foreign
+    /// entry.
     @discardableResult
-    func installCLI() -> Result<CLIInstaller.InstallOutcome, Error> {
-        Result { try CLIInstaller.install(target: cliInstallTarget, directory: cliInstallDirectory) }
+    func installCLI(prefix: CLIInstaller.Prefix) -> Result<CLIInstaller.InstallOutcome, Error> {
+        Result { try CLIInstaller.install(target: cliInstallTarget, directory: cliInstallDirectory(prefix: prefix)) }
     }
 
     /// Removes the symlink, if it is one of ours. Idempotent; refuses
     /// (without removing anything) if a foreign file is there instead.
     @discardableResult
-    func uninstallCLI() -> Result<CLIInstaller.UninstallOutcome, Error> {
-        Result { try CLIInstaller.uninstall(directory: cliInstallDirectory) }
+    func uninstallCLI(prefix: CLIInstaller.Prefix) -> Result<CLIInstaller.UninstallOutcome, Error> {
+        Result {
+            try CLIInstaller.uninstall(target: cliInstallTarget, directory: cliInstallDirectory(prefix: prefix))
+        }
     }
 }

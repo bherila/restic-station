@@ -106,8 +106,9 @@ struct CliUninstall: AsyncParsableCommand {
 
     func run() async throws {
         let directory = options.directory
+        let target = FileSecretStore.currentExecutablePath()
         do {
-            let outcome = try CLIInstaller.uninstall(directory: directory)
+            let outcome = try CLIInstaller.uninstall(target: target, directory: directory)
             switch outcome {
             case .removed(let linkPath):
                 print("removed \(linkPath)")

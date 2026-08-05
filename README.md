@@ -43,9 +43,11 @@ Running from `/Applications` matters: the background agent (SMAppService) and Fu
 Restic Station is GUI **and** CLI. The tool itself ships embedded inside the app bundle at `Restic Station.app/Contents/MacOS/restic-station-helper` — install a friendly `restic-station` symlink on your `PATH` and use that instead of typing the bundle path:
 
 ```sh
-restic-station-helper cli install --user   # ~/.local/bin, no sudo; drop --user for /usr/local/bin
-restic-station status                      # or from Settings → General → Command line, Install button
+"/Applications/Restic Station.app/Contents/MacOS/restic-station-helper" cli install --user   # ~/.local/bin, no sudo; drop --user for /usr/local/bin
+restic-station status                      # once installed — or skip this step entirely via Settings → General → Command line, Install button
 ```
+
+(`restic-station-helper` is not on `PATH` yet at this point — creating that first `PATH` entry is what this step does, so it has to be run by its full in-bundle path once. Every command after this one uses the short name.)
 
 `cli install` always creates a **symlink**, never a copy — the embedded binary's location matters (it's what `SMAppService` registration and Full Disk Access attribution bind to; see [`docs/keychain-and-fda.md`](docs/keychain-and-fda.md)), and a symlink is transparent to both because the kernel resolves it before anything runs. `cli status` reports whether it's installed and where it points; `cli uninstall` removes it. All three are idempotent and refuse to touch a file at the target path that isn't one of their own symlinks. The same install/uninstall is one click away in **Settings → General → Command line**.
 
