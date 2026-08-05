@@ -43,9 +43,11 @@ struct CliPrefixOptions: ParsableArguments {
     @Flag(
         name: .long,
         help: ArgumentHelp(
-            "Install into ~/.local/bin instead of /usr/local/bin. Neither needs sudo on a default macOS "
-                + "install — /usr/local/bin is user-writable out of the box; --user only changes where the "
-                + "symlink goes, e.g. for a machine where it isn't."
+            "Install into ~/.local/bin instead of /usr/local/bin. On a clean or Apple Silicon Mac, "
+                + "/usr/local/bin is root-owned or doesn't exist at all, so writing there needs sudo — "
+                + "a Homebrew-provisioned Intel Mac is the exception, since Homebrew itself owns /usr/local "
+                + "there. ~/.local/bin never needs elevated privileges on any Mac, which is why it's also "
+                + "the Settings \"Command line\" button's default. Without --user, cli install may need sudo."
         )
     )
     var user = false

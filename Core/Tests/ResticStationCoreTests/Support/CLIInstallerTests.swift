@@ -1,6 +1,11 @@
 import Foundation
 import Testing
 @testable import ResticStationCore
+#if canImport(Darwin)
+import Darwin
+#else
+import Glibc
+#endif
 
 /// `docs/tasks/T28` (issue #30): the `restic-station` symlink installer.
 /// Every test gets its own scratch directory under
@@ -218,6 +223,226 @@ private let movedBundleTarget = "/Applications/Restic Station 2.app/Contents/Mac
             let status = CLIInstaller.status(directory: directory, currentTarget: bundleTarget, pathEnvironment: nil)
             #expect(!status.installed)
             #expect(status.foreignEntryPresent)
+        }
+    }
+
+    // MARK: - ownership: relative destinations, loops, directories (merge blocker)
+    //
+    // `destinationOfSymbolicLink` returns a symlink's stored destination
+    // string verbatim. When that string is *relative*
+    // (`vendor/restic-station-helper`), resolving it with
+    // `FileManager.fileExists(atPath:)` — as `isOwned` used to, unguarded —
+    // resolves against the *process* current working directory, not the
+    // symlink's own parent directory. A live, working *foreign* relative
+    // symlink (the normal shape of a GNU-stow, nix/home-manager, or
+    // hand-`ln -s`-managed entry) therefore looked dangling, `isOwned`
+    // returned `true`, and `install`/`uninstall` would repoint or delete it.
+    // These tests are the red-checked regression coverage for that finding
+    // and its two adjacent, same-root-cause cases.
+
+    /// The blocker itself. A live foreign symlink with a *relative*
+    /// destination must never be treated as ours, in either direction.
+    ///
+    /// The relative destination is verified live *twice*, deliberately:
+    /// once resolved against the link's own parent directory (the correct,
+    /// shell/kernel interpretation — proves the foreign binary is real and
+    /// reachable), matching the reviewer's proof that this is a live,
+    /// working symlink and not merely a theoretical construction.
+    @Test func installAndUninstallRefuseALiveRelativeForeignSymlink() throws {
+        try withScratchDirectory { directory in
+            // A UUID-namespaced relative component so this test's verdict
+            // can never accidentally depend on whatever the test runner's
+            // real process CWD happens to contain.
+            let vendorName = "vendor-\(UUID().uuidString)"
+            let relativeDestination = "\(vendorName)/\(CLIInstaller.ownedTargetBasename)"
+            let vendorDirectory = directory.appendingPathComponent(vendorName, isDirectory: true)
+            try FileManager.default.createDirectory(at: vendorDirectory, withIntermediateDirectories: true)
+            let foreignBinaryPath = vendorDirectory.appendingPathComponent(CLIInstaller.ownedTargetBasename).path
+            let foreignContents = Data("#!/bin/sh\necho not restic-station\n".utf8)
+            try foreignContents.write(to: URL(fileURLWithPath: foreignBinaryPath))
+
+            let linkPath = directory.appendingPathComponent("restic-station").path
+            try FileManager.default.createSymbolicLink(atPath: linkPath, withDestinationPath: relativeDestination)
+
+            // Prove liveness the correct way — resolved against the link's
+            // own parent directory, not the process CWD.
+            let resolvedForeignPath = directory.appendingPathComponent(relativeDestination).path
+            #expect(FileManager.default.fileExists(atPath: resolvedForeignPath))
+            #expect(try Data(contentsOf: URL(fileURLWithPath: resolvedForeignPath)) == foreignContents)
+
+            #expect(throws: CLIInstaller.ForeignEntryError.self) {
+                try CLIInstaller.install(target: bundleTarget, directory: directory)
+            }
+            // Untouched by the refused install: still a symlink, still
+            // pointing at the same relative destination, foreign binary
+            // survives byte-for-byte.
+            let destinationAfterInstall = try FileManager.default.destinationOfSymbolicLink(atPath: linkPath)
+            #expect(destinationAfterInstall == relativeDestination)
+            #expect(try Data(contentsOf: URL(fileURLWithPath: foreignBinaryPath)) == foreignContents)
+
+            #expect(throws: CLIInstaller.ForeignEntryError.self) {
+                try CLIInstaller.uninstall(target: bundleTarget, directory: directory)
+            }
+            // Untouched by the refused uninstall too: the symlink (and the
+            // foreign binary it points at) both still exist.
+            #expect(FileManager.default.fileExists(atPath: linkPath))
+            let destinationAfterUninstall = try FileManager.default.destinationOfSymbolicLink(atPath: linkPath)
+            #expect(destinationAfterUninstall == relativeDestination)
+            #expect(try Data(contentsOf: URL(fileURLWithPath: foreignBinaryPath)) == foreignContents)
+        }
+    }
+
+    /// Same relative-destination rule, but genuinely dangling (nothing at
+    /// the other end even resolved from the link's own directory) — must
+    /// still refuse rather than fall into the "our stale symlink, repair
+    /// it" path. Only an *absolute* dangling destination is eligible for
+    /// that repair (see `installRepairsADanglingSymlinkOfOurs`), because
+    /// only an absolute destination could ever have been written by our own
+    /// `install`.
+    @Test func installAndUninstallRefuseADanglingRelativeSymlink() throws {
+        try withScratchDirectory { directory in
+            let relativeDestination = "does-not-exist-\(UUID().uuidString)/\(CLIInstaller.ownedTargetBasename)"
+            let linkPath = directory.appendingPathComponent("restic-station").path
+            try FileManager.default.createSymbolicLink(atPath: linkPath, withDestinationPath: relativeDestination)
+
+            #expect(throws: CLIInstaller.ForeignEntryError.self) {
+                try CLIInstaller.install(target: bundleTarget, directory: directory)
+            }
+            let destinationAfterInstall = try FileManager.default.destinationOfSymbolicLink(atPath: linkPath)
+            #expect(destinationAfterInstall == relativeDestination)
+
+            #expect(throws: CLIInstaller.ForeignEntryError.self) {
+                try CLIInstaller.uninstall(target: bundleTarget, directory: directory)
+            }
+            // `destinationOfSymbolicLink` throwing would itself prove the
+            // symlink is gone; reaching this line at all is part of the
+            // proof it survived. (Deliberately not also asserting
+            // `FileManager.fileExists(atPath: linkPath)` here — `fileExists`
+            // follows symlinks to their target by design, so it correctly
+            // reports `false` for *any* dangling symlink regardless of
+            // ownership; that is unrelated to what this test is checking.)
+            let destinationAfterUninstall = try FileManager.default.destinationOfSymbolicLink(atPath: linkPath)
+            #expect(destinationAfterUninstall == relativeDestination)
+        }
+    }
+
+    /// The "related, same root cause" case named in the merge-blocker
+    /// review: a two-link symlink loop
+    /// (`restic-station -> x/restic-station-helper -> restic-station`).
+    /// `stat` fails on a loop with `ELOOP`, which — like `ENOENT` — made
+    /// `FileManager.fileExists` return `false`, so pre-fix this was judged
+    /// "ours, dangling" and got repaired/removed. A loop is inert (nothing
+    /// is reachable through it, so nothing of value would have been
+    /// destroyed by the pre-fix behavior), but the decision made here is to
+    /// refuse it anyway rather than adopt it: `isOwned`'s absolute-only
+    /// guard already rejects this construction's relative first hop, and
+    /// `pathIsDefinitelyAbsent` independently refuses to treat `ELOOP` as
+    /// evidence of absence — so a loop is foreign, full stop, on two
+    /// independent grounds.
+    @Test func installAndUninstallRefuseARelativeSymlinkLoop() throws {
+        try withScratchDirectory { directory in
+            let hopDirectory = directory.appendingPathComponent("x", isDirectory: true)
+            try FileManager.default.createDirectory(at: hopDirectory, withIntermediateDirectories: true)
+            let hopPath = hopDirectory.appendingPathComponent(CLIInstaller.ownedTargetBasename).path
+            let linkPath = directory.appendingPathComponent("restic-station").path
+
+            // x/restic-station-helper -> ../restic-station
+            try FileManager.default.createSymbolicLink(atPath: hopPath, withDestinationPath: "../restic-station")
+            // restic-station -> x/restic-station-helper
+            try FileManager.default.createSymbolicLink(
+                atPath: linkPath,
+                withDestinationPath: "x/\(CLIInstaller.ownedTargetBasename)"
+            )
+
+            // Confirm the loop is real: resolving it through `stat` fails
+            // with ELOOP, not "no such file". (`FileManager.fileExists`
+            // can't tell us which — that's the whole bug — so this reaches
+            // for the POSIX call directly, matching what the fix's
+            // `pathIsDefinitelyAbsent` now does internally.)
+            var info = stat()
+            let statResult = linkPath.withCString { stat($0, &info) }
+            #expect(statResult == -1)
+            #expect(errno == ELOOP)
+
+            #expect(throws: CLIInstaller.ForeignEntryError.self) {
+                try CLIInstaller.install(target: bundleTarget, directory: directory)
+            }
+            let destinationAfterInstall = try FileManager.default.destinationOfSymbolicLink(atPath: linkPath)
+            #expect(destinationAfterInstall == "x/\(CLIInstaller.ownedTargetBasename)")
+
+            #expect(throws: CLIInstaller.ForeignEntryError.self) {
+                try CLIInstaller.uninstall(target: bundleTarget, directory: directory)
+            }
+            let destinationAfterUninstall = try FileManager.default.destinationOfSymbolicLink(atPath: linkPath)
+            #expect(destinationAfterUninstall == "x/\(CLIInstaller.ownedTargetBasename)")
+            // Both hops of the loop still stand — neither install nor
+            // uninstall touched anything.
+            let hopDestination = try FileManager.default.destinationOfSymbolicLink(atPath: hopPath)
+            #expect(hopDestination == "../restic-station")
+        }
+    }
+
+    /// A hypothetical *all-absolute* loop — a construction our relative-
+    /// destination guard alone would not catch, since neither hop is
+    /// relative. Exercises `pathIsDefinitelyAbsent`'s `ELOOP` handling as
+    /// an independent second layer, not merely as a side effect of the
+    /// relative-destination guard above.
+    @Test func installAndUninstallRefuseAnAbsoluteSymlinkLoop() throws {
+        try withScratchDirectory { directory in
+            let hopDirectory = directory.appendingPathComponent("x", isDirectory: true)
+            try FileManager.default.createDirectory(at: hopDirectory, withIntermediateDirectories: true)
+            let hopPath = hopDirectory.appendingPathComponent(CLIInstaller.ownedTargetBasename).path
+            let linkPath = directory.appendingPathComponent("restic-station").path
+
+            try FileManager.default.createSymbolicLink(atPath: hopPath, withDestinationPath: linkPath)
+            try FileManager.default.createSymbolicLink(atPath: linkPath, withDestinationPath: hopPath)
+
+            var info = stat()
+            let statResult = linkPath.withCString { stat($0, &info) }
+            #expect(statResult == -1)
+            #expect(errno == ELOOP)
+
+            #expect(throws: CLIInstaller.ForeignEntryError.self) {
+                try CLIInstaller.install(target: bundleTarget, directory: directory)
+            }
+            let destinationAfterInstall = try FileManager.default.destinationOfSymbolicLink(atPath: linkPath)
+            #expect(destinationAfterInstall == hopPath)
+
+            #expect(throws: CLIInstaller.ForeignEntryError.self) {
+                try CLIInstaller.uninstall(target: bundleTarget, directory: directory)
+            }
+            let destinationAfterUninstall = try FileManager.default.destinationOfSymbolicLink(atPath: linkPath)
+            #expect(destinationAfterUninstall == hopPath)
+        }
+    }
+
+    /// Currently-correct-but-untested: a plain *directory* sitting at the
+    /// link path (as opposed to a file or a foreign symlink, both already
+    /// covered above) is foreign too, and must survive untouched — contents
+    /// included.
+    @Test func installAndUninstallRefuseADirectoryAtTheLinkPath() throws {
+        try withScratchDirectory { directory in
+            let linkPath = directory.appendingPathComponent("restic-station").path
+            try FileManager.default.createDirectory(atPath: linkPath, withIntermediateDirectories: true)
+            let markerPath = (linkPath as NSString).appendingPathComponent("marker")
+            let markerContents = Data("still here".utf8)
+            try markerContents.write(to: URL(fileURLWithPath: markerPath))
+
+            #expect(throws: CLIInstaller.ForeignEntryError.self) {
+                try CLIInstaller.install(target: bundleTarget, directory: directory)
+            }
+            var isDirectoryAfterInstall: ObjCBool = false
+            #expect(FileManager.default.fileExists(atPath: linkPath, isDirectory: &isDirectoryAfterInstall))
+            #expect(isDirectoryAfterInstall.boolValue)
+            #expect(try Data(contentsOf: URL(fileURLWithPath: markerPath)) == markerContents)
+
+            #expect(throws: CLIInstaller.ForeignEntryError.self) {
+                try CLIInstaller.uninstall(target: bundleTarget, directory: directory)
+            }
+            var isDirectoryAfterUninstall: ObjCBool = false
+            #expect(FileManager.default.fileExists(atPath: linkPath, isDirectory: &isDirectoryAfterUninstall))
+            #expect(isDirectoryAfterUninstall.boolValue)
+            #expect(try Data(contentsOf: URL(fileURLWithPath: markerPath)) == markerContents)
         }
     }
 

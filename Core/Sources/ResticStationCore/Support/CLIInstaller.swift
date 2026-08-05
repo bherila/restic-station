@@ -1,4 +1,9 @@
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#else
+import Glibc
+#endif
 
 /// Manages the `restic-station` symlink that makes the embedded helper
 /// reachable from an ordinary shell (`docs/tasks/T28`, issue #30).
@@ -84,8 +89,14 @@ public enum CLIInstaller {
         }
 
         public var description: String {
-            "refusing to replace \(path): it already exists and is not a restic-station symlink. "
-                + "Remove it by hand first if you want the CLI installed there."
+            // Deliberately operation-neutral wording ("touch", not "replace"
+            // or "remove"): this same error is thrown by both `install`
+            // (which would otherwise overwrite the entry) and `uninstall`
+            // (which would otherwise delete it), and "refusing to replace"
+            // read as nonsensical from `uninstall`, which never replaces
+            // anything.
+            "refusing to touch \(path): it already exists and is not a restic-station symlink we manage. "
+                + "Remove it by hand first if you want restic-station's CLI symlink there instead."
         }
     }
 
@@ -324,6 +335,31 @@ public enum CLIInstaller {
     /// non-destructive answer: such a symlink is treated as foreign, and
     /// `install`/`uninstall` refuse and explain rather than guess. A user
     /// in that situation removes the old copy (or the symlink) by hand.
+    ///
+    /// **Absolute destinations only.** `expectedTarget` — and therefore
+    /// every `destination` a symlink of ours could ever hold — is always
+    /// the caller's `FileSecretStore.currentExecutablePath()`, which is
+    /// `realpath`-resolved (Darwin: `_NSGetExecutablePath` + `realpath`;
+    /// Linux: `readlink /proc/self/exe`) before it ever reaches `install`.
+    /// It is never a relative string. So a relative `destination`
+    /// (`vendor/restic-station-helper`, the ordinary shape of a GNU-stow,
+    /// nix/home-manager, or hand-`ln -s`-managed symlink) is definitionally
+    /// not one of ours, independent of anything step 3 would otherwise
+    /// conclude about it — this is checked and rejected before step 3 runs
+    /// at all.
+    ///
+    /// This is not pedantry: step 3's existence check resolves a relative
+    /// path against the *process* current working directory, not the
+    /// symlink's own parent directory (`destinationOfSymbolicLink` returns
+    /// the stored string verbatim; nothing here is symlink-relative-aware).
+    /// Without this guard, a live, working *foreign* relative symlink —
+    /// exactly the stow/home-manager case above — would almost always
+    /// resolve to "does not exist at this CWD" and be misread as our own
+    /// dangling stale link, making `install`/`uninstall` repoint or delete
+    /// someone else's live entry. Worse, the verdict would depend on the
+    /// invoking process's CWD, which is disqualifying for a check gating
+    /// destructive filesystem operations. Refusing outright for any
+    /// non-absolute destination removes that dependency entirely.
     private static func isOwned(
         _ destination: String,
         expectedTarget: String,
@@ -335,7 +371,43 @@ public enum CLIInstaller {
         if destination == expectedTarget {
             return true
         }
-        return !fileManager.fileExists(atPath: destination)
+        guard destination.hasPrefix("/") else {
+            return false
+        }
+        // Step 3: ours only if nothing is there. `pathIsDefinitelyAbsent`
+        // is used instead of `fileManager.fileExists(atPath:)` for the same
+        // "don't misread an inconclusive answer as absence" reason as the
+        // guard above: a same-basename symlink chain that loops back on
+        // itself (`restic-station -> x/restic-station-helper ->
+        // restic-station`) makes `stat` fail with `ELOOP`, which
+        // `fileExists` also collapses to `false` ("not there") — so,
+        // pre-fix, a loop was judged dangling-and-ours and got "repaired"
+        // or removed. A loop is inert (nothing is actually reachable
+        // through it, so nothing of value is destroyed by touching it) but
+        // it is still not evidence of absence, so it is deliberately kept
+        // out of the "definitely absent" verdict rather than special-cased
+        // into it. In practice a loop's first hop is also relative in the
+        // realistic construction above, so the guard right above this
+        // already refuses it; `pathIsDefinitelyAbsent` is the second,
+        // independent layer for a hypothetical all-absolute loop.
+        return pathIsDefinitelyAbsent(destination)
+    }
+
+    /// Whether `path` is provably *absent* — `stat` fails with `ENOENT`
+    /// ("no such file") or `ENOTDIR` (a nonexistent path component along
+    /// the way). Deliberately stricter than `FileManager.fileExists`,
+    /// which collapses every `stat` failure into the same `false`,
+    /// including `ELOOP` (a symlink cycle) and `EACCES` (a permission-
+    /// denied intermediate directory) — neither of which means "nothing is
+    /// there." `isOwned`'s repair path uses "absent" as its proof that
+    /// nothing else can be depending on the old destination, so an
+    /// inconclusive `stat` failure must not be read as that proof.
+    private static func pathIsDefinitelyAbsent(_ path: String) -> Bool {
+        var info = stat()
+        if path.withCString({ stat($0, &info) }) == 0 {
+            return false
+        }
+        return errno == ENOENT || errno == ENOTDIR
     }
 
     /// The existing entry's symlink target, or `nil` if the path is absent
