@@ -1,19 +1,33 @@
-#!/bin/bash -euo pipefail
-# shellcheck disable=SC2096
-# ^ the shebang above intentionally packs -euo pipefail into one shebang
-# line per docs/tasks/T19-integration-test.md ("#!/bin/bash -euo pipefail");
-# not every OS splits that into three flags, which is exactly why the `set
-# -euo pipefail` a few lines down is the one that actually matters.
+#!/usr/bin/env bash
+# Deliberately NOT `#!/bin/bash -euo pipefail`, which this script used until
+# it first ran on Linux. Darwin splits a shebang's argument string on
+# whitespace, so bash there receives `-e -u -o pipefail` and it works; the
+# Linux kernel passes the whole remainder as a *single* argument, so bash
+# gets one `-euo pipefail` token, consumes the script path as `-o`'s option
+# name, and dies with "invalid option name" — at the shebang, before a line
+# of this script runs. The `set -euo pipefail` below is the portable way to
+# get the same flags, and is now the only thing setting them.
 # scripts/integration-test.sh — Layer 2 integration test (docs/testing.md
-# §Layer 2, docs/tasks/T19-integration-test.md): builds the real app/helper,
-# seeds a real login-keychain item, and drives `restic-station-helper`
-# against two real local restic repositories end to end.
+# §Layer 2, docs/tasks/T19-integration-test.md): builds the real app/helper
+# (macOS) or uses an already-built one (Linux — see the override below),
+# seeds a real secret (login keychain on macOS, FileSecretStore on Linux),
+# and drives `restic-station-helper` against real local restic repositories
+# end to end.
 #
-# Local dev escape hatch: this machine may have no Xcode.app, in which case
-# `xcodebuild` cannot run. Set RESTIC_STATION_HELPER_OVERRIDE to the path of
-# an already-built helper binary (e.g. from a throwaway SwiftPM harness) to
-# skip the xcodebuild step entirely. CI never sets this — it always builds
-# the real app bundle.
+# Runs on both macOS and Linux (T29 / issue #31 extended this from a
+# macOS-only script — see `assert_fixture_flow` for the Linux/M5-specific
+# half: importing a config exported from macOS, `secret set` via stdin,
+# backup + mirror via `restic copy`, `config validate` correctly excluding a
+# set disabled for this machine, and `status --json`).
+#
+# Local dev escape hatch: on macOS, this machine may have no Xcode.app, in
+# which case `xcodebuild` cannot run. On Linux there is no app to build at
+# all. Either way, set RESTIC_STATION_HELPER_OVERRIDE to the path of an
+# already-built helper binary (e.g. from a throwaway SwiftPM harness, or —
+# per issue #31 — the packaged **static** release binary, so this test
+# exercises what actually ships rather than a debug build) to skip the
+# xcodebuild step entirely. macOS CI never sets this — it always builds the
+# real app bundle. Linux CI always sets it, to the static binary.
 set -euo pipefail
 
 # ── Fixed test identifiers ──────────────────────────────────────────────
@@ -28,8 +42,36 @@ TEST_PASSWORD="restic-station-integration-test-password"
 PRIMARY_DEST_ID_LOWER="$(printf '%s' "$PRIMARY_DEST_ID" | tr '[:upper:]' '[:lower:]')"
 SECONDARY_DEST_ID_LOWER="$(printf '%s' "$SECONDARY_DEST_ID" | tr '[:upper:]' '[:lower:]')"
 
+# `uname -s` — "Darwin" or "Linux". Selects the secret backend (keychain vs
+# FileSecretStore) for both scenario blocks below: the first (runs 1-4 +
+# migration + retention + lock-busy) uses whichever is native to the host it
+# runs on (macOS CI: keychain; Linux CI: file, since there is no keychain);
+# the M5 fixture-import scenario (§Fixture) always forces the file backend
+# regardless of host, matching `scripts/headless-cli-test.sh`'s convention of
+# exercising the Linux-default secret path on every platform.
+OS_NAME="$(uname -s)"
+
+# ── M5 story: import a config exported from macOS (checked-in fixture) ──
+# (docs/tasks/T29 / issue #31 "Linux integration test"). Own IDs, own repos,
+# own data directory — kept entirely separate from the SET_ID/PRIMARY_DEST_ID
+# scenario above so the two cannot interfere with each other's state or
+# machine identity.
+FIXTURE_MACHINE_ID="ci-fixture-host"
+# Uppercase (matching SET_ID/PRIMARY_DEST_ID's own convention above): Swift's
+# `UUID.uuidString` always serializes canonical-uppercase, and idx_select /
+# idx_count below do an exact string match against runs/index.jsonl's
+# `setId`/`destId` fields — a lowercase constant here would silently never
+# match a single record. UUID parsing itself is case-insensitive (these
+# still refer to the same ids the lowercase JSON fixture below declares).
+FIXTURE_SET_ID="F1000000-0000-4000-8000-000000000001"
+FIXTURE_PRIMARY_ID="F1000000-0000-4000-8000-000000000002"
+FIXTURE_MIRROR_ID="F1000000-0000-4000-8000-000000000003"
+FIXTURE_DISABLED_SET_ID="F1000000-0000-4000-8000-000000000004"
+FIXTURE_PASSWORD="fixture-import-integration-test-password"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+FIXTURE_FILE="$SCRIPT_DIR/fixtures/mac-exported-config.json"
 
 SECONDS=0
 
@@ -59,8 +101,10 @@ cleanup() {
         pkill -f "$HELPER" >/dev/null 2>&1
     fi
 
+    if [[ "$OS_NAME" == "Darwin" ]]; then
     /usr/bin/security delete-generic-password -s "$KEYCHAIN_SERVICE" -a "$PRIMARY_DEST_ID_LOWER" >/dev/null 2>&1
     /usr/bin/security delete-generic-password -s "$KEYCHAIN_SERVICE" -a "$SECONDARY_DEST_ID_LOWER" >/dev/null 2>&1
+    fi
 
     if [[ -n "$TEMP_KEYCHAIN" ]]; then
         if [[ ${#ORIGINAL_KEYCHAINS[@]} -gt 0 ]]; then
@@ -78,7 +122,10 @@ cleanup() {
 
     exit "$exit_code"
 }
-trap cleanup EXIT
+# RESTIC_STATION_IT_NO_CLEANUP=1: local debugging escape hatch that skips
+# the workspace teardown below, so $WORK (printed by setup_workspace's log
+# line) survives a failure for inspection. Never set in CI.
+[[ -n "${RESTIC_STATION_IT_NO_CLEANUP:-}" ]] || trap cleanup EXIT
 
 log() { printf '\n=== %s ===\n' "$*"; }
 
@@ -303,6 +350,47 @@ seed_keychain() {
     done
 }
 
+# Seeds the two test destinations' passwords via FileSecretStore, through
+# `secret set` reading a pipe — never argv (T23's own rule, asserted again
+# here against the real built binary). Requires $HELPER to already be built.
+seed_file_secrets() {
+    log "Seeding FileSecretStore passwords for the two test destinations (secret set, via stdin)"
+    printf '%s' "$TEST_PASSWORD" | "$HELPER" secret set --dest "$PRIMARY_DEST_ID"
+    printf '%s' "$TEST_PASSWORD" | "$HELPER" secret set --dest "$SECONDARY_DEST_ID"
+}
+
+# Picks the secret backend for the runs-1-4 scenario: keychain on macOS
+# (the platform it actually ships on), FileSecretStore on Linux (there is no
+# keychain). Must run AFTER build_helper AND after write_config — the Linux
+# path needs $HELPER to seed via `secret set`, which in turn refuses a --dest
+# that is not already a configured destination.
+setup_secret_backend() {
+    if [[ "$OS_NAME" == "Darwin" ]]; then
+        setup_keychain_access
+        seed_keychain
+    else
+        export RESTIC_STATION_SECRET_BACKEND=file
+        seed_file_secrets
+    fi
+}
+
+# The exact `RESTIC_PASSWORD_COMMAND` restic authenticates with for a given
+# lowercased destination id, matching whichever backend `setup_secret_backend`
+# chose. Quoting rule (needed because $HELPER can contain a space, e.g. the
+# app bundle's "Restic Station.app"): double-quote only when the path has a
+# character outside [A-Za-z0-9/._+=:,@-] — same rule
+# `scripts/secret-cli-test.sh` step 7 documents and applies.
+password_command_for() { # password_command_for <lowercased-dest-id>
+    local dest_lower="$1"
+    if [[ "$OS_NAME" == "Darwin" ]]; then
+        echo "/usr/bin/security find-generic-password -s $KEYCHAIN_SERVICE -a $dest_lower -w"
+    elif [[ "$HELPER" =~ ^[A-Za-z0-9/._+=:,@-]+$ ]]; then
+        echo "$HELPER print-password --dest $dest_lower"
+    else
+        echo "\"$HELPER\" print-password --dest $dest_lower"
+    fi
+}
+
 # =========================================================================
 # Build
 # =========================================================================
@@ -310,8 +398,21 @@ seed_keychain() {
 build_helper() {
     if [[ -n "${RESTIC_STATION_HELPER_OVERRIDE:-}" ]]; then
         HELPER="$RESTIC_STATION_HELPER_OVERRIDE"
-        log "Using RESTIC_STATION_HELPER_OVERRIDE (local dev escape hatch): $HELPER"
+        log "Using RESTIC_STATION_HELPER_OVERRIDE: $HELPER"
         [[ -x "$HELPER" ]] || { echo "FATAL: override helper is not executable: $HELPER" >&2; exit 1; }
+        return 0
+    fi
+
+    if [[ "$OS_NAME" == "Linux" ]]; then
+        # There is no app bundle on Linux — plain SwiftPM. CI always sets
+        # RESTIC_STATION_HELPER_OVERRIDE to the packaged **static** release
+        # binary instead (issue #31: test what ships, not a debug build);
+        # this path is the local-dev fallback for running this script
+        # directly on a Linux box.
+        log "Building via swift build (Linux, no override given)"
+        (cd "$REPO_ROOT" && swift build --product restic-station-helper)
+        HELPER="$REPO_ROOT/.build/debug/restic-station-helper"
+        [[ -x "$HELPER" ]] || { echo "FATAL: helper not found at $HELPER after build." >&2; exit 1; }
         return 0
     fi
 
@@ -389,14 +490,14 @@ EOF
 # =========================================================================
 
 restic_primary() {
-    RESTIC_PASSWORD_COMMAND="/usr/bin/security find-generic-password -s $KEYCHAIN_SERVICE -a $PRIMARY_DEST_ID_LOWER -w" \
+    RESTIC_PASSWORD_COMMAND="$(password_command_for "$PRIMARY_DEST_ID_LOWER")" \
         restic -r "$PRIMARY_REPO" "$@"
 }
 
 restic_secondary_at() { # restic_secondary_at <repo-path> <args...>
     local repo="$1"
     shift
-    RESTIC_PASSWORD_COMMAND="/usr/bin/security find-generic-password -s $KEYCHAIN_SERVICE -a $SECONDARY_DEST_ID_LOWER -w" \
+    RESTIC_PASSWORD_COMMAND="$(password_command_for "$SECONDARY_DEST_ID_LOWER")" \
         restic -r "$repo" "$@"
 }
 
@@ -404,7 +505,7 @@ primary_snapshot_count() { restic_primary snapshots --json | jlen; }
 secondary_snapshot_count_at() { restic_secondary_at "$1" snapshots --json | jlen; }
 
 init_primary() {
-    log "Initializing the primary repository directly via restic (proves the keychain path)"
+    log "Initializing the primary repository directly via restic (proves the $([[ "$OS_NAME" == "Darwin" ]] && echo keychain || echo FileSecretStore) path)"
     restic_primary init --json >/dev/null
 }
 
@@ -690,17 +791,207 @@ PY
 }
 
 # =========================================================================
+# M5 story (docs/tasks/T29 / issue #31 "Linux integration test"): import a
+# config exported from macOS (checked-in fixture — scripts/fixtures/
+# mac-exported-config.json), `secret set` via stdin, a real backup against a
+# local repo, a second destination as a mirror (restic copy), `config
+# validate` reporting the effective plan and correctly *excluding* a set
+# disabled for this machine, and `status --json` reflecting the run.
+#
+# Runs on every platform this script runs on (not gated to Linux): the whole
+# point of extending this script rather than adding a Linux sibling is that
+# macOS and Linux cannot silently drift in what they cover. Always forces
+# the FILE secret backend regardless of host, matching
+# scripts/headless-cli-test.sh's convention — this scenario is specifically
+# about the Linux-default secrets path and the cross-machine config story,
+# neither of which involves the keychain.
+#
+# Entirely separate identifiers, repos and data directory from the
+# runs-1-4 scenario above — nothing here can collide with or depend on it.
+# =========================================================================
+
+assert_fixture_flow() {
+    local step="fixture (mac-exported config import)"
+    log "$step"
+
+    command -v jq >/dev/null 2>&1 || fail "$step" "jq is required for this scenario (status --json assertions)"
+    [[ -f "$FIXTURE_FILE" ]] || fail "$step" "checked-in fixture missing: $FIXTURE_FILE"
+
+    local fixture_root="$WORK/fixture"
+    local fixture_data_dir="$fixture_root/data"
+    local fixture_source="$fixture_root/source"
+    local fixture_primary_repo="$fixture_root/repo-primary"
+    local fixture_mirror_repo="$fixture_root/repo-mirror"
+    mkdir -p "$fixture_data_dir" "$fixture_source"
+    echo "fixture file one" > "$fixture_source/a.txt"
+    echo "fixture file two" > "$fixture_source/b.txt"
+
+    # Repoint the shared dump-on-failure globals (fail()/idx_select/
+    # idx_count/json_field all read $DATA_DIR/$INDEX_FILE) at this
+    # scenario's data directory. Safe because this is the LAST scenario
+    # main() runs — nothing downstream still needs the runs-1-4 values.
+    DATA_DIR="$fixture_data_dir"
+    INDEX_FILE="$fixture_data_dir/runs/index.jsonl"
+
+    local rendered="$fixture_root/imported-config.json"
+    sed \
+        -e "s#__SOURCE_DIR__#$fixture_source#g" \
+        -e "s#__PRIMARY_REPO__#$fixture_primary_repo#g" \
+        -e "s#__MIRROR_REPO__#$fixture_mirror_repo#g" \
+        -e "s#__MACHINE_ID__#$FIXTURE_MACHINE_ID#g" \
+        "$FIXTURE_FILE" > "$rendered"
+
+    fx_helper() {
+        RESTIC_STATION_DATA_DIR="$fixture_data_dir" \
+            RESTIC_STATION_MACHINE_ID="$FIXTURE_MACHINE_ID" \
+            RESTIC_STATION_SECRET_BACKEND=file \
+            "$HELPER" "$@"
+    }
+
+    local out rc
+    set +e
+    out="$(fx_helper config import "$rendered" 2>&1)"
+    rc=$?
+    set -e
+    [[ $rc -eq 0 ]] || fail "$step" "config import exited $rc: $out"
+    [[ -f "$fixture_data_dir/config.json" ]] || fail "$step" "config import did not install config.json"
+    log "$step OK — imported a config authored (in shape) exactly as macOS's \`config export\` would produce it"
+
+    # ── secret set via stdin (T23), for both real destinations ──────────
+    step="fixture (secret set via stdin)"
+    printf '%s' "$FIXTURE_PASSWORD" | fx_helper secret set --dest "$FIXTURE_PRIMARY_ID" >/dev/null \
+        || fail "$step" "secret set (primary) failed"
+    printf '%s' "$FIXTURE_PASSWORD" | fx_helper secret set --dest "$FIXTURE_MIRROR_ID" >/dev/null \
+        || fail "$step" "secret set (mirror) failed"
+    log "$step OK"
+
+    # ── init both repos: primary directly via restic (proves the fixture's
+    #    freshly-stored password authenticates it), mirror via the helper's
+    #    own init-secondary ────────────────────────────────────────────────
+    step="fixture (init primary + mirror)"
+    local primary_id_lower mirror_id_lower pwcmd_primary pwcmd_mirror
+    primary_id_lower="$(printf '%s' "$FIXTURE_PRIMARY_ID" | tr '[:upper:]' '[:lower:]')"
+    mirror_id_lower="$(printf '%s' "$FIXTURE_MIRROR_ID" | tr '[:upper:]' '[:lower:]')"
+    # Quoting rule: double-quote $HELPER only when it contains a character
+    # outside [A-Za-z0-9/._+=:,@-] (restic runs RESTIC_PASSWORD_COMMAND
+    # through a shell) — same rule scripts/secret-cli-test.sh step 7 applies.
+    if [[ "$HELPER" =~ ^[A-Za-z0-9/._+=:,@-]+$ ]]; then
+        pwcmd_primary="$HELPER print-password --dest $primary_id_lower"
+        pwcmd_mirror="$HELPER print-password --dest $mirror_id_lower"
+    else
+        pwcmd_primary="\"$HELPER\" print-password --dest $primary_id_lower"
+        pwcmd_mirror="\"$HELPER\" print-password --dest $mirror_id_lower"
+    fi
+    RESTIC_STATION_DATA_DIR="$fixture_data_dir" RESTIC_STATION_MACHINE_ID="$FIXTURE_MACHINE_ID" \
+        RESTIC_STATION_SECRET_BACKEND=file RESTIC_PASSWORD_COMMAND="$pwcmd_primary" \
+        restic -r "$fixture_primary_repo" init --json >/dev/null \
+        || fail "$step" "restic init (primary) failed"
+
+    set +e
+    out="$(fx_helper init-secondary --set "$FIXTURE_SET_ID" --dest "$FIXTURE_MIRROR_ID" 2>&1)"
+    rc=$?
+    set -e
+    [[ $rc -eq 0 ]] || fail "$step" "init-secondary (mirror) exited $rc: $out"
+    log "$step OK"
+
+    # Both must forward RESTIC_STATION_DATA_DIR + RESTIC_STATION_SECRET_BACKEND,
+    # not just RESTIC_PASSWORD_COMMAND: restic runs the password command as a
+    # child of *itself*, inheriting restic's own environment, not this
+    # script's ambient one (nothing here exports those two globally — see
+    # fx_helper). Without them, print-password falls back to the default
+    # data directory and the default (keychain, on macOS) backend — silently
+    # the wrong store — which is exactly the bug this comment is pinned
+    # against (caught by the red-check noted in the PR description).
+    fixture_restic_primary() {
+        RESTIC_STATION_DATA_DIR="$fixture_data_dir" RESTIC_STATION_SECRET_BACKEND=file \
+            RESTIC_PASSWORD_COMMAND="$pwcmd_primary" restic -r "$fixture_primary_repo" "$@"
+    }
+    fixture_restic_mirror() {
+        RESTIC_STATION_DATA_DIR="$fixture_data_dir" RESTIC_STATION_SECRET_BACKEND=file \
+            RESTIC_PASSWORD_COMMAND="$pwcmd_mirror" restic -r "$fixture_mirror_repo" "$@"
+    }
+
+    # ── a real backup, plus the mirror destination via restic copy ───────
+    step="fixture (real backup + mirror via restic copy)"
+    set +e
+    out="$(fx_helper run-set --set "$FIXTURE_SET_ID" --kind backup 2>&1)"
+    rc=$?
+    set -e
+    [[ $rc -eq 0 ]] || fail "$step" "run-set exited $rc: $out"
+
+    local pcount mcount
+    pcount="$(fixture_restic_primary snapshots --json | jlen)"
+    mcount="$(fixture_restic_mirror snapshots --json | jlen)"
+    [[ "$pcount" -eq 1 ]] || fail "$step" "expected 1 primary snapshot, got $pcount"
+    [[ "$mcount" -eq 1 ]] || fail "$step" "expected 1 mirror snapshot (restic copy), got $mcount"
+
+    local copy_line
+    copy_line="$(idx_select copy success "$FIXTURE_SET_ID" "$FIXTURE_MIRROR_ID" "" | tail -n1)"
+    [[ -n "$copy_line" ]] || fail "$step" "no successful copy index record for the mirror destination"
+    log "$step OK (primary=$pcount, mirror=$mcount snapshot(s), restic copy record present)"
+
+    # ── config validate: effective plan for this machine, correctly
+    #    excluding the Mac-only set disabled here ─────────────────────────
+    step="fixture (config validate excludes the set disabled for this machine)"
+    set +e
+    out="$(fx_helper config validate 2>&1)"
+    rc=$?
+    set -e
+    [[ $rc -eq 0 ]] || fail "$step" "config validate exited $rc: $out"
+    echo "$out" | grep -q "RUNS HERE" \
+        || fail "$step" "did not report the \"Projects\" set as RUNS HERE: $out"
+    echo "$out" | grep -q "does not run here" \
+        || fail "$step" "did not report the Mac-only \"Mac Photos Library\" set as excluded: $out"
+    echo "$out" | grep -q "disabled on this machine" \
+        || fail "$step" "did not explain WHY the Mac-only set is excluded: $out"
+    # Only one of the two sets is disabled here — "nothing will run" is the
+    # ALL-disabled message (headless-cli-test.sh covers that case) and must
+    # NOT appear for this config.
+    if echo "$out" | grep -q "nothing will run on this machine"; then
+        fail "$step" "wrongly reported nothing running, when the \"Projects\" set is enabled here: $out"
+    fi
+    log "$step OK"
+
+    # ── status --json, piped through jq, reflects the run — and the
+    #    exclusion (anti-silent-failure guarantee, asserted on real output) ──
+    step="fixture (status --json reflects the run and the exclusion)"
+    local status_json
+    status_json="$(fx_helper status --json)" || fail "$step" "status --json failed"
+    echo "$status_json" | jq -e '.sets | length == 1' >/dev/null \
+        || fail "$step" "expected exactly one set in status --json (the disabled-here set must not appear): $status_json"
+    echo "$status_json" | jq -e '.sets[0].name == "Projects"' >/dev/null \
+        || fail "$step" "status --json did not report the \"Projects\" set: $status_json"
+    echo "$status_json" | jq -e '.sets[0].lastBackup.status == "success"' >/dev/null \
+        || fail "$step" "status --json did not reflect the successful backup: $status_json"
+    echo "$status_json" | jq -e '.excludedHere | length == 1' >/dev/null \
+        || fail "$step" "expected exactly one exclusion in status --json: $status_json"
+    echo "$status_json" | jq -e '.excludedHere[0].reason == "disabledForMachine"' >/dev/null \
+        || fail "$step" "status --json's exclusion reason was not disabledForMachine: $status_json"
+    echo "$status_json" | jq -e --arg id "$FIXTURE_DISABLED_SET_ID" '.excludedHere[0].id == $id' >/dev/null \
+        || fail "$step" "status --json's exclusion named the wrong set (expected $FIXTURE_DISABLED_SET_ID): $status_json"
+    log "$step OK"
+
+    log "fixture flow OK — mac-exported config imported, secret set via stdin, real backup + mirror " \
+        "via restic copy, config validate and status --json both correctly excluded the set disabled " \
+        "for this machine"
+}
+
+# =========================================================================
 # Main
 # =========================================================================
 
 main() {
     preflight_restic
     preflight_jq
+    log "Platform: $OS_NAME"
     setup_workspace
-    setup_keychain_access
-    seed_keychain
     build_helper
+    # write_config BEFORE setup_secret_backend: the Linux path seeds through
+    # `secret set --dest <id>`, which refuses an id that is not a configured
+    # destination. macOS seeds with `security add-generic-password`, which has
+    # no such check, so this ordering only ever mattered on Linux.
     write_config "null"
+    setup_secret_backend
     init_primary
     init_secondary
 
@@ -712,6 +1003,8 @@ main() {
     assert_retention
     assert_tick_noop
     assert_lock_busy
+
+    assert_fixture_flow
 
     log "ALL ASSERTIONS PASSED (${SECONDS}s)"
 }

@@ -6,6 +6,9 @@ build/
 xcuserdata/
 *.xcuserstate
 
+# scripts/package-linux.sh output (T29)
+dist/
+
 # SwiftPM
 Core/.build/
 Core/.swiftpm/

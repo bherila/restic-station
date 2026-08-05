@@ -73,6 +73,23 @@ swift test --package-path Core
 
 > **Note:** background-agent (SMAppService) and Full Disk Access behavior can only be tested with the app copied to `/Applications` — see [`docs/keychain-and-fda.md`](docs/keychain-and-fda.md).
 
+## Linux (headless)
+
+There is no GUI on Linux — `restic-station-helper` is the whole product: scheduling (`timer install`, a `systemd --user` timer), the `config`/`status`/`sets`/`runs`/`secret` CLI, and the same backup engine as the Mac app underneath. A statically-linked binary (no Swift runtime, no libc, no ICU — verified to run unmodified in a `scratch` container) is published for `x86_64` and `aarch64` on every green CI run: open any run on the [Actions page](../../actions), download the **restic-station-linux** artifact, then:
+
+```sh
+tar xzf restic-station-linux-x86_64.tar.gz   # or -aarch64
+cd restic-station-linux-x86_64
+./install.sh                                 # ~/.local/bin, no root needed
+```
+
+See the tarball's own `README.md` for first-run setup (moving a `config.json` authored on the Mac app over, `secret set`, `timer install`), and `docs/testing.md` for exactly how the static build is produced and verified. Building it yourself from a clean checkout (macOS, cross-compiling with Apple's Static Linux SDK — no Linux machine or container runtime needed):
+
+```sh
+scripts/package-linux.sh   # installs its own pinned toolchain/SDK (no sudo), builds + packages
+                            # x86_64 and aarch64 into dist/restic-station-linux-<arch>.tar.gz
+```
+
 ## Architecture
 
 Three components (full detail in [`docs/architecture.md`](docs/architecture.md)):

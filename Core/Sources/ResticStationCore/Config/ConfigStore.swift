@@ -4,6 +4,8 @@ import Foundation
 import Darwin
 #elseif canImport(Glibc)
 import Glibc
+#elseif canImport(Musl)
+import Musl
 #endif
 
 /// Loads and atomically persists `config.json` at the location described by
@@ -280,8 +282,10 @@ enum AtomicFile {
             toPath.withCString { toC in
                 #if canImport(Darwin)
                 Darwin.rename(fromC, toC)
-                #else
+                #elseif canImport(Glibc)
                 Glibc.rename(fromC, toC)
+                #elseif canImport(Musl)
+                Musl.rename(fromC, toC)
                 #endif
             }
         }

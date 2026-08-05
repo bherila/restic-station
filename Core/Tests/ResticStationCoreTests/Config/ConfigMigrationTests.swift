@@ -6,6 +6,8 @@ import Testing
 import Darwin
 #elseif canImport(Glibc)
 import Glibc
+#elseif canImport(Musl)
+import Musl
 #endif
 
 // T24: v1 → v2 migration, driven by a realistic pre-change `config.json`

@@ -6,7 +6,11 @@
 `scripts/integration-test.sh` implementing the contract in `docs/testing.md` §Layer 2 step by step, wired into the CI macOS job.
 
 ## Create
-- `scripts/integration-test.sh` — `#!/bin/bash -euo pipefail`. Structure:
+- `scripts/integration-test.sh` — `#!/usr/bin/env bash` plus `set -euo pipefail` on its own line.
+  (This originally specified `#!/bin/bash -euo pipefail`, which works only because Darwin splits a
+  shebang's argument string on whitespace. Linux passes the remainder as a *single* argument, so bash
+  consumes the script path as `-o`'s option name and exits with "invalid option name" before running
+  anything. T29 hit this the first time the script ran on Linux — do not reintroduce it.) Structure:
   - Preflight: restic on PATH (else skip with exit 0 + notice when `CI` unset; hard fail in CI), `jq` available (brew or bundled fallback via `python3 -c`).
   - Workspace: `mktemp -d`; `RESTIC_STATION_DATA_DIR` exported; `trap` cleans workspace AND keychain items AND kills stray helpers.
   - Keychain seeding: two fixed test UUIDs; `security add-generic-password -s restic-station -a <uuid> -w test-password -T /usr/bin/security` (delete-first for idempotency). On CI, create/unlock a temporary keychain if `security show-keychain-info` fails (document the runner behavior encountered).

@@ -6,6 +6,8 @@ import Testing
 import Darwin
 #elseif canImport(Glibc)
 import Glibc
+#elseif canImport(Musl)
+import Musl
 #endif
 
 /// Sets `variable` to `value` (or unsets it when `value` is nil) for the

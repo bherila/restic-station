@@ -6,6 +6,8 @@ import Testing
 import Darwin
 #elseif canImport(Glibc)
 import Glibc
+#elseif canImport(Musl)
+import Musl
 #endif
 
 /// `FileSecretStore` specifics: permissions, atomicity, locking, and the

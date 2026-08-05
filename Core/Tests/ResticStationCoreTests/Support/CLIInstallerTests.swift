@@ -3,8 +3,10 @@ import Testing
 @testable import ResticStationCore
 #if canImport(Darwin)
 import Darwin
-#else
+#elseif canImport(Glibc)
 import Glibc
+#elseif canImport(Musl)
+import Musl
 #endif
 
 /// `docs/tasks/T28` (issue #30): the `restic-station` symlink installer.

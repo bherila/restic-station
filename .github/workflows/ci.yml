@@ -281,3 +281,211 @@ jobs:
           name: Restic-Station-app
           path: Restic-Station.zip
           retention-days: 14
+
+  # T29 (issue #31): builds a fully static restic-station-helper for both
+  # Linux architectures (Apple's Static Linux SDK, musl — see
+  # scripts/setup-static-linux-sdk.sh for the pinned toolchain/SDK version)
+  # and packages each with scripts/package-linux.sh. Runs on macOS — the
+  # cross-compile host verified locally — but downloads its own pinned
+  # open-source Swift toolchain rather than relying on whatever Xcode ships,
+  # which is what makes the build reproducible independent of the runner
+  # image's Xcode version.
+  release-linux:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      # ~1.7 GB of downloads (toolchain .pkg + static SDK bundle); cached by
+      # the exact pinned version so a green run only pays for this once.
+      - name: Cache Static Linux SDK toolchain
+        uses: actions/cache@v4
+        with:
+          path: .build/static-linux-sdk-cache
+          key: static-linux-sdk-${{ hashFiles('scripts/setup-static-linux-sdk.sh') }}
+      - name: Build + package both architectures
+        run: scripts/package-linux.sh x86_64 aarch64
+      - name: Verify SHA256SUMS
+        run: |
+          cd dist
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum -c SHA256SUMS
+          else
+            shasum -a 256 -c SHA256SUMS
+          fi
+      - name: Verify tarball layout is inspectable by hand
+        run: |
+          for arch in x86_64 aarch64; do
+            echo "--- restic-station-linux-$arch.tar.gz ---"
+            tar tzf "dist/restic-station-linux-$arch.tar.gz"
+            for f in restic-station-helper install.sh README.md LICENSE \
+                     systemd/restic-station.service systemd/restic-station.timer; do
+              tar tzf "dist/restic-station-linux-$arch.tar.gz" | grep -qF "restic-station-linux-$arch/$f" \
+                || { echo "missing $f in $arch tarball"; exit 1; }
+            done
+          done
+      - name: Upload Linux release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: restic-station-linux
+          path: |
+            dist/restic-station-linux-x86_64.tar.gz
+            dist/restic-station-linux-aarch64.tar.gz
+            dist/SHA256SUMS
+          retention-days: 14
+
+  # T29: the Linux integration test (scripts/integration-test.sh's
+  # assert_fixture_flow — mac-exported config import, secret set via stdin,
+  # backup + mirror via restic copy, config validate/status --json excluding
+  # a set disabled for this machine) against the STATIC release binary, on a
+  # real (non-container) Ubuntu VM with real restic installed — proving
+  # T23's "RESTIC_PASSWORD_COMMAND against FileSecretStore on Linux"
+  # acceptance criterion, which the swift:6.1-container `linux` job above
+  # cannot (no restic there). aarch64, matching this runner natively — no
+  # QEMU needed.
+  linux-integration:
+    needs: release-linux
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: restic-station-linux
+          path: dist
+      # NOT `apt-get install restic`: Ubuntu 24.04 LTS ships restic 0.16.4,
+      # below the 0.17.0 minimum in docs/restic-cli.md §version that
+      # ResticDiscovery enforces. The apt build is fine for the scenarios
+      # that pin `resticPath` in config.json (an explicit path bypasses the
+      # version gate), but the T29 fixture flow imports a Mac-authored config
+      # with `resticPath: null` and therefore exercises real discovery — which
+      # correctly rejects 0.16.4 and reports "restic not found". Install the
+      # official release so CI tests the version a user is told to run.
+      - name: Install restic + jq
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends jq bzip2
+          curl -fsSL -o /tmp/restic.bz2 \
+            "https://github.com/restic/restic/releases/download/v${RESTIC_VERSION}/restic_${RESTIC_VERSION}_linux_${RESTIC_ARCH}.bz2"
+          bunzip2 -f /tmp/restic.bz2
+          sudo install -m 0755 /tmp/restic /usr/bin/restic
+          restic version
+        env:
+          RESTIC_VERSION: 0.18.1
+          RESTIC_ARCH: arm64
+      - name: Unpack the aarch64 tarball
+        run: tar xzf dist/restic-station-linux-aarch64.tar.gz -C dist
+      - name: ldd confirms no dynamic dependencies
+        run: |
+          BIN=dist/restic-station-linux-aarch64/restic-station-helper
+          chmod +x "$BIN"
+          OUT=$(ldd "$BIN" 2>&1 || true)
+          echo "$OUT"
+          echo "$OUT" | grep -q "not a dynamic executable" \
+            || { echo "expected ldd to report a static binary"; exit 1; }
+      - name: install.sh works unprivileged, is idempotent, warns off-PATH
+        run: |
+          cd dist/restic-station-linux-aarch64
+          PREFIX="$RUNNER_TEMP/install-test-bin"
+          OUT1=$(./install.sh --prefix="$PREFIX")
+          echo "$OUT1"
+          echo "$OUT1" | grep -q "WARNING:.*not on your PATH" \
+            || { echo "expected the off-PATH warning"; exit 1; }
+          test -x "$PREFIX/restic-station-helper"
+          # idempotent: a second run overwrites cleanly, no error.
+          ./install.sh --prefix="$PREFIX"
+          # on-PATH: no warning this time.
+          OUT2=$(PATH="$PREFIX:$PATH" ./install.sh --prefix="$PREFIX")
+          echo "$OUT2"
+          if echo "$OUT2" | grep -q "WARNING:.*not on your PATH"; then
+            echo "warned even though the prefix was on PATH"; exit 1
+          fi
+      - name: Run the Linux integration test against the STATIC binary
+        run: |
+          RESTIC_STATION_HELPER_OVERRIDE="$PWD/dist/restic-station-linux-aarch64/restic-station-helper" \
+            scripts/integration-test.sh
+      # T26 verification debt (deferred by an earlier task): a real systemd
+      # --user timer end to end. This runner is a bare VM (systemd IS pid 1,
+      # unlike the swift:6.1 container above) — worth an honest attempt
+      # rather than assuming it is still blocked. Never fails the job:
+      # whatever happens here is diagnostic, reported in the PR, and the
+      # `linux` job's own no-systemd-container coverage is unaffected either
+      # way.
+      - name: T26 diagnostic — does timer install work on a bare Actions VM?
+        continue-on-error: true
+        run: |
+          BIN="$PWD/dist/restic-station-linux-aarch64/restic-station-helper"
+          export RESTIC_STATION_DATA_DIR=$(mktemp -d)
+          echo '{"version":2,"resticPath":null,"showMenuBarIcon":true,"sets":[]}' \
+            > "$RESTIC_STATION_DATA_DIR/config.json"
+          "$BIN" timer install || true
+          "$BIN" timer status || true
+          systemctl --user status 2>&1 || true
+          loginctl show-user "$(whoami)" 2>&1 || true
+
+  # T29: proves the release binary is genuinely static — not just built with
+  # a static-looking flag — by running it in the three environments issue
+  # #31 names. Full three-environment sweep on x86_64 (broadest image
+  # availability, incl. a deliberately old-glibc distro); aarch64 gets the
+  # two cheap/native-multi-arch checks. See the PR description for which of
+  # the three this covers per architecture and why.
+  linux-runtime-verify:
+    needs: release-linux
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: restic-station-linux
+          path: dist
+      - name: Unpack
+        run: |
+          tar xzf "dist/restic-station-linux-${{ matrix.arch }}.tar.gz" -C dist
+          chmod +x "dist/restic-station-linux-${{ matrix.arch }}/restic-station-helper"
+      - name: ldd confirms no dynamic dependencies
+        run: |
+          OUT=$(ldd "dist/restic-station-linux-${{ matrix.arch }}/restic-station-helper" 2>&1 || true)
+          echo "$OUT"
+          echo "$OUT" | grep -q "not a dynamic executable" \
+            || { echo "expected ldd to report a static binary"; exit 1; }
+      - name: Runs in a scratch container (no libc, no userland at all)
+        run: |
+          WORK=$(mktemp -d)
+          cp "dist/restic-station-linux-${{ matrix.arch }}/restic-station-helper" "$WORK/"
+          printf 'FROM scratch\nCOPY restic-station-helper /restic-station-helper\nENTRYPOINT ["/restic-station-helper"]\n' \
+            > "$WORK/Dockerfile"
+          docker build -t rs-scratch-test "$WORK"
+          OUT=$(docker run --rm rs-scratch-test version)
+          echo "$OUT"
+          echo "$OUT" | grep -q "restic-station-helper 0.1.0"
+      - name: Runs on Alpine (musl userland — the SDK's own libc family)
+        run: |
+          docker run --rm \
+            -v "$PWD/dist/restic-station-linux-${{ matrix.arch }}:/work" \
+            alpine:3.19 /work/restic-station-helper version | tee /tmp/out.txt
+          grep -q "restic-station-helper 0.1.0" /tmp/out.txt
+      - name: Runs on Debian 12 Bookworm (glibc userland — proves no glibc need)
+        run: |
+          docker run --rm \
+            -v "$PWD/dist/restic-station-linux-${{ matrix.arch }}:/work" \
+            debian:12-slim /work/restic-station-helper version | tee /tmp/out.txt
+          grep -q "restic-station-helper 0.1.0" /tmp/out.txt
+      # Deliberately old glibc (CentOS 7: glibc 2.17, released 2012) — the
+      # point is that this must work identically to the two checks above
+      # *because* the binary carries no glibc dependency at all, static or
+      # dynamic. Only attempted on x86_64: CentOS 7 predates official arm64
+      # image builds, and this task's own instructions are explicit that a
+      # environment which cannot be exercised in Actions should be marked
+      # deferred rather than faked — so aarch64 is left there, honestly,
+      # not silently skipped.
+      - name: Runs on a deliberately old-glibc distro (CentOS 7, x86_64 only)
+        if: matrix.arch == 'x86_64'
+        run: |
+          docker run --rm \
+            -v "$PWD/dist/restic-station-linux-${{ matrix.arch }}:/work" \
+            centos:7 /work/restic-station-helper version | tee /tmp/out.txt
+          grep -q "restic-station-helper 0.1.0" /tmp/out.txt
