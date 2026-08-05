@@ -51,10 +51,21 @@ struct Status: AsyncParsableCommand {
 
         let now = Date()
         let calendar = Calendar.current
-        // 200, matching the app's own `StateWatcher` (`App/Sources/Support/
-        // StateWatcher.swift`) — enough history for "last run of any kind"
-        // across every set without an unbounded read of `runs/index.jsonl`.
-        let recentRuns = (try? runStore.recentRuns(limit: 200)) ?? []
+        // The full index, not a capped window. `HealthDerivation.setHealths`
+        // derives each set's `needsAttention` from that set's own most
+        // recent run — but a shared, global cap applied *before* the
+        // per-set filter can hide a quiet set's latest (possibly failed)
+        // run behind busier sets' newer ones, silently reporting the quiet
+        // set healthy and flipping this command's own exit code back to 0.
+        // `--json`'s exit code is documented as a Nagios/Icinga check
+        // (docs/data-model.md), so that is the worst failure mode available
+        // here — worse than printing nothing at all. `RunStore.recentRuns`
+        // already decodes the entire `runs/index.jsonl` before any `limit`
+        // is applied (there is no way to stop early on a `.jsonl` tail
+        // without a separate index), so `.max` costs nothing extra over the
+        // previous cap on the read/decode side; it only keeps entries this
+        // command would otherwise have discarded right after decoding them.
+        let recentRuns = (try? runStore.recentRuns(limit: .max)) ?? []
 
         var currentRuns: [UUID: CurrentRunState] = [:]
         for setId in stateStore.currentRunSetIDs() {

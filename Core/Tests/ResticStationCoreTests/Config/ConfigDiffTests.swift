@@ -203,6 +203,54 @@ private func baseConfig() -> AppConfig {
         #expect(summary.lines == ["~ resticPath changed"])
     }
 
+    /// `config import`'s `old` is whatever is currently on disk, read
+    /// *without* `AppConfig.validate()` (`ConfigImport.loadExistingForDiff`)
+    /// — exactly so a broken `config.json` can still be diffed and
+    /// replaced. A config with duplicate set ids decodes fine and is
+    /// exactly the broken state `config import` exists to recover from;
+    /// `Dictionary(uniqueKeysWithValues:)` traps the whole process on a
+    /// duplicate key, which would make `summarize` — and therefore `config
+    /// import` — unusable against that input. This must not crash.
+    @Test func duplicateSetIdsInTheExistingConfigDoNotCrashTheDiff() {
+        var duplicated = baseConfig()
+        var secondCopy = baseSet()
+        secondCopy.name = "Projects (duplicate)"
+        duplicated.sets.append(secondCopy) // same id as baseSet(), on purpose
+
+        // Must not trap — `Dictionary(uniqueKeysWithValues:)`'s crash on a
+        // duplicate key is the historical bug. `old` and `new` both carry
+        // the duplicate, so both dictionary constructions are exercised.
+        // The result is well-defined, not incidental: `oldByID`'s
+        // last-wins pick is `secondCopy`, so the array's *first* entry
+        // (matched against that pick while iterating `new.sets`, which
+        // still holds both raw entries) differs by name and is reported
+        // changed; the second entry, which IS the last-wins pick, compares
+        // equal to itself.
+        let summary = ConfigDiff.summarize(from: duplicated, to: duplicated)
+        #expect(summary.changed.count == 1)
+        #expect(summary.changed[0].changedFields == ["name"])
+    }
+
+    /// Last-wins is the documented tie-break: a set matched by id against a
+    /// duplicated `old` diffs against the *last* occurrence in `old.sets`.
+    @Test func duplicateSetIdsResolveLastWinsForTheDiff() {
+        var old = baseConfig()
+        var firstCopy = baseSet()
+        firstCopy.sources = ["/first"]
+        var secondCopy = baseSet()
+        secondCopy.sources = ["/second"]
+        old.sets = [firstCopy, secondCopy] // same id, both entries
+
+        var new = baseConfig()
+        new.sets[0].sources = ["/second"] // matches the LAST copy in old, not the first
+
+        let summary = ConfigDiff.summarize(from: old, to: new)
+        // If the diff had matched the first (not last) occurrence, sources
+        // would differ ("/first" -> "/second") and this set would be
+        // reported changed.
+        #expect(summary.changed.isEmpty)
+    }
+
     @Test func machineOverrideChangesAreReportedOnTheSet() {
         var new = baseConfig()
         new.sets[0].machines = ["linux-nas": BackupSetMachineOverride(enabled: false)]

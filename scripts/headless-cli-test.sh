@@ -222,6 +222,23 @@ grep -q 'Effective plan for machine "some-other-host-entirely"' "$OUT_FILE" \
     || fail "validate did not resolve for the requested --machine"
 ok "--machine resolves for an arbitrary machine id, not just this host's own"
 
+# An invalid slug (uppercase, here) can never match any `machines` override
+# key — resolving against it anyway would silently fall back to "no
+# override applies", which for a set disabled on the machine the user
+# actually meant could report it as running. Must be a hard error, not a
+# quiet no-op (issue #29 finding 4).
+RESTIC_STATION_DATA_DIR="$ALL_DISABLED_DATA" run_helper config validate --machine Mirror-Box
+expect_rc 1
+grep -qi 'not a valid machine id' "$OUT_FILE" \
+    || fail "config validate --machine <invalid slug> should reject it with a clear message, not silently resolve"
+ok "config validate rejects an invalid --machine slug instead of silently resolving nothing"
+
+RESTIC_STATION_DATA_DIR="$ALL_DISABLED_DATA" run_helper config show --machine Mirror-Box
+expect_rc 1
+grep -qi 'not a valid machine id' "$OUT_FILE" \
+    || fail "config show --machine <invalid slug> should reject it with a clear message, not silently resolve"
+ok "config show rejects an invalid --machine slug instead of silently resolving nothing"
+
 # ─────────────────────────────────────────────────────────────────────────
 # 4. status --json fixture scenarios: healthy, in-flight, failed, stale.
 # ─────────────────────────────────────────────────────────────────────────
@@ -323,6 +340,34 @@ echo "$(cat "$OUT_FILE")" | jq -e '.health == "warning"' >/dev/null || fail "sta
 echo "$(cat "$OUT_FILE")" | jq -e '.sets[0].destinations[0].stale == true' >/dev/null \
     || fail "stale fixture's destination was not flagged stale"
 ok "stale-mirror fixture: status --json exits 1, health=warning, destination flagged stale"
+
+# --- crowded-quiet-set: the configured set's own last run failed, but a
+#     flood of newer runs from an unrelated set must not crowd it out of
+#     whatever window `status` reads before deriving health (issue #29
+#     finding 5). `--json`'s exit code is documented as a Nagios/Icinga
+#     check, so a quiet set's failure being hidden behind busier ones — and
+#     the exit code flipping back to 0 — is the worst failure mode
+#     available here. ---
+CROWDED="$WORK/status-crowded"
+make_status_fixture "$CROWDED"
+OTHER_SET_ID="20000000-0000-4000-8000-000000000099"
+NOW_TS=$(date -u +%s)
+{
+    echo "{\"runId\":\"r-quiet-failed\",\"kind\":\"backup\",\"setId\":\"$SET_ID\",\"destId\":\"$PRIMARY_ID\",\"groupId\":\"r-quiet-failed\",\"status\":\"failed\",\"start\":\"$LONG_AGO_ISO\",\"end\":\"$LONG_AGO_ISO\",\"trigger\":\"scheduled\",\"snapshotId\":null,\"filesNew\":null,\"filesChanged\":null,\"dataAdded\":null,\"errorSummary\":\"wrong password\"}"
+    for i in $(seq 1 205); do
+        TS_EPOCH=$(( NOW_TS - 205 + i ))
+        TS=$(date -u -r "$TS_EPOCH" +%Y-%m-%dT%H:%M:%S.000Z 2>/dev/null \
+            || date -u -d "@$TS_EPOCH" +%Y-%m-%dT%H:%M:%S.000Z)
+        echo "{\"runId\":\"r-busy-$i\",\"kind\":\"backup\",\"setId\":\"$OTHER_SET_ID\",\"destId\":\"$PRIMARY_ID\",\"groupId\":\"r-busy-$i\",\"status\":\"success\",\"start\":\"$TS\",\"end\":\"$TS\",\"trigger\":\"scheduled\",\"snapshotId\":\"abc\",\"filesNew\":1,\"filesChanged\":0,\"dataAdded\":10,\"errorSummary\":null}"
+    done
+} > "$CROWDED/runs/index.jsonl"
+RESTIC_STATION_DATA_DIR="$CROWDED" run_helper status --json
+expect_rc 1
+echo "$(cat "$OUT_FILE")" | jq -e '.health == "warning"' >/dev/null \
+    || fail "a quiet set's failed last run must not be hidden behind 200+ newer runs from another set"
+echo "$(cat "$OUT_FILE")" | jq -e '.sets[0].needsAttention == true' >/dev/null \
+    || fail "the quiet, configured set was not flagged needsAttention despite its last run having failed"
+ok "a quiet set's failed last run survives 200+ newer runs from another set — status --json exit code stays 1"
 
 # ─────────────────────────────────────────────────────────────────────────
 # 5. every --json mode is ONLY JSON on stdout (piped through jq).

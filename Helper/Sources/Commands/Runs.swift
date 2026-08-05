@@ -40,28 +40,24 @@ struct RunsList: AsyncParsableCommand {
         let paths = AppPaths.default()
         let runStore = RunStore(paths: paths)
 
-        // `RunStore.recentRuns(limit:)` counts raw index lines, before any
-        // `--set` filter — read a wider window than `--limit` when filtering
-        // so a set that is not the most recently active one still gets its
-        // `limit` worth of history instead of being crowded out.
-        let readWindow = set == nil ? limit : max(limit, 1000)
+        // `RunStore.recentRuns(setId:limit:)` filters by `--set` *before*
+        // truncating to `--limit` — a set that is not the most recently
+        // active one still gets its own `limit` worth of history instead of
+        // being crowded out by busier sets' newer runs.
         let entries: [RunIndexEntry]
         do {
-            entries = try runStore.recentRuns(limit: readWindow)
+            entries = try runStore.recentRuns(setId: set, limit: limit)
         } catch {
             HelperExit.fail("could not read runs/index.jsonl: \(error)")
         }
 
-        let matching = entries.filter { entry in set.map { entry.setId == $0 } ?? true }
-        let limited = Array(matching.prefix(limit))
-
         if json {
-            CLIJSON.print(limited)
-        } else if limited.isEmpty {
+            CLIJSON.print(entries)
+        } else if entries.isEmpty {
             print("no runs recorded")
         } else {
             let formatter = ConfigStore.makeISO8601Formatter()
-            for entry in limited {
+            for entry in entries {
                 let end = entry.end.map(formatter.string(from:)) ?? "(running)"
                 let error = entry.errorSummary.map { "  error=\($0)" } ?? ""
                 print(

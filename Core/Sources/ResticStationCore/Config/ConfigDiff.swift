@@ -107,9 +107,28 @@ public enum ConfigDiff {
     /// ``isScheduleRelevantChange(from:to:)``, which ignores renames — that
     /// projection only cares whether the *scheduler* needs to notice, and a
     /// rename never affects what runs).
+    ///
+    /// `old`/`new` are **not assumed to be validated** — `config import`
+    /// (T27) calls this with `old` read straight off whatever `config.json`
+    /// is currently on disk, via `ConfigImport.loadExistingForDiff`, which
+    /// deliberately bypasses `AppConfig.validate()` (a read-only diff must
+    /// not itself migrate or reject anything). A config with duplicate set
+    /// ids is exactly the broken state `config import` exists to recover
+    /// from, so building the id→set maps below must never crash on one:
+    /// `Dictionary(uniqueKeysWithValues:)` traps the whole process on a
+    /// duplicate key, which would make `config import` unusable against the
+    /// one input it is the recovery tool for. Last-wins (`uniquingKeysWith:
+    /// { _, latest in latest }`) for both maps: a set's later occurrence in
+    /// its own `sets` array is treated as authoritative, matching how a
+    /// decoder or a hand-edited JSON array most plausibly meant it (the
+    /// last entry with a given key is standardly "the real one" wherever
+    /// this repo has to tie-break on a duplicate). Only which single
+    /// version of a duplicated set gets *diffed* is affected — the tool
+    /// still runs, and still shows a truthful summary of the config it is
+    /// about to install.
     public static func summarize(from old: AppConfig, to new: AppConfig) -> Summary {
-        let oldByID = Dictionary(uniqueKeysWithValues: old.sets.map { ($0.id, $0) })
-        let newByID = Dictionary(uniqueKeysWithValues: new.sets.map { ($0.id, $0) })
+        let oldByID = Dictionary(old.sets.map { ($0.id, $0) }, uniquingKeysWith: { _, latest in latest })
+        let newByID = Dictionary(new.sets.map { ($0.id, $0) }, uniquingKeysWith: { _, latest in latest })
 
         let added = new.sets
             .filter { oldByID[$0.id] == nil }

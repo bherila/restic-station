@@ -317,6 +317,55 @@ private final class TickCounter: @unchecked Sendable {
         #expect(lastBCopy == nil)
     }
 
+    // MARK: - recentRuns(setId:) filters before truncating (T27 issue #29 finding 3)
+
+    /// `runs list --set` must not lose a quiet set's history to a shared,
+    /// pre-filter cap — its own history is always in `index.jsonl`
+    /// regardless of how many *other* sets' runs are newer.
+    /// `RunStore.recentRuns(setId:limit:)` applies the `setId` filter
+    /// before `limit` truncates the result; this test would fail under the
+    /// old shape (read `limit`-ish raw entries, filter after) because the
+    /// quiet set's one run is older than every one of the busy set's.
+    @Test func recentRunsFiltersBySetBeforeApplyingTheLimit() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+
+        let tick = TickCounter()
+        let store = RunStore(paths: paths, now: {
+            Date(timeIntervalSince1970: 4_000_000_000 + Double(tick.next()))
+        })
+
+        let quietSet = UUID()
+        let busySet = UUID()
+        let destId = UUID()
+
+        // The quiet set's one run happens first — it is the OLDEST entry in
+        // the whole index.
+        let quiet = try store.begin(kind: .backup, setId: quietSet, destId: destId, trigger: .manual)
+        try store.finish(quiet, status: .success)
+
+        // Every run after it, from a different set, is newer.
+        for _ in 0..<5 {
+            let busy = try store.begin(kind: .backup, setId: busySet, destId: destId, trigger: .manual)
+            try store.finish(busy, status: .success)
+        }
+
+        // A limit smaller than the busy set's run count: a "truncate first"
+        // implementation would read only the newest `limit` raw entries —
+        // all from the busy set — and find nothing for the quiet set.
+        let quietHistory = try store.recentRuns(setId: quietSet, limit: 2)
+        #expect(quietHistory.map(\.runId) == [quiet.runId])
+
+        let busyHistory = try store.recentRuns(setId: busySet, limit: 2)
+        #expect(busyHistory.count == 2)
+        #expect(busyHistory.allSatisfy { $0.setId == busySet })
+
+        // `setId: nil` (the default) is unaffected — still every kind,
+        // every set, newest first, truncated to `limit`.
+        let everything = try store.recentRuns(limit: 3)
+        #expect(everything.count == 3)
+    }
+
     // MARK: - logURL
 
     @Test func logURLMatchesAppPaths() throws {

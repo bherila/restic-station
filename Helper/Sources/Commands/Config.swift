@@ -52,12 +52,32 @@ struct ConfigCLIContext {
     /// else this host's own `machine.json` identity.
     func targetMachineId(machineFlag: String?) -> String {
         if let machineFlag {
+            Self.requireValidMachineId(machineFlag)
             return machineFlag
         }
         do {
             return try MachineStore(paths: paths).load().machineId
         } catch {
             HelperExit.fail("could not read this machine's identity (\(paths.machineFile.path)): \(error)")
+        }
+    }
+
+    /// `--machine` accepts any string from ArgumentParser, but a machine id
+    /// is a lowercase `[a-z0-9-]` slug (`docs/data-model.md` §machine.json,
+    /// pinned by `MachineIdentity.isValid`). An id that is not a well-formed
+    /// slug can never equal a `machines` override key, so resolving against
+    /// one would silently behave exactly like "no override applies here" —
+    /// which for `config validate`/`config show` means a set that is
+    /// actually *disabled* on the machine the user meant could be reported
+    /// as running, and vice versa. A typo must be a hard error, not a quiet
+    /// no-op that happens to fall back to "everywhere" semantics. Every
+    /// subcommand accepting `--machine` must call this before resolving.
+    static func requireValidMachineId(_ machineId: String) {
+        guard MachineIdentity.isValid(machineId) else {
+            HelperExit.fail(
+                "\"\(machineId)\" is not a valid machine id — machine ids are lowercase [a-z0-9-] slugs "
+                    + "(docs/data-model.md §machine.json); check --machine for a typo"
+            )
         }
     }
 }
@@ -165,30 +185,40 @@ struct ConfigImport: AsyncParsableCommand {
         }
 
         let needsMigration = decoded.version < AppConfig.currentVersion
-        let migrated: AppConfig
-        if dryRun {
-            // Pure preview: no machine.json touch, no config.v1.backup.json
-            // write — --dry-run must not write anything at all.
-            migrated = needsMigration ? ConfigStore.previewMigration(decoded) : decoded
-        } else if needsMigration {
-            let migration = context.configStore.migrateToCurrentVersion(decoded, originalBytes: data)
-            guard migration.backupWritten else {
-                HelperExit.fail(
-                    "could not write \(context.paths.configV1BackupFile.path) — refusing to import without a "
-                        + "backup of the v1 file being migrated. Nothing was installed."
-                )
-            }
-            migrated = migration.config
-        } else {
-            migrated = decoded
-        }
-
         let existing = Self.loadExistingForDiff(paths: context.paths)
         if existing == nil {
             print("note: the existing config.json could not be read for a diff; it will still be backed up "
                 + "before import.")
         }
-        let summary = ConfigDiff.summarize(from: existing ?? AppConfig(), to: migrated)
+
+        if dryRun {
+            // Pure preview: no machine.json touch, no config.v1.backup.json
+            // write, no config.json backup or install — --dry-run must not
+            // write anything at all.
+            let migrated = needsMigration ? ConfigStore.previewMigration(decoded) : decoded
+            Self.printSummary(ConfigDiff.summarize(from: existing ?? AppConfig(), to: migrated))
+            print("dry run — nothing written (a v1→v2 preview does not simulate moving resticPath into "
+                + "machine.json; only a real import does that)")
+            HelperExit.code(0)
+        }
+
+        let result = Self.performImport(
+            decoded: decoded, originalBytes: data, needsMigration: needsMigration, existing: existing, context: context
+        )
+        Self.printSummary(result.summary)
+        switch result.outcome {
+        case .failed(let message):
+            HelperExit.fail(message)
+        case .installed(let backupPath):
+            if let backupPath {
+                print("backed up the existing config to \(backupPath)")
+            }
+            print("installed \(context.paths.configFile.path)")
+            HelperExit.code(0)
+        }
+    }
+
+    private static func printSummary(_ summary: ConfigDiff.Summary) {
         if summary.isEmpty {
             print("no changes")
         } else {
@@ -196,32 +226,112 @@ struct ConfigImport: AsyncParsableCommand {
                 print(line)
             }
         }
+    }
 
-        guard !dryRun else {
-            print("dry run — nothing written (a v1→v2 preview does not simulate moving resticPath into "
-                + "machine.json; only a real import does that)")
-            HelperExit.code(0)
+    // MARK: - The real (non-dry-run) commit, extracted for testability
+
+    struct ImportResult {
+        let summary: ConfigDiff.Summary
+        let outcome: Outcome
+
+        enum Outcome {
+            /// `nil` when there was no pre-existing `config.json` to back up.
+            case installed(backupPath: String?)
+            case failed(String)
+        }
+    }
+
+    /// Performs the actual install: backs up any existing `config.json`,
+    /// migrates if needed, and saves the result — in that order, so that a
+    /// failure at any step leaves **no host-local state changed**, matching
+    /// the message the caller reports ("Nothing was installed" must be
+    /// true).
+    ///
+    /// The ordering matters. `migrateToCurrentVersion` can adopt a
+    /// deprecated `resticPath` into `machine.json` — a host-local mutation
+    /// with a real effect on subsequent helper invocations, entirely
+    /// separate from whether `config.json` itself ends up installed. Doing
+    /// that migration *before* backing up the existing config, or before
+    /// confirming the final `save` succeeds, was the bug this function
+    /// exists to fix: a later step could fail, the command would print
+    /// "Nothing was installed", and `machine.json` would already disagree
+    /// with that claim.
+    ///
+    /// Two defenses, not one:
+    /// 1. The existing `config.json` is backed up **first** — a step that
+    ///    touches only the config directory, never `machine.json` — so a
+    ///    failure there truly precedes any host-local mutation.
+    /// 2. `machine.json`'s state is snapshotted before migration runs, and
+    ///    restored (via `savePreservingIdentity`, never `save`) if either
+    ///    the migration's own backup-write fails or the final `save` does —
+    ///    belt and braces for the one mutation (`resticPath` adoption) that
+    ///    can happen before `config.json` is confirmed installed.
+    static func performImport(
+        decoded: AppConfig,
+        originalBytes: Data,
+        needsMigration: Bool,
+        existing: AppConfig?,
+        context: ConfigCLIContext
+    ) -> ImportResult {
+        func summary(to config: AppConfig) -> ConfigDiff.Summary {
+            ConfigDiff.summarize(from: existing ?? AppConfig(), to: config)
         }
 
+        var backupPath: String?
         if FileManager.default.fileExists(atPath: context.paths.configFile.path) {
-            let backupURL = Self.allocateImportBackupURL(paths: context.paths)
+            let candidate = Self.allocateImportBackupURL(paths: context.paths)
             do {
-                try FileManager.default.copyItem(at: context.paths.configFile, to: backupURL)
+                try FileManager.default.copyItem(at: context.paths.configFile, to: candidate)
             } catch {
-                HelperExit.fail(
-                    "could not back up the existing config.json before importing: \(error). Nothing was installed."
+                return ImportResult(
+                    summary: summary(to: decoded),
+                    outcome: .failed(
+                        "could not back up the existing config.json before importing: \(error). "
+                            + "Nothing was installed."
+                    )
                 )
             }
-            print("backed up the existing config to \(backupURL.path)")
+            backupPath = candidate.path
+        }
+
+        // Snapshotted *before* migration might mutate machine.json, so any
+        // failure from here on can restore exactly what was there.
+        let identityStore = MachineStore.persistentIdentity(paths: context.paths)
+        let priorMachine = try? identityStore.load()
+        func restoreMachineIdentity() {
+            guard let priorMachine else { return }
+            _ = try? identityStore.savePreservingIdentity(priorMachine)
+        }
+
+        let migrated: AppConfig
+        if needsMigration {
+            let migration = context.configStore.migrateToCurrentVersion(decoded, originalBytes: originalBytes)
+            guard migration.backupWritten else {
+                restoreMachineIdentity()
+                return ImportResult(
+                    summary: summary(to: decoded),
+                    outcome: .failed(
+                        "could not write \(context.paths.configV1BackupFile.path) — refusing to import without a "
+                            + "backup of the v1 file being migrated. Nothing was installed."
+                    )
+                )
+            }
+            migrated = migration.config
+        } else {
+            migrated = decoded
         }
 
         do {
             try context.configStore.save(migrated)
         } catch {
-            HelperExit.fail("could not install the imported config: \(error)")
+            restoreMachineIdentity()
+            return ImportResult(
+                summary: summary(to: migrated),
+                outcome: .failed("could not install the imported config: \(error). Nothing was installed.")
+            )
         }
-        print("installed \(context.paths.configFile.path)")
-        HelperExit.code(0)
+
+        return ImportResult(summary: summary(to: migrated), outcome: .installed(backupPath: backupPath))
     }
 
     /// The config currently installed, read **without** going through
@@ -295,6 +405,7 @@ struct ConfigValidate: AsyncParsableCommand {
         let localMachineId = try? MachineStore(paths: context.paths).load().machineId
         let targetMachineId: String
         if let machine {
+            ConfigCLIContext.requireValidMachineId(machine)
             targetMachineId = machine
         } else if let localMachineId {
             targetMachineId = localMachineId

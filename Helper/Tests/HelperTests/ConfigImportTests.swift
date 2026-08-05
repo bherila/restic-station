@@ -117,6 +117,65 @@ struct ConfigImportTests {
         #expect(FileManager.default.fileExists(atPath: paths.configV1BackupFile.path))
     }
 
+    // MARK: - A reported failure must never leave machine.json mutated (issue #29 finding 1)
+
+    /// `performImport` is `ConfigImport.run()`'s real (non-dry-run) commit
+    /// path, extracted so it is unit-testable without the `HelperExit.fail`/
+    /// `.code` calls in `run()` itself (both `Never`-returning — they call
+    /// `exit(_:)`, so `run()` cannot be driven in-process at all).
+    ///
+    /// This pins the fix for the bug: importing a v1 file with a
+    /// `resticPath` used to call `migrateToCurrentVersion` — which adopts
+    /// the path into `machine.json`, a real host-local mutation — *before*
+    /// the final `config.json` install was confirmed. If that install then
+    /// failed, the command still printed "Nothing was installed", while
+    /// `machine.json` had in fact changed, so a later helper invocation
+    /// would resolve restic from the (never-installed) imported config's
+    /// path. `performImport` must roll `machine.json` back when the final
+    /// `save` fails, so the message stays true.
+    ///
+    /// The failure is forced without permission bits (root defeats `chmod`
+    /// in the Linux CI container, so a permission-based test would pass for
+    /// the wrong reason there — see this task's own instructions and the
+    /// red-check note on `migrateToCurrentVersionPerformsSideEffectsWithoutInstalling`
+    /// in `ConfigMigrationTests.swift`): pre-creating `config.json.tmp` — the
+    /// exact path `ConfigStore.save` writes to before its atomic rename —
+    /// as a *directory* makes the write fail with a real I/O type mismatch
+    /// (EISDIR), which happens identically whether the process is root or
+    /// not.
+    @Test("a save failure after migration restores machine.json — 'Nothing was installed' stays true")
+    func saveFailureAfterMigrationRestoresMachineJSON() throws {
+        let (paths, cleanup) = makeTempRoot()
+        defer { cleanup() }
+        try paths.ensureDirectories()
+
+        let context = ConfigCLIContext(
+            paths: paths, configStore: ConfigStore(paths: paths), stateStore: StateStore(paths: paths)
+        )
+
+        let v1JSON = Data(#"{"version":1,"resticPath":"/opt/homebrew/bin/restic","showMenuBarIcon":true,"sets":[]}"#.utf8)
+        let decoded = try ConfigStore.makeDecoder().decode(AppConfig.self, from: v1JSON)
+
+        let tempConfigFile = paths.configFile.deletingLastPathComponent()
+            .appendingPathComponent(paths.configFile.lastPathComponent + ".tmp", isDirectory: false)
+        try FileManager.default.createDirectory(at: tempConfigFile, withIntermediateDirectories: true)
+
+        let result = ConfigImport.performImport(
+            decoded: decoded, originalBytes: v1JSON, needsMigration: true, existing: AppConfig(), context: context
+        )
+
+        guard case .failed(let message) = result.outcome else {
+            Issue.record("expected the import to fail because config.json.tmp is a directory")
+            return
+        }
+        #expect(message.contains("Nothing was installed"))
+
+        // The crux: migration DID adopt the resticPath into machine.json —
+        // a real mutation — but since the final install failed, that
+        // mutation must have been rolled back.
+        #expect(try MachineStore.persistentIdentity(paths: paths).load().resticPath == nil)
+    }
+
     /// `--dry-run` must not touch `machine.json` or write
     /// `config.v1.backup.json` — `ConfigStore.previewMigration` is a pure
     /// version bump, which is exactly what makes this true structurally
