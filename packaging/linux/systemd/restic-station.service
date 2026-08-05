@@ -1,0 +1,10 @@
+# restic-station.service — installed by `restic-station-helper timer install`
+# (docs/scheduling.md §Linux: systemd user timer). Re-running the command
+# overwrites this file; hand edits survive only until then.
+[Unit]
+Description=Restic Station scheduling tick
+Documentation=https://github.com/bherila/restic-station/blob/main/docs/scheduling.md
+
+[Service]
+Type=oneshot
+ExecStart=<HELPER_PATH> tick

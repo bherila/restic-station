@@ -1,0 +1,24 @@
+# restic-station.timer — installed by `restic-station-helper timer install`
+# (docs/scheduling.md §Linux: systemd user timer). Re-running the command
+# overwrites this file; hand edits survive only until then.
+[Unit]
+Description=Restic Station scheduling tick every 2min
+Documentation=https://github.com/bherila/restic-station/blob/main/docs/scheduling.md
+
+[Timer]
+Unit=restic-station.service
+# First tick shortly after boot, then one every interval measured from
+# the previous tick's start. A tick that outlives the interval simply
+# delays the next one; it never overlaps (Type=oneshot, plus tick.lock).
+OnBootSec=2min
+OnUnitActiveSec=2min
+# systemd.timer(5) scopes Persistent= to OnCalendar= timers, so with the
+# monotonic pair above the post-downtime catch-up is OnBootSec='s doing,
+# not this line's. It is kept because it states the intent (missed runs
+# are caught up, never skipped) and is the switch that carries that
+# intent unchanged if the interval is ever expressed as a calendar
+# expression. Do not remove it as "dead" — see docs/scheduling.md §Linux.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

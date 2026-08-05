@@ -17,6 +17,26 @@ import Testing
     let names: [String?] = HelperMain.configuration.subcommands.map { subcommand in
         subcommand.configuration.commandName
     }
+
+    // `timer` is Linux-only (T26): scheduling is registered by the app on
+    // macOS and by the helper on Linux. Asserted as a full ordered list on
+    // both platforms rather than as a `contains` check, so a subcommand
+    // silently disappearing from `--help` still fails the build.
+    #if os(Linux)
+    #expect(
+        names == [
+            "tick",
+            "run-set",
+            "init-secondary",
+            "restore",
+            "probe-repo",
+            "unlock",
+            "fda-check",
+            "timer",
+            "version",
+        ]
+    )
+    #else
     #expect(
         names == [
             "tick",
@@ -29,4 +49,6 @@ import Testing
             "version",
         ]
     )
+    #expect(!names.contains("timer"))
+    #endif
 }
