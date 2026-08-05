@@ -264,6 +264,61 @@ private func installMachine(at paths: AppPaths, resticPath: String? = nil) throw
         }
         #expect(!FileManager.default.fileExists(atPath: paths.configV1BackupFile.path))
     }
+
+    // MARK: - migrateToCurrentVersion as a standalone, reusable step (T27 `config import`)
+
+    /// The split that T27's `config import` relies on: `migrateToCurrentVersion`
+    /// performs the side effects (resticPath adoption, v1 backup) but leaves
+    /// installing the result as `config.json` to the caller.
+    @Test func migrateToCurrentVersionPerformsSideEffectsWithoutInstalling() throws {
+        let (store, paths, cleanup) = try makeStore()
+        defer { cleanup() }
+        try installMachine(at: paths)
+        let original = try FixtureLoader.data("config-v1.json")
+        let decoded = try ConfigStore.makeDecoder().decode(AppConfig.self, from: original)
+
+        let result = store.migrateToCurrentVersion(decoded, originalBytes: original)
+
+        #expect(result.backupWritten)
+        #expect(result.config.version == 2)
+        #expect(result.config.resticPath == nil)
+        // Side effects (v1 backup, machine.json adoption) happened...
+        #expect(FileManager.default.fileExists(atPath: paths.configV1BackupFile.path))
+        #expect(try MachineStore(paths: paths, environment: [:]).load().resticPath == "/opt/homebrew/bin/restic")
+        // ...but config.json itself was never written by this call. This is
+        // the property `load()`'s `guard migration.backupWritten else { return … }`
+        // depends on: since this call is the *only* way `config.json` could
+        // be installed as a side effect of migrating, and it provably never
+        // does that, the guard is the only remaining code path that can.
+        //
+        // (An earlier version of this file also had an end-to-end variant —
+        // chmod `root` read-only, call `load()`, assert `config.json` kept
+        // its pre-migration bytes — which I dropped after the red-check this
+        // task's instructions ask for went two ways: it did not actually
+        // isolate the guard, since `writeV1BackupIfAbsent` and `save(_:)`
+        // both create a *new* file in the same directory and so fail or
+        // succeed together under plain POSIX permissions; and it failed for
+        // an unrelated reason in CI, where the Linux job's container runs as
+        // root and `chmod` does not stop root from writing at all. Both
+        // problems trace to the same root cause — permission-based
+        // filesystem tests do not isolate the specific write they intend to
+        // deny — so the honest fix was to remove it rather than patch around
+        // a fake positive.)
+    }
+
+    /// `previewMigration` is a pure version bump: no `machine.json` access,
+    /// no `resticPath` relocation, no disk I/O of any kind — the property
+    /// `config import --dry-run` depends on.
+    @Test func previewMigrationTouchesNothingOnDisk() throws {
+        let decoded = try ConfigStore.makeDecoder().decode(AppConfig.self, from: FixtureLoader.data("config-v1.json"))
+
+        let preview = ConfigStore.previewMigration(decoded)
+
+        #expect(preview.version == 2)
+        // resticPath is left exactly as decoded — previewMigration does not
+        // simulate the relocation.
+        #expect(preview.resticPath == decoded.resticPath)
+    }
 }
 
 // MARK: - The environment override must never be persisted

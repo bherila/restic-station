@@ -68,7 +68,19 @@ public struct ConfigStore: Sendable {
         guard config.version < AppConfig.currentVersion else {
             return config
         }
-        return migrateToCurrentVersion(config, original: data)
+        let migration = migrateToCurrentVersion(config, originalBytes: data)
+        // Mirrors the original single-function behavior exactly: config.json
+        // is never overwritten unless the v1 backup is confirmed on disk —
+        // see the ordering note on `migrateToCurrentVersion`.
+        guard migration.backupWritten else {
+            return migration.config
+        }
+        do {
+            try save(migration.config)
+        } catch {
+            Self.warn("could not write the migrated config.json: \(error)")
+        }
+        return migration.config
     }
 
     // MARK: - Migration
@@ -81,21 +93,42 @@ public struct ConfigStore: Sendable {
     /// only value that moves is `resticPath`, which is inherently host-local
     /// and belongs in `machine.json`.
     ///
-    /// Non-destructive, in this order:
+    /// Performs the migration's persistence side effects — in this order:
     /// 1. Adopt `resticPath` into `machine.json` (only if it has none), and
-    ///    clear it from the config **only once that write succeeded**.
-    /// 2. Copy the untouched v1 bytes to `config.v1.backup.json` — never
+    ///    clear it from the returned config **only once that write
+    ///    succeeded**.
+    /// 2. Copy `originalBytes` to `config.v1.backup.json` — never
     ///    overwriting an existing backup, so a second migration cannot
     ///    clobber the first one's copy.
-    /// 3. Only if the backup exists, write the v2 config.
     ///
-    /// Every persistence step is best-effort: a data directory that cannot
-    /// be written must not stop the helper from *running* backups, and the
-    /// in-memory result is correct either way (the migration is a pure
-    /// function of the file, so an unwritten migration simply reruns next
-    /// load). What is *not* best-effort is the ordering — the v1 file is
-    /// never overwritten unless a backup of it exists.
-    private func migrateToCurrentVersion(_ loaded: AppConfig, original: Data) -> AppConfig {
+    /// Every step is best-effort: a data directory that cannot be written
+    /// must not stop the helper from *running* backups, and the in-memory
+    /// result is correct either way (the migration is a pure function of the
+    /// file, so an unwritten migration simply reruns next load).
+    ///
+    /// **Deliberately stops short of installing the result as this store's
+    /// `config.json`.** `load()` does that itself, immediately, and only
+    /// when `backupWritten` is `true` — mirroring exactly what the
+    /// pre-refactor single function did (see below). `config import` (T27)
+    /// is the other caller: it needs to back up any config already
+    /// installed *before* overwriting it, and `--dry-run` must not install
+    /// at all — both of which require the install step to stay under the
+    /// caller's control. That is also why this is `public`: it is the
+    /// sanctioned way to reuse this migration outside `ConfigStore` itself,
+    /// per `docs/data-model.md` §Versioning — "do not reimplement it".
+    ///
+    /// - Returns: the migrated value, and whether `config.v1.backup.json`
+    ///   is confirmed on disk (already existing, or just written). **Every
+    ///   caller must skip installing `config` as `config.json` when this is
+    ///   `false`** — that is the property "the v1 file is never overwritten
+    ///   unless a backup of it exists" (`docs/data-model.md` §Versioning)
+    ///   actually rests on. `false` leaves `machine.json` however far the
+    ///   `resticPath` adoption above got (best-effort, already durable if it
+    ///   happened); only the final config.json install is gated.
+    public func migrateToCurrentVersion(
+        _ loaded: AppConfig,
+        originalBytes: Data
+    ) -> (config: AppConfig, backupWritten: Bool) {
         var migrated = loaded
         migrated.version = AppConfig.currentVersion
 
@@ -126,18 +159,29 @@ public struct ConfigStore: Sendable {
         }
 
         do {
-            try writeV1BackupIfAbsent(original)
+            try writeV1BackupIfAbsent(originalBytes)
         } catch {
             Self.warn("could not write \(paths.configV1BackupFile.lastPathComponent): \(error). "
                 + "Leaving config.json at version \(loaded.version).")
-            return migrated
+            return (migrated, false)
         }
 
-        do {
-            try save(migrated)
-        } catch {
-            Self.warn("could not write the migrated config.json: \(error)")
-        }
+        return (migrated, true)
+    }
+
+    /// A pure, side-effect-free **preview** of what
+    /// ``migrateToCurrentVersion(_:originalBytes:)`` would produce: only the
+    /// version number is bumped. No `machine.json` read or write, no
+    /// `config.v1.backup.json` write — nothing touches disk.
+    ///
+    /// For `config import --dry-run` (T27), which must not write anything at
+    /// all. The real migration additionally relocates a deprecated
+    /// `resticPath` into `machine.json` and clears it from the config; that
+    /// step is intentionally not simulated here; a dry run is a preview; the
+    /// exact `resticPath` handling is only guaranteed by actually installing.
+    public static func previewMigration(_ loaded: AppConfig) -> AppConfig {
+        var migrated = loaded
+        migrated.version = AppConfig.currentVersion
         return migrated
     }
 
@@ -176,7 +220,13 @@ public struct ConfigStore: Sendable {
 
     // MARK: - Encoding
 
-    static func makeEncoder() -> JSONEncoder {
+    /// The house JSON convention for every persisted file (`docs/data-model.md`
+    /// preamble): `.sortedKeys` + `.prettyPrinted`, ISO 8601 dates with
+    /// fractional seconds. `public` so callers outside this module — the
+    /// helper's `--json` subcommands (T27) chief among them — encode their
+    /// own output with the exact same conventions instead of reimplementing
+    /// them, keeping every JSON surface in the app byte-for-byte consistent.
+    public static func makeEncoder() -> JSONEncoder {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .prettyPrinted]
         encoder.dateEncodingStrategy = .custom { date, encoder in
@@ -186,7 +236,7 @@ public struct ConfigStore: Sendable {
         return encoder
     }
 
-    static func makeDecoder() -> JSONDecoder {
+    public static func makeDecoder() -> JSONDecoder {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .custom { decoder in
             let container = try decoder.singleValueContainer()
@@ -207,7 +257,7 @@ public struct ConfigStore: Sendable {
     /// with the rest of the persisted-JSON policy for when it does. A fresh
     /// formatter is created per call — `ISO8601DateFormatter` is a mutable,
     /// non-`Sendable` class, and encode/decode can run concurrently.
-    static func makeISO8601Formatter() -> ISO8601DateFormatter {
+    public static func makeISO8601Formatter() -> ISO8601DateFormatter {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return formatter

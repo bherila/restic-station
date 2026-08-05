@@ -226,13 +226,23 @@ public struct RunStore: Sendable {
 
     // MARK: - Reads
 
-    /// Reads `runs/index.jsonl` tail, newest first. Tolerates a truncated
-    /// or corrupt line (e.g. from a crash mid-append): such lines are
-    /// skipped with a warning to stderr; this method never throws because
-    /// of malformed index content.
-    public func recentRuns(limit: Int) throws -> [RunIndexEntry] {
+    /// Reads `runs/index.jsonl` tail, newest first, optionally restricted to
+    /// one backup set. Tolerates a truncated or corrupt line (e.g. from a
+    /// crash mid-append): such lines are skipped with a warning to stderr;
+    /// this method never throws because of malformed index content.
+    ///
+    /// When `setId` is given, the filter is applied **before** `limit`
+    /// truncates the result. `readIndexEntries()` decodes the entire file
+    /// regardless of `limit` (there is no way to stop early on a `.jsonl`
+    /// tail without an index), so there is no cost saved by truncating
+    /// first — and truncating first is actively wrong: a quiet set's whole
+    /// history can be newer than nothing and still get crowded out of a
+    /// shared, unfiltered window by busier sets' more numerous newer runs.
+    /// `runs list --set` (T27, issue #29 finding 3) depends on this order.
+    public func recentRuns(setId: UUID? = nil, limit: Int) throws -> [RunIndexEntry] {
         let entries = try readIndexEntries()
-        return Array(entries.reversed().prefix(max(limit, 0)))
+        let scoped = setId.map { id in entries.filter { $0.setId == id } } ?? entries
+        return Array(scoped.reversed().prefix(max(limit, 0)))
     }
 
     /// Most recent index entry for `setId`/`kind`, or `nil` if none.

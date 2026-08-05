@@ -146,6 +146,119 @@ private func baseConfig() -> AppConfig {
     }
 }
 
+// MARK: - Summary (config import, T27)
+
+@Suite struct ConfigDiffSummaryTests {
+    @Test func identicalConfigsProduceAnEmptySummary() {
+        let summary = ConfigDiff.summarize(from: baseConfig(), to: baseConfig())
+        #expect(summary.isEmpty)
+        #expect(summary.lines.isEmpty)
+    }
+
+    @Test func addedAndRemovedSetsAreReported() {
+        var new = baseConfig()
+        var extra = baseSet()
+        extra.id = UUID(uuidString: "66666666-6666-6666-6666-666666666666")!
+        extra.name = "Photos"
+        extra.destinations[0].id = UUID(uuidString: "77777777-7777-7777-7777-777777777777")!
+        new.sets.append(extra)
+
+        let addedSummary = ConfigDiff.summarize(from: baseConfig(), to: new)
+        #expect(addedSummary.added.map(\.name) == ["Photos"])
+        #expect(addedSummary.removed.isEmpty)
+        #expect(addedSummary.lines.contains { $0.contains("added set \"Photos\"") })
+
+        let removedSummary = ConfigDiff.summarize(from: new, to: baseConfig())
+        #expect(removedSummary.removed.map(\.name) == ["Photos"])
+        #expect(removedSummary.lines.contains { $0.contains("removed set \"Photos\"") })
+    }
+
+    @Test func aChangedSetNamesEveryDifferingField() {
+        var new = baseConfig()
+        new.sets[0].schedule = .hourly(minute: 5)
+        new.sets[0].sources.append("/Users/someone/Documents")
+
+        let summary = ConfigDiff.summarize(from: baseConfig(), to: new)
+        #expect(summary.changed.count == 1)
+        #expect(summary.changed[0].id == setId)
+        #expect(Set(summary.changed[0].changedFields) == ["schedule", "sources"])
+    }
+
+    /// Unlike `isScheduleRelevantChange`, a bare rename IS reported here —
+    /// this summary is for a human deciding whether an import looks right,
+    /// not for the scheduler.
+    @Test func aRenameIsReportedAsChanged() {
+        var new = baseConfig()
+        new.sets[0].name = "Work Projects"
+        let summary = ConfigDiff.summarize(from: baseConfig(), to: new)
+        #expect(summary.changed.map(\.changedFields) == [["name"]])
+    }
+
+    @Test func resticPathChangeIsReportedSeparatelyFromSets() {
+        var new = baseConfig()
+        new.resticPath = "/usr/local/bin/restic"
+        let summary = ConfigDiff.summarize(from: baseConfig(), to: new)
+        #expect(summary.resticPathChanged)
+        #expect(summary.changed.isEmpty)
+        #expect(summary.lines == ["~ resticPath changed"])
+    }
+
+    /// `config import`'s `old` is whatever is currently on disk, read
+    /// *without* `AppConfig.validate()` (`ConfigImport.loadExistingForDiff`)
+    /// — exactly so a broken `config.json` can still be diffed and
+    /// replaced. A config with duplicate set ids decodes fine and is
+    /// exactly the broken state `config import` exists to recover from;
+    /// `Dictionary(uniqueKeysWithValues:)` traps the whole process on a
+    /// duplicate key, which would make `summarize` — and therefore `config
+    /// import` — unusable against that input. This must not crash.
+    @Test func duplicateSetIdsInTheExistingConfigDoNotCrashTheDiff() {
+        var duplicated = baseConfig()
+        var secondCopy = baseSet()
+        secondCopy.name = "Projects (duplicate)"
+        duplicated.sets.append(secondCopy) // same id as baseSet(), on purpose
+
+        // Must not trap — `Dictionary(uniqueKeysWithValues:)`'s crash on a
+        // duplicate key is the historical bug. `old` and `new` both carry
+        // the duplicate, so both dictionary constructions are exercised.
+        // The result is well-defined, not incidental: `oldByID`'s
+        // last-wins pick is `secondCopy`, so the array's *first* entry
+        // (matched against that pick while iterating `new.sets`, which
+        // still holds both raw entries) differs by name and is reported
+        // changed; the second entry, which IS the last-wins pick, compares
+        // equal to itself.
+        let summary = ConfigDiff.summarize(from: duplicated, to: duplicated)
+        #expect(summary.changed.count == 1)
+        #expect(summary.changed[0].changedFields == ["name"])
+    }
+
+    /// Last-wins is the documented tie-break: a set matched by id against a
+    /// duplicated `old` diffs against the *last* occurrence in `old.sets`.
+    @Test func duplicateSetIdsResolveLastWinsForTheDiff() {
+        var old = baseConfig()
+        var firstCopy = baseSet()
+        firstCopy.sources = ["/first"]
+        var secondCopy = baseSet()
+        secondCopy.sources = ["/second"]
+        old.sets = [firstCopy, secondCopy] // same id, both entries
+
+        var new = baseConfig()
+        new.sets[0].sources = ["/second"] // matches the LAST copy in old, not the first
+
+        let summary = ConfigDiff.summarize(from: old, to: new)
+        // If the diff had matched the first (not last) occurrence, sources
+        // would differ ("/first" -> "/second") and this set would be
+        // reported changed.
+        #expect(summary.changed.isEmpty)
+    }
+
+    @Test func machineOverrideChangesAreReportedOnTheSet() {
+        var new = baseConfig()
+        new.sets[0].machines = ["linux-nas": BackupSetMachineOverride(enabled: false)]
+        let summary = ConfigDiff.summarize(from: baseConfig(), to: new)
+        #expect(summary.changed.map(\.changedFields) == [["machines"]])
+    }
+}
+
 @Suite struct ConfigDiffIrrelevantTests {
     @Test func menuBarToggleIsNotRelevant() {
         var new = baseConfig()
