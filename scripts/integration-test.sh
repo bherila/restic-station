@@ -361,8 +361,9 @@ seed_file_secrets() {
 
 # Picks the secret backend for the runs-1-4 scenario: keychain on macOS
 # (the platform it actually ships on), FileSecretStore on Linux (there is no
-# keychain). Must run AFTER build_helper — the Linux path needs $HELPER to
-# seed secrets via `secret set`.
+# keychain). Must run AFTER build_helper AND after write_config — the Linux
+# path needs $HELPER to seed via `secret set`, which in turn refuses a --dest
+# that is not already a configured destination.
 setup_secret_backend() {
     if [[ "$OS_NAME" == "Darwin" ]]; then
         setup_keychain_access
@@ -985,8 +986,12 @@ main() {
     log "Platform: $OS_NAME"
     setup_workspace
     build_helper
-    setup_secret_backend
+    # write_config BEFORE setup_secret_backend: the Linux path seeds through
+    # `secret set --dest <id>`, which refuses an id that is not a configured
+    # destination. macOS seeds with `security add-generic-password`, which has
+    # no such check, so this ordering only ever mattered on Linux.
     write_config "null"
+    setup_secret_backend
     init_primary
     init_secondary
 
