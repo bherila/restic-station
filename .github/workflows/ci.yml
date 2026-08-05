@@ -350,11 +350,26 @@ jobs:
         with:
           name: restic-station-linux
           path: dist
+      # NOT `apt-get install restic`: Ubuntu 24.04 LTS ships restic 0.16.4,
+      # below the 0.17.0 minimum in docs/restic-cli.md §version that
+      # ResticDiscovery enforces. The apt build is fine for the scenarios
+      # that pin `resticPath` in config.json (an explicit path bypasses the
+      # version gate), but the T29 fixture flow imports a Mac-authored config
+      # with `resticPath: null` and therefore exercises real discovery — which
+      # correctly rejects 0.16.4 and reports "restic not found". Install the
+      # official release so CI tests the version a user is told to run.
       - name: Install restic + jq
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends restic jq
+          sudo apt-get install -y -qq --no-install-recommends jq bzip2
+          curl -fsSL -o /tmp/restic.bz2 \
+            "https://github.com/restic/restic/releases/download/v${RESTIC_VERSION}/restic_${RESTIC_VERSION}_linux_${RESTIC_ARCH}.bz2"
+          bunzip2 -f /tmp/restic.bz2
+          sudo install -m 0755 /tmp/restic /usr/bin/restic
           restic version
+        env:
+          RESTIC_VERSION: 0.18.1
+          RESTIC_ARCH: arm64
       - name: Unpack the aarch64 tarball
         run: tar xzf dist/restic-station-linux-aarch64.tar.gz -C dist
       - name: ldd confirms no dynamic dependencies

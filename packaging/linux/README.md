@@ -7,9 +7,28 @@ required: `restic-station-helper` is the only thing in this tarball that has
 to run, and it runs standalone (see **Static build** below).
 
 Restic Station wraps an off-the-shelf `restic` binary already on the system
-(`restic >= 0.18`) — it never bundles or manages restic itself. Install
-restic first (your distro's package manager, or the [official
-releases](https://github.com/restic/restic/releases)).
+— it never bundles or manages restic itself. Install restic first, and note
+the minimum version: **restic 0.17.0 or newer** (`docs/restic-cli.md`
+§version — it is the first release with the exit-code contract this tool
+relies on). Anything older is rejected during discovery and reported as
+"restic not found", which reads confusingly if you just installed it.
+
+> **Your distro's package is probably too old.** Ubuntu 24.04 LTS ships
+> restic **0.16.4**, and Debian stable is comparable. `apt install restic`
+> therefore gets you a restic this tool will not use. Prefer the [official
+> release binaries](https://github.com/restic/restic/releases):
+>
+> ```sh
+> curl -fsSL -o restic.bz2 \
+>   https://github.com/restic/restic/releases/download/v0.18.1/restic_0.18.1_linux_amd64.bz2
+> bunzip2 restic.bz2 && sudo install -m 0755 restic /usr/local/bin/restic
+> ```
+>
+> (Swap `amd64` for `arm64` on aarch64.) Check with `restic version`.
+
+If you must use an older restic deliberately, setting `resticPath`
+explicitly in `config.json` bypasses the version check — but you are then
+outside what this tool is tested against.
 
 ## Contents
 
@@ -38,7 +57,9 @@ tells you and prints the line to add to your shell profile.
 
 ## First run
 
-1. Confirm restic is on `PATH`: `restic version` (>= 0.18).
+1. Confirm restic is on `PATH`: `restic version` — 0.17.0 is the minimum,
+   0.18 or newer is recommended (see the version note above; the distro
+   package is very likely too old).
 2. Get a `config.json` onto this machine. Two ways:
    - **Moved from another machine** (the headline M5 story — author backup
      sets on the Mac app, then bring the same fleet-wide config here):
