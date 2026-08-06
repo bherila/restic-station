@@ -505,12 +505,16 @@ struct StatusReport: Encodable {
         lines.append("machine \"\(machineId)\" — \(health)"
             + (fullDiskAccessDenied ? " (Full Disk Access denied)" : ""))
         if let scheduler {
-            switch scheduler.healthy {
-            case true:
-                lines.append("scheduler (\(scheduler.kind)): scheduled backups will happen")
-            case false:
-                lines.append("scheduler (\(scheduler.kind)): SCHEDULED BACKUPS WILL NOT HAPPEN")
-            case nil:
+            // `if let` rather than `switch` over the `Bool?`. Swift 6.3
+            // accepts `case true / case false / case nil` as exhaustive;
+            // Swift 6.1 — which the `linux` CI container and the macos-15
+            // runner's Xcode both use — does not, and rejects it outright.
+            // The oldest toolchain this project builds on wins.
+            if let healthy = scheduler.healthy {
+                lines.append(healthy
+                    ? "scheduler (\(scheduler.kind)): scheduled backups will happen"
+                    : "scheduler (\(scheduler.kind)): SCHEDULED BACKUPS WILL NOT HAPPEN")
+            } else {
                 lines.append("scheduler: could not be determined on this host")
             }
             for summary in scheduler.summaries {

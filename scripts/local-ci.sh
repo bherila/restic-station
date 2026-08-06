@@ -32,6 +32,22 @@
 #     Note the static SDK ships no swift-testing module, so Linux-only *test*
 #     code is not type-checked here at all — only sources are.
 #
+#     THE TOOLCHAIN VERSIONS DIFFER FROM CI, and it has already bitten:
+#     this cross-compile uses the pinned swift.org 6.3.3, while the `linux`
+#     job builds in a `swift:6.1` container and macos-15's Xcode is older
+#     than a current local one. A `switch` over a `Bool?` with
+#     `case true/false/nil` compiles clean on 6.3 and is rejected as
+#     non-exhaustive by 6.1 — it passed everything below and failed both CI
+#     build steps. A green run here does not mean the oldest supported
+#     toolchain accepts the code.
+#
+# NOT COVERED — shell portability. Every Layer-2 script runs on both
+# platforms in CI but only ever the macOS branch here, so a BSD-vs-GNU
+# divergence passes silently. This has also already bitten: `stat -f '%Lp'
+# … || stat -c '%a' …` looks like a portable idiom and is not — on GNU
+# coreutils `-f` means "file system status", so it *succeeds* on Linux and
+# the fallback never runs.
+#
 # NOT COVERED — needs a Linux host, and nothing here substitutes for it:
 #   - every runtime assertion in the `linux` job (discovery messages, timer
 #     install/status behaviour, fda-check no-op, rendered units parsing)

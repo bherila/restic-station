@@ -817,8 +817,19 @@ assert_unreadable_run_index_fails_loudly() {
 
     local index="$DATA_DIR/runs/index.jsonl"
     [[ -f "$index" ]] || fail "$step" "expected an index to exist by now: $index"
+    # `stat` is not portable here, and the usual `stat -f … || stat -c …`
+    # idiom is actively wrong: on GNU coreutils `-f` means "file system
+    # status", so it *succeeds* on Linux, prints a block of filesystem
+    # information, and the `||` fallback never runs — which is exactly how
+    # this line reached CI, passing on macOS and feeding `chmod` a paragraph
+    # about ext4 on Linux. Branch on the platform explicitly instead.
     local saved_mode
-    saved_mode="$(stat -f '%Lp' "$index" 2>/dev/null || stat -c '%a' "$index")"
+    if [[ "$OS_NAME" == "Darwin" ]]; then
+        saved_mode="$(stat -f '%Lp' "$index")"
+    else
+        saved_mode="$(stat -c '%a' "$index")"
+    fi
+    [[ "$saved_mode" =~ ^[0-7]{3,4}$ ]] || fail "$step" "could not read the index file's mode: '$saved_mode'"
     chmod 000 "$index"
 
     local out rc
