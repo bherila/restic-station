@@ -420,6 +420,19 @@ jobs:
           systemctl --user status 2>&1 || true
           loginctl show-user "$(whoami)" 2>&1 || true
 
+      # T30 (issue #32): docs/linux.md prints real terminal transcripts, not
+      # paraphrases — this is the only real (non-container) Linux host with
+      # real restic this project's CI has. scripts/linux-docs-transcript.sh
+      # runs the exact commands docs/linux.md quotes against the STATIC
+      # release binary and echoes each one before running it, so this step's
+      # log IS the source for every transcript in that doc: if a command's
+      # output ever changes, this step's log changes with it. jq was
+      # installed by the "Install restic + jq" step above.
+      - name: Docs transcript for docs/linux.md
+        run: |
+          scripts/linux-docs-transcript.sh \
+            "$PWD/dist/restic-station-linux-aarch64/restic-station-helper"
+
   # T29: proves the release binary is genuinely static — not just built with
   # a static-looking flag — by running it in the three environments issue
   # #31 names. Full three-environment sweep on x86_64 (broadest image
