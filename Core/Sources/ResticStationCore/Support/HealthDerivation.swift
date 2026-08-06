@@ -334,17 +334,47 @@ public enum HealthDerivation {
         if !liveRuns.isEmpty || setHealths.contains(where: \.isRunning) {
             return .running
         }
+        if hasWarningConditions(
+            setHealths: setHealths,
+            runsInFlight: runsInFlight,
+            fullDiskAccessDenied: fullDiskAccessDenied,
+            backgroundAgentEnabled: backgroundAgentEnabled,
+            isRunAbandoned: isRunAbandoned
+        ) {
+            return .warning
+        }
+        return .idle
+    }
+
+    /// The warning conditions **on their own**, with the `.running`
+    /// precedence removed.
+    ///
+    /// `appHealth` is a single glyph for a menu bar, so one state has to win
+    /// and `.running` reasonably does: while restic is working, "working" is
+    /// the more informative thing to show. An exit code is not a glyph. A
+    /// monitoring script asking "is anything wrong here?" during a
+    /// three-hour backup must still be told that the timer is disabled, and
+    /// `health == .warning` cannot tell it — `.running` got there first.
+    ///
+    /// So `status` exits on this, and the menu bar renders `appHealth`. Same
+    /// inputs, same rules, different question. Keeping them as two functions
+    /// over one shared predicate is what stops them drifting: there is no
+    /// second copy of "what counts as a problem".
+    public static func hasWarningConditions(
+        setHealths: [SetHealth],
+        runsInFlight: [CurrentRunState],
+        fullDiskAccessDenied: Bool,
+        backgroundAgentEnabled: Bool?,
+        isRunAbandoned: (CurrentRunState) -> Bool = { _ in false }
+    ) -> Bool {
         // An abandoned run for a set that is no longer configured has no
         // `SetHealth` to carry it, so it is counted here directly — otherwise
         // deleting a set would be a way to silence the warning about the run
         // it was killed in the middle of.
-        let abandonedRuns = runsInFlight.count - liveRuns.count
-        if setHealths.contains(where: \.needsAttention)
+        let abandonedRuns = runsInFlight.filter(isRunAbandoned).count
+        return setHealths.contains(where: \.needsAttention)
             || abandonedRuns > 0
             || fullDiskAccessDenied
-            || backgroundAgentEnabled == false {
-            return .warning
-        }
-        return .idle
+            || backgroundAgentEnabled == false
     }
 }

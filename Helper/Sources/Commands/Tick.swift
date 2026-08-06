@@ -30,7 +30,19 @@ struct Tick: AsyncParsableCommand {
         // written even when no sets or restic are configured yet.
         FdaCheck.probeAndRecord(context: "launchd", stateStore: StateStore(paths: paths))
 
-        // ── Step 2: load config, resolve it for this machine; no config or
+        // ── Step 2: recover interrupted runs. ────────────────────────────
+        //
+        // Hoisted above the config and restic gates below, which it used to
+        // sit after (it was step 3). Crash recovery needs only `RunStore` and `StateStore` —
+        // no config, no restic — and the states where those gates return
+        // early are exactly the ones where wreckage is most likely to be
+        // stranded: the killed run's set was deleted afterwards, or restic
+        // was uninstalled. Running it last meant `status` stayed in warning
+        // forever on those hosts, contradicting this project's own promise
+        // that the next tick clears it. Found by `@codex review` on #51.
+        recoverInterruptedRuns(paths: paths)
+
+        // ── Step 3: load config, resolve it for this machine; no config or
         // no sets that run here → exit 0. ────────────────────────────────
         let configStore = ConfigStore(paths: paths)
         let views: HelperContext.Views
@@ -62,17 +74,6 @@ struct Tick: AsyncParsableCommand {
             // has nothing to do.
             print(HelperContext.resticNotFoundMessage(paths: paths))
             return
-        }
-
-        // ── Step 3: recover interrupted runs. ────────────────────────────
-        do {
-            let recovered = try context.runStore.recoverInterrupted()
-            for run in recovered {
-                print("recovered interrupted run \(run.runId)")
-                clearAbandonedProgress(for: run, stateStore: context.stateStore, paths: paths)
-            }
-        } catch {
-            FileHandle.standardError.write(Data("tick: could not recover interrupted runs: \(error)\n".utf8))
         }
 
         // ── Step 4/5: sequential due sets (config order). ────────────────
@@ -140,6 +141,22 @@ struct Tick: AsyncParsableCommand {
         // ── Step 7: tick.lock released by the `defer` above; exit 0. ────
     }
 
+    /// Rewrites dead runs as `failed` and clears the progress files they
+    /// left behind. Needs only `RunStore`/`StateStore`, which is why it runs
+    /// before this tick has a config or a restic binary.
+    private func recoverInterruptedRuns(paths: AppPaths) {
+        let runStore = RunStore(paths: paths)
+        let stateStore = StateStore(paths: paths)
+        do {
+            for run in try runStore.recoverInterrupted() {
+                print("recovered interrupted run \(run.runId)")
+                clearAbandonedProgress(for: run, stateStore: stateStore, paths: paths)
+            }
+        } catch {
+            FileHandle.standardError.write(Data("tick: could not recover interrupted runs: \(error)\n".utf8))
+        }
+    }
+
     /// Deletes the `state/current-run-<setId>.json` a killed run left behind,
     /// once `recoverInterrupted()` has established the run really is dead.
     ///
@@ -152,12 +169,27 @@ struct Tick: AsyncParsableCommand {
     /// time is not the same as clearing it: this is what makes the warning go
     /// away once it has been acted on.
     ///
-    /// The `runId` guard is the whole safety of this: a *newer* run for the
-    /// same set may already be underway (the crash was days ago; this tick
-    /// only just noticed), and deleting its live progress file would break
-    /// the running backup's UI and make the health checks lie in the other
-    /// direction.
+    /// **Under the set lock**, which is the only thing that makes the
+    /// `runId` guard sound. A newer run for the same set may already be
+    /// underway (the crash was days ago; this tick only just noticed), and
+    /// deleting its live progress would break the running backup's UI and
+    /// make the health checks lie in the other direction. Comparing and then
+    /// deleting without the lock left a window where a manual `run-set`
+    /// could write its first phase marker in between and have it deleted —
+    /// `tick.lock` does not exclude manual operations, so that race was
+    /// real (`@codex review` on #51).
+    ///
+    /// Holding the lock inverts it: a live run for this set holds the same
+    /// lock for its whole duration (`BackupEngine.makeSetLock`), so failing
+    /// to acquire it *is* the answer — someone is running, the file is
+    /// theirs, leave it alone.
     private func clearAbandonedProgress(for run: RecoveredRun, stateStore: StateStore, paths: AppPaths) {
+        let lock = FileLock(path: paths.setLockFile(setId: run.setId))
+        guard lock.tryAcquire() else { return }
+        defer { lock.release() }
+
+        // Re-read inside the lock: whatever was there before we held it is
+        // not evidence of anything.
         guard let current = stateStore.readCurrentRun(setId: run.setId) else { return }
         guard current.runId == run.runId else { return }
         do {

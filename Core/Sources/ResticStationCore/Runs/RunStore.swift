@@ -284,7 +284,22 @@ public struct RunStore: Sendable {
     /// wrap and the consequence is a delayed warning, not a wrong backup.
     public func liveness(ofCurrentRun state: CurrentRunState) -> CurrentRunLiveness {
         guard let metadata = try? metadata(runId: state.runId) else { return .abandoned }
-        guard metadata.status == .running else { return .abandoned }
+        // The pid alone, deliberately — **not** `metadata.status == .running`
+        // as well.
+        //
+        // A set run is several child runs under one `current-run` file:
+        // `performChild` calls `RunStore.finish` (which moves that child's
+        // metadata off `.running`) while the file is only cleared by the
+        // *set*-level `defer`, and the next child's phase marker rewrites it
+        // moments later. Between those two points — extendable by up to
+        // `indexLockTimeout` seconds waiting on the index lock — the run is
+        // completing perfectly normally and the metadata says "not running".
+        // Requiring `.running` here reported that as abandoned wreckage and
+        // exited 1 on a healthy host mid-backup, which is crying wolf: the
+        // precise failure that teaches people to ignore a health check.
+        //
+        // Process liveness has no such window. The process is either there
+        // to finish the job and clean up, or it is not.
         return Self.isProcessAlive(pid: metadata.pid) ? .live : .abandoned
     }
 

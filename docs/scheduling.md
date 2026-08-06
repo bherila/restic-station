@@ -182,6 +182,8 @@ up", not "does a unit file exist":
 | `notActive` | not firing now |
 | `lingerDisabled` | systemd kills this user's units at logout — the single most common silent stop on a headless box |
 | `configUnreadable` | `config.json` will not parse, so every tick exits 1 |
+| `dataDirectoryMismatch` | the unit pins a *different* data directory than this command reads — the timer is fine, and ticks somewhere else |
+| `dataDirectoryUnpinned` | the unit pins none, so the tick re-derives it from the user manager's environment (a unit written before #48) |
 
 One deliberate exception: a linger state of **`unknown`** — neither
 `loginctl` nor `/var/lib/systemd/linger` could be consulted, as inside a
@@ -200,6 +202,15 @@ disagree. Three distinct answers, and only one of them is a finding:
 | `null` | this platform has no CLI-readable scheduler (macOS: `SMAppService` state is app-only) |
 | `{"kind": "unknown", "healthy": null, …}` | no systemd here; the documented fallback is a cron line, which nothing can inspect |
 | `{"kind": "systemd-timer", "healthy": false, "problems": [...], …}` | a real finding — `status` exits 1 |
+
+`status`'s **exit code is not `health == "warning"`.** `AppHealth` is a single
+glyph for a menu bar, so `running` outranks `warning` there — correctly: while
+restic is working, "working" is the more informative thing to show. An exit
+code is not a glyph, and a three-hour backup must not be able to hide a
+disabled timer from a monitoring script for three hours. `status` therefore
+exits on `HealthDerivation.hasWarningConditions`, which is the same rules
+without that precedence. Both read one shared predicate, so "what counts as a
+problem" has exactly one definition.
 
 The `null`/`unknown` cases contribute nothing to health, exactly as an absent
 `fda-check.json` does. `status` used to assert `backgroundAgentEnabled: true`

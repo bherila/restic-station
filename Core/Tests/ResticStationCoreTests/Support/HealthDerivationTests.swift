@@ -585,6 +585,72 @@ private func currentRun(percentDone: Double, phase: String = "backing-up-primary
         ) == .running)
     }
 
+    // MARK: The exit code is not the glyph (@codex review on #51)
+
+    /// `.running` outranking `.warning` is right for a menu bar and wrong
+    /// for an exit code. A three-hour backup must not be able to hide a
+    /// disabled timer from a monitoring script for three hours — that is the
+    /// same "green while backups are stopping" failure this whole change is
+    /// about, arriving through the front door.
+    @Test("a live run hides a broken scheduler from the glyph, never from the exit code")
+    func runningMasksTheGlyphButNotTheExitCode() {
+        let live = currentRun(percentDone: 0.5)
+
+        // The menu bar still says "working" — deliberately unchanged.
+        #expect(HealthDerivation.appHealth(
+            setHealths: [health(running: true)],
+            runsInFlight: [live],
+            fullDiskAccessDenied: false,
+            backgroundAgentEnabled: false
+        ) == .running)
+
+        // The exit code still says "something is wrong here".
+        #expect(HealthDerivation.hasWarningConditions(
+            setHealths: [health(running: true)],
+            runsInFlight: [live],
+            fullDiskAccessDenied: false,
+            backgroundAgentEnabled: false
+        ))
+    }
+
+    @Test("with nothing wrong, a live run reports no warning conditions either")
+    func aLiveRunAloneIsNotAWarning() {
+        #expect(HealthDerivation.hasWarningConditions(
+            setHealths: [health(running: true)],
+            runsInFlight: [currentRun(percentDone: 0.5)],
+            fullDiskAccessDenied: false,
+            backgroundAgentEnabled: true
+        ) == false)
+    }
+
+    @Test("appHealth and hasWarningConditions cannot disagree about what is a problem")
+    func theTwoQuestionsShareOneDefinition() {
+        // Every warning input, with nothing running: the two must agree,
+        // which is what makes keeping them separate safe.
+        let cases: [(String, [SetHealth], Bool, Bool?)] = [
+            ("failed run", [health(failed: true)], false, true),
+            ("stale destination", [health(stale: true)], false, true),
+            ("fda denied", [health()], true, true),
+            ("scheduler broken", [health()], false, false),
+            ("nothing wrong", [health()], false, true),
+        ]
+        for (label, setHealths, fda, agent) in cases {
+            let glyph = HealthDerivation.appHealth(
+                setHealths: setHealths,
+                runsInFlight: [],
+                fullDiskAccessDenied: fda,
+                backgroundAgentEnabled: agent
+            )
+            let exits = HealthDerivation.hasWarningConditions(
+                setHealths: setHealths,
+                runsInFlight: [],
+                fullDiskAccessDenied: fda,
+                backgroundAgentEnabled: agent
+            )
+            #expect((glyph == .warning) == exits, "\(label): glyph \(glyph), exit-worthy \(exits)")
+        }
+    }
+
     @Test("deleting the set is not a way to silence its abandoned run")
     func abandonedRunForADeletedSetIsStillAWarning() {
         // No `SetHealth` carries this one — the set is gone from the config —

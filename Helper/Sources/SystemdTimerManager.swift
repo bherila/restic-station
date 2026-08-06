@@ -38,6 +38,13 @@ struct SystemdTimerManager {
     /// forever.
     private static let commandTimeout: TimeInterval = 30
 
+    /// The per-command bound in `verdictOnly` mode. `status` is documented
+    /// as a cheap check safe to run as often as a monitoring system likes,
+    /// and a monitoring system that runs it every minute must not be able to
+    /// accumulate overlapping helper processes against a wedged user bus.
+    /// Three calls at 5s is a worst case a per-minute check survives.
+    static let verdictOnlyTimeout: TimeInterval = 5
+
     var serviceUnitURL: URL {
         unitDirectory.appendingPathComponent(SystemdCommand.serviceUnitName, isDirectory: false)
     }
@@ -189,10 +196,19 @@ struct SystemdTimerManager {
     /// - Returns: every reason scheduled backups will not happen on this
     ///   host, empty when there are none. `timer status` maps that onto its
     ///   exit code so a monitoring script can use it.
+    ///   - verdictOnly: skip everything that only produces prose. `status`
+    ///     (the monitoring command) discards this method's log output
+    ///     entirely and wants the verdict; running `list-timers` for it —
+    ///     the slowest call here, and pure narrative — is waste that a
+    ///     wedged D-Bus turns into a stall. Also shortens the per-command
+    ///     timeout, so the whole probe is bounded by
+    ///     `verdictOnlyTimeout × 3` rather than `commandTimeout × 4` plus
+    ///     termination grace (`@codex review` on #51).
     func status(
         helperPath: String? = nil,
         dataDirectory: String? = nil,
         activity: TimerActivity,
+        verdictOnly: Bool = false,
         log: (String) -> Void
     ) async -> TimerHealth {
         log("Restic Station — systemd --user timer")
@@ -241,14 +257,39 @@ struct SystemdTimerManager {
             log("  interval    every \(interval) (OnUnitActiveSec)")
         }
 
-        let enabled = await word(systemctl, SystemdCommand.isEnabledArgv)
-        let active = await word(systemctl, SystemdCommand.isActiveArgv)
+        // The unit is global to this user; the data directory is not. A
+        // timer installed for /srv/a is enabled and active while `status`
+        // asks about /srv/b — and answering "healthy" there says scheduled
+        // backups will happen for a directory nothing ticks. Compare what
+        // the unit actually pins against what this invocation resolved
+        // (`@codex review` on #51).
+        if hasService, let dataDirectory, !dataDirectory.isEmpty {
+            let installed = Self.installedDataDirectory(serviceUnitURL: serviceUnitURL)
+            if let installed, installed != dataDirectory {
+                log("  data dir    MISMATCH")
+                log("                this command:  \(dataDirectory)")
+                log("                the timer's:   \(installed)")
+                log("                fix: restic-station-helper timer install (from this environment)")
+                problems.append(.dataDirectoryMismatch)
+            } else if installed == nil {
+                log("  data dir    the unit pins none — the tick will re-derive it from the")
+                log("                systemd user manager's environment, not this one")
+                log("                fix: restic-station-helper timer install (from this environment)")
+                problems.append(.dataDirectoryUnpinned)
+            } else {
+                log("  data dir    \(dataDirectory) (pinned in the unit)")
+            }
+        }
+
+        let timeout = verdictOnly ? Self.verdictOnlyTimeout : Self.commandTimeout
+        let enabled = await word(systemctl, SystemdCommand.isEnabledArgv, timeout: timeout)
+        let active = await word(systemctl, SystemdCommand.isActiveArgv, timeout: timeout)
         log("  enabled     \(enabled ?? "unknown")")
         log("  active      \(active ?? "unknown")")
         if enabled != "enabled" { problems.append(.notEnabled) }
         if active != "active" { problems.append(.notActive) }
 
-        let linger = await lingerState()
+        let linger = await lingerState(timeout: timeout)
         switch linger {
         case .enabled:
             log("  linger      enabled — user units keep running after logout")
@@ -269,7 +310,9 @@ struct SystemdTimerManager {
             // has logind and told us the answer — fails.
         }
 
-        if hasTimer {
+        // Narrative only, and the slowest call here — skipped for a caller
+        // that discards the log.
+        if hasTimer, !verdictOnly {
             log("")
             log("  next firing")
             let timers = try? await run(systemctl, SystemdCommand.listTimersArgv)
@@ -312,6 +355,34 @@ struct SystemdTimerManager {
         }
     }
 
+    /// The `RESTIC_STATION_DATA_DIR` the installed service unit pins, or
+    /// `nil` when it pins none. Reads the unit rather than asking systemd:
+    /// the file is the thing `timer install` wrote and the thing the tick
+    /// will run from.
+    ///
+    /// Undoes `SystemdCommand`'s two escaping layers in the reverse order
+    /// they were applied — systemd quoting, then `%%` specifier escaping —
+    /// so the comparison is against the real path.
+    static func installedDataDirectory(serviceUnitURL: URL) -> String? {
+        guard let text = try? String(contentsOf: serviceUnitURL, encoding: .utf8) else { return nil }
+        let prefix = "Environment="
+        for line in text.split(separator: "\n") {
+            let trimmedLine = line.trimmingCharacters(in: .whitespaces)
+            guard trimmedLine.hasPrefix(prefix) else { continue }
+            var value = String(trimmedLine.dropFirst(prefix.count))
+            if value.hasPrefix("\""), value.hasSuffix("\""), value.count >= 2 {
+                value = String(value.dropFirst().dropLast())
+                    .replacingOccurrences(of: "\\\"", with: "\"")
+                    .replacingOccurrences(of: "\\\\", with: "\\")
+            }
+            let assignment = "RESTIC_STATION_DATA_DIR="
+            guard value.hasPrefix(assignment) else { continue }
+            return String(value.dropFirst(assignment.count))
+                .replacingOccurrences(of: "%%", with: "%")
+        }
+        return nil
+    }
+
     /// `OnUnitActiveSec=` as actually installed, so status reports the truth
     /// rather than the default this build would have written.
     static func installedInterval(timerUnitURL: URL) -> String? {
@@ -336,9 +407,9 @@ struct SystemdTimerManager {
     /// marker file `loginctl enable-linger` actually creates. The fallback
     /// exists because `loginctl show-user` fails outright for a user with no
     /// current session — precisely the headless case this warning is for.
-    func lingerState() async -> LingerState {
+    func lingerState(timeout: TimeInterval = SystemdTimerManager.commandTimeout) async -> LingerState {
         if let loginctl = loginctlPath,
-           let result = try? await run(loginctl, SystemdCommand.lingerArgv(user: userName)),
+           let result = try? await run(loginctl, SystemdCommand.lingerArgv(user: userName), timeout: timeout),
            result.exitCode == 0 {
             let output = String(decoding: result.stdout, as: UTF8.self)
             if output.contains("Linger=yes") { return .enabled }
@@ -437,7 +508,11 @@ struct SystemdTimerManager {
         }
     }
 
-    private func run(_ executable: String, _ argv: [String]) async throws -> ProcessResult {
+    private func run(
+        _ executable: String,
+        _ argv: [String],
+        timeout: TimeInterval = SystemdTimerManager.commandTimeout
+    ) async throws -> ProcessResult {
         // `env: nil` inherits this process's environment on purpose:
         // `systemctl --user` finds its per-user manager through
         // `XDG_RUNTIME_DIR`/`DBUS_SESSION_BUS_ADDRESS`, and replacing the
@@ -448,15 +523,19 @@ struct SystemdTimerManager {
             currentDirectory: nil,
             onStdoutLine: nil,
             onStderrLine: nil,
-            timeout: Self.commandTimeout
+            timeout: timeout
         )
     }
 
     /// The single trimmed stdout word `is-enabled`/`is-active` print. Both
     /// exit non-zero to *report* ("disabled" exits 1), so the exit code is
     /// deliberately ignored here and only the word is used.
-    private func word(_ executable: String, _ argv: [String]) async -> String? {
-        guard let result = try? await run(executable, argv) else { return nil }
+    private func word(
+        _ executable: String,
+        _ argv: [String],
+        timeout: TimeInterval = SystemdTimerManager.commandTimeout
+    ) async -> String? {
+        guard let result = try? await run(executable, argv, timeout: timeout) else { return nil }
         let output = Self.trimmed(result.stdout)
         return output.isEmpty ? nil : output.split(separator: "\n").first.map(String.init)
     }
@@ -482,6 +561,8 @@ enum TimerProblem: String, Equatable, Sendable, CaseIterable {
     case notActive
     case lingerDisabled
     case configUnreadable
+    case dataDirectoryMismatch
+    case dataDirectoryUnpinned
 
     /// One line, no leading capital, safe to print after a dash.
     var summary: String {
@@ -501,6 +582,11 @@ enum TimerProblem: String, Equatable, Sendable, CaseIterable {
                 + "(`sudo loginctl enable-linger <user>`)"
         case .configUnreadable:
             return "the configuration could not be loaded, so every tick will fail"
+        case .dataDirectoryMismatch:
+            return "the installed timer ticks a different data directory than this command reads"
+        case .dataDirectoryUnpinned:
+            return "the installed timer pins no data directory, so the tick may resolve a "
+                + "different one — reinstall it with `timer install`"
         }
     }
 }

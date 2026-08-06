@@ -308,8 +308,17 @@ private final class TickCounter: @unchecked Sendable {
         #expect(store.liveness(ofCurrentRun: fresh) == .abandoned)
     }
 
-    @Test("a finished run's leftover progress file is abandoned")
-    func livenessOfAFinishedRun() throws {
+    /// The counterpart to `livenessOfADeadProcess`, and the reason liveness
+    /// is pid-only rather than pid-plus-`metadata.status`.
+    ///
+    /// A set run finishes each child (moving that child's metadata off
+    /// `.running`) long before the set-level `defer` clears `current-run` —
+    /// the next child's phase marker rewrites it in between. Treating "the
+    /// metadata is finished" as abandonment reported wreckage during a
+    /// perfectly normal multi-destination backup, and `status` exited 1 on a
+    /// healthy host. Found by `@codex review` on #51.
+    @Test("a still-running process's finished child run is live, not wreckage")
+    func livenessDuringNormalCompletion() throws {
         let paths = makePaths()
         defer { cleanup(paths) }
 
@@ -317,8 +326,24 @@ private final class TickCounter: @unchecked Sendable {
         let run = try store.begin(kind: .backup, setId: UUID(), destId: UUID(), trigger: .scheduled)
         try store.finish(run, status: .success)
 
-        // Our own pid is alive, so pid alone would say "live"; the run's
-        // recorded status is what settles it.
+        // Metadata is no longer `.running`, but this process — the one that
+        // owns the run and will clear the file — is very much alive.
+        #expect(store.liveness(ofCurrentRun: progress(runId: run.runId)) == .live)
+    }
+
+    @Test("a finished run whose process is gone is still abandoned")
+    func livenessOfAFinishedRunWithADeadProcess() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+
+        let store = RunStore(paths: paths, now: { Date() })
+        let run = try store.begin(kind: .backup, setId: UUID(), destId: UUID(), trigger: .scheduled)
+        try store.finish(run, status: .success)
+
+        var stuck = try store.metadata(runId: run.runId)
+        stuck.pid = 999_999
+        try writeRawMetadata(stuck, paths: paths)
+
         #expect(store.liveness(ofCurrentRun: progress(runId: run.runId)) == .abandoned)
     }
 

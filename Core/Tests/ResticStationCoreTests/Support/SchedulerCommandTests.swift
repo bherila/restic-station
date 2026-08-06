@@ -223,6 +223,32 @@ import Testing
         #expect(SystemdCommand.enableLingerCommandLine(user: "ben") == "sudo loginctl enable-linger ben")
     }
 
+    /// systemd expands `%h`, `%t` and friends inside unit values — including
+    /// inside quotes (`systemd.unit(5)` §Specifiers). A data directory with
+    /// a literal `%` in it was therefore silently rewritten, or dropped
+    /// entirely with "Failed to resolve specifiers … ignoring", while
+    /// `timer install` reported success. Found by `@codex review` on #51.
+    @Test("a percent sign in the pinned data directory is escaped, not expanded")
+    func percentInTheDataDirectoryIsEscaped() {
+        let unit = SystemdCommand.serviceUnit(
+            helperPath: "/usr/bin/restic-station-helper",
+            dataDirectory: "/srv/%home/state"
+        )
+        #expect(unit.contains("Environment=\"RESTIC_STATION_DATA_DIR=/srv/%%home/state\""))
+        // The unescaped form must not survive anywhere in the unit: `%h` is
+        // a real specifier and would expand to the user's home directory.
+        #expect(!unit.contains("/srv/%home/state"))
+    }
+
+    @Test("an ordinary data directory is not disturbed by the escaping")
+    func ordinaryDataDirectoryIsUnchanged() {
+        let unit = SystemdCommand.serviceUnit(
+            helperPath: "/usr/bin/restic-station-helper",
+            dataDirectory: "/srv/state/restic-station"
+        )
+        #expect(unit.contains("Environment=\"RESTIC_STATION_DATA_DIR=/srv/state/restic-station\""))
+    }
+
     @Test("the documented cron fallback is a single crontab line")
     func cronFallback() {
         #expect(SystemdCommand.cronFallbackLine(helperPath: "/usr/bin/restic-station-helper")

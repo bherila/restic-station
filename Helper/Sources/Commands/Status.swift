@@ -189,7 +189,20 @@ struct Status: AsyncParsableCommand {
             }
         }
 
-        HelperExit.code(health == .warning ? 1 : 0)
+        // Not `health == .warning`. `.running` outranks `.warning` in
+        // `appHealth` — correctly, for a menu bar glyph — so exiting on it
+        // would report a host healthy for the whole duration of a backup
+        // while its timer was disabled and no *next* backup would ever
+        // start. `hasWarningConditions` is the same rules without that
+        // precedence, which is the right question for an exit code.
+        let needsAttention = HealthDerivation.hasWarningConditions(
+            setHealths: setHealths,
+            runsInFlight: Array(currentRuns.values),
+            fullDiskAccessDenied: fdaDenied,
+            backgroundAgentEnabled: scheduler.flatMap(\.healthy),
+            isRunAbandoned: isRunAbandoned
+        )
+        HelperExit.code(needsAttention ? 1 : 0)
     }
 
     /// Is anything actually going to fire the tick on this host?
@@ -217,6 +230,10 @@ struct Status: AsyncParsableCommand {
             helperPath: nil,
             dataDirectory: paths.root.path,
             activity: TimerActivity(lines: []),
+            // Bounded: this discards the log entirely, so the narrative
+            // `list-timers` call is pure cost, and a wedged user bus must
+            // not be able to hold a monitoring check for minutes.
+            verdictOnly: true,
             log: { _ in }
         )
         // "No systemd here" is where `status` and `timer status` part ways,
@@ -531,7 +548,12 @@ struct StatusReport: Encodable {
                         + "(stopped at \(abandoned.phase), \(abandoned.percentDone)%)"
                 )
                 if let file = set.abandonedRunFile {
-                    lines.append("                 the next tick clears it; to clear it now: rm \(file)")
+                    // Quoted: a data directory may contain spaces, and this
+                    // is printed as a command for someone to paste. An
+                    // unquoted path with a `;` in it would run whatever
+                    // followed (`@codex review` on #51).
+                    lines.append("                 the next tick clears it; to clear it now: "
+                        + "rm \(ShellQuoting.quoteIfNeeded(file))")
                 }
             }
             for destination in set.destinations {

@@ -186,7 +186,17 @@ public enum SystemdCommand {
             lines.append("# The data directory `timer install` resolved, pinned here on purpose: a")
             lines.append("# --user service inherits the systemd user manager's environment, not the")
             lines.append("# shell's, so XDG_STATE_HOME and friends do not reach the tick.")
-            lines.append("Environment=\(quoted("RESTIC_STATION_DATA_DIR=\(dataDirectory)"))")
+            // `specifierEscaped` before `quoted`: systemd expands `%h`, `%t`
+            // and friends inside unit values *including* inside quotes
+            // (`systemd.unit(5)` §Specifiers), so a data directory
+            // containing a literal `%` is silently rewritten — `/srv/%home`
+            // becomes `/srv/<the user's home dir>ome` — or, for an unknown
+            // sequence, makes systemd drop the whole assignment with
+            // "Failed to resolve specifiers … ignoring". Either way
+            // `timer install` reports success and the timer ticks against
+            // the wrong directory, which is the exact silent-stop this
+            // pinning exists to prevent (`@codex review` on #51).
+            lines.append("Environment=\(quoted(specifierEscaped("RESTIC_STATION_DATA_DIR=\(dataDirectory)")))")
         }
         return lines.joined(separator: "\n") + "\n"
     }
@@ -321,6 +331,13 @@ public enum SystemdCommand {
         return needsQuoting ? quoted(value) : value
     }
 
+    /// `%%` is systemd's escape for a literal percent sign
+    /// (`systemd.unit(5)` §Specifiers). Applied *before* `quoted`, since
+    /// quoting does not disable specifier expansion.
+    static func specifierEscaped(_ value: String) -> String {
+        value.replacingOccurrences(of: "%", with: "%%")
+    }
+
     static func quoted(_ value: String) -> String {
         var escaped = ""
         for character in value {
@@ -333,17 +350,10 @@ public enum SystemdCommand {
     }
 
     /// POSIX-shell quoting for the cron line, which cron hands to `/bin/sh`.
-    /// Single quotes (with the `'\''` dance) rather than double, because
-    /// inside single quotes nothing at all is special to `sh` — no `$`, no
-    /// backtick, no backslash — and a data directory is user-supplied text.
-    ///
-    /// Left bare when the value is made only of characters that are already
-    /// literal to `sh`, so the common case stays a copy-pasteable one-liner
-    /// rather than a wall of punctuation.
+    /// The rule is shared with every other command this project prints for a
+    /// human to paste — see `ShellQuoting`.
     static func shellQuoteIfNeeded(_ value: String) -> String {
-        let safe = Set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-./:=@,+")
-        guard value.isEmpty || value.contains(where: { !safe.contains($0) }) else { return value }
-        return "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        ShellQuoting.quoteIfNeeded(value)
     }
 
     /// `crontab(5)`: an unescaped `%` in the command field is replaced by a

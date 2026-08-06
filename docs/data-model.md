@@ -354,6 +354,16 @@ still alive before treating it as in flight —
 died. Not alive ⟹ the set reports `needsAttention` with the file named, not
 `isRunning`.
 
+**The pid alone decides it — deliberately not the recorded `status` as well.**
+A set run is several child runs under one `current-run` file: `performChild`
+calls `RunStore.finish` (moving that child's metadata off `running`) while the
+file is cleared only by the set-level `defer`, and the next child's phase
+marker rewrites it moments later. Requiring `status == running` reported that
+entirely normal interval as wreckage and exited 1 on a healthy host mid-backup.
+A missing run directory is still abandonment: `begin(...)` writes
+`metadata.json` before the first progress write, so a `current-run` pointing at
+a run this data directory has no record of describes nothing.
+
 Deliberately **not** a staleness rule on `updatedAt`. Progress is written only
 when restic emits a `status` line (throttled), and some phases legitimately
 emit nothing for hours — a `check --read-data` on a large repository writes

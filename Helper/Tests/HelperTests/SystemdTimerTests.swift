@@ -706,6 +706,163 @@ private func lingerResponder(_ value: String) -> @Sendable ([String]) -> Process
         #expect(log.text.contains("every tick will fail"))
     }
 
+    // MARK: The timer is global; the data directory is not (@codex review on #51)
+
+    /// A `systemd --user` timer is one unit per user. Ask `status` about
+    /// /srv/b while the installed timer ticks /srv/a and the unit is
+    /// genuinely enabled and active — so "healthy" is true of the unit and
+    /// false of the question that was asked.
+    @Test("a timer installed for another data directory is not healthy for this one")
+    func dataDirectoryMismatchIsNotHealthy() async throws {
+        let unitDirectory = try makeTempDirectory("units")
+        defer { try? FileManager.default.removeItem(at: unitDirectory) }
+        let manager = makeManager(
+            unitDirectory: unitDirectory,
+            runner: ScriptedProcessRunner(respond: statusResponder(enabled: "enabled", active: "active"))
+        )
+        try await manager.install(
+            helperPath: helperPath,
+            intervalMinutes: 2,
+            dataDirectory: "/srv/a/restic-station",
+            log: { _ in }
+        )
+
+        let log = LineSink()
+        let health = await manager.status(
+            dataDirectory: "/srv/b/restic-station",
+            activity: TimerActivity(lines: []),
+            log: { log.append($0) }
+        )
+
+        #expect(health.problems == [.dataDirectoryMismatch])
+        #expect(log.text.contains("data dir    MISMATCH"))
+        #expect(log.text.contains("/srv/a/restic-station"))
+        #expect(log.text.contains("/srv/b/restic-station"))
+    }
+
+    @Test("the same data directory is healthy, and says which one is pinned")
+    func matchingDataDirectoryIsHealthy() async throws {
+        let unitDirectory = try makeTempDirectory("units")
+        defer { try? FileManager.default.removeItem(at: unitDirectory) }
+        let manager = makeManager(
+            unitDirectory: unitDirectory,
+            runner: ScriptedProcessRunner(respond: statusResponder(enabled: "enabled", active: "active"))
+        )
+        try await manager.install(
+            helperPath: helperPath,
+            intervalMinutes: 2,
+            dataDirectory: "/srv/a/restic-station",
+            log: { _ in }
+        )
+
+        let log = LineSink()
+        let health = await manager.status(
+            dataDirectory: "/srv/a/restic-station",
+            activity: TimerActivity(lines: []),
+            log: { log.append($0) }
+        )
+
+        #expect(health.isHealthy)
+        #expect(log.text.contains("data dir    /srv/a/restic-station (pinned in the unit)"))
+    }
+
+    /// A unit written by a build from before the data directory was pinned.
+    /// It will re-derive the path from the user manager's environment, which
+    /// is exactly the silent-stop issue #48 is about — so it is a finding,
+    /// not a shrug.
+    @Test("a unit that pins no data directory at all is reported, not assumed fine")
+    func unpinnedDataDirectoryIsAProblem() async throws {
+        let unitDirectory = try makeTempDirectory("units")
+        defer { try? FileManager.default.removeItem(at: unitDirectory) }
+        let manager = makeManager(
+            unitDirectory: unitDirectory,
+            runner: ScriptedProcessRunner(respond: statusResponder(enabled: "enabled", active: "active"))
+        )
+        try await manager.install(helperPath: helperPath, intervalMinutes: 2, dataDirectory: nil, log: { _ in })
+
+        let log = LineSink()
+        let health = await manager.status(
+            dataDirectory: "/srv/a/restic-station",
+            activity: TimerActivity(lines: []),
+            log: { log.append($0) }
+        )
+
+        #expect(health.problems == [.dataDirectoryUnpinned])
+        #expect(log.text.contains("the unit pins none"))
+    }
+
+    /// The escaping round-trips: `serviceUnit` writes `%%` for a literal `%`
+    /// so systemd does not expand it, and reading the unit back has to undo
+    /// that or every such host reports a permanent false mismatch.
+    @Test("a percent sign survives the write/read round trip without a false mismatch")
+    func percentInDataDirectoryRoundTrips() async throws {
+        let unitDirectory = try makeTempDirectory("units")
+        defer { try? FileManager.default.removeItem(at: unitDirectory) }
+        let manager = makeManager(
+            unitDirectory: unitDirectory,
+            runner: ScriptedProcessRunner(respond: statusResponder(enabled: "enabled", active: "active"))
+        )
+        try await manager.install(
+            helperPath: helperPath,
+            intervalMinutes: 2,
+            dataDirectory: "/srv/100%full/state",
+            log: { _ in }
+        )
+
+        #expect(SystemdTimerManager.installedDataDirectory(
+            serviceUnitURL: unitDirectory.appendingPathComponent("restic-station.service")
+        ) == "/srv/100%full/state")
+
+        let health = await manager.status(
+            dataDirectory: "/srv/100%full/state",
+            activity: TimerActivity(lines: []),
+            log: { _ in }
+        )
+        #expect(health.isHealthy)
+    }
+
+    /// `status --json` discards this method's log entirely, so `list-timers`
+    /// — the slowest call and pure narrative — is waste there, and a wedged
+    /// D-Bus turns waste into a stall in a command documented as cheap.
+    @Test("verdictOnly skips the narrative list-timers call")
+    func verdictOnlySkipsListTimers() async throws {
+        let unitDirectory = try makeTempDirectory("units")
+        defer { try? FileManager.default.removeItem(at: unitDirectory) }
+        let runner = ScriptedProcessRunner(respond: statusResponder(enabled: "enabled", active: "active"))
+        let manager = makeManager(unitDirectory: unitDirectory, runner: runner)
+        try await manager.install(helperPath: helperPath, intervalMinutes: 2, dataDirectory: nil, log: { _ in })
+
+        let before = runner.invocations.count
+        let health = await manager.status(
+            activity: TimerActivity(lines: []),
+            verdictOnly: true,
+            log: { _ in }
+        )
+        let issued = runner.invocations.dropFirst(before)
+
+        #expect(!issued.contains { $0.contains("list-timers") })
+        // The verdict itself is unaffected — the calls that decide it still run.
+        #expect(issued.contains { $0.contains("is-enabled") })
+        #expect(issued.contains { $0.contains("is-active") })
+        // No `dataDirectory` was asked about, so the pinning check does not
+        // apply and this host is simply healthy — skipping `list-timers`
+        // must not change the verdict.
+        #expect(health.isHealthy)
+    }
+
+    @Test("the full report still runs list-timers")
+    func fullReportRunsListTimers() async throws {
+        let unitDirectory = try makeTempDirectory("units")
+        defer { try? FileManager.default.removeItem(at: unitDirectory) }
+        let runner = ScriptedProcessRunner(respond: statusResponder(enabled: "enabled", active: "active"))
+        let manager = makeManager(unitDirectory: unitDirectory, runner: runner)
+        try await manager.install(helperPath: helperPath, intervalMinutes: 2, dataDirectory: nil, log: { _ in })
+
+        let before = runner.invocations.count
+        _ = await manager.status(activity: TimerActivity(lines: []), log: { _ in })
+        #expect(runner.invocations.dropFirst(before).contains { $0.contains("list-timers") })
+    }
+
     @Test("every reason is reported, not just the first")
     func allProblemsAreReported() async throws {
         let unitDirectory = try makeTempDirectory("units")
