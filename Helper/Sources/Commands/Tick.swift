@@ -64,15 +64,21 @@ struct Tick: AsyncParsableCommand {
             print("no backup sets")
             return
         }
-        guard let context = await HelperContext.makeTolerant(
+        let context: HelperContext
+        switch await HelperContext.makeTolerant(
             paths: paths,
             views: views,
             configStore: configStore
-        ) else {
+        ) {
+        case .ready(let ready):
+            context = ready
+        case .noRestic(let result):
             // RunAtLoad tolerance: nothing usable configured yet, and
-            // discovery found no restic either — not a hard error, tick just
-            // has nothing to do.
-            print(HelperContext.resticNotFoundMessage(paths: paths))
+            // discovery found no usable restic either — not a hard error,
+            // tick just has nothing to do. It still says *why*: a tick that
+            // prints "restic not found" every two minutes on a host with a
+            // too-old restic installed is the loop issue #50 is about.
+            print(HelperContext.resticNotFoundMessage(paths: paths, result: result))
             return
         }
 

@@ -37,40 +37,125 @@ extension HelperContext {
         resolved: ResolvedConfig,
         discovery: ResticDiscovery = ResticDiscovery(),
         log: @Sendable (String) -> Void = { HelperLog.info($0) }
-    ) async -> String? {
+    ) async -> ResticResolution {
         if let configured = resolved.config.resticPath, !configured.isEmpty {
-            return configured
+            return .resolved(configured)
         }
 
         let result = await discovery.discover()
         guard let chosen = result.chosen else {
-            return nil
+            // The *result*, not a bare `nil`. Discovery ran every candidate
+            // and recorded exactly why each was rejected; throwing that away
+            // and reporting "not found" is what made this failure so
+            // confusing to act on (issue #50). Carrying it also means the
+            // message describes the search that actually happened rather
+            // than a second one run against a different environment.
+            return .notFound(result)
         }
         log("restic not configured; discovered \(chosen.path) (version \(chosen.version ?? "unknown"))")
-        return chosen.path
+        return .resolved(chosen.path)
     }
 
     /// What to print when nothing resolved.
     ///
-    /// On macOS this stays the T10 wording verbatim — there *is* an app to
-    /// open, and onboarding walks the user through picking a binary.
-    /// On Linux that advice is impossible to follow on a headless host, so
-    /// the message names what was searched and how to fix it.
-    static func resticNotFoundMessage(
-        paths: AppPaths,
-        discovery: ResticDiscovery = ResticDiscovery()
-    ) -> String {
+    /// Three genuinely different situations, which used to share one
+    /// sentence — "restic not found" — and one piece of advice that made two
+    /// of them worse (issue #50):
+    ///
+    /// - **Found, but too old.** The user has restic. Telling them to
+    ///   install restic is a loop: `apt install restic` on Ubuntu 24.04
+    ///   gives 0.16.4, below the 0.17.0 floor `ResticDiscovery` enforces, so
+    ///   following the advice verbatim reproduces the same message with a
+    ///   perfectly good binary sitting on `PATH`. This is how CI's own
+    ///   `linux-integration` job broke during T29. Name the binary, the
+    ///   version found and the minimum: that is a completely different
+    ///   action from "install restic".
+    /// - **Found, but did not run.** A Homebrew shim for an uninstalled
+    ///   formula, a wrapper script, a broken symlink — all pass
+    ///   `isExecutableFile` and fail to execute. `ResticDiscovery` records
+    ///   the reason precisely so this case "is never silent"; it was silent
+    ///   here.
+    /// - **Genuinely absent.** Only here is "install restic" the right
+    ///   advice — and it points at the official release binaries, not at a
+    ///   package manager that on most distributions ships below the floor.
+    ///
+    /// On macOS the "genuinely absent" case keeps the T10 wording verbatim:
+    /// there really is an app to open, and its Settings pane already renders
+    /// the too-old and unusable cases (`ResticDiscoveryResult.status`). The
+    /// added detail still goes into the log lines, where a launchd-run
+    /// helper's output is the only thing anyone can read.
+    static func resticNotFoundMessage(paths: AppPaths, result: ResticDiscoveryResult) -> String {
+        if let tooOld = result.firstTooOld, let version = tooOld.version {
+            return """
+                restic \(version) at \(tooOld.path) is too old — Restic Station needs \
+                \(ResticDiscovery.minimumVersion) or newer (docs/restic-cli.md §version: it is the \
+                first release with the exit-code contract this tool relies on).
+                \(Self.officialBinaryAdvice)
+                \(Self.resticPathAdvice(paths: paths))
+                """
+        }
+
+        if let unusable = result.rejected.first, case .unusable(let reason) = unusable.outcome {
+            return """
+                restic could not be used. \(reason)
+                \(Self.officialBinaryAdvice)
+                \(Self.resticPathAdvice(paths: paths))
+                """
+        }
+
         #if os(macOS)
         return "restic not configured — open Restic Station"
         #else
-        // `machine.json`, not `config.json`: a binary path is per-machine,
-        // and `config.json` is the file the user shares between hosts.
         return """
-            restic not found. Searched \(discovery.searchedDescription).
-            Install restic (for example `apt install restic` or \
-            `dnf install restic`), or set "resticPath" in \(paths.machineFile.path).
+            restic not found. Searched \(ResticDiscovery.wellKnownPaths.joined(separator: ", ")), \
+            and every directory on PATH.
+            \(Self.officialBinaryAdvice)
+            \(Self.resticPathAdvice(paths: paths))
             """
         #endif
+    }
+
+    /// Deliberately not `apt install restic` / `dnf install restic`. Ubuntu
+    /// 24.04 LTS ships 0.16.4 and Debian stable is comparable, so that
+    /// advice hands the reader a binary this tool rejects — see
+    /// `resticNotFoundMessage`.
+    ///
+    /// The minimum is named here rather than referred back to: two of the
+    /// three cases above never state a version, so "older than the minimum
+    /// above" pointed at nothing.
+    private static var officialBinaryAdvice: String {
+        """
+        Install an official release binary from https://github.com/restic/restic/releases \
+        — distribution packages are frequently older than the \
+        \(ResticDiscovery.minimumVersion) minimum.
+        """
+    }
+
+    /// `machine.json`, not `config.json`: a binary path is per-machine, and
+    /// `config.json` is the file the user shares between hosts (T24).
+    private static func resticPathAdvice(paths: AppPaths) -> String {
+        "Or set \"resticPath\" in \(paths.machineFile.path) to point at one you already have."
+    }
+}
+
+// MARK: - ResticResolution
+
+/// What `resolveResticPath` concluded — and, when it concluded nothing,
+/// enough evidence to explain why without searching a second time.
+///
+/// `.notFound` always carries a real result: the only early return is a
+/// configured `resticPath`, which is returned verbatim (an explicit path
+/// deliberately bypasses the version gate), so discovery has necessarily run
+/// by the time this case is constructed.
+enum ResticResolution: Sendable {
+    case resolved(String)
+    case notFound(ResticDiscoveryResult)
+
+    var path: String? {
+        switch self {
+        case .resolved(let path): return path
+        case .notFound: return nil
+        }
     }
 }
 

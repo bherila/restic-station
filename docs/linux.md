@@ -37,10 +37,12 @@ Two honest caveats about how that output is *presented*, so this claim can be ta
   `resticPath`.** This is the single most common first-run failure, so it is stated again here,
   prominently, not just in `packaging/linux/README.md`: **your distro's package is almost
   certainly too old.** Ubuntu 24.04 LTS ships restic **0.16.4**; Debian stable is comparable.
-  `apt install restic` gets you a restic this tool refuses to use — and the failure reads
-  confusingly, because `ResticDiscovery` reports it as **"restic not found"** right after you
-  watched a package manager install one. `docs/restic-cli.md` §version explains why 0.17.0 is
-  the floor (the first release with the exit-code contract this tool relies on).
+  `apt install restic` gets you a restic this tool refuses to use. It will tell you so in those
+  words — *"restic 0.16.4 at /usr/bin/restic is too old"* — rather than the flatly misleading
+  "restic not found" it used to report right after you watched a package manager install one
+  ([issue #50](https://github.com/bherila/restic-station/issues/50)). `docs/restic-cli.md`
+  §version explains why 0.17.0 is the floor (the first release with the exit-code contract this
+  tool relies on).
 
   Install the official release binary instead:
 
@@ -1145,24 +1147,46 @@ f1000000-0000-4000-8000-000000000003  "Offsite Mirror" (set "Projects")  passwor
 If something recursively `chmod`'ed the whole data directory, other state files were likely
 widened too — worth checking, not just `secrets.json`.
 
-**"restic not found."** Almost always the distro-package-too-old problem from
-[Prerequisites](#prerequisites) — `ResticDiscovery` requires a candidate to actually *run* a
-successful `restic version --json` above the 0.17.0 floor, not merely exist and be executable, so
-an old or broken binary is reported the same as no binary at all. Real message, from CI's `linux`
-job ("restic discovery resolves the helper's binary on Linux" step — no restic anywhere on this
-container's `PATH` at all, the simplest case that produces it):
+**"restic not found" / "restic 0.16.4 … is too old."** These are two different messages now, and
+the distinction is the point. `ResticDiscovery` requires a candidate to actually *run* a successful
+`restic version --json` above the 0.17.0 floor, not merely exist and be executable — so there are
+three ways to have no usable restic, and each says which one it is
+([issue #50](https://github.com/bherila/restic-station/issues/50)).
 
+**Nothing anywhere.** Names every location actually searched (the well-known paths, then one
+`<dir>/restic` per `PATH` entry), and where to set `resticPath` explicitly — `machine.json`, not
+`config.json`, because a binary path is host-local (see `docs/architecture.md` §restic discovery).
+
+<!-- PLACEHOLDER:restic-not-found — harvest from the `linux` job, "restic discovery resolves the
+     helper's binary on Linux" step, case 1. Do NOT hand-write. -->
 ```
-restic not found. Searched /usr/bin/restic, /usr/local/bin/restic, /opt/restic/bin/restic, and every directory on PATH.
-Install restic (for example `apt install restic` or `dnf install restic`), or set "resticPath" in /tmp/tmp.XXXXXXXXXX/machine.json.
+(pending harvest from CI)
 ```
 
-Note the message's own example (`apt install restic`) is exactly the command that produces a
-too-old binary on Ubuntu/Debian — worth knowing before following it literally; use the [official
-release binary](#prerequisites) instead. The message names every location actually searched
-(well-known paths, then one `<dir>/restic` per `PATH` entry) and where to set `resticPath`
-explicitly (`machine.json`, not `config.json` — a binary path is host-local; see
-`docs/architecture.md` §restic discovery) if you need to point at something off the beaten path.
+**Found, but too old** — this is what `apt install restic` gets you on Ubuntu 24.04 (0.16.4). The
+message names the binary, the version it reported, and the minimum, because "install restic" is
+useless advice to someone who has restic:
+
+<!-- PLACEHOLDER:restic-too-old — harvest from the `linux` job, same step, case 1b. Do NOT
+     hand-write. -->
+```
+(pending harvest from CI)
+```
+
+Until this was fixed, that case printed the *same* "restic not found" text as the case above, and
+its own suggested remedy (`apt install restic`) reproduced it — install the package, re-run, get
+told restic is not found, with a perfectly good binary sitting on `PATH`. It is how this project's
+own `linux-integration` job broke during T29.
+
+**Found, but it does not run** — a wrapper script for an uninstalled package, a broken symlink, an
+architecture mismatch. All pass the executable-bit check and fail to execute; the message carries
+restic's own exit code or stderr:
+
+<!-- PLACEHOLDER:restic-unusable — harvest from the `linux` job, same step, case 1c. Do NOT
+     hand-write. -->
+```
+(pending harvest from CI)
+```
 
 **Repo unreachable vs. an offline mirror.** `probe-repo` reports reachability directly and
 records it to `state/repo-status-<destId>.json`; a *mirror* that is offline is not an error at
