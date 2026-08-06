@@ -1157,20 +1157,20 @@ three ways to have no usable restic, and each says which one it is
 `<dir>/restic` per `PATH` entry), and where to set `resticPath` explicitly — `machine.json`, not
 `config.json`, because a binary path is host-local (see `docs/architecture.md` §restic discovery).
 
-<!-- PLACEHOLDER:restic-not-found — harvest from the `linux` job, "restic discovery resolves the
-     helper's binary on Linux" step, case 1. Do NOT hand-write. -->
 ```
-(pending harvest from CI)
+restic not found. Searched /usr/bin/restic, /usr/local/bin/restic, /opt/restic/bin/restic, and every directory on PATH.
+Install an official release binary from https://github.com/restic/restic/releases — distribution packages are frequently older than the 0.17.0 minimum.
+Or set "resticPath" in /tmp/tmp.XXXXXXXXXX/machine.json to point at one you already have.
 ```
 
 **Found, but too old** — this is what `apt install restic` gets you on Ubuntu 24.04 (0.16.4). The
 message names the binary, the version it reported, and the minimum, because "install restic" is
 useless advice to someone who has restic:
 
-<!-- PLACEHOLDER:restic-too-old — harvest from the `linux` job, same step, case 1b. Do NOT
-     hand-write. -->
 ```
-(pending harvest from CI)
+restic 0.16.4 at /tmp/tmp.XXXXXXXXXX/restic is too old — Restic Station needs 0.17.0 or newer (docs/restic-cli.md §version: it is the first release with the exit-code contract this tool relies on).
+Install an official release binary from https://github.com/restic/restic/releases — distribution packages are frequently older than the 0.17.0 minimum.
+Or set "resticPath" in /tmp/tmp.XXXXXXXXXX/machine.json to point at one you already have.
 ```
 
 Until this was fixed, that case printed the *same* "restic not found" text as the case above, and
@@ -1182,10 +1182,10 @@ own `linux-integration` job broke during T29.
 architecture mismatch. All pass the executable-bit check and fail to execute; the message carries
 restic's own exit code or stderr:
 
-<!-- PLACEHOLDER:restic-unusable — harvest from the `linux` job, same step, case 1c. Do NOT
-     hand-write. -->
 ```
-(pending harvest from CI)
+restic could not be used. /tmp/tmp.XXXXXXXXXX/restic exited 72 when asked for its version.
+Install an official release binary from https://github.com/restic/restic/releases — distribution packages are frequently older than the 0.17.0 minimum.
+Or set "resticPath" in /tmp/tmp.XXXXXXXXXX/machine.json to point at one you already have.
 ```
 
 **Repo unreachable vs. an offline mirror.** `probe-repo` reports reachability directly and
