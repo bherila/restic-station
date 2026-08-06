@@ -58,9 +58,11 @@ Download a release tarball (produced by every green CI run — see the Actions p
 required), verify the checksums, and run the installer:
 
 ```sh
-tar xzf restic-station-linux-aarch64.tar.gz    # or -x86_64
+sha256sum -c SHA256SUMS --ignore-missing        # or: shasum -a 256 -c (checks both
+                                                 # architectures' entries; --ignore-missing
+                                                 # skips whichever tarball you didn't download)
+tar xzf restic-station-linux-aarch64.tar.gz     # or -x86_64
 cd restic-station-linux-aarch64
-sha256sum -c ../SHA256SUMS --ignore-missing     # or: shasum -a 256 -c
 ./install.sh                                    # ~/.local/bin, no root needed
 ```
 
