@@ -13,13 +13,23 @@ elsewhere and can restore from them, but has nothing local to back up), or both 
 [Per-machine setup](#per-machine-setup) below. Everything under `App/` (the SwiftUI app) is
 macOS-only and irrelevant here; see `docs/architecture.md`'s components table.
 
-Every transcript in this document is real. It comes from `scripts/linux-docs-transcript.sh`,
-which CI's `linux-integration` job (`.github/workflows/ci.yml`) runs against the **static**
-release binary and a real restic 0.18.1, on a genuine (non-container) Ubuntu VM — the same job
-that runs `scripts/integration-test.sh`'s Linux fixture-import scenario. Nothing below was typed
-by hand on a Mac and relabeled; where something could not be run in CI, that is stated
-explicitly instead of shown as if it were observed (see [Scheduling](#scheduling) and
-[Not executed in CI](#not-executed-in-ci)).
+Every transcript in this document is real output from a real run. It comes from
+`scripts/linux-docs-transcript.sh`, which CI's `linux-integration` job
+(`.github/workflows/ci.yml`) runs against the **static** release binary and a real restic 0.18.1,
+on a genuine (non-container) Ubuntu VM — the same job that runs `scripts/integration-test.sh`'s
+Linux fixture-import scenario. Nothing below was typed by hand on a Mac and relabeled, and where
+something could not be run in CI that is stated explicitly rather than shown as if observed (see
+[Scheduling](#scheduling) and [Not executed in CI](#not-executed-in-ci)).
+
+Two honest caveats about how that output is *presented*, so this claim can be taken literally:
+
+- Transcripts are lightly trimmed for readability — unrelated runner noise (e.g. `Failed to set
+  thread priority … errno=13` from the CI sandbox) is dropped, long temp paths are normalised to
+  `/tmp/tmp.XXXXXXXXXX`, and a banner or two is condensed. Nothing that reflects the tool's own
+  behaviour — commands, results, exit codes, warnings, errors — is altered or omitted.
+- The **JSON config blocks** in [Per-machine setup](#per-machine-setup) are illustrations, not
+  transcripts, and are abridged where marked. Their `config validate` *output* is real; the JSON
+  itself is not copy-pasteable. That section says so where it matters.
 
 ## Prerequisites
 
@@ -223,20 +233,34 @@ identity, or for a reproducible test/demo transcript (as used above and below).
 A `machines` override on a set or a destination **replaces** the field it names — it never
 merges with the shared value — and there is no automatic path rewriting between machines
 (`/Users/bwh/...` does not become `/home/bwh/...` on its own; that was considered and rejected as
-implicit and silently wrong at the edges). Both examples below are real JSON, taken from
-`Core/Tests/ResticStationCoreTests/Fixtures/config-v2.json` — the same fixture the per-machine
-resolution unit tests load — and re-validated for real in CI (not just eyeballed) against exactly
-this file.
+implicit and silently wrong at the edges). Both examples' `config validate` **output** below is real, produced in CI against a real config —
+but read the JSON blocks as *illustrations of the override shape*, not as files to copy:
+
+- **Example 1** is **abridged** from `Core/Tests/ResticStationCoreTests/Fixtures/config-v2.json`
+  (the fixture the per-machine resolution unit tests load, and what CI actually validated). The
+  elisions are marked `…` below: a third destination and several required keys — `excludes`,
+  `stalenessWarningDays`, `nonSecretEnv` — are omitted for readability. They are **not optional**;
+  the decoders require them, so this block would fail `config import` if hand-copied as-is. That
+  is why the validate output beneath it lists three destinations where the JSON shows two.
+- **Example 2**'s config is **not** from that fixture. It is synthesized inline by
+  `scripts/linux-docs-transcript.sh`, which is what CI ran to produce the output shown with it.
+
+For a complete, importable file, use `config export` from a working install, or read the fixture
+itself — do not reconstruct one from these excerpts.
 
 **Example 1 — Linux as a source.** A NAS backs up its own directories, on its own schedule, to
 its own path into the (shared) repository; a Mac-only scratch drive is not something the NAS can
 see, so it is disabled there:
 
-```json
+```jsonc
+// ABRIDGED — see the note above. `…` marks omitted required keys and a third
+// destination; this is not a copy-pasteable config.json.
 "sets": [{
   "id": "6F9619FF-8B86-D011-B42D-00C04FC964FF",
   "name": "Documents",
   "sources": ["/Users/bwh/Documents"],
+  "excludes": [ … ],
+  "stalenessWarningDays": …,
   "schedule": { "kind": "daily", "hour": 2, "minute": 30 },
   "machines": {
     "linux-nas": { "sources": ["/srv/data"], "schedule": { "kind": "daily", "hour": 4, "minute": 0 } },
@@ -244,16 +268,20 @@ see, so it is disabled there:
   },
   "destinations": [
     { "id": "0A1B2C3D-4E5F-4A1B-8C1D-000000000001", "label": "Big Drive",
-      "repoURL": "/Volumes/Big/documents.restic", "isPrimary": true,
+      "repoURL": "/Volumes/Big/documents.restic", "isPrimary": true, "nonSecretEnv": { … },
       "machines": { "linux-nas": { "repoURL": "/mnt/big/documents.restic" } } },
+
+    // …the fixture's second destination, "R2 mirror", is omitted here — it is
+    // why the validate output below lists three destinations, not two…
+
     { "id": "2C3D4E5F-6061-4A1B-8C1D-000000000003", "label": "Mac-only external HDD",
-      "repoURL": "/Volumes/Scratch/documents.restic", "isPrimary": false,
+      "repoURL": "/Volumes/Scratch/documents.restic", "isPrimary": false, "nonSecretEnv": { … },
       "machines": { "linux-nas": { "enabled": false } } }
   ]
 }]
 ```
 
-Real `config validate` output for this exact fixture, as `linux-nas` and as `old-laptop`:
+Real `config validate` output — run in CI against the **full** fixture (`Core/Tests/ResticStationCoreTests/Fixtures/config-v2.json`), not the abridged block above, which is why it lists a third destination:
 
 ```
 $ restic-station-helper config validate --machine linux-nas
@@ -309,7 +337,7 @@ here."
 **Example 2 — Linux as a mirror/restore target only.** A host that stores copies and can restore
 from them, but backs up nothing of its own: every set is disabled for it, but it still reads the
 same `config.json`, so `restore`, `probe-repo` and `unlock` know every repository in the fleet.
-Real output, for a config where both "Documents" and "Photos" are disabled for `mirror-box`:
+Real output, from a config `scripts/linux-docs-transcript.sh` synthesizes inline for this section (not the fixture above), in which both "Documents" and "Photos" are disabled for `mirror-box`:
 
 ```
 $ restic-station-helper config validate --machine mirror-box
