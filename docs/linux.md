@@ -583,6 +583,7 @@ override, then again with `RESTIC_STATION_DATA_DIR` set explicitly to what that
 `XDG_STATE_HOME` would have resolved to, from CI's `linux-integration` job:
 
 ```
+--- reinstalled with a custom XDG_STATE_HOME and no RESTIC_STATION_DATA_DIR override ---
 $ cat /home/runner/.config/systemd/user/restic-station.service
 # restic-station.service — installed by `restic-station-helper timer install`
 # (docs/scheduling.md §Linux: systemd user timer). Re-running the command
@@ -595,10 +596,11 @@ Documentation=https://github.com/bherila/restic-station/blob/main/docs/schedulin
 Type=oneshot
 ExecStart=/tmp/tmp.XXXXXXXXXX/bin/restic-station-helper tick
 
-CONFIRMED: neither XDG_STATE_HOME nor RESTIC_STATION_DATA_DIR appears in the unit above — a tick
-run from it falls back to the default ~/.local/state/restic-station, not the custom XDG_STATE_HOME
-this shell had set.
+CONFIRMED: neither XDG_STATE_HOME nor RESTIC_STATION_DATA_DIR appears in the unit above —
+a tick run from it falls back to the default ~/.local/state/restic-station, not the
+custom XDG_STATE_HOME this shell had set.
 
+--- reinstalled again with RESTIC_STATION_DATA_DIR set explicitly to the same path ---
 $ cat /home/runner/.config/systemd/user/restic-station.service
 # restic-station.service — installed by `restic-station-helper timer install`
 # (docs/scheduling.md §Linux: systemd user timer). Re-running the command
@@ -611,11 +613,8 @@ Documentation=https://github.com/bherila/restic-station/blob/main/docs/schedulin
 Type=oneshot
 ExecStart=/tmp/tmp.XXXXXXXXXX/bin/restic-station-helper tick
 # RESTIC_STATION_DATA_DIR was set when the timer was installed.
-Environment="/tmp/tmp.XXXXXXXXXX/custom-xdg-state/restic-station"
+Environment="RESTIC_STATION_DATA_DIR=/tmp/tmp.XXXXXXXXXX/custom-xdg-state/restic-station"
 ```
-
-(PLACEHOLDER — will be replaced with the genuine `linux-integration` job log before this PR is
-pushed; see the PR's CI run for the real output this section quotes verbatim.)
 
 ### A real firing, not just "enabled/active"
 
@@ -787,8 +786,65 @@ still healthy) while `timer status`, the one place that actually looks at the sc
 reports the timer not installed and exits 1:
 
 ```
-(PLACEHOLDER — will be replaced with the genuine `linux-integration` job log before this PR is
-pushed; see the PR's CI run for the real output this section quotes verbatim.)
+--- status --json for the same data dir, right after the timer above was uninstalled ---
+
+$ restic-station-helper status --json
+{
+  "excludedHere" : [
+
+  ],
+  "fullDiskAccessDenied" : false,
+  "generatedAt" : "2026-08-06T01:24:21.708Z",
+  "health" : "idle",
+  "machineId" : "linux-nas",
+  "sets" : [
+    {
+      "currentRun" : null,
+      "destinations" : [
+        {
+          "id" : "E1000000-0000-4000-8000-000000000002",
+          "isPrimary" : true,
+          "label" : "Fire Primary",
+          "lastError" : null,
+          "lastSyncedAt" : "2026-08-06T01:24:16.971Z",
+          "reachable" : true,
+          "stale" : false
+        }
+      ],
+      "id" : "E1000000-0000-4000-8000-000000000001",
+      "isRunning" : false,
+      "lastBackup" : {
+        "ageSeconds" : 4.740049719810486,
+        "end" : "2026-08-06T01:24:16.968Z",
+        "runId" : "20260806T012416Z-backup-e1000000",
+        "start" : "2026-08-06T01:24:16.248Z",
+        "status" : "success"
+      },
+      "lastCheck" : null,
+      "lastPrune" : null,
+      "name" : "Fire Check",
+      "needsAttention" : false,
+      "nextDue" : "2026-08-06T01:29:16.246Z"
+    }
+  ]
+}
+(exit 0 — health "idle", needsAttention false, nothing here reflects that the scheduler is gone)
+
+--- timer status for the same host: correctly reports not installed ---
+
+$ restic-station-helper timer status
+Restic Station — systemd --user timer
+
+  units       not installed (looked in /home/runner/.config/systemd/user)
+                fix: restic-station-helper timer install
+  enabled     not-found
+  active      inactive
+  linger      enabled — user units keep running after logout
+
+  last tick activity (from state/ and runs/)
+    "Fire Check": backup just now (2026-08-06T01:24:16Z)
+    last run: backup success (just now (2026-08-06T01:24:16Z))
+(exit 1)
 ```
 
 ### Restore
