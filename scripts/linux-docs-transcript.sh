@@ -248,13 +248,99 @@ RESTIC_STATION_DATA_DIR="$MIRROR_BOX_DATA" run restic-station-helper config vali
 section "Scheduling: timer status on this host"
 # ===========================================================================
 # Note: this runner is a bare Ubuntu VM (systemd genuinely is pid 1 — unlike
-# the swift:6.1 container `linux` job uses), but a GitHub-hosted runner's
-# default account has no logind session. `timer install`/`timer status`
-# results here are real, not fabricated, but are NOT proof of a live
-# firing timer — that verification is tracked separately (issue #45) and
-# is not claimed here.
+# the swift:6.1 container `linux` job uses). issue #45 assumed a GitHub-
+# hosted runner's default account has no logind session at all — that
+# turned out not to hold for this runner (ubuntu-24.04-arm): `loginctl`
+# reports a real user session with lingering already enabled. Whether that
+# is a property of this specific runner image/version or something to rely
+# on generally is not something a single CI run can answer — reported
+# honestly below, not overclaimed as "issue #45 fixed everywhere."
 run restic-station-helper timer install
 run restic-station-helper timer status
 run loginctl show-user "$(whoami)" --property=Linger
+
+# ===========================================================================
+section "Scheduling: waiting to see whether the installed timer actually fires"
+# ===========================================================================
+# The one thing issue #45 says CI has never observed: a real systemd --user
+# timer firing `tick` on its own, not `timer install` merely reporting
+# enabled+active. A dedicated set with a repo already initialized and its
+# password already stored, never yet backed up (so ScheduleMath's "never-run
+# is immediately due" rule applies to the very first tick that runs it), in
+# its own timer/data dir so it cannot collide with anything above.
+FIRE_DATA="$WORK/data-fire-check"
+FIRE_SOURCE="$WORK/fire-source"
+FIRE_REPO="$WORK/fire-repo"
+mkdir -p "$FIRE_DATA" "$FIRE_SOURCE"
+echo "fire-check content" > "$FIRE_SOURCE/f.txt"
+FIRE_SET_ID="e1000000-0000-4000-8000-000000000001"
+FIRE_PRIMARY_ID="e1000000-0000-4000-8000-000000000002"
+cat > "$FIRE_DATA/config.json" <<JSON
+{
+  "version": 2,
+  "resticPath": null,
+  "showMenuBarIcon": true,
+  "sets": [
+    {
+      "id": "$FIRE_SET_ID",
+      "name": "Fire Check",
+      "sources": ["$FIRE_SOURCE"],
+      "excludes": [],
+      "schedule": {"kind": "everyMinutes", "minutes": 5},
+      "retention": null,
+      "checkPolicy": null,
+      "stalenessWarningDays": 14,
+      "destinations": [
+        {"id": "$FIRE_PRIMARY_ID", "label": "Fire Primary", "repoURL": "$FIRE_REPO", "isPrimary": true, "nonSecretEnv": {}}
+      ]
+    }
+  ]
+}
+JSON
+RESTIC_STATION_DATA_DIR="$FIRE_DATA" restic-station-helper config validate >/dev/null
+printf '%s' 'fire-check-password' \
+    | RESTIC_STATION_DATA_DIR="$FIRE_DATA" restic-station-helper secret set --dest "$FIRE_PRIMARY_ID" >/dev/null
+RESTIC_PASSWORD_COMMAND="$BIN_DIR/restic-station-helper print-password --dest $FIRE_PRIMARY_ID" \
+    RESTIC_STATION_DATA_DIR="$FIRE_DATA" restic -r "$FIRE_REPO" init >/dev/null
+
+BEFORE=$(RESTIC_STATION_DATA_DIR="$FIRE_DATA" restic-station-helper runs list --json | jq 'length')
+echo
+echo "runs recorded for \"Fire Check\" before installing its timer: $BEFORE (expect 0)"
+RESTIC_STATION_DATA_DIR="$FIRE_DATA" run restic-station-helper timer install --interval 2
+
+WAIT_SECONDS=170
+echo
+echo "waiting up to ${WAIT_SECONDS}s, polling every 10s, for the installed timer to fire a REAL tick"
+echo "that finds \"Fire Check\" due and runs it — the one thing docs/testing.md and issue #45 say"
+echo "has never been observed in CI:"
+FIRED=0
+ELAPSED=0
+while [[ $ELAPSED -lt $WAIT_SECONDS ]]; do
+    sleep 10
+    ELAPSED=$((ELAPSED + 10))
+    AFTER=$(RESTIC_STATION_DATA_DIR="$FIRE_DATA" restic-station-helper runs list --json | jq 'length' 2>/dev/null || echo "$BEFORE")
+    printf '  t=+%3ds  runs=%s\n' "$ELAPSED" "$AFTER"
+    if [[ "$AFTER" -gt "$BEFORE" ]]; then
+        FIRED=1
+        break
+    fi
+done
+
+echo
+RESTIC_STATION_DATA_DIR="$FIRE_DATA" run restic-station-helper runs list --json
+run journalctl --user -u restic-station.service --no-pager --since "-5 minutes"
+
+echo
+if [[ $FIRED -eq 1 ]]; then
+    echo "OBSERVED: the systemd --user timer fired on its own and ran a real, previously-never-run"
+    echo "backup — a live end-to-end firing, not just 'enabled/active'. See the PR description for"
+    echo "what this does and does not settle about issue #45."
+else
+    echo "NOT OBSERVED within ${WAIT_SECONDS}s: the timer reported enabled+active above, but no new run"
+    echo "appeared in that window. Left as still-open per issue #45; the wait ran out, this was not"
+    echo "given up on early."
+fi
+
+RESTIC_STATION_DATA_DIR="$FIRE_DATA" run restic-station-helper timer uninstall
 
 exit 0

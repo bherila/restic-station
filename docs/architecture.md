@@ -2,6 +2,16 @@
 
 ## Components
 
+| Component | Platform | Role |
+|---|---|---|
+| `ResticStationCore` (Swift package, `Core/`) | macOS + Linux | All logic: config, restic runner + parsers, restic discovery, schedule math, run store, backup engine, secret store abstraction. No UI. |
+| `restic-station-helper` (CLI) | macOS + Linux | The single code path for all mutating restic operations. Embedded in the app bundle on macOS; a standalone static binary on Linux (`docs/linux.md`). Subcommand surface differs slightly — `timer` is Linux-only, `fda-check` is a documented no-op off macOS. |
+| `Restic Station.app` (SwiftUI, `App/`) | **macOS only** | Menu bar status + management window (sets, runs, restore, maintenance, settings). Nothing under `App/` builds or runs on Linux; on Linux the helper's CLI is the whole product. |
+
+See `docs/linux.md` for what "Linux" means for this project end to end, and `docs/testing.md`'s CI table for exactly which jobs exercise which platform.
+
+The diagram below is the **macOS** process model (there is no app to invoke the helper on Linux, and secrets live in `secrets.json`, not a keychain — see `docs/linux.md` and `keychain-and-fda.md` §5 for the Linux equivalent):
+
 ```
 ┌─────────────────────────┐         ┌──────────────────────────────┐
 │  Restic Station.app     │ invokes │  restic-station-helper (CLI) │

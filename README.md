@@ -1,8 +1,8 @@
 # Restic Station
 
-A native macOS menu bar app for scheduling and managing [restic](https://restic.net) backups.
+Scheduling and management for [restic](https://restic.net) backups: a native macOS menu bar app, plus a cross-platform CLI (`restic-station-helper`) that runs the exact same backup engine headless on Linux. Author backup sets in the Mac app, move the config to a Linux box (NAS, VPS, home server), and it keeps backing up unattended — see [`docs/linux.md`](docs/linux.md).
 
-**Status: feature-complete, pre-release.** All planned functionality is implemented and CI-tested (including an integration suite against real restic); signed releases are not yet published — install from a CI build or build from source (below).
+**Status: feature-complete, pre-release.** All planned functionality is implemented and CI-tested (including an integration suite against real restic on both platforms); signed releases are not yet published — install from a CI build or build from source (below).
 
 ## What it does
 
@@ -16,11 +16,16 @@ Restic Station wraps an off-the-shelf restic binary already installed on the sys
 
 ## Requirements
 
+**macOS app:**
 - macOS 14 (Sonoma) or later
 - restic ≥ 0.18 on the system (`brew install restic`)
 - Xcode 15+ and [XcodeGen](https://github.com/yonaskolb/XcodeGen) to build from source
 
-## Installing
+**Linux (headless CLI):**
+- x86_64 or aarch64; no particular distro or glibc version required (statically linked, see [Linux (headless)](#linux-headless) below)
+- restic ≥ 0.17.0 (0.18+ recommended) **on `PATH` or at an explicit `resticPath`** — most distro packages are too old (Ubuntu 24.04 LTS ships 0.16.4); see [`docs/linux.md`](docs/linux.md#prerequisites)
+
+## Installing (macOS)
 
 Until signed releases exist, grab a CI build: open any green run on the [Actions page](../../actions), download the **Restic-Station-app** artifact, then:
 
@@ -94,25 +99,26 @@ scripts/package-linux.sh   # installs its own pinned toolchain/SDK (no sudo), bu
 
 Three components (full detail in [`docs/architecture.md`](docs/architecture.md)):
 
-| Component | Role |
-|---|---|
-| `ResticStationCore` (Swift package) | All logic: config, restic process runner + JSON parsers, schedule math, run store, backup engine. Fully unit-testable. |
-| `restic-station-helper` (CLI, embedded in the app bundle) | The single code path for all mutating restic operations. Invoked by `launchd` every 2 minutes in `tick` mode, by the app for manual actions, and directly by users via the `restic-station` `PATH` symlink (see [Command line](#command-line) above). |
-| `Restic Station.app` (SwiftUI) | Menu bar status + management window (sets, runs, restore, maintenance, settings). |
+| Component | Platform | Role |
+|---|---|---|
+| `ResticStationCore` (Swift package) | macOS + Linux | All logic: config, restic process runner + JSON parsers, schedule math, run store, backup engine. Fully unit-testable. |
+| `restic-station-helper` (CLI) | macOS + Linux | The single code path for all mutating restic operations. Embedded in the app bundle on macOS (invoked by `launchd` every 2 minutes in `tick` mode, by the app for manual actions, and directly via the `restic-station` `PATH` symlink — see [Command line](#command-line)); a standalone static binary on Linux, invoked by a `systemd --user` timer (see [Linux (headless)](#linux-headless)). |
+| `Restic Station.app` (SwiftUI) | **macOS only** | Menu bar status + management window (sets, runs, restore, maintenance, settings). On Linux the helper's CLI is the whole product — there is no GUI. |
 
-Repository passwords and secret environment variables (e.g. S3 keys) live in the macOS Keychain, never in config files. See [`docs/keychain-and-fda.md`](docs/keychain-and-fda.md) for how headless keychain access works.
+Repository passwords and secret environment variables (e.g. S3 keys) live in the macOS Keychain; on Linux (and on macOS if forced) they live in a mode-`0600` `secrets.json` instead. Never in `config.json`. See [`docs/keychain-and-fda.md`](docs/keychain-and-fda.md) for how both backends work.
 
 ## Documentation
 
 | Doc | Contents |
 |---|---|
 | [architecture.md](docs/architecture.md) | Components, process model, invariants, error taxonomy |
-| [data-model.md](docs/data-model.md) | Config / state / run-record schemas with examples |
+| [linux.md](docs/linux.md) | End-to-end Linux headless setup: install, move a config over, secrets, scheduling, troubleshooting |
+| [data-model.md](docs/data-model.md) | Config / state / run-record schemas with examples, incl. per-machine overrides |
 | [restic-cli.md](docs/restic-cli.md) | Exact restic invocations, exit codes, captured `--json` output fixtures |
-| [scheduling.md](docs/scheduling.md) | Tick model, due-computation rules, locking, staleness |
-| [keychain-and-fda.md](docs/keychain-and-fda.md) | Keychain ACL strategy, Full Disk Access / TCC, SMAppService gotchas |
-| [ui-spec.md](docs/ui-spec.md) | Screen-by-screen UI specification |
-| [testing.md](docs/testing.md) | Test strategy, fakes, fixtures, integration script contract |
+| [scheduling.md](docs/scheduling.md) | Tick model, due-computation rules, locking, staleness (both platforms) |
+| [keychain-and-fda.md](docs/keychain-and-fda.md) | Keychain ACL strategy (macOS), file secret store (Linux), Full Disk Access / TCC, SMAppService gotchas |
+| [ui-spec.md](docs/ui-spec.md) | Screen-by-screen UI specification — **macOS app only** |
+| [testing.md](docs/testing.md) | Test strategy, fakes, fixtures, integration script contract, CI job table |
 | [tasks/](docs/tasks/) | The implementation task breakdown (mirrored as GitHub issues) |
 
 ## FAQ
@@ -131,6 +137,21 @@ Nothing bad. Backups to the primary continue; the offline mirror is skipped (no 
 
 **Do backups run when the app is closed / the Mac was asleep?**
 Yes. A `launchd` agent runs the helper every 2 minutes independent of the app; schedules missed during sleep run within ~2 minutes of wake (anacron-style).
+
+**Can I run backups on Linux without the Mac app?**
+Yes. Building/authoring a config in the Mac app first is the easiest path (nothing to hand-write), but it's not required — `config.json` is a plain, documented JSON file (`docs/data-model.md`) you can write by hand and `config import` on the Linux box. The Mac app is never required at runtime; a fleet of Linux-only hosts with no Mac anywhere is a supported setup.
+
+**Does one config work across machines?**
+Yes, by design — `config.json` is the one file meant to be shared (checked into a private repo, rsynced, whatever you like). Per-machine differences (which sets run here, which sources/schedule/repo URL to use, offline-only mirrors) are expressed as `machines` overrides keyed on a `machineId`, not as separate files. See `docs/data-model.md` §Per-machine scoping and `docs/linux.md`.
+
+**Why isn't there a Linux GUI?**
+The two things a GUI mainly buys — visual set editing and a menu bar status icon — matter most on the machine where you're actively working, which for this project's target Linux hosts (NAS, VPS, headless server) is never true. The CLI (`config`, `status`, `sets`, `runs`, `secret`) covers the same ground non-interactively, and it's the same code either way: no separate Linux logic to keep in sync with a GUI that doesn't exist.
+
+**Are repos interchangeable between macOS and Linux?**
+Yes — a restic repository doesn't know or care what created it. A repo initialized from the Mac app can be backed up to, restored from, checked, and pruned from a Linux host and vice versa; that interchangeability is the whole point of "author on the Mac, run on Linux." What is *not* interchangeable is `machine.json` (host identity — never copy it between machines) or a stored secret (each host's `secrets.json`/keychain is populated independently via `secret set`).
+
+**Where are passwords stored on Linux, and why not the keyring?**
+A mode-`0600` file, `secrets.json`, under the state directory — never in `config.json`. The target hosts are headless (no desktop session, no D-Bus user bus, no keyring daemon), so a `gnome-keyring`/`kwallet`/`pass`-style solution would depend on infrastructure that doesn't exist there, which is exactly the kind of hidden dependency that makes a 3am scheduled backup silently fail. See `docs/keychain-and-fda.md` §5 for the full threat model — it's a narrower guarantee than the macOS Keychain's, and that's stated rather than papered over.
 
 ## License
 

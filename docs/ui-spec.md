@@ -1,5 +1,7 @@
 # UI specification
 
+**This document is macOS-app-only.** Everything below describes `Restic Station.app` — the SwiftUI menu bar app and management window. There is no GUI on Linux; `restic-station-helper`'s CLI is the entire Linux user interface (`docs/linux.md`). Nothing in this file applies to Linux, and nothing on Linux is expected to match anything described here.
+
 This spec fixes **information architecture, controls, states, and copy**. Visual layout, spacing, and composition are left to the implementing agent's judgment — build idiomatic macOS SwiftUI (forms, tables, inspectors, sheets) that would feel at home next to System Settings. Use SF Symbols throughout. Support light + dark mode (automatic — no custom colors that break either).
 
 ## Shell
