@@ -67,8 +67,9 @@ struct Tick: AsyncParsableCommand {
         // ── Step 3: recover interrupted runs. ────────────────────────────
         do {
             let recovered = try context.runStore.recoverInterrupted()
-            for runId in recovered {
-                print("recovered interrupted run \(runId)")
+            for run in recovered {
+                print("recovered interrupted run \(run.runId)")
+                clearAbandonedProgress(for: run, stateStore: context.stateStore, paths: paths)
             }
         } catch {
             FileHandle.standardError.write(Data("tick: could not recover interrupted runs: \(error)\n".utf8))
@@ -137,6 +138,36 @@ struct Tick: AsyncParsableCommand {
         }
 
         // ── Step 7: tick.lock released by the `defer` above; exit 0. ────
+    }
+
+    /// Deletes the `state/current-run-<setId>.json` a killed run left behind,
+    /// once `recoverInterrupted()` has established the run really is dead.
+    ///
+    /// Without this the file survives forever, and a `current-run` file is
+    /// what "a run is in flight" means to every reader — so one `SIGKILL`
+    /// used to pin `AppHealth` to `.running`, which outranks `.warning`, and
+    /// the menu bar stayed blue and `status` kept exiting 0 on a machine that
+    /// had stopped backing up. Readers now detect that themselves
+    /// (`RunStore.liveness(ofCurrentRun:)`), but detecting wreckage every
+    /// time is not the same as clearing it: this is what makes the warning go
+    /// away once it has been acted on.
+    ///
+    /// The `runId` guard is the whole safety of this: a *newer* run for the
+    /// same set may already be underway (the crash was days ago; this tick
+    /// only just noticed), and deleting its live progress file would break
+    /// the running backup's UI and make the health checks lie in the other
+    /// direction.
+    private func clearAbandonedProgress(for run: RecoveredRun, stateStore: StateStore, paths: AppPaths) {
+        guard let current = stateStore.readCurrentRun(setId: run.setId) else { return }
+        guard current.runId == run.runId else { return }
+        do {
+            try stateStore.clearCurrentRun(setId: run.setId)
+            print("  cleared abandoned progress \(paths.currentRunFile(setId: run.setId).lastPathComponent)")
+        } catch {
+            FileHandle.standardError.write(
+                Data("tick: could not clear abandoned progress for set \(run.setId): \(error)\n".utf8)
+            )
+        }
     }
 
     private func describe(_ outcome: SetRunOutcome) -> String {

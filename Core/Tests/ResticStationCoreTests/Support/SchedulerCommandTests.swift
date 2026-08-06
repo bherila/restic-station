@@ -230,6 +230,55 @@ import Testing
         #expect(SystemdCommand.cronFallbackLine(helperPath: "/usr/bin/h", intervalMinutes: 15)
             == "*/15 * * * * /usr/bin/h tick")
     }
+
+    @Test("the cron line carries the resolved data directory, because cron sources no profile")
+    func cronFallbackCarriesDataDirectory() {
+        // cron gives a job HOME/PATH/SHELL/LOGNAME and nothing else — no
+        // profile, no XDG_STATE_HOME. A bare `helper tick` in a crontab
+        // resolves the *default* data directory whatever the installing
+        // shell had set, which is a silently empty backup.
+        #expect(SystemdCommand.cronFallbackLine(
+            helperPath: "/usr/bin/h",
+            dataDirectory: "/srv/state/restic-station"
+        ) == "*/2 * * * * RESTIC_STATION_DATA_DIR=/srv/state/restic-station /usr/bin/h tick")
+
+        // Absent or empty means "do not pin one" — the shipped docs' bare
+        // line stays bare.
+        #expect(!SystemdCommand.cronFallbackLine(helperPath: "/usr/bin/h", dataDirectory: "")
+            .contains("RESTIC_STATION_DATA_DIR"))
+    }
+
+    @Test("a data directory with shell metacharacters is quoted, not interpolated")
+    func cronFallbackQuotesForTheShell() {
+        // cron hands the command to /bin/sh, so an unquoted `$(…)`, `;` or
+        // space in a path is executed rather than passed along.
+        let line = SystemdCommand.cronFallbackLine(
+            helperPath: "/usr/bin/h",
+            dataDirectory: "/srv/my state; rm -rf /"
+        )
+        #expect(line == "*/2 * * * * RESTIC_STATION_DATA_DIR='/srv/my state; rm -rf /' /usr/bin/h tick")
+
+        let quoted = SystemdCommand.cronFallbackLine(
+            helperPath: "/opt/restic station/helper",
+            dataDirectory: "/srv/it's"
+        )
+        #expect(quoted.contains("'/opt/restic station/helper' tick"))
+        // The `'\''` dance: close, escaped literal quote, reopen.
+        #expect(quoted.contains("'/srv/it'\\''s'"))
+    }
+
+    @Test("a % in the command is escaped — crontab(5) turns a bare one into a newline")
+    func cronFallbackEscapesPercent() {
+        // An unescaped `%` truncates the command field and feeds the rest to
+        // the job on stdin, so the crontab would silently schedule a
+        // *different, shorter* command than the one printed.
+        let line = SystemdCommand.cronFallbackLine(
+            helperPath: "/usr/bin/h",
+            dataDirectory: "/srv/100%full"
+        )
+        #expect(line.contains("100\\%full"))
+        #expect(!line.contains("100%full"))
+    }
 }
 
 // MARK: - Unit directory

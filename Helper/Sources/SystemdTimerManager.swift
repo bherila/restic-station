@@ -73,7 +73,11 @@ struct SystemdTimerManager {
     ) async throws {
         guard let systemctl = systemctlPath else {
             throw SystemdTimerError.systemdUnavailable(
-                Self.noSystemdMessage(helperPath: helperPath, intervalMinutes: intervalMinutes)
+                Self.noSystemdMessage(
+                    helperPath: helperPath,
+                    intervalMinutes: intervalMinutes,
+                    dataDirectory: dataDirectory
+                )
             )
         }
 
@@ -87,7 +91,9 @@ struct SystemdTimerManager {
         log("wrote \(serviceUnitURL.path)")
         log("wrote \(timerUnitURL.path)")
         if let dataDirectory, !dataDirectory.isEmpty {
-            log("  RESTIC_STATION_DATA_DIR=\(dataDirectory) (baked in from this shell's environment)")
+            log("  RESTIC_STATION_DATA_DIR=\(dataDirectory)")
+            log("    (the data directory this command resolved, pinned into the unit — a")
+            log("     --user service does not inherit your shell's XDG_STATE_HOME)")
         }
 
         try await runChecked(systemctl, SystemdCommand.daemonReloadArgv)
@@ -171,14 +177,24 @@ struct SystemdTimerManager {
 
     /// Prints the headless equivalent of glancing at the menu bar icon.
     ///
-    /// - Parameter helperPath: this binary's own path, used only to print a
-    ///   copy-pasteable cron line when there is no systemd. Optional because
-    ///   status must still report on a host where `/proc/self/exe` could not
-    ///   be read.
-    /// - Returns: `true` when the timer is installed, enabled and active —
-    ///   i.e. when scheduled backups really will happen. `timer status` maps
-    ///   that onto its exit code so a monitoring script can use it.
-    func status(helperPath: String? = nil, activity: [String], log: (String) -> Void) async -> Bool {
+    /// - Parameters:
+    ///   - helperPath: this binary's own path, used only to print a
+    ///     copy-pasteable cron line when there is no systemd. Optional
+    ///     because status must still report on a host where
+    ///     `/proc/self/exe` could not be read.
+    ///   - dataDirectory: the resolved data directory, for the same cron
+    ///     line — see `SystemdCommand.cronFallbackLine`.
+    ///   - activity: what the tick has been doing, plus anything the caller
+    ///     found wrong while reading it (a config it could not load).
+    /// - Returns: every reason scheduled backups will not happen on this
+    ///   host, empty when there are none. `timer status` maps that onto its
+    ///   exit code so a monitoring script can use it.
+    func status(
+        helperPath: String? = nil,
+        dataDirectory: String? = nil,
+        activity: TimerActivity,
+        log: (String) -> Void
+    ) async -> TimerHealth {
         log("Restic Station — systemd --user timer")
         log("")
 
@@ -187,14 +203,18 @@ struct SystemdTimerManager {
             log("")
             let advice = Self.cronFallbackAdvice(
                 helperPath: helperPath,
-                intervalMinutes: SystemdCommand.defaultIntervalMinutes
+                intervalMinutes: SystemdCommand.defaultIntervalMinutes,
+                dataDirectory: dataDirectory
             )
             for line in advice {
                 log(line.isEmpty ? "" : "  \(line)")
             }
-            return false
+            let health = TimerHealth(problems: [.systemdUnavailable] + activity.problems)
+            Self.logVerdict(health, log: log)
+            return health
         }
 
+        var problems: [TimerProblem] = []
         let fileManager = FileManager.default
         let hasService = fileManager.fileExists(atPath: serviceUnitURL.path)
         let hasTimer = fileManager.fileExists(atPath: timerUnitURL.path)
@@ -210,9 +230,11 @@ struct SystemdTimerManager {
             log("                \(SystemdCommand.serviceUnitName): \(hasService ? "present" : "MISSING")")
             log("                \(SystemdCommand.timerUnitName): \(hasTimer ? "present" : "MISSING")")
             log("                fix: restic-station-helper timer install")
+            problems.append(.unitsIncomplete)
         } else {
             log("  units       not installed (looked in \(unitDirectory.path))")
             log("                fix: restic-station-helper timer install")
+            problems.append(.unitsMissing)
         }
 
         if let interval = Self.installedInterval(timerUnitURL: timerUnitURL) {
@@ -223,6 +245,8 @@ struct SystemdTimerManager {
         let active = await word(systemctl, SystemdCommand.isActiveArgv)
         log("  enabled     \(enabled ?? "unknown")")
         log("  active      \(active ?? "unknown")")
+        if enabled != "enabled" { problems.append(.notEnabled) }
+        if active != "active" { problems.append(.notActive) }
 
         let linger = await lingerState()
         switch linger {
@@ -231,9 +255,18 @@ struct SystemdTimerManager {
         case .disabled:
             log("  linger      DISABLED — scheduled backups stop when \(userName) logs out")
             log("                fix: \(SystemdCommand.enableLingerCommandLine(user: userName))")
+            problems.append(.lingerDisabled)
         case .unknown:
             log("  linger      unknown — could not ask loginctl or read \(lingerMarkerDirectory.path)")
             log("                if backups stop after logout: \(SystemdCommand.enableLingerCommandLine(user: userName))")
+            // Deliberately *not* a problem. `.unknown` means neither
+            // `loginctl` nor `/var/lib/systemd/linger` could be consulted,
+            // which on a container without logind is not a broken host but a
+            // host where the question does not arise (nobody logs out of it).
+            // Failing here would make `timer status` red on every such host
+            // forever, and a health check that is always red is a health
+            // check nobody reads. Only a confirmed `Linger=no` — a host that
+            // has logind and told us the answer — fails.
         }
 
         if hasTimer {
@@ -250,15 +283,33 @@ struct SystemdTimerManager {
             }
         }
 
-        if !activity.isEmpty {
+        if !activity.lines.isEmpty {
             log("")
             log("  last tick activity (from state/ and runs/)")
-            for line in activity {
+            for line in activity.lines {
                 log("    \(line)")
             }
         }
 
-        return hasService && hasTimer && enabled == "enabled" && active == "active"
+        let health = TimerHealth(problems: problems + activity.problems)
+        Self.logVerdict(health, log: log)
+        return health
+    }
+
+    /// The last thing `timer status` prints, and the only line a human has to
+    /// read. Everything above it is evidence; this is the finding, spelled
+    /// out — including the exit code, so the connection between "what this
+    /// says" and "what a monitoring script sees" is never inferred.
+    private static func logVerdict(_ health: TimerHealth, log: (String) -> Void) {
+        log("")
+        guard !health.isHealthy else {
+            log("  VERDICT     scheduled backups will happen on this host (exit 0)")
+            return
+        }
+        log("  VERDICT     scheduled backups will NOT happen on this host (exit 1)")
+        for problem in health.problems {
+            log("                - \(problem.summary)")
+        }
     }
 
     /// `OnUnitActiveSec=` as actually installed, so status reports the truth
@@ -330,18 +381,30 @@ struct SystemdTimerManager {
     /// What `timer install` says on a host with no systemd. Names the cron
     /// one-liner rather than letting the user meet `systemctl: command not
     /// found` and file a bug.
-    static func noSystemdMessage(helperPath: String, intervalMinutes: Int) -> String {
+    static func noSystemdMessage(
+        helperPath: String,
+        intervalMinutes: Int,
+        dataDirectory: String? = nil
+    ) -> String {
         (["systemd is not available on this host, so there is no user timer to install."]
-            + cronFallbackAdvice(helperPath: helperPath, intervalMinutes: intervalMinutes))
+            + cronFallbackAdvice(
+                helperPath: helperPath,
+                intervalMinutes: intervalMinutes,
+                dataDirectory: dataDirectory
+            ))
             .joined(separator: "\n")
     }
 
-    static func cronFallbackAdvice(helperPath: String?, intervalMinutes: Int) -> [String] {
+    static func cronFallbackAdvice(
+        helperPath: String?,
+        intervalMinutes: Int,
+        dataDirectory: String? = nil
+    ) -> [String] {
         let path = helperPath ?? "/path/to/restic-station-helper"
         return [
             "Use cron instead — one line, no tooling needed (`crontab -e`):",
             "",
-            "    \(SystemdCommand.cronFallbackLine(helperPath: path, intervalMinutes: intervalMinutes))",
+            "    \(SystemdCommand.cronFallbackLine(helperPath: path, intervalMinutes: intervalMinutes, dataDirectory: dataDirectory))",
             "",
             "One behavioural difference: cron has no equivalent of the timer's",
             "boot-time catch-up, so a tick missed while the machine was off is not",
@@ -400,6 +463,75 @@ struct SystemdTimerManager {
 
     static func trimmed(_ data: Data) -> String {
         String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
+// MARK: - TimerHealth
+
+/// One reason scheduled backups will not happen on this host.
+///
+/// The `rawValue`s are a documented interface: they appear in `status
+/// --json`'s `scheduler.problems` array (`docs/data-model.md`), so a
+/// monitoring script can branch on the *kind* of breakage rather than
+/// grepping prose. Adding a case is additive; renaming one is not.
+enum TimerProblem: String, Equatable, Sendable, CaseIterable {
+    case systemdUnavailable
+    case unitsMissing
+    case unitsIncomplete
+    case notEnabled
+    case notActive
+    case lingerDisabled
+    case configUnreadable
+
+    /// One line, no leading capital, safe to print after a dash.
+    var summary: String {
+        switch self {
+        case .systemdUnavailable:
+            return "systemd is not available on this host, so nothing is scheduling the tick"
+        case .unitsMissing:
+            return "the units are not installed — run `restic-station-helper timer install`"
+        case .unitsIncomplete:
+            return "one of the two units is missing; systemd will refuse to start the timer"
+        case .notEnabled:
+            return "the timer is not enabled, so it will not come back after a reboot"
+        case .notActive:
+            return "the timer is not active, so it is not firing now"
+        case .lingerDisabled:
+            return "lingering is disabled — the timer stops at logout "
+                + "(`sudo loginctl enable-linger <user>`)"
+        case .configUnreadable:
+            return "the configuration could not be loaded, so every tick will fail"
+        }
+    }
+}
+
+/// The verdict `timer status` exits on: every reason found, in the order
+/// found, or empty for a healthy host.
+struct TimerHealth: Equatable, Sendable {
+    var problems: [TimerProblem]
+
+    var isHealthy: Bool { problems.isEmpty }
+
+    /// `timer status`'s exit code, and the one place the mapping is written
+    /// down. Documented in `docs/scheduling.md` §`timer status`.
+    var exitCode: Int32 { isHealthy ? 0 : 1 }
+}
+
+/// What the tick has been doing, plus anything that went wrong while finding
+/// out.
+///
+/// The two travel together because a failure to *read* the state is itself a
+/// scheduling problem — a `config.json` that will not parse means every tick
+/// exits 1 — and reporting the activity lines without it is how `timer
+/// status` used to print a cheerful "no backup sets configured" for a host
+/// whose config was corrupt.
+struct TimerActivity: Equatable, Sendable {
+    var lines: [String]
+    var problems: [TimerProblem]
+
+    init(lines: [String], problems: [TimerProblem] = []) {
+        self.lines = lines
+        self.problems = problems
     }
 }
 

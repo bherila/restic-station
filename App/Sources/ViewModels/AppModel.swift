@@ -365,6 +365,13 @@ final class AppModel: ObservableObject {
         // Resolved, not raw: a set this machine does not run has no health
         // to report here, and a destination disabled on this machine must
         // not raise a staleness warning for a repo it never writes to.
+        // A `current-run-*.json` whose process is gone is not a run in
+        // flight. Same predicate for both derivations, and the same one
+        // `restic-station-helper status` uses, so the menu bar and the CLI
+        // cannot disagree about whether this machine is busy.
+        let isRunAbandoned: (CurrentRunState) -> Bool = { [runStore] in
+            runStore.liveness(ofCurrentRun: $0) == .abandoned
+        }
         setHealths = HealthDerivation.setHealths(
             config: resolvedConfig,
             recentRuns: stateWatcher.recentRuns,
@@ -372,18 +379,20 @@ final class AppModel: ObservableObject {
             repoStatuses: stateWatcher.repoStatuses,
             scheduleState: stateWatcher.scheduleState,
             now: currentDate,
-            calendar: calendar
+            calendar: calendar,
+            isRunAbandoned: isRunAbandoned
         )
         appHealth = HealthDerivation.appHealth(
             setHealths: setHealths,
-            anyRunInFlight: !stateWatcher.currentRuns.isEmpty,
+            runsInFlight: Array(stateWatcher.currentRuns.values),
             // Only a *definite* denial is a warning: a missing
             // `fda-check.json` means the probe has never run (or does not
             // apply on this platform), which the Permissions pane reports as
             // "unknown" (T18) rather than as a problem. The rule lives in
             // Core so the Linux build is held to it too (T25).
             fullDiskAccessDenied: HealthDerivation.fullDiskAccessDenied(from: stateWatcher.fdaCheck),
-            backgroundAgentEnabled: launchd.isEnabled
+            backgroundAgentEnabled: launchd.isEnabled,
+            isRunAbandoned: isRunAbandoned
         )
     }
 

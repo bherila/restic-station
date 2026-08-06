@@ -215,7 +215,10 @@ private final class TickCounter: @unchecked Sendable {
 
         let recovered = try store.recoverInterrupted()
 
-        #expect(recovered == [run.runId])
+        // The setId travels with the runId so the caller can also clear the
+        // `state/current-run-<setId>.json` the dead process left behind —
+        // `Tick.clearAbandonedProgress(for:…)`.
+        #expect(recovered == [RecoveredRun(runId: run.runId, setId: setId)])
 
         let after = try store.metadata(runId: run.runId)
         #expect(after.status == .failed)
@@ -251,6 +254,81 @@ private final class TickCounter: @unchecked Sendable {
         // No index line should have been written for an untouched run.
         let index = try store.recentRuns(limit: 10)
         #expect(index.isEmpty)
+    }
+
+    // MARK: - Current-run liveness
+
+    /// A `state/current-run-<setId>.json` for `runId`. Only `runId` matters
+    /// to `liveness(ofCurrentRun:)`; the rest is filler.
+    private func progress(runId: String) -> CurrentRunState {
+        CurrentRunState(
+            runId: runId,
+            kind: .backup,
+            phase: "backing-up-primary",
+            percentDone: 0.5,
+            bytesDone: 1,
+            totalBytes: 2,
+            filesDone: 1,
+            totalFiles: 2,
+            currentFiles: [],
+            updatedAt: Date(timeIntervalSince1970: 0)
+        )
+    }
+
+    @Test("a run whose process is still alive is live")
+    func livenessOfARunningProcess() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+
+        let store = RunStore(paths: paths, now: { Date() })
+        // begin() stamps pid = getpid() — this test's own process.
+        let run = try store.begin(kind: .backup, setId: UUID(), destId: UUID(), trigger: .scheduled)
+
+        #expect(store.liveness(ofCurrentRun: progress(runId: run.runId)) == .live)
+    }
+
+    @Test("a run whose process is gone is abandoned, however recent its progress")
+    func livenessOfADeadProcess() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+
+        let store = RunStore(paths: paths, now: { Date() })
+        let run = try store.begin(kind: .backup, setId: UUID(), destId: UUID(), trigger: .scheduled)
+
+        var stuck = try store.metadata(runId: run.runId)
+        stuck.pid = 999_999
+        try writeRawMetadata(stuck, paths: paths)
+
+        // `updatedAt` is deliberately *now* — the whole point of using pid
+        // liveness rather than a timestamp heuristic is that a fresh-looking
+        // progress file from a dead process is still wreckage, and a very
+        // stale one from a live `check --read-data` is still a live run.
+        var fresh = progress(runId: run.runId)
+        fresh.updatedAt = Date()
+        #expect(store.liveness(ofCurrentRun: fresh) == .abandoned)
+    }
+
+    @Test("a finished run's leftover progress file is abandoned")
+    func livenessOfAFinishedRun() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+
+        let store = RunStore(paths: paths, now: { Date() })
+        let run = try store.begin(kind: .backup, setId: UUID(), destId: UUID(), trigger: .scheduled)
+        try store.finish(run, status: .success)
+
+        // Our own pid is alive, so pid alone would say "live"; the run's
+        // recorded status is what settles it.
+        #expect(store.liveness(ofCurrentRun: progress(runId: run.runId)) == .abandoned)
+    }
+
+    @Test("progress pointing at a run this data directory has no record of is abandoned")
+    func livenessOfAnUnknownRun() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+
+        let store = RunStore(paths: paths, now: { Date() })
+        #expect(store.liveness(ofCurrentRun: progress(runId: "20260806T000000Z-backup-deadbeef")) == .abandoned)
     }
 
     // MARK: - Index corruption tolerance

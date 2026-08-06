@@ -260,38 +260,52 @@ run restic-station-helper timer status
 run loginctl show-user "$(whoami)" --property=Linger
 
 # ===========================================================================
-section "Scheduling: the XDG_STATE_HOME gotcha — what timer install actually bakes in"
+section "Scheduling: a custom XDG_STATE_HOME reaches the timer (issue #48)"
 # ===========================================================================
-# issue #48 (found via @codex review on #47): timer install only bakes
-# RESTIC_STATION_DATA_DIR into the unit; a custom XDG_STATE_HOME set only in
-# an interactive shell's profile is invisible to the systemd --user manager
-# that actually runs the timer's tick. Demonstrated directly against the
-# real unit file this same job's `timer install` writes — reinstalling here
-# is safe (idempotent; overwrites in place) and Fire Check below reinstalls
-# again over its own environment before it matters for anything downstream.
+# issue #48 (found via @codex review on #47): timer install used to bake only
+# RESTIC_STATION_DATA_DIR into the unit, so a custom XDG_STATE_HOME set in an
+# interactive shell's profile was invisible to the systemd --user manager
+# that actually runs the tick — which then resolved ~/.local/state/
+# restic-station, found no config there, and backed up nothing while exiting
+# 0. `timer install` now resolves the data directory through AppPaths (the
+# whole override chain) and pins the absolute result.
+#
+# Verified against the real unit file this same job's `timer install` writes,
+# not read from source. Reinstalling here is safe (idempotent; overwrites in
+# place) and Fire Check below reinstalls again over its own environment
+# before it matters for anything downstream.
 UNIT_FILE="$HOME/.config/systemd/user/restic-station.service"
+CUSTOM_STATE="$WORK/custom-xdg-state"
 
 echo
 echo "--- reinstalled with a custom XDG_STATE_HOME and no RESTIC_STATION_DATA_DIR override ---"
-env -u RESTIC_STATION_DATA_DIR XDG_STATE_HOME="$WORK/custom-xdg-state" \
+env -u RESTIC_STATION_DATA_DIR XDG_STATE_HOME="$CUSTOM_STATE" \
     restic-station-helper timer install >/dev/null
 echo "\$ cat $UNIT_FILE"
 cat "$UNIT_FILE"
-if grep -q "XDG_STATE_HOME" "$UNIT_FILE"; then
-    echo "UNEXPECTED: XDG_STATE_HOME found in the unit"
+echo
+# The assertion, not just the display: this is the regression check for #48,
+# and a transcript that only printed the file would keep printing it happily
+# after a regression.
+if grep -qF "Environment=\"RESTIC_STATION_DATA_DIR=$CUSTOM_STATE/restic-station\"" "$UNIT_FILE"; then
+    echo "CONFIRMED: the unit pins $CUSTOM_STATE/restic-station — the directory this shell's"
+    echo "XDG_STATE_HOME resolves to. The tick the timer fires reads the same data the shell"
+    echo "that installed it does, with no reliance on the user manager's environment."
 else
-    echo
-    echo "CONFIRMED: neither XDG_STATE_HOME nor RESTIC_STATION_DATA_DIR appears in the unit above —"
-    echo "a tick run from it falls back to the default ~/.local/state/restic-station, not the"
-    echo "custom XDG_STATE_HOME this shell had set."
+    echo "REGRESSION (issue #48): the unit does not pin the XDG_STATE_HOME-derived data directory."
+    exit 1
 fi
 
 echo
-echo "--- reinstalled again with RESTIC_STATION_DATA_DIR set explicitly to the same path ---"
-env RESTIC_STATION_DATA_DIR="$WORK/custom-xdg-state/restic-station" \
+echo "--- and an explicit RESTIC_STATION_DATA_DIR still wins, as the highest-priority override ---"
+env RESTIC_STATION_DATA_DIR="$WORK/explicit-data-dir" \
     restic-station-helper timer install >/dev/null
 echo "\$ cat $UNIT_FILE"
 cat "$UNIT_FILE"
+grep -qF "Environment=\"RESTIC_STATION_DATA_DIR=$WORK/explicit-data-dir\"" "$UNIT_FILE" || {
+    echo "REGRESSION: an explicit RESTIC_STATION_DATA_DIR did not reach the unit"
+    exit 1
+}
 
 # ===========================================================================
 section "Scheduling: waiting to see whether the installed timer actually fires"
@@ -378,20 +392,106 @@ fi
 RESTIC_STATION_DATA_DIR="$FIRE_DATA" run restic-station-helper timer uninstall
 
 # ===========================================================================
-section "Monitoring gap: status --json cannot see the scheduler"
+section "Monitoring: status --json sees the scheduler (issues #46, #48)"
 # ===========================================================================
-# Status.run() passes backgroundAgentEnabled: true into HealthDerivation
-# unconditionally on every platform (Helper/Sources/Commands/Status.swift) —
-# Linux's actual scheduler state is only visible to `timer status`. The Fire
-# Check timer was just uninstalled above; status --json still reports this
-# host healthy (exit 0) below because the one backup it already ran
-# succeeded and nothing here looks at the scheduler at all. timer status,
-# which does look, correctly reports "not installed" and exits 1.
+# Status.run() used to pass backgroundAgentEnabled: true into
+# HealthDerivation unconditionally on every platform, so `status --json` was
+# blind to whether anything was still scheduled: after the Fire Check timer
+# was uninstalled just above, it went on reporting this host healthy (exit 0)
+# because the one backup it had already run succeeded. It now asks the same
+# SystemdTimerManager `timer status` does.
+#
+# This is the regression check for that. The script runs without `set -e`
+# (the transcript has to show real failures too), so the assertion below is
+# an explicit `exit 1` rather than a bare command's status: a `status --json`
+# that exits 0 here must fail the job. That is the whole finding — it used to
+# exit 0 on a host with no scheduler at all.
 echo
 echo "--- status --json for the same data dir, right after the timer above was uninstalled ---"
-RESTIC_STATION_DATA_DIR="$FIRE_DATA" run restic-station-helper status --json
+STATUS_RC=0
+SCHED_JSON="$(RESTIC_STATION_DATA_DIR="$FIRE_DATA" restic-station-helper status --json)" || STATUS_RC=$?
+echo "\$ restic-station-helper status --json; echo \"exit \$?\""
+echo "$SCHED_JSON"
+echo "exit $STATUS_RC"
 echo
-echo "--- timer status for the same host: correctly reports not installed ---"
+if [[ "$STATUS_RC" -ne 1 ]]; then
+    echo "REGRESSION: status --json exited $STATUS_RC on a host with no scheduler installed;"
+    echo "expected 1. This is the exact 'green while broken' failure issue #46 tracked."
+    exit 1
+fi
+echo "$SCHED_JSON" | jq -e '.scheduler.healthy == false' >/dev/null || {
+    echo "REGRESSION: status --json did not report the scheduler as unhealthy"
+    exit 1
+}
+echo "$SCHED_JSON" | jq -e '.scheduler.problems | index("unitsMissing")' >/dev/null || {
+    echo "REGRESSION: status --json did not name unitsMissing as the reason"
+    exit 1
+}
+echo "CONFIRMED: status --json reports scheduler.healthy=false, names the reason in"
+echo "scheduler.problems, and exits 1 — on the same host and data directory that used to"
+echo "exit 0 with no mention of the scheduler at all."
+
+echo
+echo "--- and the human rendering says it in one line ---"
+RESTIC_STATION_DATA_DIR="$FIRE_DATA" restic-station-helper status || true
+
+echo
+echo "--- timer status for the same host: the same verdict, the same exit code ---"
 RESTIC_STATION_DATA_DIR="$FIRE_DATA" run restic-station-helper timer status
+
+# ===========================================================================
+section "Monitoring: a killed run does not leave the host reporting healthy forever"
+# ===========================================================================
+# A SIGKILL/OOM/power-cut skips the `defer` that deletes
+# state/current-run-<setId>.json, and a current-run file is what "a run is in
+# flight" means to every reader. `.running` outranks `.warning`, so one dead
+# run used to pin this host green permanently. Readers now check the run's
+# recorded pid (RunStore.liveness) instead of trusting the file's existence.
+#
+# Forged rather than actually SIGKILLing a backup: the file contents are what
+# the reader sees either way, and a forged one is deterministic in CI. The
+# run id points at a run directory that does not exist, which is the same
+# thing a killed run looks like once its metadata has been recovered.
+FIRE_SET_ID="$(RESTIC_STATION_DATA_DIR="$FIRE_DATA" restic-station-helper status --json \
+    | jq -r '.sets[0].id')"
+WRECKAGE="$FIRE_DATA/state/current-run-$FIRE_SET_ID.json"
+cat >"$WRECKAGE" <<JSON
+{
+  "runId" : "20260101T000000Z-backup-deadbeef",
+  "kind" : "backup",
+  "phase" : "backing-up-primary",
+  "percentDone" : 0.5,
+  "bytesDone" : 1,
+  "totalBytes" : 2,
+  "filesDone" : 1,
+  "totalFiles" : 2,
+  "currentFiles" : [],
+  "updatedAt" : "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+JSON
+echo
+echo "--- a current-run file whose process is gone (updatedAt is *now*, so no timestamp"
+echo "    heuristic would catch it) ---"
+WRECK_RC=0
+WRECK_JSON="$(RESTIC_STATION_DATA_DIR="$FIRE_DATA" restic-station-helper status --json)" || WRECK_RC=$?
+echo "$WRECK_JSON" | jq '{health, sets: [.sets[] | {name, isRunning, needsAttention, abandonedRun}]}'
+echo "exit $WRECK_RC"
+echo
+echo "$WRECK_JSON" | jq -e '.health == "warning"' >/dev/null || {
+    echo "REGRESSION: an abandoned run left health as $(echo "$WRECK_JSON" | jq -r .health), not warning"
+    exit 1
+}
+echo "$WRECK_JSON" | jq -e '.sets[0].isRunning == false' >/dev/null || {
+    echo "REGRESSION: an abandoned run still reports isRunning"
+    exit 1
+}
+echo "$WRECK_JSON" | jq -e '.sets[0].abandonedRun != null' >/dev/null || {
+    echo "REGRESSION: the abandoned run was discarded rather than reported"
+    exit 1
+}
+echo "CONFIRMED: health is \"warning\" (not \"running\"), the set reports isRunning=false, and the"
+echo "abandoned run is named so it can be cleared. Before this, the same file made every"
+echo "subsequent health check on this host exit 0 forever."
+rm -f "$WRECKAGE"
 
 exit 0

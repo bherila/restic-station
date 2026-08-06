@@ -165,8 +165,42 @@ jobs:
           }
           echo "$OUT"
           echo "$OUT" | grep -q "systemd     not available"
+          echo "$OUT" | grep -q "VERDICT     scheduled backups will NOT happen"
           # uninstall is idempotent: exit 0 when nothing is installed.
           .build/debug/restic-station-helper timer uninstall
+
+      # The other half of the same question, and the one that is easy to get
+      # wrong in the direction nobody notices: `status` must NOT go red just
+      # because this container has no systemd. The documented fallback for
+      # such a host is a cron line, which nothing here can inspect, so the
+      # honest answer is "unknown" — and a health check that is permanently
+      # red inside every container is a health check nobody reads.
+      - name: status reports an uninspectable scheduler as unknown, not as broken
+        run: |
+          export HOME=$(mktemp -d)
+          export RESTIC_STATION_DATA_DIR=$(mktemp -d)
+          OUT=$(.build/debug/restic-station-helper status --json) || {
+            echo "$OUT"; echo "status exited non-zero on a host with no systemd"; exit 1
+          }
+          echo "$OUT"
+          echo "$OUT" | jq -e '.scheduler.kind == "unknown"' > /dev/null
+          echo "$OUT" | jq -e '.scheduler.healthy == null' > /dev/null
+          echo "$OUT" | jq -e '.health == "idle"' > /dev/null
+
+      - name: status refuses to report healthy when it cannot read the run history
+        run: |
+          # Root ignores file modes, so chmod-based denial is a no-op in this
+          # container and would pass for the wrong reason. A directory where
+          # runs/index.jsonl is itself a directory is unreadable for everyone,
+          # root included.
+          export HOME=$(mktemp -d)
+          export RESTIC_STATION_DATA_DIR=$(mktemp -d)
+          mkdir -p "$RESTIC_STATION_DATA_DIR/runs/index.jsonl"
+          OUT=$(.build/debug/restic-station-helper status --json 2>&1) && {
+            echo "$OUT"; echo "expected status to exit non-zero on an unreadable run index"; exit 1
+          }
+          echo "$OUT"
+          echo "$OUT" | grep -q "could not read the run history"
 
       - name: Rendered systemd units parse
         run: |

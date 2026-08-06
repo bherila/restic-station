@@ -342,6 +342,29 @@ Superset of the index line, plus: `pid`, `resticExitCode`, `argvRedacted` (argv 
 
 `phase`: `probing` | `backing-up-primary` | `copying-<destId>` | `retention` | `checking`.
 
+**Presence does not mean "running".** The file is deleted by a `defer` at the
+end of every run, so a `SIGKILL`, an OOM kill or a power cut leaves it behind
+permanently. Because `AppHealth.running` outranks `.warning`, an
+unconditionally-trusted leftover pins a machine green forever: menu bar blue,
+`status` exit 0, no backups. Every reader therefore checks whether the run is
+still alive before treating it as in flight —
+`RunStore.liveness(ofCurrentRun:)`, which reads the run's own
+`runs/<runId>/metadata.json` and applies the same `pid` + `kill(pid, 0)` test
+`recoverInterrupted()` uses, so the two can never disagree about whether a run
+died. Not alive ⟹ the set reports `needsAttention` with the file named, not
+`isRunning`.
+
+Deliberately **not** a staleness rule on `updatedAt`. Progress is written only
+when restic emits a `status` line (throttled), and some phases legitimately
+emit nothing for hours — a `check --read-data` on a large repository writes
+one phase marker and then goes quiet. Any "no progress for N minutes ⟹ dead"
+threshold either cries wolf on those runs or is set so high it stops being a
+health check.
+
+The tick clears it: `recoverInterrupted()` returns the `setId` alongside the
+`runId` precisely so step 3 can delete the matching progress file, guarded on
+`runId` so a *newer* run for the same set is never touched.
+
 ## state/fda-check.json
 
 ```json
@@ -429,7 +452,14 @@ Never a secret: `nonSecretEnv` is exactly `Destination.nonSecretEnv` (never the 
 
 ### `status --json`
 
-Reads only existing state (`state/schedule-state.json`, `state/current-run-*.json`, `state/repo-status-*.json`, `runs/index.jsonl`) — no restic invocation. `health` reuses `HealthDerivation.appHealth` verbatim (`Core/Sources/ResticStationCore/Support/HealthDerivation.swift`), so the CLI and the app's menu bar can never disagree about what counts as a warning. One documented gap: `status` has no view into whether the scheduler itself (`SMAppService` on macOS, the systemd `--user` timer on Linux — see `timer status`) is actually registered, so `backgroundAgentEnabled` is passed as `true` (neutral) rather than guessed; this is unlike the app, which knows its own `SMAppService` state.
+Reads only existing state (`state/schedule-state.json`, `state/current-run-*.json`, `state/repo-status-*.json`, `runs/index.jsonl`) — no restic invocation. `health` reuses `HealthDerivation.appHealth` verbatim (`Core/Sources/ResticStationCore/Support/HealthDerivation.swift`), so the CLI and the app's menu bar can never disagree about what counts as a warning.
+
+On Linux it also inspects the scheduler, through the same `SystemdTimerManager` `timer status` exits on — see `scheduling.md` §`status` and the scheduler for the three-valued `scheduler` key and why `null` (macOS, or a host with no systemd) is not the same as `"healthy": false`. Only a definite `false` contributes a warning.
+
+Two things `status` will **not** do quietly, both of which used to make it report healthy for the wrong reason:
+
+- An **unreadable `runs/index.jsonl`** (wrong owner, wrong mode, I/O error) exits non-zero naming the file, instead of reading as "no runs recorded" — which derives to idle, which exits 0. A corrupt or truncated *line* stays survivable: `RunStore.recentRuns` skips it with a warning, as documented above.
+- An **abandoned `current-run-*.json`** (see §state/current-run) reports `warning` with `abandonedRun` populated and `isRunning: false`, instead of `running`.
 
 ```json
 {
@@ -437,12 +467,15 @@ Reads only existing state (`state/schedule-state.json`, `state/current-run-*.jso
   "generatedAt": "2026-07-26T20:57:30.000Z",
   "health": "warning",
   "fullDiskAccessDenied": false,
+  "scheduler": null,
   "sets": [
     {
       "id": "6F9619FF-8B86-D011-B42D-00C04FC964FF",
       "name": "Projects",
       "needsAttention": true,
       "isRunning": false,
+      "abandonedRun": null,
+      "abandonedRunFile": null,
       "lastBackup": {
         "runId": "20260726T205704Z-backup-6f9619ff",
         "status": "failed",
