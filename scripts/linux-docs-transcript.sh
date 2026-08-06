@@ -260,6 +260,40 @@ run restic-station-helper timer status
 run loginctl show-user "$(whoami)" --property=Linger
 
 # ===========================================================================
+section "Scheduling: the XDG_STATE_HOME gotcha — what timer install actually bakes in"
+# ===========================================================================
+# issue #48 (found via @codex review on #47): timer install only bakes
+# RESTIC_STATION_DATA_DIR into the unit; a custom XDG_STATE_HOME set only in
+# an interactive shell's profile is invisible to the systemd --user manager
+# that actually runs the timer's tick. Demonstrated directly against the
+# real unit file this same job's `timer install` writes — reinstalling here
+# is safe (idempotent; overwrites in place) and Fire Check below reinstalls
+# again over its own environment before it matters for anything downstream.
+UNIT_FILE="$HOME/.config/systemd/user/restic-station.service"
+
+echo
+echo "--- reinstalled with a custom XDG_STATE_HOME and no RESTIC_STATION_DATA_DIR override ---"
+env -u RESTIC_STATION_DATA_DIR XDG_STATE_HOME="$WORK/custom-xdg-state" \
+    restic-station-helper timer install >/dev/null
+echo "\$ cat $UNIT_FILE"
+cat "$UNIT_FILE"
+if grep -q "XDG_STATE_HOME" "$UNIT_FILE"; then
+    echo "UNEXPECTED: XDG_STATE_HOME found in the unit"
+else
+    echo
+    echo "CONFIRMED: neither XDG_STATE_HOME nor RESTIC_STATION_DATA_DIR appears in the unit above —"
+    echo "a tick run from it falls back to the default ~/.local/state/restic-station, not the"
+    echo "custom XDG_STATE_HOME this shell had set."
+fi
+
+echo
+echo "--- reinstalled again with RESTIC_STATION_DATA_DIR set explicitly to the same path ---"
+env RESTIC_STATION_DATA_DIR="$WORK/custom-xdg-state/restic-station" \
+    restic-station-helper timer install >/dev/null
+echo "\$ cat $UNIT_FILE"
+cat "$UNIT_FILE"
+
+# ===========================================================================
 section "Scheduling: waiting to see whether the installed timer actually fires"
 # ===========================================================================
 # The one thing issue #45 says CI has never observed: a real systemd --user
@@ -342,5 +376,22 @@ else
 fi
 
 RESTIC_STATION_DATA_DIR="$FIRE_DATA" run restic-station-helper timer uninstall
+
+# ===========================================================================
+section "Monitoring gap: status --json cannot see the scheduler"
+# ===========================================================================
+# Status.run() passes backgroundAgentEnabled: true into HealthDerivation
+# unconditionally on every platform (Helper/Sources/Commands/Status.swift) —
+# Linux's actual scheduler state is only visible to `timer status`. The Fire
+# Check timer was just uninstalled above; status --json still reports this
+# host healthy (exit 0) below because the one backup it already ran
+# succeeded and nothing here looks at the scheduler at all. timer status,
+# which does look, correctly reports "not installed" and exits 1.
+echo
+echo "--- status --json for the same data dir, right after the timer above was uninstalled ---"
+RESTIC_STATION_DATA_DIR="$FIRE_DATA" run restic-station-helper status --json
+echo
+echo "--- timer status for the same host: correctly reports not installed ---"
+RESTIC_STATION_DATA_DIR="$FIRE_DATA" run restic-station-helper timer status
 
 exit 0

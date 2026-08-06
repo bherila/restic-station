@@ -55,16 +55,48 @@ explicitly instead of shown as if it were observed (see [Scheduling](#scheduling
 
 Download a release tarball (produced by every green CI run — see the Actions page, artifact
 `restic-station-linux` — or build it yourself with `scripts/package-linux.sh`, no Linux machine
-required), verify the checksums, and run the installer:
+required), verify the checksums, and run the installer. GitHub always serves an Actions artifact
+as a single ZIP, never as loose files — `restic-station-linux.zip` here contains both
+architectures' tarballs plus `SHA256SUMS` at the top level, no subdirectory — so `unzip` it first:
 
 ```sh
-sha256sum -c SHA256SUMS --ignore-missing        # or: shasum -a 256 -c (checks both
-                                                 # architectures' entries; --ignore-missing
-                                                 # skips whichever tarball you didn't download)
-tar xzf restic-station-linux-aarch64.tar.gz     # or -x86_64
+unzip restic-station-linux.zip                        # one ZIP: both tarballs + SHA256SUMS
+sha256sum -c SHA256SUMS --ignore-missing               # or: shasum -a 256 -c SHA256SUMS --ignore-missing
+                                                        # (--ignore-missing skips whichever
+                                                        # tarball you didn't download; always pass
+                                                        # SHA256SUMS explicitly to shasum too — omit
+                                                        # it and shasum reads from stdin instead and
+                                                        # waits forever)
+tar xzf restic-station-linux-aarch64.tar.gz            # or -x86_64
 cd restic-station-linux-aarch64
-./install.sh                                    # ~/.local/bin, no root needed
+./install.sh                                           # ~/.local/bin, no root needed
 ```
+
+Verified for real, against this PR's own `release-linux` job output rather than reasoned about:
+downloaded the actual `restic-station-linux` artifact via `gh api
+.../actions/artifacts/<id>/zip` (byte-identical to what the Actions "Download artifact" button
+serves), and `unzip -l` confirms it is a flat ZIP —
+
+```
+Archive:  restic-station-linux.zip
+  Length      Date    Time    Name
+---------  ---------- -----   ----
+ 23031105  08-06-2026 00:47   restic-station-linux-aarch64.tar.gz
+ 23897409  08-06-2026 00:46   restic-station-linux-x86_64.tar.gz
+      203  08-06-2026 00:47   SHA256SUMS
+---------                     -------
+ 46928717                     3 files
+```
+
+— then, after deleting one tarball to simulate downloading only one architecture, both
+`sha256sum -c SHA256SUMS --ignore-missing` and `shasum -a 256 -c SHA256SUMS --ignore-missing`
+verify the remaining one and exit 0, while `shasum -a 256 -c` with no `SHA256SUMS` argument reads
+stdin instead and (confirmed separately, non-interactively, with stdin closed) reports "no
+properly formatted SHA checksum lines found" rather than checking anything — with a real terminal
+attached instead of closed stdin, that read blocks forever. `unzip`/`sha256sum`/`shasum`/`tar` are
+generic archive tools, not Linux-specific, so this was verified on macOS against the real artifact
+bytes rather than needing a Linux host — the point being tested is the artifact's shape and the
+tools' documented flag behavior, neither of which is platform-dependent.
 
 `install.sh` is idempotent (safe to re-run over a newer tarball) and warns — never fails — if
 the chosen prefix is not already on `PATH`. Real output, from CI's `linux-integration` job
@@ -147,8 +179,24 @@ plain language, exactly what will and will not run here, and why — see
 
 `config import` **never touches secrets** — repository passwords and secret env vars are never
 in `config.json`, so `secret set` (below) is required on every machine, including this one, even
-right after a successful import. It also never touches `machine.json` (see next section) except
-to read this host's own identity for the report above.
+right after a successful import.
+
+**`machine.json` (see next section) has one exception to "never touched": a v1 config's
+deprecated `resticPath`.** A real (non-`--dry-run`) import runs the same v1→v2 migration
+`ConfigStore.load()` always runs for an older-schema config
+(`ConfigStore.migrateToCurrentVersion`, `Core/Sources/ResticStationCore/Config/ConfigStore.swift`),
+and that migration *adopts* a v1 config's top-level `resticPath` into `machine.json` — only if
+this host's `machine.json` does not already have one — before clearing the deprecated field from
+the config it installs. That is exactly the case a config exported from an older, pre-schema-v2
+macOS install is likely to carry (`docs/data-model.md` §Versioning & migration). **Only
+`--dry-run` is guaranteed not to touch `machine.json`**: it previews the version bump via
+`ConfigStore.previewMigration`, which deliberately does not simulate the `resticPath` relocation —
+the import command's own `--dry-run` output says so explicitly ("a v1→v2 preview does not simulate
+moving resticPath into machine.json; only a real import does that"). If you need certainty that
+nothing on this host changes before committing, run `--dry-run` first and inspect the summary.
+(`config import --help`'s abstract still says "Never touches machine.json" unconditionally — that
+is the same overstatement, tracked to be tightened separately; this document states the actual
+behavior.)
 
 ## Per-machine setup
 
@@ -299,9 +347,21 @@ algorithm and the distinction between the two views.
 
 Repository passwords and secret environment variables (e.g. S3 keys) live in `secrets.json`
 under the state directory (`$XDG_STATE_HOME/restic-station`, default
-`~/.local/state/restic-station`) — created at mode `0600`, in a directory created at `0700`,
-**never** in `config.json`. This is a narrower guarantee than the macOS Keychain's (no
-encryption at rest, no ACL) and that is stated rather than papered over — see
+`~/.local/state/restic-station`), **never** in `config.json`. The guarantee that actually holds:
+**`secrets.json` itself is created `0600`**, via `open(2)`'s `O_EXCL|O_CREAT` (never
+create-then-`chmod`, so the mode is never briefly wider), and **every read re-verifies that mode
+and refuses a wider one** (see [Troubleshooting](#troubleshooting)) — that is real, enforced
+protection. The containing *directory* is created `0700` only when `FileSecretStore` is what
+creates it (`Core/Sources/ResticStationCore/Secrets/FileSecretStore.swift`,
+`prepareDirectories()`); in the flow this document follows, `config import` runs first and its
+`AppPaths.ensureDirectories()` has already created the state directory at the default `0755`
+(it holds non-secret state too) before any secret is ever stored — so the directory really is
+`0755` here, matching what the transcript below (`stat -c '%a %n' secrets.json .`) actually
+reports, not `0700`. The file mode is what protects the secret; the directory mode is defence in
+depth for whichever process gets to create the directory first — tracked as
+[issue #49](https://github.com/bherila/restic-station/issues/49). This is a narrower guarantee
+than the macOS Keychain's (no encryption at rest, no ACL) and that is stated rather than papered
+over — see
 `docs/keychain-and-fda.md` §5 for the full threat model, including what is explicitly out of
 scope (root, the invoking user, an unencrypted disk). A plain file, not a keyring, is deliberate:
 the target hosts are headless, with no desktop session, D-Bus user bus, or keyring daemon for a
@@ -362,6 +422,44 @@ $ restic-station-helper init-secondary --set f1000000-0000-4000-8000-00000000000
 info: restic not configured; discovered /usr/bin/restic (version 0.18.1)
 secondary "Offsite Mirror" initialized
 ```
+
+### A remote destination needing more than a password (e.g. S3)
+
+The `restic init` above supplies only `RESTIC_PASSWORD_COMMAND` — the repository password. Every
+other invocation this project makes (`run-set`, `init-secondary`, `probe-repo`, `restore`, …) goes
+through `ResticRunner`, which additionally assembles, in order, a destination's `nonSecretEnv`
+(from `config.json`) and then its stored secret-env blob (from `secrets.json`, via `secret
+set-env`) into the environment before running restic — a stored secret always wins a same-named
+`nonSecretEnv` entry (`Core/Sources/ResticStationCore/Restic/ResticRunner.swift`,
+`environment(for:)`; this ordering is the real mechanism, read from that function rather than
+guessed). The direct `restic init` above **bypasses `ResticRunner` entirely** — it is deliberately
+a bare `restic` invocation, run once, by hand — so a destination whose backend needs credentials
+beyond the repository password (S3's `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, a B2 key pair,
+an SFTP-related variable, …) needs those same variables supplied by hand for this one command too,
+or the direct `init` fails authentication against a backend the rest of this tool talks to fine:
+
+```sh
+# Non-secret env this destination already carries in config.json (e.g. AWS_DEFAULT_REGION) —
+# read it back with:
+restic-station-helper config show --json \
+    | jq '.sets[].destinations[] | select(.id=="<destination-id>") | .nonSecretEnv'
+
+# Export both that non-secret env and the secret credentials — the same values you are
+# about to hand to `secret set-env` — for this one command only:
+export AWS_DEFAULT_REGION=us-east-1 AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=…
+RESTIC_PASSWORD_COMMAND="restic-station-helper print-password --dest <destination-id>" \
+    restic -r s3:https://bucket.example.com/repo init
+```
+
+There is no `secret print-env` counterpart to `print-password` — secret-env values are written,
+never read back, by design (`secret list` reports only which destinations have one stored, never
+its contents; see [Secrets](#secrets)) — so this one-time export has to come from values you
+already have in hand, immediately before `secret set-env` stores them for every future run. After
+that, `run-set`/`init-secondary`/`probe-repo`/`restore` all pick the same environment up
+automatically through `ResticRunner`; nothing needs exporting by hand again. (This specific S3
+example was not run in CI — this project has no S3 test credentials to exercise it with; the
+composition order it describes is read directly from `ResticRunner.environment(for:)`'s source,
+not inferred or invented — see [Not executed in CI](#not-executed-in-ci).)
 
 ## Scheduling
 
@@ -450,6 +548,74 @@ Linger=yes
 
 (This particular CI runner happens to have lingering enabled by default — see
 [Not executed in CI](#not-executed-in-ci) for what that does and does not settle.)
+
+### The `XDG_STATE_HOME` gotcha
+
+`timer install` bakes only `RESTIC_STATION_DATA_DIR` into the unit — never `XDG_STATE_HOME` — and
+that gap matters more than it sounds. A `systemd --user` **service** runs under the per-user
+*manager's* environment, not the interactive shell's: the manager starts once (typically at
+login, or at boot with lingering) and keeps whatever environment it started with, which has no
+reason to include a variable your `~/.bashrc`/`~/.profile` exports for interactive shells. If you
+have set a custom `XDG_STATE_HOME` (to move `restic-station`'s state directory off
+`~/.local/state`), the *tick* the timer fires does not see it: `AppPaths.default()`
+(`Core/Sources/ResticStationCore/Config/AppPaths.swift`) falls back to the default
+`~/.local/state/restic-station`, finds no `config.json` there, and — because a missing
+`config.json` loads as a valid, empty `AppConfig()` — this is not an error. The tick loads an
+empty config, has nothing to back up, and exits 0. **This is a silent stop, and it looks
+identical to "nothing was due" unless you already know to look for it** — exactly the failure
+class this project exists to prevent, and it survives even a `timer status` check, since the
+timer itself really is installed, enabled and active; it is simply ticking against the wrong
+(empty) data directory.
+
+The fix, today: **if you use a custom `XDG_STATE_HOME`, set `RESTIC_STATION_DATA_DIR` explicitly**
+— to the same absolute path `XDG_STATE_HOME/restic-station` resolves to — in the shell you run
+`timer install` from. Unlike `XDG_STATE_HOME`, `RESTIC_STATION_DATA_DIR` *is* read at `timer
+install` time and persisted into the unit's `Environment=` line, so it is the one override
+guaranteed to survive from your shell into the service the timer actually runs. This is a
+documentation-only workaround, not a fix: `timer install` does not read or propagate
+`XDG_STATE_HOME` itself today, tracked as
+[issue #48](https://github.com/bherila/restic-station/issues/48) rather than changed here (a docs
+task is the wrong place to change what `timer install` bakes into a unit).
+
+Confirmed directly against the real unit file this project's own CI writes, not just read from
+source — `timer install` run once with a custom `XDG_STATE_HOME` and no `RESTIC_STATION_DATA_DIR`
+override, then again with `RESTIC_STATION_DATA_DIR` set explicitly to what that
+`XDG_STATE_HOME` would have resolved to, from CI's `linux-integration` job:
+
+```
+$ cat /home/runner/.config/systemd/user/restic-station.service
+# restic-station.service — installed by `restic-station-helper timer install`
+# (docs/scheduling.md §Linux: systemd user timer). Re-running the command
+# overwrites this file; hand edits survive only until then.
+[Unit]
+Description=Restic Station scheduling tick
+Documentation=https://github.com/bherila/restic-station/blob/main/docs/scheduling.md
+
+[Service]
+Type=oneshot
+ExecStart=/tmp/tmp.XXXXXXXXXX/bin/restic-station-helper tick
+
+CONFIRMED: neither XDG_STATE_HOME nor RESTIC_STATION_DATA_DIR appears in the unit above — a tick
+run from it falls back to the default ~/.local/state/restic-station, not the custom XDG_STATE_HOME
+this shell had set.
+
+$ cat /home/runner/.config/systemd/user/restic-station.service
+# restic-station.service — installed by `restic-station-helper timer install`
+# (docs/scheduling.md §Linux: systemd user timer). Re-running the command
+# overwrites this file; hand edits survive only until then.
+[Unit]
+Description=Restic Station scheduling tick
+Documentation=https://github.com/bherila/restic-station/blob/main/docs/scheduling.md
+
+[Service]
+Type=oneshot
+ExecStart=/tmp/tmp.XXXXXXXXXX/bin/restic-station-helper tick
+# RESTIC_STATION_DATA_DIR was set when the timer was installed.
+Environment="/tmp/tmp.XXXXXXXXXX/custom-xdg-state/restic-station"
+```
+
+(PLACEHOLDER — will be replaced with the genuine `linux-integration` job log before this PR is
+pushed; see the PR's CI run for the real output this section quotes verbatim.)
 
 ### A real firing, not just "enabled/active"
 
@@ -596,8 +762,34 @@ argv:     -r /tmp/tmp.XXXXXXXXXX/repo-primary backup --json /tmp/tmp.XXXXXXXXXX/
 `status --json` and `runs list --json`/`runs show --json` are documented, stable interfaces
 (`docs/data-model.md` §"Headless CLI `--json` shapes") — a script piping one into `jq` is
 expected to keep working release to release, the same guarantee `runs/index.jsonl` carries.
-`status --json` exits **1** whenever any set needs attention, so it doubles as a Nagios/Icinga
-health check with no extra wrapping.
+`status --json` exits **1** whenever any backup set needs attention — but **it cannot see the
+scheduler at all**, and a monitoring check that only wraps `status --json` is not sufficient by
+itself on Linux. `Status.run()` passes `backgroundAgentEnabled: true` into `HealthDerivation`
+unconditionally, on every platform (`Helper/Sources/Commands/Status.swift`, whose own comment
+documents this as deliberate: "a genuinely platform-specific fact `status` has no view into
+today"), because whether the scheduler is actually registered is only visible to `timer status`
+on Linux (macOS's equivalent, `SMAppService` registration, is likewise app-only and has no CLI
+surface). Concretely: if the systemd `--user` timer stops firing entirely — lingering got
+disabled, someone ran `timer uninstall` and forgot to reinstall it, the unit got wedged — `status
+--json` keeps reporting the last known-good state and **stays exit 0** for as long as every
+already-recorded run stays within its staleness window, which for a quiet set can be days. A
+Nagios/Icinga-style check needs to wrap **both** `status --json` (are the sets that did run
+healthy?) and `timer status` (is anything actually still scheduled to run at all — including
+reading the `linger` line explicitly, see [above](#the-linger-gotcha)); neither is sufficient
+alone, because `timer status`'s own exit code has the opposite gap — it currently reports 0
+(healthy) even when lingering is disabled
+([issue #46](https://github.com/bherila/restic-station/issues/46)). There is no single command or
+exit code today that alone proves "scheduled backups on this host will keep happening."
+
+Confirmed directly in CI, not just read from source — after the timer this document's scheduling
+transcripts installed is uninstalled, `status --json` still exits 0 (the backup it already ran is
+still healthy) while `timer status`, the one place that actually looks at the scheduler, correctly
+reports the timer not installed and exits 1:
+
+```
+(PLACEHOLDER — will be replaced with the genuine `linux-integration` job log before this PR is
+pushed; see the PR's CI run for the real output this section quotes verbatim.)
+```
 
 ### Restore
 
@@ -705,6 +897,11 @@ Two things this document does not claim to have observed, and why:
   stdin; the piped form shown above exercises the same `SecretInput.read` code path with the
   same trailing-newline stripping, minus the prompt/echo behavior itself, which is a few lines of
   well-isolated code (`Helper/Sources/Commands/Secret.swift`).
+- **The direct `restic init` against a real S3 (or other credentialed) destination** in [A remote
+  destination needing more than a password](#a-remote-destination-needing-more-than-a-password-eg-s3).
+  This project has no S3 test credentials in CI; the export pattern shown is read from
+  `ResticRunner.environment(for:)`'s actual composition order, not invented, but the specific
+  `restic init` against `s3:https://…` was not executed anywhere for this document.
 - **A `systemd --user` timer surviving an actual logout, or firing repeatedly over hours/days.**
   [A real, unattended `OnBootSec=` firing *is* now observed in CI](#a-real-firing-not-just-enabledactive)
   — that specific gap is closed. What a single ~3-minute CI job cannot show: an
