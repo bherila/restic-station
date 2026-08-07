@@ -150,15 +150,47 @@ struct Tick: AsyncParsableCommand {
         do {
             for run in try runStore.recoverInterrupted() {
                 print("recovered interrupted run \(run.runId)")
-                clearAbandonedProgress(for: run, stateStore: stateStore, paths: paths)
             }
         } catch {
             FileHandle.standardError.write(Data("tick: could not recover interrupted runs: \(error)\n".utf8))
         }
+
+        // Unconditionally, not only for what `recoverInterrupted()` just
+        // returned — see `clearAbandonedProgress`.
+        clearAbandonedProgress(runStore: runStore, stateStore: stateStore, paths: paths)
     }
 
-    /// Deletes the `state/current-run-<setId>.json` a killed run left behind,
-    /// once `recoverInterrupted()` has established the run really is dead.
+    /// Deletes every `state/current-run-<setId>.json` that no live process
+    /// stands behind.
+    ///
+    /// **Driven by `currentRunSetIDs()` rather than by what
+    /// `recoverInterrupted()` returned**, which is not a refactor but the
+    /// fix for a second way the warning could become permanent.
+    /// `recoverInterrupted()` only returns runs it *itself* transitioned
+    /// from `.running` to `.failed` (`RunStore`'s `guard metadata.status ==
+    /// .running`), so wreckage whose metadata was already terminal was
+    /// returned by nothing and cleared by nothing here. Two ways to get
+    /// there, one of them routine:
+    ///
+    /// - **The upgrade cohort — every host this PR exists to rescue.** On
+    ///   the previous release the first post-kill tick already rewrote the
+    ///   run's metadata to `.failed` while nothing deleted the current-run
+    ///   file. Those hosts arrive here with exactly the state the old
+    ///   condition skipped.
+    /// - **A tick killed** between `writeMetadataAtomic` and this call.
+    ///
+    /// Left unswept, and if the set was since deleted from the config, the
+    /// consequence is the worst shape a health check has: `status` counts
+    /// the run in `hasWarningConditions` (deliberately — an abandoned run
+    /// for an unconfigured set has no `SetHealth` to carry it, so deleting a
+    /// set must not silence it) and exits 1 forever, while `sets[]` covers
+    /// only the resolved config and so names nothing. A permanent alarm with
+    /// no stated reason is one a user learns to ignore, which lands back at
+    /// the false-assurance failure this PR is about.
+    ///
+    /// Liveness is re-derived per file instead of matching a `runId`: under
+    /// the lock, a current-run file whose own metadata says the process is
+    /// gone is wreckage no matter which run left it.
     ///
     /// Without this the file survives forever, and a `current-run` file is
     /// what "a run is in flight" means to every reader — so one `SIGKILL`
@@ -170,10 +202,10 @@ struct Tick: AsyncParsableCommand {
     /// away once it has been acted on.
     ///
     /// **Under the set lock**, which is the only thing that makes the
-    /// `runId` guard sound. A newer run for the same set may already be
+    /// liveness check sound. A newer run for the same set may already be
     /// underway (the crash was days ago; this tick only just noticed), and
     /// deleting its live progress would break the running backup's UI and
-    /// make the health checks lie in the other direction. Comparing and then
+    /// make the health checks lie in the other direction. Deciding and then
     /// deleting without the lock left a window where a manual `run-set`
     /// could write its first phase marker in between and have it deleted —
     /// `tick.lock` does not exclude manual operations, so that race was
@@ -183,22 +215,24 @@ struct Tick: AsyncParsableCommand {
     /// lock for its whole duration (`BackupEngine.makeSetLock`), so failing
     /// to acquire it *is* the answer — someone is running, the file is
     /// theirs, leave it alone.
-    private func clearAbandonedProgress(for run: RecoveredRun, stateStore: StateStore, paths: AppPaths) {
-        let lock = FileLock(path: paths.setLockFile(setId: run.setId))
-        guard lock.tryAcquire() else { return }
-        defer { lock.release() }
+    private func clearAbandonedProgress(runStore: RunStore, stateStore: StateStore, paths: AppPaths) {
+        for setId in stateStore.currentRunSetIDs() {
+            let lock = FileLock(path: paths.setLockFile(setId: setId))
+            guard lock.tryAcquire() else { continue }
+            defer { lock.release() }
 
-        // Re-read inside the lock: whatever was there before we held it is
-        // not evidence of anything.
-        guard let current = stateStore.readCurrentRun(setId: run.setId) else { return }
-        guard current.runId == run.runId else { return }
-        do {
-            try stateStore.clearCurrentRun(setId: run.setId)
-            print("  cleared abandoned progress \(paths.currentRunFile(setId: run.setId).lastPathComponent)")
-        } catch {
-            FileHandle.standardError.write(
-                Data("tick: could not clear abandoned progress for set \(run.setId): \(error)\n".utf8)
-            )
+            // Re-read inside the lock: whatever was there before we held it
+            // is not evidence of anything.
+            guard let current = stateStore.readCurrentRun(setId: setId) else { continue }
+            guard runStore.liveness(ofCurrentRun: current) == .abandoned else { continue }
+            do {
+                try stateStore.clearCurrentRun(setId: setId)
+                print("  cleared abandoned progress \(paths.currentRunFile(setId: setId).lastPathComponent)")
+            } catch {
+                FileHandle.standardError.write(
+                    Data("tick: could not clear abandoned progress for set \(setId): \(error)\n".utf8)
+                )
+            }
         }
     }
 

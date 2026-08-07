@@ -801,6 +801,86 @@ JSON
     log "$step OK (warning, not running; the abandoned run is named)"
 }
 
+assert_tick_clears_wreckage_whose_metadata_is_already_terminal() {
+    local step="tick clears abandoned progress whose run is already marked failed"
+    log "$step"
+
+    # The case `recoverInterrupted()` cannot see. It only returns runs *it*
+    # transitioned from `running` to `failed`, so a current-run file whose
+    # metadata is already terminal was returned by nothing and cleared by
+    # nothing — leaving `status` to exit 1 until the set next runs, and
+    # forever if the set is deleted from the config first.
+    #
+    # This is not a contrived state: it is what every host upgrading from the
+    # previous release looks like. There, the first post-kill tick already
+    # rewrote metadata to `failed` while nothing deleted the current-run file.
+    local run_id="20260101T000000Z-backup-cafebabe"
+    local run_dir="$DATA_DIR/runs/$run_id"
+    mkdir -p "$run_dir" "$DATA_DIR/state"
+
+    # pid 999999 is above the default pid_max on both platforms, so
+    # `kill(pid, 0)` reports ESRCH — dead, without depending on what happens
+    # to be running on the test host.
+    cat >"$run_dir/metadata.json" <<JSON
+{
+  "runId" : "$run_id",
+  "kind" : "backup",
+  "setId" : "$SET_ID",
+  "destId" : "$PRIMARY_DEST_ID",
+  "groupId" : "$run_id",
+  "status" : "failed",
+  "trigger" : "scheduled",
+  "start" : "2026-01-01T00:00:00Z",
+  "end" : "2026-01-01T00:05:00Z",
+  "pid" : 999999,
+  "argvRedacted" : [],
+  "errorSummary" : "interrupted"
+}
+JSON
+
+    local wreckage="$DATA_DIR/state/current-run-${SET_ID}.json"
+    cat >"$wreckage" <<JSON
+{
+  "runId" : "$run_id",
+  "kind" : "backup",
+  "phase" : "backing-up-primary",
+  "percentDone" : 0.5,
+  "bytesDone" : 1,
+  "totalBytes" : 2,
+  "filesDone" : 1,
+  "totalFiles" : 2,
+  "currentFiles" : [],
+  "updatedAt" : "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+JSON
+
+    # Precondition: this really is the alarm state, not an already-clean host.
+    local rc
+    set +e
+    "$HELPER" status --json >/dev/null 2>&1
+    rc=$?
+    set -e
+    [[ $rc -eq 1 ]] || fail "$step" "expected status to exit 1 before the tick, got $rc"
+
+    local out
+    set +e
+    out="$("$HELPER" tick 2>&1)"
+    rc=$?
+    set -e
+    [[ $rc -eq 0 ]] || fail "$step" "tick exited $rc: $out"
+
+    [[ ! -f "$wreckage" ]] || fail "$step" "tick left the abandoned progress file behind: $out"
+
+    set +e
+    out="$("$HELPER" status --json 2>&1)"
+    rc=$?
+    set -e
+    [[ $rc -eq 0 ]] || fail "$step" "expected status to exit 0 after the tick cleared the wreckage, got $rc: $out"
+
+    rm -rf "$run_dir"
+    log "$step OK (cleared, and status returns to exit 0)"
+}
+
 assert_unreadable_run_index_fails_loudly() {
     local step="unreadable runs index (status must not report healthy)"
     log "$step"
@@ -1121,6 +1201,7 @@ main() {
     assert_retention
     assert_tick_noop
     assert_abandoned_run_is_not_healthy
+    assert_tick_clears_wreckage_whose_metadata_is_already_terminal
     assert_unreadable_run_index_fails_loudly
     assert_lock_busy
 
