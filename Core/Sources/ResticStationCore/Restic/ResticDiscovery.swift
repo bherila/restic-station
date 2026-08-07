@@ -214,8 +214,7 @@ public struct ResticDiscovery: Sendable {
         }
 
         guard result.exitCode == 0 else {
-            let stderr = String(decoding: result.stderr, as: UTF8.self)
-                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let stderr = Self.summarize(failureOutput: result.stderr)
             return ResticProbe(path: path, outcome: .unusable(
                 reason: stderr.isEmpty
                     ? "\(path) exited \(result.exitCode) when asked for its version."
@@ -238,6 +237,56 @@ public struct ResticDiscovery: Sendable {
                 ? .ok(version: info.version)
                 : .tooOld(version: info.version)
         )
+    }
+
+    /// How much of a failed candidate's stderr may appear in a `reason`.
+    ///
+    /// Bounded because `reason` is *published*: the helper prints it to
+    /// stdout from `tick` (journald / launchd logs, permanently, on every
+    /// tick) and to stderr from every strict subcommand, and the macOS
+    /// Settings pane renders it verbatim. Everything upstream of that is
+    /// untrusted output from a binary that is, by definition, not the restic
+    /// we were looking for.
+    ///
+    /// Two separate hazards, both closed by the same cap:
+    ///
+    /// - **Secrets.** The probe deliberately inherits this process's
+    ///   environment (rule 3 above — it keeps the probe faithful to how a
+    ///   user would run the binary in a shell, and `ProcessRunning` replaces
+    ///   the environment only when `env` is non-nil). A wrapper script that
+    ///   dumps its environment on failure would therefore hand us the
+    ///   caller's variables — and `docs/linux.md` §Destinations tells users
+    ///   to `export AWS_SECRET_ACCESS_KEY=…` in the very shell they then run
+    ///   helper commands from. The fix belongs here rather than on the
+    ///   probe's environment: rule 3 is about *execution* fidelity, and
+    ///   sanitizing the environment would change which binaries run at all.
+    /// - **Volume.** `readPipeToCompletion` accumulates stderr without a
+    ///   limit, so a chatty candidate could otherwise write megabytes into
+    ///   journald every tick.
+    ///
+    /// One line is enough for every real diagnostic this case produces —
+    /// `Exec format error`, `cannot execute binary file`, a missing-loader
+    /// message — all of which are short and single-line.
+    public static let maxReasonOutputLength = 200
+
+    /// The first line of a failed candidate's stderr, capped at
+    /// `maxReasonOutputLength` and marked when anything was dropped, so a
+    /// truncated diagnostic is never mistaken for the whole story.
+    static func summarize(failureOutput: Data) -> String {
+        let all = String(decoding: failureOutput, as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !all.isEmpty else { return "" }
+
+        // `all` is already trimmed, so it cannot *start* with a newline: a
+        // shorter first line always means there were further lines to drop.
+        let firstLine = all.prefix { !$0.isNewline }
+        let hasMoreLines = firstLine.count != all.count
+        let trimmed = firstLine.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if trimmed.count > maxReasonOutputLength {
+            return String(trimmed.prefix(maxReasonOutputLength)) + "… (truncated)"
+        }
+        return hasMoreLines ? trimmed + "… (truncated)" : trimmed
     }
 
     /// Probes candidates in order and stops at the first one that satisfies
