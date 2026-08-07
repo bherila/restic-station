@@ -100,6 +100,46 @@ jobs:
           echo "$OUT" | grep -q "$RESTIC_STATION_DATA_DIR/machine.json"
           # "open Restic Station" is impossible advice on a headless host.
           ! echo "$OUT" | grep -q "open Restic Station"
+          # issue #50: the advice must not be a package manager that ships
+          # below the enforced floor. Following it verbatim on this very
+          # runner's distro reproduces the failure.
+          ! echo "$OUT" | grep -qE "apt install restic|dnf install restic"
+          echo "$OUT" | grep -q "github.com/restic/restic/releases"
+
+          # 1b. issue #50's headline case, on a real Linux host: a restic that
+          #     is present and runs, but is the version `apt install restic`
+          #     would have given you. "not found" is the one thing this must
+          #     not say.
+          OLDBIN=$(mktemp -d)
+          cat > "$OLDBIN/restic" <<'SH'
+          #!/bin/sh
+          if [ "$1" = "version" ]; then
+            echo '{"version":"0.16.4","go_version":"go1.21.6","go_os":"linux","go_arch":"arm64"}'
+            exit 0
+          fi
+          exit 1
+          SH
+          chmod +x "$OLDBIN/restic"
+          OUT=$(env PATH="$OLDBIN" .build/debug/restic-station-helper \
+            probe-repo --set $UUID --dest $UUID 2>&1 || true)
+          echo "$OUT"
+          echo "$OUT" | grep -q "0.16.4"
+          echo "$OUT" | grep -q "$OLDBIN/restic"
+          echo "$OUT" | grep -q "0.17.0"
+          ! echo "$OUT" | grep -q "restic not found"
+
+          # 1c. Found, ran, and is not restic at all. `ResticDiscovery`
+          #     records the reason so this case "is never silent"; it used to
+          #     be silenced into "not found" here.
+          BADBIN=$(mktemp -d)
+          printf '#!/bin/sh\nexit 72\n' > "$BADBIN/restic"
+          chmod +x "$BADBIN/restic"
+          OUT=$(env PATH="$BADBIN" .build/debug/restic-station-helper \
+            probe-repo --set $UUID --dest $UUID 2>&1 || true)
+          echo "$OUT"
+          echo "$OUT" | grep -q "$BADBIN/restic"
+          echo "$OUT" | grep -q "72"
+          ! echo "$OUT" | grep -q "restic not found"
 
           # The v1 config written above was migrated in place by that first
           # load: version bumped, backup taken verbatim, machine identity
@@ -390,8 +430,9 @@ jobs:
       # that pin `resticPath` in config.json (an explicit path bypasses the
       # version gate), but the T29 fixture flow imports a Mac-authored config
       # with `resticPath: null` and therefore exercises real discovery — which
-      # correctly rejects 0.16.4 and reports "restic not found". Install the
-      # official release so CI tests the version a user is told to run.
+      # correctly rejects 0.16.4 (reporting it as too old by name and version
+      # since issue #50, not as "not found"). Install the official release so
+      # CI tests the version a user is told to run.
       - name: Install restic + jq
         run: |
           sudo apt-get update -qq

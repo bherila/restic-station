@@ -96,23 +96,39 @@ struct HelperContext {
         } catch {
             HelperExit.fail("could not load configuration: \(error)")
         }
-        guard let context = await makeTolerant(paths: paths, views: views, configStore: configStore) else {
-            HelperExit.fail(resticNotFoundMessage(paths: paths))
+        switch await makeTolerant(paths: paths, views: views, configStore: configStore) {
+        case .ready(let context):
+            return context
+        case .noRestic(let result):
+            HelperExit.fail(resticNotFoundMessage(paths: paths, result: result))
         }
-        return context
     }
 
     /// The lenient constructor `tick` uses: `tick`'s own contract is "exit 0
     /// always, except a hard config-load error" (`docs/scheduling.md`
     /// §Tick algorithm) — an unresolvable restic path must not be treated as
-    /// a hard error there, so this returns `nil` instead of exiting.
+    /// a hard error there, so this reports the failure instead of exiting.
+    ///
+    /// Returns the discovery result rather than a bare `nil` so the caller
+    /// can explain *which* of the three failures it was (issue #50) without
+    /// re-running a search that may take up to
+    /// `maxCandidates × probeTimeout` seconds.
+    enum TolerantOutcome {
+        case ready(HelperContext)
+        case noRestic(ResticDiscoveryResult)
+    }
+
     static func makeTolerant(
         paths: AppPaths,
         views: Views,
         configStore: ConfigStore
-    ) async -> HelperContext? {
-        guard let resticPath = await resolveResticPath(resolved: views.scheduled) else {
-            return nil
+    ) async -> TolerantOutcome {
+        let resticPath: String
+        switch await resolveResticPath(resolved: views.scheduled) {
+        case .resolved(let path):
+            resticPath = path
+        case .notFound(let result):
+            return .noRestic(result)
         }
         let processRunner = DefaultProcessRunner()
         let secrets = makeSecretStore(paths: paths, runner: processRunner)
@@ -136,7 +152,7 @@ struct HelperContext {
             stateStore: stateStore,
             reachability: reachability
         )
-        return HelperContext(
+        return .ready(HelperContext(
             paths: paths,
             configStore: configStore,
             stateStore: stateStore,
@@ -147,7 +163,7 @@ struct HelperContext {
             engine: engine,
             scheduled: views.scheduled,
             addressable: views.addressable
-        )
+        ))
     }
 
     /// The one place the helper decides which secret backend to use:

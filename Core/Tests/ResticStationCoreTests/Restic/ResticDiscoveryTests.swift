@@ -73,7 +73,13 @@ import Testing
                 return behaviours[argv.first ?? ""] ?? .failsToLaunch
             }
 
-            #expect(env == nil, "the probe must not pass an environment (rule 3)")
+            // Note what `nil` means here: `ProcessRunning` replaces the
+            // environment only when `env` is non-nil, so this asserts the
+            // probe *inherits* ours (rule 3) — it does not assert the
+            // candidate runs with an empty environment. Reading it the other
+            // way is what let a candidate's stderr be published unbounded;
+            // see `ResticDiscovery.summarize(failureOutput:)`.
+            #expect(env == nil, "the probe must not override the environment (rule 3)")
 
             switch behaviour {
             case .reports(let version):
@@ -340,7 +346,83 @@ import Testing
         }
     }
 
-    @Test("probing never inherits an environment and always carries the timeout")
+    @Test("a failed candidate's stderr is capped at one line before it reaches a reason")
+    func rejectionReasonKeepsOnlyTheFirstStderrLine() async throws {
+        let binaries = try FakeBinaries()
+        defer { binaries.cleanup() }
+        let broken = try binaries.makeExecutable("bin/restic")
+
+        // The shape that matters: a wrapper script whose failure path dumps
+        // the environment it inherited from us. `reason` is published to
+        // journald on every tick, so everything after the first line must be
+        // dropped before it can get there.
+        let runner = ProbeRunner([
+            broken: .exits(code: 1, stderr: """
+                /bin/sh: line 3: exec: restic: not found
+                PATH=/usr/bin:/bin
+                AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+                RESTIC_PASSWORD=hunter2
+                """),
+        ])
+        let discovery = ResticDiscovery(wellKnownPaths: [broken], environment: [:], runner: runner)
+
+        let result = await discovery.discover()
+        guard case .unusable(let reason) = result.rejected.first?.outcome else {
+            Issue.record("expected .unusable")
+            return
+        }
+        #expect(reason.contains("exec: restic: not found"))
+        #expect(!reason.contains("AWS_SECRET_ACCESS_KEY"))
+        #expect(!reason.contains("wJalrXUtnFEMI"))
+        #expect(!reason.contains("RESTIC_PASSWORD"))
+        #expect(!reason.contains("hunter2"))
+        #expect(reason.contains("(truncated)"), "a dropped line must be visible as dropped")
+    }
+
+    @Test("a single enormous stderr line is capped rather than published whole")
+    func rejectionReasonCapsALongSingleLine() async throws {
+        let binaries = try FakeBinaries()
+        defer { binaries.cleanup() }
+        let broken = try binaries.makeExecutable("bin/restic")
+
+        let secret = "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI"
+        let noise = String(repeating: "x", count: 4000)
+        let runner = ProbeRunner([broken: .exits(code: 1, stderr: noise + " " + secret)])
+        let discovery = ResticDiscovery(wellKnownPaths: [broken], environment: [:], runner: runner)
+
+        let result = await discovery.discover()
+        guard case .unusable(let reason) = result.rejected.first?.outcome else {
+            Issue.record("expected .unusable")
+            return
+        }
+        #expect(!reason.contains(secret))
+        #expect(reason.contains("(truncated)"))
+        // The path and exit code still fit around the capped output, so the
+        // message stays actionable rather than becoming all payload.
+        #expect(reason.contains(broken))
+        #expect(reason.contains("1"))
+        #expect(reason.count < ResticDiscovery.maxReasonOutputLength + broken.count + 100)
+    }
+
+    @Test("a short single-line stderr is passed through unmarked")
+    func rejectionReasonDoesNotMarkUntruncatedOutput() async throws {
+        let binaries = try FakeBinaries()
+        defer { binaries.cleanup() }
+        let broken = try binaries.makeExecutable("bin/restic")
+
+        let runner = ProbeRunner([broken: .exits(code: 126, stderr: "cannot execute binary file")])
+        let discovery = ResticDiscovery(wellKnownPaths: [broken], environment: [:], runner: runner)
+
+        let result = await discovery.discover()
+        guard case .unusable(let reason) = result.rejected.first?.outcome else {
+            Issue.record("expected .unusable")
+            return
+        }
+        #expect(reason.contains("cannot execute binary file"))
+        #expect(!reason.contains("truncated"), "nothing was dropped, so nothing should say so")
+    }
+
+    @Test("the probe passes no environment override, and always carries the timeout")
     func everyProbeIsBoundedAndEnvironmentFree() async throws {
         let binaries = try FakeBinaries()
         defer { binaries.cleanup() }

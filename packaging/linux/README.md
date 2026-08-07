@@ -10,8 +10,10 @@ Restic Station wraps an off-the-shelf `restic` binary already on the system
 — it never bundles or manages restic itself. Install restic first, and note
 the minimum version: **restic 0.17.0 or newer** (`docs/restic-cli.md`
 §version — it is the first release with the exit-code contract this tool
-relies on). Anything older is rejected during discovery and reported as
-"restic not found", which reads confusingly if you just installed it.
+relies on). Anything older is rejected during discovery, and the helper says
+so by name and version — "restic 0.16.4 at /usr/bin/restic is too old" —
+rather than the "restic not found" it used to report, which read as nonsense
+if you had just installed one (issue #50).
 
 > **Your distro's package is probably too old.** Ubuntu 24.04 LTS ships
 > restic **0.16.4**, and Debian stable is comparable. `apt install restic`

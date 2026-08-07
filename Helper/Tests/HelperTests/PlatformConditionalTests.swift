@@ -116,7 +116,7 @@ import ResticStationCore
             ),
             log: { _ in Issue.record("nothing should be logged when a path is already configured") }
         )
-        #expect(resolved == "/usr/bin/restic")
+        #expect(resolved.path == "/usr/bin/restic")
     }
 
     @Test("an empty machine.json resticPath falls back to the config.json one")
@@ -128,7 +128,7 @@ import ResticStationCore
             ),
             log: { _ in Issue.record("nothing should be logged when a path is already configured") }
         )
-        #expect(resolved == "/opt/homebrew/bin/restic")
+        #expect(resolved.path == "/opt/homebrew/bin/restic")
     }
 
     @Test("a configured resticPath wins without running discovery at all")
@@ -148,7 +148,7 @@ import ResticStationCore
             discovery: discovery,
             log: { _ in Issue.record("nothing should be logged when config already has a path") }
         )
-        #expect(resolved == "/configured/restic")
+        #expect(resolved.path == "/configured/restic")
     }
 
     @Test("with nothing configured, a discoverable binary is used and logged once")
@@ -167,7 +167,7 @@ import ResticStationCore
             discovery: discovery,
             log: { logged.append($0) }
         )
-        #expect(resolved == fake.path)
+        #expect(resolved.path == fake.path)
         #expect(logged.messages.count == 1)
         #expect(logged.messages.first?.contains(fake.path) == true)
     }
@@ -187,7 +187,7 @@ import ResticStationCore
             discovery: discovery,
             log: { _ in }
         )
-        #expect(resolved == fake.path)
+        #expect(resolved.path == fake.path)
     }
 
     @Test("nothing configured and nothing discoverable resolves to nil")
@@ -206,33 +206,103 @@ import ResticStationCore
             discovery: discovery,
             log: { _ in Issue.record("nothing should be logged when nothing was found") }
         )
-        #expect(resolved == nil)
+        #expect(resolved.path == nil)
     }
 
-    @Test("the not-found message is actionable on the platform it is printed on")
+    // MARK: - The three ways restic can be unusable (issue #50)
+
+    private var testPaths: AppPaths {
+        AppPaths(root: URL(fileURLWithPath: "/tmp/restic-station-test", isDirectory: true))
+    }
+
+    @Test("nothing found anywhere: say what was searched, and where to get a usable restic")
     func notFoundMessageIsPlatformAppropriate() {
-        let paths = AppPaths(root: URL(fileURLWithPath: "/tmp/restic-station-test", isDirectory: true))
-        let discovery = ResticDiscovery(
-            wellKnownPaths: ResticDiscovery.wellKnownPaths,
-            environment: [:],
-            runner: OneGoodBinary(goodPath: "")
+        let paths = testPaths
+        let message = HelperContext.resticNotFoundMessage(
+            paths: paths,
+            result: ResticDiscoveryResult(chosen: nil, rejected: [])
         )
-        let message = HelperContext.resticNotFoundMessage(paths: paths, discovery: discovery)
 
         #if os(macOS)
-        // The T10 wording, verbatim — on macOS there really is an app to open.
+        // The T10 wording, verbatim — on macOS there really is an app to open,
+        // and its Settings pane renders the richer cases itself.
         #expect(message == "restic not configured — open Restic Station")
         #else
         // Headless: name what was searched and how to fix it.
         #expect(message.contains("/usr/bin/restic"))
         #expect(message.contains("/opt/restic/bin/restic"))
         #expect(message.contains("every directory on PATH"))
-        #expect(message.contains("install restic") || message.contains("Install restic"))
+        #expect(message.contains("Install an official release binary"))
         // machine.json, not config.json: the binary path is per-machine (T24).
         #expect(message.contains(paths.machineFile.path))
         #expect(!message.contains(paths.configFile.path))
         #expect(!message.contains("open Restic Station"))
         #endif
+    }
+
+    /// The headline bug. Following `apt install restic` on Ubuntu 24.04 gets
+    /// you 0.16.4, below the 0.17.0 floor — so the old message's own remedy
+    /// reproduced the old message, with a working restic on `PATH`.
+    @Test("a too-old restic is named, with its version and the minimum — on every platform")
+    func tooOldMessageNamesTheBinaryAndVersion() {
+        let paths = testPaths
+        let result = ResticDiscoveryResult(
+            chosen: nil,
+            rejected: [ResticProbe(path: "/usr/bin/restic", outcome: .tooOld(version: "0.16.4"))]
+        )
+        let message = HelperContext.resticNotFoundMessage(paths: paths, result: result)
+
+        #expect(message.contains("0.16.4"))
+        #expect(message.contains("/usr/bin/restic"))
+        #expect(message.contains(ResticDiscovery.minimumVersion))
+        #expect(message.contains("too old"))
+        // "not found" is exactly the wrong description of a binary that was
+        // found, ran, and reported its version.
+        #expect(!message.contains("not found"))
+        // The circular advice, gone. This is the assertion the whole issue
+        // is about: a package manager that ships below the floor must not be
+        // the recommendation.
+        #expect(!message.contains("apt install"))
+        #expect(!message.contains("dnf install"))
+        #expect(message.contains("github.com/restic/restic/releases"))
+    }
+
+    /// `ResticDiscovery`'s own doc comment says unusable candidates are
+    /// recorded so that "found something, couldn't run it" is never silent.
+    /// It was silent here: the helper collapsed it into "not found".
+    @Test("a found-but-unrunnable candidate reports the reason, not 'not found'")
+    func unusableMessageCarriesTheReason() {
+        let result = ResticDiscoveryResult(
+            chosen: nil,
+            rejected: [ResticProbe(
+                path: "/opt/homebrew/bin/restic",
+                outcome: .unusable(reason: "/opt/homebrew/bin/restic exited 72 when asked for its version.")
+            )]
+        )
+        let message = HelperContext.resticNotFoundMessage(paths: testPaths, result: result)
+
+        #expect(message.contains("/opt/homebrew/bin/restic"))
+        #expect(message.contains("exited 72"))
+        #expect(!message.contains("not found"))
+    }
+
+    /// Candidates are probed in preference order, so a too-old binary in a
+    /// well-known location is the one the user thinks of as "their" restic —
+    /// it must win over an unrelated unusable candidate found later.
+    @Test("too-old outranks unusable when both were found")
+    func tooOldOutranksUnusable() {
+        let result = ResticDiscoveryResult(
+            chosen: nil,
+            rejected: [
+                ResticProbe(path: "/broken/restic", outcome: .unusable(reason: "could not be run.")),
+                ResticProbe(path: "/usr/bin/restic", outcome: .tooOld(version: "0.16.4")),
+            ]
+        )
+        let message = HelperContext.resticNotFoundMessage(paths: testPaths, result: result)
+
+        #expect(message.contains("0.16.4"))
+        #expect(message.contains("/usr/bin/restic"))
+        #expect(!message.contains("/broken/restic"))
     }
 }
 
