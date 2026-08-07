@@ -295,9 +295,19 @@ expect_rc 0
 echo "$(cat "$OUT_FILE")" | jq -e '.health == "idle"' >/dev/null || fail "healthy fixture did not report idle"
 ok "healthy fixture: status --json exits 0, health=idle"
 
-# --- in-flight: a live current-run file. ---
+# --- in-flight: a live current-run file, backed by a live run record. ---
+# Both halves are required, and that is the point. A current-run file whose
+# `runId` has no `runs/<runId>/metadata.json` with a live `pid` is precisely
+# what a SIGKILL'd run leaves behind, so this fixture used to be
+# indistinguishable from wreckage — it only "passed" because nothing checked.
+# `pid: $$` is this script's own process: alive for as long as the assertion
+# below takes, which is exactly the claim being made.
 INFLIGHT="$WORK/status-inflight"
 make_status_fixture "$INFLIGHT"
+mkdir -p "$INFLIGHT/runs/r-live"
+cat > "$INFLIGHT/runs/r-live/metadata.json" <<EOF
+{"runId":"r-live","kind":"backup","setId":"$SET_ID","destId":"$PRIMARY_ID","groupId":"r-live","status":"running","trigger":"manual","start":"$NOW_ISO","end":null,"pid":$$,"resticExitCode":null,"argvRedacted":[],"snapshotId":null,"filesNew":null,"filesChanged":null,"dataAdded":null,"errorSummary":null,"stats":null}
+EOF
 cat > "$INFLIGHT/state/current-run-$SET_ID.json" <<EOF
 {"runId":"r-live","kind":"backup","phase":"backing-up-primary","percentDone":0.42,"bytesDone":1234,"totalBytes":9999,"filesDone":3,"totalFiles":10,"currentFiles":["/tmp/src/big.dat"],"updatedAt":"$NOW_ISO"}
 EOF
@@ -306,7 +316,28 @@ expect_rc 0
 echo "$(cat "$OUT_FILE")" | jq -e '.health == "running"' >/dev/null || fail "in-flight fixture did not report running"
 echo "$(cat "$OUT_FILE")" | jq -e '.sets[0].currentRun.phase == "backing-up-primary"' >/dev/null \
     || fail "in-flight fixture did not surface live progress"
+echo "$(cat "$OUT_FILE")" | jq -e '.sets[0].abandonedRun == null' >/dev/null \
+    || fail "a live run was misreported as abandoned"
 ok "in-flight fixture: status --json exits 0, health=running, live progress surfaced"
+
+# --- abandoned: the same progress file, with no live run behind it. ---
+# The counterpart, and the regression this pairing guards: one SIGKILL'd run
+# used to pin a host to health=running and exit 0 forever, because a
+# current-run file's mere existence meant "in flight".
+ABANDONED="$WORK/status-abandoned"
+make_status_fixture "$ABANDONED"
+cat > "$ABANDONED/state/current-run-$SET_ID.json" <<EOF
+{"runId":"r-dead","kind":"backup","phase":"backing-up-primary","percentDone":0.42,"bytesDone":1234,"totalBytes":9999,"filesDone":3,"totalFiles":10,"currentFiles":["/tmp/src/big.dat"],"updatedAt":"$NOW_ISO"}
+EOF
+RESTIC_STATION_DATA_DIR="$ABANDONED" run_helper status --json
+expect_rc 1
+echo "$(cat "$OUT_FILE")" | jq -e '.health == "warning"' >/dev/null \
+    || fail "abandoned fixture did not report warning"
+echo "$(cat "$OUT_FILE")" | jq -e '.sets[0].isRunning == false' >/dev/null \
+    || fail "abandoned fixture still reported the set as running"
+echo "$(cat "$OUT_FILE")" | jq -e '.sets[0].abandonedRun.runId == "r-dead"' >/dev/null \
+    || fail "abandoned fixture did not name the abandoned run"
+ok "abandoned fixture: status --json exits 1, health=warning, the dead run is named"
 
 # --- failed: last backup failed. ---
 FAILED="$WORK/status-failed"

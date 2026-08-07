@@ -141,11 +141,34 @@ public enum SystemdCommand {
     /// timer, and enabling it directly would run one tick at every boot and
     /// then never again.
     ///
-    /// - Parameter dataDirectory: value for `RESTIC_STATION_DATA_DIR`, baked
-    ///   in only when the user actually overrode it. **No secrets are ever
-    ///   written into a unit or an `EnvironmentFile`** — restic credentials
-    ///   come from the secret store at run time (`docs/keychain-and-fda.md`),
-    ///   and a unit file is world-readable.
+    /// - Parameter dataDirectory: the **resolved absolute** data directory
+    ///   this install is running against — `AppPaths.default().root.path`,
+    ///   not whatever `RESTIC_STATION_DATA_DIR` happened to be exported.
+    ///
+    ///   A `systemd --user` service runs under the per-user *manager's*
+    ///   environment, which is whatever the manager started with at
+    ///   login/boot; it has no reason to contain a variable a shell profile
+    ///   exports for interactive shells. So a unit that leaves the data
+    ///   directory to be re-derived at tick time is a unit that resolves a
+    ///   *different* directory from the one the person installing it was
+    ///   looking at — most easily via `XDG_STATE_HOME`, which
+    ///   `AppPaths.default()` honours and which nothing used to forward
+    ///   (issue #48). The tick then finds no `config.json`, loads a valid
+    ///   empty `AppConfig()`, has nothing to back up and exits 0: backups
+    ///   stop, and it is indistinguishable from "nothing was due".
+    ///
+    ///   Baking the resolved path in unconditionally removes the whole
+    ///   class. It also makes the unit self-documenting — `systemctl --user
+    ///   cat restic-station.service` says which data directory this timer
+    ///   drives, instead of leaving it to be guessed.
+    ///
+    ///   `nil` is still accepted so the shipped template in
+    ///   `packaging/linux/systemd/` can render without one, but
+    ///   `timer install` always passes a value.
+    ///
+    ///   **No secrets are ever written into a unit or an `EnvironmentFile`**
+    ///   — restic credentials come from the secret store at run time
+    ///   (`docs/keychain-and-fda.md`), and a unit file is world-readable.
     public static func serviceUnit(helperPath: String, dataDirectory: String? = nil) -> String {
         var lines = [
             "# restic-station.service — installed by `restic-station-helper timer install`",
@@ -160,8 +183,20 @@ public enum SystemdCommand {
             "ExecStart=\(quoteIfNeeded(helperPath)) tick",
         ]
         if let dataDirectory, !dataDirectory.isEmpty {
-            lines.append("# RESTIC_STATION_DATA_DIR was set when the timer was installed.")
-            lines.append("Environment=\(quoted("RESTIC_STATION_DATA_DIR=\(dataDirectory)"))")
+            lines.append("# The data directory `timer install` resolved, pinned here on purpose: a")
+            lines.append("# --user service inherits the systemd user manager's environment, not the")
+            lines.append("# shell's, so XDG_STATE_HOME and friends do not reach the tick.")
+            // `specifierEscaped` before `quoted`: systemd expands `%h`, `%t`
+            // and friends inside unit values *including* inside quotes
+            // (`systemd.unit(5)` §Specifiers), so a data directory
+            // containing a literal `%` is silently rewritten — `/srv/%home`
+            // becomes `/srv/<the user's home dir>ome` — or, for an unknown
+            // sequence, makes systemd drop the whole assignment with
+            // "Failed to resolve specifiers … ignoring". Either way
+            // `timer install` reports success and the timer ticks against
+            // the wrong directory, which is the exact silent-stop this
+            // pinning exists to prevent (`@codex review` on #51).
+            lines.append("Environment=\(quoted(specifierEscaped("RESTIC_STATION_DATA_DIR=\(dataDirectory)")))")
         }
         return lines.joined(separator: "\n") + "\n"
     }
@@ -259,8 +294,29 @@ public enum SystemdCommand {
 
     /// The documented cron fallback for hosts with no systemd
     /// (`docs/scheduling.md` §Linux). One crontab line, no tooling.
-    public static func cronFallbackLine(helperPath: String, intervalMinutes: Int = defaultIntervalMinutes) -> String {
-        "*/\(intervalMinutes) * * * * \(helperPath) tick"
+    ///
+    /// Carries the resolved data directory for exactly the reason
+    /// `serviceUnit(helperPath:dataDirectory:)` does, and rather more
+    /// urgently: cron runs jobs with a famously minimal environment (`HOME`,
+    /// `PATH`, `SHELL`, `LOGNAME` and little else — no profile is sourced at
+    /// all), so a bare `helper tick` in a crontab resolves the *default* data
+    /// directory no matter what the shell that wrote the line had set.
+    ///
+    /// The assignment is written inline before the command because cron hands
+    /// the whole command to `/bin/sh`, where `VAR=value cmd` is ordinary
+    /// one-command-scoped assignment. A crontab-level `VAR=value` line would
+    /// also work but applies to every job in the file, which is not ours to
+    /// change.
+    public static func cronFallbackLine(
+        helperPath: String,
+        intervalMinutes: Int = defaultIntervalMinutes,
+        dataDirectory: String? = nil
+    ) -> String {
+        var command = "\(shellQuoteIfNeeded(helperPath)) tick"
+        if let dataDirectory, !dataDirectory.isEmpty {
+            command = "RESTIC_STATION_DATA_DIR=\(shellQuoteIfNeeded(dataDirectory)) \(command)"
+        }
+        return "*/\(intervalMinutes) * * * * \(cronEscaped(command))"
     }
 
     // MARK: - Quoting
@@ -275,6 +331,13 @@ public enum SystemdCommand {
         return needsQuoting ? quoted(value) : value
     }
 
+    /// `%%` is systemd's escape for a literal percent sign
+    /// (`systemd.unit(5)` §Specifiers). Applied *before* `quoted`, since
+    /// quoting does not disable specifier expansion.
+    static func specifierEscaped(_ value: String) -> String {
+        value.replacingOccurrences(of: "%", with: "%%")
+    }
+
     static func quoted(_ value: String) -> String {
         var escaped = ""
         for character in value {
@@ -284,6 +347,23 @@ public enum SystemdCommand {
             escaped.append(character)
         }
         return "\"\(escaped)\""
+    }
+
+    /// POSIX-shell quoting for the cron line, which cron hands to `/bin/sh`.
+    /// The rule is shared with every other command this project prints for a
+    /// human to paste — see `ShellQuoting`.
+    static func shellQuoteIfNeeded(_ value: String) -> String {
+        ShellQuoting.quoteIfNeeded(value)
+    }
+
+    /// `crontab(5)`: an unescaped `%` in the command field is replaced by a
+    /// newline and everything after the first one is fed to the job on stdin.
+    /// A `%` anywhere in a path would therefore truncate the command and
+    /// schedule something that is not what it looks like — silently, since
+    /// the truncated prefix is still a valid-ish command line. cron itself
+    /// strips the backslash, so `sh` sees a plain `%`.
+    static func cronEscaped(_ command: String) -> String {
+        command.replacingOccurrences(of: "%", with: "\\%")
     }
 }
 

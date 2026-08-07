@@ -750,6 +750,189 @@ assert_tick_noop() {
     log "$step OK (backup record count unchanged at $after)"
 }
 
+assert_abandoned_run_is_not_healthy() {
+    local step="abandoned run (killed process leaves current-run behind)"
+    log "$step"
+
+    # A SIGKILL/OOM/power-cut skips the `defer` that deletes
+    # state/current-run-<setId>.json. That file is what "a run is in flight"
+    # means to every reader, and `.running` outranks `.warning` — so one dead
+    # run used to make this host report healthy forever, with `status`
+    # exiting 0 and the menu bar staying blue.
+    #
+    # `updatedAt` is deliberately *now*: the point of deciding liveness from
+    # the run's recorded pid rather than from a timestamp is that neither a
+    # fresh-looking file from a dead process nor a very stale one from a live
+    # `check --read-data` can fool it.
+    mkdir -p "$DATA_DIR/state"
+    local wreckage="$DATA_DIR/state/current-run-${SET_ID}.json"
+    cat >"$wreckage" <<JSON
+{
+  "runId" : "20260101T000000Z-backup-deadbeef",
+  "kind" : "backup",
+  "phase" : "backing-up-primary",
+  "percentDone" : 0.5,
+  "bytesDone" : 1,
+  "totalBytes" : 2,
+  "filesDone" : 1,
+  "totalFiles" : 2,
+  "currentFiles" : [],
+  "updatedAt" : "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+JSON
+
+    local out rc
+    set +e
+    out="$("$HELPER" status --json 2>&1)"
+    rc=$?
+    set -e
+
+    [[ $rc -eq 1 ]] || fail "$step" "expected status --json to exit 1 with an abandoned run, got $rc: $out"
+    local health is_running abandoned
+    health="$(printf '%s' "$out" | jq -r '.health')"
+    is_running="$(printf '%s' "$out" | jq -r --arg id "$SET_ID" '.sets[] | select(.id == $id) | .isRunning')"
+    abandoned="$(printf '%s' "$out" | jq -r --arg id "$SET_ID" '.sets[] | select(.id == $id) | .abandonedRun.runId')"
+    [[ "$health" == "warning" ]] || fail "$step" "expected health=warning, got '$health'"
+    [[ "$is_running" == "false" ]] || fail "$step" "expected isRunning=false, got '$is_running'"
+    [[ "$abandoned" == "20260101T000000Z-backup-deadbeef" ]] \
+        || fail "$step" "expected the abandoned run to be named, got '$abandoned'"
+
+    rm -f "$wreckage"
+    log "$step OK (warning, not running; the abandoned run is named)"
+}
+
+assert_tick_clears_wreckage_whose_metadata_is_already_terminal() {
+    local step="tick clears abandoned progress whose run is already marked failed"
+    log "$step"
+
+    # The case `recoverInterrupted()` cannot see. It only returns runs *it*
+    # transitioned from `running` to `failed`, so a current-run file whose
+    # metadata is already terminal was returned by nothing and cleared by
+    # nothing — leaving `status` to exit 1 until the set next runs, and
+    # forever if the set is deleted from the config first.
+    #
+    # This is not a contrived state: it is what every host upgrading from the
+    # previous release looks like. There, the first post-kill tick already
+    # rewrote metadata to `failed` while nothing deleted the current-run file.
+    local run_id="20260101T000000Z-backup-cafebabe"
+    local run_dir="$DATA_DIR/runs/$run_id"
+    mkdir -p "$run_dir" "$DATA_DIR/state"
+
+    # pid 999999 is above the default pid_max on both platforms, so
+    # `kill(pid, 0)` reports ESRCH — dead, without depending on what happens
+    # to be running on the test host.
+    cat >"$run_dir/metadata.json" <<JSON
+{
+  "runId" : "$run_id",
+  "kind" : "backup",
+  "setId" : "$SET_ID",
+  "destId" : "$PRIMARY_DEST_ID",
+  "groupId" : "$run_id",
+  "status" : "failed",
+  "trigger" : "scheduled",
+  "start" : "2026-01-01T00:00:00Z",
+  "end" : "2026-01-01T00:05:00Z",
+  "pid" : 999999,
+  "argvRedacted" : [],
+  "errorSummary" : "interrupted"
+}
+JSON
+
+    local wreckage="$DATA_DIR/state/current-run-${SET_ID}.json"
+    cat >"$wreckage" <<JSON
+{
+  "runId" : "$run_id",
+  "kind" : "backup",
+  "phase" : "backing-up-primary",
+  "percentDone" : 0.5,
+  "bytesDone" : 1,
+  "totalBytes" : 2,
+  "filesDone" : 1,
+  "totalFiles" : 2,
+  "currentFiles" : [],
+  "updatedAt" : "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+JSON
+
+    # Asserted on the abandoned-run field rather than on status's exit code,
+    # deliberately. This environment has no installed timer, so `status`
+    # exits 1 here for scheduler reasons whether or not any wreckage exists —
+    # an exit-code assertion would have passed before the tick for the wrong
+    # reason and been unreachable after it. The field isolates the one thing
+    # this step is about.
+    local out rc abandoned
+    set +e
+    out="$("$HELPER" status --json 2>&1)"
+    set -e
+    abandoned="$(printf '%s' "$out" | jq -r --arg id "$SET_ID" '.sets[] | select(.id == $id) | .abandonedRun.runId')"
+    [[ "$abandoned" == "$run_id" ]] \
+        || fail "$step" "precondition: expected the abandoned run to be named before the tick, got '$abandoned'"
+
+    set +e
+    out="$("$HELPER" tick 2>&1)"
+    rc=$?
+    set -e
+    [[ $rc -eq 0 ]] || fail "$step" "tick exited $rc: $out"
+
+    [[ ! -f "$wreckage" ]] || fail "$step" "tick left the abandoned progress file behind: $out"
+
+    set +e
+    out="$("$HELPER" status --json 2>&1)"
+    set -e
+    abandoned="$(printf '%s' "$out" | jq -r --arg id "$SET_ID" '.sets[] | select(.id == $id) | .abandonedRun')"
+    [[ "$abandoned" == "null" ]] \
+        || fail "$step" "expected no abandoned run after the tick, got '$abandoned': $out"
+
+    rm -rf "$run_dir"
+    log "$step OK (cleared, and status stops reporting an abandoned run)"
+}
+
+assert_unreadable_run_index_fails_loudly() {
+    local step="unreadable runs index (status must not report healthy)"
+    log "$step"
+
+    # `(try? runStore.recentRuns(…)) ?? []` turned an unreadable index into
+    # "no runs recorded", which derives to idle, which exits 0 — `status`
+    # reporting healthy precisely because it could not read the evidence.
+    # A corrupt *line* is survivable and stays survivable (recentRuns skips
+    # it with a warning); this is the file being unreadable outright.
+    if [[ "$(id -u)" -eq 0 ]]; then
+        log "$step SKIPPED (running as root: chmod 000 does not deny root, so this would pass for the wrong reason)"
+        return
+    fi
+
+    local index="$DATA_DIR/runs/index.jsonl"
+    [[ -f "$index" ]] || fail "$step" "expected an index to exist by now: $index"
+    # `stat` is not portable here, and the usual `stat -f … || stat -c …`
+    # idiom is actively wrong: on GNU coreutils `-f` means "file system
+    # status", so it *succeeds* on Linux, prints a block of filesystem
+    # information, and the `||` fallback never runs — which is exactly how
+    # this line reached CI, passing on macOS and feeding `chmod` a paragraph
+    # about ext4 on Linux. Branch on the platform explicitly instead.
+    local saved_mode
+    if [[ "$OS_NAME" == "Darwin" ]]; then
+        saved_mode="$(stat -f '%Lp' "$index")"
+    else
+        saved_mode="$(stat -c '%a' "$index")"
+    fi
+    [[ "$saved_mode" =~ ^[0-7]{3,4}$ ]] || fail "$step" "could not read the index file's mode: '$saved_mode'"
+    chmod 000 "$index"
+
+    local out rc
+    set +e
+    out="$("$HELPER" status --json 2>&1)"
+    rc=$?
+    set -e
+    chmod "$saved_mode" "$index"
+
+    [[ $rc -ne 0 ]] || fail "$step" "status exited 0 with an unreadable run index: $out"
+    [[ "$out" == *"could not read the run history"* ]] \
+        || fail "$step" "expected the message to name the run history, got: $out"
+    [[ "$out" == *"$index"* ]] || fail "$step" "expected the message to name the file, got: $out"
+
+    log "$step OK (exit $rc, and it names the file)"
+}
+
 assert_lock_busy() {
     local step="lock-busy (run-set while the set lock is held)"
     log "$step"
@@ -955,8 +1138,29 @@ assert_fixture_flow() {
     # ── status --json, piped through jq, reflects the run — and the
     #    exclusion (anti-silent-failure guarantee, asserted on real output) ──
     step="fixture (status --json reflects the run and the exclusion)"
-    local status_json
-    status_json="$(fx_helper status --json)" || fail "$step" "status --json failed"
+    local status_json status_rc
+    set +e
+    status_json="$(fx_helper status --json)"
+    status_rc=$?
+    set -e
+    # Nothing has installed a timer for this data directory, so on Linux
+    # `status` correctly reports the scheduler as unhealthy and exits 1 —
+    # that is issues #46/#48 working, not a failure of this scenario. On
+    # macOS the scheduler is `SMAppService` state, which no CLI can read, so
+    # the field is null, contributes nothing, and the same call exits 0.
+    # Asserted per platform rather than tolerated, so a *wrong* answer on
+    # either side is still a failure.
+    if [[ "$OS_NAME" == "Linux" ]]; then
+        [[ $status_rc -eq 1 ]] || fail "$step" "expected exit 1 with no timer installed, got $status_rc"
+        echo "$status_json" | jq -e '.scheduler.healthy == false' >/dev/null \
+            || fail "$step" "expected scheduler.healthy=false with no timer installed: $status_json"
+        echo "$status_json" | jq -e '.scheduler.problems | index("unitsMissing")' >/dev/null \
+            || fail "$step" "expected scheduler.problems to name unitsMissing: $status_json"
+    else
+        [[ $status_rc -eq 0 ]] || fail "$step" "expected exit 0 on a healthy host, got $status_rc: $status_json"
+        echo "$status_json" | jq -e '.scheduler == null' >/dev/null \
+            || fail "$step" "expected a null scheduler on macOS (SMAppService is app-only): $status_json"
+    fi
     echo "$status_json" | jq -e '.sets | length == 1' >/dev/null \
         || fail "$step" "expected exactly one set in status --json (the disabled-here set must not appear): $status_json"
     echo "$status_json" | jq -e '.sets[0].name == "Projects"' >/dev/null \
@@ -1002,6 +1206,9 @@ main() {
     assert_run4
     assert_retention
     assert_tick_noop
+    assert_abandoned_run_is_not_healthy
+    assert_tick_clears_wreckage_whose_metadata_is_already_terminal
+    assert_unreadable_run_index_fails_loudly
     assert_lock_busy
 
     assert_fixture_flow

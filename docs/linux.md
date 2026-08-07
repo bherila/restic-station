@@ -529,13 +529,17 @@ both check `loginctl show-user <user> --property=Linger` and print the exact fix
 needs root, and a backup tool that escalates privilege behind your back is a worse bug than the
 warning.
 
-**Check the `linger` line explicitly — do not trust `timer status`'s exit code for this.**
-`timer status` currently exits 0 whenever the timer unit is installed, enabled and active, **even
-if lingering is disabled** (tracked as [issue #46](https://github.com/bherila/restic-station/issues/46);
-not fixed here because a docs task is the wrong place to change scheduling exit-code behavior).
-A disabled-linger host can look completely healthy to a script checking only the exit code and
-still stop backing up the next time its owner logs out. Read the `linger` line in the human
-output, or `loginctl show-user <user> --property=Linger` directly.
+**`timer status` exits 1 on a disabled-linger host** ([issue #46](https://github.com/bherila/restic-station/issues/46)),
+so the exit code alone is enough — an installed, enabled, active timer that will die at the next
+logout is not a host that will keep backing up, and reporting 0 for it was the exact
+"green while broken" failure this project exists to prevent. The `VERDICT` block at the end of the
+output names the reason.
+
+One deliberate exception: a linger state of **`unknown`** — neither `loginctl` nor
+`/var/lib/systemd/linger` could be consulted, which is what a container without logind looks like
+— does not fail. Nothing logs out of such a host, so failing would make the check permanently red
+with no reachable fix. Only a confirmed `Linger=no` counts. If you want certainty on a host that
+reports `unknown`, read `loginctl show-user <user> --property=Linger` yourself.
 
 Real `timer install`/`timer status` output, from CI's `linux-integration` job (a bare Ubuntu VM
 where systemd genuinely is pid 1, unlike the `swift:6.1` container above):
@@ -544,7 +548,9 @@ where systemd genuinely is pid 1, unlike the `swift:6.1` container above):
 $ restic-station-helper timer install
 wrote /home/runner/.config/systemd/user/restic-station.service
 wrote /home/runner/.config/systemd/user/restic-station.timer
-  RESTIC_STATION_DATA_DIR=/tmp/tmp.XXXXXXXXXX/data (baked in from this shell's environment)
+  RESTIC_STATION_DATA_DIR=/tmp/tmp.XXXXXXXXXX/data
+    (the data directory this command resolved, pinned into the unit — a
+     --user service does not inherit your shell's XDG_STATE_HOME)
 enabled restic-station.timer — ticking every 2min
   /tmp/tmp.XXXXXXXXXX/bin/restic-station-helper tick
 
@@ -555,20 +561,23 @@ Restic Station — systemd --user timer
                 restic-station.service
                 restic-station.timer
   interval    every 2min (OnUnitActiveSec)
+  data dir    /tmp/tmp.XXXXXXXXXX/data (pinned in the unit)
   enabled     enabled
   active      active
   linger      enabled — user units keep running after logout
 
   next firing
     NEXT                        LEFT LAST PASSED UNIT                 ACTIVATES
-    Thu 2026-08-06 00:29:57 UTC  32s -         - restic-station.timer restic-station.service
-
+    Thu 2026-08-06 23:04:18 UTC  41s -         - restic-station.timer restic-station.service
+    
     1 timers listed.
 
   last tick activity (from state/ and runs/)
-    "Projects": backup just now (2026-08-06T00:29:21Z)
+    "Projects": backup just now (2026-08-06T23:03:33Z)
     "Mac Photos Library": backup never
-    last run: restore success (just now (2026-08-06T00:29:24Z))
+    last run: restore success (just now (2026-08-06T23:03:36Z))
+
+  VERDICT     scheduled backups will happen on this host (exit 0)
 
 $ loginctl show-user runner --property=Linger
 Linger=yes
@@ -577,38 +586,50 @@ Linger=yes
 (This particular CI runner happens to have lingering enabled by default — see
 [Not executed in CI](#not-executed-in-ci) for what that does and does not settle.)
 
-### The `XDG_STATE_HOME` gotcha
+### The data directory the timer will use
 
-`timer install` bakes only `RESTIC_STATION_DATA_DIR` into the unit — never `XDG_STATE_HOME` — and
-that gap matters more than it sounds. A `systemd --user` **service** runs under the per-user
-*manager's* environment, not the interactive shell's: the manager starts once (typically at
-login, or at boot with lingering) and keeps whatever environment it started with, which has no
-reason to include a variable your `~/.bashrc`/`~/.profile` exports for interactive shells. If you
-have set a custom `XDG_STATE_HOME` (to move `restic-station`'s state directory off
-`~/.local/state`), the *tick* the timer fires does not see it: `AppPaths.default()`
-(`Core/Sources/ResticStationCore/Config/AppPaths.swift`) falls back to the default
-`~/.local/state/restic-station`, finds no `config.json` there, and — because a missing
-`config.json` loads as a valid, empty `AppConfig()` — this is not an error. The tick loads an
-empty config, has nothing to back up, and exits 0. **This is a silent stop, and it looks
-identical to "nothing was due" unless you already know to look for it** — exactly the failure
-class this project exists to prevent, and it survives even a `timer status` check, since the
-timer itself really is installed, enabled and active; it is simply ticking against the wrong
-(empty) data directory.
+A `systemd --user` **service** runs under the per-user *manager's* environment, not the
+interactive shell's: the manager starts once (typically at login, or at boot with lingering) and
+keeps whatever environment it started with, which has no reason to include a variable your
+`~/.bashrc`/`~/.profile` exports for interactive shells. So a unit that left the data directory
+to be re-derived at tick time would resolve a *different* directory from the one you were looking
+at when you installed it.
 
-The fix, today: **if you use a custom `XDG_STATE_HOME`, set `RESTIC_STATION_DATA_DIR` explicitly**
-— to the same absolute path `XDG_STATE_HOME/restic-station` resolves to — in the shell you run
-`timer install` from. Unlike `XDG_STATE_HOME`, `RESTIC_STATION_DATA_DIR` *is* read at `timer
-install` time and persisted into the unit's `Environment=` line, so it is the one override
-guaranteed to survive from your shell into the service the timer actually runs. This is a
-documentation-only workaround, not a fix: `timer install` does not read or propagate
-`XDG_STATE_HOME` itself today, tracked as
-[issue #48](https://github.com/bherila/restic-station/issues/48) rather than changed here (a docs
-task is the wrong place to change what `timer install` bakes into a unit).
+`timer install` therefore resolves the data directory through `AppPaths`
+(`Core/Sources/ResticStationCore/Config/AppPaths.swift`) — the whole override chain:
+`RESTIC_STATION_DATA_DIR`, then `$XDG_STATE_HOME/restic-station`, then
+`~/.local/state/restic-station` — and pins the **absolute result** into the unit:
+
+```ini
+# The data directory `timer install` resolved, pinned here on purpose: a
+# --user service inherits the systemd user manager's environment, not the
+# shell's, so XDG_STATE_HOME and friends do not reach the tick.
+Environment="RESTIC_STATION_DATA_DIR=/srv/state/restic-station"
+```
+
+This makes `systemctl --user cat restic-station.service` the answer to "which data directory does
+this timer drive", instead of something to guess.
+
+It was not always so ([issue #48](https://github.com/bherila/restic-station/issues/48)): the unit
+used to carry `RESTIC_STATION_DATA_DIR` only when that variable happened to be exported, so a
+host with a custom `XDG_STATE_HOME` installed a timer whose tick fell back to
+`~/.local/state/restic-station`, found no `config.json` there, loaded a valid *empty* config —
+and backed up nothing while exiting 0. That is a silent stop indistinguishable from "nothing was
+due", and it survived a `timer status` check, because the timer really was installed, enabled and
+active; it was simply ticking against the wrong directory. If you are reading a unit written by
+an older build, look for the `Environment=` line and reinstall if it is missing.
+
+The cron fallback carries the same pin, and needs it more — cron sources no profile at all:
+
+```cron
+*/2 * * * * RESTIC_STATION_DATA_DIR=/srv/state/restic-station /usr/local/bin/restic-station-helper tick
+```
 
 Confirmed directly against the real unit file this project's own CI writes, not just read from
 source — `timer install` run once with a custom `XDG_STATE_HOME` and no `RESTIC_STATION_DATA_DIR`
-override, then again with `RESTIC_STATION_DATA_DIR` set explicitly to what that
-`XDG_STATE_HOME` would have resolved to, from CI's `linux-integration` job:
+override, then again with `RESTIC_STATION_DATA_DIR` set explicitly, from CI's `linux-integration`
+job (`scripts/linux-docs-transcript.sh`, which asserts on the `Environment=` line rather than
+merely printing it, so this stays regression-checked):
 
 ```
 --- reinstalled with a custom XDG_STATE_HOME and no RESTIC_STATION_DATA_DIR override ---
@@ -623,12 +644,16 @@ Documentation=https://github.com/bherila/restic-station/blob/main/docs/schedulin
 [Service]
 Type=oneshot
 ExecStart=/tmp/tmp.XXXXXXXXXX/bin/restic-station-helper tick
+# The data directory `timer install` resolved, pinned here on purpose: a
+# --user service inherits the systemd user manager's environment, not the
+# shell's, so XDG_STATE_HOME and friends do not reach the tick.
+Environment="RESTIC_STATION_DATA_DIR=/tmp/tmp.XXXXXXXXXX/custom-xdg-state/restic-station"
 
-CONFIRMED: neither XDG_STATE_HOME nor RESTIC_STATION_DATA_DIR appears in the unit above —
-a tick run from it falls back to the default ~/.local/state/restic-station, not the
-custom XDG_STATE_HOME this shell had set.
+CONFIRMED: the unit pins /tmp/tmp.XXXXXXXXXX/custom-xdg-state/restic-station — the directory this shell's
+XDG_STATE_HOME resolves to. The tick the timer fires reads the same data the shell
+that installed it does, with no reliance on the user manager's environment.
 
---- reinstalled again with RESTIC_STATION_DATA_DIR set explicitly to the same path ---
+--- and an explicit RESTIC_STATION_DATA_DIR still wins, as the highest-priority override ---
 $ cat /home/runner/.config/systemd/user/restic-station.service
 # restic-station.service — installed by `restic-station-helper timer install`
 # (docs/scheduling.md §Linux: systemd user timer). Re-running the command
@@ -640,8 +665,10 @@ Documentation=https://github.com/bherila/restic-station/blob/main/docs/schedulin
 [Service]
 Type=oneshot
 ExecStart=/tmp/tmp.XXXXXXXXXX/bin/restic-station-helper tick
-# RESTIC_STATION_DATA_DIR was set when the timer was installed.
-Environment="RESTIC_STATION_DATA_DIR=/tmp/tmp.XXXXXXXXXX/custom-xdg-state/restic-station"
+# The data directory `timer install` resolved, pinned here on purpose: a
+# --user service inherits the systemd user manager's environment, not the
+# shell's, so XDG_STATE_HOME and friends do not reach the tick.
+Environment="RESTIC_STATION_DATA_DIR=/tmp/tmp.XXXXXXXXXX/explicit-data-dir"
 ```
 
 ### A real firing, not just "enabled/active"
@@ -723,110 +750,219 @@ notion of time).
 
 ## Operating it
 
-`status`, `runs list`, and `runs show --log` are read-only and safe to run as often as a
-monitoring check likes — no restic invocation, no network access. Real output, continuing the
-session above (a real backup + mirror copy already ran via `run-set --kind backup`):
+`status`, `runs list`, and `runs show --log` read only existing state — no restic invocation, no
+network access — and are safe to run as often as a monitoring check likes. One qualification, on
+Linux only: `status` also asks the systemd `--user` timer whether it will fire — three short
+`systemctl --user` queries, each bounded by a 5-second timeout — because a status command that
+cannot see the scheduler reports a stopped machine as healthy for days. It still writes nothing,
+touches no repository, and skips the slowest query (`list-timers`), which is narrative this
+caller has no use for.
+
+Real output, continuing the session above: a real backup + mirror copy has already run via
+`run-set --kind backup`, and nothing is scheduling *this* data directory.
 
 ```
 $ restic-station-helper status
-machine "linux-nas" — idle
+machine "linux-nas" — warning
+scheduler (systemd-timer): SCHEDULED BACKUPS WILL NOT HAPPEN
+  - the installed timer ticks a different data directory than this command reads
+  detail: restic-station-helper timer status
 
 set "Projects" (f1000000-0000-4000-8000-000000000001)
-    last backup: success, 1s ago (20260806T002921Z-backup-f1000000)
+    last backup: success, 1s ago (20260806T230333Z-backup-f1000000)
     last check:  never
     last prune:  never
-    next due:    2026-08-06T00:34:21.599Z
+    next due:    2026-08-06T23:08:33.941Z
       - primary "NAS Primary": reachable
       - secondary "Offsite Mirror": reachable
 
 excluded here, and why:
   - backup set "Mac Photos Library" is disabled on this machine
+(exit 1)
 
 $ restic-station-helper status --json
 {
   "excludedHere" : [
     {
       "description" : "backup set \"Mac Photos Library\" is disabled on this machine",
+      "id" : "F1000000-0000-4000-8000-000000000004",
+      "name" : "Mac Photos Library",
       "reason" : "disabledForMachine",
-      "subject" : "backupSet",
-      ...
+      "setId" : "F1000000-0000-4000-8000-000000000004",
+      "subject" : "backupSet"
     }
   ],
-  "health" : "idle",
+  "fullDiskAccessDenied" : false,
+  "generatedAt" : "2026-08-06T23:03:36.040Z",
+  "health" : "warning",
   "machineId" : "linux-nas",
+  "scheduler" : {
+    "healthy" : false,
+    "kind" : "systemd-timer",
+    "problems" : [
+      "dataDirectoryMismatch"
+    ],
+    "summaries" : [
+      "the installed timer ticks a different data directory than this command reads"
+    ]
+  },
   "sets" : [
     {
-      "lastBackup" : { "runId" : "20260806T002921Z-backup-f1000000", "status" : "success", ... },
+      "abandonedRun" : null,
+      "abandonedRunFile" : null,
+      "currentRun" : null,
+      "destinations" : [
+        {
+          "id" : "F1000000-0000-4000-8000-000000000002",
+          "isPrimary" : true,
+          "label" : "NAS Primary",
+          "lastError" : null,
+          "lastSyncedAt" : "2026-08-06T23:03:34.641Z",
+          "reachable" : true,
+          "stale" : false
+        },
+        {
+          "id" : "F1000000-0000-4000-8000-000000000003",
+          "isPrimary" : false,
+          "label" : "Offsite Mirror",
+          "lastError" : null,
+          "lastSyncedAt" : "2026-08-06T23:03:36.003Z",
+          "reachable" : true,
+          "stale" : false
+        }
+      ],
+      "id" : "F1000000-0000-4000-8000-000000000001",
+      "isRunning" : false,
+      "lastBackup" : {
+        "ageSeconds" : 1.400916576385498,
+        "end" : "2026-08-06T23:03:34.639Z",
+        "runId" : "20260806T230333Z-backup-f1000000",
+        "start" : "2026-08-06T23:03:33.943Z",
+        "status" : "success"
+      },
+      "lastCheck" : null,
+      "lastPrune" : null,
       "name" : "Projects",
       "needsAttention" : false,
-      ...
+      "nextDue" : "2026-08-06T23:08:33.941Z"
     }
   ]
 }
+(exit 1)
 
 $ restic-station-helper runs list
-20260806T002922Z-copy-f1000000  copy  success  start=2026-08-06T00:29:22.314Z  end=2026-08-06T00:29:23.708Z
-20260806T002921Z-backup-f1000000  backup  success  start=2026-08-06T00:29:21.601Z  end=2026-08-06T00:29:22.310Z
-20260806T002918Z-init-f1000000  init  success  start=2026-08-06T00:29:18.582Z  end=2026-08-06T00:29:21.581Z
+20260806T230334Z-copy-f1000000  copy  success  start=2026-08-06T23:03:34.643Z  end=2026-08-06T23:03:36.001Z
+20260806T230333Z-backup-f1000000  backup  success  start=2026-08-06T23:03:33.943Z  end=2026-08-06T23:03:34.639Z
+20260806T230330Z-init-f1000000  init  success  start=2026-08-06T23:03:30.921Z  end=2026-08-06T23:03:33.924Z
 
-$ restic-station-helper runs show 20260806T002921Z-backup-f1000000 --log
-runId:    20260806T002921Z-backup-f1000000
+(runId captured for the next command: 20260806T230333Z-backup-f1000000)
+
+$ restic-station-helper runs show 20260806T230333Z-backup-f1000000 --log
+runId:    20260806T230333Z-backup-f1000000
 kind:     backup
 setId:    f1000000-0000-4000-8000-000000000001
 destId:   f1000000-0000-4000-8000-000000000002
 status:   success
 trigger:  manual
-start:    2026-08-06T00:29:21.601Z
-end:      2026-08-06T00:29:22.310Z
-snapshot: e0f6f5fd45d8edd8f9cc923a6e81f435639637c8424bd7ce2756c2d422d2ee1a
+start:    2026-08-06T23:03:33.943Z
+end:      2026-08-06T23:03:34.639Z
+snapshot: 7b5316e2d75d2237d3d94290eefe313196bf716da45157acdce057bfad97f95a
 argv:     -r /tmp/tmp.XXXXXXXXXX/repo-primary backup --json /tmp/tmp.XXXXXXXXXX/source
 
-[00:29:21] $ -r /tmp/tmp.XXXXXXXXXX/repo-primary backup --json /tmp/tmp.XXXXXXXXXX/source
-[00:29:21] probe primary "NAS Primary": reachable
-[00:29:22] {"message_type":"summary","files_new":2,"files_changed":0,...,"snapshot_id":"e0f6f5fd..."}
+[23:03:33] $ -r /tmp/tmp.XXXXXXXXXX/repo-primary backup --json /tmp/tmp.XXXXXXXXXX/source
+[23:03:33] probe primary "NAS Primary": reachable
+[23:03:34] {"message_type":"summary","files_new":2,"files_changed":0,"files_unmodified":0,"dirs_new":3,"dirs_changed":0,"dirs_unmodified":0,"data_blobs":2,"tree_blobs":4,"data_added":1874,"data_added_packed":1484,"total_files_processed":2,"total_bytes_processed":67,"total_duration":0.678220979,"backup_start":"2026-08-06T23:03:33.956811914Z","backup_end":"2026-08-06T23:03:34.635032885Z","snapshot_id":"7b5316e2d75d2237d3d94290eefe313196bf716da45157acdce057bfad97f95a"}
 ```
+
+Two things in that output are worth calling out, because they are not what a
+first-time reader expects.
+
+`status` exits **1**, and says `SCHEDULED BACKUPS WILL NOT HAPPEN`. That is
+correct and is the whole point of [the monitoring section](#monitoring): this
+data directory has no timer driving it. On this particular runner the reason is
+`dataDirectoryMismatch` rather than `unitsMissing` — an earlier CI step (a T26
+diagnostic that checks `timer install` works on a bare Actions VM) had already
+installed a timer for a *different* directory. So this is also an unplanned
+live demonstration of that check: a timer that is genuinely enabled and active,
+correctly reported as not covering the directory being asked about.
 
 `status --json` and `runs list --json`/`runs show --json` are documented, stable interfaces
 (`docs/data-model.md` §"Headless CLI `--json` shapes") — a script piping one into `jq` is
 expected to keep working release to release, the same guarantee `runs/index.jsonl` carries.
-`status --json` exits **1** whenever any backup set needs attention — but **it cannot see the
-scheduler at all**, and a monitoring check that only wraps `status --json` is not sufficient by
-itself on Linux. `Status.run()` passes `backgroundAgentEnabled: true` into `HealthDerivation`
-unconditionally, on every platform (`Helper/Sources/Commands/Status.swift`, whose own comment
-documents this as deliberate: "a genuinely platform-specific fact `status` has no view into
-today"), because whether the scheduler is actually registered is only visible to `timer status`
-on Linux (macOS's equivalent, `SMAppService` registration, is likewise app-only and has no CLI
-surface). Concretely: if the systemd `--user` timer stops firing entirely — lingering got
-disabled, someone ran `timer uninstall` and forgot to reinstall it, the unit got wedged — `status
---json` keeps reporting the last known-good state and **stays exit 0** for as long as every
-already-recorded run stays within its staleness window, which for a quiet set can be days. A
-Nagios/Icinga-style check needs to wrap **both** `status --json` (are the sets that did run
-healthy?) and `timer status` (is anything actually still scheduled to run at all — including
-reading the `linger` line explicitly, see [above](#the-linger-gotcha)); neither is sufficient
-alone, because `timer status`'s own exit code has the opposite gap — it currently reports 0
-(healthy) even when lingering is disabled
-([issue #46](https://github.com/bherila/restic-station/issues/46)). There is no single command or
-exit code today that alone proves "scheduled backups on this host will keep happening."
 
-Confirmed directly in CI, not just read from source — after the timer this document's scheduling
-transcripts installed is uninstalled, `status --json` still exits 0 (the backup it already ran is
-still healthy) while `timer status`, the one place that actually looks at the scheduler, correctly
-reports the timer not installed and exits 1:
+**`status` sees the scheduler on Linux, so one command is enough.** It exits **1** whenever any
+backup set needs attention *or* the systemd `--user` timer will not fire — the same verdict
+`timer status` exits on, computed by the same `SystemdTimerManager`, so the two can never
+disagree. The reason is in the `scheduler` key:
+
+```jsonc
+"scheduler": {
+  "kind": "systemd-timer",
+  "healthy": false,
+  "problems": ["lingerDisabled"],          // stable identifiers — branch on these
+  "summaries": ["lingering is disabled — the timer stops at logout (`sudo loginctl enable-linger <user>`)"]
+}
+```
+
+Three answers, and only one of them is a finding:
+
+| `scheduler` | meaning | contributes to health? |
+|---|---|---|
+| `{"kind": "systemd-timer", "healthy": true, …}` | the timer will fire | no |
+| `{"kind": "systemd-timer", "healthy": false, …}` | a real finding: exit 1, reason named | **yes — warning** |
+| `{"kind": "unknown", "healthy": null, …}` | no systemd here; the documented fallback is a cron line, which nothing can inspect | no |
+| `null` | macOS: the scheduler is `SMAppService` state, which no CLI can read | no |
+
+The two "don't know" answers deliberately contribute nothing, exactly as an absent
+`fda-check.json` does — a check that goes permanently red inside every container is a check
+nobody reads. Only a definite `false` is a warning.
+
+This is a change from earlier builds, and the reason it was worth making: `Status.run()` used to
+pass `backgroundAgentEnabled: true` unconditionally on every platform, which reads as "the
+scheduler is fine". So if the timer stopped firing entirely — lingering got disabled, someone ran
+`timer uninstall` and forgot to reinstall it, the unit got wedged — `status --json` kept reporting
+the last known-good state and **stayed exit 0** for as long as every already-recorded run stayed
+inside its staleness window, which for a quiet set is days
+([issue #46](https://github.com/bherila/restic-station/issues/46)).
+
+`timer status` remains the command to run when something *is* wrong: it prints the units, the
+installed interval, the linger state and the next firing, where `status` gives you the verdict and
+the reason.
+
+Confirmed directly in CI, not just read from source — the timer this document's scheduling
+transcripts installed is uninstalled, and then `status --json` is run against the same data
+directory (`scripts/linux-docs-transcript.sh` asserts on `scheduler.healthy` and the exit code,
+so this stays regression-checked):
 
 ```
 --- status --json for the same data dir, right after the timer above was uninstalled ---
-
-$ restic-station-helper status --json
+$ restic-station-helper status --json; echo "exit $?"
 {
   "excludedHere" : [
 
   ],
   "fullDiskAccessDenied" : false,
-  "generatedAt" : "2026-08-06T01:24:21.708Z",
-  "health" : "idle",
+  "generatedAt" : "2026-08-06T23:05:10.591Z",
+  "health" : "warning",
   "machineId" : "linux-nas",
+  "scheduler" : {
+    "healthy" : false,
+    "kind" : "systemd-timer",
+    "problems" : [
+      "unitsMissing",
+      "notEnabled",
+      "notActive"
+    ],
+    "summaries" : [
+      "the units are not installed — run `restic-station-helper timer install`",
+      "the timer is not enabled, so it will not come back after a reboot",
+      "the timer is not active, so it is not firing now"
+    ]
+  },
   "sets" : [
     {
+      "abandonedRun" : null,
+      "abandonedRunFile" : null,
       "currentRun" : null,
       "destinations" : [
         {
@@ -834,7 +970,7 @@ $ restic-station-helper status --json
           "isPrimary" : true,
           "label" : "Fire Primary",
           "lastError" : null,
-          "lastSyncedAt" : "2026-08-06T01:24:16.971Z",
+          "lastSyncedAt" : "2026-08-06T23:05:02.676Z",
           "reachable" : true,
           "stale" : false
         }
@@ -842,23 +978,42 @@ $ restic-station-helper status --json
       "id" : "E1000000-0000-4000-8000-000000000001",
       "isRunning" : false,
       "lastBackup" : {
-        "ageSeconds" : 4.740049719810486,
-        "end" : "2026-08-06T01:24:16.968Z",
-        "runId" : "20260806T012416Z-backup-e1000000",
-        "start" : "2026-08-06T01:24:16.248Z",
+        "ageSeconds" : 7.917420506477356,
+        "end" : "2026-08-06T23:05:02.674Z",
+        "runId" : "20260806T230501Z-backup-e1000000",
+        "start" : "2026-08-06T23:05:01.986Z",
         "status" : "success"
       },
       "lastCheck" : null,
       "lastPrune" : null,
       "name" : "Fire Check",
       "needsAttention" : false,
-      "nextDue" : "2026-08-06T01:29:16.246Z"
+      "nextDue" : "2026-08-06T23:10:01.983Z"
     }
   ]
 }
-(exit 0 — health "idle", needsAttention false, nothing here reflects that the scheduler is gone)
+exit 1
 
---- timer status for the same host: correctly reports not installed ---
+CONFIRMED: status --json reports scheduler.healthy=false, names the reason in
+scheduler.problems, and exits 1 — on the same host and data directory that used to
+exit 0 with no mention of the scheduler at all.
+
+--- and the human rendering says it in one line ---
+machine "linux-nas" — warning
+scheduler (systemd-timer): SCHEDULED BACKUPS WILL NOT HAPPEN
+  - the units are not installed — run `restic-station-helper timer install`
+  - the timer is not enabled, so it will not come back after a reboot
+  - the timer is not active, so it is not firing now
+  detail: restic-station-helper timer status
+
+set "Fire Check" (e1000000-0000-4000-8000-000000000001)
+    last backup: success, 7s ago (20260806T230501Z-backup-e1000000)
+    last check:  never
+    last prune:  never
+    next due:    2026-08-06T23:10:01.983Z
+      - primary "Fire Primary": reachable
+
+--- timer status for the same host: the same verdict, the same exit code ---
 
 $ restic-station-helper timer status
 Restic Station — systemd --user timer
@@ -870,9 +1025,63 @@ Restic Station — systemd --user timer
   linger      enabled — user units keep running after logout
 
   last tick activity (from state/ and runs/)
-    "Fire Check": backup just now (2026-08-06T01:24:16Z)
-    last run: backup success (just now (2026-08-06T01:24:16Z))
+    "Fire Check": backup just now (2026-08-06T23:05:01Z)
+    last run: backup success (just now (2026-08-06T23:05:02Z))
+
+  VERDICT     scheduled backups will NOT happen on this host (exit 1)
+                - the units are not installed — run `restic-station-helper timer install`
+                - the timer is not enabled, so it will not come back after a reboot
+                - the timer is not active, so it is not firing now
 (exit 1)
+```
+
+**A killed run does not leave the host reporting healthy.** A `SIGKILL`, an OOM kill or a power
+cut skips the `defer` that deletes `state/current-run-<setId>.json`, and that file is what "a run
+is in flight" means to every reader — and `running` outranks `warning`. One dead run therefore
+used to pin a machine green permanently. `status` now checks the run's recorded `pid` (via
+`runs/<runId>/metadata.json`, the same evidence the tick's crash recovery uses) rather than
+trusting the file's existence, and reports:
+
+```jsonc
+"isRunning": false,
+"needsAttention": true,
+"abandonedRun": { "runId": "20260101T000000Z-backup-deadbeef", "kind": "backup", … },
+"abandonedRunFile": "/srv/state/restic-station/state/current-run-<setId>.json"
+```
+
+The next tick clears it (`recoverInterrupted` rewrites the run as `failed`, then deletes the
+matching progress file); `rm` the named file to clear it now. Note this is **not** a staleness
+rule on `updatedAt` — a `check --read-data` on a large repository legitimately writes nothing for
+hours, and a threshold that tolerates that is too coarse to be a health check.
+
+```
+--- a current-run file whose process is gone (updatedAt is *now*, so no timestamp
+    heuristic would catch it) ---
+{
+  "health": "warning",
+  "sets": [
+    {
+      "name": "Fire Check",
+      "isRunning": false,
+      "needsAttention": true,
+      "abandonedRun": {
+        "bytesDone": 1,
+        "filesDone": 1,
+        "kind": "backup",
+        "percentDone": 50,
+        "phase": "backing-up-primary",
+        "runId": "20260101T000000Z-backup-deadbeef",
+        "totalBytes": 2,
+        "totalFiles": 2
+      }
+    }
+  ]
+}
+exit 1
+
+CONFIRMED: health is "warning" (not "running"), the set reports isRunning=false, and the
+abandoned run is named so it can be cleared. Before this, the same file made every
+subsequent health check on this host exit 0 forever.
 ```
 
 ### Restore
@@ -913,8 +1122,10 @@ fleet legitimately has overrides for hosts that are not this one.
 **Lingering disabled → backups silently stop.** See [The linger gotcha](#the-linger-gotcha).
 Symptom: everything looked fine right after `timer install`, then backups just stop days or
 weeks later with nothing in any log, because the SSH session that ran `timer install` eventually
-ended. Fix: `sudo loginctl enable-linger <user>`, then `restic-station-helper timer status` and
-confirm the `linger` line says `enabled`.
+ended. Both `timer status` and `status` exit 1 on such a host and name `lingerDisabled` as the
+reason, so a monitoring check catches it — but only once you look. Fix:
+`sudo loginctl enable-linger <user>`, then `restic-station-helper timer status` and confirm the
+`linger` line says `enabled` and the `VERDICT` line says backups will happen.
 
 **"refusing to read …/secrets.json: it is group- or world-accessible."** Exactly what it says —
 run the `chmod 600` the message prints. Real output, deliberately reproduced by widening the mode

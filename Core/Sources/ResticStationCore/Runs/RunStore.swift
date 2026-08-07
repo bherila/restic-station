@@ -27,6 +27,40 @@ public struct ActiveRun: Equatable, Sendable {
     public var argvRedacted: [String]
 }
 
+/// One run `recoverInterrupted()` rewrote from `.running` to `.failed`.
+///
+/// Carries the `setId` as well as the `runId` because the caller has a second
+/// piece of wreckage to clear: `state/current-run-<setId>.json`, which the
+/// dead process never got to delete. See `Tick`'s step 3.
+public struct RecoveredRun: Equatable, Sendable {
+    public let runId: String
+    public let setId: UUID
+
+    public init(runId: String, setId: UUID) {
+        self.runId = runId
+        self.setId = setId
+    }
+}
+
+/// Whether a `state/current-run-<setId>.json` still describes something that
+/// is actually happening.
+///
+/// The file is deleted by the `defer` at the end of every run, so its mere
+/// presence normally means "a run is in flight" — and that is what the menu
+/// bar and `status` report. A `SIGKILL`, an OOM kill or a power cut skips
+/// that `defer` and leaves the file behind forever, at which point
+/// `AppHealth` pins to `.running` (which outranks `.warning`) and every
+/// health check reports green for a machine that has stopped backing up.
+/// That is the exact failure this type exists to make impossible.
+public enum CurrentRunLiveness: String, Equatable, Sendable {
+    /// The run's `runs/<runId>/metadata.json` is still `.running` and its
+    /// `pid` answers `kill(pid, 0)`.
+    case live
+    /// The process that wrote it is gone. Nothing will ever update or delete
+    /// this file: it is wreckage, not progress.
+    case abandoned
+}
+
 /// Errors surfaced by `RunStore`'s own I/O beyond ordinary `Data`/`JSONDecoder`
 /// throws (which propagate as-is from `metadata(runId:)`).
 public enum RunStoreError: Error, Equatable, Sendable, CustomStringConvertible {
@@ -177,12 +211,18 @@ public struct RunStore: Sendable {
     /// Scans `runs/*/metadata.json` for records left `status == .running`
     /// whose `pid` is no longer alive (`kill(pid, 0)` fails with `ESRCH`),
     /// rewrites each as `.failed` with `errorSummary: "interrupted"`,
-    /// appends the index line, and returns the recovered `runId`s. Records
+    /// appends the index line, and returns what it recovered. Records
     /// whose `pid` is alive (including "alive but owned by someone else",
     /// i.e. `kill` fails with `EPERM`) are left untouched. Unreadable /
     /// corrupt metadata files are skipped, never thrown.
+    ///
+    /// Returns `RecoveredRun` (runId **and** setId) rather than bare runIds:
+    /// the caller must also clear the `state/current-run-<setId>.json` the
+    /// dead process left behind, and it cannot work out which one from a
+    /// runId alone. See `liveness(ofCurrentRun:)` for what that stale file
+    /// does to health reporting if it is left in place.
     @discardableResult
-    public func recoverInterrupted() throws -> [String] {
+    public func recoverInterrupted() throws -> [RecoveredRun] {
         try paths.ensureDirectories()
 
         let fileManager = FileManager.default
@@ -194,7 +234,7 @@ public struct RunStore: Sendable {
         }
 
         let decoder = ConfigStore.makeDecoder()
-        var recovered: [String] = []
+        var recovered: [RecoveredRun] = []
 
         for dir in runDirs {
             var isDirectory: ObjCBool = false
@@ -213,13 +253,57 @@ public struct RunStore: Sendable {
             updated.errorSummary = "interrupted"
             try writeMetadataAtomic(updated)
             try appendIndexEntry(updated.indexEntry)
-            recovered.append(metadata.runId)
+            recovered.append(RecoveredRun(runId: metadata.runId, setId: metadata.setId))
         }
 
         return recovered
     }
 
-    private static func isProcessAlive(pid: Int32) -> Bool {
+    /// Is this `state/current-run-<setId>.json` still backed by a live
+    /// process? (`docs/data-model.md` §current-run.json)
+    ///
+    /// Decided from the run's own `runs/<runId>/metadata.json` — the same
+    /// `pid` + `kill(pid, 0)` evidence `recoverInterrupted()` uses, so the
+    /// two can never disagree about whether a run died.
+    ///
+    /// Deliberately **not** a timestamp heuristic on `updatedAt`. Progress is
+    /// only written when restic emits a `status` line (throttled), and some
+    /// phases legitimately emit nothing for hours — a `check --read-data` on
+    /// a large repository writes one phase marker and then goes quiet. Any
+    /// "no progress for N minutes ⟹ dead" rule either cries wolf on those
+    /// runs or is set so high it stops being a health check. Process
+    /// liveness has neither failure mode.
+    ///
+    /// Missing or undecodable metadata counts as `.abandoned`: `begin(...)`
+    /// writes `metadata.json` *before* the first progress write, so a
+    /// current-run file pointing at a run directory that is not there
+    /// describes a run this data directory has no record of.
+    ///
+    /// Inherits one known limitation from `recoverInterrupted()`: a recycled
+    /// pid can make a dead run look live. The window is a whole pid-space
+    /// wrap and the consequence is a delayed warning, not a wrong backup.
+    public func liveness(ofCurrentRun state: CurrentRunState) -> CurrentRunLiveness {
+        guard let metadata = try? metadata(runId: state.runId) else { return .abandoned }
+        // The pid alone, deliberately — **not** `metadata.status == .running`
+        // as well.
+        //
+        // A set run is several child runs under one `current-run` file:
+        // `performChild` calls `RunStore.finish` (which moves that child's
+        // metadata off `.running`) while the file is only cleared by the
+        // *set*-level `defer`, and the next child's phase marker rewrites it
+        // moments later. Between those two points — extendable by up to
+        // `indexLockTimeout` seconds waiting on the index lock — the run is
+        // completing perfectly normally and the metadata says "not running".
+        // Requiring `.running` here reported that as abandoned wreckage and
+        // exited 1 on a healthy host mid-backup, which is crying wolf: the
+        // precise failure that teaches people to ignore a health check.
+        //
+        // Process liveness has no such window. The process is either there
+        // to finish the job and clean up, or it is not.
+        return Self.isProcessAlive(pid: metadata.pid) ? .live : .abandoned
+    }
+
+    static func isProcessAlive(pid: Int32) -> Bool {
         if kill(pid, 0) == 0 { return true }
         // EPERM: process exists but we can't signal it (still alive).
         // ESRCH (or anything else): no such process.

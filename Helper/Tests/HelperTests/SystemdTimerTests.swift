@@ -508,9 +508,13 @@ private func lingerResponder(_ value: String) -> @Sendable ([String]) -> Process
         try await manager.install(helperPath: helperPath, intervalMinutes: 2, dataDirectory: nil, log: { _ in })
 
         let log = LineSink()
-        let healthy = await manager.status(activity: ["\"Docs\": backup just now"], log: { log.append($0) })
+        let health = await manager.status(
+            activity: TimerActivity(lines: ["\"Docs\": backup just now"]),
+            log: { log.append($0) }
+        )
 
-        #expect(healthy)
+        #expect(health.isHealthy)
+        #expect(health.exitCode == 0)
         let text = log.text
         #expect(text.contains("units       installed in \(unitDirectory.path)"))
         // Read back from the installed file, not assumed from this build's
@@ -535,7 +539,7 @@ private func lingerResponder(_ value: String) -> @Sendable ([String]) -> Process
         try await manager.install(helperPath: helperPath, intervalMinutes: 30, dataDirectory: nil, log: { _ in })
 
         let log = LineSink()
-        _ = await manager.status(activity: [], log: { log.append($0) })
+        _ = await manager.status(activity: TimerActivity(lines: []), log: { log.append($0) })
         #expect(log.text.contains("interval    every 30min"))
     }
 
@@ -552,9 +556,10 @@ private func lingerResponder(_ value: String) -> @Sendable ([String]) -> Process
         try await manager.install(helperPath: helperPath, intervalMinutes: 2, dataDirectory: nil, log: { _ in })
 
         let log = LineSink()
-        let healthy = await manager.status(activity: [], log: { log.append($0) })
+        let health = await manager.status(activity: TimerActivity(lines: []), log: { log.append($0) })
 
-        #expect(!healthy)
+        #expect(!health.isHealthy)
+        #expect(health.problems == [.notEnabled, .notActive, .lingerDisabled])
         #expect(log.text.contains("linger      DISABLED"))
         #expect(log.text.contains("sudo loginctl enable-linger ben"))
     }
@@ -565,12 +570,13 @@ private func lingerResponder(_ value: String) -> @Sendable ([String]) -> Process
         defer { try? FileManager.default.removeItem(at: unitDirectory) }
         let log = LineSink()
 
-        let healthy = await makeManager(
+        let health = await makeManager(
             unitDirectory: unitDirectory,
             runner: ScriptedProcessRunner(respond: statusResponder(enabled: "disabled", active: "inactive"))
-        ).status(activity: [], log: { log.append($0) })
+        ).status(activity: TimerActivity(lines: []), log: { log.append($0) })
 
-        #expect(!healthy)
+        #expect(!health.isHealthy)
+        #expect(health.problems.contains(.unitsMissing))
         #expect(log.text.contains("not installed"))
         #expect(log.text.contains("restic-station-helper timer install"))
     }
@@ -590,9 +596,10 @@ private func lingerResponder(_ value: String) -> @Sendable ([String]) -> Process
         try FileManager.default.removeItem(at: unitDirectory.appendingPathComponent("restic-station.service"))
 
         let log = LineSink()
-        let healthy = await manager.status(activity: [], log: { log.append($0) })
+        let health = await manager.status(activity: TimerActivity(lines: []), log: { log.append($0) })
 
-        #expect(!healthy)
+        #expect(!health.isHealthy)
+        #expect(health.problems.contains(.unitsIncomplete))
         #expect(log.text.contains("INCOMPLETE"))
         #expect(log.text.contains("restic-station.service: MISSING"))
     }
@@ -604,16 +611,324 @@ private func lingerResponder(_ value: String) -> @Sendable ([String]) -> Process
         let runner = ScriptedProcessRunner()
         let log = LineSink()
 
-        let healthy = await makeManager(unitDirectory: unitDirectory, runner: runner, systemctlPath: nil)
-            .status(helperPath: helperPath, activity: [], log: { log.append($0) })
+        let health = await makeManager(unitDirectory: unitDirectory, runner: runner, systemctlPath: nil)
+            .status(helperPath: helperPath, activity: TimerActivity(lines: []), log: { log.append($0) })
 
-        #expect(!healthy)
+        #expect(!health.isHealthy)
+        #expect(health.problems == [.systemdUnavailable])
         #expect(log.text.contains("systemd     not available"))
         // The real binary path, so the line can be pasted straight into
         // `crontab -e` rather than edited first.
         #expect(log.text.contains("*/2 * * * * \(helperPath) tick"))
         #expect(log.text.contains("crontab -e"))
         #expect(runner.invocations.isEmpty)
+    }
+
+    // MARK: Reasons a green timer is not actually green (issue #46)
+
+    /// The headline fix. A host whose units are installed, enabled and active
+    /// looks perfect — right up until the SSH session that installed them
+    /// ends, at which point systemd stops every one of that user's units and
+    /// backups stop with nothing in any log. `timer status` used to exit 0 on
+    /// exactly that host, and `docs/linux.md` had to ship a caveat telling
+    /// readers not to trust its exit code.
+    @Test("an enabled+active timer with lingering disabled is NOT healthy")
+    func lingerDisabledFailsTheHealthCheck() async throws {
+        let unitDirectory = try makeTempDirectory("units")
+        defer { try? FileManager.default.removeItem(at: unitDirectory) }
+        let manager = makeManager(
+            unitDirectory: unitDirectory,
+            runner: ScriptedProcessRunner(
+                respond: statusResponder(enabled: "enabled", active: "active", linger: "no")
+            )
+        )
+        try await manager.install(helperPath: helperPath, intervalMinutes: 2, dataDirectory: nil, log: { _ in })
+
+        let log = LineSink()
+        let health = await manager.status(activity: TimerActivity(lines: []), log: { log.append($0) })
+
+        #expect(health.problems == [.lingerDisabled])
+        #expect(health.exitCode == 1)
+        // The verdict block is what makes the exit code legible to a human
+        // who ran this by hand rather than from a monitoring script.
+        #expect(log.text.contains("VERDICT     scheduled backups will NOT happen"))
+        #expect(log.text.contains("lingering is disabled"))
+    }
+
+    /// The deliberate exception, and the reason it is one: `.unknown` means
+    /// the question could not be asked (no `loginctl`, unreadable marker
+    /// directory) — typically a container with no logind, which nobody logs
+    /// out of. Failing there would make this check permanently red with no
+    /// reachable fix.
+    @Test("an unknown linger state does not fail the health check")
+    func unknownLingerDoesNotFailTheHealthCheck() async throws {
+        let unitDirectory = try makeTempDirectory("units")
+        defer { try? FileManager.default.removeItem(at: unitDirectory) }
+        let missingMarkerDirectory = unitDirectory.appendingPathComponent("no-linger-dir", isDirectory: true)
+        let manager = makeManager(
+            unitDirectory: unitDirectory,
+            runner: ScriptedProcessRunner(respond: statusResponder(enabled: "enabled", active: "active")),
+            loginctlPath: nil,
+            lingerMarkerDirectory: missingMarkerDirectory
+        )
+        try await manager.install(helperPath: helperPath, intervalMinutes: 2, dataDirectory: nil, log: { _ in })
+
+        let log = LineSink()
+        let health = await manager.status(activity: TimerActivity(lines: []), log: { log.append($0) })
+
+        #expect(health.isHealthy)
+        #expect(health.exitCode == 0)
+        #expect(log.text.contains("linger      unknown"))
+        #expect(log.text.contains("VERDICT     scheduled backups will happen"))
+    }
+
+    /// A config the tick cannot load means every tick exits 1. Reporting the
+    /// timer green because the *unit* is fine is technically true and
+    /// practically a lie.
+    @Test("a problem found while reading the tick's state fails the health check")
+    func activityProblemsFailTheHealthCheck() async throws {
+        let unitDirectory = try makeTempDirectory("units")
+        defer { try? FileManager.default.removeItem(at: unitDirectory) }
+        let manager = makeManager(
+            unitDirectory: unitDirectory,
+            runner: ScriptedProcessRunner(respond: statusResponder(enabled: "enabled", active: "active"))
+        )
+        try await manager.install(helperPath: helperPath, intervalMinutes: 2, dataDirectory: nil, log: { _ in })
+
+        let log = LineSink()
+        let health = await manager.status(
+            activity: TimerActivity(lines: ["could not load /x/config.json"], problems: [.configUnreadable]),
+            log: { log.append($0) }
+        )
+
+        #expect(health.problems == [.configUnreadable])
+        #expect(health.exitCode == 1)
+        #expect(log.text.contains("every tick will fail"))
+    }
+
+    // MARK: The timer is global; the data directory is not (@codex review on #51)
+
+    /// A `systemd --user` timer is one unit per user. Ask `status` about
+    /// /srv/b while the installed timer ticks /srv/a and the unit is
+    /// genuinely enabled and active — so "healthy" is true of the unit and
+    /// false of the question that was asked.
+    @Test("a timer installed for another data directory is not healthy for this one")
+    func dataDirectoryMismatchIsNotHealthy() async throws {
+        let unitDirectory = try makeTempDirectory("units")
+        defer { try? FileManager.default.removeItem(at: unitDirectory) }
+        let manager = makeManager(
+            unitDirectory: unitDirectory,
+            runner: ScriptedProcessRunner(respond: statusResponder(enabled: "enabled", active: "active"))
+        )
+        try await manager.install(
+            helperPath: helperPath,
+            intervalMinutes: 2,
+            dataDirectory: "/srv/a/restic-station",
+            log: { _ in }
+        )
+
+        let log = LineSink()
+        let health = await manager.status(
+            dataDirectory: "/srv/b/restic-station",
+            activity: TimerActivity(lines: []),
+            log: { log.append($0) }
+        )
+
+        #expect(health.problems == [.dataDirectoryMismatch])
+        #expect(log.text.contains("data dir    MISMATCH"))
+        #expect(log.text.contains("/srv/a/restic-station"))
+        #expect(log.text.contains("/srv/b/restic-station"))
+    }
+
+    @Test("the same data directory is healthy, and says which one is pinned")
+    func matchingDataDirectoryIsHealthy() async throws {
+        let unitDirectory = try makeTempDirectory("units")
+        defer { try? FileManager.default.removeItem(at: unitDirectory) }
+        let manager = makeManager(
+            unitDirectory: unitDirectory,
+            runner: ScriptedProcessRunner(respond: statusResponder(enabled: "enabled", active: "active"))
+        )
+        try await manager.install(
+            helperPath: helperPath,
+            intervalMinutes: 2,
+            dataDirectory: "/srv/a/restic-station",
+            log: { _ in }
+        )
+
+        let log = LineSink()
+        let health = await manager.status(
+            dataDirectory: "/srv/a/restic-station",
+            activity: TimerActivity(lines: []),
+            log: { log.append($0) }
+        )
+
+        #expect(health.isHealthy)
+        #expect(log.text.contains("data dir    /srv/a/restic-station (pinned in the unit)"))
+    }
+
+    /// A unit written by a build from before the data directory was pinned.
+    /// It will re-derive the path from the user manager's environment, which
+    /// is exactly the silent-stop issue #48 is about — so it is a finding,
+    /// not a shrug.
+    @Test("a unit that pins no data directory at all is reported, not assumed fine")
+    func unpinnedDataDirectoryIsAProblem() async throws {
+        let unitDirectory = try makeTempDirectory("units")
+        defer { try? FileManager.default.removeItem(at: unitDirectory) }
+        let manager = makeManager(
+            unitDirectory: unitDirectory,
+            runner: ScriptedProcessRunner(respond: statusResponder(enabled: "enabled", active: "active"))
+        )
+        try await manager.install(helperPath: helperPath, intervalMinutes: 2, dataDirectory: nil, log: { _ in })
+
+        let log = LineSink()
+        let health = await manager.status(
+            dataDirectory: "/srv/a/restic-station",
+            activity: TimerActivity(lines: []),
+            log: { log.append($0) }
+        )
+
+        #expect(health.problems == [.dataDirectoryUnpinned])
+        #expect(log.text.contains("the unit pins none"))
+    }
+
+    /// The escaping round-trips: `serviceUnit` writes `%%` for a literal `%`
+    /// so systemd does not expand it, and reading the unit back has to undo
+    /// that or every such host reports a permanent false mismatch.
+    @Test("a percent sign survives the write/read round trip without a false mismatch")
+    func percentInDataDirectoryRoundTrips() async throws {
+        let unitDirectory = try makeTempDirectory("units")
+        defer { try? FileManager.default.removeItem(at: unitDirectory) }
+        let manager = makeManager(
+            unitDirectory: unitDirectory,
+            runner: ScriptedProcessRunner(respond: statusResponder(enabled: "enabled", active: "active"))
+        )
+        try await manager.install(
+            helperPath: helperPath,
+            intervalMinutes: 2,
+            dataDirectory: "/srv/100%full/state",
+            log: { _ in }
+        )
+
+        #expect(SystemdTimerManager.installedDataDirectory(
+            serviceUnitURL: unitDirectory.appendingPathComponent("restic-station.service")
+        ) == "/srv/100%full/state")
+
+        let health = await manager.status(
+            dataDirectory: "/srv/100%full/state",
+            activity: TimerActivity(lines: []),
+            log: { _ in }
+        )
+        #expect(health.isHealthy)
+    }
+
+    /// `status --json` discards this method's log entirely, so `list-timers`
+    /// — the slowest call and pure narrative — is waste there, and a wedged
+    /// D-Bus turns waste into a stall in a command documented as cheap.
+    @Test("verdictOnly skips the narrative list-timers call")
+    func verdictOnlySkipsListTimers() async throws {
+        let unitDirectory = try makeTempDirectory("units")
+        defer { try? FileManager.default.removeItem(at: unitDirectory) }
+        let runner = ScriptedProcessRunner(respond: statusResponder(enabled: "enabled", active: "active"))
+        let manager = makeManager(unitDirectory: unitDirectory, runner: runner)
+        try await manager.install(helperPath: helperPath, intervalMinutes: 2, dataDirectory: nil, log: { _ in })
+
+        let before = runner.invocations.count
+        let health = await manager.status(
+            activity: TimerActivity(lines: []),
+            verdictOnly: true,
+            log: { _ in }
+        )
+        let issued = runner.invocations.dropFirst(before)
+
+        #expect(!issued.contains { $0.contains("list-timers") })
+        // The verdict itself is unaffected — the calls that decide it still run.
+        #expect(issued.contains { $0.contains("is-enabled") })
+        #expect(issued.contains { $0.contains("is-active") })
+        // No `dataDirectory` was asked about, so the pinning check does not
+        // apply and this host is simply healthy — skipping `list-timers`
+        // must not change the verdict.
+        #expect(health.isHealthy)
+    }
+
+    @Test("the full report still runs list-timers")
+    func fullReportRunsListTimers() async throws {
+        let unitDirectory = try makeTempDirectory("units")
+        defer { try? FileManager.default.removeItem(at: unitDirectory) }
+        let runner = ScriptedProcessRunner(respond: statusResponder(enabled: "enabled", active: "active"))
+        let manager = makeManager(unitDirectory: unitDirectory, runner: runner)
+        try await manager.install(helperPath: helperPath, intervalMinutes: 2, dataDirectory: nil, log: { _ in })
+
+        let before = runner.invocations.count
+        _ = await manager.status(activity: TimerActivity(lines: []), log: { _ in })
+        #expect(runner.invocations.dropFirst(before).contains { $0.contains("list-timers") })
+    }
+
+    @Test("every reason is reported, not just the first")
+    func allProblemsAreReported() async throws {
+        let unitDirectory = try makeTempDirectory("units")
+        defer { try? FileManager.default.removeItem(at: unitDirectory) }
+        let log = LineSink()
+
+        let health = await makeManager(
+            unitDirectory: unitDirectory,
+            runner: ScriptedProcessRunner(
+                respond: statusResponder(enabled: "disabled", active: "inactive", linger: "no")
+            )
+        ).status(
+            activity: TimerActivity(lines: [], problems: [.configUnreadable]),
+            log: { log.append($0) }
+        )
+
+        // Fixing one of these would still leave the host not backing up; a
+        // health check that stops at the first finding sends the reader round
+        // the loop once per problem.
+        #expect(health.problems == [.unitsMissing, .notEnabled, .notActive, .lingerDisabled, .configUnreadable])
+        for problem in health.problems {
+            #expect(log.text.contains(problem.summary))
+        }
+    }
+}
+
+// MARK: - timer status's view of the tick's own state
+
+@Suite struct TimerStatusActivityTests {
+
+    private func makePaths() -> AppPaths {
+        AppPaths(root: FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-timer-activity-\(UUID().uuidString)"))
+    }
+
+    @Test("a host with nothing configured yet is not a broken host")
+    func absentConfigIsNotAProblem() throws {
+        let paths = makePaths()
+        try paths.ensureDirectories()
+        defer { try? FileManager.default.removeItem(at: paths.root) }
+
+        // `timer install` before `config import` is the documented order in
+        // docs/linux.md, so this state has to stay exit 0.
+        let activity = TimerCommand.Status.activity(paths: paths)
+        #expect(activity.problems.isEmpty)
+        #expect(activity.lines.contains("no backup sets configured — the tick runs and exits immediately"))
+    }
+
+    /// The bug: `(try? load()) ?? AppConfig()` turned an unparseable
+    /// `config.json` into a valid empty one, so `timer status` printed the
+    /// same cheerful "no backup sets configured" as a fresh host and exited
+    /// 0 — on a machine where every single tick was exiting 1 on that file.
+    @Test("a config that will not load is reported, not silently read as an empty one")
+    func unreadableConfigIsAProblem() throws {
+        let paths = makePaths()
+        try paths.ensureDirectories()
+        defer { try? FileManager.default.removeItem(at: paths.root) }
+        try Data("{ this is not json".utf8).write(to: paths.configFile)
+
+        let activity = TimerCommand.Status.activity(paths: paths)
+        #expect(activity.problems == [.configUnreadable])
+        // And it must not describe a stand-in empty config as if it were
+        // this host's actual set list.
+        #expect(activity.lines.count == 1)
+        #expect(activity.lines[0].contains(paths.configFile.path))
+        #expect(!activity.lines.contains("no backup sets configured — the tick runs and exits immediately"))
     }
 }
 

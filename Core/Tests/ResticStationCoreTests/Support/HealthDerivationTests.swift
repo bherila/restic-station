@@ -440,7 +440,7 @@ private func currentRun(percentDone: Double, phase: String = "backing-up-primary
     @Test func everythingHealthyIsIdle() {
         #expect(HealthDerivation.appHealth(
             setHealths: [health()],
-            anyRunInFlight: false,
+            runsInFlight: [],
             fullDiskAccessDenied: false,
             backgroundAgentEnabled: true
         ) == .idle)
@@ -449,7 +449,7 @@ private func currentRun(percentDone: Double, phase: String = "backing-up-primary
     @Test func noSetsAtAllWithAWorkingAgentIsIdle() {
         #expect(HealthDerivation.appHealth(
             setHealths: [],
-            anyRunInFlight: false,
+            runsInFlight: [],
             fullDiskAccessDenied: false,
             backgroundAgentEnabled: true
         ) == .idle)
@@ -458,7 +458,7 @@ private func currentRun(percentDone: Double, phase: String = "backing-up-primary
     @Test func runningBeatsEveryWarning() {
         #expect(HealthDerivation.appHealth(
             setHealths: [health(running: true, failed: true, stale: true)],
-            anyRunInFlight: true,
+            runsInFlight: [currentRun(percentDone: 0.5)],
             fullDiskAccessDenied: true,
             backgroundAgentEnabled: false
         ) == .running)
@@ -467,7 +467,7 @@ private func currentRun(percentDone: Double, phase: String = "backing-up-primary
     @Test func runInFlightForADeletedSetStillCountsAsRunning() {
         #expect(HealthDerivation.appHealth(
             setHealths: [],
-            anyRunInFlight: true,
+            runsInFlight: [currentRun(percentDone: 0.5)],
             fullDiskAccessDenied: false,
             backgroundAgentEnabled: true
         ) == .running)
@@ -476,7 +476,7 @@ private func currentRun(percentDone: Double, phase: String = "backing-up-primary
     @Test func failedLastRunIsAWarning() {
         #expect(HealthDerivation.appHealth(
             setHealths: [health(), health(failed: true)],
-            anyRunInFlight: false,
+            runsInFlight: [],
             fullDiskAccessDenied: false,
             backgroundAgentEnabled: true
         ) == .warning)
@@ -485,7 +485,7 @@ private func currentRun(percentDone: Double, phase: String = "backing-up-primary
     @Test func staleDestinationIsAWarning() {
         #expect(HealthDerivation.appHealth(
             setHealths: [health(stale: true)],
-            anyRunInFlight: false,
+            runsInFlight: [],
             fullDiskAccessDenied: false,
             backgroundAgentEnabled: true
         ) == .warning)
@@ -494,7 +494,7 @@ private func currentRun(percentDone: Double, phase: String = "backing-up-primary
     @Test func deniedFullDiskAccessIsAWarning() {
         #expect(HealthDerivation.appHealth(
             setHealths: [health()],
-            anyRunInFlight: false,
+            runsInFlight: [],
             fullDiskAccessDenied: true,
             backgroundAgentEnabled: true
         ) == .warning)
@@ -509,7 +509,7 @@ private func currentRun(percentDone: Double, phase: String = "backing-up-primary
         #expect(HealthDerivation.fullDiskAccessDenied(from: nil) == false)
         #expect(HealthDerivation.appHealth(
             setHealths: [health()],
-            anyRunInFlight: false,
+            runsInFlight: [],
             fullDiskAccessDenied: HealthDerivation.fullDiskAccessDenied(from: nil),
             backgroundAgentEnabled: true
         ) == .idle)
@@ -536,10 +536,173 @@ private func currentRun(percentDone: Double, phase: String = "backing-up-primary
     @Test func disabledBackgroundAgentIsAWarning() {
         #expect(HealthDerivation.appHealth(
             setHealths: [health()],
-            anyRunInFlight: false,
+            runsInFlight: [],
             fullDiskAccessDenied: false,
             backgroundAgentEnabled: false
         ) == .warning)
+    }
+
+    @Test("an unknown scheduler state is not a warning — only a definite false is")
+    func unknownBackgroundAgentIsNotAWarning() {
+        // The `nil` case exists because `status` on macOS genuinely cannot
+        // read `SMAppService` state. Before it did, that caller passed `true`
+        // — "the scheduler is fine" — which is a different claim entirely.
+        #expect(HealthDerivation.appHealth(
+            setHealths: [health()],
+            runsInFlight: [],
+            fullDiskAccessDenied: false,
+            backgroundAgentEnabled: nil
+        ) == .idle)
+    }
+
+    // MARK: Abandoned runs
+
+    @Test("a killed run's leftover current-run file is a warning, never 'running'")
+    func abandonedRunIsAWarningNotRunning() {
+        let wreckage = currentRun(percentDone: 0.5)
+        // The bug this replaces: one SIGKILL left this file behind, nothing
+        // ever deleted it, and `.running` outranks `.warning` — so the menu
+        // bar stayed blue and `status` exited 0 from then on, forever.
+        #expect(HealthDerivation.appHealth(
+            setHealths: [health()],
+            runsInFlight: [wreckage],
+            fullDiskAccessDenied: false,
+            backgroundAgentEnabled: true,
+            isRunAbandoned: { _ in true }
+        ) == .warning)
+    }
+
+    @Test("one abandoned run does not mask a genuinely live one")
+    func aLiveRunStillOutranksAnAbandonedOne() {
+        let live = currentRun(percentDone: 0.5)
+        let wreckage = currentRun(percentDone: 0.1, phase: "checking")
+        #expect(HealthDerivation.appHealth(
+            setHealths: [health()],
+            runsInFlight: [wreckage, live],
+            fullDiskAccessDenied: false,
+            backgroundAgentEnabled: true,
+            isRunAbandoned: { $0.phase == "checking" }
+        ) == .running)
+    }
+
+    // MARK: The exit code is not the glyph (@codex review on #51)
+
+    /// `.running` outranking `.warning` is right for a menu bar and wrong
+    /// for an exit code. A three-hour backup must not be able to hide a
+    /// disabled timer from a monitoring script for three hours — that is the
+    /// same "green while backups are stopping" failure this whole change is
+    /// about, arriving through the front door.
+    @Test("a live run hides a broken scheduler from the glyph, never from the exit code")
+    func runningMasksTheGlyphButNotTheExitCode() {
+        let live = currentRun(percentDone: 0.5)
+
+        // The menu bar still says "working" — deliberately unchanged.
+        #expect(HealthDerivation.appHealth(
+            setHealths: [health(running: true)],
+            runsInFlight: [live],
+            fullDiskAccessDenied: false,
+            backgroundAgentEnabled: false
+        ) == .running)
+
+        // The exit code still says "something is wrong here".
+        #expect(HealthDerivation.hasWarningConditions(
+            setHealths: [health(running: true)],
+            runsInFlight: [live],
+            fullDiskAccessDenied: false,
+            backgroundAgentEnabled: false
+        ))
+    }
+
+    @Test("with nothing wrong, a live run reports no warning conditions either")
+    func aLiveRunAloneIsNotAWarning() {
+        #expect(HealthDerivation.hasWarningConditions(
+            setHealths: [health(running: true)],
+            runsInFlight: [currentRun(percentDone: 0.5)],
+            fullDiskAccessDenied: false,
+            backgroundAgentEnabled: true
+        ) == false)
+    }
+
+    @Test("appHealth and hasWarningConditions cannot disagree about what is a problem")
+    func theTwoQuestionsShareOneDefinition() {
+        // Every warning input, with nothing running: the two must agree,
+        // which is what makes keeping them separate safe.
+        let cases: [(String, [SetHealth], Bool, Bool?)] = [
+            ("failed run", [health(failed: true)], false, true),
+            ("stale destination", [health(stale: true)], false, true),
+            ("fda denied", [health()], true, true),
+            ("scheduler broken", [health()], false, false),
+            ("nothing wrong", [health()], false, true),
+        ]
+        for (label, setHealths, fda, agent) in cases {
+            let glyph = HealthDerivation.appHealth(
+                setHealths: setHealths,
+                runsInFlight: [],
+                fullDiskAccessDenied: fda,
+                backgroundAgentEnabled: agent
+            )
+            let exits = HealthDerivation.hasWarningConditions(
+                setHealths: setHealths,
+                runsInFlight: [],
+                fullDiskAccessDenied: fda,
+                backgroundAgentEnabled: agent
+            )
+            #expect((glyph == .warning) == exits, "\(label): glyph \(glyph), exit-worthy \(exits)")
+        }
+    }
+
+    @Test("deleting the set is not a way to silence its abandoned run")
+    func abandonedRunForADeletedSetIsStillAWarning() {
+        // No `SetHealth` carries this one — the set is gone from the config —
+        // so `appHealth` has to count it directly or it vanishes.
+        #expect(HealthDerivation.appHealth(
+            setHealths: [],
+            runsInFlight: [currentRun(percentDone: 0.5)],
+            fullDiskAccessDenied: false,
+            backgroundAgentEnabled: true,
+            isRunAbandoned: { _ in true }
+        ) == .warning)
+    }
+}
+
+// MARK: - Abandoned runs, per set
+
+@Suite struct SetHealthAbandonedRunTests {
+    private func derive(abandoned: Bool) -> SetHealth {
+        HealthDerivation.setHealth(
+            set: makeSet(),
+            recentRuns: [],
+            currentRun: currentRun(percentDone: 0.5),
+            repoStatuses: [:],
+            setScheduleState: nil,
+            now: Date(timeIntervalSince1970: 1_800_000_000),
+            calendar: utcCalendar(),
+            isRunAbandoned: { _ in abandoned }
+        )
+    }
+
+    @Test("a live current-run reports as running and not as a problem")
+    func liveRunIsRunning() {
+        let health = derive(abandoned: false)
+        #expect(health.isRunning)
+        #expect(health.currentRun != nil)
+        #expect(health.abandonedRun == nil)
+        #expect(health.progressPercent == 50)
+        #expect(health.needsAttention == false)
+    }
+
+    @Test("an abandoned current-run reports as needing attention, not as running")
+    func abandonedRunNeedsAttention() {
+        let health = derive(abandoned: true)
+        #expect(health.isRunning == false)
+        #expect(health.currentRun == nil)
+        // Kept as data, not discarded: `status` names the file to delete.
+        #expect(health.abandonedRun?.runId == "run")
+        #expect(health.hasAbandonedRun)
+        // Nothing is in flight, so there is no progress to report — a
+        // half-finished percentage from a dead process is worse than none.
+        #expect(health.progressPercent == nil)
+        #expect(health.needsAttention)
     }
 }
 

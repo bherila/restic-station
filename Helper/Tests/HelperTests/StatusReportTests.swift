@@ -94,6 +94,7 @@ struct StatusReportTests {
     private func makeSetStatus(needsAttention: Bool, isRunning: Bool) -> StatusReport.SetStatus {
         StatusReport.SetStatus(
             id: setId, name: "Projects", needsAttention: needsAttention, isRunning: isRunning,
+            abandonedRun: nil, abandonedRunFile: nil,
             lastBackup: nil, lastCheck: nil, lastPrune: nil, currentRun: nil,
             nextDue: Date(timeIntervalSince1970: 0),
             destinations: [
@@ -108,7 +109,7 @@ struct StatusReportTests {
     @Test("a healthy report names no attention-needed flags")
     func healthyReportHasNoFlags() {
         let report = StatusReport(
-            machineId: "studio-mac", generatedAt: Date(), health: "idle", fullDiskAccessDenied: false,
+            machineId: "studio-mac", generatedAt: Date(), health: "idle", fullDiskAccessDenied: false, scheduler: nil,
             sets: [makeSetStatus(needsAttention: false, isRunning: false)], excludedHere: []
         )
         let lines = report.humanLines().joined(separator: "\n")
@@ -118,7 +119,7 @@ struct StatusReportTests {
     @Test("a warning report flags the set, and shows the destination's unreachable+stale state")
     func warningReportFlagsTheSet() {
         let report = StatusReport(
-            machineId: "studio-mac", generatedAt: Date(), health: "warning", fullDiskAccessDenied: false,
+            machineId: "studio-mac", generatedAt: Date(), health: "warning", fullDiskAccessDenied: false, scheduler: nil,
             sets: [makeSetStatus(needsAttention: true, isRunning: false)], excludedHere: []
         )
         let lines = report.humanLines().joined(separator: "\n")
@@ -132,7 +133,7 @@ struct StatusReportTests {
     func excludedHereSection() {
         let omission = ResolvedOmission(subject: .backupSet, id: setId, name: "Photos", reason: .disabledForMachine)
         let report = StatusReport(
-            machineId: "mirror-box", generatedAt: Date(), health: "idle", fullDiskAccessDenied: false,
+            machineId: "mirror-box", generatedAt: Date(), health: "idle", fullDiskAccessDenied: false, scheduler: nil,
             sets: [], excludedHere: [StatusReport.Exclusion(omission: omission)]
         )
         let lines = report.humanLines().joined(separator: "\n")
@@ -146,7 +147,7 @@ struct StatusReportTests {
     func jsonEncodesExplicitNulls() throws {
         let report = StatusReport(
             machineId: "studio-mac", generatedAt: Date(timeIntervalSince1970: 0), health: "idle",
-            fullDiskAccessDenied: false, sets: [makeSetStatus(needsAttention: false, isRunning: false)],
+            fullDiskAccessDenied: false, scheduler: nil, sets: [makeSetStatus(needsAttention: false, isRunning: false)],
             excludedHere: []
         )
         let data = try ConfigStore.makeEncoder().encode(report)

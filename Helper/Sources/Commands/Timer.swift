@@ -81,10 +81,13 @@ extension TimerCommand {
                 re-running with a different --interval. Nothing is duplicated \
                 and no state is lost.
 
-                If RESTIC_STATION_DATA_DIR is set in the shell you run this \
-                from, it is baked into the service unit so the timer uses the \
-                same data directory you do. No secrets are ever written into a \
-                unit file or an EnvironmentFile.
+                The data directory this command resolved is pinned into the \
+                service unit, so the timer always uses the same one you do — \
+                a systemd --user service inherits the user manager's \
+                environment, not your shell's, so XDG_STATE_HOME and \
+                RESTIC_STATION_DATA_DIR would otherwise not reach the tick. \
+                No secrets are ever written into a unit file or an \
+                EnvironmentFile.
                 """
         )
 
@@ -112,12 +115,20 @@ extension TimerCommand {
                 HelperExit.fail("\(error)")
             }
 
-            let dataDirectory = ProcessInfo.processInfo.environment["RESTIC_STATION_DATA_DIR"]
+            // The *resolved* root, not `RESTIC_STATION_DATA_DIR` as found in
+            // the environment. `AppPaths.default()` is the whole override
+            // chain — the env var, then `$XDG_STATE_HOME/restic-station`,
+            // then `~/.local/state/restic-station` — and it is what every
+            // other command in this binary reads. Forwarding only the env var
+            // (issue #48) meant a host with a custom XDG_STATE_HOME installed
+            // a timer pointing at a data directory that has no config in it,
+            // and then backed nothing up without ever failing.
+            let dataDirectory = AppPaths.default().root.path
             do {
                 try await TimerCommand.makeManager().install(
                     helperPath: helperPath,
                     intervalMinutes: interval,
-                    dataDirectory: dataDirectory?.isEmpty == false ? dataDirectory : nil,
+                    dataDirectory: dataDirectory,
                     log: { print($0) }
                 )
             } catch {
@@ -159,35 +170,73 @@ extension TimerCommand {
             commandName: "status",
             abstract: "Report whether the timer is installed, enabled, active and when it next fires, "
                 + "plus what the tick has been doing. Exit 0 when scheduled backups will happen, "
-                + "1 otherwise (so it can be used as a health check)."
+                + "1 otherwise (so it can be used as a health check).",
+            discussion: """
+                Exit 1 covers every way this host can stop backing up on a \
+                schedule, not just a missing unit: no systemd, units missing \
+                or half-deleted, the timer not enabled or not active, \
+                lingering disabled (the timer dies at logout), or a \
+                config.json that will not load (every tick would fail on it). \
+                The VERDICT block at the end of the output lists exactly \
+                which of those applied.
+
+                One deliberate exception: a linger state of "unknown" — \
+                loginctl is absent and /var/lib/systemd/linger cannot be \
+                read, as inside a container with no logind — does not fail. \
+                Nothing logs out of such a host, so failing would make this \
+                check permanently red for no reachable fix.
+                """
         )
 
         func run() async throws {
-            // Best-effort: only used to print a copy-pasteable cron line on a
-            // host with no systemd, so an unresolvable path degrades to a
-            // placeholder rather than failing the whole report.
-            let healthy = await TimerCommand.makeManager().status(
+            let paths = AppPaths.default()
+            // Best-effort on `helperPath`: it is only used to print a
+            // copy-pasteable cron line on a host with no systemd, so an
+            // unresolvable path degrades to a placeholder rather than
+            // failing the whole report.
+            let health = await TimerCommand.makeManager().status(
                 helperPath: try? HelperSelfPath.resolve(),
-                activity: Self.activityLines(),
+                dataDirectory: paths.root.path,
+                activity: Self.activity(paths: paths),
                 log: { print($0) }
             )
-            HelperExit.code(healthy ? 0 : 1)
+            HelperExit.code(health.exitCode)
         }
 
-        /// Reads `state/` and `runs/` best-effort: `timer status` must still
-        /// answer the scheduling question on a host where nothing has been
-        /// configured yet, so every read here degrades to "no lines" rather
-        /// than to an error.
-        static func activityLines() -> [String] {
-            let paths = AppPaths.default()
-            let config = (try? ConfigStore(paths: paths).load()) ?? AppConfig()
+        /// Reads `state/` and `runs/`. `timer status` must still answer the
+        /// scheduling question on a host where nothing has been configured
+        /// yet — so an *absent* config is fine and reports no lines — but a
+        /// config that is present and will not load is a different animal
+        /// and comes back as a `.configUnreadable` problem.
+        ///
+        /// The distinction is the whole point. `(try? load()) ?? AppConfig()`
+        /// turned an unparseable `config.json` into a valid empty one, and
+        /// `timer status` printed "no backup sets configured — the tick runs
+        /// and exits immediately" and exited 0, on a host where every single
+        /// tick was exiting 1 on that same file.
+        static func activity(paths: AppPaths) -> TimerActivity {
+            var problems: [TimerProblem] = []
+            var config = AppConfig()
+            do {
+                config = try ConfigStore(paths: paths).load()
+            } catch {
+                problems.append(.configUnreadable)
+            }
+
             let recentRuns = (try? RunStore(paths: paths).recentRuns(limit: 1)) ?? []
-            return SystemdTimerActivity.lines(
+            var lines = SystemdTimerActivity.lines(
                 config: config,
                 scheduleState: StateStore(paths: paths).readScheduleState(),
                 recentRuns: recentRuns,
                 now: Date()
             )
+            if problems.contains(.configUnreadable) {
+                // Replace rather than append: the lines above were derived
+                // from an empty stand-in config and describing them as this
+                // host's backup sets would be worse than saying nothing.
+                lines = ["could not load \(paths.configFile.path) — every tick will fail on it"]
+            }
+            return TimerActivity(lines: lines, problems: problems)
         }
     }
 }

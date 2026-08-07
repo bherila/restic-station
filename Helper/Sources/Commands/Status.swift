@@ -17,9 +17,10 @@ struct Status: AsyncParsableCommand {
         commandName: "status",
         abstract: "The headless menu bar: per set, last run outcome+age, next due time, any "
             + "in-flight run's live progress, per-destination reachability+staleness, and last "
-            + "check/prune. Reads only existing state — no restic invocation. --json for scripting "
-            + "(e.g. a Nagios/Icinga check). Exit 0 healthy (including a run in flight), 1 if any "
-            + "set needs attention."
+            + "check/prune. On Linux it also reports whether the systemd --user timer will "
+            + "actually fire. Reads only existing state — no restic invocation. --json for "
+            + "scripting (e.g. a Nagios/Icinga check). Exit 0 healthy (including a run in "
+            + "flight), 1 if any set needs attention or the scheduler is broken."
     )
 
     @Flag(name: .long, help: "Emit JSON. Only JSON reaches stdout in this mode.")
@@ -65,7 +66,20 @@ struct Status: AsyncParsableCommand {
         // without a separate index), so `.max` costs nothing extra over the
         // previous cap on the read/decode side; it only keeps entries this
         // command would otherwise have discarded right after decoding them.
-        let recentRuns = (try? runStore.recentRuns(limit: .max)) ?? []
+        //
+        // Thrown, not swallowed. `recentRuns` already tolerates everything
+        // that is *survivable* — a missing index reads as no runs, a corrupt
+        // or truncated line is skipped with a warning — so anything left to
+        // throw here is the file being unreadable outright (wrong owner,
+        // wrong mode, I/O error). `(try? …) ?? []` turned that into "no runs
+        // recorded", which derives to idle, which exits 0: this command
+        // reporting healthy precisely because it could not read the evidence.
+        let recentRuns: [RunIndexEntry]
+        do {
+            recentRuns = try runStore.recentRuns(limit: .max)
+        } catch {
+            HelperExit.fail("could not read the run history (\(paths.runsIndexFile.path)): \(error)")
+        }
 
         var currentRuns: [UUID: CurrentRunState] = [:]
         for setId in stateStore.currentRunSetIDs() {
@@ -81,6 +95,13 @@ struct Status: AsyncParsableCommand {
         }
         let scheduleState = stateStore.readScheduleState()
 
+        // A `current-run-*.json` left behind by a killed process is not a run
+        // in flight. Passed to both derivations so the two halves of the
+        // health decision cannot disagree — see `RunStore.liveness`.
+        let isRunAbandoned: (CurrentRunState) -> Bool = {
+            runStore.liveness(ofCurrentRun: $0) == .abandoned
+        }
+
         let setHealths = HealthDerivation.setHealths(
             config: scheduled.config,
             recentRuns: recentRuns,
@@ -88,28 +109,30 @@ struct Status: AsyncParsableCommand {
             repoStatuses: repoStatuses,
             scheduleState: scheduleState,
             now: now,
-            calendar: calendar
+            calendar: calendar,
+            isRunAbandoned: isRunAbandoned
         )
 
         let fdaCheck = stateStore.readFdaCheck()
         let fdaDenied = HealthDerivation.fullDiskAccessDenied(from: fdaCheck)
-        // Every live current-run file counts, including one for a set no
-        // longer in the resolved config — `currentRunSetIDs()`'s documented
-        // contract, which is what `HealthDerivation.appHealth`'s
-        // `anyRunInFlight` parameter expects.
-        let anyRunInFlight = !stateStore.currentRunSetIDs().isEmpty
-        // `backgroundAgentEnabled` asks "is the scheduler (SMAppService /
-        // the systemd --user timer) actually registered?" — a genuinely
-        // platform-specific fact `status` has no view into today (Linux has
-        // `timer status` for exactly this; macOS's SMAppService state is
-        // app-only). Passing `true` keeps that dimension neutral rather than
-        // guessing either a false "healthy" or a false "warning" into every
-        // invocation. Documented here rather than silently baked in.
+        // `backgroundAgentEnabled` asks "is the scheduler actually going to
+        // fire?" On Linux that is answerable and this command now answers it
+        // (`scheduler(paths:)`); on macOS it is `SMAppService` state, which
+        // is app-only and has no CLI surface, so the honest answer is `nil`
+        // — unknown, contributing nothing. It used to pass `true`
+        // unconditionally on both platforms, which reads as "the scheduler is
+        // fine" and meant `status --json` could not see a Linux host whose
+        // timer had been uninstalled.
+        let scheduler = await Self.scheduler(paths: paths)
         let health = HealthDerivation.appHealth(
             setHealths: setHealths,
-            anyRunInFlight: anyRunInFlight,
+            // Every current-run file, including one for a set no longer in
+            // the resolved config — `currentRunSetIDs()`'s documented
+            // contract, which is what `appHealth`'s `runsInFlight` expects.
+            runsInFlight: Array(currentRuns.values),
             fullDiskAccessDenied: fdaDenied,
-            backgroundAgentEnabled: true
+            backgroundAgentEnabled: scheduler.flatMap(\.healthy),
+            isRunAbandoned: isRunAbandoned
         )
 
         let sets: [StatusReport.SetStatus] = setHealths.map { setHealth in
@@ -131,6 +154,10 @@ struct Status: AsyncParsableCommand {
                 name: setHealth.name,
                 needsAttention: setHealth.needsAttention,
                 isRunning: setHealth.isRunning,
+                abandonedRun: StatusReport.CurrentRunSummary(setHealth.abandonedRun),
+                abandonedRunFile: setHealth.hasAbandonedRun
+                    ? paths.currentRunFile(setId: setHealth.setId).path
+                    : nil,
                 lastBackup: StatusReport.RunSummary(setHealth.lastBackup, now: now),
                 lastCheck: StatusReport.RunSummary(try? runStore.lastRun(setId: setHealth.setId, kind: .check), now: now),
                 lastPrune: StatusReport.RunSummary(try? runStore.lastRun(setId: setHealth.setId, kind: .prune), now: now),
@@ -149,6 +176,7 @@ struct Status: AsyncParsableCommand {
             generatedAt: now,
             health: health.rawValue,
             fullDiskAccessDenied: fdaDenied,
+            scheduler: scheduler,
             sets: sets,
             excludedHere: excludedHere
         )
@@ -161,7 +189,81 @@ struct Status: AsyncParsableCommand {
             }
         }
 
-        HelperExit.code(health == .warning ? 1 : 0)
+        // Not `health == .warning`. `.running` outranks `.warning` in
+        // `appHealth` — correctly, for a menu bar glyph — so exiting on it
+        // would report a host healthy for the whole duration of a backup
+        // while its timer was disabled and no *next* backup would ever
+        // start. `hasWarningConditions` is the same rules without that
+        // precedence, which is the right question for an exit code.
+        let needsAttention = HealthDerivation.hasWarningConditions(
+            setHealths: setHealths,
+            runsInFlight: Array(currentRuns.values),
+            fullDiskAccessDenied: fdaDenied,
+            backgroundAgentEnabled: scheduler.flatMap(\.healthy),
+            isRunAbandoned: isRunAbandoned
+        )
+        HelperExit.code(needsAttention ? 1 : 0)
+    }
+
+    /// Is anything actually going to fire the tick on this host?
+    ///
+    /// `nil` = this platform cannot answer from a CLI. On macOS the scheduler
+    /// is a `SMAppService`-registered LaunchAgent whose status only the app
+    /// can read, so `status` says "unknown" rather than assuming; on Linux
+    /// the systemd `--user` timer is fully inspectable and the answer is the
+    /// same one `timer status` exits on — deliberately the same code path,
+    /// so the two commands can never disagree about whether this host is
+    /// scheduled.
+    ///
+    /// This is the one place `status` spawns subprocesses (three short
+    /// `systemctl --user` queries, each bounded by
+    /// `SystemdTimerManager.commandTimeout`). Worth it: a status command that
+    /// cannot see the scheduler reports a machine as healthy for as long as
+    /// its last recorded run stays inside the staleness window, which for a
+    /// quiet set is days.
+    static func scheduler(paths: AppPaths) async -> StatusReport.SchedulerStatus? {
+        #if os(Linux)
+        // No activity lines and no activity problems: this call is only for
+        // the verdict, and `run()` has already loaded the config itself (and
+        // exited non-zero if it could not).
+        let health = await TimerCommand.makeManager().status(
+            helperPath: nil,
+            dataDirectory: paths.root.path,
+            activity: TimerActivity(lines: []),
+            // Bounded: this discards the log entirely, so the narrative
+            // `list-timers` call is pure cost, and a wedged user bus must
+            // not be able to hold a monitoring check for minutes.
+            verdictOnly: true,
+            log: { _ in }
+        )
+        // "No systemd here" is where `status` and `timer status` part ways,
+        // deliberately. `timer status` is asked specifically about the
+        // systemd timer, so no systemd is a definite no and it exits 1.
+        // `status` is asked whether *anything* schedules backups — and the
+        // documented answer for a host without systemd is the cron fallback
+        // (`SystemdCommand.cronFallbackLine`), which nothing here can
+        // inspect. Reporting `false` would make this command permanently red
+        // inside every container, which is the always-red-check failure the
+        // linger `.unknown` case avoids for the same reason.
+        guard !health.problems.contains(.systemdUnavailable) else {
+            return StatusReport.SchedulerStatus(
+                kind: "unknown",
+                healthy: nil,
+                problems: health.problems.map(\.rawValue),
+                summaries: ["no systemd on this host — if you set up the documented cron "
+                    + "fallback, nothing here can see it either way"]
+            )
+        }
+        return StatusReport.SchedulerStatus(
+            kind: "systemd-timer",
+            healthy: health.isHealthy,
+            problems: health.problems.map(\.rawValue),
+            summaries: health.problems.map(\.summary)
+        )
+        #else
+        _ = paths
+        return nil
+        #endif
     }
 }
 
@@ -258,11 +360,56 @@ struct StatusReport: Encodable {
         }
     }
 
+    /// Whether anything is going to fire the tick on this host.
+    ///
+    /// Two different kinds of "don't know", and neither is `false`:
+    /// - the whole object is `null` — this platform has no CLI-readable
+    ///   scheduler at all (macOS, where it is `SMAppService` state);
+    /// - the object is present with `healthy: null` — this host has no
+    ///   systemd, so the documented scheduler is a cron line nothing here
+    ///   can inspect.
+    ///
+    /// Only `healthy: false` is a finding, and only it makes `status` exit 1.
+    struct SchedulerStatus: Encodable {
+        /// `"systemd-timer"`, or `"unknown"` when no scheduler could be
+        /// inspected. Present so a script can tell *which* scheduler
+        /// answered without inferring it from the platform.
+        let kind: String
+        let healthy: Bool?
+        /// `TimerProblem.rawValue`s — stable identifiers to branch on.
+        let problems: [String]
+        /// The same problems as prose, in the same order, for a human
+        /// reading the JSON or an alert body quoting it.
+        let summaries: [String]
+
+        private enum CodingKeys: String, CodingKey {
+            case kind, healthy, problems, summaries
+        }
+
+        // Explicit `null` for `healthy` — see
+        // `EffectiveConfigReport.SetEntry.encode(to:)` for the convention.
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(kind, forKey: .kind)
+            try container.encode(healthy, forKey: .healthy)
+            try container.encode(problems, forKey: .problems)
+            try container.encode(summaries, forKey: .summaries)
+        }
+    }
+
     struct SetStatus: Encodable {
         let id: UUID
         let name: String
         let needsAttention: Bool
         let isRunning: Bool
+        /// Live progress from a run that was killed and never cleaned up.
+        /// Mutually exclusive with `currentRun`: a `current-run` file is
+        /// either one or the other (`RunStore.liveness(ofCurrentRun:)`).
+        let abandonedRun: CurrentRunSummary?
+        /// The file to delete, spelled out — the fix for an abandoned run is
+        /// `rm <this>`, and a message that does not name it makes the reader
+        /// go and derive the path from a UUID.
+        let abandonedRunFile: String?
         let lastBackup: RunSummary?
         let lastCheck: RunSummary?
         let lastPrune: RunSummary?
@@ -272,7 +419,7 @@ struct StatusReport: Encodable {
 
         private enum CodingKeys: String, CodingKey {
             case id, name, needsAttention, isRunning, lastBackup, lastCheck, lastPrune
-            case currentRun, nextDue, destinations
+            case currentRun, nextDue, destinations, abandonedRun, abandonedRunFile
         }
 
         // Explicit `null` for every optional — see
@@ -283,6 +430,8 @@ struct StatusReport: Encodable {
             try container.encode(name, forKey: .name)
             try container.encode(needsAttention, forKey: .needsAttention)
             try container.encode(isRunning, forKey: .isRunning)
+            try container.encode(abandonedRun, forKey: .abandonedRun)
+            try container.encode(abandonedRunFile, forKey: .abandonedRunFile)
             try container.encode(lastBackup, forKey: .lastBackup)
             try container.encode(lastCheck, forKey: .lastCheck)
             try container.encode(lastPrune, forKey: .lastPrune)
@@ -326,8 +475,28 @@ struct StatusReport: Encodable {
     /// the same string the app's menu bar state maps to an SF Symbol from.
     let health: String
     let fullDiskAccessDenied: Bool
+    let scheduler: SchedulerStatus?
     let sets: [SetStatus]
     let excludedHere: [Exclusion]
+
+    private enum CodingKeys: String, CodingKey {
+        case machineId, generatedAt, health, fullDiskAccessDenied, scheduler, sets, excludedHere
+    }
+
+    // Explicit `null` for `scheduler` — see
+    // `EffectiveConfigReport.SetEntry.encode(to:)` for the convention. It
+    // matters more here than most: a missing key and `"healthy": false` are
+    // very different findings.
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(machineId, forKey: .machineId)
+        try container.encode(generatedAt, forKey: .generatedAt)
+        try container.encode(health, forKey: .health)
+        try container.encode(fullDiskAccessDenied, forKey: .fullDiskAccessDenied)
+        try container.encode(scheduler, forKey: .scheduler)
+        try container.encode(sets, forKey: .sets)
+        try container.encode(excludedHere, forKey: .excludedHere)
+    }
 
     // MARK: Human rendering
 
@@ -335,6 +504,26 @@ struct StatusReport: Encodable {
         var lines: [String] = []
         lines.append("machine \"\(machineId)\" — \(health)"
             + (fullDiskAccessDenied ? " (Full Disk Access denied)" : ""))
+        if let scheduler {
+            // `if let` rather than `switch` over the `Bool?`. Swift 6.3
+            // accepts `case true / case false / case nil` as exhaustive;
+            // Swift 6.1 — which the `linux` CI container and the macos-15
+            // runner's Xcode both use — does not, and rejects it outright.
+            // The oldest toolchain this project builds on wins.
+            if let healthy = scheduler.healthy {
+                lines.append(healthy
+                    ? "scheduler (\(scheduler.kind)): scheduled backups will happen"
+                    : "scheduler (\(scheduler.kind)): SCHEDULED BACKUPS WILL NOT HAPPEN")
+            } else {
+                lines.append("scheduler: could not be determined on this host")
+            }
+            for summary in scheduler.summaries {
+                lines.append("  - \(summary)")
+            }
+            if scheduler.healthy == false {
+                lines.append("  detail: restic-station-helper timer status")
+            }
+        }
         lines.append("")
 
         if sets.isEmpty {
@@ -356,6 +545,20 @@ struct StatusReport: Encodable {
                     "    in progress: \(currentRun.kind) — \(currentRun.phase), "
                         + "\(currentRun.percentDone)% (\(currentRun.filesDone)/\(currentRun.totalFiles) files)"
                 )
+            }
+            if let abandoned = set.abandonedRun {
+                lines.append(
+                    "    ABANDONED:   \(abandoned.kind) run \(abandoned.runId) was killed "
+                        + "(stopped at \(abandoned.phase), \(abandoned.percentDone)%)"
+                )
+                if let file = set.abandonedRunFile {
+                    // Quoted: a data directory may contain spaces, and this
+                    // is printed as a command for someone to paste. An
+                    // unquoted path with a `;` in it would run whatever
+                    // followed (`@codex review` on #51).
+                    lines.append("                 the next tick clears it; to clear it now: "
+                        + "rm \(ShellQuoting.quoteIfNeeded(file))")
+                }
             }
             for destination in set.destinations {
                 let role = destination.isPrimary ? "primary" : "secondary"
