@@ -854,15 +854,20 @@ JSON
 }
 JSON
 
-    # Precondition: this really is the alarm state, not an already-clean host.
-    local rc
+    # Asserted on the abandoned-run field rather than on status's exit code,
+    # deliberately. This environment has no installed timer, so `status`
+    # exits 1 here for scheduler reasons whether or not any wreckage exists —
+    # an exit-code assertion would have passed before the tick for the wrong
+    # reason and been unreachable after it. The field isolates the one thing
+    # this step is about.
+    local out rc abandoned
     set +e
-    "$HELPER" status --json >/dev/null 2>&1
-    rc=$?
+    out="$("$HELPER" status --json 2>&1)"
     set -e
-    [[ $rc -eq 1 ]] || fail "$step" "expected status to exit 1 before the tick, got $rc"
+    abandoned="$(printf '%s' "$out" | jq -r --arg id "$SET_ID" '.sets[] | select(.id == $id) | .abandonedRun.runId')"
+    [[ "$abandoned" == "$run_id" ]] \
+        || fail "$step" "precondition: expected the abandoned run to be named before the tick, got '$abandoned'"
 
-    local out
     set +e
     out="$("$HELPER" tick 2>&1)"
     rc=$?
@@ -873,12 +878,13 @@ JSON
 
     set +e
     out="$("$HELPER" status --json 2>&1)"
-    rc=$?
     set -e
-    [[ $rc -eq 0 ]] || fail "$step" "expected status to exit 0 after the tick cleared the wreckage, got $rc: $out"
+    abandoned="$(printf '%s' "$out" | jq -r --arg id "$SET_ID" '.sets[] | select(.id == $id) | .abandonedRun')"
+    [[ "$abandoned" == "null" ]] \
+        || fail "$step" "expected no abandoned run after the tick, got '$abandoned': $out"
 
     rm -rf "$run_dir"
-    log "$step OK (cleared, and status returns to exit 0)"
+    log "$step OK (cleared, and status stops reporting an abandoned run)"
 }
 
 assert_unreadable_run_index_fails_loudly() {
