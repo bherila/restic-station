@@ -10,7 +10,8 @@
 #
 # What it proves:
 #   1. `secret set` reads the password from a PIPE, never from argv.
-#   2. `secrets.json` is 0600 and its directory 0700.
+#   2. After config import creates state first, `secret set` tightens the
+#      existing directory from 0755 to 0700 and creates `secrets.json` 0600.
 #   3. `print-password` returns the EXACT bytes, with no trailing newline
 #      (asserted byte-for-byte with `od`, not by string comparison).
 #   4. `secret list` output contains no secret value.
@@ -59,12 +60,11 @@ DATA_DIR="$WORK/data"
 SOURCE_DIR="$WORK/source"
 REPO="$WORK/repo"
 mkdir -p "$DATA_DIR" "$SOURCE_DIR"
-# The data directory has to exist before this script can write config.json
-# into it, so the "created at 0700" half of the contract is asserted by the
-# FileSecretStore unit tests (which start from nothing). What this script
-# asserts is the other half, which those cannot: that a real helper process
-# never *widens* the directory it finds.
-chmod 700 "$DATA_DIR"
+# Reproduce the ordering behind issue #49: config import reaches the data
+# directory first, while it is still at the process-default 0755 mode, and
+# only then does `secret set` prepare it to hold secrets. The unit test pins
+# the same ordering; this is the real-helper coverage that used to be absent.
+chmod 755 "$DATA_DIR"
 echo "hello" > "$SOURCE_DIR/a.txt"
 
 export RESTIC_STATION_DATA_DIR="$DATA_DIR"
@@ -72,7 +72,8 @@ export RESTIC_STATION_SECRET_BACKEND=file
 
 RESTIC_BIN="$(command -v restic || true)"
 
-cat > "$DATA_DIR/config.json" <<EOF
+IMPORT_CONFIG="$WORK/import-config.json"
+cat > "$IMPORT_CONFIG" <<EOF
 {
   "version": 1,
   "resticPath": "${RESTIC_BIN:-/usr/bin/false}",
@@ -101,6 +102,8 @@ cat > "$DATA_DIR/config.json" <<EOF
 }
 EOF
 
+"$HELPER" config import "$IMPORT_CONFIG" >/dev/null
+
 SECRETS_FILE="$DATA_DIR/secrets.json"
 
 # Portable `stat` for the permission bits.
@@ -111,6 +114,9 @@ mode_of() {
         stat -c '%a' "$1"
     fi
 }
+
+[[ "$(mode_of "$DATA_DIR")" == "755" ]] \
+    || fail "config import did not leave the pre-existing data dir at mode 755"
 
 # ─────────────────────────────────────────────────────────────────────────
 log "1. secret set reads the password from a pipe (never argv)"

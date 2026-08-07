@@ -29,7 +29,9 @@ import Musl
 ///
 /// **Permissions.** The file is created `0600`. A fresh containing directory
 /// is created `0700` via `mkdir(2)`; an existing one is tightened to `0700`
-/// before the secrets file is written. The secret file is never
+/// before the secrets file is written. If the filesystem cannot enforce that
+/// mode, a group/world-writable result is refused while a readable-only result
+/// warns about metadata exposure and continues. The secret file is never
 /// create-then-`chmod`, which would leave a window in which it is
 /// world-readable. Every read re-verifies the file mode and refuses to read
 /// a group- or world-accessible file (see ``load()``).
@@ -60,6 +62,8 @@ public struct FileSecretStore: SecretStore {
 
     private let paths: AppPaths
     private let helperPath: String
+    private let directoryModeSetter: @Sendable (String, mode_t) -> Void
+    private let warningHandler: @Sendable (String) -> Void
 
     /// - Parameters:
     ///   - paths: supplies `root` (the secrets file's directory) and
@@ -77,8 +81,28 @@ public struct FileSecretStore: SecretStore {
     ///     `CommandLine.arguments[0]`, which is whatever the caller chose to
     ///     put in `argv[0]` and is trivially spoofable.
     public init(paths: AppPaths, helperPath: String) {
+        self.init(
+            paths: paths,
+            helperPath: helperPath,
+            directoryModeSetter: { path, mode in
+                _ = path.withCString { chmod($0, mode) }
+            },
+            warningHandler: { message in
+                FileHandle.standardError.write(Data((message + "\n").utf8))
+            }
+        )
+    }
+
+    init(
+        paths: AppPaths,
+        helperPath: String,
+        directoryModeSetter: @escaping @Sendable (String, mode_t) -> Void,
+        warningHandler: @escaping @Sendable (String) -> Void
+    ) {
         self.paths = paths
         self.helperPath = helperPath
+        self.directoryModeSetter = directoryModeSetter
+        self.warningHandler = warningHandler
     }
 
     // MARK: - Paths
@@ -446,11 +470,18 @@ public struct FileSecretStore: SecretStore {
 
     // MARK: - Directories
 
-    /// Creates or tightens `root` to `0700`, and creates `locks/` if missing.
+    /// Creates or attempts to tighten `root` to `0700`, then creates `locks/`.
     ///
     /// A fresh `root` is created with `mkdir(2)`'s mode argument, so there is
     /// no interval where a newly created secrets directory has a looser mode.
-    /// An existing `root` is tightened before any secret is written.
+    /// An existing `root` is tightened before any secret is written. The
+    /// resulting mode, not `chmod(2)`'s return value, decides what happens —
+    /// some network and non-POSIX filesystems report success without changing
+    /// it. Group/world-write access is fatal because another user could
+    /// unlink or rename the `0600` file and substitute one whose mode still
+    /// passes the read-time check. Group/world-read access without write
+    /// access exposes only destination IDs and file metadata, so it emits a
+    /// warning to stderr but does not prevent storing the protected file.
     func prepareDirectories() throws {
         try createDirectory(at: paths.root, mode: 0o700)
         // Lock files hold nothing; the default mode is fine.
@@ -486,9 +517,30 @@ public struct FileSecretStore: SecretStore {
     }
 
     private func setMode(_ mode: mode_t, on url: URL) throws {
-        guard url.path.withCString({ chmod($0, mode) }) == 0 else {
+        let path = url.path
+        directoryModeSetter(path, mode)
+
+        var info = stat()
+        guard path.withCString({ stat($0, &info) }) == 0 else {
             throw SecretStoreError.backendFailed(
-                "could not set permissions on \(url.path): \(Self.describe(errno: errno))"
+                "could not inspect permissions on \(path): \(Self.describe(errno: errno))"
+            )
+        }
+        let permissions = UInt32(info.st_mode) & 0o777
+        guard permissions & 0o022 == 0 else {
+            throw SecretStoreError.backendFailed(
+                "refusing to store secrets in \(path): the directory is group- or world-writable "
+                    + "(mode \(Self.octal(permissions))). Another user could replace secrets.json "
+                    + "even though the file is mode 0600. Fix it with: chmod 700 \(path)"
+            )
+        }
+        if permissions & 0o044 != 0 {
+            warningHandler(
+                "warning: \(path) remains group- or world-readable "
+                    + "(mode \(Self.octal(permissions))) after attempting chmod 700. "
+                    + "secrets.json is still created mode 0600, but other users can see which "
+                    + "destinations have secrets and the file's size and mtime. "
+                    + "Fix the directory with: chmod 700 \(path)"
             )
         }
     }

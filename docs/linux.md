@@ -381,17 +381,17 @@ under the state directory (`$XDG_STATE_HOME/restic-station`, default
 **`secrets.json` itself is created `0600`**, via `open(2)`'s `O_EXCL|O_CREAT` (never
 create-then-`chmod`, so the mode is never briefly wider), and **every read re-verifies that mode
 and refuses a wider one** (see [Troubleshooting](#troubleshooting)) — that is real, enforced
-protection. The containing *directory* is created `0700` only when `FileSecretStore` is what
-creates it (`Core/Sources/ResticStationCore/Secrets/FileSecretStore.swift`,
-`prepareDirectories()`); in the flow this document follows, `config import` runs first and its
-`AppPaths.ensureDirectories()` has already created the state directory at the default `0755`
-(it holds non-secret state too) before any secret is ever stored — so the directory really is
-`0755` here, matching what the transcript below (`stat -c '%a %n' secrets.json .`) actually
-reports, not `0700`. The file mode is what protects the secret; the directory mode is defence in
-depth for whichever process gets to create the directory first — tracked as
-[issue #49](https://github.com/bherila/restic-station/issues/49). This is a narrower guarantee
-than the macOS Keychain's (no encryption at rest, no ACL) and that is stated rather than papered
-over — see
+protection. Fresh state directories are created `0700`, including by
+`AppPaths.ensureDirectories()`; before any secret is written, `FileSecretStore.prepareDirectories()`
+also attempts to tighten an existing directory to `0700` ([issue
+#49](https://github.com/bherila/restic-station/issues/49)). The resulting mode is checked rather
+than trusting `chmod(2)`'s return value: a group/world-*writable* directory is refused because
+another user could replace `secrets.json` despite its `0600` mode, while a group/world-readable
+but non-writable directory emits a warning and continues because the exposure is metadata only —
+which destination IDs have secrets, plus the file's size and mtime. The `0600` file mode is still
+what protects the secret contents; the directory mode is defence in depth. This remains a
+narrower guarantee than the macOS Keychain's (no encryption at rest, no ACL) and that is stated
+rather than papered over — see
 `docs/keychain-and-fda.md` §5 for the full threat model, including what is explicitly out of
 scope (root, the invoking user, an unencrypted disk). A plain file, not a keyring, is deliberate:
 the target hosts are headless, with no desktop session, D-Bus user bus, or keyring daemon for a
@@ -426,7 +426,7 @@ f1000000-0000-4000-8000-000000000003  "Offsite Mirror" (set "Projects")  passwor
 
 $ stat -c '%a %n' secrets.json .
 600 secrets.json
-755 .
+700 .
 ```
 
 `secret list` prints which destinations have secrets, never what they are — its renderer is

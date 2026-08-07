@@ -10,6 +10,23 @@ import Glibc
 import Musl
 #endif
 
+private final class WarningRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recorded: [String] = []
+
+    func record(_ message: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        recorded.append(message)
+    }
+
+    var messages: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return recorded
+    }
+}
+
 /// `FileSecretStore` specifics: permissions, atomicity, locking, and the
 /// `RESTIC_PASSWORD_COMMAND` string.
 ///
@@ -65,6 +82,64 @@ struct FileSecretStoreTests {
 
         #expect(try Self.permissions(of: root) == 0o700)
         #expect(try Self.permissions(of: store.fileURL) == 0o600)
+    }
+
+    @Test("a directory that remains group-writable is refused before storing a secret")
+    func refusesDirectoryThatRemainsWritable() async throws {
+        let (_, root) = Self.makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try #require(root.path.withCString { chmod($0, 0o770) } == 0)
+        let warnings = WarningRecorder()
+        let store = FileSecretStore(
+            paths: AppPaths(root: root),
+            helperPath: "/opt/restic-station/restic-station-helper",
+            directoryModeSetter: { _, _ in },
+            warningHandler: { warnings.record($0) }
+        )
+
+        do {
+            try await store.setPassword("hunter2", destId: Self.destId)
+            Issue.record("expected a group-writable secrets directory to be refused")
+        } catch let error as SecretStoreError {
+            guard case .backendFailed(let message) = error else {
+                Issue.record("expected .backendFailed, got \(error)")
+                return
+            }
+            #expect(message.contains(root.path))
+            #expect(message.contains("group- or world-writable"))
+            #expect(message.contains("0770"))
+            #expect(message.contains("replace secrets.json"))
+        }
+        #expect(!FileManager.default.fileExists(atPath: store.fileURL.path))
+        #expect(warnings.messages.isEmpty)
+    }
+
+    @Test("a readable-only directory warns but still stores a 0600 secret")
+    func warnsForDirectoryThatRemainsReadable() async throws {
+        let (_, root) = Self.makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try #require(root.path.withCString { chmod($0, 0o755) } == 0)
+        let warnings = WarningRecorder()
+        let store = FileSecretStore(
+            paths: AppPaths(root: root),
+            helperPath: "/opt/restic-station/restic-station-helper",
+            directoryModeSetter: { _, _ in },
+            warningHandler: { warnings.record($0) }
+        )
+
+        try await store.setPassword("hunter2", destId: Self.destId)
+
+        #expect(try Self.permissions(of: root) == 0o755)
+        #expect(try Self.permissions(of: store.fileURL) == 0o600)
+        #expect(try await store.password(destId: Self.destId) == "hunter2")
+        let messages = warnings.messages
+        #expect(!messages.isEmpty)
+        #expect(messages.allSatisfy { $0.contains(root.path) })
+        #expect(messages.allSatisfy { $0.contains("group- or world-readable") })
+        #expect(messages.allSatisfy { $0.contains("0755") })
+        #expect(messages.allSatisfy { $0.contains("chmod 700") })
     }
 
     @Test("the temp file a write goes through is itself created 0600")
