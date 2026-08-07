@@ -306,7 +306,9 @@ public enum SystemdCommand {
     /// the whole command to `/bin/sh`, where `VAR=value cmd` is ordinary
     /// one-command-scoped assignment. A crontab-level `VAR=value` line would
     /// also work but applies to every job in the file, which is not ours to
-    /// change.
+    /// change. Percent signs do not require that global escape hatch:
+    /// ``cronEscaped(_:)`` encodes the complete command field before cron
+    /// passes it to the shell.
     public static func cronFallbackLine(
         helperPath: String,
         intervalMinutes: Int = defaultIntervalMinutes,
@@ -356,14 +358,24 @@ public enum SystemdCommand {
         ShellQuoting.quoteIfNeeded(value)
     }
 
-    /// `crontab(5)`: an unescaped `%` in the command field is replaced by a
-    /// newline and everything after the first one is fed to the job on stdin.
-    /// A `%` anywhere in a path would therefore truncate the command and
-    /// schedule something that is not what it looks like — silently, since
-    /// the truncated prefix is still a valid-ish command line. cron itself
-    /// strips the backslash, so `sh` sees a plain `%`.
+    /// Encodes a shell command for Vixie cron's command-field scanner.
+    ///
+    /// The scanner in Vixie cron 3.0pl1's `do_command.c` turns `\\` into `\`,
+    /// turns `\%` into `%`, and splits the command at an unescaped `%`. Both
+    /// characters therefore need encoding: double every literal backslash
+    /// and prefix every literal percent with a backslash. Encoding only `%`
+    /// is insufficient when the shell-quoted command already has a backslash
+    /// immediately before it: the resulting `\\%` is decoded as one literal
+    /// backslash followed by an unescaped delimiter.
     static func cronEscaped(_ command: String) -> String {
-        command.replacingOccurrences(of: "%", with: "\\%")
+        var escaped = ""
+        for character in command {
+            if character == "\\" || character == "%" {
+                escaped.append("\\")
+            }
+            escaped.append(character)
+        }
+        return escaped
     }
 }
 
