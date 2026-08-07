@@ -289,21 +289,44 @@ import Testing
             dataDirectory: "/srv/it's"
         )
         #expect(quoted.contains("'/opt/restic station/helper' tick"))
-        // The `'\''` dance: close, escaped literal quote, reopen.
-        #expect(quoted.contains("'/srv/it'\\''s'"))
+        // The `'\''` shell-quoting dance, with its backslash doubled for
+        // cron so the shell still receives exactly one.
+        #expect(quoted.contains(#"'/srv/it'\\''s'"#))
     }
 
-    @Test("a % in the command is escaped — crontab(5) turns a bare one into a newline")
-    func cronFallbackEscapesPercent() {
-        // An unescaped `%` truncates the command field and feeds the rest to
-        // the job on stdin, so the crontab would silently schedule a
-        // *different, shorter* command than the one printed.
-        let line = SystemdCommand.cronFallbackLine(
+    @Test("Vixie cron encoding preserves backslash runs and protects every percent")
+    func cronFallbackEncodesCommandField() {
+        // Vixie cron's do_command.c scanner decodes `\\` to `\`, `\%` to
+        // `%`, and splits at an unescaped `%`. The encoded command therefore
+        // needs 2n+1 backslashes before a percent that follows n literal
+        // backslashes. These exact strings cover n = 0, 1, and 2.
+        #expect(SystemdCommand.cronFallbackLine(
             helperPath: "/usr/bin/h",
             dataDirectory: "/srv/100%full"
-        )
-        #expect(line.contains("100\\%full"))
-        #expect(!line.contains("100%full"))
+        ) == #"*/2 * * * * RESTIC_STATION_DATA_DIR='/srv/100\%full' /usr/bin/h tick"#)
+
+        #expect(SystemdCommand.cronFallbackLine(
+            helperPath: "/usr/bin/h",
+            dataDirectory: #"/srv/a\%b"#
+        ) == #"*/2 * * * * RESTIC_STATION_DATA_DIR='/srv/a\\\%b' /usr/bin/h tick"#)
+
+        #expect(SystemdCommand.cronFallbackLine(
+            helperPath: "/usr/bin/h",
+            dataDirectory: #"/srv/a\\%b"#
+        ) == #"*/2 * * * * RESTIC_STATION_DATA_DIR='/srv/a\\\\\%b' /usr/bin/h tick"#)
+
+        // The encoding applies to the complete command field, not just the
+        // data-directory assignment. There is no command-field position in
+        // which a literal percent should remain unescaped.
+        #expect(SystemdCommand.cronFallbackLine(
+            helperPath: "/opt/100%/helper",
+            dataDirectory: "/srv/plain"
+        ) == #"*/2 * * * * RESTIC_STATION_DATA_DIR=/srv/plain '/opt/100\%/helper' tick"#)
+
+        // Backslashes are decoded by the same scanner even when no percent
+        // follows, so they must be doubled everywhere to reach /bin/sh
+        // unchanged.
+        #expect(SystemdCommand.cronEscaped(#"/srv/a\\b"#) == #"/srv/a\\\\b"#)
     }
 }
 
