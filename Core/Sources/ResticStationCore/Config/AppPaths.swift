@@ -205,10 +205,16 @@ public struct AppPaths: Equatable, Sendable {
 
     // MARK: - Directory creation
 
-    /// Creates `root`, `runs/`, `state/`, and `locks/` if missing. Idempotent.
+    /// Creates `root`, `runs/`, `state/`, and `locks/` if missing. A fresh
+    /// `root` is owner-only because it may later contain secrets. Idempotent.
     public func ensureDirectories() throws {
         let fileManager = FileManager.default
-        for directory in [root, runsDir, stateDir, locksDir] {
+        try fileManager.createDirectory(
+            at: root,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        for directory in [runsDir, stateDir, locksDir] {
             try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
         }
     }

@@ -51,6 +51,22 @@ struct FileSecretStoreTests {
         #expect(try Self.permissions(of: root) == 0o700)
     }
 
+    @Test("an existing data directory is tightened after ensureDirectories then secret set")
+    func tightensDataDirectoryCreatedBeforeSecretSet() async throws {
+        let (store, root) = Self.makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = AppPaths(root: root)
+
+        try paths.ensureDirectories()
+        try #require(root.path.withCString { chmod($0, 0o755) } == 0)
+        #expect(try Self.permissions(of: root) == 0o755)
+
+        try await store.setPassword("hunter2", destId: Self.destId)
+
+        #expect(try Self.permissions(of: root) == 0o700)
+        #expect(try Self.permissions(of: store.fileURL) == 0o600)
+    }
+
     @Test("the temp file a write goes through is itself created 0600")
     func tempFileIsAlsoTight() async throws {
         let (store, root) = Self.makeStore()

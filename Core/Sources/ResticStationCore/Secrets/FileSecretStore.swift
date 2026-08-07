@@ -27,11 +27,12 @@ import Musl
 /// `RESTIC_PASSWORD_COMMAND=<helper> print-password --dest <uuid>`, i.e. over
 /// the child's stdout, never its command line.
 ///
-/// **Permissions.** The file is created `0600` and the containing directory
-/// `0700`, both at creation time via `open(2)`/`mkdir(2)` modes — never
-/// create-then-`chmod`, which would leave a window in which the file is
-/// world-readable. Every read re-verifies the mode and refuses to read a
-/// group- or world-accessible file (see ``load()``).
+/// **Permissions.** The file is created `0600`. A fresh containing directory
+/// is created `0700` via `mkdir(2)`; an existing one is tightened to `0700`
+/// before the secrets file is written. The secret file is never
+/// create-then-`chmod`, which would leave a window in which it is
+/// world-readable. Every read re-verifies the file mode and refuses to read
+/// a group- or world-accessible file (see ``load()``).
 ///
 /// **Atomicity.** Writes go to a fixed-name temp file in the same directory,
 /// created `O_EXCL` at `0600`, `fsync`ed, then `rename(2)`d over the real
@@ -445,14 +446,11 @@ public struct FileSecretStore: SecretStore {
 
     // MARK: - Directories
 
-    /// Creates `root` at `0700` and `locks/` if they are missing.
+    /// Creates or tightens `root` to `0700`, and creates `locks/` if missing.
     ///
-    /// `root` is created with `mkdir(2)`'s mode argument, never
-    /// create-then-`chmod`. An *existing* `root` is left alone: it may have
-    /// been created at `0755` by `AppPaths.ensureDirectories()` (it holds
-    /// non-secret state too), and the `0600` file mode — enforced on every
-    /// read — is what actually protects the secrets. The `0700` directory is
-    /// defence in depth for the case where we get there first.
+    /// A fresh `root` is created with `mkdir(2)`'s mode argument, so there is
+    /// no interval where a newly created secrets directory has a looser mode.
+    /// An existing `root` is tightened before any secret is written.
     func prepareDirectories() throws {
         try createDirectory(at: paths.root, mode: 0o700)
         // Lock files hold nothing; the default mode is fine.
@@ -462,6 +460,7 @@ public struct FileSecretStore: SecretStore {
     private func createDirectory(at url: URL, mode: mode_t) throws {
         var info = stat()
         if url.path.withCString({ stat($0, &info) }) == 0 {
+            try setMode(mode, on: url)
             return
         }
         let parent = url.deletingLastPathComponent()
@@ -472,12 +471,24 @@ public struct FileSecretStore: SecretStore {
         if created == 0 {
             // Same reasoning as the file's fchmod: the directory was created
             // at `mode`, so this only pins it there against the umask.
-            _ = url.path.withCString { chmod($0, mode) }
+            try setMode(mode, on: url)
             return
         }
-        if errno != EEXIST {
+        if errno == EEXIST {
+            // Another process created it after the stat above. It will hold
+            // this process's secrets too, so enforce the same mode.
+            try setMode(mode, on: url)
+        } else {
             throw SecretStoreError.backendFailed(
                 "could not create \(url.path): \(Self.describe(errno: errno))"
+            )
+        }
+    }
+
+    private func setMode(_ mode: mode_t, on url: URL) throws {
+        guard url.path.withCString({ chmod($0, mode) }) == 0 else {
+            throw SecretStoreError.backendFailed(
+                "could not set permissions on \(url.path): \(Self.describe(errno: errno))"
             )
         }
     }

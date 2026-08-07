@@ -305,6 +305,9 @@ struct AppPathsEnvTests {
             let values = try directory.resourceValues(forKeys: [.isDirectoryKey])
             #expect(values.isDirectory == true)
         }
+        var info = stat()
+        try #require(root.path.withCString { stat($0, &info) } == 0)
+        #expect(UInt32(info.st_mode) & 0o777 == 0o700)
     }
 
     @Test func ensureDirectoriesIsIdempotent() throws {
