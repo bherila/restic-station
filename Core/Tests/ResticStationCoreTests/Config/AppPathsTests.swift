@@ -320,4 +320,35 @@ struct AppPathsEnvTests {
         let values = try paths.stateDir.resourceValues(forKeys: [.isDirectoryKey])
         #expect(values.isDirectory == true)
     }
+
+    @Test func ensureDirectoriesDoesNotApplyRootModeToMissingAncestors() throws {
+        let fileManager = FileManager.default
+        let base = fileManager.temporaryDirectory
+            .appendingPathComponent("restic-station-ancestor-test-\(UUID().uuidString)", isDirectory: true)
+        defer { try? fileManager.removeItem(at: base) }
+        try fileManager.createDirectory(at: base, withIntermediateDirectories: true)
+
+        // Record this process's ordinary directory-creation mode so the test
+        // remains correct under both permissive and owner-only umasks.
+        let probe = base.appendingPathComponent("default-mode-probe", isDirectory: true)
+        try fileManager.createDirectory(at: probe, withIntermediateDirectories: true)
+        var probeInfo = stat()
+        try #require(probe.path.withCString { stat($0, &probeInfo) } == 0)
+        let defaultMode = UInt32(probeInfo.st_mode) & 0o777
+        try fileManager.removeItem(at: probe)
+
+        let firstAncestor = base.appendingPathComponent("shared", isDirectory: true)
+        let secondAncestor = firstAncestor.appendingPathComponent("state", isDirectory: true)
+        let root = secondAncestor.appendingPathComponent("restic-station", isDirectory: true)
+        try AppPaths(root: root).ensureDirectories()
+
+        for ancestor in [firstAncestor, secondAncestor] {
+            var info = stat()
+            try #require(ancestor.path.withCString { stat($0, &info) } == 0)
+            #expect(UInt32(info.st_mode) & 0o777 == defaultMode)
+        }
+        var rootInfo = stat()
+        try #require(root.path.withCString { stat($0, &rootInfo) } == 0)
+        #expect(UInt32(rootInfo.st_mode) & 0o777 == 0o700)
+    }
 }

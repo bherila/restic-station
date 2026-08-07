@@ -54,6 +54,13 @@ struct FileSecretStoreTests {
         return UInt32(info.st_mode) & 0o777
     }
 
+    static func modeBits(of url: URL) throws -> UInt32 {
+        var info = stat()
+        let ok = url.path.withCString { stat($0, &info) }
+        try #require(ok == 0, "stat failed for \(url.path)")
+        return UInt32(info.st_mode) & 0o7777
+    }
+
     // MARK: - Permissions at creation
 
     @Test("the secrets file is created 0600 and its directory 0700, at creation time")
@@ -107,7 +114,7 @@ struct FileSecretStoreTests {
                 return
             }
             #expect(message.contains(root.path))
-            #expect(message.contains("group- or world-writable"))
+            #expect(message.contains("write-and-search"))
             #expect(message.contains("0770"))
             #expect(message.contains("replace secrets.json"))
         }
@@ -115,7 +122,53 @@ struct FileSecretStoreTests {
         #expect(warnings.messages.isEmpty)
     }
 
-    @Test("a readable-only directory warns but still stores a 0600 secret")
+    @Test("a sticky writable directory is accepted because other users cannot replace entries")
+    func acceptsStickyWritableDirectory() async throws {
+        let (_, root) = Self.makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try #require(root.path.withCString { chmod($0, 0o1777) } == 0)
+        let warnings = WarningRecorder()
+        let store = FileSecretStore(
+            paths: AppPaths(root: root),
+            helperPath: "/opt/restic-station/restic-station-helper",
+            directoryModeSetter: { _, _ in },
+            warningHandler: { warnings.record($0) }
+        )
+
+        try await store.setPassword("hunter2", destId: Self.destId)
+
+        #expect(try Self.modeBits(of: root) == 0o1777)
+        #expect(try Self.permissions(of: store.fileURL) == 0o600)
+        #expect(try await store.password(destId: Self.destId) == "hunter2")
+        #expect(warnings.messages.count == 1)
+    }
+
+    @Test("write without search permission cannot replace entries and is not refused")
+    func acceptsWriteWithoutSearchPermission() async throws {
+        let modes: [mode_t] = [0o720, 0o702]
+        for mode in modes {
+            let (_, root) = Self.makeStore()
+            defer { try? FileManager.default.removeItem(at: root) }
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            try #require(root.path.withCString { chmod($0, mode) } == 0)
+            let warnings = WarningRecorder()
+            let store = FileSecretStore(
+                paths: AppPaths(root: root),
+                helperPath: "/opt/restic-station/restic-station-helper",
+                directoryModeSetter: { _, _ in },
+                warningHandler: { warnings.record($0) }
+            )
+
+            try await store.setPassword("hunter2", destId: Self.destId)
+
+            #expect(try Self.permissions(of: root) == UInt32(mode))
+            #expect(try Self.permissions(of: store.fileURL) == 0o600)
+            #expect(warnings.messages.isEmpty)
+        }
+    }
+
+    @Test("a readable/searchable directory warns once but still stores a 0600 secret")
     func warnsForDirectoryThatRemainsReadable() async throws {
         let (_, root) = Self.makeStore()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -135,11 +188,84 @@ struct FileSecretStoreTests {
         #expect(try Self.permissions(of: store.fileURL) == 0o600)
         #expect(try await store.password(destId: Self.destId) == "hunter2")
         let messages = warnings.messages
-        #expect(!messages.isEmpty)
-        #expect(messages.allSatisfy { $0.contains(root.path) })
-        #expect(messages.allSatisfy { $0.contains("group- or world-readable") })
-        #expect(messages.allSatisfy { $0.contains("0755") })
-        #expect(messages.allSatisfy { $0.contains("chmod 700") })
+        try #require(messages.count == 1)
+        #expect(messages[0].contains(root.path))
+        #expect(messages[0].contains("group or other users"))
+        #expect(messages[0].contains("0755"))
+        #expect(messages[0].contains("chmod 700"))
+    }
+
+    @Test("search-only access warns once because fixed-path metadata is visible")
+    func warnsOnceForSearchOnlyDirectory() async throws {
+        let (_, root) = Self.makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try #require(root.path.withCString { chmod($0, 0o711) } == 0)
+        let warnings = WarningRecorder()
+        let store = FileSecretStore(
+            paths: AppPaths(root: root),
+            helperPath: "/opt/restic-station/restic-station-helper",
+            directoryModeSetter: { _, _ in },
+            warningHandler: { warnings.record($0) }
+        )
+
+        try await store.setPassword("hunter2", destId: Self.destId)
+
+        #expect(try Self.permissions(of: store.fileURL) == 0o600)
+        let messages = warnings.messages
+        try #require(messages.count == 1)
+        #expect(messages[0].contains("0711"))
+        #expect(messages[0].contains("metadata"))
+        #expect(!messages[0].contains("destination"))
+    }
+
+    @Test("a writable non-sticky immediate parent is refused")
+    func refusesWritableImmediateParent() async throws {
+        let base = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-parent-\(UUID().uuidString)", isDirectory: true)
+        let root = base.appendingPathComponent("data", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try #require(base.path.withCString { chmod($0, 0o770) } == 0)
+        try #require(root.path.withCString { chmod($0, 0o700) } == 0)
+        let store = FileSecretStore(
+            paths: AppPaths(root: root),
+            helperPath: "/opt/restic-station/restic-station-helper"
+        )
+
+        do {
+            try await store.setPassword("hunter2", destId: Self.destId)
+            Issue.record("expected a writable non-sticky parent to be refused")
+        } catch let error as SecretStoreError {
+            guard case .backendFailed(let message) = error else {
+                Issue.record("expected .backendFailed, got \(error)")
+                return
+            }
+            #expect(message.contains(base.path))
+            #expect(message.contains("parent directory"))
+            #expect(message.contains("0770"))
+            #expect(message.contains("rename or replace"))
+        }
+        #expect(!FileManager.default.fileExists(atPath: store.fileURL.path))
+    }
+
+    @Test("a sticky writable immediate parent protects the data directory entry")
+    func acceptsStickyWritableImmediateParent() async throws {
+        let base = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-parent-\(UUID().uuidString)", isDirectory: true)
+        let root = base.appendingPathComponent("data", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try #require(base.path.withCString { chmod($0, 0o1777) } == 0)
+        try #require(root.path.withCString { chmod($0, 0o700) } == 0)
+        let store = FileSecretStore(
+            paths: AppPaths(root: root),
+            helperPath: "/opt/restic-station/restic-station-helper"
+        )
+
+        try await store.setPassword("hunter2", destId: Self.destId)
+
+        #expect(try Self.permissions(of: store.fileURL) == 0o600)
     }
 
     @Test("the temp file a write goes through is itself created 0600")

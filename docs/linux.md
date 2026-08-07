@@ -385,10 +385,13 @@ protection. Fresh state directories are created `0700`, including by
 `AppPaths.ensureDirectories()`; before any secret is written, `FileSecretStore.prepareDirectories()`
 also attempts to tighten an existing directory to `0700` ([issue
 #49](https://github.com/bherila/restic-station/issues/49)). The resulting mode is checked rather
-than trusting `chmod(2)`'s return value: a group/world-*writable* directory is refused because
-another user could replace `secrets.json` despite its `0600` mode, while a group/world-readable
-but non-writable directory emits a warning and continues because the exposure is metadata only —
-which destination IDs have secrets, plus the file's size and mtime. The `0600` file mode is still
+than trusting `chmod(2)`'s return value. Group/world write *and search* access is refused when it
+would let another user replace `secrets.json` despite its `0600` mode; sticky directories are
+accepted when their ownership protects the entry, as it does under `/tmp`. Group/world read or
+search access emits one warning per mutation and continues because the exposure is directory
+entries and/or file metadata, not the secret contents. The same replacement check covers the
+state directory's immediate parent so another writer cannot rename the whole directory aside; it
+does not claim to audit every higher ancestor or filesystem ACL. The `0600` file mode is still
 what protects the secret contents; the directory mode is defence in depth. This remains a
 narrower guarantee than the macOS Keychain's (no encryption at rest, no ACL) and that is stated
 rather than papered over — see
