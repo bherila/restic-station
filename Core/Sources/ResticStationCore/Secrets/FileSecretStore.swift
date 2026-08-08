@@ -27,10 +27,15 @@ import Musl
 /// `RESTIC_PASSWORD_COMMAND=<helper> print-password --dest <uuid>`, i.e. over
 /// the child's stdout, never its command line.
 ///
-/// **Permissions.** The file is created `0600` and the containing directory
-/// `0700`, both at creation time via `open(2)`/`mkdir(2)` modes — never
-/// create-then-`chmod`, which would leave a window in which the file is
-/// world-readable. Every read re-verifies the mode and refuses to read a
+/// **Permissions.** The file is created `0600`. A fresh containing directory
+/// is created `0700` via `mkdir(2)`; an existing one is tightened to `0700`
+/// before the secrets file is written. If the filesystem cannot enforce that
+/// mode, unprotected group/world write-and-search access is refused, while
+/// group/world read or search access warns about metadata exposure and
+/// continues. A sticky directory owned by this user (or root) protects its
+/// entries from other writers and is therefore not refused. The secret file
+/// is never create-then-`chmod`, which would leave a window in which it is
+/// world-readable. Every read re-verifies the file mode and refuses to read a
 /// group- or world-accessible file (see ``load()``).
 ///
 /// **Atomicity.** Writes go to a fixed-name temp file in the same directory,
@@ -59,6 +64,8 @@ public struct FileSecretStore: SecretStore {
 
     private let paths: AppPaths
     private let helperPath: String
+    private let directoryModeSetter: @Sendable (String, mode_t) -> Void
+    private let warningHandler: @Sendable (String) -> Void
 
     /// - Parameters:
     ///   - paths: supplies `root` (the secrets file's directory) and
@@ -76,8 +83,28 @@ public struct FileSecretStore: SecretStore {
     ///     `CommandLine.arguments[0]`, which is whatever the caller chose to
     ///     put in `argv[0]` and is trivially spoofable.
     public init(paths: AppPaths, helperPath: String) {
+        self.init(
+            paths: paths,
+            helperPath: helperPath,
+            directoryModeSetter: { path, mode in
+                _ = path.withCString { chmod($0, mode) }
+            },
+            warningHandler: { message in
+                FileHandle.standardError.write(Data((message + "\n").utf8))
+            }
+        )
+    }
+
+    init(
+        paths: AppPaths,
+        helperPath: String,
+        directoryModeSetter: @escaping @Sendable (String, mode_t) -> Void,
+        warningHandler: @escaping @Sendable (String) -> Void
+    ) {
         self.paths = paths
         self.helperPath = helperPath
+        self.directoryModeSetter = directoryModeSetter
+        self.warningHandler = warningHandler
     }
 
     // MARK: - Paths
@@ -348,7 +375,10 @@ public struct FileSecretStore: SecretStore {
     }
 
     private func withWriteLock(_ body: () throws -> Void) async throws {
-        try prepareDirectories()
+        // `store` repeats the check inside the lock so it remains safe if it
+        // is ever called from another write path. Keep this pre-lock check to
+        // create the lock directory, but report a degraded mode only once.
+        try prepareDirectories(reportWarnings: false)
         let lock = FileLock(path: lockFileURL)
         let deadline = Date().addingTimeInterval(Self.lockTimeout)
         while !lock.tryAcquire() {
@@ -445,23 +475,37 @@ public struct FileSecretStore: SecretStore {
 
     // MARK: - Directories
 
-    /// Creates `root` at `0700` and `locks/` if they are missing.
+    /// Creates or attempts to tighten `root` to `0700`, then creates `locks/`.
     ///
-    /// `root` is created with `mkdir(2)`'s mode argument, never
-    /// create-then-`chmod`. An *existing* `root` is left alone: it may have
-    /// been created at `0755` by `AppPaths.ensureDirectories()` (it holds
-    /// non-secret state too), and the `0600` file mode — enforced on every
-    /// read — is what actually protects the secrets. The `0700` directory is
-    /// defence in depth for the case where we get there first.
-    func prepareDirectories() throws {
-        try createDirectory(at: paths.root, mode: 0o700)
+    /// A fresh `root` is created with `mkdir(2)`'s mode argument, so there is
+    /// no interval where a newly created secrets directory has a looser mode.
+    /// An existing `root` is tightened before any secret is written. The
+    /// resulting mode, not `chmod(2)`'s return value, decides what happens —
+    /// some network and non-POSIX filesystems report success without changing
+    /// it. Group/world write *and search* access is fatal when it is not
+    /// protected by sticky-directory ownership: another user could unlink or
+    /// rename the `0600` file and substitute one whose mode still passes the
+    /// read-time check. A sticky directory is accepted only when its owner and
+    /// the protected entry's owner are this process's user (or root, which is
+    /// outside the threat model). Group/world read or search access exposes
+    /// directory entries and/or file metadata, so it emits a warning to stderr
+    /// but does not prevent storing the protected file.
+    ///
+    /// The immediate parent receives the same replacement-risk check because
+    /// otherwise another writer could rename `root` itself. This deliberately
+    /// stops at one parent rather than claiming to audit the full ancestor
+    /// chain or filesystem ACLs; those remain deployment boundaries.
+    func prepareDirectories(reportWarnings: Bool = true) throws {
+        try createDirectory(at: paths.root, mode: 0o700, reportWarnings: reportWarnings)
+        try validateImmediateParent()
         // Lock files hold nothing; the default mode is fine.
         try FileManager.default.createDirectory(at: paths.locksDir, withIntermediateDirectories: true)
     }
 
-    private func createDirectory(at url: URL, mode: mode_t) throws {
+    private func createDirectory(at url: URL, mode: mode_t, reportWarnings: Bool) throws {
         var info = stat()
         if url.path.withCString({ stat($0, &info) }) == 0 {
+            try setMode(mode, on: url, reportWarnings: reportWarnings)
             return
         }
         let parent = url.deletingLastPathComponent()
@@ -472,14 +516,115 @@ public struct FileSecretStore: SecretStore {
         if created == 0 {
             // Same reasoning as the file's fchmod: the directory was created
             // at `mode`, so this only pins it there against the umask.
-            _ = url.path.withCString { chmod($0, mode) }
+            try setMode(mode, on: url, reportWarnings: reportWarnings)
             return
         }
-        if errno != EEXIST {
+        if errno == EEXIST {
+            // Another process created it after the stat above. It will hold
+            // this process's secrets too, so enforce the same mode.
+            try setMode(mode, on: url, reportWarnings: reportWarnings)
+        } else {
             throw SecretStoreError.backendFailed(
                 "could not create \(url.path): \(Self.describe(errno: errno))"
             )
         }
+    }
+
+    private func setMode(_ mode: mode_t, on url: URL, reportWarnings: Bool) throws {
+        let path = url.path
+        directoryModeSetter(path, mode)
+
+        let info = try directoryInfo(at: url)
+        let modeBits = UInt32(info.st_mode)
+        let displayedMode = modeBits & 0o7777
+        guard !Self.hasUnprotectedReplacementAccess(info, entryOwner: geteuid()) else {
+            throw SecretStoreError.backendFailed(
+                "refusing to store secrets in \(path): the directory has unprotected group/world "
+                    + "write-and-search access (mode \(Self.octal(displayedMode))). Another user "
+                    + "could replace secrets.json "
+                    + "even though the file is mode 0600. " + Self.tightenRemedy(for: path)
+            )
+        }
+        if reportWarnings && modeBits & 0o055 != 0 {
+            warningHandler(
+                "warning: \(path) remains accessible to group or other users "
+                    + "(mode \(Self.octal(displayedMode))). "
+                    + "secrets.json is still created mode 0600, but directory entries and/or "
+                    + "file metadata may be visible. " + Self.tightenRemedy(for: path)
+            )
+        }
+    }
+
+    /// The remedy sentence for both messages in `setMode`.
+    ///
+    /// Neither message is reachable unless this process's *own*
+    /// `chmod(path, 0700)` has just run and the following `stat` showed the
+    /// bits still set — so "fix it with: chmod 700" on its own prescribes the
+    /// exact command the code has already tried and watched fail. A headless
+    /// operator runs it, nothing changes, and the next `secret set` prints the
+    /// identical message; advice that cannot work is how a correct refusal
+    /// teaches people to distrust this tool's output. Name the two reachable
+    /// causes instead. Found by review on #60.
+    private static func tightenRemedy(for path: String) -> String {
+        "chmod 700 \(path) did not take effect. Either the directory belongs to another user, "
+            + "in which case run that chmod as its owner or as root; or the filesystem does not "
+            + "honour permissions at all (a CIFS/FAT mount with dir_mode/dmask, vboxsf, WSL "
+            + "drvfs without metadata), in which case no chmod by anyone will ever change it and "
+            + "the data directory has to move — point RESTIC_STATION_DATA_DIR at a filesystem "
+            + "that does."
+    }
+
+    private func validateImmediateParent() throws {
+        let parent = paths.root.deletingLastPathComponent()
+        guard parent.path != paths.root.path else { return }
+
+        var rootEntryInfo = stat()
+        guard paths.root.path.withCString({ lstat($0, &rootEntryInfo) }) == 0 else {
+            throw SecretStoreError.backendFailed(
+                "could not inspect \(paths.root.path): \(Self.describe(errno: errno))"
+            )
+        }
+        let parentInfo = try directoryInfo(at: parent)
+        guard !Self.hasUnprotectedReplacementAccess(parentInfo, entryOwner: rootEntryInfo.st_uid) else {
+            let displayedMode = UInt32(parentInfo.st_mode) & 0o7777
+            throw SecretStoreError.backendFailed(
+                "refusing to store secrets under \(parent.path): the immediate parent directory "
+                    + "has unprotected group/world write-and-search access "
+                    + "(mode \(Self.octal(displayedMode))), allowing another user to rename or "
+                    + "replace \(paths.root.lastPathComponent). Fix the parent permissions or "
+                    + "use a sticky directory whose entries are owner-protected."
+            )
+        }
+    }
+
+    private func directoryInfo(at url: URL) throws -> stat {
+        var info = stat()
+        guard url.path.withCString({ stat($0, &info) }) == 0 else {
+            throw SecretStoreError.backendFailed(
+                "could not inspect permissions on \(url.path): \(Self.describe(errno: errno))"
+            )
+        }
+        guard UInt32(info.st_mode) & UInt32(S_IFMT) == UInt32(S_IFDIR) else {
+            throw SecretStoreError.backendFailed("expected a directory at \(url.path)")
+        }
+        return info
+    }
+
+    /// Whether mode bits let another user replace an entry in `directory`.
+    /// Directory mutation requires write and search for the same permission
+    /// class. Sticky mode then limits it to the entry owner, directory owner,
+    /// or root, so both relevant owners must belong to the trusted boundary.
+    private static func hasUnprotectedReplacementAccess(_ directory: stat, entryOwner: uid_t) -> Bool {
+        let mode = UInt32(directory.st_mode)
+        let groupCanReplace = mode & 0o030 == 0o030
+        let otherCanReplace = mode & 0o003 == 0o003
+        guard groupCanReplace || otherCanReplace else { return false }
+        guard mode & UInt32(S_ISVTX) != 0 else { return true }
+
+        func isTrustedOwner(_ owner: uid_t) -> Bool {
+            owner == geteuid() || owner == 0
+        }
+        return !isTrustedOwner(directory.st_uid) || !isTrustedOwner(entryOwner)
     }
 
     // MARK: - Small helpers
@@ -498,6 +643,7 @@ public struct FileSecretStore: SecretStore {
     }
 
     private static func octal(_ permissions: UInt32) -> String {
-        "0" + String(permissions, radix: 8)
+        let digits = String(permissions, radix: 8)
+        return String(repeating: "0", count: max(0, 4 - digits.count)) + digits
     }
 }

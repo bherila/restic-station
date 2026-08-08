@@ -205,10 +205,23 @@ public struct AppPaths: Equatable, Sendable {
 
     // MARK: - Directory creation
 
-    /// Creates `root`, `runs/`, `state/`, and `locks/` if missing. Idempotent.
+    /// Creates `root`, `runs/`, `state/`, and `locks/` if missing. A fresh
+    /// `root` is owner-only because it may later contain secrets. Missing
+    /// ancestors are created separately with the process-default mode so the
+    /// `0700` attribute is not imposed on shared XDG directories such as
+    /// `~/.local` and `~/.local/state`. Idempotent.
     public func ensureDirectories() throws {
         let fileManager = FileManager.default
-        for directory in [root, runsDir, stateDir, locksDir] {
+        let parent = root.deletingLastPathComponent()
+        if parent.path != root.path {
+            try fileManager.createDirectory(at: parent, withIntermediateDirectories: true)
+        }
+        try fileManager.createDirectory(
+            at: root,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        for directory in [runsDir, stateDir, locksDir] {
             try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
         }
     }
