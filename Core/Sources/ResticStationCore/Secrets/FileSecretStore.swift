@@ -542,18 +542,36 @@ public struct FileSecretStore: SecretStore {
                 "refusing to store secrets in \(path): the directory has unprotected group/world "
                     + "write-and-search access (mode \(Self.octal(displayedMode))). Another user "
                     + "could replace secrets.json "
-                    + "even though the file is mode 0600. Fix it with: chmod 700 \(path)"
+                    + "even though the file is mode 0600. " + Self.tightenRemedy(for: path)
             )
         }
         if reportWarnings && modeBits & 0o055 != 0 {
             warningHandler(
                 "warning: \(path) remains accessible to group or other users "
-                    + "(mode \(Self.octal(displayedMode))) after attempting chmod 700. "
+                    + "(mode \(Self.octal(displayedMode))). "
                     + "secrets.json is still created mode 0600, but directory entries and/or "
-                    + "file metadata may be visible. "
-                    + "Fix the directory with: chmod 700 \(path)"
+                    + "file metadata may be visible. " + Self.tightenRemedy(for: path)
             )
         }
+    }
+
+    /// The remedy sentence for both messages in `setMode`.
+    ///
+    /// Neither message is reachable unless this process's *own*
+    /// `chmod(path, 0700)` has just run and the following `stat` showed the
+    /// bits still set — so "fix it with: chmod 700" on its own prescribes the
+    /// exact command the code has already tried and watched fail. A headless
+    /// operator runs it, nothing changes, and the next `secret set` prints the
+    /// identical message; advice that cannot work is how a correct refusal
+    /// teaches people to distrust this tool's output. Name the two reachable
+    /// causes instead. Found by review on #60.
+    private static func tightenRemedy(for path: String) -> String {
+        "chmod 700 \(path) did not take effect. Either the directory belongs to another user, "
+            + "in which case run that chmod as its owner or as root; or the filesystem does not "
+            + "honour permissions at all (a CIFS/FAT mount with dir_mode/dmask, vboxsf, WSL "
+            + "drvfs without metadata), in which case no chmod by anyone will ever change it and "
+            + "the data directory has to move — point RESTIC_STATION_DATA_DIR at a filesystem "
+            + "that does."
     }
 
     private func validateImmediateParent() throws {

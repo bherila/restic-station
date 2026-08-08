@@ -117,6 +117,10 @@ struct FileSecretStoreTests {
             #expect(message.contains("write-and-search"))
             #expect(message.contains("0770"))
             #expect(message.contains("replace secrets.json"))
+            // This message is only reachable once our own chmod has failed, so
+            // it must name a remedy that isn't the command we just ran — a
+            // mode-forcing mount ignores the operator's chmod too. See #60.
+            #expect(message.contains("RESTIC_STATION_DATA_DIR"))
         }
         #expect(!FileManager.default.fileExists(atPath: store.fileURL.path))
         #expect(warnings.messages.isEmpty)
@@ -193,6 +197,10 @@ struct FileSecretStoreTests {
         #expect(messages[0].contains("group or other users"))
         #expect(messages[0].contains("0755"))
         #expect(messages[0].contains("chmod 700"))
+        // Same reachability argument as the refusal above: naming only the
+        // chmod we already attempted is advice an operator can act on and
+        // watch do nothing.
+        #expect(messages[0].contains("RESTIC_STATION_DATA_DIR"))
     }
 
     @Test("search-only access warns once because fixed-path metadata is visible")

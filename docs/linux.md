@@ -391,7 +391,13 @@ accepted when their ownership protects the entry, as it does under `/tmp`. Group
 search access emits one warning per mutation and continues because the exposure is directory
 entries and/or file metadata, not the secret contents. The same replacement check covers the
 state directory's immediate parent so another writer cannot rename the whole directory aside; it
-does not claim to audit every higher ancestor or filesystem ACL. The `0600` file mode is still
+does not claim to audit every higher ancestor or filesystem ACL. Neither the refusal nor the
+warning can be reached unless a `chmod` this process already attempted failed to take effect, so
+both name the two causes that produce that instead of prescribing the same `chmod` again: the
+directory belongs to another user (run it as that owner or as root), or the filesystem does not
+honour permissions at all (a CIFS/FAT mount with `dir_mode`/`dmask`, `vboxsf`, WSL `drvfs` without
+`metadata`), where no `chmod` will ever change it and the data directory has to move — point
+`RESTIC_STATION_DATA_DIR` at a filesystem that does. The `0600` file mode is still
 what protects the secret contents; the directory mode is defence in depth. This remains a
 narrower guarantee than the macOS Keychain's (no encryption at rest, no ACL) and that is stated
 rather than papered over — see
