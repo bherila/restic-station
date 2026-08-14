@@ -16,8 +16,9 @@ public enum AppHealth: String, Equatable, Sendable, CaseIterable {
     case running
     /// Last run of any set failed, OR any destination is stale, OR a run was
     /// killed and left its `current-run-*.json` behind, OR the Full Disk
-    /// Access probe came back denied, OR the scheduler is known not to be
-    /// registered (so scheduled backups are not actually happening).
+    /// Access probe came back denied, OR a first backup is overdue, OR the
+    /// scheduler is known not to be registered (so scheduled backups are not
+    /// actually happening).
     case warning
 }
 
@@ -57,6 +58,12 @@ public struct SetHealth: Identifiable, Equatable, Sendable {
     /// it. The tick clears it on its next pass (`RunStore.recoverInterrupted`
     /// + `Tick` step 3), so on a healthy host this is transient.
     public let abandonedRun: CurrentRunState?
+    /// This set has no run history, no recorded backup attempt and no run in
+    /// flight, and has remained visible on this machine beyond the larger of
+    /// one schedule period and 24 hours. It closes the fresh-install hole
+    /// where an absent scheduler or unusable restic could otherwise leave a
+    /// never-run set healthy forever.
+    public let firstBackupOverdue: Bool
     /// Destinations of this set that are stale per `docs/scheduling.md`
     /// §Staleness, in the set's configured destination order.
     public let staleDestinationIds: [UUID]
@@ -73,7 +80,8 @@ public struct SetHealth: Identifiable, Equatable, Sendable {
         currentRun: CurrentRunState?,
         staleDestinationIds: [UUID],
         nextDue: Date,
-        abandonedRun: CurrentRunState? = nil
+        abandonedRun: CurrentRunState? = nil,
+        firstBackupOverdue: Bool = false
     ) {
         self.setId = setId
         self.name = name
@@ -83,6 +91,7 @@ public struct SetHealth: Identifiable, Equatable, Sendable {
         self.staleDestinationIds = staleDestinationIds
         self.nextDue = nextDue
         self.abandonedRun = abandonedRun
+        self.firstBackupOverdue = firstBackupOverdue
     }
 
     public var isRunning: Bool { currentRun != nil }
@@ -106,7 +115,9 @@ public struct SetHealth: Identifiable, Equatable, Sendable {
     public var hasAbandonedRun: Bool { abandonedRun != nil }
 
     /// This set contributes `.warning` to the global `AppHealth`.
-    public var needsAttention: Bool { lastRunFailed || hasStaleDestination || hasAbandonedRun }
+    public var needsAttention: Bool {
+        lastRunFailed || hasStaleDestination || hasAbandonedRun || firstBackupOverdue
+    }
 
     /// 0...100, rounded, clamped — restic reports `percent_done` as a 0...1
     /// fraction (`docs/data-model.md` §current-run). `nil` when not running.
@@ -142,6 +153,8 @@ public enum HealthDerivation {
     ///     is what tells the two apart.
     ///   - repoStatuses: destination status keyed by `Destination.id`.
     ///   - scheduleState: `state/schedule-state.json`, or `nil` if absent.
+    ///   - visibleSince: later mtime of `config.json` and `machine.json`, or
+    ///     `nil` when unavailable. Injected to keep this derivation pure.
     ///   - isRunAbandoned: `RunStore.liveness(ofCurrentRun:) == .abandoned`
     ///     in production. Injected rather than called directly because this
     ///     type is pure by contract (no clock, no filesystem) and the answer
@@ -154,6 +167,7 @@ public enum HealthDerivation {
         scheduleState: ScheduleState?,
         now: Date,
         calendar: Calendar,
+        visibleSince: Date? = nil,
         isRunAbandoned: (CurrentRunState) -> Bool = { _ in false }
     ) -> [SetHealth] {
         config.sets.map { set in
@@ -165,6 +179,7 @@ public enum HealthDerivation {
                 setScheduleState: scheduleState?.sets[set.id],
                 now: now,
                 calendar: calendar,
+                visibleSince: visibleSince,
                 isRunAbandoned: isRunAbandoned
             )
         }
@@ -180,6 +195,7 @@ public enum HealthDerivation {
         setScheduleState: SetScheduleState?,
         now: Date,
         calendar: Calendar,
+        visibleSince: Date? = nil,
         isRunAbandoned: (CurrentRunState) -> Bool = { _ in false }
     ) -> SetHealth {
         // `recentRuns` is newest-first, so the first match in each filter is
@@ -215,6 +231,21 @@ public enum HealthDerivation {
         // `currentRun`, and none of them can be fooled by wreckage again.
         let abandonedRun = currentRun.flatMap { isRunAbandoned($0) ? $0 : nil }
 
+        let neverAttempted = setScheduleState?.lastBackupStart == nil
+            && runsForSet.isEmpty
+            && currentRun == nil
+        let firstBackupOverdue: Bool
+        if neverAttempted, let visibleSince {
+            // A future mtime is clock skew, not evidence that the set has
+            // been visible for a negative or wraparound duration.
+            let boundedVisibleSince = min(visibleSince, now)
+            let minimumGrace: TimeInterval = 24 * 60 * 60
+            let grace = max(ScheduleMath.approximatePeriod(of: set.schedule), minimumGrace)
+            firstBackupOverdue = now.timeIntervalSince(boundedVisibleSince) > grace
+        } else {
+            firstBackupOverdue = false
+        }
+
         return SetHealth(
             setId: set.id,
             name: set.name,
@@ -228,7 +259,8 @@ public enum HealthDerivation {
                 now: now,
                 calendar: calendar
             ),
-            abandonedRun: abandonedRun
+            abandonedRun: abandonedRun,
+            firstBackupOverdue: firstBackupOverdue
         )
     }
 

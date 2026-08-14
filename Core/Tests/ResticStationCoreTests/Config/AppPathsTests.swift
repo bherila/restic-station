@@ -231,6 +231,25 @@ struct AppPathsEnvTests {
         #expect(paths.mountsDir(destId: destId).path == "\(rootPath)/mounts/\(destId.uuidString)")
     }
 
+    @Test func configurationVisibleSinceUsesTheNewestReadableMtimeAndFailsOpen() throws {
+        let (paths, root) = makeTempPaths()
+        let fileManager = FileManager.default
+        defer { try? fileManager.removeItem(at: root) }
+
+        #expect(paths.configurationVisibleSince(fileManager: fileManager) == nil)
+
+        try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+        try Data("{}".utf8).write(to: paths.configFile)
+        let configDate = Date(timeIntervalSince1970: 1_700_000_000)
+        try fileManager.setAttributes([.modificationDate: configDate], ofItemAtPath: paths.configFile.path)
+        #expect(paths.configurationVisibleSince(fileManager: fileManager) == configDate)
+
+        try Data("{}".utf8).write(to: paths.machineFile)
+        let machineDate = configDate.addingTimeInterval(3_600)
+        try fileManager.setAttributes([.modificationDate: machineDate], ofItemAtPath: paths.machineFile.path)
+        #expect(paths.configurationVisibleSince(fileManager: fileManager) == machineDate)
+    }
+
     /// Guards requirement 3 against future drift: every member other than
     /// `root` itself must be a pure function of `root`, so two roots yield the
     /// same relative sub-paths. Written as literal relative strings so a

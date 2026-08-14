@@ -52,6 +52,7 @@ struct Status: AsyncParsableCommand {
 
         let now = Date()
         let calendar = Calendar.current
+        let configurationVisibleSince = paths.configurationVisibleSince()
         // The full index, not a capped window. `HealthDerivation.setHealths`
         // derives each set's `needsAttention` from that set's own most
         // recent run — but a shared, global cap applied *before* the
@@ -115,6 +116,7 @@ struct Status: AsyncParsableCommand {
             scheduleState: scheduleState,
             now: now,
             calendar: calendar,
+            visibleSince: configurationVisibleSince,
             isRunAbandoned: isRunAbandoned
         )
 
@@ -159,6 +161,7 @@ struct Status: AsyncParsableCommand {
                 name: setHealth.name,
                 needsAttention: setHealth.needsAttention,
                 isRunning: setHealth.isRunning,
+                firstBackupOverdue: setHealth.firstBackupOverdue,
                 abandonedRun: StatusReport.CurrentRunSummary(setHealth.abandonedRun),
                 abandonedRunFile: setHealth.hasAbandonedRun
                     ? paths.currentRunFile(setId: setHealth.setId).path
@@ -462,6 +465,9 @@ struct StatusReport: Encodable {
         let name: String
         let needsAttention: Bool
         let isRunning: Bool
+        /// No backup has ever been attempted and the first-run grace window
+        /// derived from the configuration mtimes has elapsed.
+        let firstBackupOverdue: Bool
         /// Live progress from a run that was killed and never cleaned up.
         /// Mutually exclusive with `currentRun`: a `current-run` file is
         /// either one or the other (`RunStore.liveness(ofCurrentRun:)`).
@@ -478,7 +484,7 @@ struct StatusReport: Encodable {
         let destinations: [DestinationStatus]
 
         private enum CodingKeys: String, CodingKey {
-            case id, name, needsAttention, isRunning, lastBackup, lastCheck, lastPrune
+            case id, name, needsAttention, isRunning, firstBackupOverdue, lastBackup, lastCheck, lastPrune
             case currentRun, nextDue, destinations, abandonedRun, abandonedRunFile
         }
 
@@ -490,6 +496,7 @@ struct StatusReport: Encodable {
             try container.encode(name, forKey: .name)
             try container.encode(needsAttention, forKey: .needsAttention)
             try container.encode(isRunning, forKey: .isRunning)
+            try container.encode(firstBackupOverdue, forKey: .firstBackupOverdue)
             try container.encode(abandonedRun, forKey: .abandonedRun)
             try container.encode(abandonedRunFile, forKey: .abandonedRunFile)
             try container.encode(lastBackup, forKey: .lastBackup)
@@ -600,6 +607,9 @@ struct StatusReport: Encodable {
             let suffix = flags.isEmpty ? "" : " — \(flags.joined(separator: ", "))"
             lines.append("set \"\(set.name)\" (\(set.id.uuidString.lowercased()))\(suffix)")
             lines.append("    last backup: \(Self.describe(set.lastBackup))")
+            if set.firstBackupOverdue {
+                lines.append("                  FIRST BACKUP OVERDUE — no backup attempt since this set became visible")
+            }
             lines.append("    last check:  \(Self.describe(set.lastCheck))")
             lines.append("    last prune:  \(Self.describe(set.lastPrune))")
             lines.append("    next due:    \(ConfigStore.makeISO8601Formatter().string(from: set.nextDue))")

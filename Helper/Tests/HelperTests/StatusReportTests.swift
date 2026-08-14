@@ -91,9 +91,14 @@ struct StatusReportTests {
 
     // MARK: - humanLines
 
-    private func makeSetStatus(needsAttention: Bool, isRunning: Bool) -> StatusReport.SetStatus {
+    private func makeSetStatus(
+        needsAttention: Bool,
+        isRunning: Bool,
+        firstBackupOverdue: Bool = false
+    ) -> StatusReport.SetStatus {
         StatusReport.SetStatus(
             id: setId, name: "Projects", needsAttention: needsAttention, isRunning: isRunning,
+            firstBackupOverdue: firstBackupOverdue,
             abandonedRun: nil, abandonedRunFile: nil,
             lastBackup: nil, lastCheck: nil, lastPrune: nil, currentRun: nil,
             nextDue: Date(timeIntervalSince1970: 0),
@@ -129,6 +134,19 @@ struct StatusReportTests {
         #expect(lines.contains("volume not mounted"))
     }
 
+    @Test("an overdue first backup is explicit next to the never-backed-up status")
+    func overdueFirstBackupIsExplicit() {
+        let report = StatusReport(
+            machineId: "studio-mac", generatedAt: Date(), health: "warning",
+            fullDiskAccessDenied: false, scheduler: nil,
+            sets: [makeSetStatus(needsAttention: true, isRunning: false, firstBackupOverdue: true)],
+            unattributedRuns: [], excludedHere: []
+        )
+        let lines = report.humanLines().joined(separator: "\n")
+        #expect(lines.contains("last backup: never"))
+        #expect(lines.contains("FIRST BACKUP OVERDUE"))
+    }
+
     @Test("excludedHere renders its own section")
     func excludedHereSection() {
         let omission = ResolvedOmission(subject: .backupSet, id: setId, name: "Photos", reason: .disabledForMachine)
@@ -156,6 +174,7 @@ struct StatusReportTests {
         #expect(text.contains("\"lastCheck\" : null"))
         #expect(text.contains("\"lastPrune\" : null"))
         #expect(text.contains("\"currentRun\" : null"))
+        #expect(text.contains("\"firstBackupOverdue\" : false"))
         #expect(text.contains("\"lastSyncedAt\" : null"))
         #expect(text.contains("\"unattributedRuns\" : ["))
         // `reachable: false` is a real, known value here — not null — but

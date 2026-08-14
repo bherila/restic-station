@@ -99,6 +99,20 @@ public struct AppPaths: Equatable, Sendable {
         root.appendingPathComponent("machine.json", isDirectory: false)
     }
 
+    /// When this machine could first have seen its current configuration,
+    /// approximated by the later mtime of the shared config and host-local
+    /// machine files. Missing or unreadable mtimes are ignored; `nil` means
+    /// callers must not derive an age-based warning from filesystem state
+    /// they could not establish.
+    public func configurationVisibleSince(fileManager: FileManager = .default) -> Date? {
+        [configFile, machineFile].compactMap { file in
+            guard let attributes = try? fileManager.attributesOfItem(atPath: file.path) else {
+                return nil
+            }
+            return attributes[.modificationDate] as? Date
+        }.max()
+    }
+
     // MARK: - runs/
 
     public var runsDir: URL {
