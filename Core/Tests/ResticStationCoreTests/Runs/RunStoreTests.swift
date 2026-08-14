@@ -260,7 +260,7 @@ private final class TickCounter: @unchecked Sendable {
 
     /// A `state/current-run-<setId>.json` for `runId`. Only `runId` matters
     /// to `liveness(ofCurrentRun:)`; the rest is filler.
-    private func progress(runId: String) -> CurrentRunState {
+    private func progress(runId: String, heartbeatUptime: TimeInterval? = nil) -> CurrentRunState {
         CurrentRunState(
             runId: runId,
             kind: .backup,
@@ -271,6 +271,8 @@ private final class TickCounter: @unchecked Sendable {
             filesDone: 1,
             totalFiles: 2,
             currentFiles: [],
+            heartbeatAt: heartbeatUptime.map { _ in Date(timeIntervalSince1970: 100) },
+            heartbeatUptime: heartbeatUptime,
             updatedAt: Date(timeIntervalSince1970: 0)
         )
     }
@@ -285,6 +287,54 @@ private final class TickCounter: @unchecked Sendable {
         let run = try store.begin(kind: .backup, setId: UUID(), destId: UUID(), trigger: .scheduled)
 
         #expect(store.liveness(ofCurrentRun: progress(runId: run.runId)) == .live)
+    }
+
+    @Test("a live process with a fresh heartbeat is live")
+    func livenessOfAHeartbeatingProcess() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+
+        let store = RunStore(paths: paths, now: { Date() }, uptime: { 1_000 })
+        let run = try store.begin(kind: .backup, setId: UUID(), destId: UUID(), trigger: .scheduled)
+
+        #expect(store.liveness(ofCurrentRun: progress(runId: run.runId, heartbeatUptime: 999)) == .live)
+    }
+
+    @Test("a live process with a stale heartbeat is stalled")
+    func livenessOfAStalledProcess() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+
+        let nowUptime = 1_000.0
+        let store = RunStore(paths: paths, now: { Date() }, uptime: { nowUptime })
+        let run = try store.begin(kind: .backup, setId: UUID(), destId: UUID(), trigger: .scheduled)
+        let stale = nowUptime - RunStore.currentRunHeartbeatStaleAfter - 1
+
+        #expect(store.liveness(ofCurrentRun: progress(runId: run.runId, heartbeatUptime: stale)) == .stalled)
+    }
+
+    @Test("exactly five minutes without a heartbeat is still inside the grace bound")
+    func heartbeatThresholdIsStrict() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+
+        let nowUptime = 1_000.0
+        let store = RunStore(paths: paths, now: { Date() }, uptime: { nowUptime })
+        let run = try store.begin(kind: .backup, setId: UUID(), destId: UUID(), trigger: .scheduled)
+        let boundary = nowUptime - RunStore.currentRunHeartbeatStaleAfter
+
+        #expect(store.liveness(ofCurrentRun: progress(runId: run.runId, heartbeatUptime: boundary)) == .live)
+    }
+
+    @Test("an uptime reset proves a recycled pid did not write this heartbeat")
+    func heartbeatFromAPriorBootIsAbandoned() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+
+        let store = RunStore(paths: paths, now: { Date() }, uptime: { 100 })
+        let run = try store.begin(kind: .backup, setId: UUID(), destId: UUID(), trigger: .scheduled)
+
+        #expect(store.liveness(ofCurrentRun: progress(runId: run.runId, heartbeatUptime: 200)) == .abandoned)
     }
 
     @Test("a run whose process is gone is abandoned, however recent its progress")

@@ -901,6 +901,51 @@ struct BackupEngineTests {
         #expect(stateStore.readCurrentRun(setId: Self.setId)?.updatedAt == Self.t0.addingTimeInterval(1.5))
     }
 
+    @Test("heartbeat advances liveness without changing visible progress")
+    func heartbeatPreservesProgress() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-heartbeat-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let stateStore = StateStore(paths: AppPaths(root: root))
+        let clock = TestClock(Self.t0)
+        let uptime = Box(100.0)
+        let reporter = ProgressReporter(
+            stateStore: stateStore,
+            setId: Self.setId,
+            runId: "heartbeat-run",
+            kind: .check,
+            phase: "checking",
+            now: clock.now,
+            uptime: { uptime.value },
+            heartbeatInterval: 3_600
+        )
+
+        reporter.writePhaseMarker()
+        reporter.startHeartbeat()
+        defer { reporter.stopHeartbeat() }
+        let initial = try #require(stateStore.readCurrentRun(setId: Self.setId))
+        #expect(initial.updatedAt == Self.t0)
+        #expect(initial.heartbeatAt == Self.t0)
+        #expect(initial.heartbeatUptime == 100)
+
+        clock.advance(60)
+        uptime.value = 160
+        reporter.writeHeartbeat()
+
+        let heartbeating = try #require(stateStore.readCurrentRun(setId: Self.setId))
+        #expect(heartbeating.updatedAt == initial.updatedAt)
+        #expect(heartbeating.percentDone == initial.percentDone)
+        #expect(heartbeating.phase == initial.phase)
+        #expect(heartbeating.heartbeatAt == Self.t0.addingTimeInterval(60))
+        #expect(heartbeating.heartbeatUptime == 160)
+
+        reporter.stopHeartbeat()
+        clock.advance(60)
+        uptime.value = 220
+        reporter.writeHeartbeat()
+        #expect(stateStore.readCurrentRun(setId: Self.setId)?.heartbeatUptime == 160)
+    }
+
     @Test("shouldWriteProgress: first write allowed, window enforced, backwards clock does not stall")
     func throttlePredicate() {
         #expect(BackupEngine.shouldWriteProgress(lastWriteAt: nil, now: Self.t0))

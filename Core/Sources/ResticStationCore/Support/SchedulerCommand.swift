@@ -66,6 +66,16 @@ public enum LaunchctlCommand {
         argv.append("gui/\(uid)/\(label)")
         return argv
     }
+
+    /// `print gui/<uid>/<label>` — exits zero only while launchd has the
+    /// agent loaded. This is the helper CLI's scheduler-health probe; unlike
+    /// `SMAppService.status`, it does not require running inside the app.
+    public static func printArgv(
+        label: String = helperLabel,
+        uid: UInt32
+    ) -> [String] {
+        ["print", "gui/\(uid)/\(label)"]
+    }
 }
 
 #endif

@@ -20,9 +20,12 @@ extension AppModel {
     /// run has no index line yet; see `currentRuns`).
     var recentRuns: [RunIndexEntry] { stateWatcher.recentRuns }
 
-    /// In-flight run progress keyed by `BackupSet.id`
-    /// (`state/current-run-<setId>.json`).
-    var currentRuns: [UUID: CurrentRunState] { stateWatcher.currentRuns }
+    /// In-flight, heartbeating run progress keyed by `BackupSet.id`.
+    /// Abandoned and stalled state still contributes to health, but neither
+    /// is rendered as useful live progress in the Runs screen.
+    var currentRuns: [UUID: CurrentRunState] {
+        stateWatcher.currentRuns.filter { runStore.liveness(ofCurrentRun: $0.value) == .live }
+    }
 
     // MARK: - Naming
 
@@ -89,6 +92,9 @@ extension AppModel {
     func backUpNowUnavailableReason(setId: UUID) -> String? {
         guard isBusy(setId: setId) else { return nil }
         let name = setName(for: setId)
+        if let run = stateWatcher.currentRuns[setId], runStore.liveness(ofCurrentRun: run) == .stalled {
+            return "\(name)'s helper appears stalled. Inspect its run log before terminating it."
+        }
         if let phase = currentRuns[setId]?.phase {
             return "\(name) is busy — \(RunPhase.describe(phase)). Wait for it to finish, then try again."
         }

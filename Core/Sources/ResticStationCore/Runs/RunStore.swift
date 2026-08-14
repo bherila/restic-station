@@ -53,9 +53,13 @@ public struct RecoveredRun: Equatable, Sendable {
 /// health check reports green for a machine that has stopped backing up.
 /// That is the exact failure this type exists to make impossible.
 public enum CurrentRunLiveness: String, Equatable, Sendable {
-    /// The run's `runs/<runId>/metadata.json` is still `.running` and its
-    /// `pid` answers `kill(pid, 0)`.
+    /// The recorded `pid` answers `kill(pid, 0)` and, when written by a new
+    /// helper, its independent awake-time heartbeat is still fresh.
     case live
+    /// The process still exists, but its independent heartbeat has not
+    /// advanced for the bounded awake-time threshold. It may be stopped or
+    /// deadlocked and must not be presented as useful progress.
+    case stalled
     /// The process that wrote it is gone. Nothing will ever update or delete
     /// this file: it is wreckage, not progress.
     case abandoned
@@ -93,6 +97,13 @@ public enum RunStoreError: Error, Equatable, Sendable, CustomStringConvertible {
 public struct RunStore: Sendable {
     public let paths: AppPaths
     private let now: @Sendable () -> Date
+    private let uptime: @Sendable () -> TimeInterval
+
+    /// Five minutes is ten missed 30-second heartbeats: long enough to absorb
+    /// scheduling pressure, short enough for a monitoring check to catch a
+    /// wedged helper before another two-minute scheduler tick is mistaken for
+    /// useful work. The uptime clock excludes system sleep.
+    public static let currentRunHeartbeatStaleAfter: TimeInterval = 5 * 60
 
     /// How long `finish`/`recoverInterrupted` will retry for the index
     /// companion lock before giving up with `RunStoreError.indexLockTimeout`.
@@ -102,15 +113,24 @@ public struct RunStore: Sendable {
     private static let indexLockPollInterval: UInt32 = 5_000 // microseconds
 
     public init(paths: AppPaths) {
-        self.init(paths: paths, now: { Date() })
+        self.init(
+            paths: paths,
+            now: { Date() },
+            uptime: { ProcessInfo.processInfo.systemUptime }
+        )
     }
 
     /// Clock-injecting initializer, so `runId` generation (which embeds a
     /// UTC timestamp) is deterministic in tests. `init(paths:)` is the
     /// production entry point and simply forwards to this with `Date()`.
-    public init(paths: AppPaths, now: @escaping @Sendable () -> Date) {
+    public init(
+        paths: AppPaths,
+        now: @escaping @Sendable () -> Date,
+        uptime: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
+    ) {
         self.paths = paths
         self.now = now
+        self.uptime = uptime
     }
 
     // MARK: - begin / finish
@@ -259,8 +279,8 @@ public struct RunStore: Sendable {
         return recovered
     }
 
-    /// Is this `state/current-run-<setId>.json` still backed by a live
-    /// process? (`docs/data-model.md` §current-run.json)
+    /// Is this `state/current-run-<setId>.json` live, stalled, or abandoned?
+    /// (`docs/data-model.md` §current-run.json)
     ///
     /// Decided from the run's own `runs/<runId>/metadata.json` — the same
     /// `pid` + `kill(pid, 0)` evidence `recoverInterrupted()` uses, so the
@@ -268,20 +288,21 @@ public struct RunStore: Sendable {
     ///
     /// Deliberately **not** a timestamp heuristic on `updatedAt`. Progress is
     /// only written when restic emits a `status` line (throttled), and some
-    /// phases legitimately emit nothing for hours — a `check --read-data` on
-    /// a large repository writes one phase marker and then goes quiet. Any
-    /// "no progress for N minutes ⟹ dead" rule either cries wolf on those
-    /// runs or is set so high it stops being a health check. Process
-    /// liveness has neither failure mode.
+    /// phases legitimately emit nothing for hours. New helpers write a
+    /// separate, unconditional heartbeat; its uptime value is the only age
+    /// considered here. Uptime pauses during sleep, so a laptop wake is not a
+    /// false stall. Older current-run files have no heartbeat and retain the
+    /// previous process-only behavior until their run finishes.
     ///
     /// Missing or undecodable metadata counts as `.abandoned`: `begin(...)`
     /// writes `metadata.json` *before* the first progress write, so a
     /// current-run file pointing at a run directory that is not there
     /// describes a run this data directory has no record of.
     ///
-    /// Inherits one known limitation from `recoverInterrupted()`: a recycled
-    /// pid can make a dead run look live. The window is a whole pid-space
-    /// wrap and the consequence is a delayed warning, not a wrong backup.
+    /// A pre-heartbeat legacy file inherits one known limitation from
+    /// `recoverInterrupted()`: a recycled pid can make a dead run look live.
+    /// Heartbeat-bearing files detect the usual reboot/pid-reuse case because
+    /// their recorded uptime is greater than the new boot's uptime.
     public func liveness(ofCurrentRun state: CurrentRunState) -> CurrentRunLiveness {
         guard let metadata = try? metadata(runId: state.runId) else { return .abandoned }
         // The pid alone, deliberately — **not** `metadata.status == .running`
@@ -300,7 +321,15 @@ public struct RunStore: Sendable {
         //
         // Process liveness has no such window. The process is either there
         // to finish the job and clean up, or it is not.
-        return Self.isProcessAlive(pid: metadata.pid) ? .live : .abandoned
+        guard Self.isProcessAlive(pid: metadata.pid) else { return .abandoned }
+        guard let heartbeatUptime = state.heartbeatUptime else { return .live }
+
+        let heartbeatAge = uptime() - heartbeatUptime
+        // A negative age means the uptime clock reset, normally because this
+        // current-run file survived a reboot and its pid was recycled. The
+        // recorded process cannot be the process that wrote this heartbeat.
+        if heartbeatAge < 0 { return .abandoned }
+        return heartbeatAge > Self.currentRunHeartbeatStaleAfter ? .stalled : .live
     }
 
     static func isProcessAlive(pid: Int32) -> Bool {

@@ -80,6 +80,19 @@ expect_rc() {
     }
 }
 
+# A fixture can prove its backup state is healthy without controlling the
+# host scheduler. On macOS the status command now probes the real LaunchAgent;
+# on Linux it probes the real user timer. A definite scheduler failure makes
+# status exit 1, while healthy or unknown scheduler state contributes 0.
+CLEAN_STATUS_RC=0
+capture_clean_status_rc() {
+    if jq -e '.scheduler.healthy == false' "$OUT_FILE" >/dev/null; then
+        CLEAN_STATUS_RC=1
+    else
+        CLEAN_STATUS_RC=0
+    fi
+}
+
 SECRET_PASSWORD='h34dl3ss "cli" $ecret with spaces '
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -291,15 +304,21 @@ cat > "$HEALTHY/runs/r-healthy/metadata.json" <<EOF
 {"runId":"r-healthy","kind":"backup","setId":"$SET_ID","destId":"$PRIMARY_ID","groupId":"r-healthy","status":"success","trigger":"scheduled","start":"$ONE_HOUR_AGO_ISO","end":"$ONE_HOUR_AGO_ISO","pid":1,"resticExitCode":0,"argvRedacted":["restic","backup"],"snapshotId":"abc123","filesNew":1,"filesChanged":0,"dataAdded":100,"errorSummary":null,"stats":null}
 EOF
 RESTIC_STATION_DATA_DIR="$HEALTHY" run_helper status --json
-expect_rc 0
-echo "$(cat "$OUT_FILE")" | jq -e '.health == "idle"' >/dev/null || fail "healthy fixture did not report idle"
-ok "healthy fixture: status --json exits 0, health=idle"
+capture_clean_status_rc
+expect_rc "$CLEAN_STATUS_RC"
+jq -e '
+    .sets[0].needsAttention == false
+    and .sets[0].lastBackup.status == "success"
+    and .health == (if .scheduler.healthy == false then "warning" else "idle" end)
+' "$OUT_FILE" >/dev/null || fail "healthy fixture was not healthy apart from an independently reported scheduler finding"
+ok "healthy fixture: backup state is idle; exit reflects the host scheduler"
 
 # --- first backup grace: fresh config stays quiet; old never-run config warns. ---
 FIRST_BACKUP_FRESH="$WORK/status-first-backup-fresh"
 make_status_fixture "$FIRST_BACKUP_FRESH"
 RESTIC_STATION_DATA_DIR="$FIRST_BACKUP_FRESH" run_helper status --json
-expect_rc 0
+capture_clean_status_rc
+expect_rc "$CLEAN_STATUS_RC"
 echo "$(cat "$OUT_FILE")" | jq -e '.sets[0].firstBackupOverdue == false' >/dev/null \
     || fail "a fresh never-run set warned before its first-backup grace elapsed"
 
@@ -336,13 +355,44 @@ cat > "$INFLIGHT/state/current-run-$SET_ID.json" <<EOF
 {"runId":"r-live","kind":"backup","phase":"backing-up-primary","percentDone":0.42,"bytesDone":1234,"totalBytes":9999,"filesDone":3,"totalFiles":10,"currentFiles":["/tmp/src/big.dat"],"updatedAt":"$NOW_ISO"}
 EOF
 RESTIC_STATION_DATA_DIR="$INFLIGHT" run_helper status --json
-expect_rc 0
+capture_clean_status_rc
+expect_rc "$CLEAN_STATUS_RC"
 echo "$(cat "$OUT_FILE")" | jq -e '.health == "running"' >/dev/null || fail "in-flight fixture did not report running"
 echo "$(cat "$OUT_FILE")" | jq -e '.sets[0].currentRun.phase == "backing-up-primary"' >/dev/null \
     || fail "in-flight fixture did not surface live progress"
 echo "$(cat "$OUT_FILE")" | jq -e '.sets[0].abandonedRun == null' >/dev/null \
     || fail "a live run was misreported as abandoned"
-ok "in-flight fixture: status --json exits 0, health=running, live progress surfaced"
+ok "in-flight fixture: health=running, live progress surfaced; exit reflects the host scheduler"
+
+# --- stalled: the pid still exists, but the independent awake-time heartbeat
+#     is stale. A negative fixture value is intentionally older than every
+#     possible system uptime, keeping this test deterministic on fresh CI VMs. ---
+STALLED="$WORK/status-stalled"
+make_status_fixture "$STALLED"
+mkdir -p "$STALLED/runs/r-stalled"
+cat > "$STALLED/runs/r-stalled/metadata.json" <<EOF
+{"runId":"r-stalled","kind":"backup","setId":"$SET_ID","destId":"$PRIMARY_ID","groupId":"r-stalled","status":"running","trigger":"manual","start":"$NOW_ISO","end":null,"pid":$$,"resticExitCode":null,"argvRedacted":[],"snapshotId":null,"filesNew":null,"filesChanged":null,"dataAdded":null,"errorSummary":null,"stats":null}
+EOF
+cat > "$STALLED/state/current-run-$SET_ID.json" <<EOF
+{"runId":"r-stalled","kind":"backup","phase":"backing-up-primary","percentDone":0.42,"bytesDone":1234,"totalBytes":9999,"filesDone":3,"totalFiles":10,"currentFiles":["/tmp/src/big.dat"],"heartbeatAt":"$NOW_ISO","heartbeatUptime":-301,"updatedAt":"$NOW_ISO"}
+EOF
+RESTIC_STATION_DATA_DIR="$STALLED" run_helper status --json
+expect_rc 1
+jq -e '
+    .health == "warning"
+    and .sets[0].isRunning == false
+    and .sets[0].currentRun == null
+    and .sets[0].stalledRun.runId == "r-stalled"
+    and (.sets[0].stalledRunLog | endswith("/runs/r-stalled/log.txt"))
+' "$OUT_FILE" >/dev/null || fail "stalled fixture was not reported as warning with its diagnostic log"
+RESTIC_STATION_DATA_DIR="$STALLED" run_helper status
+expect_rc 1
+grep -qF "STALLED:     backup run r-stalled" "$OUT_FILE" \
+    || fail "human status did not name the stalled run"
+if grep -qF "current-run-$SET_ID.json" "$OUT_FILE"; then
+    fail "human status suggested deleting a current-run file still owned by a stalled process"
+fi
+ok "stalled fixture: a live pid with a stale heartbeat is warning, not progress or safe wreckage"
 
 # --- abandoned: the same progress file, with no live run behind it. ---
 # The counterpart, and the regression this pairing guards: one SIGKILL'd run
@@ -467,8 +517,11 @@ ok "a quiet set's failed last run survives 200+ newer runs from another set — 
 # ─────────────────────────────────────────────────────────────────────────
 log "5. --json output is parseable JSON with nothing else on stdout"
 
-RESTIC_STATION_DATA_DIR="$HEALTHY" "$HELPER" status --json | jq -e '.machineId | length > 0' >/dev/null \
-    || fail "status --json did not pipe cleanly through jq"
+RESTIC_STATION_DATA_DIR="$HEALTHY" run_helper status --json
+capture_clean_status_rc
+expect_rc "$CLEAN_STATUS_RC"
+jq -e '.machineId | length > 0' "$OUT_FILE" >/dev/null \
+    || fail "status --json did not produce clean JSON"
 RESTIC_STATION_DATA_DIR="$HEALTHY" "$HELPER" sets list --json | jq -e 'type == "array"' >/dev/null \
     || fail "sets list --json did not pipe cleanly through jq"
 RESTIC_STATION_DATA_DIR="$HEALTHY" "$HELPER" runs list --json | jq -e 'type == "array"' >/dev/null \
@@ -507,12 +560,12 @@ ok "an unloadable config.json → exit 1 for config validate, status, sets list"
 RESTIC_STATION_DATA_DIR="$HEALTHY" run_helper config validate
 expect_rc 0
 RESTIC_STATION_DATA_DIR="$HEALTHY" run_helper status
-expect_rc 0
+expect_rc "$CLEAN_STATUS_RC"
 RESTIC_STATION_DATA_DIR="$HEALTHY" run_helper sets list
 expect_rc 0
 RESTIC_STATION_DATA_DIR="$HEALTHY" run_helper runs list
 expect_rc 0
-ok "a healthy, well-formed setup → exit 0 for config validate, status, sets list, runs list"
+ok "a healthy, well-formed setup → commands succeed; status exit independently reflects the host scheduler"
 
 # ─────────────────────────────────────────────────────────────────────────
 # The real-restic half: secret set/list, a real run-set, status reflecting
@@ -589,7 +642,8 @@ EOF
     expect_rc 0
 
     RESTIC_STATION_DATA_DIR="$REAL_DATA" run_helper status --json
-    expect_rc 0
+    capture_clean_status_rc
+    expect_rc "$CLEAN_STATUS_RC"
     echo "$(cat "$OUT_FILE")" | jq -e '.sets[0].lastBackup.status == "success"' >/dev/null \
         || fail "status did not reflect the real backup that just ran"
     ok "a real run-set backup is reflected by status --json"

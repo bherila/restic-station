@@ -641,7 +641,7 @@ private func currentRun(percentDone: Double, phase: String = "backing-up-primary
             runsInFlight: [wreckage],
             fullDiskAccessDenied: false,
             backgroundAgentEnabled: true,
-            isRunAbandoned: { _ in true }
+            runLiveness: { _ in .abandoned }
         ) == .warning)
     }
 
@@ -654,8 +654,20 @@ private func currentRun(percentDone: Double, phase: String = "backing-up-primary
             runsInFlight: [wreckage, live],
             fullDiskAccessDenied: false,
             backgroundAgentEnabled: true,
-            isRunAbandoned: { $0.phase == "checking" }
+            runLiveness: { $0.phase == "checking" ? .abandoned : .live }
         ) == .running)
+    }
+
+    @Test("a stalled run is a warning, not useful progress")
+    func stalledRunIsAWarningNotRunning() {
+        let stalled = currentRun(percentDone: 0.5)
+        #expect(HealthDerivation.appHealth(
+            setHealths: [health()],
+            runsInFlight: [stalled],
+            fullDiskAccessDenied: false,
+            backgroundAgentEnabled: true,
+            runLiveness: { _ in .stalled }
+        ) == .warning)
     }
 
     // MARK: The exit code is not the glyph (@codex review on #51)
@@ -733,7 +745,7 @@ private func currentRun(percentDone: Double, phase: String = "backing-up-primary
             runsInFlight: [currentRun(percentDone: 0.5)],
             fullDiskAccessDenied: false,
             backgroundAgentEnabled: true,
-            isRunAbandoned: { _ in true }
+            runLiveness: { _ in .abandoned }
         ) == .warning)
     }
 }
@@ -750,7 +762,7 @@ private func currentRun(percentDone: Double, phase: String = "backing-up-primary
             setScheduleState: nil,
             now: Date(timeIntervalSince1970: 1_800_000_000),
             calendar: utcCalendar(),
-            isRunAbandoned: { _ in abandoned }
+            runLiveness: { _ in abandoned ? .abandoned : .live }
         )
     }
 
@@ -774,6 +786,27 @@ private func currentRun(percentDone: Double, phase: String = "backing-up-primary
         #expect(health.hasAbandonedRun)
         // Nothing is in flight, so there is no progress to report — a
         // half-finished percentage from a dead process is worse than none.
+        #expect(health.progressPercent == nil)
+        #expect(health.needsAttention)
+    }
+
+    @Test("a stalled current-run is retained as a warning, not rendered as progress")
+    func stalledRunNeedsAttention() {
+        let health = HealthDerivation.setHealth(
+            set: makeSet(),
+            recentRuns: [],
+            currentRun: currentRun(percentDone: 0.5),
+            repoStatuses: [:],
+            setScheduleState: nil,
+            now: Date(timeIntervalSince1970: 1_800_000_000),
+            calendar: utcCalendar(),
+            runLiveness: { _ in .stalled }
+        )
+        #expect(!health.isRunning)
+        #expect(health.currentRun == nil)
+        #expect(health.abandonedRun == nil)
+        #expect(health.stalledRun?.runId == "run")
+        #expect(health.hasStalledRun)
         #expect(health.progressPercent == nil)
         #expect(health.needsAttention)
     }

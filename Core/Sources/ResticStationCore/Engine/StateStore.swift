@@ -123,6 +123,15 @@ public struct CurrentRunState: Codable, Equatable, Sendable {
     public var filesDone: Int
     public var totalFiles: Int
     public var currentFiles: [String]
+    /// Wall-clock time of the helper's most recent liveness heartbeat. This
+    /// advances even while restic emits no progress; `updatedAt` remains the
+    /// time the visible progress fields last changed.
+    public var heartbeatAt: Date?
+    /// System uptime, in seconds, at `heartbeatAt`. Unlike wall time this
+    /// clock pauses while the machine sleeps, so a laptop does not wake to a
+    /// false "stalled" warning. Optional for compatibility with current-run
+    /// files written by releases before heartbeats existed.
+    public var heartbeatUptime: TimeInterval?
     public var updatedAt: Date
 
     public init(
@@ -135,6 +144,8 @@ public struct CurrentRunState: Codable, Equatable, Sendable {
         filesDone: Int,
         totalFiles: Int,
         currentFiles: [String],
+        heartbeatAt: Date? = nil,
+        heartbeatUptime: TimeInterval? = nil,
         updatedAt: Date
     ) {
         self.runId = runId
@@ -146,6 +157,8 @@ public struct CurrentRunState: Codable, Equatable, Sendable {
         self.filesDone = filesDone
         self.totalFiles = totalFiles
         self.currentFiles = currentFiles
+        self.heartbeatAt = heartbeatAt
+        self.heartbeatUptime = heartbeatUptime
         self.updatedAt = updatedAt
     }
 }

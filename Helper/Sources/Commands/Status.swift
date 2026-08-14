@@ -2,6 +2,10 @@ import ArgumentParser
 import Foundation
 import ResticStationCore
 
+#if canImport(Darwin)
+import Darwin
+#endif
+
 /// `status [--json]` — the headless equivalent of the menu bar
 /// (`docs/tasks/T27`). Reads only existing state (`state/schedule-state.json`,
 /// `state/current-run-*.json`, `state/repo-status-*.json`, `runs/index.jsonl`)
@@ -17,8 +21,8 @@ struct Status: AsyncParsableCommand {
         commandName: "status",
         abstract: "The headless menu bar: per set, last run outcome+age, next due time, any "
             + "in-flight run's live progress, per-destination reachability+staleness, and last "
-            + "check/prune. On Linux it also reports whether the systemd --user timer will "
-            + "actually fire. Reads only existing state — no restic invocation. --json for "
+            + "check/prune. It also reports whether launchd (macOS) or the systemd --user "
+            + "timer (Linux) will actually fire. Reads state and the host scheduler — no restic invocation. --json for "
             + "scripting (e.g. a Nagios/Icinga check). Exit 0 healthy (including a run in "
             + "flight), 1 if any set needs attention or the scheduler is broken."
     )
@@ -95,7 +99,7 @@ struct Status: AsyncParsableCommand {
         // stale by the time the report prints. Reusing it is what guarantees
         // the JSON body, human rendering, health and exit code all describe
         // the same instant instead of contradicting one another.
-        let isRunAbandoned = Self.abandonedRunPredicate(
+        let runLiveness = Self.runLivenessPredicate(
             currentRuns: currentRuns,
             liveness: runStore.liveness(ofCurrentRun:)
         )
@@ -117,19 +121,16 @@ struct Status: AsyncParsableCommand {
             now: now,
             calendar: calendar,
             visibleSince: configurationVisibleSince,
-            isRunAbandoned: isRunAbandoned
+            runLiveness: runLiveness
         )
 
         let fdaCheck = stateStore.readFdaCheck()
         let fdaDenied = HealthDerivation.fullDiskAccessDenied(from: fdaCheck)
         // `backgroundAgentEnabled` asks "is the scheduler actually going to
-        // fire?" On Linux that is answerable and this command now answers it
-        // (`scheduler(paths:)`); on macOS it is `SMAppService` state, which
-        // is app-only and has no CLI surface, so the honest answer is `nil`
-        // — unknown, contributing nothing. It used to pass `true`
-        // unconditionally on both platforms, which reads as "the scheduler is
-        // fine" and meant `status --json` could not see a Linux host whose
-        // timer had been uninstalled.
+        // fire?" On Linux we inspect systemd; on macOS we ask launchd whether
+        // the SMAppService agent is loaded. It used to pass `true`
+        // unconditionally, which reads as "the scheduler is fine" and hid a
+        // host whose timer or LaunchAgent had stopped firing.
         let scheduler = await Self.scheduler(paths: paths)
         let health = HealthDerivation.appHealth(
             setHealths: setHealths,
@@ -139,7 +140,7 @@ struct Status: AsyncParsableCommand {
             runsInFlight: Array(currentRuns.values),
             fullDiskAccessDenied: fdaDenied,
             backgroundAgentEnabled: scheduler.flatMap(\.healthy),
-            isRunAbandoned: isRunAbandoned
+            runLiveness: runLiveness
         )
 
         let sets: [StatusReport.SetStatus] = setHealths.map { setHealth in
@@ -166,6 +167,8 @@ struct Status: AsyncParsableCommand {
                 abandonedRunFile: setHealth.hasAbandonedRun
                     ? paths.currentRunFile(setId: setHealth.setId).path
                     : nil,
+                stalledRun: StatusReport.CurrentRunSummary(setHealth.stalledRun),
+                stalledRunLog: setHealth.stalledRun.map { paths.runLogFile(runId: $0.runId).path },
                 lastBackup: StatusReport.RunSummary(setHealth.lastBackup, now: now),
                 lastCheck: StatusReport.RunSummary(try? runStore.lastRun(setId: setHealth.setId, kind: .check), now: now),
                 lastPrune: StatusReport.RunSummary(try? runStore.lastRun(setId: setHealth.setId, kind: .prune), now: now),
@@ -187,7 +190,13 @@ struct Status: AsyncParsableCommand {
             .map { setId, run in
                 StatusReport.UnattributedRun(
                     setId: setId,
-                    liveness: isRunAbandoned(run) ? .abandoned : .live,
+                    liveness: {
+                        switch runLiveness(run) {
+                        case .live: return .live
+                        case .stalled: return .stalled
+                        case .abandoned: return .abandoned
+                        }
+                    }(),
                     currentRun: StatusReport.CurrentRunSummary(run),
                     currentRunFile: paths.currentRunFile(setId: setId).path
                 )
@@ -227,7 +236,7 @@ struct Status: AsyncParsableCommand {
             runsInFlight: Array(currentRuns.values),
             fullDiskAccessDenied: fdaDenied,
             backgroundAgentEnabled: scheduler.flatMap(\.healthy),
-            isRunAbandoned: isRunAbandoned
+            runLiveness: runLiveness
         )
         HelperExit.code(needsAttention ? 1 : 0)
     }
@@ -236,28 +245,25 @@ struct Status: AsyncParsableCommand {
     /// health derivations in one `status` invocation share. Keying by run ID
     /// also avoids repeating the process probe if malformed state contains
     /// the same run under more than one set ID.
-    static func abandonedRunPredicate(
+    static func runLivenessPredicate(
         currentRuns: [UUID: CurrentRunState],
         liveness: (CurrentRunState) -> CurrentRunLiveness
-    ) -> (CurrentRunState) -> Bool {
+    ) -> (CurrentRunState) -> CurrentRunLiveness {
         var livenessByRunId: [String: CurrentRunLiveness] = [:]
         for run in currentRuns.values where livenessByRunId[run.runId] == nil {
             livenessByRunId[run.runId] = liveness(run)
         }
         return { run in
-            livenessByRunId[run.runId] == .abandoned
+            livenessByRunId[run.runId] ?? .abandoned
         }
     }
 
     /// Is anything actually going to fire the tick on this host?
     ///
-    /// `nil` = this platform cannot answer from a CLI. On macOS the scheduler
-    /// is a `SMAppService`-registered LaunchAgent whose status only the app
-    /// can read, so `status` says "unknown" rather than assuming; on Linux
-    /// the systemd `--user` timer is fully inspectable and the answer is the
-    /// same one `timer status` exits on — deliberately the same code path,
-    /// so the two commands can never disagree about whether this host is
-    /// scheduled.
+    /// On macOS, `launchctl print gui/<uid>/<label>` answers whether the
+    /// `SMAppService`-registered agent is actually loaded. On Linux the
+    /// systemd `--user` timer is fully inspectable and the answer is the same
+    /// one `timer status` exits on — deliberately the same code path.
     ///
     /// This is the one place `status` spawns subprocesses (three short
     /// `systemctl --user` queries, each bounded by
@@ -265,8 +271,14 @@ struct Status: AsyncParsableCommand {
     /// cannot see the scheduler reports a machine as healthy for as long as
     /// its last recorded run stays inside the staleness window, which for a
     /// quiet set is days.
-    static func scheduler(paths: AppPaths) async -> StatusReport.SchedulerStatus? {
+    static func scheduler(
+        paths: AppPaths,
+        runner: any ProcessRunning = DefaultProcessRunner(),
+        uid: UInt32? = nil
+    ) async -> StatusReport.SchedulerStatus? {
         #if os(Linux)
+        _ = runner
+        _ = uid
         // No activity lines and no activity problems: this call is only for
         // the verdict, and `run()` has already loaded the config itself (and
         // exited non-zero if it could not).
@@ -306,7 +318,39 @@ struct Status: AsyncParsableCommand {
         )
         #else
         _ = paths
-        return nil
+        let resolvedUID = uid ?? getuid()
+        let argv = [LaunchctlCommand.executablePath] + LaunchctlCommand.printArgv(uid: resolvedUID)
+        do {
+            let result = try await runner.run(
+                argv,
+                env: nil,
+                currentDirectory: nil,
+                onStdoutLine: nil,
+                onStderrLine: nil,
+                timeout: 5
+            )
+            if result.exitCode == 0 {
+                return StatusReport.SchedulerStatus(
+                    kind: "launchd-agent",
+                    healthy: true,
+                    problems: [],
+                    summaries: []
+                )
+            }
+            return StatusReport.SchedulerStatus(
+                kind: "launchd-agent",
+                healthy: false,
+                problems: ["agentNotLoaded"],
+                summaries: ["launchd does not have \(LaunchctlCommand.helperLabel) loaded for user \(resolvedUID)"]
+            )
+        } catch {
+            return StatusReport.SchedulerStatus(
+                kind: "launchd-agent",
+                healthy: nil,
+                problems: ["launchctlProbeFailed"],
+                summaries: ["could not query launchd: \(error)"]
+            )
+        }
         #endif
     }
 }
@@ -383,6 +427,7 @@ struct StatusReport: Encodable {
     struct UnattributedRun: Encodable {
         enum Liveness: String, Encodable {
             case live
+            case stalled
             case abandoned
         }
 
@@ -425,18 +470,15 @@ struct StatusReport: Encodable {
 
     /// Whether anything is going to fire the tick on this host.
     ///
-    /// Two different kinds of "don't know", and neither is `false`:
-    /// - the whole object is `null` — this platform has no CLI-readable
-    ///   scheduler at all (macOS, where it is `SMAppService` state);
-    /// - the object is present with `healthy: null` — this host has no
-    ///   systemd, so the documented scheduler is a cron line nothing here
-    ///   can inspect.
+    /// `healthy: null` means the platform's scheduler probe could not give a
+    /// definite answer: no systemd on Linux, or `launchctl print` itself
+    /// failed on macOS. That is distinct from a definite `false`.
     ///
     /// Only `healthy: false` is a finding, and only it makes `status` exit 1.
     struct SchedulerStatus: Encodable {
-        /// `"systemd-timer"`, or `"unknown"` when no scheduler could be
-        /// inspected. Present so a script can tell *which* scheduler
-        /// answered without inferring it from the platform.
+        /// `"systemd-timer"`, `"launchd-agent"`, or `"unknown"`. Present so
+        /// a script can tell which scheduler answered without inferring it
+        /// from the platform.
         let kind: String
         let healthy: Bool?
         /// `TimerProblem.rawValue`s — stable identifiers to branch on.
@@ -476,6 +518,12 @@ struct StatusReport: Encodable {
         /// `rm <this>`, and a message that does not name it makes the reader
         /// go and derive the path from a UUID.
         let abandonedRunFile: String?
+        /// Process still exists, but its awake-time heartbeat is stale.
+        let stalledRun: CurrentRunSummary?
+        /// Run log to inspect before deciding whether to terminate a stalled
+        /// process. Unlike abandoned wreckage, its current-run file is not a
+        /// safe cleanup target while the process owns the set lock.
+        let stalledRunLog: String?
         let lastBackup: RunSummary?
         let lastCheck: RunSummary?
         let lastPrune: RunSummary?
@@ -486,6 +534,7 @@ struct StatusReport: Encodable {
         private enum CodingKeys: String, CodingKey {
             case id, name, needsAttention, isRunning, firstBackupOverdue, lastBackup, lastCheck, lastPrune
             case currentRun, nextDue, destinations, abandonedRun, abandonedRunFile
+            case stalledRun, stalledRunLog
         }
 
         // Explicit `null` for every optional — see
@@ -499,6 +548,8 @@ struct StatusReport: Encodable {
             try container.encode(firstBackupOverdue, forKey: .firstBackupOverdue)
             try container.encode(abandonedRun, forKey: .abandonedRun)
             try container.encode(abandonedRunFile, forKey: .abandonedRunFile)
+            try container.encode(stalledRun, forKey: .stalledRun)
+            try container.encode(stalledRunLog, forKey: .stalledRunLog)
             try container.encode(lastBackup, forKey: .lastBackup)
             try container.encode(lastCheck, forKey: .lastCheck)
             try container.encode(lastPrune, forKey: .lastPrune)
@@ -591,7 +642,11 @@ struct StatusReport: Encodable {
                 lines.append("  - \(summary)")
             }
             if scheduler.healthy == false {
-                lines.append("  detail: restic-station-helper timer status")
+                if scheduler.kind == "launchd-agent" {
+                    lines.append("  detail: open Restic Station → Settings → General → Background backups")
+                } else {
+                    lines.append("  detail: restic-station-helper timer status")
+                }
             }
         }
         lines.append("")
@@ -633,6 +688,16 @@ struct StatusReport: Encodable {
                         + "rm \(ShellQuoting.quoteIfNeeded(file))")
                 }
             }
+            if let stalled = set.stalledRun {
+                lines.append(
+                    "    STALLED:     \(stalled.kind) run \(stalled.runId) still has a process, "
+                        + "but no heartbeat for more than 5 minutes of awake time "
+                        + "(stopped at \(stalled.phase), \(stalled.percentDone)%)"
+                )
+                if let log = set.stalledRunLog {
+                    lines.append("                 inspect the run log before terminating it: \(log)")
+                }
+            }
             for destination in set.destinations {
                 let role = destination.isPrimary ? "primary" : "secondary"
                 let reach = destination.reachable.map { $0 ? "reachable" : "UNREACHABLE" } ?? "not yet probed"
@@ -647,16 +712,21 @@ struct StatusReport: Encodable {
             lines.append("current runs for sets no longer configured:")
             for item in unattributedRuns {
                 let run = item.currentRun
-                let state = item.liveness == .abandoned ? "ABANDONED" : "LIVE"
+                let state = item.liveness.rawValue.uppercased()
                 lines.append(
                     "  - \(state): \(run.kind) run \(run.runId) for set "
                         + "\(item.setId.uuidString.lowercased()) "
                         + "(\(run.phase), \(run.percentDone)%)"
                 )
-                let cleanup = item.liveness == .abandoned
-                    ? "the next tick clears it; to clear it now: "
-                    : "the running helper should clear it when it finishes; to clear it now: "
-                lines.append("    \(cleanup)rm \(ShellQuoting.quoteIfNeeded(item.currentRunFile))")
+                switch item.liveness {
+                case .abandoned:
+                    lines.append("    the next tick clears it; to clear it now: rm "
+                        + ShellQuoting.quoteIfNeeded(item.currentRunFile))
+                case .stalled:
+                    lines.append("    the process still owns this run; inspect it before terminating it")
+                case .live:
+                    lines.append("    the running helper should clear it when it finishes")
+                }
             }
         }
 

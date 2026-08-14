@@ -23,7 +23,7 @@ struct StatusLivenessTests {
             updatedAt: Date()
         )
         var evaluations = 0
-        let isRunAbandoned = Status.abandonedRunPredicate(
+        let runLiveness = Status.runLivenessPredicate(
             currentRuns: [setId: run, duplicateSetId: run]
         ) { _ in
             evaluations += 1
@@ -33,9 +33,9 @@ struct StatusLivenessTests {
         }
 
         #expect(evaluations == 1)
-        #expect(!isRunAbandoned(run)) // setHealths
-        #expect(!isRunAbandoned(run)) // appHealth
-        #expect(!isRunAbandoned(run)) // hasWarningConditions / exit code
+        #expect(runLiveness(run) == .live) // setHealths
+        #expect(runLiveness(run) == .live) // appHealth
+        #expect(runLiveness(run) == .live) // hasWarningConditions / exit code
         #expect(evaluations == 1)
     }
 }

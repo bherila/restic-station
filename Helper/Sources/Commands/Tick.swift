@@ -166,8 +166,8 @@ struct Tick: AsyncParsableCommand {
         clearAbandonedProgress(runStore: runStore, stateStore: stateStore, paths: paths)
     }
 
-    /// Deletes every `state/current-run-<setId>.json` that no live process
-    /// stands behind.
+    /// Deletes every `state/current-run-<setId>.json` whose recorded process
+    /// is gone. A stalled process still owns the set lock and is never swept.
     ///
     /// **Driven by `currentRunSetIDs()` rather than by what
     /// `recoverInterrupted()` returned**, which is not a refactor but the
