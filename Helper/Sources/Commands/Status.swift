@@ -87,6 +87,18 @@ struct Status: AsyncParsableCommand {
                 currentRuns[setId] = state
             }
         }
+
+        // One point-in-time answer per run, captured before the scheduler
+        // probe below can spend time in subprocesses. A run may finish while
+        // that probe is in flight, so this snapshot can intentionally be
+        // stale by the time the report prints. Reusing it is what guarantees
+        // the JSON body, human rendering, health and exit code all describe
+        // the same instant instead of contradicting one another.
+        let isRunAbandoned = Self.abandonedRunPredicate(
+            currentRuns: currentRuns,
+            liveness: runStore.liveness(ofCurrentRun:)
+        )
+
         var repoStatuses: [UUID: RepoStatus] = [:]
         for (_, destination) in scheduled.destinations {
             if let status = stateStore.readRepoStatus(destId: destination.id) {
@@ -94,13 +106,6 @@ struct Status: AsyncParsableCommand {
             }
         }
         let scheduleState = stateStore.readScheduleState()
-
-        // A `current-run-*.json` left behind by a killed process is not a run
-        // in flight. Passed to both derivations so the two halves of the
-        // health decision cannot disagree — see `RunStore.liveness`.
-        let isRunAbandoned: (CurrentRunState) -> Bool = {
-            runStore.liveness(ofCurrentRun: $0) == .abandoned
-        }
 
         let setHealths = HealthDerivation.setHealths(
             config: scheduled.config,
@@ -203,6 +208,23 @@ struct Status: AsyncParsableCommand {
             isRunAbandoned: isRunAbandoned
         )
         HelperExit.code(needsAttention ? 1 : 0)
+    }
+
+    /// Captures one liveness answer per run ID and returns the predicate all
+    /// health derivations in one `status` invocation share. Keying by run ID
+    /// also avoids repeating the process probe if malformed state contains
+    /// the same run under more than one set ID.
+    static func abandonedRunPredicate(
+        currentRuns: [UUID: CurrentRunState],
+        liveness: (CurrentRunState) -> CurrentRunLiveness
+    ) -> (CurrentRunState) -> Bool {
+        var livenessByRunId: [String: CurrentRunLiveness] = [:]
+        for run in currentRuns.values where livenessByRunId[run.runId] == nil {
+            livenessByRunId[run.runId] = liveness(run)
+        }
+        return { run in
+            livenessByRunId[run.runId] == .abandoned
+        }
     }
 
     /// Is anything actually going to fire the tick on this host?
