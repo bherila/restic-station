@@ -250,6 +250,9 @@ public enum ScheduleMath {
     public static func isDue(schedule: Schedule, lastRunStart: Date?,
                              now: Date, calendar: Calendar) -> Bool
     // isDue ⟺ nextDue(after: lastRunStart) <= now
+
+    /// Stable elapsed duration used by the first-backup health grace only.
+    public static func approximatePeriod(of schedule: Schedule) -> TimeInterval
 }
 ```
 
@@ -266,6 +269,8 @@ Rules (anacron semantics):
 5. **Clock skew:** if `lastRunStart > now` (clock moved backwards), treat as due at the next grid point after `now` (i.e. clamp lastRunStart to now); never go into a fire-loop.
 
 `lastBackupStart` records **attempt** starts (success or failure) — a failing backup retries at the next grid slot, not every 2 minutes. Manual runs also set it.
+
+**A first backup cannot remain silently overdue forever.** A resolved set with no run history, no `lastBackupStart`, and no current run becomes a health warning after `max(approximatePeriod(schedule), 24 hours)`: 24 hours for every-minutes/hourly/daily schedules and seven days for weekly. The grace is measured from the later mtime of `config.json` and host-local `machine.json`, clamped to `now` for clock skew. If neither mtime can be read, the condition stays off rather than manufacturing a warning. Any attempted or in-flight run disables this first-run condition; ordinary run outcome and destination-staleness rules take over from there.
 
 **Check scheduling:** fixed weekly cadence. `checkIsDue` = `lastCheckStart == nil || now − lastCheckStart ≥ 7 days`, evaluated only when no backup for the same set is due in the same tick (backup wins; check runs on a later tick). Each scheduled check uses `--read-data-subset=<cursor+1 mod t>/<t>` against the **primary**, advancing `checkSliceCursor` on success only. Secondaries are checked structure-only (no `--read-data-subset`) every 4th check *if reachable*.
 

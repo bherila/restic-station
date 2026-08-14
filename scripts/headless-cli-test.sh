@@ -295,6 +295,30 @@ expect_rc 0
 echo "$(cat "$OUT_FILE")" | jq -e '.health == "idle"' >/dev/null || fail "healthy fixture did not report idle"
 ok "healthy fixture: status --json exits 0, health=idle"
 
+# --- first backup grace: fresh config stays quiet; old never-run config warns. ---
+FIRST_BACKUP_FRESH="$WORK/status-first-backup-fresh"
+make_status_fixture "$FIRST_BACKUP_FRESH"
+RESTIC_STATION_DATA_DIR="$FIRST_BACKUP_FRESH" run_helper status --json
+expect_rc 0
+echo "$(cat "$OUT_FILE")" | jq -e '.sets[0].firstBackupOverdue == false' >/dev/null \
+    || fail "a fresh never-run set warned before its first-backup grace elapsed"
+
+FIRST_BACKUP_OVERDUE="$WORK/status-first-backup-overdue"
+make_status_fixture "$FIRST_BACKUP_OVERDUE"
+# First load creates machine.json; aging both files exercises the exact mtime
+# anchor production uses. POSIX `touch -t` works on macOS and Linux.
+RESTIC_STATION_DATA_DIR="$FIRST_BACKUP_OVERDUE" run_helper config validate
+expect_rc 0
+touch -t 202001010000 "$FIRST_BACKUP_OVERDUE/config.json" "$FIRST_BACKUP_OVERDUE/machine.json"
+RESTIC_STATION_DATA_DIR="$FIRST_BACKUP_OVERDUE" run_helper status --json
+expect_rc 1
+echo "$(cat "$OUT_FILE")" | jq -e '
+    .health == "warning"
+    and .sets[0].lastBackup == null
+    and .sets[0].firstBackupOverdue == true
+' >/dev/null || fail "an old never-attempted set did not report its overdue first backup"
+ok "first-backup grace: fresh config stays healthy; old never-attempted config warns"
+
 # --- in-flight: a live current-run file, backed by a live run record. ---
 # Both halves are required, and that is the point. A current-run file whose
 # `runId` has no `runs/<runId>/metadata.json` with a live `pid` is precisely

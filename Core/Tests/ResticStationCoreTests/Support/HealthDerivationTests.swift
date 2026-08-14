@@ -89,6 +89,68 @@ private func currentRun(percentDone: Double, phase: String = "backing-up-primary
     )
 }
 
+// MARK: - First backup overdue
+
+@Suite struct SetHealthFirstBackupOverdueTests {
+    private let now = Date(timeIntervalSince1970: 1_800_000_000)
+
+    private func derive(
+        schedule: Schedule = .daily(hour: 2, minute: 30),
+        recentRuns: [RunIndexEntry] = [],
+        currentRunState: CurrentRunState? = nil,
+        setScheduleState: SetScheduleState? = nil,
+        visibleSince: Date?
+    ) -> SetHealth {
+        HealthDerivation.setHealth(
+            set: makeSet(schedule: schedule),
+            recentRuns: recentRuns,
+            currentRun: currentRunState,
+            repoStatuses: [:],
+            setScheduleState: setScheduleState,
+            now: now,
+            calendar: utcCalendar(),
+            visibleSince: visibleSince
+        )
+    }
+
+    @Test("daily and shorter schedules warn only after the 24-hour floor")
+    func dailyUsesTwentyFourHourFloor() {
+        let boundary = now.addingTimeInterval(-24 * 60 * 60)
+        #expect(!derive(visibleSince: boundary).firstBackupOverdue)
+
+        let overdue = derive(visibleSince: boundary.addingTimeInterval(-1))
+        #expect(overdue.firstBackupOverdue)
+        #expect(overdue.needsAttention)
+    }
+
+    @Test("weekly schedules use one full schedule period")
+    func weeklyUsesSevenDays() {
+        let schedule = Schedule.weekly(weekday: 1, hour: 3, minute: 0)
+        let boundary = now.addingTimeInterval(-7 * 24 * 60 * 60)
+        #expect(!derive(schedule: schedule, visibleSince: boundary).firstBackupOverdue)
+        #expect(derive(schedule: schedule, visibleSince: boundary.addingTimeInterval(-1)).firstBackupOverdue)
+    }
+
+    @Test("an unavailable or future visibility clock cannot warn")
+    func unavailableOrFutureVisibilityFailsOpen() {
+        #expect(!derive(visibleSince: nil).firstBackupOverdue)
+        #expect(!derive(visibleSince: now.addingTimeInterval(60 * 60)).firstBackupOverdue)
+    }
+
+    @Test("any attempt, run history, or current run suppresses the first-backup warning")
+    func evidenceOfAnAttemptSuppressesWarning() {
+        let old = now.addingTimeInterval(-30 * 24 * 60 * 60)
+        #expect(!derive(
+            setScheduleState: SetScheduleState(lastBackupStart: now.addingTimeInterval(-60)),
+            visibleSince: old
+        ).firstBackupOverdue)
+
+        let priorRun = run(start: now.addingTimeInterval(-120), end: now.addingTimeInterval(-60))
+        #expect(!derive(recentRuns: [priorRun], visibleSince: old).firstBackupOverdue)
+        #expect(!derive(currentRunState: currentRun(percentDone: 0.1), visibleSince: old).firstBackupOverdue)
+    }
+}
+
 // MARK: - Last run selection
 
 @Suite struct SetHealthLastRunTests {
@@ -421,7 +483,8 @@ private func currentRun(percentDone: Double, phase: String = "backing-up-primary
     private func health(
         running: Bool = false,
         failed: Bool = false,
-        stale: Bool = false
+        stale: Bool = false,
+        firstBackupOverdue: Bool = false
     ) -> SetHealth {
         let now = Date(timeIntervalSince1970: 1_800_000_000)
         return SetHealth(
@@ -433,7 +496,8 @@ private func currentRun(percentDone: Double, phase: String = "backing-up-primary
                 : nil,
             currentRun: running ? currentRun(percentDone: 0.5) : nil,
             staleDestinationIds: stale ? [secondaryId] : [],
-            nextDue: .distantPast
+            nextDue: .distantPast,
+            firstBackupOverdue: firstBackupOverdue
         )
     }
 
@@ -485,6 +549,15 @@ private func currentRun(percentDone: Double, phase: String = "backing-up-primary
     @Test func staleDestinationIsAWarning() {
         #expect(HealthDerivation.appHealth(
             setHealths: [health(stale: true)],
+            runsInFlight: [],
+            fullDiskAccessDenied: false,
+            backgroundAgentEnabled: true
+        ) == .warning)
+    }
+
+    @Test func overdueFirstBackupIsAWarning() {
+        #expect(HealthDerivation.appHealth(
+            setHealths: [health(firstBackupOverdue: true)],
             runsInFlight: [],
             fullDiskAccessDenied: false,
             backgroundAgentEnabled: true

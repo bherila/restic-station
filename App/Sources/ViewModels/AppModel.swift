@@ -380,6 +380,7 @@ final class AppModel: ObservableObject {
             scheduleState: stateWatcher.scheduleState,
             now: currentDate,
             calendar: calendar,
+            visibleSince: paths.configurationVisibleSince(),
             isRunAbandoned: isRunAbandoned
         )
         appHealth = HealthDerivation.appHealth(

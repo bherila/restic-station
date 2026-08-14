@@ -11,6 +11,22 @@ import Foundation
 /// Linux-safe.
 public enum ScheduleMath {
 
+    /// Approximate elapsed period used only for the first-backup grace
+    /// window. Wall-clock schedules still use `Calendar` for their actual
+    /// due instants; here a stable duration is deliberately sufficient.
+    public static func approximatePeriod(of schedule: Schedule) -> TimeInterval {
+        switch schedule {
+        case .everyMinutes(let minutes):
+            return TimeInterval(minutes) * 60
+        case .hourly:
+            return 60 * 60
+        case .daily:
+            return 24 * 60 * 60
+        case .weekly:
+            return 7 * 24 * 60 * 60
+        }
+    }
+
     // MARK: nextDue
 
     /// The first instant strictly after `lastRunStart` at which `schedule`

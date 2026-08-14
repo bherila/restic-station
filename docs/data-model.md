@@ -466,10 +466,11 @@ Reads only existing state (`state/schedule-state.json`, `state/current-run-*.jso
 
 On Linux it also inspects the scheduler, through the same `SystemdTimerManager` `timer status` exits on — see `scheduling.md` §`status` and the scheduler for the three-valued `scheduler` key and why `null` (macOS, or a host with no systemd) is not the same as `"healthy": false`. Only a definite `false` contributes a warning.
 
-Two things `status` will **not** do quietly, both of which used to make it report healthy for the wrong reason:
+Three things `status` will **not** do quietly, all of which used to make it report healthy for the wrong reason:
 
 - An **unreadable `runs/index.jsonl`** (wrong owner, wrong mode, I/O error) exits non-zero naming the file, instead of reading as "no runs recorded" — which derives to idle, which exits 0. A corrupt or truncated *line* stays survivable: `RunStore.recentRuns` skips it with a warning, as documented above.
 - An **abandoned `current-run-*.json`** (see §state/current-run) reports `warning` with `abandonedRun` populated and `isRunning: false`, instead of `running`.
+- A set whose **first backup was never attempted** reports `firstBackupOverdue: true` after the larger of one schedule period and 24 hours from the later `config.json`/`machine.json` mtime. Missing mtimes disable this condition; a live run, any run history, or `lastBackupStart` proves setup progressed and disables it.
 
 ```json
 {
@@ -484,6 +485,7 @@ Two things `status` will **not** do quietly, both of which used to make it repor
       "name": "Projects",
       "needsAttention": true,
       "isRunning": false,
+      "firstBackupOverdue": false,
       "abandonedRun": null,
       "abandonedRunFile": null,
       "lastBackup": {
@@ -515,7 +517,7 @@ Two things `status` will **not** do quietly, both of which used to make it repor
 }
 ```
 
-`health`: `"idle"` | `"running"` | `"warning"` (`AppHealth.rawValue`). Exit code: **0** for `idle`/`running`, **1** for `warning` — usable directly as a Nagios/Icinga-style check. `lastBackup`/`lastCheck`/`lastPrune` are `null` before any attempt of that kind; `reachable` is `null` — never `false` — for a destination that has not been probed yet (`state/repo-status-<destId>.json` absent), the same "absent means not yet known, never a definite negative" rule `fda-check.json` uses. `excludedHere` has the same shape as `config show`'s.
+`health`: `"idle"` | `"running"` | `"warning"` (`AppHealth.rawValue`). Exit code: **0** for `idle`/`running`, **1** for `warning` — usable directly as a Nagios/Icinga-style check. `lastBackup`/`lastCheck`/`lastPrune` are `null` before any attempt of that kind; `reachable` is `null` — never `false` — for a destination that has not been probed yet (`state/repo-status-<destId>.json` absent), the same "absent means not yet known, never a definite negative" rule `fda-check.json` uses. `firstBackupOverdue` explains the otherwise-empty warning for a never-attempted set. `excludedHere` has the same shape as `config show`'s.
 
 `unattributedRuns` contains any `current-run-<setId>.json` whose set is no longer in this machine's resolved configuration. Each entry carries the missing `setId`, `liveness` (`"live"` or `"abandoned"`), the usual `currentRun` summary, and the exact `currentRunFile`. These runs still determine top-level health and the exit code, so an empty `sets` array never leaves their effect unexplained. Human output names the same run and prints a shell-quoted cleanup command.
 

@@ -15,7 +15,7 @@ This spec fixes **information architecture, controls, states, and copy**. Visual
 Icon (template, SF Symbols):
 - Idle/healthy: `externaldrive.badge.checkmark`
 - Running: `externaldrive.badge.timemachine` (any run in flight)
-- Warning: `externaldrive.badge.exclamationmark` (last run of any set failed, OR any destination stale, OR FDA/agent problem)
+- Warning: `externaldrive.badge.exclamationmark` (last run of any set failed, OR any destination stale, OR a first backup is overdue, OR FDA/agent problem)
 
 Menu content (top to bottom):
 1. One line per set (disabled item): `"<SetName> — <relative last backup> <✓|⚠|✕>"`, e.g. "Projects — 2 hours ago ✓". Never run: "Projects — never backed up".

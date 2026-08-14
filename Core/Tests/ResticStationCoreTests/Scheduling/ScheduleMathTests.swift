@@ -42,6 +42,15 @@ private func date(
     return calendar.date(from: components)!
 }
 
+@Suite struct ScheduleMathApproximatePeriodTests {
+    @Test func everyScheduleHasTheDocumentedFirstBackupGracePeriod() {
+        #expect(ScheduleMath.approximatePeriod(of: .everyMinutes(30)) == 30 * 60)
+        #expect(ScheduleMath.approximatePeriod(of: .hourly(minute: 15)) == 60 * 60)
+        #expect(ScheduleMath.approximatePeriod(of: .daily(hour: 2, minute: 30)) == 24 * 60 * 60)
+        #expect(ScheduleMath.approximatePeriod(of: .weekly(weekday: 1, hour: 3, minute: 0)) == 7 * 24 * 60 * 60)
+    }
+}
+
 // MARK: - Rule 1: never-run is immediately due
 
 @Suite struct ScheduleMathNeverRunTests {

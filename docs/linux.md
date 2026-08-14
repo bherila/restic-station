@@ -842,6 +842,7 @@ $ restic-station-helper status --json
           "stale" : false
         }
       ],
+      "firstBackupOverdue" : false,
       "id" : "F1000000-0000-4000-8000-000000000001",
       "isRunning" : false,
       "lastBackup" : {
@@ -989,6 +990,7 @@ $ restic-station-helper status --json; echo "exit $?"
           "stale" : false
         }
       ],
+      "firstBackupOverdue" : false,
       "id" : "E1000000-0000-4000-8000-000000000001",
       "isRunning" : false,
       "lastBackup" : {
