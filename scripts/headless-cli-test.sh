@@ -339,6 +339,44 @@ echo "$(cat "$OUT_FILE")" | jq -e '.sets[0].abandonedRun.runId == "r-dead"' >/de
     || fail "abandoned fixture did not name the abandoned run"
 ok "abandoned fixture: status --json exits 1, health=warning, the dead run is named"
 
+# --- unattributed: current-run files whose sets were deleted from config. ---
+# These still determine global health and the exit code, so both a live and
+# an abandoned one must remain visible even though `sets[]` has nowhere to
+# carry them. A punctuation-heavy data dir red-checks the printed rm command.
+UNATTRIBUTED="$WORK/status unattributed; safe"
+make_status_fixture "$UNATTRIBUTED"
+jq '.sets = []' "$UNATTRIBUTED/config.json" > "$UNATTRIBUTED/config.json.tmp"
+mv "$UNATTRIBUTED/config.json.tmp" "$UNATTRIBUTED/config.json"
+UNATTRIBUTED_LIVE_SET_ID="10000000-0000-4000-8000-000000000001"
+UNATTRIBUTED_DEAD_SET_ID="20000000-0000-4000-8000-000000000002"
+mkdir -p "$UNATTRIBUTED/runs/r-unattributed-live"
+cat > "$UNATTRIBUTED/runs/r-unattributed-live/metadata.json" <<EOF
+{"runId":"r-unattributed-live","kind":"backup","setId":"$UNATTRIBUTED_LIVE_SET_ID","destId":"$PRIMARY_ID","groupId":"r-unattributed-live","status":"running","trigger":"manual","start":"$NOW_ISO","end":null,"pid":$$,"resticExitCode":null,"argvRedacted":[],"snapshotId":null,"filesNew":null,"filesChanged":null,"dataAdded":null,"errorSummary":null,"stats":null}
+EOF
+cat > "$UNATTRIBUTED/state/current-run-$UNATTRIBUTED_LIVE_SET_ID.json" <<EOF
+{"runId":"r-unattributed-live","kind":"backup","phase":"backing-up-primary","percentDone":0.25,"bytesDone":1,"totalBytes":4,"filesDone":1,"totalFiles":4,"currentFiles":[],"updatedAt":"$NOW_ISO"}
+EOF
+cat > "$UNATTRIBUTED/state/current-run-$UNATTRIBUTED_DEAD_SET_ID.json" <<EOF
+{"runId":"r-unattributed-dead","kind":"backup","phase":"backing-up-primary","percentDone":0.5,"bytesDone":2,"totalBytes":4,"filesDone":2,"totalFiles":4,"currentFiles":[],"updatedAt":"$NOW_ISO"}
+EOF
+RESTIC_STATION_DATA_DIR="$UNATTRIBUTED" run_helper status --json
+expect_rc 1
+echo "$(cat "$OUT_FILE")" | jq -e '
+    (.sets | length) == 0
+    and (.unattributedRuns | length) == 2
+    and any(.unattributedRuns[]; .currentRun.runId == "r-unattributed-live" and .liveness == "live")
+    and any(.unattributedRuns[]; .currentRun.runId == "r-unattributed-dead" and .liveness == "abandoned")
+' >/dev/null || fail "unattributed live/abandoned runs were not both explained in JSON"
+RESTIC_STATION_DATA_DIR="$UNATTRIBUTED" run_helper status
+expect_rc 1
+grep -qF "LIVE: backup run r-unattributed-live" "$OUT_FILE" \
+    || fail "human status did not name the unattributed live run"
+grep -qF "ABANDONED: backup run r-unattributed-dead" "$OUT_FILE" \
+    || fail "human status did not name the unattributed abandoned run"
+grep -qF "rm '$UNATTRIBUTED/state/current-run-$UNATTRIBUTED_DEAD_SET_ID.json'" "$OUT_FILE" \
+    || fail "human status did not shell-quote the unattributed run cleanup path"
+ok "unattributed fixture: live and abandoned runs explain global health in JSON and human output"
+
 # --- failed: last backup failed. ---
 FAILED="$WORK/status-failed"
 make_status_fixture "$FAILED"

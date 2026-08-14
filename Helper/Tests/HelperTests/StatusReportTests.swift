@@ -110,7 +110,7 @@ struct StatusReportTests {
     func healthyReportHasNoFlags() {
         let report = StatusReport(
             machineId: "studio-mac", generatedAt: Date(), health: "idle", fullDiskAccessDenied: false, scheduler: nil,
-            sets: [makeSetStatus(needsAttention: false, isRunning: false)], excludedHere: []
+            sets: [makeSetStatus(needsAttention: false, isRunning: false)], unattributedRuns: [], excludedHere: []
         )
         let lines = report.humanLines().joined(separator: "\n")
         #expect(!lines.contains("NEEDS ATTENTION"))
@@ -120,7 +120,7 @@ struct StatusReportTests {
     func warningReportFlagsTheSet() {
         let report = StatusReport(
             machineId: "studio-mac", generatedAt: Date(), health: "warning", fullDiskAccessDenied: false, scheduler: nil,
-            sets: [makeSetStatus(needsAttention: true, isRunning: false)], excludedHere: []
+            sets: [makeSetStatus(needsAttention: true, isRunning: false)], unattributedRuns: [], excludedHere: []
         )
         let lines = report.humanLines().joined(separator: "\n")
         #expect(lines.contains("NEEDS ATTENTION"))
@@ -134,7 +134,7 @@ struct StatusReportTests {
         let omission = ResolvedOmission(subject: .backupSet, id: setId, name: "Photos", reason: .disabledForMachine)
         let report = StatusReport(
             machineId: "mirror-box", generatedAt: Date(), health: "idle", fullDiskAccessDenied: false, scheduler: nil,
-            sets: [], excludedHere: [StatusReport.Exclusion(omission: omission)]
+            sets: [], unattributedRuns: [], excludedHere: [StatusReport.Exclusion(omission: omission)]
         )
         let lines = report.humanLines().joined(separator: "\n")
         #expect(lines.contains("excluded here, and why"))
@@ -148,7 +148,7 @@ struct StatusReportTests {
         let report = StatusReport(
             machineId: "studio-mac", generatedAt: Date(timeIntervalSince1970: 0), health: "idle",
             fullDiskAccessDenied: false, scheduler: nil, sets: [makeSetStatus(needsAttention: false, isRunning: false)],
-            excludedHere: []
+            unattributedRuns: [], excludedHere: []
         )
         let data = try ConfigStore.makeEncoder().encode(report)
         let text = String(decoding: data, as: UTF8.self)
@@ -157,9 +157,35 @@ struct StatusReportTests {
         #expect(text.contains("\"lastPrune\" : null"))
         #expect(text.contains("\"currentRun\" : null"))
         #expect(text.contains("\"lastSyncedAt\" : null"))
+        #expect(text.contains("\"unattributedRuns\" : ["))
         // `reachable: false` is a real, known value here — not null — but
         // "not yet probed" (nil) must still round-trip as explicit null
         // elsewhere; covered by encoding a destination with no repo-status.
+    }
+
+    @Test("an unattributed abandoned run renders with a named, shell-quoted cleanup path")
+    func unattributedRunsRender() {
+        let run = CurrentRunState(
+            runId: "orphaned-run", kind: .backup, phase: "backing-up-primary", percentDone: 0.5,
+            bytesDone: 1, totalBytes: 2, filesDone: 1, totalFiles: 2, currentFiles: [], updatedAt: Date()
+        )
+        let path = "/tmp/status state;safe/current-run.json"
+        let report = StatusReport(
+            machineId: "studio-mac", generatedAt: Date(), health: "warning",
+            fullDiskAccessDenied: false, scheduler: nil, sets: [],
+            unattributedRuns: [
+                StatusReport.UnattributedRun(
+                    setId: setId, liveness: .abandoned,
+                    currentRun: StatusReport.CurrentRunSummary(run), currentRunFile: path
+                ),
+            ],
+            excludedHere: []
+        )
+
+        let lines = report.humanLines().joined(separator: "\n")
+        #expect(lines.contains("current runs for sets no longer configured"))
+        #expect(lines.contains("ABANDONED: backup run orphaned-run"))
+        #expect(lines.contains("rm '/tmp/status state;safe/current-run.json'"))
     }
 
     @Test("a never-probed destination's reachable/lastSyncedAt/lastError all encode null, not false/omitted")

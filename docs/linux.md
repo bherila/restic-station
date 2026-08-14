@@ -857,6 +857,9 @@ $ restic-station-helper status --json
       "needsAttention" : false,
       "nextDue" : "2026-08-06T23:08:33.941Z"
     }
+  ],
+  "unattributedRuns" : [
+
   ]
 }
 (exit 1)
@@ -1001,6 +1004,9 @@ $ restic-station-helper status --json; echo "exit $?"
       "needsAttention" : false,
       "nextDue" : "2026-08-06T23:10:01.983Z"
     }
+  ],
+  "unattributedRuns" : [
+
   ]
 }
 exit 1
