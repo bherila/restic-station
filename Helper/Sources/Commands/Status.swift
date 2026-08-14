@@ -172,6 +172,24 @@ struct Status: AsyncParsableCommand {
             )
         }
 
+        // A current-run file can outlive the set it belonged to. It still
+        // contributes to app health and the exit code, so omitting it from
+        // the report would make those verdicts impossible to explain.
+        // Reuse the point-in-time liveness snapshot above: this must not
+        // re-probe a process after the scheduler subprocesses have run.
+        let configuredSetIds = Set(scheduled.config.sets.map(\.id))
+        let unattributedRuns: [StatusReport.UnattributedRun] = currentRuns
+            .filter { !configuredSetIds.contains($0.key) }
+            .sorted { $0.key.uuidString < $1.key.uuidString }
+            .map { setId, run in
+                StatusReport.UnattributedRun(
+                    setId: setId,
+                    liveness: isRunAbandoned(run) ? .abandoned : .live,
+                    currentRun: StatusReport.CurrentRunSummary(run),
+                    currentRunFile: paths.currentRunFile(setId: setId).path
+                )
+            }
+
         let excludedHere: [StatusReport.Exclusion] = scheduled.omissions.map { omission in
             StatusReport.Exclusion(omission: omission)
         }
@@ -183,6 +201,7 @@ struct Status: AsyncParsableCommand {
             fullDiskAccessDenied: fdaDenied,
             scheduler: scheduler,
             sets: sets,
+            unattributedRuns: unattributedRuns,
             excludedHere: excludedHere
         )
 
@@ -338,8 +357,7 @@ struct StatusReport: Encodable {
         let filesDone: Int
         let totalFiles: Int
 
-        init?(_ state: CurrentRunState?) {
-            guard let state else { return nil }
+        init(_ state: CurrentRunState) {
             runId = state.runId
             kind = state.kind.rawValue
             phase = state.phase
@@ -349,6 +367,26 @@ struct StatusReport: Encodable {
             filesDone = state.filesDone
             totalFiles = state.totalFiles
         }
+
+        init?(_ state: CurrentRunState?) {
+            guard let state else { return nil }
+            self.init(state)
+        }
+    }
+
+    /// A `current-run-<setId>.json` whose set is absent from this machine's
+    /// resolved configuration. These runs still affect global health; this
+    /// record makes that effect attributable in JSON and human output.
+    struct UnattributedRun: Encodable {
+        enum Liveness: String, Encodable {
+            case live
+            case abandoned
+        }
+
+        let setId: UUID
+        let liveness: Liveness
+        let currentRun: CurrentRunSummary
+        let currentRunFile: String
     }
 
     struct DestinationStatus: Encodable {
@@ -499,10 +537,12 @@ struct StatusReport: Encodable {
     let fullDiskAccessDenied: Bool
     let scheduler: SchedulerStatus?
     let sets: [SetStatus]
+    let unattributedRuns: [UnattributedRun]
     let excludedHere: [Exclusion]
 
     private enum CodingKeys: String, CodingKey {
-        case machineId, generatedAt, health, fullDiskAccessDenied, scheduler, sets, excludedHere
+        case machineId, generatedAt, health, fullDiskAccessDenied, scheduler, sets
+        case unattributedRuns, excludedHere
     }
 
     // Explicit `null` for `scheduler` — see
@@ -517,6 +557,7 @@ struct StatusReport: Encodable {
         try container.encode(fullDiskAccessDenied, forKey: .fullDiskAccessDenied)
         try container.encode(scheduler, forKey: .scheduler)
         try container.encode(sets, forKey: .sets)
+        try container.encode(unattributedRuns, forKey: .unattributedRuns)
         try container.encode(excludedHere, forKey: .excludedHere)
     }
 
@@ -588,6 +629,24 @@ struct StatusReport: Encodable {
                 let error = destination.lastError.map { " (\($0))" } ?? ""
                 let staleFlag = destination.stale ? ", STALE" : ""
                 lines.append("      - \(role) \"\(destination.label)\": \(reach)\(error)\(staleFlag)")
+            }
+        }
+
+        if !unattributedRuns.isEmpty {
+            lines.append("")
+            lines.append("current runs for sets no longer configured:")
+            for item in unattributedRuns {
+                let run = item.currentRun
+                let state = item.liveness == .abandoned ? "ABANDONED" : "LIVE"
+                lines.append(
+                    "  - \(state): \(run.kind) run \(run.runId) for set "
+                        + "\(item.setId.uuidString.lowercased()) "
+                        + "(\(run.phase), \(run.percentDone)%)"
+                )
+                let cleanup = item.liveness == .abandoned
+                    ? "the next tick clears it; to clear it now: "
+                    : "the running helper should clear it when it finishes; to clear it now: "
+                lines.append("    \(cleanup)rm \(ShellQuoting.quoteIfNeeded(item.currentRunFile))")
             }
         }
 

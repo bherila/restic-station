@@ -510,11 +510,14 @@ Two things `status` will **not** do quietly, both of which used to make it repor
       ]
     }
   ],
+  "unattributedRuns": [],
   "excludedHere": []
 }
 ```
 
 `health`: `"idle"` | `"running"` | `"warning"` (`AppHealth.rawValue`). Exit code: **0** for `idle`/`running`, **1** for `warning` — usable directly as a Nagios/Icinga-style check. `lastBackup`/`lastCheck`/`lastPrune` are `null` before any attempt of that kind; `reachable` is `null` — never `false` — for a destination that has not been probed yet (`state/repo-status-<destId>.json` absent), the same "absent means not yet known, never a definite negative" rule `fda-check.json` uses. `excludedHere` has the same shape as `config show`'s.
+
+`unattributedRuns` contains any `current-run-<setId>.json` whose set is no longer in this machine's resolved configuration. Each entry carries the missing `setId`, `liveness` (`"live"` or `"abandoned"`), the usual `currentRun` summary, and the exact `currentRunFile`. These runs still determine top-level health and the exit code, so an empty `sets` array never leaves their effect unexplained. Human output names the same run and prints a shell-quoted cleanup command.
 
 ### `sets list --json`
 
