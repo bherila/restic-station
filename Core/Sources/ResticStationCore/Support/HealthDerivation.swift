@@ -14,11 +14,10 @@ public enum AppHealth: String, Equatable, Sendable, CaseIterable {
     /// `.warning`: while restic is working, "working" is the more
     /// informative state.
     case running
-    /// Last run of any set failed, OR any destination is stale, OR a run was
-    /// killed and left its `current-run-*.json` behind, OR the Full Disk
-    /// Access probe came back denied, OR a first backup is overdue, OR the
-    /// scheduler is known not to be registered (so scheduled backups are not
-    /// actually happening).
+    /// Last run of any set failed, OR any destination is stale, OR a run is
+    /// stalled/abandoned, OR the Full Disk Access probe came back denied, OR
+    /// a first backup is overdue, OR the scheduler is known not to be
+    /// registered (so scheduled backups are not actually happening).
     case warning
 }
 
@@ -42,7 +41,8 @@ public struct SetHealth: Identifiable, Equatable, Sendable {
     public let lastRun: RunIndexEntry?
     /// Live progress, from `state/current-run-<setId>.json`. Non-`nil` ⟺
     /// a run is in flight for this set **and the process running it is still
-    /// alive** — see `abandonedRun` for the other case.
+    /// alive and heartbeating** — see `stalledRun` and `abandonedRun` for the
+    /// other cases.
     public let currentRun: CurrentRunState?
     /// A `state/current-run-<setId>.json` whose process is gone
     /// (`RunStore.liveness(ofCurrentRun:) == .abandoned`): a run that was
@@ -58,6 +58,11 @@ public struct SetHealth: Identifiable, Equatable, Sendable {
     /// it. The tick clears it on its next pass (`RunStore.recoverInterrupted`
     /// + `Tick` step 3), so on a healthy host this is transient.
     public let abandonedRun: CurrentRunState?
+    /// A run whose process still exists but whose independent heartbeat has
+    /// stopped. It is not safe to call this progress, and unlike abandoned
+    /// wreckage the current-run file must not be deleted while the process
+    /// still owns the set lock.
+    public let stalledRun: CurrentRunState?
     /// This set has no run history, no recorded backup attempt and no run in
     /// flight, and has remained visible on this machine beyond the larger of
     /// one schedule period and 24 hours. It closes the fresh-install hole
@@ -81,6 +86,7 @@ public struct SetHealth: Identifiable, Equatable, Sendable {
         staleDestinationIds: [UUID],
         nextDue: Date,
         abandonedRun: CurrentRunState? = nil,
+        stalledRun: CurrentRunState? = nil,
         firstBackupOverdue: Bool = false
     ) {
         self.setId = setId
@@ -91,6 +97,7 @@ public struct SetHealth: Identifiable, Equatable, Sendable {
         self.staleDestinationIds = staleDestinationIds
         self.nextDue = nextDue
         self.abandonedRun = abandonedRun
+        self.stalledRun = stalledRun
         self.firstBackupOverdue = firstBackupOverdue
     }
 
@@ -114,9 +121,11 @@ public struct SetHealth: Identifiable, Equatable, Sendable {
 
     public var hasAbandonedRun: Bool { abandonedRun != nil }
 
+    public var hasStalledRun: Bool { stalledRun != nil }
+
     /// This set contributes `.warning` to the global `AppHealth`.
     public var needsAttention: Bool {
-        lastRunFailed || hasStaleDestination || hasAbandonedRun || firstBackupOverdue
+        lastRunFailed || hasStaleDestination || hasAbandonedRun || hasStalledRun || firstBackupOverdue
     }
 
     /// 0...100, rounded, clamped — restic reports `percent_done` as a 0...1
@@ -149,14 +158,14 @@ public enum HealthDerivation {
     ///   - recentRuns: `RunStore.recentRuns` output, **newest first**
     ///     (as published by the app's `StateWatcher`).
     ///   - currentRuns: every `state/current-run-<setId>.json` that exists,
-    ///     keyed by `BackupSet.id` — live *and* abandoned; `isRunAbandoned`
-    ///     is what tells the two apart.
+    ///     keyed by `BackupSet.id` — live, stalled and abandoned;
+    ///     `runLiveness` tells the three apart.
     ///   - repoStatuses: destination status keyed by `Destination.id`.
     ///   - scheduleState: `state/schedule-state.json`, or `nil` if absent.
     ///   - visibleSince: later mtime of `config.json` and `machine.json`, or
     ///     `nil` when unavailable. Injected to keep this derivation pure.
-    ///   - isRunAbandoned: `RunStore.liveness(ofCurrentRun:) == .abandoned`
-    ///     in production. Injected rather than called directly because this
+    ///   - runLiveness: `RunStore.liveness(ofCurrentRun:)` in production.
+    ///     Injected rather than called directly because this
     ///     type is pure by contract (no clock, no filesystem) and the answer
     ///     needs to read `runs/<runId>/metadata.json`.
     public static func setHealths(
@@ -168,7 +177,7 @@ public enum HealthDerivation {
         now: Date,
         calendar: Calendar,
         visibleSince: Date? = nil,
-        isRunAbandoned: (CurrentRunState) -> Bool = { _ in false }
+        runLiveness: (CurrentRunState) -> CurrentRunLiveness = { _ in .live }
     ) -> [SetHealth] {
         config.sets.map { set in
             setHealth(
@@ -180,7 +189,7 @@ public enum HealthDerivation {
                 now: now,
                 calendar: calendar,
                 visibleSince: visibleSince,
-                isRunAbandoned: isRunAbandoned
+                runLiveness: runLiveness
             )
         }
     }
@@ -196,7 +205,7 @@ public enum HealthDerivation {
         now: Date,
         calendar: Calendar,
         visibleSince: Date? = nil,
-        isRunAbandoned: (CurrentRunState) -> Bool = { _ in false }
+        runLiveness: (CurrentRunState) -> CurrentRunLiveness = { _ in .live }
     ) -> SetHealth {
         // `recentRuns` is newest-first, so the first match in each filter is
         // the most recent one. `.running` entries are skipped: an in-flight
@@ -225,11 +234,13 @@ public enum HealthDerivation {
             }
             .map(\.id)
 
-        // One progress file, two possible meanings. Splitting it here — the
+        // One progress file, three possible meanings. Splitting it here — the
         // single place that reads it — is what keeps every consumer honest:
         // `isRunning`, `progressPercent` and `AppHealth.running` all follow
         // `currentRun`, and none of them can be fooled by wreckage again.
-        let abandonedRun = currentRun.flatMap { isRunAbandoned($0) ? $0 : nil }
+        let liveness = currentRun.map(runLiveness)
+        let abandonedRun = liveness == .abandoned ? currentRun : nil
+        let stalledRun = liveness == .stalled ? currentRun : nil
 
         let neverAttempted = setScheduleState?.lastBackupStart == nil
             && runsForSet.isEmpty
@@ -251,7 +262,7 @@ public enum HealthDerivation {
             name: set.name,
             lastBackup: lastBackup,
             lastRun: lastRun,
-            currentRun: abandonedRun == nil ? currentRun : nil,
+            currentRun: liveness == .live ? currentRun : nil,
             staleDestinationIds: staleDestinationIds,
             nextDue: nextDue(
                 schedule: set.schedule,
@@ -260,6 +271,7 @@ public enum HealthDerivation {
                 calendar: calendar
             ),
             abandonedRun: abandonedRun,
+            stalledRun: stalledRun,
             firstBackupOverdue: firstBackupOverdue
         )
     }
@@ -328,9 +340,9 @@ public enum HealthDerivation {
     /// The menu bar icon's state.
     ///
     /// `.running` still outranks `.warning` — while restic is working,
-    /// "working" is the more informative state — but only a *live* run
-    /// counts. Before `isRunAbandoned` existed, one `SIGKILL`ed run left a
-    /// `current-run-*.json` that nothing ever deleted, and this function
+    /// "working" is the more informative state — but only a *live,
+    /// heartbeating* run counts. Before liveness was derived, one `SIGKILL`ed
+    /// run left a `current-run-*.json` that nothing ever deleted, and this function
     /// returned `.running` from then until the end of time: green menu bar,
     /// `status` exit 0, no backups. The precedence is unchanged; what
     /// changed is that "in flight" now has to be true.
@@ -341,7 +353,7 @@ public enum HealthDerivation {
     ///     before the set was deleted is still running, and its wreckage is
     ///     still wreckage). `setHealths` only covers configured sets, which
     ///     is why this is a separate parameter rather than derived from it.
-    ///   - isRunAbandoned: see `setHealths(…)`. Must be the same predicate
+    ///   - runLiveness: see `setHealths(…)`. Must be the same predicate
     ///     passed there, or the two halves of this decision disagree.
     ///   - fullDiskAccessDenied: from `state/fda-check.json`, via
     ///     `fullDiskAccessDenied(from:)` — "not yet known" (or "not
@@ -360,9 +372,9 @@ public enum HealthDerivation {
         runsInFlight: [CurrentRunState],
         fullDiskAccessDenied: Bool,
         backgroundAgentEnabled: Bool?,
-        isRunAbandoned: (CurrentRunState) -> Bool = { _ in false }
+        runLiveness: (CurrentRunState) -> CurrentRunLiveness = { _ in .live }
     ) -> AppHealth {
-        let liveRuns = runsInFlight.filter { !isRunAbandoned($0) }
+        let liveRuns = runsInFlight.filter { runLiveness($0) == .live }
         if !liveRuns.isEmpty || setHealths.contains(where: \.isRunning) {
             return .running
         }
@@ -371,7 +383,7 @@ public enum HealthDerivation {
             runsInFlight: runsInFlight,
             fullDiskAccessDenied: fullDiskAccessDenied,
             backgroundAgentEnabled: backgroundAgentEnabled,
-            isRunAbandoned: isRunAbandoned
+            runLiveness: runLiveness
         ) {
             return .warning
         }
@@ -397,15 +409,15 @@ public enum HealthDerivation {
         runsInFlight: [CurrentRunState],
         fullDiskAccessDenied: Bool,
         backgroundAgentEnabled: Bool?,
-        isRunAbandoned: (CurrentRunState) -> Bool = { _ in false }
+        runLiveness: (CurrentRunState) -> CurrentRunLiveness = { _ in .live }
     ) -> Bool {
-        // An abandoned run for a set that is no longer configured has no
+        // An unhealthy run for a set that is no longer configured has no
         // `SetHealth` to carry it, so it is counted here directly — otherwise
         // deleting a set would be a way to silence the warning about the run
         // it was killed in the middle of.
-        let abandonedRuns = runsInFlight.filter(isRunAbandoned).count
+        let unhealthyRuns = runsInFlight.filter { runLiveness($0) != .live }.count
         return setHealths.contains(where: \.needsAttention)
-            || abandonedRuns > 0
+            || unhealthyRuns > 0
             || fullDiskAccessDenied
             || backgroundAgentEnabled == false
     }

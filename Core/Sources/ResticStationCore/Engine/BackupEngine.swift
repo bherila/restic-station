@@ -1,4 +1,5 @@
 import Foundation
+import Dispatch
 
 // MARK: - RestoreRequest
 
@@ -113,6 +114,11 @@ public final class BackupEngine: Sendable {
     /// (`docs/architecture.md` §Process model: "≤ 1 write per 1–2 s").
     static let progressWriteInterval: TimeInterval = 1.5
 
+    /// Independent liveness write cadence. This is intentionally much slower
+    /// than progress updates: its only job is to prove the helper can still
+    /// execute, including during restic phases that emit no output for hours.
+    static let currentRunHeartbeatInterval: TimeInterval = 30
+
     /// Structure-only checks of the secondaries run on every Nth successful
     /// check of the primary (`docs/scheduling.md` §Check scheduling).
     static let secondaryCheckEveryNChecks = 4
@@ -129,6 +135,7 @@ public final class BackupEngine: Sendable {
     private let stateStore: StateStore
     private let reachability: Reachability
     private let now: @Sendable () -> Date
+    private let uptime: @Sendable () -> TimeInterval
 
     public init(
         config: AppConfig,
@@ -138,7 +145,8 @@ public final class BackupEngine: Sendable {
         runStore: RunStore,
         stateStore: StateStore,
         reachability: Reachability,
-        now: @escaping @Sendable () -> Date = Date.init
+        now: @escaping @Sendable () -> Date = Date.init,
+        uptime: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
     ) {
         self.config = config
         self.paths = paths
@@ -148,6 +156,7 @@ public final class BackupEngine: Sendable {
         self.stateStore = stateStore
         self.reachability = reachability
         self.now = now
+        self.uptime = uptime
     }
 
     // MARK: - runSet
@@ -687,9 +696,11 @@ public final class BackupEngine: Sendable {
         defer { logWriter?.close() }
         logWriter?.appendLine("$ \(run.argvRedacted.joined(separator: " "))")
 
-        if let preflightPhase {
-            progressReporter(setId: setId, run: run, phase: preflightPhase).writePhaseMarker()
-        }
+        let reporter = progressReporter(setId: setId, run: run, phase: preflightPhase ?? phase)
+        reporter.writePhaseMarker()
+        reporter.startHeartbeat()
+        defer { reporter.stopHeartbeat() }
+
         if let preflight, let reason = await preflight(logWriter) {
             logWriter?.appendLine("aborted: \(reason)")
             finish(run, status: .failed, errorSummary: reason)
@@ -699,8 +710,9 @@ public final class BackupEngine: Sendable {
             )
         }
 
-        let reporter = progressReporter(setId: setId, run: run, phase: phase)
-        reporter.writePhaseMarker()
+        if preflightPhase != nil {
+            reporter.beginPhase(phase)
+        }
 
         let result = await execute(
             command,
@@ -876,7 +888,9 @@ public final class BackupEngine: Sendable {
             runId: run.runId,
             kind: run.kind,
             phase: phase,
-            now: now
+            now: now,
+            uptime: uptime,
+            heartbeatInterval: Self.currentRunHeartbeatInterval
         )
     }
 
@@ -1037,9 +1051,9 @@ public final class BackupEngine: Sendable {
 ///
 /// One instance per child run: the throttle window is per phase, so the
 /// first `status` line of every phase lands immediately and the UI never
-/// waits for progress to appear. `@unchecked Sendable` because the restic
-/// stdout callback runs on the process runner's reader queue — the mutable
-/// timestamp is guarded by the lock.
+/// waits for progress to appear. An independent timer refreshes only the
+/// heartbeat fields. `@unchecked Sendable` because the restic stdout callback
+/// and timer run on different queues; all mutable state is guarded by `lock`.
 ///
 /// Internal rather than private so the throttle can be exercised directly by
 /// `BackupEngineTests` (a set run deletes `current-run` when it ends, so the
@@ -1049,11 +1063,17 @@ final class ProgressReporter: @unchecked Sendable {
     private let setId: UUID
     private let runId: String
     private let kind: RunKind
-    private let phase: String
     private let now: @Sendable () -> Date
+    private let uptime: @Sendable () -> TimeInterval
+    private let heartbeatInterval: TimeInterval
+    private let heartbeatQueue: DispatchQueue
 
     private let lock = NSLock()
-    private var lastWriteAt: Date?
+    private var phase: String
+    private var lastProgressWriteAt: Date?
+    private var latestState: CurrentRunState?
+    private var heartbeatTimer: DispatchSourceTimer?
+    private var heartbeatActive = false
 
     init(
         stateStore: StateStore,
@@ -1061,7 +1081,9 @@ final class ProgressReporter: @unchecked Sendable {
         runId: String,
         kind: RunKind,
         phase: String,
-        now: @escaping @Sendable () -> Date
+        now: @escaping @Sendable () -> Date,
+        uptime: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+        heartbeatInterval: TimeInterval = BackupEngine.currentRunHeartbeatInterval
     ) {
         self.stateStore = stateStore
         self.setId = setId
@@ -1069,11 +1091,29 @@ final class ProgressReporter: @unchecked Sendable {
         self.kind = kind
         self.phase = phase
         self.now = now
+        self.uptime = uptime
+        self.heartbeatInterval = heartbeatInterval
+        self.heartbeatQueue = DispatchQueue(label: "net.herila.ResticStation.current-run-heartbeat.\(setId)")
+    }
+
+    deinit {
+        heartbeatTimer?.cancel()
     }
 
     /// One unthrottled write announcing the phase, with zeroed counters.
     /// Deliberately does not arm the throttle.
     func writePhaseMarker() {
+        beginPhase(phase)
+    }
+
+    /// Announces a new child phase immediately and resets its progress. The
+    /// same reporter (and heartbeat) spans preflight and the restic command,
+    /// so a wedged probe is detectable too.
+    func beginPhase(_ newPhase: String) {
+        let at = now()
+        let heartbeatUptime = uptime()
+        lock.lock()
+        phase = newPhase
         write(
             percentDone: 0,
             bytesDone: 0,
@@ -1081,21 +1121,78 @@ final class ProgressReporter: @unchecked Sendable {
             filesDone: 0,
             totalFiles: 0,
             currentFiles: [],
-            at: now()
+            at: at,
+            heartbeatUptime: heartbeatUptime
         )
+        lock.unlock()
+    }
+
+    /// Starts a dedicated dispatch timer rather than a child Swift task. A
+    /// restic await or a wedged cooperative task must not stop the evidence
+    /// that tells health checks whether this helper can still execute.
+    func startHeartbeat() {
+        lock.lock()
+        guard !heartbeatActive else {
+            lock.unlock()
+            return
+        }
+        heartbeatActive = true
+        let timer = DispatchSource.makeTimerSource(queue: heartbeatQueue)
+        heartbeatTimer = timer
+        lock.unlock()
+
+        timer.schedule(
+            deadline: .now() + heartbeatInterval,
+            repeating: heartbeatInterval,
+            leeway: .seconds(1)
+        )
+        timer.setEventHandler { [weak self] in
+            self?.writeHeartbeat()
+        }
+        timer.resume()
+    }
+
+    /// Cancels future writes and waits for any write already in flight to
+    /// leave the lock. The set-level cleanup can then delete current-run
+    /// without a late heartbeat recreating it.
+    func stopHeartbeat() {
+        lock.lock()
+        heartbeatActive = false
+        let timer = heartbeatTimer
+        heartbeatTimer = nil
+        lock.unlock()
+        timer?.cancel()
+    }
+
+    /// Internal for deterministic tests; the production timer calls the same
+    /// path. A heartbeat changes only its own timestamps, never the visible
+    /// progress fields or `updatedAt`.
+    func writeHeartbeat() {
+        let at = now()
+        let heartbeatUptime = uptime()
+        lock.lock()
+        defer { lock.unlock() }
+        guard heartbeatActive, var state = latestState else { return }
+        state.heartbeatAt = at
+        state.heartbeatUptime = heartbeatUptime
+        latestState = state
+        persist(state)
     }
 
     /// Writes one streamed `status` line, at most once per
     /// `BackupEngine.progressWriteInterval`.
     func record(_ status: BackupStatus) {
         let at = now()
+        let heartbeatUptime = uptime()
         lock.lock()
-        let shouldWrite = BackupEngine.shouldWriteProgress(lastWriteAt: lastWriteAt, now: at)
+        let shouldWrite = BackupEngine.shouldWriteProgress(lastWriteAt: lastProgressWriteAt, now: at)
         if shouldWrite {
-            lastWriteAt = at
+            lastProgressWriteAt = at
         }
-        lock.unlock()
-        guard shouldWrite else { return }
+        guard shouldWrite else {
+            lock.unlock()
+            return
+        }
 
         write(
             percentDone: status.percentDone,
@@ -1104,8 +1201,10 @@ final class ProgressReporter: @unchecked Sendable {
             filesDone: status.filesDone ?? 0,
             totalFiles: status.totalFiles ?? 0,
             currentFiles: status.currentFiles ?? [],
-            at: at
+            at: at,
+            heartbeatUptime: heartbeatUptime
         )
+        lock.unlock()
     }
 
     private func write(
@@ -1115,7 +1214,8 @@ final class ProgressReporter: @unchecked Sendable {
         filesDone: Int,
         totalFiles: Int,
         currentFiles: [String],
-        at: Date
+        at: Date,
+        heartbeatUptime: TimeInterval
     ) {
         let state = CurrentRunState(
             runId: runId,
@@ -1127,8 +1227,17 @@ final class ProgressReporter: @unchecked Sendable {
             filesDone: filesDone,
             totalFiles: totalFiles,
             currentFiles: currentFiles,
+            heartbeatAt: at,
+            heartbeatUptime: heartbeatUptime,
             updatedAt: at
         )
+        latestState = state
+        persist(state)
+    }
+
+    /// Caller holds `lock`, serializing progress and heartbeat writes so an
+    /// older heartbeat snapshot can never overwrite newer progress.
+    private func persist(_ state: CurrentRunState) {
         do {
             try stateStore.writeCurrentRun(setId: setId, state)
         } catch {

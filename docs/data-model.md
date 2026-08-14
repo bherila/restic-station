@@ -336,6 +336,8 @@ Superset of the index line, plus: `pid`, `resticExitCode`, `argvRedacted` (argv 
   "filesDone": 120,
   "totalFiles": 4000,
   "currentFiles": ["/Users/user/proj/big.dat"],
+  "heartbeatAt": "2026-07-26T20:57:29Z",
+  "heartbeatUptime": 84721.4,
   "updatedAt": "2026-07-26T20:57:30Z"
 }
 ```
@@ -349,10 +351,12 @@ unconditionally-trusted leftover pins a machine green forever: menu bar blue,
 `status` exit 0, no backups. Every reader therefore checks whether the run is
 still alive before treating it as in flight —
 `RunStore.liveness(ofCurrentRun:)`, which reads the run's own
-`runs/<runId>/metadata.json` and applies the same `pid` + `kill(pid, 0)` test
-`recoverInterrupted()` uses, so the two can never disagree about whether a run
-died. Not alive ⟹ the set reports `needsAttention` with the file named, not
-`isRunning`.
+`runs/<runId>/metadata.json`, verifies the pid with `kill(pid, 0)`, and checks
+the independent heartbeat. A missing process is **abandoned**; a present
+process whose heartbeat is more than five minutes old is **stalled**. Both
+report `needsAttention` and `isRunning: false`. An abandoned file can be
+cleared; a stalled run still owns the set lock, so status names its log for
+diagnosis instead of suggesting deletion.
 
 **The pid alone decides it — deliberately not the recorded `status` as well.**
 A set run is several child runs under one `current-run` file: `performChild`
@@ -364,12 +368,14 @@ A missing run directory is still abandonment: `begin(...)` writes
 `metadata.json` before the first progress write, so a `current-run` pointing at
 a run this data directory has no record of describes nothing.
 
-Deliberately **not** a staleness rule on `updatedAt`. Progress is written only
+Liveness is deliberately **not** a staleness rule on `updatedAt`. Progress is written only
 when restic emits a `status` line (throttled), and some phases legitimately
 emit nothing for hours — a `check --read-data` on a large repository writes
-one phase marker and then goes quiet. Any "no progress for N minutes ⟹ dead"
-threshold either cries wolf on those runs or is set so high it stops being a
-health check.
+one phase marker and then goes quiet. The helper therefore writes
+`heartbeatAt` and `heartbeatUptime` every 30 seconds independently of progress.
+The uptime value ages only while the machine is awake, so normal sleep cannot
+create a false stall; `updatedAt` remains the timestamp of visible progress.
+Files written by older releases have no heartbeat and retain pid-only behavior.
 
 The tick clears it: `recoverInterrupted()` returns the `setId` alongside the
 `runId` precisely so step 3 can delete the matching progress file, guarded on
@@ -464,12 +470,13 @@ Never a secret: `nonSecretEnv` is exactly `Destination.nonSecretEnv` (never the 
 
 Reads only existing state (`state/schedule-state.json`, `state/current-run-*.json`, `state/repo-status-*.json`, `runs/index.jsonl`) — no restic invocation. `health` reuses `HealthDerivation.appHealth` verbatim (`Core/Sources/ResticStationCore/Support/HealthDerivation.swift`), so the CLI and the app's menu bar can never disagree about what counts as a warning.
 
-On Linux it also inspects the scheduler, through the same `SystemdTimerManager` `timer status` exits on — see `scheduling.md` §`status` and the scheduler for the three-valued `scheduler` key and why `null` (macOS, or a host with no systemd) is not the same as `"healthy": false`. Only a definite `false` contributes a warning.
+It also inspects the platform scheduler: the same `SystemdTimerManager` used by `timer status` on Linux, and `launchctl print gui/$UID/net.herila.ResticStation.helper` on macOS. See `scheduling.md` §`status` and the scheduler. Only a definite `false` contributes a warning; a failed probe reports `healthy: null`.
 
 Three things `status` will **not** do quietly, all of which used to make it report healthy for the wrong reason:
 
 - An **unreadable `runs/index.jsonl`** (wrong owner, wrong mode, I/O error) exits non-zero naming the file, instead of reading as "no runs recorded" — which derives to idle, which exits 0. A corrupt or truncated *line* stays survivable: `RunStore.recentRuns` skips it with a warning, as documented above.
 - An **abandoned `current-run-*.json`** (see §state/current-run) reports `warning` with `abandonedRun` populated and `isRunning: false`, instead of `running`.
+- A **stalled run** whose process still exists but has stopped heartbeating reports `warning` with `stalledRun` and `stalledRunLog` populated. It is never offered as safe-to-delete wreckage.
 - A set whose **first backup was never attempted** reports `firstBackupOverdue: true` after the larger of one schedule period and 24 hours from the later `config.json`/`machine.json` mtime. Missing mtimes disable this condition; a live run, any run history, or `lastBackupStart` proves setup progressed and disables it.
 
 ```json
@@ -478,7 +485,7 @@ Three things `status` will **not** do quietly, all of which used to make it repo
   "generatedAt": "2026-07-26T20:57:30.000Z",
   "health": "warning",
   "fullDiskAccessDenied": false,
-  "scheduler": null,
+  "scheduler": {"kind": "launchd-agent", "healthy": true, "problems": [], "summaries": []},
   "sets": [
     {
       "id": "6F9619FF-8B86-D011-B42D-00C04FC964FF",
@@ -488,6 +495,8 @@ Three things `status` will **not** do quietly, all of which used to make it repo
       "firstBackupOverdue": false,
       "abandonedRun": null,
       "abandonedRunFile": null,
+      "stalledRun": null,
+      "stalledRunLog": null,
       "lastBackup": {
         "runId": "20260726T205704Z-backup-6f9619ff",
         "status": "failed",
@@ -519,7 +528,7 @@ Three things `status` will **not** do quietly, all of which used to make it repo
 
 `health`: `"idle"` | `"running"` | `"warning"` (`AppHealth.rawValue`). Exit code: **0** for `idle`/`running`, **1** for `warning` — usable directly as a Nagios/Icinga-style check. `lastBackup`/`lastCheck`/`lastPrune` are `null` before any attempt of that kind; `reachable` is `null` — never `false` — for a destination that has not been probed yet (`state/repo-status-<destId>.json` absent), the same "absent means not yet known, never a definite negative" rule `fda-check.json` uses. `firstBackupOverdue` explains the otherwise-empty warning for a never-attempted set. `excludedHere` has the same shape as `config show`'s.
 
-`unattributedRuns` contains any `current-run-<setId>.json` whose set is no longer in this machine's resolved configuration. Each entry carries the missing `setId`, `liveness` (`"live"` or `"abandoned"`), the usual `currentRun` summary, and the exact `currentRunFile`. These runs still determine top-level health and the exit code, so an empty `sets` array never leaves their effect unexplained. Human output names the same run and prints a shell-quoted cleanup command.
+`unattributedRuns` contains any `current-run-<setId>.json` whose set is no longer in this machine's resolved configuration. Each entry carries the missing `setId`, `liveness` (`"live"`, `"stalled"`, or `"abandoned"`), the usual `currentRun` summary, and the exact `currentRunFile`. These runs still determine top-level health and the exit code, so an empty `sets` array never leaves their effect unexplained. Human output names the same run; abandoned entries print a shell-quoted cleanup command, while stalled entries direct the operator to the run log.
 
 ### `sets list --json`
 

@@ -44,6 +44,11 @@ import Testing
         #expect(argv.last == "gui/\(uid)/net.herila.ResticStation.helper")
     }
 
+    @Test func printUsesCallerUIDAndExactLabel() {
+        #expect(LaunchctlCommand.printArgv(uid: 502)
+            == ["print", "gui/502/net.herila.ResticStation.helper"])
+    }
+
     @Test func executablePathIsAbsolute() {
         // Absolute so nothing depends on the app's inherited PATH.
         #expect(LaunchctlCommand.executablePath == "/bin/launchctl")

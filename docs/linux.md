@@ -926,7 +926,9 @@ Three answers, and only one of them is a finding:
 | `{"kind": "systemd-timer", "healthy": true, …}` | the timer will fire | no |
 | `{"kind": "systemd-timer", "healthy": false, …}` | a real finding: exit 1, reason named | **yes — warning** |
 | `{"kind": "unknown", "healthy": null, …}` | no systemd here; the documented fallback is a cron line, which nothing can inspect | no |
-| `null` | macOS: the scheduler is `SMAppService` state, which no CLI can read | no |
+| `{"kind": "launchd-agent", "healthy": true, …}` | macOS: launchd reports the SMAppService agent loaded | no |
+| `{"kind": "launchd-agent", "healthy": false, …}` | macOS: the agent is not loaded | **yes — warning** |
+| `{"kind": "launchd-agent", "healthy": null, …}` | macOS: the launchctl probe failed, so state is unknown | no |
 
 The two "don't know" answers deliberately contribute nothing, exactly as an absent
 `fda-check.json` does — a check that goes permanently red inside every container is a check

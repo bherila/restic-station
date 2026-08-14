@@ -1146,10 +1146,9 @@ assert_fixture_flow() {
     # Nothing has installed a timer for this data directory, so on Linux
     # `status` correctly reports the scheduler as unhealthy and exits 1 —
     # that is issues #46/#48 working, not a failure of this scenario. On
-    # macOS the scheduler is `SMAppService` state, which no CLI can read, so
-    # the field is null, contributes nothing, and the same call exits 0.
-    # Asserted per platform rather than tolerated, so a *wrong* answer on
-    # either side is still a failure.
+    # macOS probes the LaunchAgent directly. Its state belongs to the host,
+    # not this fixture: a developer may have the real app enabled while CI
+    # will not. Assert the answer is internally consistent in either state.
     if [[ "$OS_NAME" == "Linux" ]]; then
         [[ $status_rc -eq 1 ]] || fail "$step" "expected exit 1 with no timer installed, got $status_rc"
         echo "$status_json" | jq -e '.scheduler.healthy == false' >/dev/null \
@@ -1157,9 +1156,26 @@ assert_fixture_flow() {
         echo "$status_json" | jq -e '.scheduler.problems | index("unitsMissing")' >/dev/null \
             || fail "$step" "expected scheduler.problems to name unitsMissing: $status_json"
     else
-        [[ $status_rc -eq 0 ]] || fail "$step" "expected exit 0 on a healthy host, got $status_rc: $status_json"
-        echo "$status_json" | jq -e '.scheduler == null' >/dev/null \
-            || fail "$step" "expected a null scheduler on macOS (SMAppService is app-only): $status_json"
+        echo "$status_json" | jq -e '.scheduler.kind == "launchd-agent"' >/dev/null \
+            || fail "$step" "expected a launchd-agent scheduler probe on macOS: $status_json"
+        local scheduler_health
+        scheduler_health="$(echo "$status_json" | jq -r '.scheduler.healthy')"
+        case "$scheduler_health" in
+            true)
+                [[ $status_rc -eq 0 ]] || fail "$step" "healthy LaunchAgent should exit 0, got $status_rc: $status_json"
+                ;;
+            false)
+                [[ $status_rc -eq 1 ]] || fail "$step" "missing LaunchAgent should exit 1, got $status_rc: $status_json"
+                echo "$status_json" | jq -e '.scheduler.problems | index("agentNotLoaded")' >/dev/null \
+                    || fail "$step" "missing LaunchAgent did not name agentNotLoaded: $status_json"
+                ;;
+            null)
+                [[ $status_rc -eq 0 ]] || fail "$step" "unknown LaunchAgent state should not fail status: $status_json"
+                echo "$status_json" | jq -e '.scheduler.problems | index("launchctlProbeFailed")' >/dev/null \
+                    || fail "$step" "unknown LaunchAgent state did not name launchctlProbeFailed: $status_json"
+                ;;
+            *) fail "$step" "unexpected LaunchAgent health '$scheduler_health': $status_json" ;;
+        esac
     fi
     echo "$status_json" | jq -e '.sets | length == 1' >/dev/null \
         || fail "$step" "expected exactly one set in status --json (the disabled-here set must not appear): $status_json"

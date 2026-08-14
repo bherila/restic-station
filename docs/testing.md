@@ -114,7 +114,8 @@ out (the job's own session never ends mid-run). Both remain genuinely open, trac
 
 ## Layer 3 — manual checklists (docs/tasks reference these; run before tagging a release)
 
-**SMAppService** (app copied to /Applications): register → status Enabled (or approval flow via System Settings) → `launchctl print gui/$UID/net.herila.ResticStation.helper` shows agent → wait ≤2 min → tick ran (state files touched) → quit app → tick still runs → unregister → agent gone.
+**SMAppService** (app copied to /Applications): register → status Enabled (or approval flow via System Settings) → `launchctl print gui/$UID/net.herila.ResticStation.helper` shows agent and `restic-station-helper status --json` reports `scheduler.kind == "launchd-agent"`, `healthy == true` → wait ≤2 min → tick ran (state files touched) → quit app → tick still runs → unregister → agent gone and CLI scheduler health becomes `false`/`agentNotLoaded`.
+**Stall detection**: start a backup against disposable data, wait for `heartbeatUptime` to appear in its current-run file, `kill -STOP <metadata pid>`, and confirm the app and `status --json` change from running/live to warning/stalled after five minutes of awake time; `kill -CONT`, then terminate or let the run finish. Confirm sleep time did not consume the threshold.
 **FDA**: revoke in System Settings → both badges show denied → app probe correct; grant to app → app badge granted; Re-check → agent badge granted (if not: fallback path per keychain-and-fda.md verifies).
 **Keychain**: create destination with password → run scheduled backup with app closed → no GUI prompt appears, backup succeeds.
 **Sleep/catch-up**: schedule daily at a time while Mac will be asleep; wake after → backup runs within ~2 min of wake.

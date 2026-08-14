@@ -194,14 +194,17 @@ Only a confirmed `Linger=no` counts.
 ### `status` and the scheduler
 
 `restic-station-helper status [--json]` reports the same verdict under a
-`scheduler` key, from the same code path, so the two commands cannot
-disagree. Three distinct answers, and only one of them is a finding:
+`scheduler` key. Linux uses the same code path as `timer status`; macOS asks
+launchd directly whether the SMAppService agent is loaded. A definite `false`
+is a finding, while an unavailable probe remains unknown:
 
 | `scheduler` | meaning |
 |---|---|
-| `null` | this platform has no CLI-readable scheduler (macOS: `SMAppService` state is app-only) |
 | `{"kind": "unknown", "healthy": null, …}` | no systemd here; the documented fallback is a cron line, which nothing can inspect |
 | `{"kind": "systemd-timer", "healthy": false, "problems": [...], …}` | a real finding — `status` exits 1 |
+| `{"kind": "launchd-agent", "healthy": true, …}` | macOS launchd reports the SMAppService agent loaded |
+| `{"kind": "launchd-agent", "healthy": false, "problems": ["agentNotLoaded"], …}` | macOS launchd cannot find the agent — `status` exits 1 |
+| `{"kind": "launchd-agent", "healthy": null, "problems": ["launchctlProbeFailed"], …}` | the launchctl probe failed; state is unknown and does not fail status |
 
 `status`'s **exit code is not `health == "warning"`.** `AppHealth` is a single
 glyph for a menu bar, so `running` outranks `warning` there — correctly: while

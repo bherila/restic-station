@@ -136,7 +136,7 @@ State — not config — is the right XDG base dir for `root`: `config.json` is 
 | `runs/<runId>/log.txt` | full streamed log of the run |
 | `runs/index.jsonl` | append-only, one summary JSON line per finished run |
 | `state/schedule-state.json` | last-start times + check-slice cursors per set |
-| `state/current-run-<setId>.json` | live progress of an in-flight run (deleted on completion) |
+| `state/current-run-<setId>.json` | live progress plus an independent 30-second awake-time heartbeat (deleted on completion) |
 | `state/repo-status-<destId>.json` | reachability + last-synced info per destination |
 | `state/fda-check.json` | result of the helper's Full Disk Access probe |
 | `locks/tick.lock`, `locks/set-<setId>.lock` | flock files (see `scheduling.md`) |

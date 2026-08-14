@@ -111,6 +111,11 @@ final class AppModel: ObservableObject {
     private let now: @Sendable () -> Date
     private var cancellables: Set<AnyCancellable> = []
     private var hasStarted = false
+    private var healthRefreshTask: Task<Void, Never>?
+    /// A stopped heartbeat creates no filesystem event. Re-evaluate against
+    /// uptime often enough for the menu bar to turn yellow at the same bound
+    /// as the CLI without polling or rewriting any state.
+    private static let healthRefreshIntervalNanoseconds: UInt64 = 30_000_000_000
 
     // MARK: - Init
 
@@ -204,12 +209,22 @@ final class AppModel: ObservableObject {
         stateWatcher.start()
         launchd.refreshStatus()
         recomputeDerivedState()
+        healthRefreshTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: Self.healthRefreshIntervalNanoseconds)
+                guard !Task.isCancelled else { return }
+                guard let self else { return }
+                self.recomputeDerivedState()
+            }
+        }
         Task { await refreshResticInfo() }
     }
 
     func stop() {
         guard hasStarted else { return }
         hasStarted = false
+        healthRefreshTask?.cancel()
+        healthRefreshTask = nil
         stateWatcher.stop()
     }
 
@@ -365,12 +380,12 @@ final class AppModel: ObservableObject {
         // Resolved, not raw: a set this machine does not run has no health
         // to report here, and a destination disabled on this machine must
         // not raise a staleness warning for a repo it never writes to.
-        // A `current-run-*.json` whose process is gone is not a run in
-        // flight. Same predicate for both derivations, and the same one
-        // `restic-station-helper status` uses, so the menu bar and the CLI
-        // cannot disagree about whether this machine is busy.
-        let isRunAbandoned: (CurrentRunState) -> Bool = { [runStore] in
-            runStore.liveness(ofCurrentRun: $0) == .abandoned
+        // A `current-run-*.json` whose process is gone or whose heartbeat is
+        // stale is not healthy in-flight work. The menu bar and CLI share
+        // this predicate, so they cannot disagree about whether the machine
+        // is busy.
+        let runLiveness: (CurrentRunState) -> CurrentRunLiveness = { [runStore] in
+            runStore.liveness(ofCurrentRun: $0)
         }
         setHealths = HealthDerivation.setHealths(
             config: resolvedConfig,
@@ -381,7 +396,7 @@ final class AppModel: ObservableObject {
             now: currentDate,
             calendar: calendar,
             visibleSince: paths.configurationVisibleSince(),
-            isRunAbandoned: isRunAbandoned
+            runLiveness: runLiveness
         )
         appHealth = HealthDerivation.appHealth(
             setHealths: setHealths,
@@ -393,7 +408,7 @@ final class AppModel: ObservableObject {
             // Core so the Linux build is held to it too (T25).
             fullDiskAccessDenied: HealthDerivation.fullDiskAccessDenied(from: stateWatcher.fdaCheck),
             backgroundAgentEnabled: launchd.isEnabled,
-            isRunAbandoned: isRunAbandoned
+            runLiveness: runLiveness
         )
     }
 

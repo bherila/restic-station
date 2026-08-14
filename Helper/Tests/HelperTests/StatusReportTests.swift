@@ -94,12 +94,15 @@ struct StatusReportTests {
     private func makeSetStatus(
         needsAttention: Bool,
         isRunning: Bool,
-        firstBackupOverdue: Bool = false
+        firstBackupOverdue: Bool = false,
+        stalledRun: StatusReport.CurrentRunSummary? = nil,
+        stalledRunLog: String? = nil
     ) -> StatusReport.SetStatus {
         StatusReport.SetStatus(
             id: setId, name: "Projects", needsAttention: needsAttention, isRunning: isRunning,
             firstBackupOverdue: firstBackupOverdue,
             abandonedRun: nil, abandonedRunFile: nil,
+            stalledRun: stalledRun, stalledRunLog: stalledRunLog,
             lastBackup: nil, lastCheck: nil, lastPrune: nil, currentRun: nil,
             nextDue: Date(timeIntervalSince1970: 0),
             destinations: [
@@ -174,12 +177,39 @@ struct StatusReportTests {
         #expect(text.contains("\"lastCheck\" : null"))
         #expect(text.contains("\"lastPrune\" : null"))
         #expect(text.contains("\"currentRun\" : null"))
+        #expect(text.contains("\"stalledRun\" : null"))
+        #expect(text.contains("\"stalledRunLog\" : null"))
         #expect(text.contains("\"firstBackupOverdue\" : false"))
         #expect(text.contains("\"lastSyncedAt\" : null"))
         #expect(text.contains("\"unattributedRuns\" : ["))
         // `reachable: false` is a real, known value here — not null — but
         // "not yet probed" (nil) must still round-trip as explicit null
         // elsewhere; covered by encoding a destination with no repo-status.
+    }
+
+    @Test("a stalled run is explicit and points at its log, never a cleanup command")
+    func stalledRunRenders() {
+        let run = CurrentRunState(
+            runId: "stalled-run", kind: .check, phase: "checking", percentDone: 0.25,
+            bytesDone: 1, totalBytes: 4, filesDone: 1, totalFiles: 4, currentFiles: [], updatedAt: Date()
+        )
+        let report = StatusReport(
+            machineId: "studio-mac", generatedAt: Date(), health: "warning",
+            fullDiskAccessDenied: false, scheduler: nil,
+            sets: [makeSetStatus(
+                needsAttention: true,
+                isRunning: false,
+                stalledRun: StatusReport.CurrentRunSummary(run),
+                stalledRunLog: "/tmp/run log.txt"
+            )],
+            unattributedRuns: [], excludedHere: []
+        )
+
+        let lines = report.humanLines().joined(separator: "\n")
+        #expect(lines.contains("STALLED:     check run stalled-run"))
+        #expect(lines.contains("inspect the run log"))
+        #expect(lines.contains("/tmp/run log.txt"))
+        #expect(!lines.contains("rm "))
     }
 
     @Test("an unattributed abandoned run renders with a named, shell-quoted cleanup path")

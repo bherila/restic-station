@@ -81,6 +81,8 @@ struct StateStoreTests {
           "filesDone": 120,
           "totalFiles": 4000,
           "currentFiles": ["/Users/user/proj/big.dat"],
+          "heartbeatAt": "2026-07-26T20:57:31Z",
+          "heartbeatUptime": 12345.5,
           "updatedAt": "2026-07-26T20:57:30Z"
         }
         """
@@ -94,11 +96,34 @@ struct StateStoreTests {
         #expect(decoded.filesDone == 120)
         #expect(decoded.totalFiles == 4000)
         #expect(decoded.currentFiles == ["/Users/user/proj/big.dat"])
+        #expect(decoded.heartbeatAt == Self.date("2026-07-26T20:57:31Z"))
+        #expect(decoded.heartbeatUptime == 12_345.5)
         #expect(decoded.updatedAt == Self.date("2026-07-26T20:57:30Z"))
 
         let reEncoded = try StateStore.makeEncoder().encode(decoded)
         let reDecoded = try StateStore.makeDecoder().decode(CurrentRunState.self, from: reEncoded)
         #expect(reDecoded == decoded)
+    }
+
+    @Test("current-run files from before heartbeats remain decodable")
+    func decodesLegacyCurrentRunWithoutHeartbeat() throws {
+        let json = """
+        {
+          "runId": "legacy",
+          "kind": "check",
+          "phase": "checking",
+          "percentDone": 0,
+          "bytesDone": 0,
+          "totalBytes": 0,
+          "filesDone": 0,
+          "totalFiles": 0,
+          "currentFiles": [],
+          "updatedAt": "2026-07-26T20:57:30Z"
+        }
+        """
+        let decoded = try StateStore.makeDecoder().decode(CurrentRunState.self, from: Data(json.utf8))
+        #expect(decoded.heartbeatAt == nil)
+        #expect(decoded.heartbeatUptime == nil)
     }
 
     @Test("decodes the documented state/fda-check.json literal")
