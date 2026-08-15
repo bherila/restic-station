@@ -527,14 +527,17 @@ import Testing
 
     // MARK: - searchedDescription
 
-    @Test("the failure message names what was searched")
-    func searchedDescriptionNamesTheList() {
+    @Test("the result carries the injected search description")
+    func searchedDescriptionNamesTheList() async {
         let discovery = ResticDiscovery(
-            wellKnownPaths: ResticDiscovery.linuxWellKnownPaths,
-            environment: [:],
+            wellKnownPaths: ["/custom/bin/restic"],
+            environment: ["PATH": "/another/custom/bin"],
             runner: ProbeRunner([:])
         )
         #expect(discovery.searchedDescription
-            == "/usr/bin/restic, /usr/local/bin/restic, /opt/restic/bin/restic, and every directory on PATH")
+            == "/custom/bin/restic, and every directory on PATH")
+
+        let result = await discovery.discover()
+        #expect(result.searchedDescription == discovery.searchedDescription)
     }
 }

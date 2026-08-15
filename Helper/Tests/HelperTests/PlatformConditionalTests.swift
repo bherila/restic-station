@@ -220,7 +220,11 @@ import ResticStationCore
         let paths = testPaths
         let message = HelperContext.resticNotFoundMessage(
             paths: paths,
-            result: ResticDiscoveryResult(chosen: nil, rejected: [])
+            result: ResticDiscoveryResult(
+                chosen: nil,
+                rejected: [],
+                searchedDescription: "/custom/restic and the injected PATH"
+            )
         )
 
         #if os(macOS)
@@ -229,9 +233,8 @@ import ResticStationCore
         #expect(message == "restic not configured — open Restic Station")
         #else
         // Headless: name what was searched and how to fix it.
-        #expect(message.contains("/usr/bin/restic"))
-        #expect(message.contains("/opt/restic/bin/restic"))
-        #expect(message.contains("every directory on PATH"))
+        #expect(message.contains("/custom/restic and the injected PATH"))
+        #expect(!message.contains("/usr/bin/restic"))
         #expect(message.contains("Install an official release binary"))
         // machine.json, not config.json: the binary path is per-machine (T24).
         #expect(message.contains(paths.machineFile.path))
@@ -248,7 +251,8 @@ import ResticStationCore
         let paths = testPaths
         let result = ResticDiscoveryResult(
             chosen: nil,
-            rejected: [ResticProbe(path: "/usr/bin/restic", outcome: .tooOld(version: "0.16.4"))]
+            rejected: [ResticProbe(path: "/usr/bin/restic", outcome: .tooOld(version: "0.16.4"))],
+            searchedDescription: "test search"
         )
         let message = HelperContext.resticNotFoundMessage(paths: paths, result: result)
 
@@ -277,7 +281,8 @@ import ResticStationCore
             rejected: [ResticProbe(
                 path: "/opt/homebrew/bin/restic",
                 outcome: .unusable(reason: "/opt/homebrew/bin/restic exited 72 when asked for its version.")
-            )]
+            )],
+            searchedDescription: "test search"
         )
         let message = HelperContext.resticNotFoundMessage(paths: testPaths, result: result)
 
@@ -296,7 +301,8 @@ import ResticStationCore
             rejected: [
                 ResticProbe(path: "/broken/restic", outcome: .unusable(reason: "could not be run.")),
                 ResticProbe(path: "/usr/bin/restic", outcome: .tooOld(version: "0.16.4")),
-            ]
+            ],
+            searchedDescription: "test search"
         )
         let message = HelperContext.resticNotFoundMessage(paths: testPaths, result: result)
 

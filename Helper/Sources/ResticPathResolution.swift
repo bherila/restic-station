@@ -107,8 +107,7 @@ extension HelperContext {
         return "restic not configured — open Restic Station"
         #else
         return """
-            restic not found. Searched \(ResticDiscovery.wellKnownPaths.joined(separator: ", ")), \
-            and every directory on PATH.
+            restic not found. Searched \(result.searchedDescription).
             \(Self.officialBinaryAdvice)
             \(Self.resticPathAdvice(paths: paths))
             """

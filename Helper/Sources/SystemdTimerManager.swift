@@ -42,7 +42,8 @@ struct SystemdTimerManager {
     /// as a cheap check safe to run as often as a monitoring system likes,
     /// and a monitoring system that runs it every minute must not be able to
     /// accumulate overlapping helper processes against a wedged user bus.
-    /// Three calls at 5s is a worst case a per-minute check survives.
+    /// Three calls at 5s plus up to 10s termination grace per timed-out
+    /// process is a roughly 45s worst case a per-minute check survives.
     static let verdictOnlyTimeout: TimeInterval = 5
 
     var serviceUnitURL: URL {
@@ -202,8 +203,9 @@ struct SystemdTimerManager {
     ///     the slowest call here, and pure narrative — is waste that a
     ///     wedged D-Bus turns into a stall. Also shortens the per-command
     ///     timeout, so the whole probe is bounded by
-    ///     `verdictOnlyTimeout × 3` rather than `commandTimeout × 4` plus
-    ///     termination grace (`@codex review` on #51).
+    ///     three `verdictOnlyTimeout` windows plus up to three termination
+    ///     grace periods, rather than four full `commandTimeout` windows and
+    ///     their termination grace (`@codex review` on #51).
     func status(
         helperPath: String? = nil,
         dataDirectory: String? = nil,
