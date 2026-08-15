@@ -303,12 +303,20 @@ public struct ResticDiscovery: Sendable {
             let probe = await probe(path: path)
             switch probe.outcome {
             case .ok:
-                return ResticDiscoveryResult(chosen: probe, rejected: rejected)
+                return ResticDiscoveryResult(
+                    chosen: probe,
+                    rejected: rejected,
+                    searchedDescription: searchedDescription
+                )
             case .tooOld, .unusable:
                 rejected.append(probe)
             }
         }
-        return ResticDiscoveryResult(chosen: nil, rejected: rejected)
+        return ResticDiscoveryResult(
+            chosen: nil,
+            rejected: rejected,
+            searchedDescription: searchedDescription
+        )
     }
 }
 
@@ -354,10 +362,15 @@ public struct ResticDiscoveryResult: Equatable, Sendable {
     /// Candidates that were found and executed but rejected, in probe order
     /// — the raw material for "0.16.4 found, 0.17.0+ required".
     public let rejected: [ResticProbe]
+    /// The locations configured on the discovery instance that produced this
+    /// result. Keeping the description with the result prevents diagnostics
+    /// from substituting the platform defaults after a customized search.
+    public let searchedDescription: String
 
-    public init(chosen: ResticProbe?, rejected: [ResticProbe]) {
+    public init(chosen: ResticProbe?, rejected: [ResticProbe], searchedDescription: String) {
         self.chosen = chosen
         self.rejected = rejected
+        self.searchedDescription = searchedDescription
     }
 
     /// The first rejected candidate that at least *ran* but was too old —
