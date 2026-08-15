@@ -126,6 +126,7 @@ import Testing
         let unit = SystemdCommand.timerUnit()
         #expect(unit.contains("OnBootSec=2min"))
         #expect(unit.contains("OnUnitActiveSec=2min"))
+        #expect(unit.contains("AccuracySec=1s"))
         // Load-bearing per issue #28: the anacron-equivalent that keeps Linux
         // behaviourally equal to macOS after downtime. Do not drop it — see
         // docs/scheduling.md §Linux for what it does and does not do.
@@ -140,6 +141,7 @@ import Testing
         let unit = SystemdCommand.timerUnit(intervalMinutes: minutes)
         #expect(unit.contains("OnBootSec=\(minutes)min"))
         #expect(unit.contains("OnUnitActiveSec=\(minutes)min"))
+        #expect(unit.contains("AccuracySec=1s"))
         #expect(unit.contains("Description=Restic Station scheduling tick every \(minutes)min"))
     }
 

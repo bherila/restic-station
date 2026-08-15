@@ -173,6 +173,7 @@ private func lingerResponder(_ value: String) -> @Sendable ([String]) -> Process
         )
         #expect(service.contains("ExecStart=\(helperPath) tick"))
         #expect(timer.contains("OnUnitActiveSec=2min"))
+        #expect(timer.contains("AccuracySec=1s"))
         #expect(timer.contains("Persistent=true"))
         #expect(log.text.contains("enabled restic-station.timer"))
     }
@@ -245,6 +246,7 @@ private func lingerResponder(_ value: String) -> @Sendable ([String]) -> Process
         )
         #expect(timer.contains("OnUnitActiveSec=15min"))
         #expect(!timer.contains("OnUnitActiveSec=2min"))
+        #expect(timer.contains("AccuracySec=1s"))
     }
 
     @Test("RESTIC_STATION_DATA_DIR is carried into the unit when the caller overrode it")
