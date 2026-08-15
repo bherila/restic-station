@@ -16,7 +16,11 @@ The workflow builds a Release app, ad-hoc signs it, copies that exact bundle to
   helper identity, and equivalent FDA probe results in both invocation paths;
 - a real disposable restic backup and restore, including the macOS Keychain
   path used by the integration suite;
-- file-backed secret handling and the headless config/status/sets/runs CLI.
+- file-backed secret handling and the exhaustive headless
+  config/status/sets/runs fixture matrix. The matrix uses the Debug helper
+  produced by the same run; the exact installed Release helper separately
+  exercises config import/validate/status and real backup/mirror/restore in
+  the integration suite.
 
 Every run retains the verified app for 14 days and the check results, probe
 JSON, signing metadata, and integration logs for 30 days. The same evidence is

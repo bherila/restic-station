@@ -130,7 +130,10 @@ host or suitable self-hosted runner.
 The manually triggered `macOS Release Verification` workflow is the clean,
 hosted-Mac release evidence path. Unlike the ordinary `macos` job, it builds a
 Release app, installs and launch-smokes that exact bundle, exercises the CLI
-symlink and direct-versus-symlink FDA probes, and uploads detailed evidence.
+symlink and direct-versus-symlink FDA probes, runs the real backup/restore and
+secret integration suites against the installed Release helper, runs the
+exhaustive headless fixture matrix against the Debug helper from the same
+commit, and uploads detailed evidence.
 See [macOS release verification](macos-release-verification.md) for its scope
 and the user-approval/reboot checks that an ephemeral runner cannot prove.
 
