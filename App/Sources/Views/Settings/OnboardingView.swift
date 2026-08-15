@@ -220,9 +220,13 @@ struct OnboardingView: View {
                     case .requiresApproval:
                         Button("Open Login Items settings") { launchd.openLoginItemsSettings() }
                     case .notFound:
-                        VStack(alignment: .leading, spacing: 8) {
-                            CopyablePath(text: Bundle.main.bundlePath, helpText: "Copy this app's path")
-                            Button("Try to register anyway") { permissions.enableAgent(launchd: launchd) }
+                        if launchd.embeddedAgentExists {
+                            Button("Enable background agent") { permissions.enableAgent(launchd: launchd) }
+                        } else {
+                            VStack(alignment: .leading, spacing: 8) {
+                                CopyablePath(text: Bundle.main.bundlePath, helpText: "Copy this app's path")
+                                Button("Try to register anyway") { permissions.enableAgent(launchd: launchd) }
+                            }
                         }
                     default:
                         Button("Enable background agent") { permissions.enableAgent(launchd: launchd) }
@@ -427,7 +431,7 @@ struct OnboardingView: View {
         case .enabled: return "Enabled"
         case .requiresApproval: return "Requires approval"
         case .notRegistered: return "Not registered"
-        case .notFound: return "Not found"
+        case .notFound: return launchd.embeddedAgentExists ? "Not registered" : "Not found"
         @unknown default: return "Unknown"
         }
     }

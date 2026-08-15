@@ -123,7 +123,18 @@ struct PermissionsView: View {
 
             switch launchd.status {
             case .enabled:
-                EmptyView()
+                HStack {
+                    Button("Remove") {
+                        pane.removeAgent(launchd: launchd, model: model)
+                    }
+                    .disabled(pane.agentOperationInProgress)
+                    if let error = pane.agentError {
+                        Text(error)
+                            .font(.callout)
+                            .foregroundStyle(.red)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
             case .requiresApproval:
                 Button("Open Login Items settings") {
                     launchd.openLoginItemsSettings()
@@ -141,16 +152,30 @@ struct PermissionsView: View {
                     }
                 }
             case .notFound:
-                VStack(alignment: .leading, spacing: 8) {
-                    CopyablePath(text: Bundle.main.bundlePath, helpText: "Copy this app's path")
-                    Button("Try to register anyway") {
-                        pane.enableAgent(launchd: launchd)
+                if launchd.embeddedAgentExists {
+                    HStack {
+                        Button("Enable") {
+                            pane.enableAgent(launchd: launchd)
+                        }
+                        if let error = pane.agentError {
+                            Text(error)
+                                .font(.callout)
+                                .foregroundStyle(.red)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
                     }
-                    if let error = pane.agentError {
-                        Text(error)
-                            .font(.callout)
-                            .foregroundStyle(.red)
-                            .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    VStack(alignment: .leading, spacing: 8) {
+                        CopyablePath(text: Bundle.main.bundlePath, helpText: "Copy this app's path")
+                        Button("Try to register anyway") {
+                            pane.enableAgent(launchd: launchd)
+                        }
+                        if let error = pane.agentError {
+                            Text(error)
+                                .font(.callout)
+                                .foregroundStyle(.red)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
                     }
                 }
             @unknown default:
@@ -181,7 +206,7 @@ struct PermissionsView: View {
         case .enabled: return "Enabled"
         case .requiresApproval: return "Requires approval"
         case .notRegistered: return "Not registered"
-        case .notFound: return "Not found"
+        case .notFound: return launchd.embeddedAgentExists ? "Not registered" : "Not found"
         @unknown default: return "Unknown"
         }
     }
@@ -204,6 +229,7 @@ final class PermissionsPaneModel: ObservableObject {
     @Published private(set) var appVerdict: FdaVerdict = .unknown(reason: "Not checked yet.")
     @Published private(set) var recheck: RecheckPhase = .idle
     @Published private(set) var agentError: String?
+    @Published private(set) var agentOperationInProgress = false
 
     /// How long to wait for the agent to write a fresh
     /// `state/fda-check.json` after the kickstart (T18: "timeout 30 s →
@@ -312,6 +338,28 @@ final class PermissionsPaneModel: ObservableObject {
             agentError = nil
         } catch {
             agentError = error.localizedDescription
+        }
+    }
+
+    func removeAgent(launchd: LaunchdManager, model: AppModel) {
+        guard !agentOperationInProgress else { return }
+        model.refresh()
+        let busy = model.setsWithWorkInFlight
+        guard busy.isEmpty else {
+            agentError = "Wait for the current backup to finish before removing the background agent: "
+                + busy.joined(separator: ", ")
+            return
+        }
+
+        agentOperationInProgress = true
+        agentError = nil
+        Task { @MainActor [weak self] in
+            defer { self?.agentOperationInProgress = false }
+            do {
+                try await launchd.unregister()
+            } catch {
+                self?.agentError = error.localizedDescription
+            }
         }
     }
 

@@ -45,6 +45,12 @@ public final class LaunchdManager: ObservableObject {
     /// is surfaced as information rather than thrown.
     @Published public private(set) var lastKickstartError: String?
 
+    /// Whether this copy of the app actually contains the LaunchAgent plist.
+    /// macOS can report `.notFound` before a first registration even when the
+    /// resource is present, so the UI must not turn that status alone into a
+    /// false "broken installation" diagnosis.
+    public let embeddedAgentExists: Bool
+
     private let service: SMAppService
     private let bundlePath: String
 
@@ -54,6 +60,7 @@ public final class LaunchdManager: ObservableObject {
     ) {
         self.service = service
         self.bundlePath = bundlePath
+        self.embeddedAgentExists = Self.embeddedAgentExists(in: bundlePath)
         self.status = service.status
         self.diagnostic = Self.diagnostic(for: service.status, bundlePath: bundlePath)
     }
@@ -181,7 +188,7 @@ public final class LaunchdManager: ObservableObject {
     /// One user-facing sentence per `SMAppService.Status`. All four
     /// documented cases are handled explicitly (plus `@unknown default`,
     /// since `SMAppService.Status` is a non-frozen ObjC enum).
-    static func diagnostic(for status: SMAppService.Status, bundlePath: String) -> String? {
+    nonisolated static func diagnostic(for status: SMAppService.Status, bundlePath: String) -> String? {
         switch status {
         case .enabled:
             return nil
@@ -193,6 +200,10 @@ public final class LaunchdManager: ObservableObject {
             return "Background backups are not set up yet. Registering the background "
                 + "agent lets Restic Station back up on schedule even while it is closed."
         case .notFound:
+            if embeddedAgentExists(in: bundlePath) {
+                return "Background backups are not set up yet. Registering the background "
+                    + "agent lets Restic Station back up on schedule even while it is closed."
+            }
             var message = "macOS could not find the background agent "
                 + "(\(plistName)) inside this copy of Restic Station."
             if isDerivedDataPath(bundlePath) {
@@ -215,8 +226,15 @@ public final class LaunchdManager: ObservableObject {
     /// lives under `~/Library/Developer/Xcode/DerivedData/…` by default but
     /// is freely relocatable via build settings, and `swift build` output
     /// paths differ again — the marker component is what's reliable.
-    static func isDerivedDataPath(_ path: String) -> Bool {
+    nonisolated static func isDerivedDataPath(_ path: String) -> Bool {
         path.contains("DerivedData")
+    }
+
+    nonisolated static func embeddedAgentExists(in bundlePath: String) -> Bool {
+        FileManager.default.fileExists(atPath: URL(fileURLWithPath: bundlePath, isDirectory: true)
+            .appendingPathComponent("Contents/Library/LaunchAgents", isDirectory: true)
+            .appendingPathComponent(plistName, isDirectory: false)
+            .path)
     }
 }
 
