@@ -1,0 +1,111 @@
+name: macOS Release Verification
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-release-verification-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: macos-15 release evidence
+    runs-on: macos-15
+    timeout-minutes: 25
+    env:
+      DERIVED_DATA: ${{ github.workspace }}/dd-release-verification
+      BUILT_APP: ${{ github.workspace }}/dd-release-verification/Build/Products/Release/Restic Station.app
+      INSTALLED_APP: /Applications/Restic Station.app
+      EVIDENCE_DIR: ${{ github.workspace }}/release-evidence
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install test tools
+        run: brew install xcodegen restic jq
+
+      - name: Generate the Xcode project
+        run: xcodegen generate
+
+      - name: Run app and Core tests
+        run: |
+          xcodebuild -scheme "Restic Station" test \
+            CODE_SIGNING_ALLOWED=NO \
+            -derivedDataPath "$DERIVED_DATA"
+          swift test
+          swift test --package-path Core
+
+      - name: Build, sign, and install the Release app
+        run: |
+          xcodebuild -scheme "Restic Station" \
+            -configuration Release \
+            build \
+            CODE_SIGNING_ALLOWED=NO \
+            -derivedDataPath "$DERIVED_DATA"
+          codesign --force --deep --sign - "$BUILT_APP"
+          sudo ditto "$BUILT_APP" "$INSTALLED_APP"
+
+      - name: Verify the exact installed bundle
+        run: scripts/macos-release-verification.sh "$INSTALLED_APP" "$EVIDENCE_DIR" --exercise-user-cli
+
+      - name: Real backup, restore, Keychain, and CLI integration
+        env:
+          RESTIC_STATION_HELPER_OVERRIDE: /Applications/Restic Station.app/Contents/MacOS/restic-station-helper
+        run: |
+          scripts/integration-test.sh 2>&1 | tee "$EVIDENCE_DIR/integration-test.log"
+          scripts/secret-cli-test.sh "$RESTIC_STATION_HELPER_OVERRIDE" \
+            2>&1 | tee "$EVIDENCE_DIR/secret-cli-test.log"
+          scripts/headless-cli-test.sh "$RESTIC_STATION_HELPER_OVERRIDE" \
+            2>&1 | tee "$EVIDENCE_DIR/headless-cli-test.log"
+
+      - name: Package the verified app
+        run: ditto -c -k --keepParent "$INSTALLED_APP" Restic-Station-verified.zip
+
+      - name: Record evidence boundaries
+        if: always()
+        run: |
+          mkdir -p "$EVIDENCE_DIR"
+          tee "$EVIDENCE_DIR/hosted-runner-boundaries.md" <<'EOF'
+          # Hosted-runner evidence boundaries
+
+          A standard GitHub-hosted macOS runner can verify the Release bundle,
+          code signature, launch behavior, CLI symlink identity, process-context
+          FDA probe, Keychain access, and disposable real backup/restore flows.
+
+          It cannot honestly prove user-granted Full Disk Access, approval of the
+          SMAppService background item in System Settings, behavior across
+          sleep/wake or logout/reboot, or a missed-run catch-up after the runner
+          was powered off. Those remain named manual checks on a persistent Mac.
+          EOF
+          {
+            echo "## macOS release verification"
+            echo
+            if [[ -f "$EVIDENCE_DIR/checks.txt" ]]; then
+              echo '```text'
+              sed -n '1,200p' "$EVIDENCE_DIR/checks.txt"
+              echo '```'
+              echo
+            fi
+            sed -n '1,200p' "$EVIDENCE_DIR/hosted-runner-boundaries.md"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-release-evidence
+          path: release-evidence
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload verified app
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Restic-Station-verified-app
+          path: Restic-Station-verified.zip
+          if-no-files-found: error
+          retention-days: 14

@@ -131,4 +131,11 @@ out (the job's own session never ends mid-run). Both remain genuinely open, trac
 | `linux-integration` | `ubuntu-24.04-arm` (bare VM, no container) | downloads `restic-station-linux`'s aarch64 tarball → installs real restic + jq → `ldd` + `install.sh` checks → `scripts/integration-test.sh` against the **static** binary (`RESTIC_STATION_HELPER_OVERRIDE`) → non-blocking T26 systemd diagnostic → `scripts/linux-docs-transcript.sh` (T30 / issue #32: real command transcripts for `docs/linux.md`, against this same static binary and real restic) |
 | `linux-runtime-verify` | `ubuntu-latest` (x86_64) and `ubuntu-24.04-arm` (aarch64), matrix | `ldd` → builds+runs a `scratch` container → runs on Alpine → runs on Debian 12 → (x86_64 only) runs on CentOS 7, the deliberately old-glibc distro |
 
+The manually triggered `macOS Release Verification` workflow is the clean,
+hosted-Mac release evidence path. Unlike the ordinary `macos` job, it builds a
+Release app, installs and launch-smokes that exact bundle, exercises the CLI
+symlink and direct-versus-symlink FDA probes, and uploads detailed evidence.
+See [macOS release verification](macos-release-verification.md) for its scope
+and the user-approval/reboot checks that an ephemeral runner cannot prove.
+
 All jobs on push + PR; the four Linux-release jobs depend only on `release-linux`, not on `linux`/`macos`, so a static-build regression is visible even if the debug-build jobs are still running. Keep total macOS time reasonable (public-repo runners are free but slow) — `release-linux` is the long pole (~1-2 min per architecture once its toolchain cache is warm, longer cold).
