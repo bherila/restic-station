@@ -692,8 +692,9 @@ Environment="RESTIC_STATION_DATA_DIR=/tmp/tmp.XXXXXXXXXX/explicit-data-dir"
 its own — the gap `docs/testing.md` and [issue #45](https://github.com/bherila/restic-station/issues/45)
 originally called out. CI now checks this directly: install a timer for a dedicated backup set
 that has never run before (so `ScheduleMath`'s "never-run is immediately due" rule makes it due
-on the very first tick), then poll for up to ~3 minutes without touching anything by hand. Real
-output — the timer fired unattended at the 50-second mark and ran a genuine backup:
+on the very first tick), then wait for both the initial activation and an `OnUnitActiveSec=`
+repeat without touching anything by hand. The set itself is due every five minutes, so the repeat
+must tick without creating an early second backup. Real output from the 2026-08-15 run:
 
 ```
 $ restic-station-helper timer install --interval 2
@@ -701,20 +702,22 @@ wrote /home/runner/.config/systemd/user/restic-station.service
 wrote /home/runner/.config/systemd/user/restic-station.timer
 enabled restic-station.timer — ticking every 2min
 
-waiting up to 170s, polling every 10s, for the installed timer to fire on its own:
-  t=+ 10s  runs=0
-  t=+ 20s  runs=0
-  t=+ 30s  runs=0
-  t=+ 40s  runs=0
-  t=+ 50s  runs=1
+waiting up to 250s, polling every 10s, for two unattended service activations:
+the first must back up the never-run set; the OnUnitActiveSec repeat must tick again without
+backing it up early (the set itself is due every 5 minutes):
+  t=+100s  service starts=0  backup runs=0
+  t=+110s  service starts=1  backup runs=1
+  ...
+  t=+220s  service starts=1  backup runs=1
+  t=+230s  service starts=2  backup runs=1
 
 $ restic-station-helper runs list --json
 [
   {
     "kind" : "backup",
-    "runId" : "20260806T003011Z-backup-e1000000",
+    "runId" : "20260815T185107Z-backup-e1000000",
     "setId" : "E1000000-0000-4000-8000-000000000001",
-    "snapshotId" : "7a341607c8e0f92e36c0ceec95d1601144745861b68ab6a7cb3447b55a2c468d",
+    "snapshotId" : "c8f3f32b8ece4b56b7813aa2c14ddead13a6dbd999377653babbed9c0323eb58",
     "status" : "success",
     "trigger" : "scheduled",
     ...
@@ -722,18 +725,22 @@ $ restic-station-helper runs list --json
 ]
 
 $ journalctl --user -u restic-station.service --no-pager --since -5 minutes
-Aug 06 00:30:11 runnervma9114 systemd[1250]: Starting restic-station.service - Restic Station scheduling tick...
-Aug 06 00:30:11 runnervma9114 restic-station-helper[3903]: info: restic not configured; discovered /usr/bin/restic (version 0.18.1)
-Aug 06 00:30:12 runnervma9114 restic-station-helper[3903]: set "Fire Check": success (1 run)
-Aug 06 00:30:12 runnervma9114 systemd[1250]: Finished restic-station.service - Restic Station scheduling tick.
+Aug 15 18:51:07 runnervm69nxj systemd[1238]: Starting restic-station.service - Restic Station scheduling tick...
+Aug 15 18:51:07 runnervm69nxj restic-station-helper[4448]: info: restic not configured; discovered /usr/bin/restic (version 0.18.1)
+Aug 15 18:51:08 runnervm69nxj restic-station-helper[4448]: set "Fire Check": success (1 run)
+Aug 15 18:51:08 runnervm69nxj systemd[1238]: Finished restic-station.service - Restic Station scheduling tick.
+Aug 15 18:53:08 runnervm69nxj systemd[1238]: Starting restic-station.service - Restic Station scheduling tick...
+Aug 15 18:53:08 runnervm69nxj restic-station-helper[4623]: info: restic not configured; discovered /usr/bin/restic (version 0.18.1)
+Aug 15 18:53:08 runnervm69nxj systemd[1238]: Finished restic-station.service - Restic Station scheduling tick.
 ```
 
 `"trigger": "scheduled"` (not `"manual"`) confirms the tick that produced this run really was
 invoked by the timer, not by anything in the script calling the helper directly. This is a
-genuine, unattended, `OnBootSec=` → due-set discovery → real backup firing, on a real
-(non-container) host — see [issue #45](https://github.com/bherila/restic-station/issues/45) for
-exactly what this does and does not settle (it does not cover an `OnUnitActiveSec=` repeat
-firing, or survival across an actual logout of the account that ran `timer install`).
+genuine, unattended, `OnBootSec=` → due-set discovery → real backup firing followed two minutes
+later by an unattended `OnUnitActiveSec=` repeat on a real (non-container) host. The unchanged
+backup-run count proves schedule due-ness remained authoritative. See
+[issue #45](https://github.com/bherila/restic-station/issues/45) for the remaining logout/reboot
+survival boundary.
 
 ### Journal locations
 
@@ -1254,10 +1261,10 @@ Two things this document does not claim to have observed, and why:
   This project has no S3 test credentials in CI; the export pattern shown is read from
   `ResticRunner.environment(for:)`'s actual composition order, not invented, but the specific
   `restic init` against `s3:https://…` was not executed anywhere for this document.
-- **A `systemd --user` timer surviving an actual logout, or firing repeatedly over hours/days.**
-  [A real, unattended `OnBootSec=` firing *is* now observed in CI](#a-real-firing-not-just-enabledactive)
-  — that specific gap is closed. What a single ~3-minute CI job cannot show: an
-  `OnUnitActiveSec=` repeat firing (the job doesn't wait that long), or the timer surviving the
-  account that ran `timer install` actually logging out (the CI job's own session never ends
-  mid-run). That longer-horizon verification is tracked in
+- **A `systemd --user` timer surviving an actual logout/reboot, or firing repeatedly over
+  hours/days.** [A real, unattended initial firing and one `OnUnitActiveSec=` repeat are now
+  observed in CI](#a-real-firing-not-just-enabledactive). What the hosted job still cannot show
+  is the timer surviving the account that ran `timer install` actually logging out or the VM
+  rebooting (the job's own session and host never end mid-run), nor long-duration repetition.
+  That remaining persistent-host verification is tracked in
   [issue #45](https://github.com/bherila/restic-station/issues/45).
