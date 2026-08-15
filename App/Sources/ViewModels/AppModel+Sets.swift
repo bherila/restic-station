@@ -213,6 +213,17 @@ extension AppModel {
 
     // MARK: - Initialization
 
+    /// The machine-resolved destination used by repository actions launched
+    /// from the editor. Kept as a pure lookup so app tests can pin the safety
+    /// boundary: initialization must never fall back to the shared raw URL
+    /// when this machine overrides it.
+    func repositoryActionDestination(setId: UUID, destId: UUID) -> Destination? {
+        guard let found = addressableConfig.destination(id: destId), found.set.id == setId else {
+            return nil
+        }
+        return found.destination
+    }
+
     /// *Initialize repository* in the destination editor.
     ///
     /// A **secondary** goes through the helper's `init-secondary` subcommand
@@ -235,12 +246,11 @@ extension AppModel {
         // this machine backs up to. A raw `config` destination would init
         // `/Volumes/Big/…` on a host whose override says `/mnt/big/…` —
         // creating (or probing) a repository nothing ever writes to.
-        guard let found = addressableConfig.destination(id: destId), found.set.id == setId else {
+        guard let destination = repositoryActionDestination(setId: setId, destId: destId) else {
             return .failed(
                 "This destination has not been saved yet. Save the backup set, then initialize."
             )
         }
-        let destination = found.destination
 
         if destination.isPrimary {
             return await initializePrimaryRepository(destination)

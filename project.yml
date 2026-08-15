@@ -53,3 +53,11 @@ targets:
       - package: ResticStationCore
       - package: swift-argument-parser
         product: ArgumentParser
+
+  "Restic StationTests":
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: App/Tests
+    dependencies:
+      - target: "Restic Station"

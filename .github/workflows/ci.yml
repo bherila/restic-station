@@ -305,8 +305,8 @@ jobs:
         run: brew install xcodegen restic jq
       - name: Generate Xcode project
         run: xcodegen generate
-      - name: Build
-        run: xcodebuild -scheme "Restic Station" build CODE_SIGNING_ALLOWED=NO -derivedDataPath dd
+      - name: Build and run app unit tests
+        run: xcodebuild -scheme "Restic Station" test CODE_SIGNING_ALLOWED=NO -derivedDataPath dd
       - name: Verify bundle layout
         run: |
           APP="dd/Build/Products/Debug/Restic Station.app"
