@@ -1,0 +1,72 @@
+{
+  "onboardingCompleted" : true,
+  "resticPath" : null,
+  "sets" : [
+    {
+      "checkPolicy" : { "enabled" : true, "readDataSubsetSlices" : 12 },
+      "destinations" : [
+        {
+          "id" : "10000000-0000-4000-8000-000000000001",
+          "isPrimary" : true,
+          "label" : "Studio NAS",
+          "nonSecretEnv" : {},
+          "repoURL" : "/Volumes/StudioNAS/documents.restic"
+        },
+        {
+          "id" : "10000000-0000-4000-8000-000000000002",
+          "isPrimary" : false,
+          "label" : "Offsite Mirror",
+          "nonSecretEnv" : { "AWS_DEFAULT_REGION" : "auto" },
+          "repoURL" : "s3:https://example.invalid/backups/documents"
+        }
+      ],
+      "excludes" : [".git", "node_modules", "*.tmp"],
+      "id" : "10000000-0000-4000-8000-000000000010",
+      "name" : "Documents & Projects",
+      "retention" : { "keepDaily" : 7, "keepLast" : 5, "keepMonthly" : 12, "keepWeekly" : 5, "keepYearly" : 3 },
+      "schedule" : { "hour" : 2, "kind" : "daily", "minute" : 30 },
+      "sources" : ["/Users/demo/Documents", "/Users/demo/Projects"],
+      "stalenessWarningDays" : 14
+    },
+    {
+      "checkPolicy" : null,
+      "destinations" : [
+        {
+          "id" : "20000000-0000-4000-8000-000000000001",
+          "isPrimary" : true,
+          "label" : "Archive SSD",
+          "nonSecretEnv" : {},
+          "repoURL" : "/Volumes/Archive/photos.restic"
+        }
+      ],
+      "excludes" : [],
+      "id" : "20000000-0000-4000-8000-000000000010",
+      "name" : "Photo Library",
+      "retention" : null,
+      "schedule" : { "hour" : 3, "kind" : "weekly", "minute" : 0, "weekday" : 1 },
+      "sources" : ["/Users/demo/Pictures/Photos Library.photoslibrary"],
+      "stalenessWarningDays" : 3
+    },
+    {
+      "checkPolicy" : null,
+      "destinations" : [
+        {
+          "id" : "30000000-0000-4000-8000-000000000001",
+          "isPrimary" : true,
+          "label" : "Cloud Archive",
+          "nonSecretEnv" : { "AWS_DEFAULT_REGION" : "us-west-2" },
+          "repoURL" : "s3:s3.us-west-2.amazonaws.com/example-workstation"
+        }
+      ],
+      "excludes" : ["Library/Caches", "Downloads"],
+      "id" : "30000000-0000-4000-8000-000000000010",
+      "name" : "Workstation",
+      "retention" : { "keepDaily" : 14, "keepLast" : 10, "keepMonthly" : 12, "keepWeekly" : 8, "keepYearly" : 5 },
+      "schedule" : { "kind" : "hourly", "minute" : 15 },
+      "sources" : ["/Users/demo/Desktop", "/Users/demo/Library/Mail", "/Users/demo/Library/Messages"],
+      "stalenessWarningDays" : 14
+    }
+  ],
+  "showMenuBarIcon" : true,
+  "version" : 2
+}

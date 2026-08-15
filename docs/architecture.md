@@ -92,7 +92,7 @@ Three rules, all load-bearing:
 
 **Who resolves what.** The app persists a user-chosen or discovered path into `config.json`'s `resticPath` and shows the rejected candidates in Settings. The helper resolves independently, in this order:
 
-1. `machine.json` `resticPath` — the per-machine override (T24; not implemented yet, see the `TODO(#26)` in `Helper/Sources/ResticPathResolution.swift`).
+1. `machine.json` `resticPath` — the per-machine override (T24), preferred whenever it is set.
 2. `config.json` `resticPath` — deprecated. `config.json` is shared across machines, so a path correct on one host is wrong on the next.
 3. Discovery.
 

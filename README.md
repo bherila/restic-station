@@ -12,6 +12,12 @@ Scheduling and management for [restic](https://restic.net) backups: a native mac
 - **Restore** — browse or search snapshots of any destination, restore selected paths with overwrite warnings, or mount a snapshot read-only (optional, requires [macFUSE](https://macfuse.github.io)).
 - **Maintenance** — retention policies (`restic forget --prune`), repository statistics, and scheduled integrity checks (`restic check --read-data-subset` slice rotation).
 
+## A look at the app
+
+| Backup sets and destination health | Grouped backup, mirror, and maintenance history |
+|---|---|
+| ![Restic Station Backup Sets dashboard showing three configured sets, their destinations, schedules, health, and next due time](docs/images/backup-sets.png) | ![Restic Station Runs screen showing successful backups with an expanded group containing its mirror copy and prune operations](docs/images/run-history.png) |
+
 Restic Station wraps an off-the-shelf restic binary already installed on the system (e.g. `brew install restic`) — it never bundles or manages restic itself.
 
 ## Requirements
