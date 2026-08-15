@@ -18,6 +18,7 @@ struct SetListView: View {
 
     /// The set the delete confirmation is about (`nil` = not shown).
     @State private var pendingDeletion: BackupSet?
+    @State private var showingEffectivePlan = false
 
     var body: some View {
         Group {
@@ -47,7 +48,20 @@ struct SetListView: View {
                 }
                 .disabled(selectedSet == nil)
                 .help("Delete the selected backup set")
+
+                Button {
+                    showingEffectivePlan = true
+                } label: {
+                    Label("Effective Plan", systemImage: "desktopcomputer.and.macbook")
+                }
+                .help("Preview what each configured machine will back up")
             }
+        }
+        .sheet(isPresented: $showingEffectivePlan) {
+            MachineEffectivePlanView(
+                config: model.config,
+                currentMachineID: model.machine.machineId
+            )
         }
         .alert(
             "Delete “\(pendingDeletion?.name ?? "")”?",
