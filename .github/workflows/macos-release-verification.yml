@@ -22,7 +22,7 @@ jobs:
       EVIDENCE_DIR: ${{ github.workspace }}/release-evidence
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install test tools
         run: brew install xcodegen restic jq
@@ -106,7 +106,7 @@ jobs:
 
       - name: Upload verification evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: macos-release-evidence
           path: release-evidence
@@ -115,7 +115,7 @@ jobs:
 
       - name: Upload verified app
         if: success()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: Restic-Station-verified-app
           path: Restic-Station-verified.zip

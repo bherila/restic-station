@@ -9,7 +9,7 @@ jobs:
     runs-on: ubuntu-24.04-arm
     container: swift:6.1
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Root package = the headless side (helper executable + Core by path).
       # A Linux-only compile error in Helper/ or Core/ fails here.
       - name: Build helper (root SwiftPM package)
@@ -300,7 +300,7 @@ jobs:
   macos:
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install tools
         run: brew install xcodegen restic jq
       - name: Generate Xcode project
@@ -350,7 +350,7 @@ jobs:
           codesign --force --deep --sign - "$APP"
           ditto -c -k --keepParent "$APP" "Restic-Station.zip"
       - name: Upload app artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: Restic-Station-app
           path: Restic-Station.zip
@@ -367,11 +367,11 @@ jobs:
   release-linux:
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # ~1.7 GB of downloads (toolchain .pkg + static SDK bundle); cached by
       # the exact pinned version so a green run only pays for this once.
       - name: Cache Static Linux SDK toolchain
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: .build/static-linux-sdk-cache
           key: static-linux-sdk-${{ hashFiles('scripts/setup-static-linux-sdk.sh') }}
@@ -397,7 +397,7 @@ jobs:
             done
           done
       - name: Upload Linux release artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: restic-station-linux
           path: |
@@ -419,8 +419,8 @@ jobs:
     needs: release-linux
     runs-on: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           name: restic-station-linux
           path: dist
@@ -526,7 +526,7 @@ jobs:
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: restic-station-linux
           path: dist
