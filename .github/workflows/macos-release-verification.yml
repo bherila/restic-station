@@ -51,15 +51,27 @@ jobs:
       - name: Verify the exact installed bundle
         run: scripts/macos-release-verification.sh "$INSTALLED_APP" "$EVIDENCE_DIR" --exercise-user-cli
 
-      - name: Real backup, restore, Keychain, and CLI integration
+      # The exhaustive fixture matrix deliberately uses the Debug helper from
+      # the test build. On hosted macOS, certain fresh-config invocations of
+      # the installed ad-hoc Release helper pay a ~35-second OS discovery
+      # penalty each; repeating dozens of them adds no Release-specific
+      # coverage and pushes the job toward its timeout. The next step still
+      # drives the exact installed Release helper through config import,
+      # validate, status, real backup/mirror/restore, Keychain, and secrets.
+      - name: Exhaustive headless CLI regression suite
+        run: |
+          mkdir -p "$EVIDENCE_DIR"
+          scripts/headless-cli-test.sh \
+            "$DERIVED_DATA/Build/Products/Debug/Restic Station.app/Contents/MacOS/restic-station-helper" \
+            2>&1 | tee "$EVIDENCE_DIR/headless-cli-test.log"
+
+      - name: Real Release backup, restore, Keychain, and secret integration
         env:
           RESTIC_STATION_HELPER_OVERRIDE: /Applications/Restic Station.app/Contents/MacOS/restic-station-helper
         run: |
           scripts/integration-test.sh 2>&1 | tee "$EVIDENCE_DIR/integration-test.log"
           scripts/secret-cli-test.sh "$RESTIC_STATION_HELPER_OVERRIDE" \
             2>&1 | tee "$EVIDENCE_DIR/secret-cli-test.log"
-          scripts/headless-cli-test.sh "$RESTIC_STATION_HELPER_OVERRIDE" \
-            2>&1 | tee "$EVIDENCE_DIR/headless-cli-test.log"
 
       - name: Package the verified app
         run: ditto -c -k --keepParent "$INSTALLED_APP" Restic-Station-verified.zip
