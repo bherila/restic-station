@@ -84,6 +84,13 @@ swift test --package-path Core
 
 > **Note:** background-agent (SMAppService) and Full Disk Access behavior can only be tested with the app copied to `/Applications` — see [`docs/keychain-and-fda.md`](docs/keychain-and-fda.md).
 
+For a repeatable clean-machine release check, manually run **macOS Release
+Verification** on the [Actions page](../../actions). It builds and installs the
+Release app on a standard hosted `macos-15` runner, exercises real disposable
+backup/restore and CLI flows, and retains the verified bundle plus evidence.
+The exact coverage and persistent-Mac boundaries are documented in
+[`docs/macos-release-verification.md`](docs/macos-release-verification.md).
+
 ## Linux (headless)
 
 There is no GUI on Linux — `restic-station-helper` is the whole product: scheduling (`timer install`, a `systemd --user` timer), the `config`/`status`/`sets`/`runs`/`secret` CLI, and the same backup engine as the Mac app underneath. A statically-linked binary (no Swift runtime, no libc, no ICU — verified to run unmodified in a `scratch` container) is published for `x86_64` and `aarch64` on every green CI run: open any run on the [Actions page](../../actions), download the **restic-station-linux** artifact, then:
