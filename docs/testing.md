@@ -1,11 +1,11 @@
 # Testing strategy
 
-Three layers: unit tests (Core, run everywhere including Linux CI), an integration script (real restic, macOS **and** Linux CI — see §Layer 2), and manual checklists (SMAppService/FDA — cannot be automated).
+Three layers: unit tests (portable Core plus macOS app wiring), an integration script (real restic, macOS **and** Linux CI — see §Layer 2), and manual checklists (SMAppService/FDA — cannot be automated).
 
-## Layer 1 — unit tests (`swift test --package-path Core`)
+## Layer 1 — unit tests (`swift test --package-path Core`; app tests through `xcodebuild test`)
 
 ### Framework: Swift Testing (not XCTest)
-All Core tests use **Swift Testing** (`import Testing`, `@Test`, `#expect`/`#require`, parameterized `@Test(arguments:)` for the table-driven suites) — never XCTest. Reasons: parameterized tests fit the scenario/table specs naturally, it runs identically on Linux, and it works with a bare Swift toolchain. **Development-machine note:** the primary dev machine has Command Line Tools but no Xcode.app — `xcodebuild` (app/helper builds) runs only in CI or on machines with full Xcode; Core tests run locally via a Homebrew Swift toolchain (`brew install swift`, then the `swift` binary inside `/opt/homebrew/Cellar/swift/*/Swift-*.xctoolchain/usr/bin/`), which supports Swift Testing but not XCTest. Structure every task so its logic is verifiable by `swift test --package-path Core` alone; xcodebuild-dependent acceptance criteria are verified by CI.
+Core and app unit tests use **Swift Testing** (`import Testing`, `@Test`, `#expect`/`#require`, parameterized `@Test(arguments:)` for the table-driven suites) — never XCTest. Core tests run through SwiftPM on macOS and Linux; app tests run through the Xcode-generated `Restic StationTests` target on macOS. Keep portable business logic in Core, but cover app-owned state transitions and wiring in the app target instead of relying on compilation alone.
 
 ### Linux compatibility requirement
 Core MUST compile and its tests pass on Linux (CI runs them on an `ubuntu-24.04-arm` runner in a `swift:6.1` container — cheap and fast for public repos). Practical rules:
