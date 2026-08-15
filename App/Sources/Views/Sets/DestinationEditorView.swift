@@ -52,6 +52,7 @@ struct DestinationEditorView: View {
     @State private var probe: DestinationProbeOutcome?
     @State private var busy: BusyKind?
     @State private var message: EditorMessage?
+    @State private var showingMachineOverrides = false
 
     init(set: Binding<BackupSet>, initialDestination destination: Destination, isNew: Bool) {
         _set = set
@@ -86,6 +87,8 @@ struct DestinationEditorView: View {
             Form {
                 identitySection
 
+                machineOverridesSection
+
                 switch kind {
                 case .local:
                     localSection
@@ -107,6 +110,13 @@ struct DestinationEditorView: View {
         .frame(minWidth: 620, idealWidth: 680, minHeight: 560, idealHeight: 640)
         .task {
             await loadSecrets()
+        }
+        .sheet(isPresented: $showingMachineOverrides) {
+            DestinationMachineOverridesEditor(
+                destination: $draft,
+                sharedConfig: model.config,
+                currentMachineID: model.machine.machineId
+            )
         }
     }
 
@@ -138,6 +148,20 @@ struct DestinationEditorView: View {
                     Text(formKind.title).tag(formKind)
                 }
             }
+        }
+    }
+
+    private var machineOverridesSection: some View {
+        Section {
+            LabeledContent("Configured profiles", value: "\(draft.machines?.count ?? 0)")
+            Button("Edit Machine Overrides…") { openMachineOverrides() }
+        } header: {
+            Text("Machine overrides")
+        } footer: {
+            Text("Override this destination's enabled state, complete repository URL, or non-secret "
+                + "environment per machine. Secrets stay in the local secret store.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
         }
     }
 
@@ -451,6 +475,15 @@ struct DestinationEditorView: View {
     }
 
     // MARK: - Actions
+
+    private func openMachineOverrides() {
+        // The destination form decomposes the shared URL into friendlier
+        // fields. Bring those pending values into the draft before the
+        // machine editor offers them as the starting point for an override.
+        draft.repoURL = assembledRepoURL
+        draft.nonSecretEnv = assembledNonSecretEnv
+        showingMachineOverrides = true
+    }
 
     private func chooseFolder() {
         let panel = NSOpenPanel()

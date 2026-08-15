@@ -32,8 +32,8 @@ final class AppModel: ObservableObject {
     /// The loaded configuration, **as written** — every per-machine
     /// `machines` override still on it. This is the value the editors read
     /// and `saveConfig(_:)` writes back, which is what keeps round-tripping
-    /// safe: the app does not yet edit `machines` keys (per-machine editing
-    /// UI is a follow-up), and it must never drop the ones it finds.
+    /// safe: machine-aware editors mutate only the selected sparse override,
+    /// and ordinary edits must never drop overrides they do not touch.
     /// Read-only to views; edits go through `saveConfig(_:)` /
     /// `updateConfig(_:)`.
     @Published private(set) var config: AppConfig

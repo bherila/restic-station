@@ -29,16 +29,20 @@ Quitting the app does NOT stop scheduled backups (they're launchd's job) — the
 
 **List** (sidebar selection → content): table/list of sets: name, source count, primary destination label + kind icon, schedule summary ("Daily 02:30"), last run status badge, next due time (via ScheduleMath, display only). Toolbar: add set, delete set (confirmation: "Deletes the backup set configuration. Repositories and snapshots are NOT touched."). Empty state: short explainer + "Create your first backup set".
 
+The toolbar's **Effective Plan** sheet lists the union of machine IDs referenced anywhere in `config.json`, plus this host's `machineId`. Picking a machine previews every effective source, schedule, repository URL, enabled destination, and exclusion reason. This is a preview of the shared configuration only; it never changes the host-local `machine.json`.
+
 **Set editor** (form):
 - Name.
 - **Sources**: list of absolute paths; add via `NSOpenPanel` (directories + files, multi-select), remove; warn inline (yellow) on nested/duplicate paths.
 - **Excludes**: editable string list; caption linking restic exclude-pattern syntax (`https://restic.readthedocs.io/en/stable/040_backup.html#excluding-files`).
 - **Schedule**: picker for kind (Every N minutes / Hourly / Daily / Weekly) with contextual fields (N stepper ≥5; minute; hour+minute; weekday+hour+minute).
+- **Machine overrides**: choose any known machine profile or add a valid machine ID, then inherit/enable/disable the set and optionally replace its complete sources list or schedule. Replacement arrays are labeled as replace-not-merge. Removing an override restores inheritance.
 - **Staleness warning**: stepper, days, default 14.
 - **Retention** (optional section, off = never forget): steppers/optional fields for keep-last/hourly/daily/weekly/monthly/yearly; default suggestion when enabling: 7 daily / 4 weekly / 12 monthly / 2 yearly. Footnote: "Applied to the primary after each backup, and mirrored to each secondary after it syncs."
 - **Integrity checks** (optional): toggle + slice count (default 20). Footnote: "Weekly `restic check`; over 20 weeks the entire repository's data is read and verified."
 - **Destinations**: table (label, repo, kind badge, PRIMARY tag, status dot reachable/offline/stale + "last synced N days ago"). Exactly-one-primary enforced by radio-style selection; changing primary shows an explanatory confirmation (new primary must already contain the data or the next backup re-uploads everything).
   - **Destination editor** (sheet): label; kind picker driving the form:
+    - **Machine overrides**: inherit/enable/disable this destination and optionally replace its complete repository URL or non-secret environment dictionary. Secret environment values and passwords stay in the local secret store and are never copied into shared config.
     - *Local folder*: path picker; inline warning if under `~/Library/Mobile Documents` ("iCloud may evict repository files with Optimize Mac Storage — this can corrupt reads; consider a non-synced location. Sync folders replicate deletions — treat this as a convenience copy, not your only backup."); note when under `/Volumes` ("Removable volume — will be skipped when not mounted" — for secondaries this is normal).
     - *S3-compatible*: endpoint URL (placeholder `https://<accountid>.r2.cloudflarestorage.com` / empty = AWS), bucket, path prefix, region (optional, "auto" hint for R2), Access Key ID (→ keychain env blob), Secret Access Key (SecureField → keychain env blob). The form assembles `repoURL = s3:<endpoint>/<bucket>/<prefix>`; show the assembled URL read-only.
     - *SFTP / REST / Other*: raw repo URL field + free-form non-secret env key/value table + secret env key/value table (values in SecureFields → keychain blob). Caption: "Anything restic accepts after `-r`."

@@ -19,6 +19,7 @@ struct SetEditorView: View {
     @State private var isNew: Bool
     @State private var fieldErrors: [SetEditorField: String] = [:]
     @State private var didSave = false
+    @State private var showingMachineOverrides = false
 
     init(initialSet: BackupSet, isNew: Bool) {
         _draft = State(initialValue: initialSet)
@@ -40,6 +41,8 @@ struct SetEditorView: View {
                 schedule: $draft.schedule,
                 errorMessage: fieldErrors[.schedule]
             )
+
+            machineOverridesSection
 
             stalenessSection
 
@@ -67,6 +70,13 @@ struct SetEditorView: View {
         .toolbar { toolbarContent }
         .onChange(of: draft) { _, _ in
             didSave = false
+        }
+        .sheet(isPresented: $showingMachineOverrides) {
+            SetMachineOverridesEditor(
+                set: $draft,
+                sharedConfig: model.config,
+                currentMachineID: model.machine.machineId
+            )
         }
     }
 
@@ -100,6 +110,42 @@ struct SetEditorView: View {
         } header: {
             Text("Staleness warning")
         }
+    }
+
+    private var machineOverridesSection: some View {
+        Section {
+            LabeledContent("This host") {
+                let plan = MachineOverrideUI.effectivePlan(
+                    config: configReplacingDraft,
+                    machineID: model.machine.machineId
+                )
+                let runsHere = plan.sets.first(where: { $0.id == draft.id })?.enabled == true
+                Label(
+                    runsHere ? "Runs here" : "Does not run here",
+                    systemImage: runsHere ? "checkmark.circle.fill" : "minus.circle.fill"
+                )
+                .foregroundStyle(runsHere ? .green : .secondary)
+            }
+            LabeledContent("Configured profiles", value: "\(draft.machines?.count ?? 0)")
+            Button("Edit Machine Overrides…") { showingMachineOverrides = true }
+        } header: {
+            Text("Machine overrides")
+        } footer: {
+            Text("Override this set's enabled state, complete source list, or schedule per machine. "
+                + "Overrides live in shared config.json; this host's machine.json is never edited here.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private var configReplacingDraft: AppConfig {
+        var config = model.config
+        if let index = config.sets.firstIndex(where: { $0.id == draft.id }) {
+            config.sets[index] = draft
+        } else {
+            config.sets.append(draft)
+        }
+        return config
     }
 
     // MARK: - Toolbar
