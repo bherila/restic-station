@@ -380,14 +380,18 @@ under the state directory (`$XDG_STATE_HOME/restic-station`, default
 `~/.local/state/restic-station`), **never** in `config.json`. The guarantee that actually holds:
 **`secrets.json` itself is created `0600`**, via `open(2)`'s `O_EXCL|O_CREAT` (never
 create-then-`chmod`, so the mode is never briefly wider), and **every read re-verifies that mode
-and refuses a wider one** (see [Troubleshooting](#troubleshooting)) — that is real, enforced
-protection. Fresh state directories are created `0700`, including by
+and the opened file's owner** (see [Troubleshooting](#troubleshooting)). A non-root helper trusts
+its effective uid and root; a root helper trusts only root, so it cannot bootstrap secrets from an
+attacker-prepared `0600` file. Fresh state directories are created `0700`, including by
 `AppPaths.ensureDirectories()`; before any secret is written, `FileSecretStore.prepareDirectories()`
 also attempts to tighten an existing directory to `0700` ([issue
 #49](https://github.com/bherila/restic-station/issues/49)). The resulting mode is checked rather
 than trusting `chmod(2)`'s return value. Group/world write *and search* access is refused when it
-would let another user replace `secrets.json` despite its `0600` mode; sticky directories are
-accepted when their ownership protects the entry, as it does under `/tmp`. Group/world read or
+would let another user replace `secrets.json` despite its `0600` mode; an owner outside the same
+effective-user/root boundary is refused regardless of mode. Sticky directories are accepted when
+trusted ownership protects the entry, as it does under `/tmp`. A squatted `secrets.json.tmp` is
+still refused, but the diagnostic names its owner and the exact remove-or-relocate recovery instead
+of reporting only “File exists.” Group/world read or
 search access emits one warning per mutation and continues because the exposure is directory
 entries and/or file metadata, not the secret contents. The same replacement check covers the
 state directory's immediate parent so another writer cannot rename the whole directory aside; it
@@ -1165,6 +1169,16 @@ f1000000-0000-4000-8000-000000000003  "Offsite Mirror" (set "Projects")  passwor
 
 If something recursively `chmod`'ed the whole data directory, other state files were likely
 widened too — worth checking, not just `secrets.json`.
+
+**"refusing to read …/secrets.json: it is owned by uid …".** The helper will not consume a
+plausible-looking secret file from outside its ownership boundary. Verify that the path really is
+the intended data directory, then run the printed `chown` deliberately; for a root-run helper the
+file and data directory must be root-owned.
+
+**"could not safely create …/secrets.json.tmp".** A stale or squatted fixed temp entry could not
+be removed, or appeared during the secure `O_EXCL` create. The message reports the entry owner:
+remove it as that owner or root and retry. If the data root itself is a shared sticky directory
+such as `/tmp`, prefer a private directory and point `RESTIC_STATION_DATA_DIR` there.
 
 **"restic not found" / "restic 0.16.4 … is too old."** These are two different messages now, and
 the distinction is the point. `ResticDiscovery` requires a candidate to actually *run* a successful
