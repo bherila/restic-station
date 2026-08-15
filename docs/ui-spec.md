@@ -82,7 +82,7 @@ Per set (picker or sections):
 - **restic binary**: discovered path + version chip; "Locate manually…" file picker; states: OK (green, "restic 0.18.1"), too old (yellow, "0.16 found — 0.17+ required"), missing (red, "Install with `brew install restic`").
 - **Permissions & background**:
   - FDA card: two badges — App: granted/denied; Background agent: granted/denied/unknown (from `fda-check.json`; "Re-check" button kickstarts the helper). "Open Full Disk Access settings" button (deep link). Help disclosure with the fallback instructions (add helper binary manually — path shown, copyable).
-  - Background agent card: SMAppService status (Enabled / Requires approval → "Open Login Items settings" button / Not registered → "Enable" button). Caption: "Runs backups on schedule even when Restic Station is closed."
+  - Background agent card: SMAppService status (Enabled → "Remove" button / Requires approval → "Open Login Items settings" button / Not registered → "Enable" button). Removal is refused while a backup is in flight. A pre-registration `.notFound` is presented as Not registered when the embedded plist is present; a genuinely missing plist remains Not found with reinstall guidance. Caption: "Runs backups on schedule even when Restic Station is closed."
 
 ## Onboarding (first launch, no config)
 
