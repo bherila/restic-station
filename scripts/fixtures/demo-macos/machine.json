@@ -1,0 +1,5 @@
+{
+  "machineId" : "demo-mac",
+  "resticPath" : "/opt/homebrew/bin/restic",
+  "version" : 1
+}

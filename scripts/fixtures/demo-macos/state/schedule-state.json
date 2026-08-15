@@ -1,0 +1,19 @@
+{
+  "sets" : {
+    "10000000-0000-4000-8000-000000000010" : {
+      "checkSliceCursor" : 4,
+      "lastBackupStart" : "2026-08-15T17:12:04.000Z",
+      "lastCheckStart" : "2026-08-09T09:35:02.000Z"
+    },
+    "20000000-0000-4000-8000-000000000010" : {
+      "checkSliceCursor" : null,
+      "lastBackupStart" : "2026-08-10T10:20:11.000Z",
+      "lastCheckStart" : null
+    },
+    "30000000-0000-4000-8000-000000000010" : {
+      "checkSliceCursor" : null,
+      "lastBackupStart" : "2026-08-15T17:30:05.000Z",
+      "lastCheckStart" : null
+    }
+  }
+}
