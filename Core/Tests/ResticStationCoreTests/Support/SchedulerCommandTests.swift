@@ -200,6 +200,7 @@ import Testing
         let argvs = [
             SystemdCommand.daemonReloadArgv,
             SystemdCommand.enableTimerArgv,
+            SystemdCommand.restartTimerArgv,
             SystemdCommand.disableTimerArgv,
             SystemdCommand.isEnabledArgv,
             SystemdCommand.isActiveArgv,
@@ -213,6 +214,7 @@ import Testing
     @Test func exactArgvSpellings() {
         #expect(SystemdCommand.daemonReloadArgv == ["--user", "daemon-reload"])
         #expect(SystemdCommand.enableTimerArgv == ["--user", "enable", "--now", "restic-station.timer"])
+        #expect(SystemdCommand.restartTimerArgv == ["--user", "restart", "restic-station.timer"])
         #expect(SystemdCommand.disableTimerArgv == ["--user", "disable", "--now", "restic-station.timer"])
         #expect(SystemdCommand.isEnabledArgv == ["--user", "is-enabled", "restic-station.timer"])
         #expect(SystemdCommand.isActiveArgv == ["--user", "is-active", "restic-station.timer"])

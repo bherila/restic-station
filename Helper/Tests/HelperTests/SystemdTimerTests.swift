@@ -154,11 +154,12 @@ private func lingerResponder(_ value: String) -> @Sendable ([String]) -> Process
             log: { log.append($0) }
         )
 
-        // Exact sequence. daemon-reload must precede enable, or systemd
-        // enables whatever version of the unit it last read.
+        // Exact sequence. daemon-reload must precede enable, and restart
+        // must follow it: `enable --now` does not refresh an active timer.
         #expect(runner.invocations == [
             [systemctl, "--user", "daemon-reload"],
             [systemctl, "--user", "enable", "--now", "restic-station.timer"],
+            [systemctl, "--user", "restart", "restic-station.timer"],
             [loginctl, "show-user", "ben", "--property=Linger"],
         ])
 
@@ -215,7 +216,8 @@ private func lingerResponder(_ value: String) -> @Sendable ([String]) -> Process
 
     /// The acceptance criterion "`timer install` is idempotent": re-running
     /// updates in place. Nothing accumulates, and the second run is the same
-    /// three calls, not a different repair path.
+    /// four calls, not a different repair path. Restarting every time is
+    /// essential: `enable --now` leaves an already-active timer untouched.
     @Test("re-running updates the units in place and duplicates nothing")
     func installIsIdempotent() async throws {
         let unitDirectory = try makeTempDirectory("units")
@@ -229,6 +231,7 @@ private func lingerResponder(_ value: String) -> @Sendable ([String]) -> Process
         let expectedOnce: [[String]] = [
             ["--user", "daemon-reload"],
             ["--user", "enable", "--now", "restic-station.timer"],
+            ["--user", "restart", "restic-station.timer"],
             ["show-user", "ben", "--property=Linger"],
         ]
         #expect(runner.arguments == expectedOnce + expectedOnce)

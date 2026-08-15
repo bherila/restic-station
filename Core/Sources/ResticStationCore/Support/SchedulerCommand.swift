@@ -280,6 +280,10 @@ public enum SystemdCommand {
 
     public static let daemonReloadArgv = ["--user", "daemon-reload"]
     public static let enableTimerArgv = ["--user", "enable", "--now", SystemdCommand.timerUnitName]
+    /// `enable --now` is a no-op for an already-active timer. `timer install`
+    /// rewrites both units, so it must restart the timer after daemon-reload
+    /// to load the new interval/data directory and reset its monotonic clock.
+    public static let restartTimerArgv = ["--user", "restart", SystemdCommand.timerUnitName]
     public static let disableTimerArgv = ["--user", "disable", "--now", SystemdCommand.timerUnitName]
     public static let isEnabledArgv = ["--user", "is-enabled", SystemdCommand.timerUnitName]
     public static let isActiveArgv = ["--user", "is-active", SystemdCommand.timerUnitName]
