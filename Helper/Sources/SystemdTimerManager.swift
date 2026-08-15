@@ -106,6 +106,12 @@ struct SystemdTimerManager {
 
         try await runChecked(systemctl, SystemdCommand.daemonReloadArgv)
         try await runChecked(systemctl, SystemdCommand.enableTimerArgv)
+        // `enable --now` starts an inactive timer but deliberately leaves an
+        // already-active one alone. Reinstallation commonly changes the
+        // pinned data directory or interval, so restart after daemon-reload:
+        // otherwise the first fire can still follow the old monotonic clock
+        // and subsequent fires may never adopt the rewritten timer state.
+        try await runChecked(systemctl, SystemdCommand.restartTimerArgv)
         log("enabled \(SystemdCommand.timerUnitName) — ticking every \(SystemdCommand.duration(minutes: intervalMinutes))")
         log("  \(helperPath) tick")
 

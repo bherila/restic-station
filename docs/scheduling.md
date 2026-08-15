@@ -79,6 +79,7 @@ ExecStart=<HELPER_PATH> tick
 Unit=restic-station.service
 OnBootSec=2min
 OnUnitActiveSec=2min
+AccuracySec=1s
 Persistent=true
 
 [Install]
@@ -96,6 +97,10 @@ WantedBy=timers.target
   that tick finds every set overdue from `schedule-state.json` — the same
   single catch-up run macOS gets from launchd coalescing missed
   `StartInterval` fires on wake.
+- **`AccuracySec=1s` keeps the two-minute contract honest.** systemd otherwise
+  defaults to a one-minute coalescing window, so a nominal two-minute tick can
+  arrive almost three minutes later. A one-second window retains light
+  coalescing without adding a full minute to wake/catch-up latency.
 - **`Persistent=true` is kept deliberately, and is not what does that.**
   `systemd.timer(5)` scopes `Persistent=` to `OnCalendar=` timers, so with the
   monotonic pair above it has no effect of its own. It stays because it states

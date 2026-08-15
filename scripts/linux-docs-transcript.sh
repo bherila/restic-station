@@ -310,12 +310,13 @@ grep -qF "Environment=\"RESTIC_STATION_DATA_DIR=$WORK/explicit-data-dir\"" "$UNI
 # ===========================================================================
 section "Scheduling: waiting to see whether the installed timer actually fires"
 # ===========================================================================
-# The one thing issue #45 says CI has never observed: a real systemd --user
-# timer firing `tick` on its own, not `timer install` merely reporting
-# enabled+active. A dedicated set with a repo already initialized and its
-# password already stored, never yet backed up (so ScheduleMath's "never-run
-# is immediately due" rule applies to the very first tick that runs it), in
-# its own timer/data dir so it cannot collide with anything above.
+# Issue #45's live scheduler gate: observe both the initial OnBootSec firing
+# and a later OnUnitActiveSec firing, not merely `timer install` reporting
+# enabled+active. A dedicated set has a repo already initialized and its
+# password already stored, but has never run (so ScheduleMath's "never-run is
+# immediately due" rule applies to the first tick). Its 5-minute backup
+# schedule deliberately exceeds the timer's 2-minute cadence: the repeat tick
+# must happen, but must not create a second backup before the set is due.
 FIRE_DATA="$WORK/data-fire-check"
 FIRE_SOURCE="$WORK/fire-source"
 FIRE_REPO="$WORK/fire-repo"
@@ -354,22 +355,36 @@ RESTIC_PASSWORD_COMMAND="$BIN_DIR/restic-station-helper print-password --dest $F
 BEFORE=$(RESTIC_STATION_DATA_DIR="$FIRE_DATA" restic-station-helper runs list --json | jq 'length')
 echo
 echo "runs recorded for \"Fire Check\" before installing its timer: $BEFORE (expect 0)"
+JOURNAL_START="$(date --iso-8601=seconds)"
 RESTIC_STATION_DATA_DIR="$FIRE_DATA" run restic-station-helper timer install --interval 2
 
-WAIT_SECONDS=170
+service_start_count() {
+    journalctl --user -u restic-station.service --no-pager --since "$JOURNAL_START" -o json 2>/dev/null \
+        | jq -s '[.[] | select((.MESSAGE // "") | startswith("Starting restic-station.service"))] | length' \
+        2>/dev/null || echo 0
+}
+
+WAIT_SECONDS=250
 echo
-echo "waiting up to ${WAIT_SECONDS}s, polling every 10s, for the installed timer to fire a REAL tick"
-echo "that finds \"Fire Check\" due and runs it — the one thing docs/testing.md and issue #45 say"
-echo "has never been observed in CI:"
+echo "waiting up to ${WAIT_SECONDS}s, polling every 10s, for two unattended service activations:"
+echo "the first must back up the never-run set; the OnUnitActiveSec repeat must tick again without"
+echo "backing it up early (the set itself is due every 5 minutes):"
 FIRED=0
+REPEATED=0
 ELAPSED=0
 while [[ $ELAPSED -lt $WAIT_SECONDS ]]; do
     sleep 10
     ELAPSED=$((ELAPSED + 10))
     AFTER=$(RESTIC_STATION_DATA_DIR="$FIRE_DATA" restic-station-helper runs list --json | jq 'length' 2>/dev/null || echo "$BEFORE")
-    printf '  t=+%3ds  runs=%s\n' "$ELAPSED" "$AFTER"
+    SERVICE_STARTS=$(service_start_count)
+    printf '  t=+%3ds  service starts=%s  backup runs=%s\n' "$ELAPSED" "$SERVICE_STARTS" "$AFTER"
     if [[ "$AFTER" -gt "$BEFORE" ]]; then
         FIRED=1
+    fi
+    if [[ "$SERVICE_STARTS" -ge 2 ]]; then
+        REPEATED=1
+    fi
+    if [[ $FIRED -eq 1 && $REPEATED -eq 1 ]]; then
         break
     fi
 done
@@ -379,15 +394,21 @@ RESTIC_STATION_DATA_DIR="$FIRE_DATA" run restic-station-helper runs list --json
 run journalctl --user -u restic-station.service --no-pager --since "-5 minutes"
 
 echo
-if [[ $FIRED -eq 1 ]]; then
-    echo "OBSERVED: the systemd --user timer fired on its own and ran a real, previously-never-run"
-    echo "backup — a live end-to-end firing, not just 'enabled/active'. See the PR description for"
-    echo "what this does and does not settle about issue #45."
-else
-    echo "NOT OBSERVED within ${WAIT_SECONDS}s: the timer reported enabled+active above, but no new run"
-    echo "appeared in that window. Left as still-open per issue #45; the wait ran out, this was not"
-    echo "given up on early."
+if [[ $FIRED -ne 1 ]]; then
+    echo "REGRESSION: no unattended backup appeared within ${WAIT_SECONDS}s"
+    exit 1
 fi
+if [[ $REPEATED -ne 1 ]]; then
+    echo "REGRESSION: OnUnitActiveSec did not produce a second service activation within ${WAIT_SECONDS}s"
+    exit 1
+fi
+if [[ "$AFTER" -ne $((BEFORE + 1)) ]]; then
+    echo "REGRESSION: the 2-minute timer cadence created $((AFTER - BEFORE)) backups even though the"
+    echo "set's 5-minute due time permits exactly one in this observation window"
+    exit 1
+fi
+echo "CONFIRMED: systemd fired the initial due backup and then activated the service again through"
+echo "OnUnitActiveSec. The repeat tick created no early backup; due-ness still came from schedule state."
 
 RESTIC_STATION_DATA_DIR="$FIRE_DATA" run restic-station-helper timer uninstall
 
