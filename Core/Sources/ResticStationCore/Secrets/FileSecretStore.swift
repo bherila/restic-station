@@ -36,13 +36,15 @@ import Musl
 /// entries from other writers and is therefore not refused. The secret file
 /// is never create-then-`chmod`, which would leave a window in which it is
 /// world-readable. Every read re-verifies the file mode and refuses to read a
-/// group- or world-accessible file (see ``load()``).
+/// group- or world-accessible file or one owned outside the helper/root trust
+/// boundary (see ``load()``).
 ///
 /// **Atomicity.** Writes go to a fixed-name temp file in the same directory,
 /// created `O_EXCL` at `0600`, `fsync`ed, then `rename(2)`d over the real
 /// file — the same pattern as `ConfigStore.save(_:)`. A crash can therefore
 /// never truncate `secrets.json`; the worst case is a leftover temp file,
-/// which the next write unlinks.
+/// which the next write unlinks or reports with ownership-aware recovery
+/// guidance if another user has squatted the fixed path.
 ///
 /// **Concurrency.** The tick helper and an interactive `secret set` can run
 /// at the same time, so every read-modify-write happens under the shared
@@ -66,6 +68,7 @@ public struct FileSecretStore: SecretStore {
     private let helperPath: String
     private let directoryModeSetter: @Sendable (String, mode_t) -> Void
     private let warningHandler: @Sendable (String) -> Void
+    private let effectiveUserID: @Sendable () -> uid_t
 
     /// - Parameters:
     ///   - paths: supplies `root` (the secrets file's directory) and
@@ -99,12 +102,14 @@ public struct FileSecretStore: SecretStore {
         paths: AppPaths,
         helperPath: String,
         directoryModeSetter: @escaping @Sendable (String, mode_t) -> Void,
-        warningHandler: @escaping @Sendable (String) -> Void
+        warningHandler: @escaping @Sendable (String) -> Void,
+        effectiveUserID: @escaping @Sendable () -> uid_t = { geteuid() }
     ) {
         self.paths = paths
         self.helperPath = helperPath
         self.directoryModeSetter = directoryModeSetter
         self.warningHandler = warningHandler
+        self.effectiveUserID = effectiveUserID
     }
 
     // MARK: - Paths
@@ -349,6 +354,14 @@ public struct FileSecretStore: SecretStore {
                 "refusing to read \(path): it is not a regular file."
             )
         }
+        let euid = effectiveUserID()
+        guard Self.isTrustedOwner(info.st_uid, effectiveUID: euid) else {
+            throw SecretStoreError.backendFailed(
+                "refusing to read \(path): it is owned by uid \(info.st_uid), outside this "
+                    + "helper's trusted ownership boundary (\(Self.trustedOwnerDescription(effectiveUID: euid))). "
+                    + "Fix the ownership with: chown \(euid) \(ShellQuoting.quoteIfNeeded(path))"
+            )
+        }
         let permissions = mode & 0o777
         guard permissions & 0o077 == 0 else {
             throw SecretStoreError.backendFailed(
@@ -412,11 +425,33 @@ public struct FileSecretStore: SecretStore {
         // Clear any leftover from a crashed write so O_EXCL always creates a
         // brand-new file — which is what guarantees the 0600 creation mode
         // actually applies (open(2) ignores `mode` for an existing file).
-        _ = tempPath.withCString { unlink($0) }
+        // A sticky shared directory can make another user's squatted entry
+        // impossible for us to unlink, so never discard that failure.
+        let removed = tempPath.withCString { unlink($0) }
+        if removed != 0 {
+            let code = errno
+            if code != ENOENT {
+                throw SecretStoreError.backendFailed(
+                    Self.tempFileConflictMessage(
+                        path: tempPath,
+                        reason: "could not remove the existing temporary entry: \(Self.describe(errno: code))"
+                    )
+                )
+            }
+        }
         let fd = tempPath.withCString { open($0, O_CREAT | O_EXCL | O_WRONLY, 0o600) }
         guard fd >= 0 else {
+            let code = errno
+            if code == EEXIST {
+                throw SecretStoreError.backendFailed(
+                    Self.tempFileConflictMessage(
+                        path: tempPath,
+                        reason: "another entry appeared before the secure temporary file could be created"
+                    )
+                )
+            }
             throw SecretStoreError.backendFailed(
-                "could not create \(tempPath): \(Self.describe(errno: errno))"
+                "could not create \(tempPath): \(Self.describe(errno: code))"
             )
         }
         // Not "create-then-chmod": the file was *created* at 0600 and a umask
@@ -535,9 +570,20 @@ public struct FileSecretStore: SecretStore {
         directoryModeSetter(path, mode)
 
         let info = try directoryInfo(at: url)
+        let euid = effectiveUserID()
+        try requireTrustedOwner(
+            info.st_uid,
+            at: path,
+            role: "secrets directory",
+            effectiveUID: euid
+        )
         let modeBits = UInt32(info.st_mode)
         let displayedMode = modeBits & 0o7777
-        guard !Self.hasUnprotectedReplacementAccess(info, entryOwner: geteuid()) else {
+        guard !Self.hasUnprotectedReplacementAccess(
+            info,
+            entryOwner: euid,
+            effectiveUID: euid
+        ) else {
             throw SecretStoreError.backendFailed(
                 "refusing to store secrets in \(path): the directory has unprotected group/world "
                     + "write-and-search access (mode \(Self.octal(displayedMode))). Another user "
@@ -585,7 +631,24 @@ public struct FileSecretStore: SecretStore {
             )
         }
         let parentInfo = try directoryInfo(at: parent)
-        guard !Self.hasUnprotectedReplacementAccess(parentInfo, entryOwner: rootEntryInfo.st_uid) else {
+        let euid = effectiveUserID()
+        try requireTrustedOwner(
+            rootEntryInfo.st_uid,
+            at: paths.root.path,
+            role: "secrets directory entry",
+            effectiveUID: euid
+        )
+        try requireTrustedOwner(
+            parentInfo.st_uid,
+            at: parent.path,
+            role: "immediate parent directory",
+            effectiveUID: euid
+        )
+        guard !Self.hasUnprotectedReplacementAccess(
+            parentInfo,
+            entryOwner: rootEntryInfo.st_uid,
+            effectiveUID: euid
+        ) else {
             let displayedMode = UInt32(parentInfo.st_mode) & 0o7777
             throw SecretStoreError.backendFailed(
                 "refusing to store secrets under \(parent.path): the immediate parent directory "
@@ -614,17 +677,63 @@ public struct FileSecretStore: SecretStore {
     /// Directory mutation requires write and search for the same permission
     /// class. Sticky mode then limits it to the entry owner, directory owner,
     /// or root, so both relevant owners must belong to the trusted boundary.
-    private static func hasUnprotectedReplacementAccess(_ directory: stat, entryOwner: uid_t) -> Bool {
+    private static func hasUnprotectedReplacementAccess(
+        _ directory: stat,
+        entryOwner: uid_t,
+        effectiveUID: uid_t
+    ) -> Bool {
         let mode = UInt32(directory.st_mode)
         let groupCanReplace = mode & 0o030 == 0o030
         let otherCanReplace = mode & 0o003 == 0o003
         guard groupCanReplace || otherCanReplace else { return false }
         guard mode & UInt32(S_ISVTX) != 0 else { return true }
 
-        func isTrustedOwner(_ owner: uid_t) -> Bool {
-            owner == geteuid() || owner == 0
+        return !isTrustedOwner(directory.st_uid, effectiveUID: effectiveUID)
+            || !isTrustedOwner(entryOwner, effectiveUID: effectiveUID)
+    }
+
+    /// A non-root helper accepts its own entries and root-managed entries. A
+    /// root helper accepts only root: otherwise root's ability to read/chmod
+    /// everything would turn an attacker-owned 0600 file or 0700 directory
+    /// into a trusted secrets source.
+    static func isTrustedOwner(_ owner: uid_t, effectiveUID: uid_t) -> Bool {
+        owner == effectiveUID || owner == 0
+    }
+
+    private func requireTrustedOwner(
+        _ owner: uid_t,
+        at path: String,
+        role: String,
+        effectiveUID: uid_t
+    ) throws {
+        guard Self.isTrustedOwner(owner, effectiveUID: effectiveUID) else {
+            throw SecretStoreError.backendFailed(
+                "refusing to store secrets at \(path): the \(role) is owned by uid \(owner), "
+                    + "outside this helper's trusted ownership boundary "
+                    + "(\(Self.trustedOwnerDescription(effectiveUID: effectiveUID))). "
+                    + "Move RESTIC_STATION_DATA_DIR to trusted storage or deliberately change "
+                    + "ownership with: "
+                    + "chown \(effectiveUID) \(ShellQuoting.quoteIfNeeded(path))"
+            )
         }
-        return !isTrustedOwner(directory.st_uid) || !isTrustedOwner(entryOwner)
+    }
+
+    private static func trustedOwnerDescription(effectiveUID: uid_t) -> String {
+        effectiveUID == 0 ? "root (uid 0)" : "uid \(effectiveUID) or root (uid 0)"
+    }
+
+    private static func tempFileConflictMessage(path: String, reason: String) -> String {
+        var info = stat()
+        let owner: String
+        if path.withCString({ lstat($0, &info) }) == 0 {
+            owner = " The existing entry is owned by uid \(info.st_uid)."
+        } else {
+            owner = " Its owner could not be inspected because the entry changed concurrently."
+        }
+        return "could not safely create \(path): \(reason)." + owner
+            + " Remove that entry as its owner or as root, then retry. If the data directory is itself "
+            + "shared and sticky (for example /tmp), move it to private storage and point "
+            + "RESTIC_STATION_DATA_DIR there."
     }
 
     // MARK: - Small helpers

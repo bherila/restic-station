@@ -61,6 +61,13 @@ struct FileSecretStoreTests {
         return UInt32(info.st_mode) & 0o7777
     }
 
+    static func owner(of url: URL) throws -> uid_t {
+        var info = stat()
+        let ok = url.path.withCString { stat($0, &info) }
+        try #require(ok == 0, "stat failed for \(url.path)")
+        return info.st_uid
+    }
+
     // MARK: - Permissions at creation
 
     @Test("the secrets file is created 0600 and its directory 0700, at creation time")
@@ -276,6 +283,55 @@ struct FileSecretStoreTests {
         #expect(try Self.permissions(of: store.fileURL) == 0o600)
     }
 
+    @Test("trusted ownership is self-or-root for users, but root-only for root")
+    func trustedOwnershipPolicy() {
+        #expect(FileSecretStore.isTrustedOwner(0, effectiveUID: 0))
+        #expect(!FileSecretStore.isTrustedOwner(501, effectiveUID: 0))
+        #expect(FileSecretStore.isTrustedOwner(501, effectiveUID: 501))
+        #expect(FileSecretStore.isTrustedOwner(0, effectiveUID: 501))
+        #expect(!FileSecretStore.isTrustedOwner(502, effectiveUID: 501))
+    }
+
+    @Test("a root helper refuses a non-root-owned secrets directory")
+    func rootRefusesUntrustedSecretsDirectory() async throws {
+        let (_, root) = Self.makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try #require(root.path.withCString { chmod($0, 0o700) } == 0)
+
+        let untrustedOwner: uid_t
+        if geteuid() == 0 {
+            untrustedOwner = 65_534
+            try #require(root.path.withCString { chown($0, untrustedOwner, gid_t.max) } == 0)
+        } else {
+            untrustedOwner = geteuid()
+        }
+
+        let store = FileSecretStore(
+            paths: AppPaths(root: root),
+            helperPath: "/opt/restic-station/restic-station-helper",
+            directoryModeSetter: { _, _ in },
+            warningHandler: { _ in },
+            effectiveUserID: { 0 }
+        )
+
+        do {
+            try await store.setPassword("hunter2", destId: Self.destId)
+            Issue.record("expected root to refuse a non-root-owned secrets directory")
+        } catch let error as SecretStoreError {
+            guard case .backendFailed(let message) = error else {
+                Issue.record("expected .backendFailed, got \(error)")
+                return
+            }
+            #expect(message.contains(root.path))
+            #expect(message.contains("owned by uid \(untrustedOwner)"))
+            #expect(message.contains("root (uid 0)"))
+            #expect(message.contains("RESTIC_STATION_DATA_DIR"))
+            #expect(!message.contains("hunter2"))
+        }
+        #expect(!FileManager.default.fileExists(atPath: store.fileURL.path))
+    }
+
     @Test("the temp file a write goes through is itself created 0600")
     func tempFileIsAlsoTight() async throws {
         let (store, root) = Self.makeStore()
@@ -297,6 +353,35 @@ struct FileSecretStoreTests {
 
         #expect(try Self.permissions(of: store.fileURL) == 0o600)
         #expect(try await store.password(destId: Self.destId) == "hunter2")
+    }
+
+    @Test("an unremovable temp entry reports its owner and an actionable recovery")
+    func diagnosesSquattedTempEntry() async throws {
+        let (store, root) = Self.makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try store.prepareDirectories()
+        try FileManager.default.createDirectory(
+            at: store.tempFileURL,
+            withIntermediateDirectories: false
+        )
+        let owner = try Self.owner(of: store.tempFileURL)
+
+        do {
+            try await store.setPassword("hunter2", destId: Self.destId)
+            Issue.record("expected an unremovable temporary entry to be refused")
+        } catch let error as SecretStoreError {
+            guard case .backendFailed(let message) = error else {
+                Issue.record("expected .backendFailed, got \(error)")
+                return
+            }
+            #expect(message.contains(store.tempFileURL.path))
+            #expect(message.contains("owned by uid \(owner)"))
+            #expect(message.contains("Remove that entry"))
+            #expect(message.contains("RESTIC_STATION_DATA_DIR"))
+            #expect(!message.contains("hunter2"))
+        }
+        #expect(FileManager.default.fileExists(atPath: store.tempFileURL.path))
+        #expect(!FileManager.default.fileExists(atPath: store.fileURL.path))
     }
 
     // MARK: - Permissions on read
@@ -347,6 +432,47 @@ struct FileSecretStoreTests {
         _ = store.fileURL.path.withCString { chmod($0, 0o400) }
 
         #expect(try await store.password(destId: Self.destId) == "hunter2")
+    }
+
+    @Test("a root helper refuses a non-root-owned 0600 secrets file")
+    func rootRefusesUntrustedSecretsFile() async throws {
+        let (writer, root) = Self.makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try await writer.setPassword("hunter2", destId: Self.destId)
+
+        let untrustedOwner: uid_t
+        if geteuid() == 0 {
+            untrustedOwner = 65_534
+            let changed = writer.fileURL.path.withCString {
+                chown($0, untrustedOwner, gid_t.max)
+            }
+            try #require(changed == 0)
+        } else {
+            untrustedOwner = geteuid()
+        }
+        try #require(try Self.permissions(of: writer.fileURL) == 0o600)
+
+        let reader = FileSecretStore(
+            paths: AppPaths(root: root),
+            helperPath: "/opt/restic-station/restic-station-helper",
+            directoryModeSetter: { _, _ in },
+            warningHandler: { _ in },
+            effectiveUserID: { 0 }
+        )
+        do {
+            _ = try await reader.password(destId: Self.destId)
+            Issue.record("expected root to refuse a non-root-owned secrets file")
+        } catch let error as SecretStoreError {
+            guard case .backendFailed(let message) = error else {
+                Issue.record("expected .backendFailed, got \(error)")
+                return
+            }
+            #expect(message.contains(reader.fileURL.path))
+            #expect(message.contains("owned by uid \(untrustedOwner)"))
+            #expect(message.contains("root (uid 0)"))
+            #expect(message.contains("chown 0"))
+            #expect(!message.contains("hunter2"))
+        }
     }
 
     @Test("a symlink in place of the secrets file is refused, never followed")
