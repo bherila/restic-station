@@ -136,6 +136,79 @@ struct CLIErrorContractTests {
     }
 }
 
+@Suite("the published code table")
+struct CLIErrorDocumentationTests {
+
+    /// `docs/cli-json.md` is normative and is what callers read. A code that
+    /// exists and is undocumented is as bad as one that is documented and
+    /// does not exist, and neither shows up in any other test — the doc is
+    /// prose that nothing else in the build ever reads.
+    ///
+    /// Located from `#filePath` rather than from the test bundle: the doc is
+    /// a repo file, not a test resource, and this works identically on both
+    /// platforms. Precedent: `ModelsTests.dataModelExampleConfigJSON`
+    /// decodes `docs/data-model.md`'s example verbatim for the same reason.
+    private static var codeTable: String {
+        get throws {
+            let repoRoot = URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent()   // …/Support
+                .deletingLastPathComponent()   // …/ResticStationCoreTests
+                .deletingLastPathComponent()   // …/Tests
+                .deletingLastPathComponent()   // …/Core
+                .deletingLastPathComponent()   // repo root
+            let doc = repoRoot.appendingPathComponent("docs/cli-json.md")
+            return try String(contentsOf: doc, encoding: .utf8)
+        }
+    }
+
+    @Test("every code has a row in docs/cli-json.md")
+    func everyCodeIsDocumented() throws {
+        let table = try Self.codeTable
+        for code in CLIErrorCode.allCases {
+            #expect(
+                table.contains("| `\(code.rawValue)` |"),
+                "\(code.rawValue) has no row in the docs/cli-json.md code table"
+            )
+        }
+    }
+
+    @Test("the documented retryability and exit code match the implementation")
+    func documentedFlagsMatch() throws {
+        let table = try Self.codeTable
+        for code in CLIErrorCode.allCases {
+            let row = try #require(
+                table.split(separator: "\n").first { $0.hasPrefix("| `\(code.rawValue)` |") },
+                "\(code.rawValue) has no row to check"
+            )
+            let columns = row.split(separator: "|").map { $0.trimmingCharacters(in: .whitespaces) }
+            // | code | retryable | exit | meaning |
+            let documentedRetryable = columns[1].contains("yes")
+            #expect(
+                documentedRetryable == code.retryable,
+                "\(code.rawValue): docs say retryable=\(documentedRetryable), code says \(code.retryable)"
+            )
+            #expect(
+                columns[2].contains(String(code.exitCode.rawValue)),
+                "\(code.rawValue): docs say exit \(columns[2]), code says \(code.exitCode.rawValue)"
+            )
+        }
+    }
+
+    @Test("the table documents no code that does not exist")
+    func noPhantomCodes() throws {
+        let known = Set(CLIErrorCode.allCases.map(\.rawValue))
+        for line in try Self.codeTable.split(separator: "\n") where line.hasPrefix("| `") {
+            let name = line.dropFirst(3).prefix { $0 != "`" }
+            // Skip the `details` table, whose first column is a key name.
+            guard name.contains("_") else { continue }
+            #expect(
+                known.contains(String(name)),
+                "docs/cli-json.md documents \(name), which is not a CLIErrorCode"
+            )
+        }
+    }
+}
+
 @Suite("CLI error mapping from typed errors")
 struct CLIErrorMappingTests {
 

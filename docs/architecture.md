@@ -110,6 +110,8 @@ Every failure is classified into one of three categories, which drive both `RunS
 
 restic exit code mapping (verified against restic 0.18.1 — see `restic-cli.md`): `0` success, `1` fatal, `2` Go runtime error, `3` backup incomplete-read warning, `10` repository does not exist, `11` repository locked, `12` wrong password. Exit 11 on a *scheduled* run: attempt `restic unlock` once (removes only stale locks of dead processes), retry the operation once, then fail terminal if still locked.
 
+The three categories above drive *this app's* behavior. What a **headless caller** sees is a second, finer classification carried in the `--json` error envelope — `set_not_found`, `repository_locked`, `secret_rejected` and the rest — so an agent never has to match English prose to find out what went wrong. The exit-code contract below is unchanged by it. See `cli-json.md` for the code table, the redaction policy, and the versioning rules.
+
 ## RunStatus
 
 `success` | `warning` | `failed` | `skipped` | `running`. `skipped` records exist so the UI can show "was due but another run was in flight". A crash mid-run leaves a `running` metadata record with no end time; the next helper invocation that finds a `running` record whose PID is dead rewrites it as `failed` with message "interrupted".
