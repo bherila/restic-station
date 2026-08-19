@@ -55,12 +55,13 @@ never match on it. `details` is omitted entirely when empty.
 | `repository_offline` | **yes** | **3** | The destination did not answer — an unplugged drive, a sleeping NAS. Expected, not a fault. |
 | `repository_locked` | **yes** | 1 | restic exit 11: another restic process holds the repository lock. |
 | `repository_not_initialized` | no | 1 | restic exit 10: nothing is initialized at that location. |
-| `secret_unavailable` | **yes** | 1 | The secret backend answered badly and may answer well later — a locked login keychain, a `secrets.json` whose mode was widened. |
+| `secret_unavailable` | **yes** | 1 | The secret backend answered badly and may answer well later — a locked login keychain, a transient I/O error. **Also currently reported for the file backend's permanent refusals** (a group-accessible or symlinked `secrets.json`, an untrusted owner, malformed contents), which retrying cannot fix — see #96. |
 | `secret_not_configured` | no | 1 | The backend answered "no such item": no password is stored for this destination. Run `secret set`. Also what `ResticRunner`'s pre-flight reports, so the distinction survives to the commands that actually run restic. |
 | `secret_rejected` | no | 1 | restic exit 12: the secret was read fine and restic refused it. |
 | `restic_not_found` | no | 1 | No restic binary anywhere that was searched. |
 | `restic_unsupported` | no | 1 | A restic was found and ran, but is below the minimum or is not restic. |
 | `restic_failed` | no | 1 | restic ran and failed. |
+| `operation_timed_out` | **yes** | 1 | The operation exceeded the caller's timeout and was stopped; restic never reported. A stalled network or a spinning-up remote clears on its own. |
 | `operation_not_allowed` | no | 1 | Refused by a safety invariant — `forget` with an empty retention policy, `prune` on a mirror behind its primary (`architecture.md` §Invariants). |
 | `internal_error` | no | 1 | An unexpected failure. Bounded; never a serialized object description. |
 
@@ -93,7 +94,7 @@ Every field is an id, a small integer, or a closed enum value:
 | `runId` | string | The failure is about one run record. |
 | `machineId` | string | A per-machine resolution decided the outcome. |
 | `resticExitCode` | integer | restic ran and returned it. |
-| `resticCategory` | `success` \| `warning` \| `terminal` \| `retryable` | Alongside a restic failure. |
+| `resticCategory` | `success` \| `warning` \| `terminal` \| `retryable` | Alongside a restic failure whose run-record category and `retryable` agree. Omitted for `operation_timed_out`, where they do not: the operation did not complete (a `.failed` record is written) *and* repeating it can succeed. |
 | `versionFound` / `versionSupported` | string | A version mismatch — schema or restic binary. Reduced to a dotted numeric triple; see §Redaction. |
 | `diagnosticReference` | string | A run id or log path worth fetching, when safe. |
 

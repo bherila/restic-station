@@ -49,6 +49,7 @@ private let representative: [CLIErrorCode: CLIFailure] = [
         message: "restic 0.16.4 at /usr/bin/restic is too old."
     ),
     .resticFailed: .classify(exitClass: .fatal(stderrSummary: "repository is damaged")),
+    .operationTimedOut: .classify(ResticRunnerError.timedOut),
     .internalError: .classify(ConfigStoreError.renameFailed(errno: 13, from: "a", to: "b")),
     // These two have no typed error yet: `repositoryOffline` is produced by
     // a `Reachability` *result* (#79 wires it), and `operationNotAllowed` by
@@ -101,9 +102,10 @@ struct CLIErrorContractTests {
         #expect(CLIErrorCode.resticNotFound.rawValue == "restic_not_found")
         #expect(CLIErrorCode.resticUnsupported.rawValue == "restic_unsupported")
         #expect(CLIErrorCode.resticFailed.rawValue == "restic_failed")
+        #expect(CLIErrorCode.operationTimedOut.rawValue == "operation_timed_out")
         #expect(CLIErrorCode.operationNotAllowed.rawValue == "operation_not_allowed")
         #expect(CLIErrorCode.internalError.rawValue == "internal_error")
-        #expect(CLIErrorCode.allCases.count == 19)
+        #expect(CLIErrorCode.allCases.count == 20)
     }
 
     @Test("only busy and offline leave exit 1 — the coarse shell contract is unchanged")
@@ -335,6 +337,22 @@ struct CLIErrorMappingTests {
         #expect(CLIFailure.boundedVersion("0.16.4") == "0.16.4")
         #expect(CLIFailure.boundedVersion("0.17.0-rc.1") == "0.17.0")
         #expect(CLIFailure.boundedVersion("") == "0")
+    }
+
+    @Test("a timeout tells an agent what it tells a person: try again")
+    func timeoutsAreRetryable() {
+        // `timedOut.userFacingMessage` has always ended "then try again",
+        // while the envelope classified it as `restic_failed`, whose
+        // published `retryable` is false — the two halves of the same
+        // failure gave opposite advice.
+        let timeout = CLIFailure.classify(ResticRunnerError.timedOut)
+        #expect(timeout.code == .operationTimedOut)
+        #expect(timeout.retryable)
+        #expect(timeout.message.contains("try again"))
+        // Not published: it answers the engine's "write a failed record?"
+        // question, and would read as `terminal` beside `retryable: true`.
+        #expect(timeout.details.resticCategory == nil)
+        #expect(timeout.details == CLIErrorDetails())
     }
 
     @Test("the runner's two secret failures stay distinct all the way to the envelope")

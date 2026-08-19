@@ -110,6 +110,15 @@ public enum CLIErrorCode: String, Sendable, Codable, CaseIterable, Equatable {
     case resticUnsupported = "restic_unsupported"
     /// restic ran and failed.
     case resticFailed = "restic_failed"
+    /// The operation exceeded the caller's timeout and was stopped
+    /// (`ResticRunnerError.timedOut`) — restic never reported anything.
+    ///
+    /// Retryable, and split from ``resticFailed`` for that reason: a stalled
+    /// network or a spinning-up remote clears on its own, which is what the
+    /// human-facing message has always said ("try again"). Reporting it as
+    /// `restic_failed` told an agent the opposite of what the same failure
+    /// told a person.
+    case operationTimedOut = "operation_timed_out"
 
     // ── Refused on purpose ────────────────────────────────────────────────
 
@@ -148,7 +157,8 @@ extension CLIErrorCode {
              .repositoryLocked, .secretUnavailable, .secretRejected,
              .secretNotConfigured,
              .repositoryNotInitialized, .resticNotFound, .resticUnsupported,
-             .resticFailed, .operationNotAllowed, .internalError:
+             .resticFailed, .operationTimedOut, .operationNotAllowed,
+             .internalError:
             return .error
         }
     }
@@ -173,6 +183,8 @@ extension CLIErrorCode {
              .resticUnsupported, .resticFailed, .operationNotAllowed,
              .internalError:
             return false
+        case .operationTimedOut:
+            return true
         }
     }
 }
@@ -630,11 +642,15 @@ extension CLIFailure {
                 details: CLIErrorDetails(resticCategory: error.category)
             )
         case .timedOut:
-            return CLIFailure(
-                code: .resticFailed,
-                message: error.userFacingMessage,
-                details: CLIErrorDetails(resticCategory: error.category)
-            )
+            // `resticCategory` is deliberately not published here, and this
+            // is the one case where it would have to be. It answers "does
+            // this write a `.failed` run record" — the engine's question,
+            // and for a timeout the answer is yes, the operation did not
+            // complete. `retryable` answers "can the caller repeat the
+            // identical request" — and for a timeout the answer is also
+            // yes. Publishing `terminal` beside `retryable: true` would read
+            // as advice it is not.
+            return CLIFailure(code: .operationTimedOut, message: error.userFacingMessage)
         }
     }
 
