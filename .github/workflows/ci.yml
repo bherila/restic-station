@@ -145,7 +145,14 @@ jobs:
           # load: version bumped, backup taken verbatim, machine identity
           # created (T24). grep rather than jq — the Swift container has no
           # jq, and the JSON separator spacing differs between platforms.
-          grep -qE '"version"[[:space:]]*:[[:space:]]*2' "$RESTIC_STATION_DATA_DIR/config.json"
+          #
+          # The literal below is `AppConfig.currentVersion` and must be bumped
+          # with it. This is the only migration assertion that lives in the
+          # workflow rather than under scripts/, so `local-ci.sh` cannot catch
+          # it going stale — the v2 → v3 bump reached CI red for exactly that
+          # reason. Migration is a single jump, so the backup is named for the
+          # version the file started at (v1 here), not for current - 1.
+          grep -qE '"version"[[:space:]]*:[[:space:]]*3' "$RESTIC_STATION_DATA_DIR/config.json"
           grep -qE '"version"[[:space:]]*:[[:space:]]*1' "$RESTIC_STATION_DATA_DIR/config.v1.backup.json"
           grep -qE '"machineId"[[:space:]]*:[[:space:]]*"[a-z0-9-]+"' "$RESTIC_STATION_DATA_DIR/machine.json"
 
