@@ -784,10 +784,11 @@ ok "status --json exit 1 on a warning is still a report, not an error envelope"
 # ─────────────────────────────────────────────────────────────────────────
 log "9. every --json command emits one success envelope on stdout"
 
-# `probe-repo` is given the healthy fixture's real set/destination so it
-# reaches its report rather than a not-found failure. It probes a local path
-# that does not exist, so it reports offline — which is a *success* with
-# outcome "offline", and is exactly the case worth pinning here.
+# `probe-repo` is deliberately absent from this loop and handled below:
+# it is the only command here that must resolve a usable restic before it
+# can produce any report at all, so on a host without one its correct
+# output is an error envelope, not a success. The `linux` CI job is exactly
+# such a host.
 ENVELOPE_CMDS=(
     "version"
     "status"
@@ -796,7 +797,6 @@ ENVELOPE_CMDS=(
     "runs show r-healthy"
     "config show"
     "config validate"
-    "probe-repo --set $SET_ID --dest $PRIMARY_ID"
     "secret list"
     "cli status"
     "fda-check"
@@ -818,7 +818,7 @@ for CMD in "${ENVELOPE_CMDS[@]}"; do
     [[ "$(jq -r 'keys | join(",")' "$OUT_FILE")" == "data,ok,schemaVersion" ]] \
         || fail "\`$CMD --json\` has unexpected top-level keys: $(jq -r 'keys | join(",")' "$OUT_FILE")"
 done
-ok "all ${#ENVELOPE_CMDS[@]} --json commands emit {schemaVersion, ok, data} and nothing else"
+ok "all ${#ENVELOPE_CMDS[@]} restic-independent --json commands emit {schemaVersion, ok, data} and nothing else"
 
 # The payload each one actually carries, spot-checked so the envelope test
 # above cannot pass on an empty or wrong `data`.
@@ -826,27 +826,50 @@ RESTIC_STATION_DATA_DIR="$HEALTHY" run_helper_split version --json
 [[ "$(jq -r '.data.name' "$OUT_FILE")" == "restic-station-helper" ]] || fail "version --json lost its name"
 [[ -n "$(jq -r '.data.platform' "$OUT_FILE")" ]] || fail "version --json did not name a platform"
 
-# probe-repo's outcome depends on whether the fixture's repository path
-# happens to exist, so the *mapping* is what gets pinned, not one outcome:
-# every outcome is a success envelope, and the exit code is the coarse
-# shell signal for the same fact. An offline destination reported as an
-# error envelope would make a sleeping NAS look like a broken config.
+# probe-repo, on both kinds of host.
+#
+# With a usable restic its *outcome mapping* is what gets pinned, not one
+# outcome — whether the fixture's repository path happens to exist is not
+# this test's subject. Every outcome is a success envelope, and the exit
+# code is the coarse shell signal for the same fact; an offline destination
+# reported as an error envelope would make a sleeping NAS look like a
+# broken config.
+#
+# Without one, `HelperContext.make()` fails before any probe happens and
+# restic_not_found is the correct answer. Asserting that rather than
+# skipping keeps the no-restic host covered instead of silently untested.
 RESTIC_STATION_DATA_DIR="$HEALTHY" run_helper_split probe-repo --set "$SET_ID" --dest "$PRIMARY_ID" --json
 PROBE_RC="$RC"
-PROBE_OUTCOME="$(jq -r '.data.outcome' "$OUT_FILE")"
-[[ "$(jq -r '.ok' "$OUT_FILE")" == "true" ]] \
-    || fail "probe-repo --json reported an error envelope for outcome=$PROBE_OUTCOME"
-case "$PROBE_OUTCOME" in
-    reachable) [[ "$PROBE_RC" -eq 0 ]] || fail "probe-repo reachable must exit 0, got $PROBE_RC" ;;
-    offline)   [[ "$PROBE_RC" -eq 3 ]] || fail "probe-repo offline must exit 3, got $PROBE_RC" ;;
-    error)     [[ "$PROBE_RC" -eq 1 ]] || fail "probe-repo error must exit 1, got $PROBE_RC" ;;
-    *)         fail "probe-repo --json reported an unknown outcome: $PROBE_OUTCOME" ;;
-esac
-[[ "$(jq -r '.data.reachable' "$OUT_FILE")" == "$([[ "$PROBE_OUTCOME" == "reachable" ]] && echo true || echo false)" ]] \
-    || fail "probe-repo's reachable flag disagrees with its outcome"
-# The optional field is present as an explicit null, never omitted.
-jq -e 'has("reason")' <<<"$(jq -c '.data' "$OUT_FILE")" >/dev/null \
-    || fail "probe-repo --json omitted the reason key instead of encoding null"
+# Branch on what the helper actually reported, not on `command -v restic`:
+# discovery also searches well-known absolute paths, so a host can have a
+# usable restic that is not on PATH and the two would disagree.
+if [[ "$(jq -r '.ok' "$OUT_FILE")" == "false" ]]; then
+    # The only legitimate failures here are the two that mean "no usable
+    # restic". Any other code is a regression, not an environment.
+    PROBE_CODE="$(jq -r '.error.code' "$OUT_FILE")"
+    case "$PROBE_CODE" in
+        restic_not_found|restic_unsupported) ;;
+        *) fail "probe-repo --json failed with $PROBE_CODE, which is not a restic-availability problem" ;;
+    esac
+    [[ "$PROBE_RC" -eq 1 ]] || fail "$PROBE_CODE must exit 1, got $PROBE_RC"
+    ok "probe-repo --json on a host with no usable restic reports $PROBE_CODE, exit 1"
+else
+    PROBE_OUTCOME="$(jq -r '.data.outcome' "$OUT_FILE")"
+    [[ "$(jq -r '.ok' "$OUT_FILE")" == "true" ]] \
+        || fail "probe-repo --json reported an error envelope for outcome=$PROBE_OUTCOME"
+    case "$PROBE_OUTCOME" in
+        reachable) [[ "$PROBE_RC" -eq 0 ]] || fail "probe-repo reachable must exit 0, got $PROBE_RC" ;;
+        offline)   [[ "$PROBE_RC" -eq 3 ]] || fail "probe-repo offline must exit 3, got $PROBE_RC" ;;
+        error)     [[ "$PROBE_RC" -eq 1 ]] || fail "probe-repo error must exit 1, got $PROBE_RC" ;;
+        *)         fail "probe-repo --json reported an unknown outcome: $PROBE_OUTCOME" ;;
+    esac
+    [[ "$(jq -r '.data.reachable' "$OUT_FILE")" == "$([[ "$PROBE_OUTCOME" == "reachable" ]] && echo true || echo false)" ]] \
+        || fail "probe-repo's reachable flag disagrees with its outcome"
+    # The optional field is present as an explicit null, never omitted.
+    jq -e 'has("reason")' <<<"$(jq -c '.data' "$OUT_FILE")" >/dev/null \
+        || fail "probe-repo --json omitted the reason key instead of encoding null"
+    ok "probe-repo --json maps every outcome to a success envelope and its exit code"
+fi
 
 RESTIC_STATION_DATA_DIR="$HEALTHY" run_helper_split config validate --json
 [[ "$(jq -r '.data.nothingRunsHere' "$OUT_FILE")" == "false" ]] \
