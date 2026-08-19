@@ -106,6 +106,7 @@ environment, or an unbounded restic stderr blob. The rule is enforced by the
 shape of the type rather than by every call site remembering it.
 
 `message` is capped at 500 characters (`CLIFailure.messageCharacterLimit`),
+ellipsis included — a truncated message is exactly 500, never 501 —
 matching `ResticExitClass.summarize`. The cap is not cosmetic: before it, an
 unloadable `config.json` printed the whole `DecodingError` description,
 including the `NSDebugDescription` that quotes the offending bytes.

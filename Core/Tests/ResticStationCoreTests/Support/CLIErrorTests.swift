@@ -399,7 +399,7 @@ struct CLIErrorMappingTests {
             var description: String { String(repeating: "x", count: 5_000) }
         }
         let failure = CLIFailure.classify(Verbose())
-        #expect(failure.message.count == CLIFailure.messageCharacterLimit + 1) // + the ellipsis
+        #expect(failure.message.count == CLIFailure.messageCharacterLimit) // the ellipsis is inside the cap
         #expect(failure.message.hasSuffix("…"))
     }
 
@@ -408,13 +408,13 @@ struct CLIErrorMappingTests {
         // Constructed directly, the way a future call site will. Nothing
         // here calls `bounded(_:)`, and the message is still bounded.
         let direct = CLIFailure(code: .operationNotAllowed, message: String(repeating: "y", count: 5_000))
-        #expect(direct.message.count == CLIFailure.messageCharacterLimit + 1)
+        #expect(direct.message.count == CLIFailure.messageCharacterLimit)
 
         // The concrete case that motivated it: a machine id is interpolated
         // into this message and `MachineIdentity` imposes no length limit.
         let longId = String(repeating: "n", count: 2_000)
         let disabled = CLIFailure.setDisabledHere(setId: setId, machineId: longId)
-        #expect(disabled.message.count <= CLIFailure.messageCharacterLimit + 1)
+        #expect(disabled.message.count <= CLIFailure.messageCharacterLimit)
     }
 }
 

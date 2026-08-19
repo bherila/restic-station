@@ -307,12 +307,16 @@ public struct CLIFailure: Error, Equatable, Sendable {
     /// Applied by ``init(code:message:details:)`` to everything, so calling
     /// it explicitly is only ever belt-and-braces at a site that wants to be
     /// obvious about capping a subprocess's output.
+    ///
+    /// The ellipsis is counted, not added on top: `messageCharacterLimit` is
+    /// published as the longest message this type will carry, and a caller
+    /// enforcing it would reject a 501-character one.
     public static func bounded(_ text: String) -> String {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.count > messageCharacterLimit else {
             return trimmed
         }
-        return String(trimmed.prefix(messageCharacterLimit)) + "…"
+        return String(trimmed.prefix(messageCharacterLimit - 1)) + "…"
     }
 
     /// Reduces a version string **reported by a probed executable** to the

@@ -225,7 +225,7 @@ struct CommandFailureClassificationTests {
                 // The message names the file and stays bounded — the
                 // pre-#81 version printed a whole DecodingError description.
                 #expect(failure.message.hasPrefix("could not load configuration:"))
-                #expect(failure.message.count <= CLIFailure.messageCharacterLimit + 1)
+                #expect(failure.message.count <= CLIFailure.messageCharacterLimit)
             }
         }
     }
