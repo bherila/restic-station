@@ -17,10 +17,19 @@ struct HelperMain: AsyncParsableCommand {
     ///
     /// `parsed` is captured so the failure path can ask the command the user
     /// actually invoked whether it wanted JSON, instead of guessing.
+    /// - Note: the **synchronous** `parseAsRoot()`, not the `asyncParseAsRoot()`
+    ///   the synthesized `main()` uses. `any ParsableCommand` is not
+    ///   `Sendable`, and Swift 6.1 — the toolchain the `linux` CI job builds
+    ///   with — rejects awaiting a non-Sendable result from a nonisolated
+    ///   context. (6.3 accepts it, so this compiles locally and fails only in
+    ///   CI; ArgumentParser's own copy is exempt because the library itself
+    ///   builds in a different language mode.) The two parse paths differ
+    ///   only in supporting async *shell completions*, and this project
+    ///   declares no custom completions at all, so nothing is given up.
     static func main() async {
         var parsed: ParsableCommand?
         do {
-            var command = try await asyncParseAsRoot()
+            var command = try parseAsRoot()
             parsed = command
             if var asyncCommand = command as? AsyncParsableCommand {
                 try await asyncCommand.run()
