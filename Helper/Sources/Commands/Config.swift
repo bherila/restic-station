@@ -137,8 +137,8 @@ struct ConfigImport: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "import",
         abstract: "Install a config.json exported from another machine (or re-import this "
-            + "machine's own). Validates, migrates v1→v2 if needed (reusing the same migration "
-            + "config.json's own loader uses), backs up any config.json already installed "
+            + "machine's own). Validates, migrates an older-schema config if needed (reusing the same "
+            + "migration config.json's own loader uses), backs up any config.json already installed "
             + "before overwriting it, and prints a summary of what changed. --dry-run prints the "
             + "summary and installs nothing. Never touches machine.json or a secret. "
             + "Exit 0 ok, 1 error."
@@ -197,7 +197,7 @@ struct ConfigImport: AsyncParsableCommand {
             // write anything at all.
             let migrated = needsMigration ? ConfigStore.previewMigration(decoded) : decoded
             Self.printSummary(ConfigDiff.summarize(from: existing ?? AppConfig(), to: migrated))
-            print("dry run — nothing written (a v1→v2 preview does not simulate moving resticPath into "
+            print("dry run — nothing written (a migration preview does not simulate moving resticPath into "
                 + "machine.json; only a real import does that)")
             HelperExit.code(0)
         }

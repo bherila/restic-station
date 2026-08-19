@@ -91,7 +91,7 @@ struct EffectiveConfigReport: Encodable {
     let machineId: String
     let version: Int
     /// The deprecated top-level fallback, if this view still carries one —
-    /// `nil` on any config that has completed v1→v2 migration and has a
+    /// `nil` on any config that has migrated off v1 and has a
     /// `machine.json` resticPath.
     let resticPath: String?
     let sets: [SetEntry]

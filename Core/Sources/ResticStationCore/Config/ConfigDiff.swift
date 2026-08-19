@@ -73,7 +73,7 @@ public enum ConfigDiff {
         public let changed: [ChangedSet]
         /// The deprecated top-level `resticPath` differs. Surfaced
         /// separately from `changed` because it is a config-wide field, not
-        /// a per-set one, and because a v1→v2 import always trips this (the
+        /// a per-set one, and because importing a v1 config always trips this (the
         /// migration clears it) — worth naming explicitly rather than
         /// leaving a reader to wonder why no set explains it.
         public let resticPathChanged: Bool
