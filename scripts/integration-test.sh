@@ -918,19 +918,38 @@ assert_unreadable_run_index_fails_loudly() {
     [[ "$saved_mode" =~ ^[0-7]{3,4}$ ]] || fail "$step" "could not read the index file's mode: '$saved_mode'"
     chmod 000 "$index"
 
-    local out rc
+    # stdout and stderr are captured separately: since issue #81 a failing
+    # `--json` command puts an error envelope on stdout, and `status` may
+    # also log a discovery `info:` line to stderr — merging the two would
+    # feed `jq` something that is not JSON.
+    local out err rc
+    local err_file="$DATA_DIR/../unreadable-index-stderr"
     set +e
-    out="$("$HELPER" status --json 2>&1)"
+    out="$("$HELPER" status --json 2>"$err_file")"
     rc=$?
     set -e
+    err="$(cat "$err_file")"
+    rm -f "$err_file"
     chmod "$saved_mode" "$index"
 
     [[ $rc -ne 0 ]] || fail "$step" "status exited 0 with an unreadable run index: $out"
-    [[ "$out" == *"could not read the run history"* ]] \
-        || fail "$step" "expected the message to name the run history, got: $out"
-    [[ "$out" == *"$index"* ]] || fail "$step" "expected the message to name the file, got: $out"
 
-    log "$step OK (exit $rc, and it names the file)"
+    # Read through `jq` rather than grepping the raw bytes: the encoder
+    # escapes forward slashes, so the file path is spelled `\/var\/…` on the
+    # wire and a literal substring match for it silently fails. A caller
+    # decodes the JSON and sees the real path, which is what this asserts.
+    local code message
+    code="$(jq -r '.error.code' <<<"$out")" \
+        || fail "$step" "status --json did not emit a parseable envelope. stdout: $out stderr: $err"
+    message="$(jq -r '.error.message' <<<"$out")"
+
+    [[ "$code" == "internal_error" ]] \
+        || fail "$step" "expected internal_error for an unreadable index, got: $code"
+    [[ "$message" == *"could not read the run history"* ]] \
+        || fail "$step" "expected the message to name the run history, got: $message"
+    [[ "$message" == *"$index"* ]] || fail "$step" "expected the message to name the file, got: $message"
+
+    log "$step OK (exit $rc, code=$code, and it names the file)"
 }
 
 assert_lock_busy() {
