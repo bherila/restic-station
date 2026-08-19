@@ -65,7 +65,7 @@ enum SetsCopy {
     /// also excluded from future backups, but are reserved to remove matching
     /// files from existing snapshots when the purge workflow runs.
     static let purgeExcludesTitle = "Purge Excludes"
-    static let purgeExcludesEmptyState = "No existing snapshots are marked for removal."
+    static let purgeExcludesEmptyState = "Nothing is marked for removal from existing snapshots."
     static let purgeExcludesPatternField = "Pattern"
     static let purgeExcludesPatternPlaceholder = "node_modules"
     static let purgeExcludesAddPattern = "Add Pattern"
