@@ -230,9 +230,9 @@ jobs:
             echo "$OUT"; echo "status exited non-zero on a host with no systemd"; exit 1
           }
           echo "$OUT"
-          echo "$OUT" | jq -e '.scheduler.kind == "unknown"' > /dev/null
-          echo "$OUT" | jq -e '.scheduler.healthy == null' > /dev/null
-          echo "$OUT" | jq -e '.health == "idle"' > /dev/null
+          echo "$OUT" | jq -e '.data | .scheduler.kind == "unknown"' > /dev/null
+          echo "$OUT" | jq -e '.data | .scheduler.healthy == null' > /dev/null
+          echo "$OUT" | jq -e '.data | .health == "idle"' > /dev/null
 
       - name: status refuses to report healthy when it cannot read the run history
         run: |

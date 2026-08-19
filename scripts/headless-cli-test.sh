@@ -105,7 +105,7 @@ expect_rc() {
 # status exit 1, while healthy or unknown scheduler state contributes 0.
 CLEAN_STATUS_RC=0
 capture_clean_status_rc() {
-    if jq -e '.scheduler.healthy == false' "$OUT_FILE" >/dev/null; then
+    if jq -e '.data | .scheduler.healthy == false' "$OUT_FILE" >/dev/null; then
         CLEAN_STATUS_RC=1
     else
         CLEAN_STATUS_RC=0
@@ -176,9 +176,9 @@ ok "real import installs config.json"
 
 RESTIC_STATION_DATA_DIR="$LINUX_DATA" run_helper config show --json
 expect_rc 0
-echo "$(cat "$OUT_FILE")" | jq -e '.sets[0].name == "Projects"' >/dev/null \
+echo "$(cat "$OUT_FILE")" | jq -e '.data | .sets[0].name == "Projects"' >/dev/null \
     || fail "imported config does not resolve the same set on the new host"
-echo "$(cat "$OUT_FILE")" | jq -e '.sets[0].destinations | length == 2' >/dev/null \
+echo "$(cat "$OUT_FILE")" | jq -e '.data | .sets[0].destinations | length == 2' >/dev/null \
     || fail "imported config lost a destination"
 ok "config show --json on the importing host matches the exported set semantically"
 
@@ -328,6 +328,7 @@ RESTIC_STATION_DATA_DIR="$HEALTHY" run_helper status --json
 capture_clean_status_rc
 expect_rc "$CLEAN_STATUS_RC"
 jq -e '
+    .data |
     .sets[0].needsAttention == false
     and .sets[0].lastBackup.status == "success"
     and .health == (if .scheduler.healthy == false then "warning" else "idle" end)
@@ -340,7 +341,7 @@ make_status_fixture "$FIRST_BACKUP_FRESH"
 RESTIC_STATION_DATA_DIR="$FIRST_BACKUP_FRESH" run_helper status --json
 capture_clean_status_rc
 expect_rc "$CLEAN_STATUS_RC"
-echo "$(cat "$OUT_FILE")" | jq -e '.sets[0].firstBackupOverdue == false' >/dev/null \
+echo "$(cat "$OUT_FILE")" | jq -e '.data | .sets[0].firstBackupOverdue == false' >/dev/null \
     || fail "a fresh never-run set warned before its first-backup grace elapsed"
 
 FIRST_BACKUP_OVERDUE="$WORK/status-first-backup-overdue"
@@ -353,6 +354,7 @@ touch -t 202001010000 "$FIRST_BACKUP_OVERDUE/config.json" "$FIRST_BACKUP_OVERDUE
 RESTIC_STATION_DATA_DIR="$FIRST_BACKUP_OVERDUE" run_helper status --json
 expect_rc 1
 echo "$(cat "$OUT_FILE")" | jq -e '
+    .data |
     .health == "warning"
     and .sets[0].lastBackup == null
     and .sets[0].firstBackupOverdue == true
@@ -378,10 +380,10 @@ EOF
 RESTIC_STATION_DATA_DIR="$INFLIGHT" run_helper status --json
 capture_clean_status_rc
 expect_rc "$CLEAN_STATUS_RC"
-echo "$(cat "$OUT_FILE")" | jq -e '.health == "running"' >/dev/null || fail "in-flight fixture did not report running"
-echo "$(cat "$OUT_FILE")" | jq -e '.sets[0].currentRun.phase == "backing-up-primary"' >/dev/null \
+echo "$(cat "$OUT_FILE")" | jq -e '.data | .health == "running"' >/dev/null || fail "in-flight fixture did not report running"
+echo "$(cat "$OUT_FILE")" | jq -e '.data | .sets[0].currentRun.phase == "backing-up-primary"' >/dev/null \
     || fail "in-flight fixture did not surface live progress"
-echo "$(cat "$OUT_FILE")" | jq -e '.sets[0].abandonedRun == null' >/dev/null \
+echo "$(cat "$OUT_FILE")" | jq -e '.data | .sets[0].abandonedRun == null' >/dev/null \
     || fail "a live run was misreported as abandoned"
 ok "in-flight fixture: health=running, live progress surfaced; exit reflects the host scheduler"
 
@@ -400,6 +402,7 @@ EOF
 RESTIC_STATION_DATA_DIR="$STALLED" run_helper status --json
 expect_rc 1
 jq -e '
+    .data |
     .health == "warning"
     and .sets[0].isRunning == false
     and .sets[0].currentRun == null
@@ -426,11 +429,11 @@ cat > "$ABANDONED/state/current-run-$SET_ID.json" <<EOF
 EOF
 RESTIC_STATION_DATA_DIR="$ABANDONED" run_helper status --json
 expect_rc 1
-echo "$(cat "$OUT_FILE")" | jq -e '.health == "warning"' >/dev/null \
+echo "$(cat "$OUT_FILE")" | jq -e '.data | .health == "warning"' >/dev/null \
     || fail "abandoned fixture did not report warning"
-echo "$(cat "$OUT_FILE")" | jq -e '.sets[0].isRunning == false' >/dev/null \
+echo "$(cat "$OUT_FILE")" | jq -e '.data | .sets[0].isRunning == false' >/dev/null \
     || fail "abandoned fixture still reported the set as running"
-echo "$(cat "$OUT_FILE")" | jq -e '.sets[0].abandonedRun.runId == "r-dead"' >/dev/null \
+echo "$(cat "$OUT_FILE")" | jq -e '.data | .sets[0].abandonedRun.runId == "r-dead"' >/dev/null \
     || fail "abandoned fixture did not name the abandoned run"
 ok "abandoned fixture: status --json exits 1, health=warning, the dead run is named"
 
@@ -457,6 +460,7 @@ EOF
 RESTIC_STATION_DATA_DIR="$UNATTRIBUTED" run_helper status --json
 expect_rc 1
 echo "$(cat "$OUT_FILE")" | jq -e '
+    .data |
     (.sets | length) == 0
     and (.unattributedRuns | length) == 2
     and any(.unattributedRuns[]; .currentRun.runId == "r-unattributed-live" and .liveness == "live")
@@ -480,8 +484,8 @@ cat > "$FAILED/runs/index.jsonl" <<EOF
 EOF
 RESTIC_STATION_DATA_DIR="$FAILED" run_helper status --json
 expect_rc 1
-echo "$(cat "$OUT_FILE")" | jq -e '.health == "warning"' >/dev/null || fail "failed fixture did not report warning"
-echo "$(cat "$OUT_FILE")" | jq -e '.sets[0].needsAttention == true' >/dev/null \
+echo "$(cat "$OUT_FILE")" | jq -e '.data | .health == "warning"' >/dev/null || fail "failed fixture did not report warning"
+echo "$(cat "$OUT_FILE")" | jq -e '.data | .sets[0].needsAttention == true' >/dev/null \
     || fail "failed fixture's set was not flagged needsAttention"
 ok "failed fixture: status --json exits 1, health=warning"
 
@@ -500,8 +504,8 @@ cat > "$STALE/state/repo-status-$PRIMARY_ID.json" <<EOF
 EOF
 RESTIC_STATION_DATA_DIR="$STALE" run_helper status --json
 expect_rc 1
-echo "$(cat "$OUT_FILE")" | jq -e '.health == "warning"' >/dev/null || fail "stale fixture did not report warning"
-echo "$(cat "$OUT_FILE")" | jq -e '.sets[0].destinations[0].stale == true' >/dev/null \
+echo "$(cat "$OUT_FILE")" | jq -e '.data | .health == "warning"' >/dev/null || fail "stale fixture did not report warning"
+echo "$(cat "$OUT_FILE")" | jq -e '.data | .sets[0].destinations[0].stale == true' >/dev/null \
     || fail "stale fixture's destination was not flagged stale"
 ok "stale-mirror fixture: status --json exits 1, health=warning, destination flagged stale"
 
@@ -527,9 +531,9 @@ NOW_TS=$(date -u +%s)
 } > "$CROWDED/runs/index.jsonl"
 RESTIC_STATION_DATA_DIR="$CROWDED" run_helper status --json
 expect_rc 1
-echo "$(cat "$OUT_FILE")" | jq -e '.health == "warning"' >/dev/null \
+echo "$(cat "$OUT_FILE")" | jq -e '.data | .health == "warning"' >/dev/null \
     || fail "a quiet set's failed last run must not be hidden behind 200+ newer runs from another set"
-echo "$(cat "$OUT_FILE")" | jq -e '.sets[0].needsAttention == true' >/dev/null \
+echo "$(cat "$OUT_FILE")" | jq -e '.data | .sets[0].needsAttention == true' >/dev/null \
     || fail "the quiet, configured set was not flagged needsAttention despite its last run having failed"
 ok "a quiet set's failed last run survives 200+ newer runs from another set — status --json exit code stays 1"
 
@@ -541,15 +545,15 @@ log "5. --json output is parseable JSON with nothing else on stdout"
 RESTIC_STATION_DATA_DIR="$HEALTHY" run_helper status --json
 capture_clean_status_rc
 expect_rc "$CLEAN_STATUS_RC"
-jq -e '.machineId | length > 0' "$OUT_FILE" >/dev/null \
+jq -e '.data | .machineId | length > 0' "$OUT_FILE" >/dev/null \
     || fail "status --json did not produce clean JSON"
-RESTIC_STATION_DATA_DIR="$HEALTHY" "$HELPER" sets list --json | jq -e 'type == "array"' >/dev/null \
+RESTIC_STATION_DATA_DIR="$HEALTHY" "$HELPER" sets list --json | jq -e '.data | type == "array"' >/dev/null \
     || fail "sets list --json did not pipe cleanly through jq"
-RESTIC_STATION_DATA_DIR="$HEALTHY" "$HELPER" runs list --json | jq -e 'type == "array"' >/dev/null \
+RESTIC_STATION_DATA_DIR="$HEALTHY" "$HELPER" runs list --json | jq -e '.data | type == "array"' >/dev/null \
     || fail "runs list --json did not pipe cleanly through jq"
-RESTIC_STATION_DATA_DIR="$HEALTHY" "$HELPER" config show --json | jq -e '.machineId | length > 0' >/dev/null \
+RESTIC_STATION_DATA_DIR="$HEALTHY" "$HELPER" config show --json | jq -e '.data | .machineId | length > 0' >/dev/null \
     || fail "config show --json did not pipe cleanly through jq"
-RESTIC_STATION_DATA_DIR="$HEALTHY" "$HELPER" runs show r-healthy --json | jq -e '.runId == "r-healthy"' >/dev/null \
+RESTIC_STATION_DATA_DIR="$HEALTHY" "$HELPER" runs show r-healthy --json | jq -e '.data | .runId == "r-healthy"' >/dev/null \
     || fail "runs show --json did not pipe cleanly through jq"
 ok "status, sets list, runs list, runs show, config show --json all parse cleanly through jq"
 
@@ -666,7 +670,7 @@ EOF
     RESTIC_STATION_DATA_DIR="$REAL_DATA" run_helper status --json
     capture_clean_status_rc
     expect_rc "$CLEAN_STATUS_RC"
-    echo "$(cat "$OUT_FILE")" | jq -e '.sets[0].lastBackup.status == "success"' >/dev/null \
+    echo "$(cat "$OUT_FILE")" | jq -e '.data | .sets[0].lastBackup.status == "success"' >/dev/null \
         || fail "status did not reflect the real backup that just ran"
     ok "a real run-set backup is reflected by status --json"
 
@@ -762,7 +766,7 @@ ok "--json --help still prints help and exits 0"
 # stay a StatusReport, never an error envelope.
 RESTIC_STATION_DATA_DIR="$FAILED" run_helper_split status --json
 expect_rc 1
-jq -e '.sets' "$OUT_FILE" >/dev/null \
+jq -e '.data | .sets' "$OUT_FILE" >/dev/null \
     || fail "status --json stopped emitting a report when health is warning"
 jq -e 'has("error") | not' "$OUT_FILE" >/dev/null \
     || fail "status --json turned a warning-level report into an error envelope"

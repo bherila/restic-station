@@ -150,12 +150,16 @@ struct SecretRemove: AsyncParsableCommand {
 
 // MARK: - secret list
 
-struct SecretList: AsyncParsableCommand {
+struct SecretList: AsyncParsableCommand, JSONRenderable {
     static let configuration = CommandConfiguration(
         commandName: "list",
         abstract: "List the configured destinations that have a stored password and/or secret "
-            + "environment. Never prints a secret value. Exit 0 ok, 1 error."
+            + "environment. Never prints a secret value. --json for scripting. "
+            + "Exit 0 ok, 1 error."
     )
+
+    @Flag(name: .long, help: "Emit JSON. Only JSON reaches stdout in this mode.")
+    var json = false
 
     func run() async throws {
         let context = SecretContext.make()
@@ -172,14 +176,14 @@ struct SecretList: AsyncParsableCommand {
             } catch SecretStoreError.itemNotFound {
                 hasPassword = false
             } catch {
-                HelperExit.fail("could not read stored secrets: \(error)")
+                throw CLIFailure.classify(error)
             }
 
             let secretEnvCount: Int
             do {
                 secretEnvCount = try await context.store.secretEnv(destId: destId).count
             } catch {
-                HelperExit.fail("could not read stored secrets: \(error)")
+                throw CLIFailure.classify(error)
             }
 
             rows.append(
@@ -193,8 +197,16 @@ struct SecretList: AsyncParsableCommand {
             )
         }
 
-        for line in SecretListing.format(rows) {
-            print(line)
+        if json {
+            // Presence metadata only. `Row` has no field that can hold a
+            // password or an env *value* — it counts them. That is the same
+            // redaction-by-shape rule `CLIErrorDetails` follows, and it is
+            // why this command can have a JSON mode at all.
+            CLIJSON.print(rows)
+        } else {
+            for line in SecretListing.format(rows) {
+                print(line)
+            }
         }
         HelperExit.code(0)
     }
@@ -370,7 +382,9 @@ enum SecretEnvInput {
 /// Renders `secret list`. Pure, so a test can assert on the exact lines and
 /// prove no secret value can reach stdout.
 enum SecretListing {
-    struct Row {
+    /// Also `secret list --json`'s element shape (`docs/cli-json.md`).
+    /// Encodable deliberately carries *counts*, never values.
+    struct Row: Encodable {
         let destId: UUID
         let label: String
         let setName: String

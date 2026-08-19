@@ -192,7 +192,8 @@ public enum CLIInstaller {
 
     // MARK: - Status
 
-    public struct Status: Sendable, Equatable {
+    /// Also `cli status --json`'s shape (`docs/cli-json.md`).
+    public struct Status: Sendable, Equatable, Encodable {
         public let linkPath: String
         /// `true` only for a symlink of ours (owned basename) — a foreign
         /// file at the same path is reported as not installed, since it is

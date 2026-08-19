@@ -376,7 +376,7 @@ struct ConfigImport: AsyncParsableCommand {
 
 // MARK: - config validate
 
-struct ConfigValidate: AsyncParsableCommand {
+struct ConfigValidate: AsyncParsableCommand, JSONRenderable {
     static let configuration = CommandConfiguration(
         commandName: "validate",
         abstract: "Check config.json and report, for one machine: hard errors (exit 1); warnings "
@@ -390,6 +390,28 @@ struct ConfigValidate: AsyncParsableCommand {
     @Option(name: .long, help: "Validate as resolved for this machine id, instead of this host's own.")
     var machine: String?
 
+    @Flag(name: .long, help: "Emit JSON. Only JSON reaches stdout in this mode.")
+    var json = false
+
+    /// `config validate --json`'s shape — see `docs/cli-json.md`.
+    ///
+    /// `errors` is always empty here: a config that will not load is
+    /// reported as a `config_invalid` **error envelope**, not as a success
+    /// document with an error list, because that is the same condition every
+    /// other `--json` command reports that way. The field exists so the
+    /// shape does not change when a future check can find a hard error in a
+    /// config that *does* load.
+    struct Report: Encodable {
+        let machineId: String
+        let errors: [String]
+        let warnings: [String]
+        let effective: EffectiveConfigReport
+        /// The machine-readable form of the human "nothing will run on this
+        /// machine." line — the anti-silent-failure guarantee (T27), which a
+        /// caller would otherwise have to notice by counting enabled sets.
+        let nothingRunsHere: Bool
+    }
+
     func run() async throws {
         let context = ConfigCLIContext.make()
 
@@ -399,13 +421,20 @@ struct ConfigValidate: AsyncParsableCommand {
         do {
             config = try context.configStore.load()
         } catch {
+            // Human mode keeps printing its own `Errors:` block and exiting
+            // 1; JSON mode reports the same condition as the shared
+            // `config_invalid` envelope so a caller does not need a
+            // per-command exception.
+            guard !json else { throw CLIFailure.configInvalid(underlying: error) }
             print("Errors:")
             print("  - \(error)")
             HelperExit.code(1)
         }
-        print("Errors:")
-        print("  (none)")
-        print("")
+        if !json {
+            print("Errors:")
+            print("  (none)")
+            print("")
+        }
 
         let localMachineId = try? MachineStore(paths: context.paths).load().machineId
         let targetMachineId: String
@@ -452,6 +481,21 @@ struct ConfigValidate: AsyncParsableCommand {
             }
         }
 
+        let nothingRunsHere = report.sets.allSatisfy { !$0.enabledHere }
+
+        if json {
+            CLIJSON.print(
+                Report(
+                    machineId: targetMachineId,
+                    errors: [],
+                    warnings: warnings,
+                    effective: report,
+                    nothingRunsHere: nothingRunsHere
+                )
+            )
+            HelperExit.code(0)
+        }
+
         print("Warnings:")
         if warnings.isEmpty {
             print("  (none)")
@@ -466,7 +510,7 @@ struct ConfigValidate: AsyncParsableCommand {
         for line in report.humanLines() {
             print(line.isEmpty ? "" : "  \(line)")
         }
-        if report.sets.allSatisfy({ !$0.enabledHere }) {
+        if nothingRunsHere {
             print("")
             print("  nothing will run on this machine.")
         }
