@@ -38,27 +38,32 @@ struct ConfigCLIContext {
         return ConfigCLIContext(paths: paths, configStore: ConfigStore(paths: paths), stateStore: StateStore(paths: paths))
     }
 
-    /// Loads `config.json`, or exits 1 with the load error (per the T10/T27
-    /// exit-code contract: a config that will not load is a hard error).
-    func loadConfigOrExit() -> AppConfig {
+    /// Loads `config.json`, or throws a classified failure (per the
+    /// T10/T27 exit-code contract: a config that will not load is a hard
+    /// error). Still exit 1; `docs/cli-json.md` covers the envelope a
+    /// `--json` caller sees instead of the bare sentence.
+    func loadConfig() throws -> AppConfig {
         do {
             return try configStore.load()
         } catch {
-            HelperExit.fail("could not load configuration: \(error)")
+            throw CLIFailure.configInvalid(underlying: error)
         }
     }
 
     /// Resolves the machine id to report/resolve for: `--machine` if given,
     /// else this host's own `machine.json` identity.
-    func targetMachineId(machineFlag: String?) -> String {
+    func targetMachineId(machineFlag: String?) throws -> String {
         if let machineFlag {
-            Self.requireValidMachineId(machineFlag)
+            try Self.requireValidMachineId(machineFlag)
             return machineFlag
         }
         do {
             return try MachineStore(paths: paths).load().machineId
         } catch {
-            HelperExit.fail("could not read this machine's identity (\(paths.machineFile.path)): \(error)")
+            throw CLIFailure.machineIdentityUnreadable(
+                path: paths.machineFile.path,
+                underlying: error
+            )
         }
     }
 
@@ -72,9 +77,9 @@ struct ConfigCLIContext {
     /// as running, and vice versa. A typo must be a hard error, not a quiet
     /// no-op that happens to fall back to "everywhere" semantics. Every
     /// subcommand accepting `--machine` must call this before resolving.
-    static func requireValidMachineId(_ machineId: String) {
+    static func requireValidMachineId(_ machineId: String) throws {
         guard MachineIdentity.isValid(machineId) else {
-            HelperExit.fail(
+            throw CLIFailure.invalidArguments(
                 "\"\(machineId)\" is not a valid machine id — machine ids are lowercase [a-z0-9-] slugs "
                     + "(docs/data-model.md §machine.json); check --machine for a typo"
             )
@@ -100,7 +105,7 @@ struct ConfigExport: AsyncParsableCommand {
 
     func run() async throws {
         let context = ConfigCLIContext.make()
-        let config = context.loadConfigOrExit()
+        let config = try context.loadConfig()
 
         let data: Data
         do {
@@ -405,7 +410,7 @@ struct ConfigValidate: AsyncParsableCommand {
         let localMachineId = try? MachineStore(paths: context.paths).load().machineId
         let targetMachineId: String
         if let machine {
-            ConfigCLIContext.requireValidMachineId(machine)
+            try ConfigCLIContext.requireValidMachineId(machine)
             targetMachineId = machine
         } else if let localMachineId {
             targetMachineId = localMachineId
@@ -472,7 +477,7 @@ struct ConfigValidate: AsyncParsableCommand {
 
 // MARK: - config show
 
-struct ConfigShow: AsyncParsableCommand {
+struct ConfigShow: AsyncParsableCommand, JSONRenderable {
     static let configuration = CommandConfiguration(
         commandName: "show",
         abstract: "Print the resolved configuration for one machine — every set and destination "
@@ -489,8 +494,8 @@ struct ConfigShow: AsyncParsableCommand {
 
     func run() async throws {
         let context = ConfigCLIContext.make()
-        let config = context.loadConfigOrExit()
-        let targetMachineId = context.targetMachineId(machineFlag: machine)
+        let config = try context.loadConfig()
+        let targetMachineId = try context.targetMachineId(machineFlag: machine)
 
         let scheduled = config.resolved(for: targetMachineId)
         let addressable = config.addressable(for: targetMachineId)

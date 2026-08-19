@@ -40,8 +40,12 @@ public enum CLIErrorCode: String, Sendable, Codable, CaseIterable, Equatable {
 
     // ── Configuration ─────────────────────────────────────────────────────
 
-    /// `config.json` could not be decoded, failed ``AppConfig/validate()``,
-    /// or was written by a newer Restic Station than this build supports.
+    /// A configuration file on this host will not load: `config.json`
+    /// could not be decoded, failed ``AppConfig/validate()``, or was written
+    /// by a newer Restic Station than this build supports — or `machine.json`
+    /// could not be read. `message` names which file it was; see
+    /// ``CLIFailure/machineIdentityUnreadable(path:underlying:)`` for why
+    /// the two share a code.
     case configInvalid = "config_invalid"
 
     // ── The thing you named is not here ───────────────────────────────────
@@ -398,10 +402,65 @@ extension CLIFailure {
         if let configError = underlying as? ConfigError {
             return classify(configError)
         }
+        // Wording preserved verbatim from the `HelperExit.fail` call sites
+        // this replaced, so human mode stays byte-identical. Only the cap is
+        // new — and the message it caps is a `DecodingError` description
+        // that quotes the offending bytes.
         return CLIFailure(
             code: .configInvalid,
-            message: bounded("config.json could not be loaded: \(underlying)")
+            message: bounded("could not load configuration: \(underlying)")
         )
+    }
+
+    /// `machine.json` could not be read.
+    ///
+    /// Reported as ``CLIErrorCode/configInvalid`` rather than as its own
+    /// code: it is a configuration file on this host that will not load, the
+    /// caller's remedy is the same class of action, and `message` names
+    /// which of the two files it was. A separate code would be a
+    /// distinction no caller could act on differently.
+    ///
+    /// The path stays in `message` and out of `details` — a data-directory
+    /// path carries a home directory, and `details` is the half of the
+    /// envelope that promises to be safe to log.
+    public static func machineIdentityUnreadable(path: String, underlying: any Error) -> CLIFailure {
+        CLIFailure(
+            code: .configInvalid,
+            message: bounded("could not read this machine's identity (\(path)): \(underlying)")
+        )
+    }
+
+    /// A run's `metadata.json` could not be read.
+    ///
+    /// "Absent" and "corrupt" are different answers to the caller — one
+    /// means the id is wrong, the other means this host's state is damaged —
+    /// so they are separated here rather than collapsed into one message the
+    /// caller would have to read.
+    public static func runUnreadable(runId: String, underlying: any Error) -> CLIFailure {
+        if isFileNotFound(underlying) {
+            return .runNotFound(runId: runId)
+        }
+        return CLIFailure(
+            code: .internalError,
+            message: bounded("could not read run \"\(runId)\": \(underlying)"),
+            details: CLIErrorDetails(runId: bounded(runId))
+        )
+    }
+
+    /// A local state file this host owns could not be read. Not the
+    /// caller's fault and not something a retry fixes.
+    public static func stateUnreadable(_ message: String) -> CLIFailure {
+        CLIFailure(code: .internalError, message: bounded(message))
+    }
+
+    /// Whether an error means "that file is not there", across both
+    /// Foundation implementations. `CocoaError` is what `Data(contentsOf:)`
+    /// throws on Darwin *and* on swift-corelibs-foundation, so one check
+    /// covers macOS and Linux.
+    static func isFileNotFound(_ error: any Error) -> Bool {
+        (error as? CocoaError)?.code == .fileReadNoSuchFile
+            || (error as NSError).domain == NSCocoaErrorDomain
+            && (error as NSError).code == NSFileReadNoSuchFileError
     }
 }
 

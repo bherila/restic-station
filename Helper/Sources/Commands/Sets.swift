@@ -13,7 +13,7 @@ struct Sets: AsyncParsableCommand {
 
 // MARK: - sets list
 
-struct SetsList: AsyncParsableCommand {
+struct SetsList: AsyncParsableCommand, JSONRenderable {
     static let configuration = CommandConfiguration(
         commandName: "list",
         abstract: "List every backup set: id, name, enabled-here, sources, destination count, "
@@ -29,13 +29,13 @@ struct SetsList: AsyncParsableCommand {
         do {
             config = try ConfigStore(paths: paths).load()
         } catch {
-            HelperExit.fail("could not load configuration: \(error)")
+            throw CLIFailure.configInvalid(underlying: error)
         }
         let machineId: String
         do {
             machineId = try MachineStore(paths: paths).load().machineId
         } catch {
-            HelperExit.fail("could not read this machine's identity (\(paths.machineFile.path)): \(error)")
+            throw CLIFailure.machineIdentityUnreadable(path: paths.machineFile.path, underlying: error)
         }
 
         let scheduledIds = Set(config.resolved(for: machineId).config.sets.map(\.id))
