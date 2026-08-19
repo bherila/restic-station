@@ -174,7 +174,12 @@ jobs:
           echo "$OUT"
           echo "$OUT" | grep -q "discovered $FAKEBIN/restic"
           # Got past restic resolution and on to the real (absent) set.
-          echo "$OUT" | grep -q "no backup set with id"
+          # Case-insensitive on purpose: this asserts *where* execution got
+          # to, not the sentence. The wording is presentation text that moves
+          # as commands convert to `CLIFailure` (#81) — probe-repo's went from
+          # a lowercase `HelperExit.fail` fragment to a capitalised sentence
+          # and turned this step red for nothing but the leading letter.
+          echo "$OUT" | grep -qi "backup set with id"
 
           # 3. tick still exits 0 on a host with nothing configured.
           #    (tick resolves restic through the same `resolveResticPath`
