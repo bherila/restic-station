@@ -19,3 +19,7 @@ Core/.swiftpm/
 
 # Claude Code session state (agent worktrees etc.)
 .claude/
+
+# LLVM coverage output from instrumented test/binary runs
+*.profraw
+*.profdata
