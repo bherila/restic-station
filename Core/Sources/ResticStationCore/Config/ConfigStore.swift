@@ -14,7 +14,7 @@ import Musl
 public struct ConfigStore: Sendable {
     public let paths: AppPaths
 
-    /// Collaborator for the one part of v1 → v2 migration that leaves
+    /// Collaborator for the migration step that leaves
     /// `config.json`: relocating `resticPath` into `machine.json`. Held
     /// rather than constructed per call so the store stays a value with a
     /// single `paths` source of truth.
@@ -110,7 +110,8 @@ public struct ConfigStore: Sendable {
     /// 1. Adopt `resticPath` into `machine.json` (only if it has none), and
     ///    clear it from the returned config **only once that write
     ///    succeeded**.
-    /// 2. Copy `originalBytes` to `config.v1.backup.json` — never
+    /// 2. Copy `originalBytes` to the source-versioned
+    ///    `config.v<from>.backup.json` — never
     ///    overwriting an existing backup, so a second migration cannot
     ///    clobber the first one's copy.
     ///
@@ -130,10 +131,11 @@ public struct ConfigStore: Sendable {
     /// sanctioned way to reuse this migration outside `ConfigStore` itself,
     /// per `docs/data-model.md` §Versioning — "do not reimplement it".
     ///
-    /// - Returns: the migrated value, and whether `config.v1.backup.json`
-    ///   is confirmed on disk (already existing, or just written). **Every
+    /// - Returns: the migrated value, and whether the source-versioned
+    ///   migration backup is confirmed on disk (already existing, or just
+    ///   written). **Every
     ///   caller must skip installing `config` as `config.json` when this is
-    ///   `false`** — that is the property "the v1 file is never overwritten
+    ///   `false`** — that is the property "the source file is never overwritten
     ///   unless a backup of it exists" (`docs/data-model.md` §Versioning)
     ///   actually rests on. `false` leaves `machine.json` however far the
     ///   `resticPath` adoption above got (best-effort, already durable if it
@@ -185,7 +187,7 @@ public struct ConfigStore: Sendable {
     /// A pure, side-effect-free **preview** of what
     /// ``migrateToCurrentVersion(_:originalBytes:)`` would produce: only the
     /// version number is bumped. No `machine.json` read or write, no
-    /// `config.v1.backup.json` write — nothing touches disk.
+    /// source-versioned migration-backup write — nothing touches disk.
     ///
     /// For `config import --dry-run` (T27), which must not write anything at
     /// all. The real migration additionally relocates a deprecated

@@ -9,12 +9,12 @@ import Testing
 /// doc's recognizable prefix. Every other byte — keys, values, nesting,
 /// including the `retention` block's explicit `null`s — matches the doc.
 ///
-/// It is a schema-v2 config with **no** `machines` keys — the shape the vast
+/// It is a schema-v3 config with **no** `machines` keys — the shape the vast
 /// majority of installs have, and the one the compatibility guarantee is
 /// about: absent `machines` means inherit and run everywhere.
 let dataModelExampleConfigJSON = """
 {
-  "version": 2,
+  "version": 3,
   "resticPath": "/opt/homebrew/bin/restic",
   "showMenuBarIcon": true,
   "sets": [
@@ -23,6 +23,7 @@ let dataModelExampleConfigJSON = """
       "name": "Projects",
       "sources": ["/Users/user/proj", "/Users/user/.gitconfig"],
       "excludes": ["node_modules", ".build", "*.tmp"],
+      "purgeExcludes": ["DerivedData"],
       "schedule": { "kind": "daily", "hour": 2, "minute": 30 },
       "retention": {
         "keepLast": null, "keepHourly": null, "keepDaily": 7,
@@ -65,10 +66,11 @@ let dataModelExampleConfigJSON = """
         try config.validate()
 
         // Field-for-field checks against the documented example.
-        #expect(config.version == 2)
+        #expect(config.version == 3)
         #expect(config.resticPath == "/opt/homebrew/bin/restic")
         #expect(config.showMenuBarIcon == true)
         #expect(config.sets.count == 1)
+        #expect(config.sets[0].purgeExcludes == ["DerivedData"])
 
         let set = config.sets[0]
         #expect(set.id == UUID(uuidString: "6F9619FF-8B86-D011-B42D-00C04FC964FF"))

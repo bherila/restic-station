@@ -35,6 +35,7 @@ The toolbar's **Effective Plan** sheet lists the union of machine IDs referenced
 - Name.
 - **Sources**: list of absolute paths; add via `NSOpenPanel` (directories + files, multi-select), remove; warn inline (yellow) on nested/duplicate paths.
 - **Excludes**: editable string list; caption linking restic exclude-pattern syntax (`https://restic.readthedocs.io/en/stable/040_backup.html#excluding-files`).
+- **Purge Excludes**: separate editable string list using the same restic exclude-pattern syntax. Empty state: "No existing snapshots are marked for removal." Footer: "Purge excludes are reserved to remove matching files from existing snapshots. They are also excluded from new backups. Space is not reclaimed until a prune runs." A blank pattern surfaces inline: "Remove the blank pattern — every entry here must be a real path or glob."
 - **Schedule**: picker for kind (Every N minutes / Hourly / Daily / Weekly) with contextual fields (N stepper ≥5; minute; hour+minute; weekday+hour+minute).
 - **Machine overrides**: choose any known machine profile or add a valid machine ID, then inherit/enable/disable the set and optionally replace its complete sources list or schedule. Replacement arrays are labeled as replace-not-merge. Removing an override restores inheritance.
 - **Staleness warning**: stepper, days, default 14.

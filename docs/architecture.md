@@ -130,7 +130,7 @@ State — not config — is the right XDG base dir for `root`: `config.json` is 
 | Path (relative to `root`) | Contents |
 |---|---|
 | `config.json` | `AppConfig` (see `data-model.md`) — **shared across every machine** |
-| `config.v1.backup.json` | untouched copy of a schema-v1 `config.json`, written once before the first v2 write |
+| `config.v<N>.backup.json` | untouched copy of the schema-vN `config.json` that was migrated, written once before its current-version replacement |
 | `machine.json` | `MachineConfig`: this host's `machineId` and restic path — **host-local, never copy it between machines** |
 | `runs/<runId>/metadata.json` | one `RunMetadata` per run |
 | `runs/<runId>/log.txt` | full streamed log of the run |

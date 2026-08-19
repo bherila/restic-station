@@ -27,6 +27,8 @@ struct EffectiveConfigReportTests {
             id: setId,
             name: "Documents",
             sources: ["/Users/bwh/Documents"],
+            excludes: [".DS_Store"],
+            purgeExcludes: ["node_modules"],
             schedule: .daily(hour: 2, minute: 30),
             destinations: [
                 Destination(id: primaryId, label: "Big Drive", repoURL: "/Volumes/Big/docs.restic", isPrimary: true),
@@ -55,6 +57,8 @@ struct EffectiveConfigReportTests {
         // for `map(\.configuration.commandName)`).
         #expect(report.sets[0].destinations.allSatisfy { $0.enabledHere })
         #expect(report.excludedHere.isEmpty)
+        #expect(report.sets[0].excludes == [".DS_Store"])
+        #expect(report.sets[0].purgeExcludes == ["node_modules"])
     }
 
     /// The headline case: a set disabled on `mirror-box` still appears in
@@ -124,6 +128,8 @@ struct EffectiveConfigReportTests {
         let lines = report.humanLines().joined(separator: "\n")
         #expect(lines.contains("\"Documents\""))
         #expect(lines.contains("does not run here"))
+        #expect(lines.contains("excludes: .DS_Store"))
+        #expect(lines.contains("purge excludes: node_modules"))
         #expect(lines.contains("excluded here, and why"))
         #expect(lines.contains("disabled on this machine"))
     }
@@ -150,5 +156,6 @@ struct EffectiveConfigReportTests {
         #expect(text.contains("\"resticPath\" : null"))
         #expect(text.contains("\"retention\" : null"))
         #expect(text.contains("\"checkPolicy\" : null"))
+        #expect(text.contains("\"purgeExcludes\" : [\n        \"node_modules\"\n      ]"))
     }
 }

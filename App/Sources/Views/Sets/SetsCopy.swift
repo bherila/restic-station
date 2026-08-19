@@ -59,6 +59,20 @@ enum SetsCopy {
     static let excludeSyntaxURL = URL(
         string: "https://restic.readthedocs.io/en/stable/040_backup.html#excluding-files"
     )!
+    static let excludeSyntaxLinkText = "restic exclude-pattern syntax"
+
+    /// Purge excludes are deliberately a separate list: their patterns are
+    /// also excluded from future backups, but are reserved to remove matching
+    /// files from existing snapshots when the purge workflow runs.
+    static let purgeExcludesTitle = "Purge Excludes"
+    static let purgeExcludesEmptyState = "No existing snapshots are marked for removal."
+    static let purgeExcludesPatternField = "Pattern"
+    static let purgeExcludesPatternPlaceholder = "node_modules"
+    static let purgeExcludesAddPattern = "Add Pattern"
+    static let purgeExcludesRemovePatternHelp = "Remove this purge pattern"
+    static let purgeExcludesFootnote =
+        "Purge excludes are reserved to remove matching files from existing snapshots. "
+        + "They are also excluded from new backups. Space is not reclaimed until a prune runs."
 
     // MARK: - Written for this screen
 

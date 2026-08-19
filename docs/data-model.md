@@ -13,11 +13,11 @@ Two files hold configuration, and the split matters:
 
 ## config.json — `AppConfig`
 
-The example below is a schema-v2 config with **no** `machines` keys — the shape most installs have, and the one the compatibility guarantee is about: absent `machines` means inherit and run everywhere. `resticPath` is shown for completeness; it is deprecated (see §machine.json) and migration clears it.
+The example below is a schema-v3 config with **no** `machines` keys — the shape most installs have, and the one the compatibility guarantee is about: absent `machines` means inherit and run everywhere. `resticPath` is shown for completeness; it is deprecated (see §machine.json) and migration clears it.
 
 ```json
 {
-  "version": 2,
+  "version": 3,
   "resticPath": "/opt/homebrew/bin/restic",
   "showMenuBarIcon": true,
   "sets": [
@@ -26,6 +26,7 @@ The example below is a schema-v2 config with **no** `machines` keys — the shap
       "name": "Projects",
       "sources": ["/Users/user/proj", "/Users/user/.gitconfig"],
       "excludes": ["node_modules", ".build", "*.tmp"],
+      "purgeExcludes": ["DerivedData"],
       "schedule": { "kind": "daily", "hour": 2, "minute": 30 },
       "retention": {
         "keepLast": null, "keepHourly": null, "keepDaily": 7,
@@ -65,7 +66,7 @@ The example below is a schema-v2 config with **no** `machines` keys — the shap
 
 ```swift
 public struct AppConfig: Codable, Equatable {
-    public var version: Int            // = 2; bump on breaking schema change
+    public var version: Int            // = 3; bump on breaking schema change
     public var resticPath: String?     // DEPRECATED — see machine.json; nil = not set
     public var showMenuBarIcon: Bool   // default true
     public var sets: [BackupSet]
@@ -76,6 +77,7 @@ public struct BackupSet: Codable, Equatable, Identifiable {
     public var name: String
     public var sources: [String]           // absolute paths
     public var excludes: [String]          // restic --exclude patterns
+    public var purgeExcludes: [String]     // history-affecting restic --exclude patterns (v3)
     public var schedule: Schedule
     public var retention: RetentionPolicy? // nil = never forget
     public var checkPolicy: CheckPolicy?   // nil = no scheduled checks
@@ -142,7 +144,7 @@ public struct CheckPolicy: Codable, Equatable {
 
 `Schedule` encodes with a `kind` discriminator (custom Codable). Unknown `kind` on decode → throw (config version gates compatibility).
 
-**Encoding conventions.** Optionals are encoded as explicit JSON `null` (never omitted) so the file stays diffable — with two deliberate exceptions, both about *absence being meaningful*: `onboardingCompleted`, and every `machines` key (on sets, on destinations, and on the fields inside an override). Absent `machines` means "runs everywhere", so a config with no per-machine overrides — which is every config written before v2, and most configs after it — is byte-identical apart from its `version` number instead of gaining a `"machines": null` on every set and destination. Inside an override, `"sources": null` would read like "override to no sources" when it means the opposite, so sparse overrides are written sparsely.
+**Encoding conventions.** Optionals are encoded as explicit JSON `null` (never omitted) so the file stays diffable — with two deliberate exceptions, both about *absence being meaningful*: `onboardingCompleted`, and every `machines` key (on sets, on destinations, and on the fields inside an override). `purgeExcludes` is non-optional and always encoded, including as `[]`; missing or explicit `null` decodes as `[]` solely for pre-v3 compatibility. Absent `machines` means "runs everywhere", so a config with no per-machine overrides — which is every config written before v2, and most configs after it — is byte-identical apart from its `version` number instead of gaining a `"machines": null` on every set and destination. Inside an override, `"sources": null` would read like "override to no sources" when it means the opposite, so sparse overrides are written sparsely.
 
 ### Invariants (enforced by `AppConfig.validate() throws`, called on every save and after load)
 
@@ -150,9 +152,10 @@ public struct CheckPolicy: Codable, Equatable {
 2. Set and destination UUIDs are unique across the whole config.
 3. `sources` non-empty for every set; every source is an absolute path.
 4. `Schedule` fields in range (minute 0–59, hour 0–23, weekday 1–7, everyMinutes ≥ 5).
-5. `stalenessWarningDays ≥ 1`; `readDataSubsetSlices` in 2...100.
-6. Every `machines` key is a valid `machineId` (see §machine.json for the charset), and every value an override supplies gets the same check as the field it replaces: override `sources` entries must be absolute, an override `schedule` must be in range. **Exception:** an override `sources` of `[]` is legal where a top-level `[]` is not — it is how a machine says "nothing to back up here", and resolution drops the set with a recorded reason rather than running a source-less backup.
-7. **Per machine:** if a set runs on a machine, exactly one of its destinations must be a primary that is enabled there. Disabling the primary is never a valid way to say "do not run here" — disable the whole set for that machine instead. Checked for every `machineId` the config mentions; machines with no overrides see the shared values, which invariant 1 already covers.
+5. Every `purgeExcludes` pattern is non-empty. A blank plain `excludes` entry is harmless noise, but a blank pattern must never become a history-changing purge rule.
+6. `stalenessWarningDays ≥ 1`; `readDataSubsetSlices` in 2...100.
+7. Every `machines` key is a valid `machineId` (see §machine.json for the charset), and every value an override supplies gets the same check as the field it replaces: override `sources` entries must be absolute, an override `schedule` must be in range. **Exception:** an override `sources` of `[]` is legal where a top-level `[]` is not — it is how a machine says "nothing to back up here", and resolution drops the set with a recorded reason rather than running a source-less backup.
+8. **Per machine:** if a set runs on a machine, exactly one of its destinations must be a primary that is enabled there. Disabling the primary is never a valid way to say "do not run here" — disable the whole set for that machine instead. Checked for every `machineId` the config mentions; machines with no overrides see the shared values, which invariant 1 already covers.
 
 A `machines` key that no `machine.json` in the fleet claims is **not** an error — machines come and go, and the config is shared. It is a warning surfaced by `config validate` (T27).
 
@@ -391,25 +394,33 @@ The tick clears it: `recoverInterrupted()` returns the `setId` alongside the
 
 ## Versioning & migration
 
-`AppConfig.currentVersion` is **2**. Loader behavior: version > current → refuse with a clear error ("config written by a newer Restic Station"); version < current → run the in-code migration chain, then persist. State/run files carry no version field — they are regenerable caches/history; on decode failure, skip the record and log, never crash. `machine.json` versions independently (`MachineConfig.currentVersion`, currently 1).
+`AppConfig.currentVersion` is **3**. Loader behavior: version > current → refuse with a clear error ("config written by a newer Restic Station"); version < current → run the in-code migration chain, then persist. State/run files carry no version field — they are regenerable caches/history; on decode failure, skip the record and log, never crash. `machine.json` versions independently (`MachineConfig.currentVersion`, currently 1).
 
 ### v1 → v2
 
 The schema change needs no data change: an absent `machines` key already means "runs everywhere", so a v1 config *is* a valid v2 config once the version number is bumped. Exactly one value moves.
 
-`ConfigStore.load()` of a `version: 1` file:
+### v2 → v3
+
+`purgeExcludes` is a second exclusion list. An absent or explicit `null` key decodes as `[]`, preserving the pre-v3 behavior of not marking anything for purge. Every saved v3 config writes the key, including when empty.
+
+### Persistence and backups
+
+`ConfigStore` performs a **single jump** from the file's source version to the current version; it does not write one intermediate config or backup per version crossed. A v1 file loaded by a v3 build therefore produces only `config.v1.backup.json`, because no v2 file ever existed on that host.
+
+For a file below the current version, `ConfigStore.load()`:
 
 1. Adds **no** `machines` keys.
 2. If `config.json` has a `resticPath` and `machine.json` has none, moves it into `machine.json` and clears the deprecated field. If `machine.json` already has one, that one wins and the deprecated field is still cleared. If the write fails, `resticPath` is left in `config.json`, where it still works as the documented fallback.
-3. Copies the untouched v1 bytes to **`config.v1.backup.json`**, beside `config.json`, with `O_EXCL` — **never** overwriting an existing backup, so a second migration cannot clobber the first one's copy (or a copy the user put there by hand).
-4. Only if that backup exists, writes the v2 config atomically.
-5. Sets `version: 2` and returns.
+3. Copies the untouched source bytes to **`config.v<source-version>.backup.json`**, beside `config.json`, with `O_EXCL` — **never** overwriting an existing backup, so a second migration cannot clobber the source's copy (or a copy the user put there by hand).
+4. Only if that backup exists, writes the current-version config atomically.
+5. Sets `version: 3` and returns.
 
-Migration is **idempotent**: the second load sees `version: 2` and does nothing. Every persistence step is best-effort — a data directory that cannot be written must not stop the helper from running backups, and the migration is a pure function of the file, so an unwritten migration simply reruns next load. What is *not* best-effort is the ordering: **the v1 file is never overwritten unless a backup of it exists.**
+Migration is **idempotent**: the second load sees `version: 3` and does nothing. Every persistence step is best-effort — a data directory that cannot be written must not stop the helper from running backups, and the migration is a pure function of the file, so an unwritten migration simply reruns next load. What is *not* best-effort is the ordering: **the source file is never overwritten unless a backup of it exists.**
 
 A v1 config that fails `validate()` at its own version is a hard error: it produces no backup file and no rewritten `config.json`.
 
-The net effect on an existing single-machine install is that `"version": 1` becomes `"version": 2`, `"resticPath"` becomes `null`, and everything the engine acts on — sources, destinations, schedules, retention, the effective restic binary — is unchanged.
+The net effect on an existing single-machine install is that `"version": 1` becomes `"version": 3`, `"resticPath"` becomes `null`, `"purgeExcludes"` becomes `[]`, and everything the engine acts on — sources, destinations, schedules, retention, the effective restic binary — is unchanged.
 
 ## Headless CLI `--json` shapes (T27)
 
@@ -424,7 +435,7 @@ Both commands build the identical report (`EffectiveConfigReport`, `Helper/Sourc
 ```json
 {
   "machineId": "studio-mac",
-  "version": 2,
+  "version": 3,
   "resticPath": null,
   "sets": [
     {
@@ -433,6 +444,7 @@ Both commands build the identical report (`EffectiveConfigReport`, `Helper/Sourc
       "enabledHere": true,
       "sources": ["/Users/user/proj"],
       "excludes": ["node_modules"],
+      "purgeExcludes": [],
       "schedule": { "kind": "daily", "hour": 2, "minute": 30 },
       "retention": null,
       "checkPolicy": null,

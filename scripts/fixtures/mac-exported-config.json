@@ -1,5 +1,5 @@
 {
-  "version": 2,
+  "version": 3,
   "resticPath": null,
   "showMenuBarIcon": true,
   "onboardingCompleted": true,
@@ -9,6 +9,7 @@
       "name": "Projects",
       "sources": ["__SOURCE_DIR__"],
       "excludes": [],
+      "purgeExcludes": [],
       "schedule": {"kind": "everyMinutes", "minutes": 5},
       "retention": null,
       "checkPolicy": null,
@@ -35,6 +36,7 @@
       "name": "Mac Photos Library",
       "sources": ["/Users/author/Pictures/Photos Library.photoslibrary"],
       "excludes": [],
+      "purgeExcludes": [],
       "schedule": {"kind": "daily", "hour": 2, "minute": 30},
       "retention": null,
       "checkPolicy": null,

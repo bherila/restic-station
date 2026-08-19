@@ -176,6 +176,34 @@ struct ConfigImportTests {
         #expect(try MachineStore.persistentIdentity(paths: paths).load().resticPath == nil)
     }
 
+    @Test("a migration-backup failure names the source-versioned file and source version")
+    func migrationBackupFailureNamesTheActualSourceVersion() throws {
+        let (paths, cleanup) = makeTempRoot()
+        defer { cleanup() }
+        try FileManager.default.createDirectory(at: paths.root, withIntermediateDirectories: true)
+        // `ensureDirectories()` must fail identically under a root CI
+        // container: a regular file cannot become the locks directory.
+        try Data("not a directory".utf8).write(to: paths.locksDir)
+
+        let context = ConfigCLIContext(
+            paths: paths, configStore: ConfigStore(paths: paths), stateStore: StateStore(paths: paths)
+        )
+        let v2JSON = Data(#"{"version":2,"resticPath":null,"showMenuBarIcon":true,"sets":[]}"#.utf8)
+        let decoded = try ConfigStore.makeDecoder().decode(AppConfig.self, from: v2JSON)
+
+        let result = ConfigImport.performImport(
+            decoded: decoded, originalBytes: v2JSON, needsMigration: true, existing: AppConfig(), context: context
+        )
+
+        guard case .failed(let message) = result.outcome else {
+            Issue.record("expected migration backup to fail because locks is a file")
+            return
+        }
+        #expect(message.contains(paths.configBackupFile(fromVersion: 2).path))
+        #expect(message.contains("version 2 file"))
+        #expect(message.contains("Nothing was installed"))
+    }
+
     /// `--dry-run` must not touch `machine.json` or write
     /// `config.v1.backup.json` — `ConfigStore.previewMigration` is a pure
     /// version bump, which is exactly what makes this true structurally

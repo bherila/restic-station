@@ -214,6 +214,7 @@ struct AppPathsEnvTests {
         let rootPath = root.path
         #expect(paths.configFile.path == "\(rootPath)/config.json")
         #expect(paths.configV1BackupFile.path == "\(rootPath)/config.v1.backup.json")
+        #expect(paths.configBackupFile(fromVersion: 2).path == "\(rootPath)/config.v2.backup.json")
         #expect(paths.machineFile.path == "\(rootPath)/machine.json")
         #expect(paths.runsDir.path == "\(rootPath)/runs")
         #expect(paths.runsIndexFile.path == "\(rootPath)/runs/index.jsonl")
@@ -272,6 +273,7 @@ struct AppPathsEnvTests {
             [
                 paths.configFile.path,
                 paths.configV1BackupFile.path,
+                paths.configBackupFile(fromVersion: 2).path,
                 paths.machineFile.path,
                 paths.runsDir.path,
                 paths.runsIndexFile.path,
@@ -296,6 +298,7 @@ struct AppPathsEnvTests {
         #expect(relativeA == [
             "config.json",
             "config.v1.backup.json",
+            "config.v2.backup.json",
             "machine.json",
             "runs",
             "runs/index.jsonl",

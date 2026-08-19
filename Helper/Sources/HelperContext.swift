@@ -69,7 +69,7 @@ struct HelperContext {
 
     /// Loads `config.json` + `machine.json` and resolves both views.
     ///
-    /// Order matters: `configStore.load()` may run the v1 → v2 migration,
+    /// Order matters: `configStore.load()` may run a schema migration,
     /// which writes `resticPath` into `machine.json` and clears it from the
     /// config it returns. Reading the machine identity *after* the load is
     /// what makes the migrated path visible on the very first run rather

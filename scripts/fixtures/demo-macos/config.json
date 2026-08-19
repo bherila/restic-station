@@ -23,6 +23,7 @@
       "excludes" : [".git", "node_modules", "*.tmp"],
       "id" : "10000000-0000-4000-8000-000000000010",
       "name" : "Documents & Projects",
+      "purgeExcludes" : [],
       "retention" : { "keepDaily" : 7, "keepLast" : 5, "keepMonthly" : 12, "keepWeekly" : 5, "keepYearly" : 3 },
       "schedule" : { "hour" : 2, "kind" : "daily", "minute" : 30 },
       "sources" : ["/Users/demo/Documents", "/Users/demo/Projects"],
@@ -42,6 +43,7 @@
       "excludes" : [],
       "id" : "20000000-0000-4000-8000-000000000010",
       "name" : "Photo Library",
+      "purgeExcludes" : [],
       "retention" : null,
       "schedule" : { "hour" : 3, "kind" : "weekly", "minute" : 0, "weekday" : 1 },
       "sources" : ["/Users/demo/Pictures/Photos Library.photoslibrary"],
@@ -61,6 +63,7 @@
       "excludes" : ["Library/Caches", "Downloads"],
       "id" : "30000000-0000-4000-8000-000000000010",
       "name" : "Workstation",
+      "purgeExcludes" : [],
       "retention" : { "keepDaily" : 14, "keepLast" : 10, "keepMonthly" : 12, "keepWeekly" : 8, "keepYearly" : 5 },
       "schedule" : { "kind" : "hourly", "minute" : 15 },
       "sources" : ["/Users/demo/Desktop", "/Users/demo/Library/Mail", "/Users/demo/Library/Messages"],
@@ -68,5 +71,5 @@
     }
   ],
   "showMenuBarIcon" : true,
-  "version" : 2
+  "version" : 3
 }

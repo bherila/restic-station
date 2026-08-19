@@ -192,7 +192,7 @@ struct ConfigImport: AsyncParsableCommand {
         }
 
         if dryRun {
-            // Pure preview: no machine.json touch, no config.v1.backup.json
+            // Pure preview: no machine.json touch, no migration-backup
             // write, no config.json backup or install — --dry-run must not
             // write anything at all.
             let migrated = needsMigration ? ConfigStore.previewMigration(decoded) : decoded
@@ -311,8 +311,8 @@ struct ConfigImport: AsyncParsableCommand {
                 return ImportResult(
                     summary: summary(to: decoded),
                     outcome: .failed(
-                        "could not write \(context.paths.configV1BackupFile.path) — refusing to import without a "
-                            + "backup of the v1 file being migrated. Nothing was installed."
+                        "could not write \(context.paths.configBackupFile(fromVersion: decoded.version).path) — refusing to import without a "
+                            + "backup of the version \(decoded.version) file being migrated. Nothing was installed."
                     )
                 )
             }

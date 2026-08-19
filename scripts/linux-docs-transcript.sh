@@ -203,7 +203,7 @@ MIRROR_BOX_DATA="$WORK/data-mirror-box"
 mkdir -p "$MIRROR_BOX_DATA"
 cat > "$MIRROR_BOX_DATA/config.json" <<'JSON'
 {
-  "version": 2,
+  "version": 3,
   "resticPath": null,
   "showMenuBarIcon": true,
   "sets": [
@@ -212,6 +212,7 @@ cat > "$MIRROR_BOX_DATA/config.json" <<'JSON'
       "name": "Documents",
       "sources": ["/Users/bwh/Documents"],
       "excludes": [],
+      "purgeExcludes": [],
       "schedule": {"kind": "daily", "hour": 2, "minute": 30},
       "retention": null,
       "checkPolicy": null,
@@ -227,6 +228,7 @@ cat > "$MIRROR_BOX_DATA/config.json" <<'JSON'
       "name": "Photos",
       "sources": ["/Users/bwh/Pictures"],
       "excludes": [],
+      "purgeExcludes": [],
       "schedule": {"kind": "weekly", "weekday": 1, "hour": 3, "minute": 0},
       "retention": null,
       "checkPolicy": null,
@@ -326,7 +328,7 @@ FIRE_SET_ID="e1000000-0000-4000-8000-000000000001"
 FIRE_PRIMARY_ID="e1000000-0000-4000-8000-000000000002"
 cat > "$FIRE_DATA/config.json" <<JSON
 {
-  "version": 2,
+  "version": 3,
   "resticPath": null,
   "showMenuBarIcon": true,
   "sets": [
@@ -335,6 +337,7 @@ cat > "$FIRE_DATA/config.json" <<JSON
       "name": "Fire Check",
       "sources": ["$FIRE_SOURCE"],
       "excludes": [],
+      "purgeExcludes": [],
       "schedule": {"kind": "everyMinutes", "minutes": 5},
       "retention": null,
       "checkPolicy": null,
