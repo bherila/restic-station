@@ -105,6 +105,14 @@ password, a secret environment value, raw keychain output, a subprocess
 environment, or an unbounded restic stderr blob. The rule is enforced by the
 shape of the type rather than by every call site remembering it.
 
+The fixed key set bounds *what* can appear, not *how much*: `machineId` comes
+from `config.json`, where `MachineIdentity` imposes no length limit. So every
+free-form value is additionally capped at 128 characters
+(`CLIErrorDetails.valueCharacterLimit`), applied when the envelope is
+encoded rather than when the value is set — the fields are mutable, and a cap
+on the way in can be undone on the way past. A truncated value keeps a
+trailing `…` so it reads as truncated rather than as a different id.
+
 `message` is capped at 500 characters (`CLIFailure.messageCharacterLimit`),
 ellipsis included — a truncated message is exactly 500, never 501 —
 matching `ResticExitClass.summarize`. The cap is not cosmetic: before it, an

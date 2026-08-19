@@ -403,6 +403,53 @@ struct CLIErrorMappingTests {
         #expect(failure.message.hasSuffix("…"))
     }
 
+    @Test("no single details value can be enormous, however it got there")
+    func detailsValuesAreBounded() throws {
+        // `machineId` comes from `config.json`, and `MachineIdentity.isValid`
+        // imposes no length limit — so "details is bounded by construction"
+        // was true of the *key set* and not of the document. Asserted on the
+        // encoded form, because that is what the guarantee is about and
+        // because the fields are `var`s that can be assigned after any
+        // constructor has had its say.
+        var details = CLIErrorDetails(setId: setId)
+        details.machineId = String(repeating: "n", count: 4_000)
+        details.runId = String(repeating: "r", count: 4_000)
+        details.diagnosticReference = String(repeating: "/log", count: 4_000)
+        details.versionSupported = String(repeating: "9", count: 4_000)
+
+        let failure = CLIFailure(code: .setDisabledHere, message: "disabled", details: details)
+        let data = try ConfigStore.makeEncoder().encode(CLIErrorEnvelope(failure))
+        let object = try #require(
+            try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        )
+        let body = try #require(object["error"] as? [String: Any])
+        let encoded = try #require(body["details"] as? [String: Any])
+        for key in ["machineId", "runId", "diagnosticReference", "versionSupported"] {
+            let value = try #require(encoded[key] as? String, "\(key) missing from the encoded details")
+            #expect(value.count <= CLIErrorDetails.valueCharacterLimit, "\(key) was \(value.count) characters")
+            // Marked, so a truncated id reads as truncated rather than as a
+            // different id that happens to exist.
+            #expect(value.hasSuffix("…"))
+        }
+        // The id types cannot be oversized in the first place.
+        #expect(encoded["setId"] as? String == setId.uuidString)
+    }
+
+    @Test("a valid but enormous machine id does not reach the wire")
+    func machineIdFromConfigIsBounded() throws {
+        // The concrete route Codex named: `setDisabledHere` and
+        // `destinationDisabledHere` both put a config-supplied machine id
+        // straight into `details`.
+        let longId = String(repeating: "m", count: 3_000)
+        for failure in [
+            CLIFailure.setDisabledHere(setId: setId, machineId: longId),
+            CLIFailure.destinationDisabledHere(setId: setId, destinationId: destId, machineId: longId),
+        ] {
+            let data = try ConfigStore.makeEncoder().encode(CLIErrorEnvelope(failure))
+            #expect(data.count < 2_000, "the whole envelope should be small, was \(data.count) bytes")
+        }
+    }
+
     @Test("the cap belongs to the type, not to whichever constructor remembered it")
     func theInitializerBoundsToo() {
         // Constructed directly, the way a future call site will. Nothing

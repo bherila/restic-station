@@ -242,6 +242,25 @@ public struct CLIErrorDetails: Encodable, Equatable, Sendable {
         self == CLIErrorDetails()
     }
 
+    /// Longest any single free-form string in `details` will be on the wire.
+    ///
+    /// The fixed shape stops a *repository URL* or a stderr blob from ever
+    /// having a field to live in, but it does not stop a field's own value
+    /// from being enormous: `machineId` comes from `config.json` and
+    /// `MachineIdentity.isValid` imposes no length limit, so "`details` is
+    /// bounded by construction" was true of the key set and not of the
+    /// document. 128 is generous for every real value — a UUID string is 36,
+    /// a machine slug is a hostname, a run id is a timestamp and a suffix.
+    public static let valueCharacterLimit = 128
+
+    /// Caps one free-form value, marking it so a truncated id reads as
+    /// truncated rather than as a different id.
+    static func boundedValue(_ text: String?) -> String? {
+        guard let text else { return nil }
+        guard text.count > valueCharacterLimit else { return text }
+        return String(text.prefix(valueCharacterLimit - 1)) + "…"
+    }
+
     private enum CodingKeys: String, CodingKey {
         case setId, destinationId, runId, machineId
         case resticExitCode, resticCategory
@@ -249,17 +268,24 @@ public struct CLIErrorDetails: Encodable, Equatable, Sendable {
     }
 
     // `encodeIfPresent` throughout — see the omission note above.
+    //
+    // Every free-form string is capped **here** rather than in the factories
+    // that set them. The fields are `public var`, so a cap applied on the way
+    // in can be undone by assignment; applied on the way out it holds for
+    // every value however it arrived, which is what the published guarantee
+    // says. `setId`/`destinationId` are `UUID` and cannot be oversized;
+    // `resticExitCode` and `resticCategory` are an integer and a closed enum.
     public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encodeIfPresent(setId, forKey: .setId)
         try container.encodeIfPresent(destinationId, forKey: .destinationId)
-        try container.encodeIfPresent(runId, forKey: .runId)
-        try container.encodeIfPresent(machineId, forKey: .machineId)
+        try container.encodeIfPresent(Self.boundedValue(runId), forKey: .runId)
+        try container.encodeIfPresent(Self.boundedValue(machineId), forKey: .machineId)
         try container.encodeIfPresent(resticExitCode, forKey: .resticExitCode)
         try container.encodeIfPresent(resticCategory?.rawValue, forKey: .resticCategory)
-        try container.encodeIfPresent(versionFound, forKey: .versionFound)
-        try container.encodeIfPresent(versionSupported, forKey: .versionSupported)
-        try container.encodeIfPresent(diagnosticReference, forKey: .diagnosticReference)
+        try container.encodeIfPresent(Self.boundedValue(versionFound), forKey: .versionFound)
+        try container.encodeIfPresent(Self.boundedValue(versionSupported), forKey: .versionSupported)
+        try container.encodeIfPresent(Self.boundedValue(diagnosticReference), forKey: .diagnosticReference)
     }
 }
 
