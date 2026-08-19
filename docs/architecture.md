@@ -104,9 +104,19 @@ Every failure is classified into one of three categories, which drive both `RunS
 
 | Category | Meaning | Examples | Effect |
 |---|---|---|---|
-| **Terminal** | The operation failed; a run record with `.failed` is written; no retry until next scheduled slot or manual trigger | restic exit 1 (fatal), exit 12 (wrong password), exit 10 (repo missing), primary unreachable | run `.failed`, menubar warning state |
+| **Terminal** | The operation failed; a run record with `.failed` is written; no retry until next scheduled slot or manual trigger | restic exit 1 (fatal), exit 12 (wrong password), exit 10 (repo missing), primary unreachable, no password stored for the destination | run `.failed`, menubar warning state |
 | **Warning** | The operation completed with caveats; run record `.warning` | restic exit 3 (some source files unreadable), a secondary offline (skip + staleness), check found no errors but a slice was skipped | run `.warning` |
 | **Retryable** | Environmental/transient; do NOT write a `.failed` run — leave schedule state untouched so the next tick retries | keychain locked (password command fails at pre-login tick), set lock busy (another run in flight), tick lock busy | run `.skipped` (busy) or no record (keychain locked) |
+
+A locked keychain and a destination with **no password stored** are both
+"the pre-flight could not produce a password", and they land in different
+rows: the first clears itself at the next tick, the second never does.
+`ResticRunner`'s pre-flight keeps them apart
+(`ResticRunnerError.secretsUnavailable` vs `.secretsNotConfigured`, from
+`SecretStoreError.backendFailed` vs `.itemNotFound`) rather than collapsing
+both into the retryable one — which is also what stops the `--json` envelope
+advising an agent to retry a request that cannot succeed until someone runs
+`secret set`.
 
 restic exit code mapping (verified against restic 0.18.1 — see `restic-cli.md`): `0` success, `1` fatal, `2` Go runtime error, `3` backup incomplete-read warning, `10` repository does not exist, `11` repository locked, `12` wrong password. Exit 11 on a *scheduled* run: attempt `restic unlock` once (removes only stale locks of dead processes), retry the operation once, then fail terminal if still locked.
 

@@ -56,7 +56,7 @@ never match on it. `details` is omitted entirely when empty.
 | `repository_locked` | **yes** | 1 | restic exit 11: another restic process holds the repository lock. |
 | `repository_not_initialized` | no | 1 | restic exit 10: nothing is initialized at that location. |
 | `secret_unavailable` | **yes** | 1 | The secret backend answered badly and may answer well later — a locked login keychain, a `secrets.json` whose mode was widened. |
-| `secret_not_configured` | no | 1 | The backend answered "no such item": no password is stored for this destination. Run `secret set`. |
+| `secret_not_configured` | no | 1 | The backend answered "no such item": no password is stored for this destination. Run `secret set`. Also what `ResticRunner`'s pre-flight reports, so the distinction survives to the commands that actually run restic. |
 | `secret_rejected` | no | 1 | restic exit 12: the secret was read fine and restic refused it. |
 | `restic_not_found` | no | 1 | No restic binary anywhere that was searched. |
 | `restic_unsupported` | no | 1 | A restic was found and ran, but is below the minimum or is not restic. |

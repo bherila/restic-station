@@ -575,6 +575,15 @@ extension CLIFailure {
 
     static func classify(_ error: ResticRunnerError) -> CLIFailure {
         switch error {
+        case .secretsNotConfigured(let destinationId):
+            return CLIFailure(
+                code: .secretNotConfigured,
+                message: error.userFacingMessage,
+                details: CLIErrorDetails(
+                    destinationId: destinationId,
+                    resticCategory: error.category
+                )
+            )
         case .secretsUnavailable(let destinationId):
             return CLIFailure(
                 code: .secretUnavailable,

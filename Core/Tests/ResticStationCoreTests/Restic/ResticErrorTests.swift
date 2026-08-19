@@ -91,6 +91,11 @@ struct ResticErrorTests {
     func runnerErrorCategories() {
         let destinationId = UUID()
         #expect(ResticRunnerError.secretsUnavailable(destinationId: destinationId).category == .retryable)
+        // Terminal, and the one case where that differs from its sibling:
+        // a store that could not be read may read fine later, whereas a
+        // destination with nothing stored stays that way until a human
+        // stores something.
+        #expect(ResticRunnerError.secretsNotConfigured(destinationId: destinationId).category == .terminal)
         #expect(ResticRunnerError.launchFailed("no such file").category == .terminal)
         #expect(ResticRunnerError.timedOut.category == .terminal)
     }
@@ -115,8 +120,23 @@ struct ResticErrorTests {
     @Test("ResticRunnerError descriptions never carry secret material")
     func runnerErrorDescriptions() {
         let destinationId = UUID()
-        let error = ResticRunnerError.secretsUnavailable(destinationId: destinationId)
-        #expect(error.description.contains(destinationId.uuidString))
-        #expect(!error.userFacingMessage.isEmpty)
+        for error in [
+            ResticRunnerError.secretsUnavailable(destinationId: destinationId),
+            ResticRunnerError.secretsNotConfigured(destinationId: destinationId),
+        ] {
+            #expect(error.description.contains(destinationId.uuidString))
+            #expect(!error.userFacingMessage.isEmpty)
+        }
+    }
+
+    @Test("an absent password names the remedy, not the store it is absent from")
+    func secretsNotConfiguredWording() {
+        let message = ResticRunnerError.secretsNotConfigured(destinationId: UUID()).userFacingMessage
+        #expect(message.contains("secret set"))
+        // Unlike its sibling this is not worded per backend: which store
+        // does not hold the password is not something the reader can act
+        // on, and naming it invites a look inside for something absent.
+        #expect(!message.lowercased().contains("keychain"))
+        #expect(!message.lowercased().contains("secrets file"))
     }
 }

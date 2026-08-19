@@ -337,6 +337,26 @@ struct CLIErrorMappingTests {
         #expect(CLIFailure.boundedVersion("") == "0")
     }
 
+    @Test("the runner's two secret failures stay distinct all the way to the envelope")
+    func runnerSecretFailuresKeepTheirRetryAdvice() {
+        // The runner's pre-flight used to collapse both `SecretStoreError`
+        // cases into `secretsUnavailable`, which made `secret_not_configured`
+        // unreachable from the path that actually runs restic — so a caller
+        // was told to retry a request that cannot succeed until a human
+        // stores a password.
+        let unreadable = CLIFailure.classify(ResticRunnerError.secretsUnavailable(destinationId: destId))
+        #expect(unreadable.code == .secretUnavailable)
+        #expect(unreadable.retryable)
+
+        let absent = CLIFailure.classify(ResticRunnerError.secretsNotConfigured(destinationId: destId))
+        #expect(absent.code == .secretNotConfigured)
+        #expect(!absent.retryable)
+        #expect(absent.details.destinationId == destId)
+        // The published category agrees with `retryable` rather than
+        // contradicting it in the same envelope.
+        #expect(absent.details.resticCategory == .terminal)
+    }
+
     @Test("a restic that could not be spawned at all is reported as not found")
     func launchFailureIsNotFound() {
         #expect(CLIFailure.classify(ResticRunnerError.launchFailed("no such file")).code == .resticNotFound)
