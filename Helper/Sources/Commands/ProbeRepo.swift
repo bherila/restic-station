@@ -42,6 +42,24 @@ struct ProbeRepo: AsyncParsableCommand, JSONRenderable {
         /// Why, when `outcome` is not `reachable`. Never a repository URL
         /// or a credential — it is `Reachability`'s own bounded reason.
         let reason: String?
+
+        // Explicit `null`, never an omitted key: that is the convention
+        // every other `--json` shape follows (`docs/data-model.md`
+        // §Encoding conventions), and the synthesized encoder would use
+        // `encodeIfPresent` and drop it.
+        private enum CodingKeys: String, CodingKey {
+            case setId, destinationId, label, outcome, reachable, reason
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(setId, forKey: .setId)
+            try container.encode(destinationId, forKey: .destinationId)
+            try container.encode(label, forKey: .label)
+            try container.encode(outcome, forKey: .outcome)
+            try container.encode(reachable, forKey: .reachable)
+            try container.encode(reason, forKey: .reason)
+        }
     }
 
     func run() async throws {

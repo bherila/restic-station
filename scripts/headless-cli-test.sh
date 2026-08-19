@@ -24,6 +24,8 @@
 #      grepped for the fixture secret value at the very end.
 #   7. Exit-code contract (0 ok / 1 error) spot-checked for the new
 #      subcommands on both the happy and unhappy path.
+#   9. Every `--json` command emits one success envelope
+#      ({schemaVersion, ok, data}) on stdout and nothing else (issue #79).
 #   8. A failing `--json` command emits exactly one error envelope on
 #      stdout with the documented `error.code` (issue #81,
 #      `docs/cli-json.md`), human mode is unchanged, and a nonzero exit
@@ -771,6 +773,94 @@ jq -e '.data | .sets' "$OUT_FILE" >/dev/null \
 jq -e 'has("error") | not' "$OUT_FILE" >/dev/null \
     || fail "status --json turned a warning-level report into an error envelope"
 ok "status --json exit 1 on a warning is still a report, not an error envelope"
+
+# ─────────────────────────────────────────────────────────────────────────
+# 9. The success envelope, across every --json command (issue #79).
+#
+#    The Swift suite checks that each of these conforms to JSONRenderable;
+#    what only a real process can show is that stdout carries exactly one
+#    envelope and nothing else — no progress prose, no warning line, no
+#    ANSI. Stdout and stderr are captured separately for that reason.
+# ─────────────────────────────────────────────────────────────────────────
+log "9. every --json command emits one success envelope on stdout"
+
+# `probe-repo` is given the healthy fixture's real set/destination so it
+# reaches its report rather than a not-found failure. It probes a local path
+# that does not exist, so it reports offline — which is a *success* with
+# outcome "offline", and is exactly the case worth pinning here.
+ENVELOPE_CMDS=(
+    "version"
+    "status"
+    "sets list"
+    "runs list"
+    "runs show r-healthy"
+    "config show"
+    "config validate"
+    "probe-repo --set $SET_ID --dest $PRIMARY_ID"
+    "secret list"
+    "cli status"
+    "fda-check"
+)
+
+for CMD in "${ENVELOPE_CMDS[@]}"; do
+    # shellcheck disable=SC2086
+    RESTIC_STATION_DATA_DIR="$HEALTHY" run_helper_split $CMD --json
+    jq -e . "$OUT_FILE" >/dev/null 2>&1 \
+        || fail "\`$CMD --json\` did not put exactly one JSON document on stdout: $(cat "$OUT_FILE")"
+    [[ "$(jq -r '.ok' "$OUT_FILE")" == "true" ]] \
+        || fail "\`$CMD --json\` did not report ok=true (got $(jq -c '.' "$OUT_FILE"))"
+    [[ "$(jq -r '.schemaVersion' "$OUT_FILE")" == "1" ]] \
+        || fail "\`$CMD --json\` did not pin schemaVersion 1"
+    jq -e 'has("data")' "$OUT_FILE" >/dev/null \
+        || fail "\`$CMD --json\` emitted no data key"
+    # The three envelope keys and nothing else: a command that leaks an
+    # extra top-level field has escaped CLIJSON.
+    [[ "$(jq -r 'keys | join(",")' "$OUT_FILE")" == "data,ok,schemaVersion" ]] \
+        || fail "\`$CMD --json\` has unexpected top-level keys: $(jq -r 'keys | join(",")' "$OUT_FILE")"
+done
+ok "all ${#ENVELOPE_CMDS[@]} --json commands emit {schemaVersion, ok, data} and nothing else"
+
+# The payload each one actually carries, spot-checked so the envelope test
+# above cannot pass on an empty or wrong `data`.
+RESTIC_STATION_DATA_DIR="$HEALTHY" run_helper_split version --json
+[[ "$(jq -r '.data.name' "$OUT_FILE")" == "restic-station-helper" ]] || fail "version --json lost its name"
+[[ -n "$(jq -r '.data.platform' "$OUT_FILE")" ]] || fail "version --json did not name a platform"
+
+# probe-repo's outcome depends on whether the fixture's repository path
+# happens to exist, so the *mapping* is what gets pinned, not one outcome:
+# every outcome is a success envelope, and the exit code is the coarse
+# shell signal for the same fact. An offline destination reported as an
+# error envelope would make a sleeping NAS look like a broken config.
+RESTIC_STATION_DATA_DIR="$HEALTHY" run_helper_split probe-repo --set "$SET_ID" --dest "$PRIMARY_ID" --json
+PROBE_RC="$RC"
+PROBE_OUTCOME="$(jq -r '.data.outcome' "$OUT_FILE")"
+[[ "$(jq -r '.ok' "$OUT_FILE")" == "true" ]] \
+    || fail "probe-repo --json reported an error envelope for outcome=$PROBE_OUTCOME"
+case "$PROBE_OUTCOME" in
+    reachable) [[ "$PROBE_RC" -eq 0 ]] || fail "probe-repo reachable must exit 0, got $PROBE_RC" ;;
+    offline)   [[ "$PROBE_RC" -eq 3 ]] || fail "probe-repo offline must exit 3, got $PROBE_RC" ;;
+    error)     [[ "$PROBE_RC" -eq 1 ]] || fail "probe-repo error must exit 1, got $PROBE_RC" ;;
+    *)         fail "probe-repo --json reported an unknown outcome: $PROBE_OUTCOME" ;;
+esac
+[[ "$(jq -r '.data.reachable' "$OUT_FILE")" == "$([[ "$PROBE_OUTCOME" == "reachable" ]] && echo true || echo false)" ]] \
+    || fail "probe-repo's reachable flag disagrees with its outcome"
+# The optional field is present as an explicit null, never omitted.
+jq -e 'has("reason")' <<<"$(jq -c '.data' "$OUT_FILE")" >/dev/null \
+    || fail "probe-repo --json omitted the reason key instead of encoding null"
+
+RESTIC_STATION_DATA_DIR="$HEALTHY" run_helper_split config validate --json
+[[ "$(jq -r '.data.nothingRunsHere' "$OUT_FILE")" == "false" ]] \
+    || fail "config validate --json did not report that something runs here"
+jq -e '.data.effective.sets | length >= 1' "$OUT_FILE" >/dev/null \
+    || fail "config validate --json carried no effective plan"
+
+# secret list reports presence, never values — the reason it can have a JSON
+# mode at all. Asserted structurally, not just by the end-of-run grep.
+RESTIC_STATION_DATA_DIR="$HEALTHY" run_helper_split secret list --json
+jq -e '[.data[] | keys] | flatten | unique | inside(["destId","label","setName","hasPassword","secretEnvCount"])' \
+    "$OUT_FILE" >/dev/null \
+    || fail "secret list --json grew a field beyond presence metadata: $(jq -c '.data' "$OUT_FILE")"
+ok "payloads carry what they claim, and secret list --json stays presence-only"
 
 # ─────────────────────────────────────────────────────────────────────────
 # 6. THE secret-leak check: every byte this script's helper invocations

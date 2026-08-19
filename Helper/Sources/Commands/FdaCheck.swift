@@ -46,6 +46,22 @@ struct FdaCheck: AsyncParsableCommand, JSONRenderable {
         let probedPath: String?
         let checkedAt: Date?
         let context: String
+
+        // Explicit `null` for the three that are absent off macOS — see the
+        // encoding convention in `docs/data-model.md`. A missing key and a
+        // null one must not be two ways of saying "not applicable".
+        private enum CodingKeys: String, CodingKey {
+            case applicable, granted, probedPath, checkedAt, context
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(applicable, forKey: .applicable)
+            try container.encode(granted, forKey: .granted)
+            try container.encode(probedPath, forKey: .probedPath)
+            try container.encode(checkedAt, forKey: .checkedAt)
+            try container.encode(context, forKey: .context)
+        }
     }
 
     func run() async throws {

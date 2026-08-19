@@ -210,6 +210,23 @@ public enum CLIInstaller {
         /// our symlinks — `install`/`uninstall` will refuse until it is
         /// removed by hand.
         public let foreignEntryPresent: Bool
+
+        // `resolvedTarget` encodes as explicit `null` rather than being
+        // omitted, matching every other `--json` shape
+        // (`docs/data-model.md` §Encoding conventions).
+        private enum CodingKeys: String, CodingKey {
+            case linkPath, installed, resolvedTarget, upToDate, onPath, foreignEntryPresent
+        }
+
+        public func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(linkPath, forKey: .linkPath)
+            try container.encode(installed, forKey: .installed)
+            try container.encode(resolvedTarget, forKey: .resolvedTarget)
+            try container.encode(upToDate, forKey: .upToDate)
+            try container.encode(onPath, forKey: .onPath)
+            try container.encode(foreignEntryPresent, forKey: .foreignEntryPresent)
+        }
     }
 
     /// `currentTarget` is what a fresh `install` would point at right now

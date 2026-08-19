@@ -501,7 +501,7 @@ or the direct `init` fails authentication against a backend the rest of this too
 # Non-secret env this destination already carries in config.json (e.g. AWS_DEFAULT_REGION) —
 # read it back with:
 restic-station-helper config show --json \
-    | jq '.sets[].destinations[] | select(.id=="<destination-id>") | .nonSecretEnv'
+    | jq '.data.sets[].destinations[] | select(.id=="<destination-id>") | .nonSecretEnv'
 
 # Export both that non-secret env and the secret credentials — the same values you are
 # about to hand to `secret set-env` — for this one command only:
@@ -728,17 +728,21 @@ backing it up early (the set itself is due every 5 minutes):
   t=+230s  service starts=2  backup runs=1
 
 $ restic-station-helper runs list --json
-[
-  {
-    "kind" : "backup",
-    "runId" : "20260815T185107Z-backup-e1000000",
-    "setId" : "E1000000-0000-4000-8000-000000000001",
-    "snapshotId" : "c8f3f32b8ece4b56b7813aa2c14ddead13a6dbd999377653babbed9c0323eb58",
-    "status" : "success",
-    "trigger" : "scheduled",
-    ...
-  }
-]
+{
+  "data" : [
+    {
+      "kind" : "backup",
+      "runId" : "20260815T185107Z-backup-e1000000",
+      "setId" : "E1000000-0000-4000-8000-000000000001",
+      "snapshotId" : "c8f3f32b8ece4b56b7813aa2c14ddead13a6dbd999377653babbed9c0323eb58",
+      "status" : "success",
+      "trigger" : "scheduled",
+      ...
+    }
+  ],
+  "ok" : true,
+  "schemaVersion" : 1
+}
 
 $ journalctl --user -u restic-station.service --no-pager --since -5 minutes
 Aug 15 18:51:07 runnervm69nxj systemd[1238]: Starting restic-station.service - Restic Station scheduling tick...
@@ -820,75 +824,79 @@ excluded here, and why:
 
 $ restic-station-helper status --json
 {
-  "excludedHere" : [
-    {
-      "description" : "backup set \"Mac Photos Library\" is disabled on this machine",
-      "id" : "F1000000-0000-4000-8000-000000000004",
-      "name" : "Mac Photos Library",
-      "reason" : "disabledForMachine",
-      "setId" : "F1000000-0000-4000-8000-000000000004",
-      "subject" : "backupSet"
-    }
-  ],
-  "fullDiskAccessDenied" : false,
-  "generatedAt" : "2026-08-06T23:03:36.040Z",
-  "health" : "warning",
-  "machineId" : "linux-nas",
-  "scheduler" : {
-    "healthy" : false,
-    "kind" : "systemd-timer",
-    "problems" : [
-      "dataDirectoryMismatch"
+  "data" : {
+    "excludedHere" : [
+      {
+        "description" : "backup set \"Mac Photos Library\" is disabled on this machine",
+        "id" : "F1000000-0000-4000-8000-000000000004",
+        "name" : "Mac Photos Library",
+        "reason" : "disabledForMachine",
+        "setId" : "F1000000-0000-4000-8000-000000000004",
+        "subject" : "backupSet"
+      }
     ],
-    "summaries" : [
-      "the installed timer ticks a different data directory than this command reads"
+    "fullDiskAccessDenied" : false,
+    "generatedAt" : "2026-08-06T23:03:36.040Z",
+    "health" : "warning",
+    "machineId" : "linux-nas",
+    "scheduler" : {
+      "healthy" : false,
+      "kind" : "systemd-timer",
+      "problems" : [
+        "dataDirectoryMismatch"
+      ],
+      "summaries" : [
+        "the installed timer ticks a different data directory than this command reads"
+      ]
+    },
+    "sets" : [
+      {
+        "abandonedRun" : null,
+        "abandonedRunFile" : null,
+        "currentRun" : null,
+        "destinations" : [
+          {
+            "id" : "F1000000-0000-4000-8000-000000000002",
+            "isPrimary" : true,
+            "label" : "NAS Primary",
+            "lastError" : null,
+            "lastSyncedAt" : "2026-08-06T23:03:34.641Z",
+            "reachable" : true,
+            "stale" : false
+          },
+          {
+            "id" : "F1000000-0000-4000-8000-000000000003",
+            "isPrimary" : false,
+            "label" : "Offsite Mirror",
+            "lastError" : null,
+            "lastSyncedAt" : "2026-08-06T23:03:36.003Z",
+            "reachable" : true,
+            "stale" : false
+          }
+        ],
+        "firstBackupOverdue" : false,
+        "id" : "F1000000-0000-4000-8000-000000000001",
+        "isRunning" : false,
+        "lastBackup" : {
+          "ageSeconds" : 1.400916576385498,
+          "end" : "2026-08-06T23:03:34.639Z",
+          "runId" : "20260806T230333Z-backup-f1000000",
+          "start" : "2026-08-06T23:03:33.943Z",
+          "status" : "success"
+        },
+        "lastCheck" : null,
+        "lastPrune" : null,
+        "name" : "Projects",
+        "needsAttention" : false,
+        "nextDue" : "2026-08-06T23:08:33.941Z"
+      }
+    ],
+    "unattributedRuns" : [
+
     ]
   },
-  "sets" : [
-    {
-      "abandonedRun" : null,
-      "abandonedRunFile" : null,
-      "currentRun" : null,
-      "destinations" : [
-        {
-          "id" : "F1000000-0000-4000-8000-000000000002",
-          "isPrimary" : true,
-          "label" : "NAS Primary",
-          "lastError" : null,
-          "lastSyncedAt" : "2026-08-06T23:03:34.641Z",
-          "reachable" : true,
-          "stale" : false
-        },
-        {
-          "id" : "F1000000-0000-4000-8000-000000000003",
-          "isPrimary" : false,
-          "label" : "Offsite Mirror",
-          "lastError" : null,
-          "lastSyncedAt" : "2026-08-06T23:03:36.003Z",
-          "reachable" : true,
-          "stale" : false
-        }
-      ],
-      "firstBackupOverdue" : false,
-      "id" : "F1000000-0000-4000-8000-000000000001",
-      "isRunning" : false,
-      "lastBackup" : {
-        "ageSeconds" : 1.400916576385498,
-        "end" : "2026-08-06T23:03:34.639Z",
-        "runId" : "20260806T230333Z-backup-f1000000",
-        "start" : "2026-08-06T23:03:33.943Z",
-        "status" : "success"
-      },
-      "lastCheck" : null,
-      "lastPrune" : null,
-      "name" : "Projects",
-      "needsAttention" : false,
-      "nextDue" : "2026-08-06T23:08:33.941Z"
-    }
-  ],
-  "unattributedRuns" : [
-
-  ]
+  "ok" : true,
+  "schemaVersion" : 1
 }
 (exit 1)
 
@@ -982,63 +990,67 @@ so this stays regression-checked):
 --- status --json for the same data dir, right after the timer above was uninstalled ---
 $ restic-station-helper status --json; echo "exit $?"
 {
-  "excludedHere" : [
+  "data" : {
+    "excludedHere" : [
 
-  ],
-  "fullDiskAccessDenied" : false,
-  "generatedAt" : "2026-08-06T23:05:10.591Z",
-  "health" : "warning",
-  "machineId" : "linux-nas",
-  "scheduler" : {
-    "healthy" : false,
-    "kind" : "systemd-timer",
-    "problems" : [
-      "unitsMissing",
-      "notEnabled",
-      "notActive"
     ],
-    "summaries" : [
-      "the units are not installed — run `restic-station-helper timer install`",
-      "the timer is not enabled, so it will not come back after a reboot",
-      "the timer is not active, so it is not firing now"
+    "fullDiskAccessDenied" : false,
+    "generatedAt" : "2026-08-06T23:05:10.591Z",
+    "health" : "warning",
+    "machineId" : "linux-nas",
+    "scheduler" : {
+      "healthy" : false,
+      "kind" : "systemd-timer",
+      "problems" : [
+        "unitsMissing",
+        "notEnabled",
+        "notActive"
+      ],
+      "summaries" : [
+        "the units are not installed — run `restic-station-helper timer install`",
+        "the timer is not enabled, so it will not come back after a reboot",
+        "the timer is not active, so it is not firing now"
+      ]
+    },
+    "sets" : [
+      {
+        "abandonedRun" : null,
+        "abandonedRunFile" : null,
+        "currentRun" : null,
+        "destinations" : [
+          {
+            "id" : "E1000000-0000-4000-8000-000000000002",
+            "isPrimary" : true,
+            "label" : "Fire Primary",
+            "lastError" : null,
+            "lastSyncedAt" : "2026-08-06T23:05:02.676Z",
+            "reachable" : true,
+            "stale" : false
+          }
+        ],
+        "firstBackupOverdue" : false,
+        "id" : "E1000000-0000-4000-8000-000000000001",
+        "isRunning" : false,
+        "lastBackup" : {
+          "ageSeconds" : 7.917420506477356,
+          "end" : "2026-08-06T23:05:02.674Z",
+          "runId" : "20260806T230501Z-backup-e1000000",
+          "start" : "2026-08-06T23:05:01.986Z",
+          "status" : "success"
+        },
+        "lastCheck" : null,
+        "lastPrune" : null,
+        "name" : "Fire Check",
+        "needsAttention" : false,
+        "nextDue" : "2026-08-06T23:10:01.983Z"
+      }
+    ],
+    "unattributedRuns" : [
+
     ]
   },
-  "sets" : [
-    {
-      "abandonedRun" : null,
-      "abandonedRunFile" : null,
-      "currentRun" : null,
-      "destinations" : [
-        {
-          "id" : "E1000000-0000-4000-8000-000000000002",
-          "isPrimary" : true,
-          "label" : "Fire Primary",
-          "lastError" : null,
-          "lastSyncedAt" : "2026-08-06T23:05:02.676Z",
-          "reachable" : true,
-          "stale" : false
-        }
-      ],
-      "firstBackupOverdue" : false,
-      "id" : "E1000000-0000-4000-8000-000000000001",
-      "isRunning" : false,
-      "lastBackup" : {
-        "ageSeconds" : 7.917420506477356,
-        "end" : "2026-08-06T23:05:02.674Z",
-        "runId" : "20260806T230501Z-backup-e1000000",
-        "start" : "2026-08-06T23:05:01.986Z",
-        "status" : "success"
-      },
-      "lastCheck" : null,
-      "lastPrune" : null,
-      "name" : "Fire Check",
-      "needsAttention" : false,
-      "nextDue" : "2026-08-06T23:10:01.983Z"
-    }
-  ],
-  "unattributedRuns" : [
-
-  ]
+  "ok" : true,
+  "schemaVersion" : 1
 }
 exit 1
 
