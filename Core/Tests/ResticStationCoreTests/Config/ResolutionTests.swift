@@ -353,7 +353,7 @@ private func baseConfig() -> AppConfig {
     @Test func macResolutionIsIdenticalOnEveryHostOS() throws {
         let expected = """
         {
-          "version": 2,
+          "version": 3,
           "resticPath": null,
           "showMenuBarIcon": true,
           "sets": [
@@ -362,6 +362,7 @@ private func baseConfig() -> AppConfig {
               "name": "Documents",
               "sources": ["/Users/bwh/Documents"],
               "excludes": ["*.tmp"],
+              "purgeExcludes": [],
               "schedule": { "kind": "daily", "hour": 2, "minute": 30 },
               "retention": {
                 "keepLast": null, "keepHourly": null, "keepDaily": 7,
@@ -404,7 +405,7 @@ private func baseConfig() -> AppConfig {
     @Test func linuxResolutionIsIdenticalOnEveryHostOS() throws {
         let expected = """
         {
-          "version": 2,
+          "version": 3,
           "resticPath": null,
           "showMenuBarIcon": true,
           "sets": [
@@ -413,6 +414,7 @@ private func baseConfig() -> AppConfig {
               "name": "Documents",
               "sources": ["/srv/data"],
               "excludes": ["*.tmp"],
+              "purgeExcludes": [],
               "schedule": { "kind": "daily", "hour": 4, "minute": 0 },
               "retention": {
                 "keepLast": null, "keepHourly": null, "keepDaily": 7,
@@ -682,10 +684,25 @@ private func baseConfig() -> AppConfig {
 
         // Structural equality against the fixture bytes: no key gained, none
         // lost — in particular no `"machines": null` sprayed over every set
-        // and destination that has no overrides.
+        // and destination that has no overrides. The one deliberate
+        // exception is `"purgeExcludes": []`: `BackupSet.encode(to:)` always
+        // writes that key regardless of the config's own `version`, so a
+        // plain v2 fixture gains it on any re-encode without anything else
+        // changing. `config-v2.json` itself stays a pure v2 fixture (no
+        // `purgeExcludes` key) so it keeps doubling as migration input; the
+        // expected object below adds the key back in rather than needing a
+        // second, near-duplicate fixture.
         let actual = try JSONSerialization.jsonObject(with: reencoded) as? NSDictionary
-        let expected = try JSONSerialization.jsonObject(with: FixtureLoader.data("config-v2.json")) as? NSDictionary
-        #expect(actual == expected)
+        guard var expected = try JSONSerialization.jsonObject(with: FixtureLoader.data("config-v2.json")) as? [String: Any],
+              var sets = expected["sets"] as? [[String: Any]] else {
+            Issue.record("could not parse config-v2.json fixture as a JSON object with a sets array")
+            return
+        }
+        for index in sets.indices {
+            sets[index]["purgeExcludes"] = [String]()
+        }
+        expected["sets"] = sets
+        #expect(actual == (expected as NSDictionary))
     }
 
     /// The pre-change fixture, resolved on the machine that authored it,

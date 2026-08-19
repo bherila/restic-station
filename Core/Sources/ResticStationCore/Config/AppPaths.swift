@@ -71,12 +71,31 @@ public struct AppPaths: Equatable, Sendable {
         root.appendingPathComponent("config.json", isDirectory: false)
     }
 
-    /// `config.v1.backup.json` — the untouched copy of a schema-v1
-    /// `config.json` that `ConfigStore` writes once, immediately before the
-    /// first v2 write (`docs/data-model.md` §Versioning & migration). Never
-    /// overwritten.
+    /// `config.v<N>.backup.json` — the untouched copy of a `config.json` at
+    /// schema version `N` that `ConfigStore` writes once, immediately before
+    /// the first write at a newer version (`docs/data-model.md` §Versioning &
+    /// migration). Never overwritten.
+    ///
+    /// **Keyed by the version being migrated *from*, not by a fixed name.**
+    /// A single `config.v1.backup.json` was correct while v2 was the only
+    /// destination, but it silently breaks the invariant as soon as a third
+    /// version exists: a host that migrated v1→v2 long ago already has that
+    /// file, so an `O_EXCL` write for a v2→v3 migration finds it present,
+    /// reports the backup as confirmed, and lets `config.json` be overwritten
+    /// with no copy of the v2 file anywhere. One file per source version
+    /// keeps "never overwritten unless a backup of it exists" true for every
+    /// step of the chain.
+    public func configBackupFile(fromVersion version: Int) -> URL {
+        root.appendingPathComponent("config.v\(version).backup.json", isDirectory: false)
+    }
+
+    /// `config.v1.backup.json` — the schema-v1 copy specifically.
+    ///
+    /// Retained because it names a file that exists on every host that has
+    /// been through the v1→v2 migration; new code should prefer
+    /// ``configBackupFile(fromVersion:)``.
     public var configV1BackupFile: URL {
-        root.appendingPathComponent("config.v1.backup.json", isDirectory: false)
+        configBackupFile(fromVersion: 1)
     }
 
     /// `config.import-backup-<suffix>.json` — the verbatim copy `config

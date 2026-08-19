@@ -15,7 +15,9 @@ public struct AppConfig: Codable, Equatable, Sendable {
     /// - 1: the original single-machine schema.
     /// - 2: per-machine scoping — `machines` overrides on `BackupSet` and
     ///   `Destination`, and `resticPath` relocated to `machine.json`.
-    public static let currentVersion = 2
+    /// - 3: `purgeExcludes` on `BackupSet` — patterns excluded from new
+    ///   backups *and* rewritten out of existing snapshots.
+    public static let currentVersion = 3
 
     public var version: Int
     /// **Deprecated** — superseded by `MachineConfig.resticPath`, because
@@ -83,8 +85,23 @@ public struct BackupSet: Codable, Equatable, Identifiable, Sendable {
     public var name: String
     /// Absolute paths.
     public var sources: [String]
-    /// restic `--exclude` patterns.
+    /// restic `--exclude` patterns. Forward-only: they keep matching paths
+    /// out of *new* snapshots and do nothing to snapshots already written.
     public var excludes: [String]
+    /// restic `--exclude` patterns that are **also applied retroactively**
+    /// (schema v3): matching paths are kept out of new snapshots exactly as
+    /// ``excludes`` are, and are additionally rewritten out of the snapshots
+    /// already in each destination.
+    ///
+    /// Deliberately a second list rather than a flag on ``excludes``. The
+    /// retroactive half deletes backup data irreversibly, so it must be
+    /// something a person opts a pattern into — not a behaviour that changes
+    /// underneath every exclude anyone has ever configured.
+    ///
+    /// Note the asymmetry with removal: adding a pattern here destroys data,
+    /// while removing one restores nothing. `restic rewrite --forget` has no
+    /// inverse.
+    public var purgeExcludes: [String]
     public var schedule: Schedule
     /// `nil` = never forget.
     public var retention: RetentionPolicy?
@@ -107,6 +124,7 @@ public struct BackupSet: Codable, Equatable, Identifiable, Sendable {
         name: String,
         sources: [String],
         excludes: [String] = [],
+        purgeExcludes: [String] = [],
         schedule: Schedule,
         retention: RetentionPolicy? = nil,
         checkPolicy: CheckPolicy? = nil,
@@ -118,6 +136,7 @@ public struct BackupSet: Codable, Equatable, Identifiable, Sendable {
         self.name = name
         self.sources = sources
         self.excludes = excludes
+        self.purgeExcludes = purgeExcludes
         self.schedule = schedule
         self.retention = retention
         self.checkPolicy = checkPolicy
@@ -127,8 +146,31 @@ public struct BackupSet: Codable, Equatable, Identifiable, Sendable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, name, sources, excludes, schedule, retention, checkPolicy, stalenessWarningDays, destinations
+        case id, name, sources, excludes, purgeExcludes, schedule, retention, checkPolicy
+        case stalenessWarningDays, destinations
         case machines
+    }
+
+    // Hand-written decode, where every other type here relies on the
+    // synthesized one, for a single reason: `purgeExcludes` is a v3 key that
+    // must decode out of a v1 or v2 file, and decoding happens *before*
+    // migration runs (`ConfigStore.load()` decodes, validates, then
+    // migrates). The synthesized decoder would throw `keyNotFound` on every
+    // pre-v3 config and no migration would ever get the chance to run.
+    // Absent and explicit `null` both read as "no purge patterns".
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        name = try container.decode(String.self, forKey: .name)
+        sources = try container.decode([String].self, forKey: .sources)
+        excludes = try container.decode([String].self, forKey: .excludes)
+        purgeExcludes = try container.decodeIfPresent([String].self, forKey: .purgeExcludes) ?? []
+        schedule = try container.decode(Schedule.self, forKey: .schedule)
+        retention = try container.decodeIfPresent(RetentionPolicy.self, forKey: .retention)
+        checkPolicy = try container.decodeIfPresent(CheckPolicy.self, forKey: .checkPolicy)
+        stalenessWarningDays = try container.decode(Int.self, forKey: .stalenessWarningDays)
+        destinations = try container.decode([Destination].self, forKey: .destinations)
+        machines = try container.decodeIfPresent([String: BackupSetMachineOverride].self, forKey: .machines)
     }
 
     // See AppConfig.encode(to:) — explicit null for `retention`/`checkPolicy`.
@@ -144,12 +186,28 @@ public struct BackupSet: Codable, Equatable, Identifiable, Sendable {
         try container.encode(name, forKey: .name)
         try container.encode(sources, forKey: .sources)
         try container.encode(excludes, forKey: .excludes)
+        try container.encode(purgeExcludes, forKey: .purgeExcludes)
         try container.encode(schedule, forKey: .schedule)
         try container.encode(retention, forKey: .retention)
         try container.encode(checkPolicy, forKey: .checkPolicy)
         try container.encode(stalenessWarningDays, forKey: .stalenessWarningDays)
         try container.encode(destinations, forKey: .destinations)
         try container.encodeIfPresent(machines, forKey: .machines)
+    }
+
+    /// Every pattern that must reach `restic backup` as `--exclude`: the
+    /// forward-only ``excludes`` followed by ``purgeExcludes``, deduped with
+    /// first-occurrence order preserved.
+    ///
+    /// The forward half of purging is exactly "these patterns are also
+    /// ordinary excludes", so it costs nothing — which is why this is the
+    /// single place the two lists are ever concatenated. Nothing else should
+    /// do it by hand: a caller that forgets leaves a purge pattern being
+    /// rewritten out of history on every run and immediately backed up again
+    /// by the next one.
+    public var effectiveBackupExcludes: [String] {
+        var seen = Set<String>()
+        return (excludes + purgeExcludes).filter { seen.insert($0).inserted }
     }
 }
 
@@ -433,6 +491,8 @@ public enum ConfigError: Error, Equatable, Sendable, CustomStringConvertible {
     case emptySources(setId: UUID)
     /// Invariant 3: a set has a non-absolute source path.
     case relativeSourcePath(setId: UUID, path: String)
+    /// Invariant 3: a set has an empty `purgeExcludes` pattern.
+    case emptyPurgeExcludePattern(setId: UUID, index: Int)
     /// Invariant 4: a `Schedule` field is out of range.
     case invalidSchedule(setId: UUID, reason: String)
     /// Invariant 5: `stalenessWarningDays < 1`.
@@ -460,6 +520,9 @@ public enum ConfigError: Error, Equatable, Sendable, CustomStringConvertible {
             return "backup set \(setId) has no sources"
         case .relativeSourcePath(let setId, let path):
             return "backup set \(setId) has a non-absolute source path: \(path)"
+        case .emptyPurgeExcludePattern(let setId, let index):
+            return "backup set \(setId) has an empty purgeExcludes pattern at position \(index) — "
+                + "remove the blank row; an empty pattern would be passed to restic as --exclude \"\""
         case .invalidSchedule(let setId, let reason):
             return "backup set \(setId) has an invalid schedule: \(reason)"
         case .invalidStalenessWarningDays(let setId, let value):
@@ -516,6 +579,14 @@ extension AppConfig {
             }
             for source in set.sources where !source.hasPrefix("/") {
                 throw ConfigError.relativeSourcePath(setId: set.id, path: source)
+            }
+
+            // Invariant 3: no blank purge pattern. `excludes` is deliberately
+            // left unvalidated — a stray blank row there is harmless noise —
+            // but `--exclude ""` in a list that also drives `rewrite --forget`
+            // is not something to find out about from a repository.
+            for (index, pattern) in set.purgeExcludes.enumerated() where pattern.isEmpty {
+                throw ConfigError.emptyPurgeExcludePattern(setId: set.id, index: index)
             }
 
             // Invariant 4: Schedule fields in range.
