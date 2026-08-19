@@ -33,7 +33,8 @@ private let representative: [CLIErrorCode: CLIFailure] = [
     .setBusy: .setBusy(setId: setId),
     .repositoryLocked: .classify(exitClass: .repoLocked),
     .repositoryNotInitialized: .classify(exitClass: .repoDoesNotExist),
-    .secretUnavailable: .classify(SecretStoreError.itemNotFound),
+    .secretUnavailable: .classify(SecretStoreError.backendFailed("security: SecKeychainSearchCopyNext: user canceled")),
+    .secretNotConfigured: .classify(SecretStoreError.itemNotFound),
     .secretRejected: .classify(exitClass: .wrongPassword),
     .resticNotFound: .resticUnavailable(
         result: ResticDiscoveryResult(chosen: nil, rejected: [], searchedDescription: "PATH"),
@@ -96,12 +97,13 @@ struct CLIErrorContractTests {
         #expect(CLIErrorCode.repositoryNotInitialized.rawValue == "repository_not_initialized")
         #expect(CLIErrorCode.secretUnavailable.rawValue == "secret_unavailable")
         #expect(CLIErrorCode.secretRejected.rawValue == "secret_rejected")
+        #expect(CLIErrorCode.secretNotConfigured.rawValue == "secret_not_configured")
         #expect(CLIErrorCode.resticNotFound.rawValue == "restic_not_found")
         #expect(CLIErrorCode.resticUnsupported.rawValue == "restic_unsupported")
         #expect(CLIErrorCode.resticFailed.rawValue == "restic_failed")
         #expect(CLIErrorCode.operationNotAllowed.rawValue == "operation_not_allowed")
         #expect(CLIErrorCode.internalError.rawValue == "internal_error")
-        #expect(CLIErrorCode.allCases.count == 18)
+        #expect(CLIErrorCode.allCases.count == 19)
     }
 
     @Test("only busy and offline leave exit 1 — the coarse shell contract is unchanged")
@@ -133,6 +135,12 @@ struct CLIErrorContractTests {
         #expect(rejected.code == .secretRejected)
         #expect(!rejected.retryable)
         #expect(CLIErrorCode.secretUnavailable.retryable)
+        // And a destination whose password was never stored: the backend
+        // answered, the answer will not change on its own, and a caller
+        // told `retryable: true` would loop until a human runs `secret set`.
+        let missing = CLIFailure.classify(SecretStoreError.itemNotFound)
+        #expect(missing.code == .secretNotConfigured)
+        #expect(!missing.retryable)
     }
 }
 
@@ -220,6 +228,26 @@ struct CLIErrorMappingTests {
         #expect(failure.code == .configInvalid)
         #expect(failure.details.versionFound == "9")
         #expect(failure.details.versionSupported == String(AppConfig.currentVersion))
+        // Classified *and* still prefixed. The prefix is what the
+        // `HelperExit.fail` call sites this replaced printed, and it is the
+        // only thing in the envelope that says which of the two files
+        // `config_invalid` covers actually failed.
+        #expect(failure.message.hasPrefix("could not load configuration:"))
+    }
+
+    @Test("every config-load failure names the file, typed or not")
+    func configLoadFailuresKeepTheirContext() {
+        // A `ConfigError` took an early return that skipped the prefix,
+        // so the two arms of the same call disagreed about whether the
+        // message identified `config.json` at all.
+        let typed = CLIFailure.configInvalid(underlying: ConfigError.emptySources(setId: setId))
+        #expect(typed.code == .configInvalid)
+        #expect(typed.message.hasPrefix("could not load configuration:"))
+        #expect(typed.message.contains(ConfigError.emptySources(setId: setId).description))
+
+        let untyped = CLIFailure.configInvalid(underlying: ConfigStoreError.renameFailed(errno: 13, from: "a", to: "b"))
+        #expect(untyped.code == .configInvalid)
+        #expect(untyped.message.hasPrefix("could not load configuration:"))
     }
 
     @Test("restic exit codes map to their repository meanings, with the raw code kept")
@@ -281,6 +309,34 @@ struct CLIErrorMappingTests {
         #expect(notRestic.details.versionFound == nil)
     }
 
+    @Test("a probed binary cannot put arbitrary text into details.versionFound")
+    func versionFoundIsBounded() {
+        // `versionFound` is the one `details` field whose value comes from
+        // outside this process — a wrapper on PATH can answer `version`
+        // with any JSON object it likes, and `VersionInfo` accepts the
+        // string because its comparison simply ignores what it cannot read.
+        // Verbatim, that would put unbounded attacker-chosen text into the
+        // half of the envelope documented as safe to log.
+        let hostile = String(repeating: "9", count: 4_000) + " <script>"
+        let failure = CLIFailure.resticUnavailable(
+            result: ResticDiscoveryResult(
+                chosen: nil,
+                rejected: [ResticProbe(path: "/tmp/restic", outcome: .tooOld(version: hostile))],
+                searchedDescription: "PATH"
+            ),
+            message: "too old"
+        )
+        let found = try? #require(failure.details.versionFound)
+        #expect(found?.count ?? .max <= 64)
+        #expect(found?.contains("<script>") == false)
+        // Ordinary versions survive intact — this sanitizes, it does not
+        // discard, and the published value is the number the too-old
+        // decision was actually made on.
+        #expect(CLIFailure.boundedVersion("0.16.4") == "0.16.4")
+        #expect(CLIFailure.boundedVersion("0.17.0-rc.1") == "0.17.0")
+        #expect(CLIFailure.boundedVersion("") == "0")
+    }
+
     @Test("a restic that could not be spawned at all is reported as not found")
     func launchFailureIsNotFound() {
         #expect(CLIFailure.classify(ResticRunnerError.launchFailed("no such file")).code == .resticNotFound)
@@ -290,8 +346,11 @@ struct CLIErrorMappingTests {
     func secretBackendsAgree() {
         // The acceptance criterion from #81: a macOS keychain failure and a
         // Linux `secrets.json` failure must be indistinguishable to a caller
-        // deciding what to do about it.
-        #expect(CLIFailure.classify(SecretStoreError.itemNotFound).code == .secretUnavailable)
+        // deciding what to do about it. Both backends raise the same two
+        // cases, so the split below is by *condition* and not by backend —
+        // `KeychainSecretStore` maps `security`'s exit 44 to `itemNotFound`
+        // exactly as `FileSecretStore` maps a missing key.
+        #expect(CLIFailure.classify(SecretStoreError.itemNotFound).code == .secretNotConfigured)
         #expect(
             CLIFailure.classify(SecretStoreError.backendFailed("security: exit 51")).code
                 == .secretUnavailable
@@ -322,6 +381,20 @@ struct CLIErrorMappingTests {
         let failure = CLIFailure.classify(Verbose())
         #expect(failure.message.count == CLIFailure.messageCharacterLimit + 1) // + the ellipsis
         #expect(failure.message.hasSuffix("…"))
+    }
+
+    @Test("the cap belongs to the type, not to whichever constructor remembered it")
+    func theInitializerBoundsToo() {
+        // Constructed directly, the way a future call site will. Nothing
+        // here calls `bounded(_:)`, and the message is still bounded.
+        let direct = CLIFailure(code: .operationNotAllowed, message: String(repeating: "y", count: 5_000))
+        #expect(direct.message.count == CLIFailure.messageCharacterLimit + 1)
+
+        // The concrete case that motivated it: a machine id is interpolated
+        // into this message and `MachineIdentity` imposes no length limit.
+        let longId = String(repeating: "n", count: 2_000)
+        let disabled = CLIFailure.setDisabledHere(setId: setId, machineId: longId)
+        #expect(disabled.message.count <= CLIFailure.messageCharacterLimit + 1)
     }
 }
 

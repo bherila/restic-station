@@ -55,7 +55,8 @@ never match on it. `details` is omitted entirely when empty.
 | `repository_offline` | **yes** | **3** | The destination did not answer — an unplugged drive, a sleeping NAS. Expected, not a fault. |
 | `repository_locked` | **yes** | 1 | restic exit 11: another restic process holds the repository lock. |
 | `repository_not_initialized` | no | 1 | restic exit 10: nothing is initialized at that location. |
-| `secret_unavailable` | **yes** | 1 | The password or secret env could not be **read** — a locked login keychain, a `secrets.json` whose mode was widened. |
+| `secret_unavailable` | **yes** | 1 | The secret backend answered badly and may answer well later — a locked login keychain, a `secrets.json` whose mode was widened. |
+| `secret_not_configured` | no | 1 | The backend answered "no such item": no password is stored for this destination. Run `secret set`. |
 | `secret_rejected` | no | 1 | restic exit 12: the secret was read fine and restic refused it. |
 | `restic_not_found` | no | 1 | No restic binary anywhere that was searched. |
 | `restic_unsupported` | no | 1 | A restic was found and ran, but is below the minimum or is not restic. |
@@ -69,10 +70,17 @@ Means precisely: **the identical request could succeed later with nobody
 changing anything.** It is advice for a backoff loop, not a judgement about
 severity.
 
-This is why `secret_rejected` is split from `secret_unavailable`. A locked
-keychain is worth retrying unchanged; a wrong password will fail identically
-forever until a human replaces it. Collapsing them — as the original issue's
-taxonomy did — would force one `retryable` value that is wrong for one of them.
+This is why `secret_rejected` and `secret_not_configured` are split from
+`secret_unavailable`. A locked keychain is worth retrying unchanged; a wrong
+password will fail identically forever until a human replaces it, and a
+destination with no password stored stays that way until someone runs
+`secret set`. Collapsing them — as the original issue's taxonomy did — would
+force one `retryable` value that is wrong for two of the three.
+
+The split is by **condition, not by backend**: `SecretStoreError.itemNotFound`
+is what the macOS keychain backend reports for `security`'s exit 44 and what
+the Linux file backend reports for a missing key, so #81's requirement that the
+two backends be indistinguishable to a caller still holds.
 
 ### `details`
 
@@ -86,7 +94,7 @@ Every field is an id, a small integer, or a closed enum value:
 | `machineId` | string | A per-machine resolution decided the outcome. |
 | `resticExitCode` | integer | restic ran and returned it. |
 | `resticCategory` | `success` \| `warning` \| `terminal` \| `retryable` | Alongside a restic failure. |
-| `versionFound` / `versionSupported` | string | A version mismatch — schema or restic binary. |
+| `versionFound` / `versionSupported` | string | A version mismatch — schema or restic binary. Reduced to a dotted numeric triple; see §Redaction. |
 | `diagnosticReference` | string | A run id or log path worth fetching, when safe. |
 
 ## Redaction
@@ -101,6 +109,14 @@ shape of the type rather than by every call site remembering it.
 matching `ResticExitClass.summarize`. The cap is not cosmetic: before it, an
 unloadable `config.json` printed the whole `DecodingError` description,
 including the `NSDebugDescription` that quotes the offending bytes.
+
+`versionFound` is the one `details` value that originates outside this
+process: a binary on PATH answers `version` with a JSON object, and
+`VersionInfo` accepts any string there because its comparison ignores what it
+cannot read. It is therefore published as the dotted numeric triple the
+comparison actually used (`CLIFailure.boundedVersion`), never verbatim — the
+raw text still reaches a human through `message`, which is capped. This keeps
+`details` bounded by construction rather than by trusting what was probed.
 
 Where a path is genuinely useful to a human — `machine.json`'s location, a log
 file — it stays in `message` and is kept out of `details`, which is the half of
@@ -177,6 +193,7 @@ arrive:
   mean matching restic's English stderr, which is exactly the practice this
   contract exists to stop.
 
-Two codes not in that list are defined: `secret_rejected` (see §`retryable`)
-and `run_not_found` (`runs show <unknown-id>` is a real failure of a `--json`
-command and had no code at all).
+Three codes not in that list are defined: `secret_rejected` and
+`secret_not_configured` (see §`retryable`) and `run_not_found`
+(`runs show <unknown-id>` is a real failure of a `--json` command and had no
+code at all).

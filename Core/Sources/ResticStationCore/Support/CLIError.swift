@@ -85,6 +85,16 @@ public enum CLIErrorCode: String, Sendable, Codable, CaseIterable, Equatable {
     /// this distinction reliably detectable, so collapsing it would have
     /// meant publishing a `retryable` that is wrong half the time.
     case secretRejected = "secret_rejected"
+    /// Nothing is stored for this destination — the backend answered, and
+    /// the answer was "no such item" (``SecretStoreError/itemNotFound``).
+    ///
+    /// Split from ``secretUnavailable`` for the same reason
+    /// ``secretRejected`` is: the two conditions are indistinguishable to a
+    /// caller that only sees "the secret could not be read", and they need
+    /// opposite retry advice. A keychain that is locked at a pre-login tick
+    /// unlocks by itself; a destination whose password was never stored
+    /// stays that way until a human runs `secret set`.
+    case secretNotConfigured = "secret_not_configured"
 
     // ── Repository state ──────────────────────────────────────────────────
 
@@ -136,6 +146,7 @@ extension CLIErrorCode {
         case .invalidArguments, .configInvalid, .setNotFound, .setDisabledHere,
              .destinationNotFound, .destinationDisabledHere, .runNotFound,
              .repositoryLocked, .secretUnavailable, .secretRejected,
+             .secretNotConfigured,
              .repositoryNotInitialized, .resticNotFound, .resticUnsupported,
              .resticFailed, .operationNotAllowed, .internalError:
             return .error
@@ -147,17 +158,18 @@ extension CLIErrorCode {
     ///
     /// This is advice for an automated caller's backoff loop, so it is
     /// deliberately narrow — it means "the identical request could succeed
-    /// later with nobody changing anything". ``secretRejected`` exists so
-    /// that a wrong password does not have to share this flag with a locked
-    /// keychain. It tracks ``ResticErrorCategory/retryable`` where the two
-    /// overlap.
+    /// later with nobody changing anything". ``secretRejected`` and
+    /// ``secretNotConfigured`` exist so that a wrong password and an absent
+    /// one do not have to share this flag with a locked keychain. It tracks
+    /// ``ResticErrorCategory/retryable`` where the two overlap.
     public var retryable: Bool {
         switch self {
         case .setBusy, .repositoryOffline, .repositoryLocked, .secretUnavailable:
             return true
         case .invalidArguments, .configInvalid, .setNotFound, .setDisabledHere,
              .destinationNotFound, .destinationDisabledHere, .runNotFound,
-             .secretRejected, .repositoryNotInitialized, .resticNotFound,
+             .secretRejected, .secretNotConfigured,
+             .repositoryNotInitialized, .resticNotFound,
              .resticUnsupported, .resticFailed, .operationNotAllowed,
              .internalError:
             return false
@@ -266,9 +278,15 @@ public struct CLIFailure: Error, Equatable, Sendable {
     public let message: String
     public let details: CLIErrorDetails
 
+    /// `message` is bounded here rather than at the call sites, so the cap
+    /// below is a property of the type and not of every constructor
+    /// remembering it. `setDisabledHere` was the counter-example: it
+    /// interpolates a machine id, and `MachineIdentity.isValid` imposes no
+    /// length limit, so a valid id could carry the message past the bound
+    /// this type publishes.
     public init(code: CLIErrorCode, message: String, details: CLIErrorDetails = CLIErrorDetails()) {
         self.code = code
-        self.message = message
+        self.message = Self.bounded(message)
         self.details = details
     }
 
@@ -285,12 +303,37 @@ public struct CLIFailure: Error, Equatable, Sendable {
     public static let messageCharacterLimit = 500
 
     /// Trims and caps arbitrary text for use as a `message`.
+    ///
+    /// Applied by ``init(code:message:details:)`` to everything, so calling
+    /// it explicitly is only ever belt-and-braces at a site that wants to be
+    /// obvious about capping a subprocess's output.
     public static func bounded(_ text: String) -> String {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.count > messageCharacterLimit else {
             return trimmed
         }
         return String(trimmed.prefix(messageCharacterLimit)) + "…"
+    }
+
+    /// Reduces a version string **reported by a probed executable** to the
+    /// dotted numeric triple the comparison actually used.
+    ///
+    /// `versionFound` is the one `details` field whose value originates
+    /// outside this process: it is whatever the binary put in its
+    /// `version` field, and `VersionInfo` accepts any string there because
+    /// `numericTriple` ignores what it cannot read. Copying it verbatim
+    /// would let an arbitrary — arbitrarily long, arbitrarily worded —
+    /// payload into the half of the envelope that promises to be bounded
+    /// and safe to log, which is exactly the promise `details` being a
+    /// fixed struct exists to keep.
+    ///
+    /// Publishing the triple keeps the field honest rather than merely
+    /// short: it is the number the too-old decision was made on. The raw
+    /// text still reaches a human through `message`, which is capped.
+    public static func boundedVersion(_ raw: String) -> String {
+        let triple = VersionInfo.numericTriple(raw).prefix(3)
+        guard !triple.isEmpty else { return "0" }
+        return triple.map(String.init).joined(separator: ".")
     }
 }
 
@@ -377,7 +420,7 @@ extension CLIFailure {
                 code: .resticUnsupported,
                 message: bounded(message),
                 details: CLIErrorDetails(
-                    versionFound: tooOld.version,
+                    versionFound: tooOld.version.map(boundedVersion),
                     versionSupported: ResticDiscovery.minimumVersion
                 )
             )
@@ -400,7 +443,17 @@ extension CLIFailure {
     /// an `NSDebugDescription` that quotes the offending bytes.
     public static func configInvalid(underlying: any Error) -> CLIFailure {
         if let configError = underlying as? ConfigError {
-            return classify(configError)
+            // Classified for its code and details, then re-prefixed: this is
+            // the *load* path, and dropping the prefix would both regress
+            // human mode (the old `HelperExit.fail` interpolated the same
+            // `description` behind it) and leave the message silent about
+            // which file failed — `config_invalid` also covers `machine.json`.
+            let classified = classify(configError)
+            return CLIFailure(
+                code: classified.code,
+                message: "could not load configuration: \(configError.description)",
+                details: classified.details
+            )
         }
         // Wording preserved verbatim from the `HelperExit.fail` call sites
         // this replaced, so human mode stays byte-identical. Only the cap is
@@ -547,13 +600,23 @@ extension CLIFailure {
     }
 
     static func classify(_ error: SecretStoreError) -> CLIFailure {
-        // Both cases are one code deliberately: the acceptance criterion is
-        // that the macOS keychain backend and the Linux file backend map to
-        // the *same* logical code, and `itemNotFound` vs `backendFailed` is
-        // a backend-shaped distinction, not one a caller can act on
-        // differently. The backend's own diagnostic text stays in `message`,
+        // The acceptance criterion is that the macOS keychain backend and
+        // the Linux file backend map to the *same* logical code — and they
+        // do: both report a missing item as `itemNotFound` and everything
+        // else as `backendFailed`, so this split is by condition, not by
+        // backend. It is `retryable` that forces it. `backendFailed` is a
+        // backend that answered badly and may answer well later; a missing
+        // item is a stable fact about this host until someone runs
+        // `secret set`, and publishing `retryable: true` for it would tell
+        // an automated caller to loop forever on a request that cannot
+        // succeed. The backend's own diagnostic text stays in `message`,
         // bounded, and never reaches `details`.
-        CLIFailure(code: .secretUnavailable, message: bounded(error.description))
+        switch error {
+        case .itemNotFound:
+            return CLIFailure(code: .secretNotConfigured, message: error.description)
+        case .backendFailed:
+            return CLIFailure(code: .secretUnavailable, message: error.description)
+        }
     }
 
     /// restic ran to completion and reported a failure.
