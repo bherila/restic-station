@@ -14,7 +14,7 @@ import Musl
 public struct ConfigStore: Sendable {
     public let paths: AppPaths
 
-    /// Collaborator for the one part of v1 → v2 migration that leaves
+    /// Collaborator for the migration step that leaves
     /// `config.json`: relocating `resticPath` into `machine.json`. Held
     /// rather than constructed per call so the store stays a value with a
     /// single `paths` source of truth.
@@ -87,19 +87,31 @@ public struct ConfigStore: Sendable {
 
     // MARK: - Migration
 
-    /// v1 → v2 (`docs/data-model.md` §Versioning & migration).
+    /// Any older version → current (`docs/data-model.md` §Versioning &
+    /// migration).
     ///
-    /// The schema change itself needs no data change: an absent `machines`
-    /// key already means "this set/destination runs everywhere", so a v1
-    /// config *is* a valid v2 config once the version number is bumped. The
-    /// only value that moves is `resticPath`, which is inherently host-local
-    /// and belongs in `machine.json`.
+    /// Neither step so far needs a data change, because both new keys have a
+    /// meaning when absent:
+    ///
+    /// - **v1 → v2.** An absent `machines` key already means "this
+    ///   set/destination runs everywhere", so a v1 config *is* a valid v2
+    ///   config once the version number is bumped. The only value that moves
+    ///   is `resticPath`, which is inherently host-local and belongs in
+    ///   `machine.json`.
+    /// - **v2 → v3.** An absent `purgeExcludes` decodes as `[]` (see
+    ///   `BackupSet.init(from:)`), which is "no patterns are purged" — the
+    ///   behaviour every pre-v3 config already had. A pure version bump.
+    ///
+    /// The pre-migration bytes are copied to `config.v<from>.backup.json`,
+    /// keyed by the version being migrated *from*, so each step of the chain
+    /// leaves its own recoverable copy.
     ///
     /// Performs the migration's persistence side effects — in this order:
     /// 1. Adopt `resticPath` into `machine.json` (only if it has none), and
     ///    clear it from the returned config **only once that write
     ///    succeeded**.
-    /// 2. Copy `originalBytes` to `config.v1.backup.json` — never
+    /// 2. Copy `originalBytes` to the source-versioned
+    ///    `config.v<from>.backup.json` — never
     ///    overwriting an existing backup, so a second migration cannot
     ///    clobber the first one's copy.
     ///
@@ -119,10 +131,11 @@ public struct ConfigStore: Sendable {
     /// sanctioned way to reuse this migration outside `ConfigStore` itself,
     /// per `docs/data-model.md` §Versioning — "do not reimplement it".
     ///
-    /// - Returns: the migrated value, and whether `config.v1.backup.json`
-    ///   is confirmed on disk (already existing, or just written). **Every
+    /// - Returns: the migrated value, and whether the source-versioned
+    ///   migration backup is confirmed on disk (already existing, or just
+    ///   written). **Every
     ///   caller must skip installing `config` as `config.json` when this is
-    ///   `false`** — that is the property "the v1 file is never overwritten
+    ///   `false`** — that is the property "the source file is never overwritten
     ///   unless a backup of it exists" (`docs/data-model.md` §Versioning)
     ///   actually rests on. `false` leaves `machine.json` however far the
     ///   `resticPath` adoption above got (best-effort, already durable if it
@@ -161,10 +174,10 @@ public struct ConfigStore: Sendable {
         }
 
         do {
-            try writeV1BackupIfAbsent(originalBytes)
+            try writeBackupIfAbsent(originalBytes, fromVersion: loaded.version)
         } catch {
-            Self.warn("could not write \(paths.configV1BackupFile.lastPathComponent): \(error). "
-                + "Leaving config.json at version \(loaded.version).")
+            Self.warn("could not write \(paths.configBackupFile(fromVersion: loaded.version).lastPathComponent): "
+                + "\(error). Leaving config.json at version \(loaded.version).")
             return (migrated, false)
         }
 
@@ -174,7 +187,7 @@ public struct ConfigStore: Sendable {
     /// A pure, side-effect-free **preview** of what
     /// ``migrateToCurrentVersion(_:originalBytes:)`` would produce: only the
     /// version number is bumped. No `machine.json` read or write, no
-    /// `config.v1.backup.json` write — nothing touches disk.
+    /// source-versioned migration-backup write — nothing touches disk.
     ///
     /// For `config import --dry-run` (T27), which must not write anything at
     /// all. The real migration additionally relocates a deprecated
@@ -191,13 +204,14 @@ public struct ConfigStore: Sendable {
     /// "never overwrite an existing backup" a property of the filesystem
     /// rather than of a check-then-write race: a second migration finds the
     /// file there and leaves it alone.
-    private func writeV1BackupIfAbsent(_ original: Data) throws {
-        guard !FileManager.default.fileExists(atPath: paths.configV1BackupFile.path) else {
+    private func writeBackupIfAbsent(_ original: Data, fromVersion version: Int) throws {
+        let backupFile = paths.configBackupFile(fromVersion: version)
+        guard !FileManager.default.fileExists(atPath: backupFile.path) else {
             return
         }
         try paths.ensureDirectories()
         do {
-            try original.write(to: paths.configV1BackupFile, options: .withoutOverwriting)
+            try original.write(to: backupFile, options: .withoutOverwriting)
         } catch let error as NSError where error.code == NSFileWriteFileExistsError {
             return // lost a race with another process; its copy is just as good
         }

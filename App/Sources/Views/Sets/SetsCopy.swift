@@ -59,6 +59,20 @@ enum SetsCopy {
     static let excludeSyntaxURL = URL(
         string: "https://restic.readthedocs.io/en/stable/040_backup.html#excluding-files"
     )!
+    static let excludeSyntaxLinkText = "restic exclude-pattern syntax"
+
+    /// Purge excludes are deliberately a separate list: their patterns are
+    /// also excluded from future backups, but are reserved to remove matching
+    /// files from existing snapshots when the purge workflow runs.
+    static let purgeExcludesTitle = "Purge Excludes"
+    static let purgeExcludesEmptyState = "Nothing is marked for removal from existing snapshots."
+    static let purgeExcludesPatternField = "Pattern"
+    static let purgeExcludesPatternPlaceholder = "node_modules"
+    static let purgeExcludesAddPattern = "Add Pattern"
+    static let purgeExcludesRemovePatternHelp = "Remove this purge pattern"
+    static let purgeExcludesFootnote =
+        "Purge excludes are reserved to remove matching files from existing snapshots. "
+        + "They are also excluded from new backups. Space is not reclaimed until a prune runs."
 
     // MARK: - Written for this screen
 
@@ -191,6 +205,11 @@ enum SetsCopy {
             return (.sources, "Add at least one folder or file to back up.")
         case .relativeSourcePath(_, let path):
             return (.sources, "Sources must be absolute paths — “\(path)” is not.")
+        case .emptyPurgeExcludePattern:
+            return (
+                .purgeExcludes,
+                "Remove the blank pattern — every entry here must be a real path or glob."
+            )
         case .invalidSchedule(_, let reason):
             return (.schedule, "This schedule is out of range: \(reason).")
         case .invalidStalenessWarningDays:
@@ -258,6 +277,10 @@ enum SetsCopy {
 enum SetEditorField: Hashable, Sendable {
     case name
     case sources
+    /// The purging-exclusion list (schema v3). There is no `excludes` case:
+    /// plain excludes are deliberately unvalidated, so nothing can ever
+    /// point an error at them.
+    case purgeExcludes
     case schedule
     case staleness
     case retention

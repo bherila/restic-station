@@ -144,7 +144,61 @@ struct ExcludesSection: View {
         } footer: {
             VStack(alignment: .leading, spacing: 2) {
                 Text("Each pattern is passed to restic as --exclude.")
-                Link("restic exclude-pattern syntax", destination: SetsCopy.excludeSyntaxURL)
+                Link(SetsCopy.excludeSyntaxLinkText, destination: SetsCopy.excludeSyntaxURL)
+            }
+            .font(.footnote)
+            .foregroundStyle(.secondary)
+        }
+    }
+}
+
+// MARK: - Purge excludes
+
+/// The separate, history-affecting exclusion list. Its copy is pinned in
+/// `SetsCopy` and `docs/ui-spec.md` §Backup Sets.
+struct PurgeExcludesSection: View {
+    @Binding var purgeExcludes: [String]
+    let errorMessage: String?
+
+    var body: some View {
+        Section {
+            if purgeExcludes.isEmpty {
+                Text(SetsCopy.purgeExcludesEmptyState)
+                    .foregroundStyle(.secondary)
+            }
+
+            ForEach(purgeExcludes.indices, id: \.self) { index in
+                HStack {
+                    TextField(
+                        SetsCopy.purgeExcludesPatternField,
+                        text: $purgeExcludes[index],
+                        prompt: Text(SetsCopy.purgeExcludesPatternPlaceholder)
+                    )
+                    .labelsHidden()
+                    Button {
+                        purgeExcludes.remove(at: index)
+                    } label: {
+                        Image(systemName: "minus.circle")
+                    }
+                    .buttonStyle(.borderless)
+                    .help(SetsCopy.purgeExcludesRemovePatternHelp)
+                }
+            }
+
+            HStack {
+                Button(SetsCopy.purgeExcludesAddPattern) { purgeExcludes.append("") }
+                Spacer()
+            }
+
+            if let errorMessage {
+                InlineMessage(errorMessage)
+            }
+        } header: {
+            Text(SetsCopy.purgeExcludesTitle)
+        } footer: {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(SetsCopy.purgeExcludesFootnote)
+                Link(SetsCopy.excludeSyntaxLinkText, destination: SetsCopy.excludeSyntaxURL)
             }
             .font(.footnote)
             .foregroundStyle(.secondary)

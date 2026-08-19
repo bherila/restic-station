@@ -54,7 +54,7 @@ private func installMachine(at paths: AppPaths, resticPath: String? = nil) throw
 
         let migrated = try store.load()
 
-        #expect(migrated.version == 2)
+        #expect(migrated.version == 3)
         // Moved, not copied: the deprecated field is cleared once the value
         // is safely recorded host-locally.
         #expect(migrated.resticPath == nil)
@@ -62,7 +62,7 @@ private func installMachine(at paths: AppPaths, resticPath: String? = nil) throw
 
         // …and it was persisted, so the next load is a plain v2 read.
         let onDisk = try ConfigStore.makeDecoder().decode(AppConfig.self, from: Data(contentsOf: paths.configFile))
-        #expect(onDisk.version == 2)
+        #expect(onDisk.version == 3)
         #expect(onDisk.resticPath == nil)
     }
 
@@ -157,7 +157,7 @@ private func installMachine(at paths: AppPaths, resticPath: String? = nil) throw
         #expect(try Data(contentsOf: paths.configV1BackupFile) == sentinel)
         // The migration still happened.
         let onDisk = try ConfigStore.makeDecoder().decode(AppConfig.self, from: Data(contentsOf: paths.configFile))
-        #expect(onDisk.version == 2)
+        #expect(onDisk.version == 3)
     }
 
     /// A v1 config that is *invalid* is a hard error at its own version — it
@@ -211,7 +211,7 @@ private func installMachine(at paths: AppPaths, resticPath: String? = nil) throw
 
         let migrated = try store.load()
 
-        #expect(migrated.version == 2)
+        #expect(migrated.version == 3)
         #expect(migrated.resticPath == nil)
         #expect(try MachineStore(paths: paths, environment: [:]).load().resticPath == nil)
     }
@@ -242,17 +242,121 @@ private func installMachine(at paths: AppPaths, resticPath: String? = nil) throw
 
     // MARK: - No migration where none is due
 
-    @Test func aV2ConfigIsNotMigratedAndProducesNoBackup() throws {
+    /// A v2 config *is* migrated to v3 (only `purgeExcludes` decoding-in as
+    /// `[]` changes, per `BackupSet.init(from:)`), and the pre-migration v2
+    /// bytes land in `config.v2.backup.json` — keyed by the version being
+    /// migrated *from*, not the fixed `config.v1.backup.json`.
+    @Test func aV2ConfigIsMigratedToV3AndBacksUpTheV2Bytes() throws {
+        let (store, paths, cleanup) = try makeStore()
+        defer { cleanup() }
+        let original = try FixtureLoader.data("config-v2.json")
+        try original.write(to: paths.configFile)
+        let before = try ConfigStore.makeDecoder().decode(AppConfig.self, from: original)
+
+        let loaded = try store.load()
+
+        #expect(loaded.version == 3)
+        // Nothing else about the config changed — every set's purgeExcludes
+        // decoded to [] and every other field is untouched.
+        for set in loaded.sets {
+            #expect(set.purgeExcludes == [])
+        }
+        #expect(loaded.resticPath == before.resticPath)
+        #expect(loaded.showMenuBarIcon == before.showMenuBarIcon)
+        #expect(loaded.onboardingCompleted == before.onboardingCompleted)
+        #expect(loaded.sets.map(\.id) == before.sets.map(\.id))
+
+        // The v2 file is never touched — only its own version-keyed backup.
+        #expect(!FileManager.default.fileExists(atPath: paths.configV1BackupFile.path))
+        let v2Backup = paths.configBackupFile(fromVersion: 2)
+        #expect(v2Backup.lastPathComponent == "config.v2.backup.json")
+        #expect(FileManager.default.fileExists(atPath: v2Backup.path))
+        #expect(try Data(contentsOf: v2Backup) == original)
+
+        // ...and config.json itself now holds the migrated (v3) content.
+        let onDisk = try ConfigStore.makeDecoder().decode(AppConfig.self, from: Data(contentsOf: paths.configFile))
+        #expect(onDisk.version == 3)
+    }
+
+    // MARK: - The backup-file-per-version fix
+
+    /// The bug the version-keyed backup filename exists to fix: a host that
+    /// migrated v1 → v2 long ago already has `config.v1.backup.json` on
+    /// disk. A later v2 → v3 migration must not mistake that file for its
+    /// own backup — it needs its own `config.v2.backup.json`, and the v1
+    /// file must be left exactly as it was.
+    @Test func aV2ToV3MigrationWritesItsOwnBackupEvenWhenAV1BackupAlreadyExists() throws {
         let (store, paths, cleanup) = try makeStore()
         defer { cleanup() }
         let original = try FixtureLoader.data("config-v2.json")
         try original.write(to: paths.configFile)
 
+        let preexistingV1Backup = Data(#"{"this":"is the old v1 backup, from years ago"}"#.utf8)
+        try preexistingV1Backup.write(to: paths.configV1BackupFile)
+
         let loaded = try store.load()
 
-        #expect(loaded.version == 2)
-        #expect(!FileManager.default.fileExists(atPath: paths.configV1BackupFile.path))
+        #expect(loaded.version == 3)
+        // The v1 backup is untouched...
+        #expect(try Data(contentsOf: paths.configV1BackupFile) == preexistingV1Backup)
+        // ...and a *separate*, correct v2 backup was written alongside it,
+        // recoverable verbatim.
+        let v2Backup = paths.configBackupFile(fromVersion: 2)
+        #expect(FileManager.default.fileExists(atPath: v2Backup.path))
+        #expect(try Data(contentsOf: v2Backup) == original)
+    }
+
+    /// Idempotent the same way the v1 migration is: a second load must not
+    /// clobber the v2 backup a first load already wrote.
+    @Test func migrationIsIdempotentAndNeverOverwritesAnExistingV2Backup() throws {
+        let (store, paths, cleanup) = try makeStore()
+        defer { cleanup() }
+        let original = try FixtureLoader.data("config-v2.json")
+        try original.write(to: paths.configFile)
+
+        let first = try store.load()
+        let v2Backup = paths.configBackupFile(fromVersion: 2)
+        let backupAfterFirst = try Data(contentsOf: v2Backup)
+        let fileAfterFirst = try Data(contentsOf: paths.configFile)
+
+        let second = try store.load()
+
+        #expect(second == first)
+        #expect(try Data(contentsOf: v2Backup) == backupAfterFirst)
+        #expect(try Data(contentsOf: paths.configFile) == fileAfterFirst)
+    }
+
+    /// When the backup write fails, `config.json` must be left alone —
+    /// mirroring the v1 guard this suite exercises end-to-end at
+    /// `migrateToCurrentVersionPerformsSideEffectsWithoutInstalling`'s
+    /// comment. Reproduced without `chmod`, which the note there explains
+    /// does not stop a CI container running as root: a plain *file* sits
+    /// where `locks/` needs to become a directory, so
+    /// `paths.ensureDirectories()` fails for anyone, root included, because
+    /// `mkdir` cannot replace an existing file regardless of privilege.
+    @Test func whenTheBackupCannotBeWrittenConfigJSONIsLeftAlone() throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("restic-station-migration-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let paths = AppPaths(root: root)
+        let store = ConfigStore(paths: paths)
+
+        let original = try FixtureLoader.data("config-v2.json")
+        try original.write(to: paths.configFile)
+        try Data().write(to: paths.locksDir) // a file, not a directory
+
+        let loaded = try store.load()
+
+        // The in-memory result still reflects the version bump — migration
+        // is a pure function of the input regardless of whether its side
+        // effects landed...
+        #expect(loaded.version == 3)
+        // ...but nothing was persisted: no backup, and config.json unchanged.
+        #expect(!FileManager.default.fileExists(atPath: paths.configBackupFile(fromVersion: 2).path))
         #expect(try Data(contentsOf: paths.configFile) == original)
+        let onDisk = try ConfigStore.makeDecoder().decode(AppConfig.self, from: Data(contentsOf: paths.configFile))
+        #expect(onDisk.version == 2)
     }
 
     @Test func aNewerVersionStillRefusesToLoad() throws {
@@ -282,7 +386,7 @@ private func installMachine(at paths: AppPaths, resticPath: String? = nil) throw
         let result = store.migrateToCurrentVersion(decoded, originalBytes: original)
 
         #expect(result.backupWritten)
-        #expect(result.config.version == 2)
+        #expect(result.config.version == 3)
         #expect(result.config.resticPath == nil)
         // Side effects (v1 backup, machine.json adoption) happened...
         #expect(FileManager.default.fileExists(atPath: paths.configV1BackupFile.path))
@@ -316,7 +420,7 @@ private func installMachine(at paths: AppPaths, resticPath: String? = nil) throw
 
         let preview = ConfigStore.previewMigration(decoded)
 
-        #expect(preview.version == 2)
+        #expect(preview.version == 3)
         // resticPath is left exactly as decoded — previewMigration does not
         // simulate the relocation.
         #expect(preview.resticPath == decoded.resticPath)

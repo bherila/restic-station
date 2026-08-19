@@ -224,7 +224,15 @@ public final class BackupEngine: Sendable {
             trigger: trigger,
             groupId: nil, // this run *is* the group
             phase: "backing-up-primary",
-            command: .backup(repo: primary.repoURL, sources: set.sources, excludes: set.excludes),
+            // `effectiveBackupExcludes`, not `excludes`: purge patterns are
+            // ordinary excludes as far as `backup` is concerned. Passing only
+            // `excludes` here would have every run re-capture exactly what
+            // the purge phase had just rewritten out of history.
+            command: .backup(
+                repo: primary.repoURL,
+                sources: set.sources,
+                excludes: set.effectiveBackupExcludes
+            ),
             invocation: ResticInvocation(destination: primary),
             streamProgress: true,
             preflightPhase: "probing",

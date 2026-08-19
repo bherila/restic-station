@@ -182,7 +182,7 @@ import ResticStationCore
 
         let views = try HelperContext.loadViews(paths: paths, configStore: ConfigStore(paths: paths))
 
-        #expect(views.scheduled.config.version == 2)
+        #expect(views.scheduled.config.version == 3)
         #expect(views.scheduled.config.resticPath == "/opt/homebrew/bin/restic")
         #expect(views.addressable.config.resticPath == "/opt/homebrew/bin/restic")
         // …and it came from machine.json, which the same load created.

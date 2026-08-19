@@ -38,6 +38,7 @@ struct EffectiveConfigReport: Encodable {
         let enabledHere: Bool
         let sources: [String]
         let excludes: [String]
+        let purgeExcludes: [String]
         let schedule: Schedule
         let retention: RetentionPolicy?
         let checkPolicy: CheckPolicy?
@@ -45,7 +46,7 @@ struct EffectiveConfigReport: Encodable {
         let destinations: [DestinationEntry]
 
         private enum CodingKeys: String, CodingKey {
-            case id, name, enabledHere, sources, excludes, schedule, retention, checkPolicy
+            case id, name, enabledHere, sources, excludes, purgeExcludes, schedule, retention, checkPolicy
             case stalenessWarningDays, destinations
         }
 
@@ -61,6 +62,7 @@ struct EffectiveConfigReport: Encodable {
             try container.encode(enabledHere, forKey: .enabledHere)
             try container.encode(sources, forKey: .sources)
             try container.encode(excludes, forKey: .excludes)
+            try container.encode(purgeExcludes, forKey: .purgeExcludes)
             try container.encode(schedule, forKey: .schedule)
             try container.encode(retention, forKey: .retention)
             try container.encode(checkPolicy, forKey: .checkPolicy)
@@ -89,7 +91,7 @@ struct EffectiveConfigReport: Encodable {
     let machineId: String
     let version: Int
     /// The deprecated top-level fallback, if this view still carries one —
-    /// `nil` on any config that has completed v1→v2 migration and has a
+    /// `nil` on any config that has migrated off v1 and has a
     /// `machine.json` resticPath.
     let resticPath: String?
     let sets: [SetEntry]
@@ -140,6 +142,7 @@ struct EffectiveConfigReport: Encodable {
                 enabledHere: enabledHere,
                 sources: set.sources,
                 excludes: set.excludes,
+                purgeExcludes: set.purgeExcludes,
                 schedule: set.schedule,
                 retention: set.retention,
                 checkPolicy: set.checkPolicy,
@@ -198,6 +201,8 @@ struct EffectiveConfigReport: Encodable {
             let status = set.enabledHere ? "RUNS HERE" : "does not run here"
             lines.append("set \"\(set.name)\" (\(set.id.uuidString.lowercased())) — \(status)")
             lines.append("    sources: \(set.sources.isEmpty ? "(none)" : set.sources.joined(separator: ", "))")
+            lines.append("    excludes: \(set.excludes.isEmpty ? "(none)" : set.excludes.joined(separator: ", "))")
+            lines.append("    purge excludes: \(set.purgeExcludes.isEmpty ? "(none)" : set.purgeExcludes.joined(separator: ", "))")
             lines.append("    schedule: \(Self.describe(set.schedule))")
             for destination in set.destinations {
                 let role = destination.isPrimary ? "primary" : "secondary"

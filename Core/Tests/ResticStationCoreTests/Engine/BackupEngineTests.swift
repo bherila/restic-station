@@ -130,6 +130,8 @@ struct BackupEngineTests {
         script: [FakeProcessRunner.Expectation],
         retention: RetentionPolicy? = RetentionPolicy(keepLast: 3),
         checkPolicy: CheckPolicy? = nil,
+        excludes: [String] = [],
+        purgeExcludes: [String] = [],
         primaryReachable: Bool = true,
         reachableSecondaries: [Bool] = [true, true],
         startingAt: Date = t0,
@@ -168,6 +170,8 @@ struct BackupEngineTests {
             id: setId,
             name: "Projects",
             sources: [source],
+            excludes: excludes,
+            purgeExcludes: purgeExcludes,
             schedule: .daily(hour: 2, minute: 30),
             retention: retention,
             checkPolicy: checkPolicy,
@@ -247,8 +251,14 @@ struct BackupEngineTests {
         ]
     }
 
-    static func backupArgv(_ repo: String) -> [String] {
-        ["-r", repo, "backup", "--json", source]
+    static func backupArgv(_ repo: String, excludes: [String] = []) -> [String] {
+        var argv = ["-r", repo, "backup", "--json"]
+        for exclude in excludes {
+            argv.append("--exclude")
+            argv.append(exclude)
+        }
+        argv.append(source)
+        return argv
     }
 
     static func copyArgv(to secondary: String, from primary: String) -> [String] {
@@ -733,6 +743,46 @@ struct BackupEngineTests {
         }
         #expect(status == .success)
         #expect(children.map(\.kind) == [.backup, .copy])
+    }
+
+    // MARK: - purgeExcludes reach `backup` as ordinary --exclude flags
+
+    /// `set.effectiveBackupExcludes` — plain `excludes` followed by
+    /// `purgeExcludes` — is what `backup` actually receives (issue #86, the
+    /// purging-exclusions epic #85): a purge pattern is a forward-only
+    /// exclude too, so
+    /// `backup` must never re-capture what the purge phase just rewrote out
+    /// of history.
+    @Test("purgeExcludes: backup argv carries plain excludes, then purge excludes, as --exclude")
+    func backupArgvCarriesPurgeExcludesAfterPlainExcludes() async throws {
+        let env = Self.makeEnv(
+            script: [],
+            retention: nil,
+            excludes: ["node_modules", "*.tmp"],
+            purgeExcludes: ["secrets/", "*.key"],
+            reachableSecondaries: []
+        )
+        defer { env.cleanUp() }
+
+        let expectedExcludes = ["node_modules", "*.tmp", "secrets/", "*.key"]
+        #expect(env.set.effectiveBackupExcludes == expectedExcludes)
+
+        let script = Self.resticCall(
+            Self.backupArgv(env.primary.repoURL, excludes: expectedExcludes),
+            dest: Self.primaryId,
+            stdoutLines: Self.backupStream()
+        )
+        env.fake.script = script
+
+        let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
+
+        #expect(env.resticArgvs == [[Self.resticPath] + Self.backupArgv(env.primary.repoURL, excludes: expectedExcludes)])
+        guard case .completed(let status, _, let children) = outcome else {
+            Issue.record("expected .completed, got \(outcome)")
+            return
+        }
+        #expect(status == .success)
+        #expect(children.map(\.kind) == [.backup])
     }
 
     // MARK: - Safety invariant: forget never targets an un-copied mirror

@@ -173,7 +173,7 @@ public struct MachineStore: Sendable {
     /// and writes the host's **persistent, on-disk identity**.
     ///
     /// Use this for any path that *writes* `machine.json` for a reason
-    /// unrelated to identity, the v1 → v2 migration's `resticPath`
+    /// unrelated to identity, the schema migration's `resticPath`
     /// relocation being the only one today. The override is documented as
     /// non-persistent; a load-mutate-save round trip through the normal
     /// store would quietly bake a temporary test/profile id into the file,

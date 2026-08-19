@@ -73,7 +73,7 @@ public enum ConfigDiff {
         public let changed: [ChangedSet]
         /// The deprecated top-level `resticPath` differs. Surfaced
         /// separately from `changed` because it is a config-wide field, not
-        /// a per-set one, and because a v1→v2 import always trips this (the
+        /// a per-set one, and because importing a v1 config always trips this (the
         /// migration clears it) — worth naming explicitly rather than
         /// leaving a reader to wonder why no set explains it.
         public let resticPathChanged: Bool
@@ -144,6 +144,7 @@ public enum ConfigDiff {
             if oldSet.name != newSet.name { fields.append("name") }
             if oldSet.sources != newSet.sources { fields.append("sources") }
             if oldSet.excludes != newSet.excludes { fields.append("excludes") }
+            if oldSet.purgeExcludes != newSet.purgeExcludes { fields.append("purgeExcludes") }
             if oldSet.schedule != newSet.schedule { fields.append("schedule") }
             if oldSet.retention != newSet.retention { fields.append("retention") }
             if oldSet.checkPolicy != newSet.checkPolicy { fields.append("checkPolicy") }
@@ -167,6 +168,7 @@ public enum ConfigDiff {
                 schedule: set.schedule,
                 sources: set.sources,
                 excludes: set.excludes,
+                purgeExcludes: set.purgeExcludes,
                 retention: set.retention,
                 checkPolicy: set.checkPolicy,
                 destinations: set.destinations,
@@ -186,6 +188,10 @@ public enum ConfigDiff {
         let schedule: Schedule
         let sources: [String]
         let excludes: [String]
+        /// Schedule-relevant for two reasons, not one: it changes the
+        /// `--exclude` set of the next `backup`, *and* gaining a pattern is
+        /// what makes the next run owe a purge.
+        let purgeExcludes: [String]
         let retention: RetentionPolicy?
         let checkPolicy: CheckPolicy?
         /// Whole destinations, not just ids: a changed `repoURL` or a moved

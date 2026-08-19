@@ -170,11 +170,15 @@ Warnings:
 Effective plan for machine "linux-nas":
   set "Projects" (f1000000-0000-4000-8000-000000000001) — RUNS HERE
       sources: /tmp/tmp.XXXXXXXXXX/source
+      excludes: (none)
+      purge excludes: (none)
       schedule: every 5 minutes
         - primary "NAS Primary": /tmp/tmp.XXXXXXXXXX/repo-primary
         - secondary "Offsite Mirror": /tmp/tmp.XXXXXXXXXX/repo-mirror
   set "Mac Photos Library" (f1000000-0000-4000-8000-000000000004) — does not run here
       sources: /Users/author/Pictures/Photos Library.photoslibrary
+      excludes: (none)
+      purge excludes: (none)
       schedule: daily 02:30
         - primary "NAS Primary": /Volumes/BackupNAS/photos-repo  (excluded here)
 
@@ -194,7 +198,7 @@ in `config.json`, so `secret set` (below) is required on every machine, includin
 right after a successful import.
 
 **`machine.json` (see next section) has one exception to "never touched": a v1 config's
-deprecated `resticPath`.** A real (non-`--dry-run`) import runs the same v1→v2 migration
+deprecated `resticPath`.** A real (non-`--dry-run`) import runs the same migration
 `ConfigStore.load()` always runs for an older-schema config
 (`ConfigStore.migrateToCurrentVersion`, `Core/Sources/ResticStationCore/Config/ConfigStore.swift`),
 and that migration *adopts* a v1 config's top-level `resticPath` into `machine.json` — only if
@@ -203,7 +207,7 @@ the config it installs. That is exactly the case a config exported from an older
 macOS install is likely to carry (`docs/data-model.md` §Versioning & migration). **Only
 `--dry-run` is guaranteed not to touch `machine.json`**: it previews the version bump via
 `ConfigStore.previewMigration`, which deliberately does not simulate the `resticPath` relocation —
-the import command's own `--dry-run` output says so explicitly ("a v1→v2 preview does not simulate
+the import command's own `--dry-run` output says so explicitly ("a migration preview does not simulate
 moving resticPath into machine.json; only a real import does that"). If you need certainty that
 nothing on this host changes before committing, run `--dry-run` first and inspect the summary.
 (`config import --help`'s abstract still says "Never touches machine.json" unconditionally — that
@@ -296,12 +300,16 @@ Warnings:
 Effective plan for machine "linux-nas":
   set "Documents" (6f9619ff-8b86-d011-b42d-00c04fc964ff) — RUNS HERE
       sources: /srv/data
+      excludes: node_modules, .build, *.tmp
+      purge excludes: (none)
       schedule: daily 04:00
         - primary "Big Drive": /mnt/big/documents.restic
         - secondary "R2 mirror": s3:https://accountid.r2.cloudflarestorage.com/backups/documents
         - secondary "Mac-only external HDD": /Volumes/Scratch/documents.restic  (excluded here)
   set "Photos" (7a8b9c0d-1e2f-4a3b-8c4d-000000000010) — does not run here
       sources: /Users/bwh/Pictures
+      excludes: (none)
+      purge excludes: (none)
       schedule: weekly Sun 03:00
         - primary "Big Drive": /mnt/big/photos.restic  (excluded here)
 
@@ -319,12 +327,16 @@ Warnings:
 Effective plan for machine "old-laptop":
   set "Documents" (6f9619ff-8b86-d011-b42d-00c04fc964ff) — does not run here
       sources: /Users/bwh/Documents
+      excludes: node_modules, .build, *.tmp
+      purge excludes: (none)
       schedule: daily 02:30
         - primary "Big Drive": /Volumes/Big/documents.restic  (excluded here)
         - secondary "R2 mirror": s3:https://accountid.r2.cloudflarestorage.com/backups/documents  (excluded here)
         - secondary "Mac-only external HDD": /Volumes/Scratch/documents.restic  (excluded here)
   set "Photos" (7a8b9c0d-1e2f-4a3b-8c4d-000000000010) — RUNS HERE
       sources: /Users/bwh/Pictures
+      excludes: (none)
+      purge excludes: (none)
       schedule: weekly Sun 03:00
         - primary "Big Drive": /Volumes/Big/photos.restic
 
@@ -352,10 +364,14 @@ Warnings:
 Effective plan for machine "mirror-box":
   set "Documents" (6f9619ff-8b86-d011-b42d-00c04fc964ff) — does not run here
       sources: /Users/bwh/Documents
+      excludes: (none)
+      purge excludes: (none)
       schedule: daily 02:30
         - primary "Big Drive": /Volumes/Big/documents.restic  (excluded here)
   set "Photos" (7a8b9c0d-1e2f-4a3b-8c4d-000000000010) — does not run here
       sources: /Users/bwh/Pictures
+      excludes: (none)
+      purge excludes: (none)
       schedule: weekly Sun 03:00
         - primary "Big Drive": /Volumes/Big/photos.restic  (excluded here)
 

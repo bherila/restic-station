@@ -137,8 +137,8 @@ struct ConfigImport: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "import",
         abstract: "Install a config.json exported from another machine (or re-import this "
-            + "machine's own). Validates, migrates v1→v2 if needed (reusing the same migration "
-            + "config.json's own loader uses), backs up any config.json already installed "
+            + "machine's own). Validates, migrates an older-schema config if needed (reusing the same "
+            + "migration config.json's own loader uses), backs up any config.json already installed "
             + "before overwriting it, and prints a summary of what changed. --dry-run prints the "
             + "summary and installs nothing. Never touches machine.json or a secret. "
             + "Exit 0 ok, 1 error."
@@ -192,12 +192,12 @@ struct ConfigImport: AsyncParsableCommand {
         }
 
         if dryRun {
-            // Pure preview: no machine.json touch, no config.v1.backup.json
+            // Pure preview: no machine.json touch, no migration-backup
             // write, no config.json backup or install — --dry-run must not
             // write anything at all.
             let migrated = needsMigration ? ConfigStore.previewMigration(decoded) : decoded
             Self.printSummary(ConfigDiff.summarize(from: existing ?? AppConfig(), to: migrated))
-            print("dry run — nothing written (a v1→v2 preview does not simulate moving resticPath into "
+            print("dry run — nothing written (a migration preview does not simulate moving resticPath into "
                 + "machine.json; only a real import does that)")
             HelperExit.code(0)
         }
@@ -311,8 +311,8 @@ struct ConfigImport: AsyncParsableCommand {
                 return ImportResult(
                     summary: summary(to: decoded),
                     outcome: .failed(
-                        "could not write \(context.paths.configV1BackupFile.path) — refusing to import without a "
-                            + "backup of the v1 file being migrated. Nothing was installed."
+                        "could not write \(context.paths.configBackupFile(fromVersion: decoded.version).path) — refusing to import without a "
+                            + "backup of the version \(decoded.version) file being migrated. Nothing was installed."
                     )
                 )
             }

@@ -9,12 +9,12 @@ import Testing
 /// doc's recognizable prefix. Every other byte — keys, values, nesting,
 /// including the `retention` block's explicit `null`s — matches the doc.
 ///
-/// It is a schema-v2 config with **no** `machines` keys — the shape the vast
+/// It is a schema-v3 config with **no** `machines` keys — the shape the vast
 /// majority of installs have, and the one the compatibility guarantee is
 /// about: absent `machines` means inherit and run everywhere.
 let dataModelExampleConfigJSON = """
 {
-  "version": 2,
+  "version": 3,
   "resticPath": "/opt/homebrew/bin/restic",
   "showMenuBarIcon": true,
   "sets": [
@@ -23,6 +23,7 @@ let dataModelExampleConfigJSON = """
       "name": "Projects",
       "sources": ["/Users/user/proj", "/Users/user/.gitconfig"],
       "excludes": ["node_modules", ".build", "*.tmp"],
+      "purgeExcludes": ["DerivedData"],
       "schedule": { "kind": "daily", "hour": 2, "minute": 30 },
       "retention": {
         "keepLast": null, "keepHourly": null, "keepDaily": 7,
@@ -65,10 +66,11 @@ let dataModelExampleConfigJSON = """
         try config.validate()
 
         // Field-for-field checks against the documented example.
-        #expect(config.version == 2)
+        #expect(config.version == 3)
         #expect(config.resticPath == "/opt/homebrew/bin/restic")
         #expect(config.showMenuBarIcon == true)
         #expect(config.sets.count == 1)
+        #expect(config.sets[0].purgeExcludes == ["DerivedData"])
 
         let set = config.sets[0]
         #expect(set.id == UUID(uuidString: "6F9619FF-8B86-D011-B42D-00C04FC964FF"))
@@ -230,6 +232,7 @@ let dataModelExampleConfigJSON = """
               "name": "EveryMinutes",
               "sources": ["/src/a"],
               "excludes": [],
+              "purgeExcludes": [],
               "schedule": { "kind": "everyMinutes", "minutes": 30 },
               "retention": null,
               "checkPolicy": null,
@@ -249,6 +252,7 @@ let dataModelExampleConfigJSON = """
               "name": "Hourly",
               "sources": ["/src/b"],
               "excludes": ["*.tmp"],
+              "purgeExcludes": [],
               "schedule": { "kind": "hourly", "minute": 15 },
               "retention": { "keepLast": 5, "keepHourly": null, "keepDaily": null, "keepWeekly": null, "keepMonthly": null, "keepYearly": null },
               "checkPolicy": { "enabled": false, "readDataSubsetSlices": 10 },
@@ -275,6 +279,7 @@ let dataModelExampleConfigJSON = """
               "name": "Daily",
               "sources": ["/src/c"],
               "excludes": [],
+              "purgeExcludes": [],
               "schedule": { "kind": "daily", "hour": 2, "minute": 30 },
               "retention": { "keepLast": null, "keepHourly": null, "keepDaily": null, "keepWeekly": null, "keepMonthly": null, "keepYearly": null },
               "checkPolicy": null,
@@ -294,6 +299,7 @@ let dataModelExampleConfigJSON = """
               "name": "Weekly",
               "sources": ["/src/d"],
               "excludes": [],
+              "purgeExcludes": [],
               "schedule": { "kind": "weekly", "weekday": 7, "hour": 23, "minute": 59 },
               "retention": null,
               "checkPolicy": null,
@@ -324,7 +330,10 @@ let dataModelExampleConfigJSON = """
 /// the same way the v1 example is: it must decode, validate, and re-encode
 /// to exactly these keys — no `"machines": null` sprayed over the entries
 /// that have no overrides, and no override field materialising as an
-/// explicit `null`.
+/// explicit `null`. Carries an explicit `"purgeExcludes": []` (absent from
+/// the doc's v2-era prose) because `BackupSet.encode(to:)` always writes the
+/// key regardless of a config's `version` — the structural round-trip below
+/// would otherwise fail on the key the encoder adds back.
 let dataModelMachinesExampleJSON = """
 {
   "version": 2,
@@ -336,6 +345,7 @@ let dataModelMachinesExampleJSON = """
       "name": "Documents",
       "sources": ["/Users/bwh/Documents"],
       "excludes": [],
+      "purgeExcludes": [],
       "schedule": { "kind": "daily", "hour": 2, "minute": 30 },
       "retention": null,
       "checkPolicy": null,
@@ -548,5 +558,159 @@ let dataModelMachinesExampleJSON = """
         config.onboardingCompleted = true
         try store.save(config)
         #expect(try store.load().onboardingCompleted == true)
+    }
+}
+
+// MARK: - purgeExcludes (schema v3)
+
+/// A minimal, hand-authored `BackupSet` JSON body, with `purgeExcludesField`
+/// spliced in right after `"excludes":[]` — everything `BackupSet.init(from:)`
+/// requires, and nothing else, so each case below can vary just the one
+/// field under test.
+private func backupSetJSON(purgeExcludesField: String) -> String {
+    """
+    {"id":"11111111-1111-4111-8111-111111111111","name":"x","sources":["/src"],\
+    "excludes":[]\(purgeExcludesField),\
+    "schedule":{"kind":"daily","hour":1,"minute":1},"retention":null,"checkPolicy":null,\
+    "stalenessWarningDays":14,"destinations":[]}
+    """
+}
+
+/// `BackupSet.purgeExcludes` was added at schema v3, so — like
+/// `onboardingCompleted` at v1→v2 — it carries a decode/encode compatibility
+/// contract. It diverges from that precedent in exactly one place: unlike
+/// `onboardingCompleted`, which uses `encodeIfPresent` to stay invisible on
+/// every pre-existing config, `purgeExcludes` is a non-optional `[String]`
+/// and `BackupSet.encode(to:)` writes it unconditionally — an empty array
+/// still encodes as `"purgeExcludes": []`, never an absent key. That
+/// asymmetry is deliberate (see `Models.swift`'s `AppConfig.currentVersion`
+/// doc comment) and is exactly what the third test below pins down.
+@Suite struct BackupSetPurgeExcludesCompatibilityTests {
+    @Test func decodesLegacySetWithoutTheKey() throws {
+        let json = backupSetJSON(purgeExcludesField: "")
+        let set = try ConfigStore.makeDecoder().decode(BackupSet.self, from: Data(json.utf8))
+        #expect(set.purgeExcludes == [])
+    }
+
+    @Test func decodesExplicitNullAsEmptyArray() throws {
+        let json = backupSetJSON(purgeExcludesField: #","purgeExcludes":null"#)
+        let set = try ConfigStore.makeDecoder().decode(BackupSet.self, from: Data(json.utf8))
+        #expect(set.purgeExcludes == [])
+    }
+
+    @Test func decodedValuesRoundTrip() throws {
+        let json = backupSetJSON(purgeExcludesField: #","purgeExcludes":["secrets/","*.key"]"#)
+        let set = try ConfigStore.makeDecoder().decode(BackupSet.self, from: Data(json.utf8))
+        #expect(set.purgeExcludes == ["secrets/", "*.key"])
+
+        let encoder = ConfigStore.makeEncoder()
+        let decoder = ConfigStore.makeDecoder()
+        let reencoded = try decoder.decode(BackupSet.self, from: encoder.encode(set))
+        #expect(reencoded == set)
+    }
+
+    /// The divergence from `onboardingCompleted`: the key is written even
+    /// when the array is empty, not omitted.
+    @Test func theKeyIsAlwaysPresentInEncodedOutputEvenWhenEmpty() throws {
+        let set = BackupSet(
+            id: UUID(),
+            name: "Plain",
+            sources: ["/src"],
+            schedule: .daily(hour: 1, minute: 0),
+            destinations: [Destination(id: UUID(), label: "Primary", repoURL: "/repo", isPrimary: true)]
+        )
+        #expect(set.purgeExcludes == [])
+
+        let object = try JSONSerialization.jsonObject(with: ConfigStore.makeEncoder().encode(set)) as? [String: Any]
+        #expect(object?.keys.contains("purgeExcludes") == true)
+        #expect(object?["purgeExcludes"] as? [String] == [])
+    }
+
+    /// Round-trips through the real `ConfigStore` (temp dir), the same way
+    /// `onboardingCompleted`'s equivalent test does.
+    @Test func survivesASaveLoadCycle() throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("restic-station-purge-excludes-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let store = ConfigStore(paths: AppPaths(root: root))
+        let config = AppConfig(sets: [BackupSet(
+            id: UUID(),
+            name: "Documents",
+            sources: ["/src"],
+            purgeExcludes: ["cache/", "*.tmp"],
+            schedule: .daily(hour: 1, minute: 0),
+            destinations: [Destination(id: UUID(), label: "Primary", repoURL: "/repo", isPrimary: true)]
+        )])
+        try store.save(config)
+        #expect(try store.load().sets[0].purgeExcludes == ["cache/", "*.tmp"])
+    }
+}
+
+// MARK: - BackupSet.effectiveBackupExcludes
+
+@Suite struct EffectiveBackupExcludesTests {
+    private func set(excludes: [String], purgeExcludes: [String]) -> BackupSet {
+        BackupSet(
+            id: UUID(),
+            name: "Documents",
+            sources: ["/src"],
+            excludes: excludes,
+            purgeExcludes: purgeExcludes,
+            schedule: .daily(hour: 1, minute: 0),
+            destinations: [Destination(id: UUID(), label: "Primary", repoURL: "/repo", isPrimary: true)]
+        )
+    }
+
+    @Test func excludesComeBeforePurgeExcludes() {
+        let backupSet = set(excludes: ["a", "b"], purgeExcludes: ["c", "d"])
+        #expect(backupSet.effectiveBackupExcludes == ["a", "b", "c", "d"])
+    }
+
+    @Test func aPatternInBothListsIsDedupedKeepingItsFirstOccurrence() {
+        let backupSet = set(excludes: ["a", "shared"], purgeExcludes: ["shared", "b"])
+        #expect(backupSet.effectiveBackupExcludes == ["a", "shared", "b"])
+    }
+
+    @Test func bothEmptyProducesAnEmptyList() {
+        let backupSet = set(excludes: [], purgeExcludes: [])
+        #expect(backupSet.effectiveBackupExcludes == [])
+    }
+}
+
+// MARK: - validate() and purgeExcludes
+
+@Suite struct PurgeExcludesValidationTests {
+    private func set(excludes: [String] = [], purgeExcludes: [String] = []) -> BackupSet {
+        BackupSet(
+            id: UUID(),
+            name: "Documents",
+            sources: ["/src"],
+            excludes: excludes,
+            purgeExcludes: purgeExcludes,
+            schedule: .daily(hour: 1, minute: 0),
+            destinations: [Destination(id: UUID(), label: "Primary", repoURL: "/repo", isPrimary: true)]
+        )
+    }
+
+    @Test func emptyStringPurgePatternThrowsWithTheOffendingSetAndIndex() {
+        let backupSet = set(purgeExcludes: ["ok/", "", "also-ok/"])
+        let config = AppConfig(sets: [backupSet])
+
+        #expect(throws: ConfigError.emptyPurgeExcludePattern(setId: backupSet.id, index: 1)) {
+            try config.validate()
+        }
+    }
+
+    @Test func nonEmptyPurgePatternsValidate() throws {
+        let config = AppConfig(sets: [set(purgeExcludes: ["cache/", "*.tmp"])])
+        try config.validate()
+    }
+
+    /// `excludes` is deliberately left unvalidated: a blank row there is
+    /// harmless noise, not a `restic rewrite --forget` argument.
+    @Test func anEmptyStringEntryInPlainExcludesStillValidates() throws {
+        let config = AppConfig(sets: [set(excludes: ["", "node_modules"])])
+        try config.validate()
     }
 }

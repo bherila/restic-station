@@ -52,6 +52,12 @@ private func baseConfig() -> AppConfig {
         #expect(ConfigDiff.isScheduleRelevantChange(from: baseConfig(), to: new))
     }
 
+    @Test func purgeExcludesChangeIsRelevant() {
+        var new = baseConfig()
+        new.sets[0].purgeExcludes = ["secrets/"]
+        #expect(ConfigDiff.isScheduleRelevantChange(from: baseConfig(), to: new))
+    }
+
     @Test func destinationChangeIsRelevant() {
         var new = baseConfig()
         new.sets[0].destinations[0].repoURL = "/tmp/other"
@@ -256,6 +262,13 @@ private func baseConfig() -> AppConfig {
         new.sets[0].machines = ["linux-nas": BackupSetMachineOverride(enabled: false)]
         let summary = ConfigDiff.summarize(from: baseConfig(), to: new)
         #expect(summary.changed.map(\.changedFields) == [["machines"]])
+    }
+
+    @Test func purgeExcludesChangeIsReportedAsAChangedField() {
+        var new = baseConfig()
+        new.sets[0].purgeExcludes = ["secrets/"]
+        let summary = ConfigDiff.summarize(from: baseConfig(), to: new)
+        #expect(summary.changed.map(\.changedFields) == [["purgeExcludes"]])
     }
 }
 

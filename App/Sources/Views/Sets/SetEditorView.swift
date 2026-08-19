@@ -2,7 +2,7 @@ import ResticStationCore
 import SwiftUI
 
 /// The set editor (`docs/ui-spec.md` §Backup Sets, **Set editor**): name,
-/// sources, excludes, schedule, staleness warning, retention, integrity
+/// sources, excludes, purge excludes, schedule, staleness warning, retention, integrity
 /// checks, destinations.
 ///
 /// Editing rules (T14): every change lands in a **draft copy**; *Save*
@@ -36,6 +36,11 @@ struct SetEditorView: View {
             )
 
             ExcludesSection(excludes: $draft.excludes)
+
+            PurgeExcludesSection(
+                purgeExcludes: $draft.purgeExcludes,
+                errorMessage: fieldErrors[.purgeExcludes]
+            )
 
             ScheduleSection(
                 schedule: $draft.schedule,

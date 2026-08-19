@@ -82,6 +82,8 @@ Sources passed as **absolute paths**. NDJSON stream on stdout (`backup.ndjson`, 
 ```
 `status` also optionally carries `seconds_remaining`, `current_files: [String]`, `error_count` (not in the small fixture; treat all fields except `message_type` as optional). Other message types that may appear: `error` (`{"message_type":"error","error":{…},"during":"…","item":"…"}`) and `verbose_status` — ignore unknown types gracefully. `percent_done` is 0…1.
 
+Each backup passes `BackupSet.effectiveBackupExcludes`: `excludes` followed by `purgeExcludes`, deduplicated while preserving first-occurrence order. Both lists become individual `--exclude` arguments. `purgeExcludes` is the separate history-affecting list: it excludes matching files from new snapshots and is reserved for the workflow that removes matching paths from existing snapshots; removing repository space still requires a later `prune`.
+
 ### copy (mirror primary → secondary)
 ```
 restic -r <secondaryRepo> copy --from-repo <primaryRepo>

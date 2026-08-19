@@ -142,7 +142,7 @@ final class AppModel: ObservableObject {
         self.now = now
 
         // **Config first, machine second.** `ConfigStore.load()` may run the
-        // v1 → v2 migration, which moves `resticPath` out of `config.json`
+        // schema migration, which moves `resticPath` out of `config.json`
         // and into `machine.json`. Reading the machine identity beforehand
         // would capture it without that path, so the first session after an
         // upgrade would resolve `resticPath == nil` and report restic as
