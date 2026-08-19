@@ -112,6 +112,77 @@ struct EnvelopeRenderingTests {
     }
 }
 
+@Suite("restic-unavailable classification keeps the existing prose")
+struct ResticUnavailableWiringTests {
+
+    /// `HelperContext.make()` throws
+    /// `CLIFailure.resticUnavailable(result:message:)` with the message
+    /// `resticNotFoundMessage` builds, so the human-mode sentence is
+    /// unchanged and only the *code* is new.
+    ///
+    /// Asserted here rather than by running the binary because the branch is
+    /// unreachable on a host that has restic installed anywhere
+    /// `ResticDiscovery` looks — which is every developer Mac, and is why
+    /// CI's own discovery assertions live in the Linux job.
+    private static func failure(for result: ResticDiscoveryResult) -> CLIFailure {
+        let paths = AppPaths(root: URL(fileURLWithPath: "/tmp/restic-station-test"))
+        return .resticUnavailable(
+            result: result,
+            message: HelperContext.resticNotFoundMessage(paths: paths, result: result)
+        )
+    }
+
+    @Test("a too-old restic keeps the version-naming message and reports restic_unsupported")
+    func tooOld() {
+        let result = ResticDiscoveryResult(
+            chosen: nil,
+            rejected: [ResticProbe(path: "/usr/bin/restic", outcome: .tooOld(version: "0.16.4"))],
+            searchedDescription: "PATH"
+        )
+        let failure = Self.failure(for: result)
+        #expect(failure.code == .resticUnsupported)
+        // The three things issue #50 requires the message to say. If the
+        // wording changes these stay true; if the *wiring* breaks and the
+        // message is replaced by a generic one, they do not.
+        #expect(failure.message.contains("0.16.4"))
+        #expect(failure.message.contains(ResticDiscovery.minimumVersion))
+        #expect(!failure.message.contains("restic not found"))
+        #expect(failure.details.versionFound == "0.16.4")
+    }
+
+    @Test("a restic that ran and is not restic keeps its reason and is not reported as missing")
+    func unusable() {
+        let result = ResticDiscoveryResult(
+            chosen: nil,
+            rejected: [ResticProbe(path: "/tmp/restic", outcome: .unusable(reason: "/tmp/restic exited 72."))],
+            searchedDescription: "PATH"
+        )
+        let failure = Self.failure(for: result)
+        #expect(failure.code == .resticUnsupported)
+        #expect(failure.message.contains("72"))
+        #expect(!failure.message.contains("restic not found"))
+    }
+
+    @Test("nothing found anywhere is restic_not_found, and says where it looked")
+    func notFoundAtAll() {
+        let result = ResticDiscoveryResult(
+            chosen: nil,
+            rejected: [],
+            searchedDescription: "/usr/bin/restic and every directory on PATH"
+        )
+        let failure = Self.failure(for: result)
+        #expect(failure.code == .resticNotFound)
+        #if os(Linux)
+        // The macOS message is the "open Restic Station" one, which is
+        // deliberately different and is asserted not to appear on Linux by
+        // the workflow's own discovery step.
+        #expect(failure.message.contains("restic not found"))
+        #expect(failure.message.contains("every directory on PATH"))
+        #expect(failure.message.contains("github.com/restic/restic/releases"))
+        #endif
+    }
+}
+
 @Suite("failures classified by the commands themselves")
 struct CommandFailureClassificationTests {
 
