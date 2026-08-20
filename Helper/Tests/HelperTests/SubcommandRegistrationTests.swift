@@ -1,3 +1,5 @@
+import Foundation
+import ResticStationCore
 import Testing
 
 @testable import restic_station_helper
@@ -118,6 +120,77 @@ import Testing
         subcommand.configuration.commandName
     }
     #expect(names == ["prune"])
+}
+
+@Test func maintenancePruneBindsConfirmedDestinationToItsPreview() throws {
+    let setId = UUID()
+    let destination = Destination(
+        id: UUID(),
+        label: "Primary",
+        repoURL: "/Volumes/current.restic",
+        isPrimary: true,
+        nonSecretEnv: ["AWS_DEFAULT_REGION": "current"]
+    )
+    let parsed = try #require(HelperMain.parseAsRoot([
+        "maintenance", "prune", "--set", setId.uuidString,
+        "--dest", destination.id.uuidString,
+        "--expected-destination", Destination(
+            id: destination.id,
+            label: destination.label,
+            repoURL: destination.repoURL,
+            isPrimary: destination.isPrimary,
+            nonSecretEnv: ["AWS_DEFAULT_REGION": "previewed"]
+        ).pruneConfirmationFingerprint(secretEnv: [:]),
+    ]) as? MaintenancePrune)
+    #expect(parsed.expectedDestination != nil)
+
+    #expect(parsed.expectedDestination == Destination(
+        id: destination.id,
+        label: destination.label,
+        repoURL: destination.repoURL,
+        isPrimary: destination.isPrimary,
+        nonSecretEnv: ["AWS_DEFAULT_REGION": "previewed"]
+    ).pruneConfirmationFingerprint(secretEnv: [:]))
+}
+
+@Test func maintenancePruneAcceptsHyphenPrefixedPreviewBindings() throws {
+    let setId = UUID()
+    let destinationId = UUID()
+    let parsed = try #require(HelperMain.parseAsRoot([
+        "maintenance", "prune", "--set", setId.uuidString,
+        "--dest", destinationId.uuidString,
+        "--expected-destination", "-valid-preview-binding",
+    ]) as? MaintenancePrune)
+    #expect(parsed.expectedDestination == "-valid-preview-binding")
+}
+
+@Test func maintenancePruneAcceptsItsUnchangedEffectiveDestination() throws {
+    let destination = Destination(
+        id: UUID(),
+        label: "Primary",
+        repoURL: "s3:s3.us-east-1.amazonaws.com/example",
+        isPrimary: true,
+        nonSecretEnv: ["AWS_DEFAULT_REGION": "us-east-1"]
+    )
+
+    #expect(destination.pruneConfirmationFingerprint(secretEnv: [:])
+        == destination.pruneConfirmationFingerprint(secretEnv: [:]))
+}
+
+@Test func maintenancePruneRejectsAChangedSecretEnvironment() throws {
+    let destination = Destination(
+        id: UUID(),
+        label: "Primary",
+        repoURL: "s3:s3.us-east-1.amazonaws.com/example",
+        isPrimary: true
+    )
+    let previewBinding = destination.pruneConfirmationFingerprint(
+        secretEnv: ["AWS_ACCESS_KEY_ID": "preview-account"]
+    )
+
+    #expect(previewBinding != destination.pruneConfirmationFingerprint(
+        secretEnv: ["AWS_ACCESS_KEY_ID": "changed-account"]
+    ))
 }
 
 /// T28 (issue #30): the `restic-station` PATH symlink manager.

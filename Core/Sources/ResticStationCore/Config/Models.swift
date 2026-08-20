@@ -331,6 +331,60 @@ public struct Destination: Codable, Equatable, Identifiable, Sendable {
     }
 }
 
+public extension Destination {
+    /// The repository identity a maintenance preview authorizes. Local paths
+    /// are resolved before binding so a symlink retarget between preview and
+    /// confirmation invalidates the capability instead of redirecting prune
+    /// to an unpreviewed repository. Remote URLs are opaque to Foundation
+    /// and must remain verbatim.
+    func pruneRepositoryURL() -> String {
+        guard kind == .localPath else { return repoURL }
+        return URL(fileURLWithPath: repoURL)
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+            .path
+    }
+
+    /// The exact destination passed to the preview and destructive prune.
+    /// Keeping the resolved local URL in the invocation closes the remaining
+    /// time-of-check/time-of-use gap after its fingerprint was validated.
+    func pruneInvocationDestination() -> Destination {
+        guard kind == .localPath else { return self }
+        var resolved = self
+        resolved.repoURL = pruneRepositoryURL()
+        return resolved
+    }
+
+    /// Stable binding for a destructive maintenance confirmation. The helper
+    /// supplies the stored secret environment, so the binding covers every
+    /// destination value that affects a restic invocation without ever
+    /// exposing a secret on argv or in app memory.
+    func pruneConfirmationFingerprint(
+        secretEnv: [String: String],
+        executableIdentity: String? = nil
+    ) -> String {
+        struct EffectiveDestination: Codable {
+            let repoURL: String
+            let nonSecretEnv: [String: String]
+            let secretEnv: [String: String]
+            let executableIdentity: String?
+        }
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let effective = EffectiveDestination(
+            repoURL: pruneRepositoryURL(),
+            nonSecretEnv: nonSecretEnv,
+            secretEnv: secretEnv,
+            executableIdentity: executableIdentity
+        )
+        // Encoding an in-memory String dictionary cannot fail in practice;
+        // fail closed with an impossible-to-match fingerprint if it ever did.
+        guard let data = try? encoder.encode(effective) else { return "" }
+        return SHA256Digest.hex(data)
+    }
+}
+
 public enum DestinationKind: Equatable, Sendable {
     /// No scheme prefix; includes `/Volumes/...` and iCloud paths.
     case localPath

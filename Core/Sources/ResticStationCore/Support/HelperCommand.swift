@@ -26,9 +26,12 @@ public enum HelperCommand: Equatable, Sendable {
     case prune(setId: UUID)
     /// `run-set --set <uuid> --kind check`.
     case check(setId: UUID)
-    /// `maintenance prune --set <uuid> [--dest <uuid>] [--dry-run]`.
+    /// `maintenance prune --set <uuid> [--dest <uuid>] [--expected-destination <preview-token>] [--dry-run]`.
     /// This reclaims unused packs without applying a retention policy.
-    case maintenancePrune(setId: UUID, destId: UUID?, dryRun: Bool)
+    /// `expectedDestination` is an opaque helper-issued binding for the full
+    /// effective destination the preceding preview described; direct CLI
+    /// callers may omit it.
+    case maintenancePrune(setId: UUID, destId: UUID?, expectedDestination: String?, dryRun: Bool, json: Bool = false)
     /// `init-secondary --set <uuid> --dest <uuid>`.
     case initSecondary(setId: UUID, destId: UUID)
     /// `probe-repo --set <uuid> --dest <uuid>` (exit 3 = offline).
@@ -68,10 +71,14 @@ public enum HelperCommand: Equatable, Sendable {
             return Self.runSet(setId: setId, kind: "prune")
         case .check(let setId):
             return Self.runSet(setId: setId, kind: "check")
-        case .maintenancePrune(let setId, let destId, let dryRun):
+        case .maintenancePrune(let setId, let destId, let expectedDestination, let dryRun, let json):
             var argv = ["maintenance", "prune", "--set", Self.render(setId)]
             if let destId { argv.append(contentsOf: ["--dest", Self.render(destId)]) }
+            // Attach the opaque value so a valid base64url token beginning
+            // with `-` can never be reparsed as another option.
+            if let expectedDestination { argv.append("--expected-destination=\(expectedDestination)") }
             if dryRun { argv.append("--dry-run") }
+            if json { argv.append("--json") }
             return argv
         case .initSecondary(let setId, let destId):
             return ["init-secondary", "--set", Self.render(setId), "--dest", Self.render(destId)]

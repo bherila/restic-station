@@ -99,6 +99,26 @@ struct ReachabilityTests {
         #expect(resticCall?.argv == ["/usr/local/bin/restic", "-r", dest.repoURL, "cat", "config"])
     }
 
+    @Test("remote destination: an explicit secret snapshot is used for the probe")
+    func remoteProbeUsesProvidedSecretSnapshot() async throws {
+        let dest = Destination(id: Self.destId, label: "R2", repoURL: "s3:https://x/bucket", isPrimary: false)
+        let fake = FakeProcessRunner(script: [
+            .init(argvPrefix: ["/usr/local/bin/restic", "-r", dest.repoURL, "cat", "config"]),
+        ])
+        let secrets = FakeSecretStore(defaultPassword: Self.password)
+        secrets.store(secretEnv: ["AWS_SECRET_ACCESS_KEY": "changed-after-preview"], for: dest.id)
+        let reachability = Self.makeReachability(fake, secrets: secrets)
+
+        let result = await reachability.probe(
+            dest,
+            destinationSecretEnv: ["AWS_SECRET_ACCESS_KEY": "previewed-value"]
+        )
+
+        #expect(result == .reachable)
+        let env = try #require(fake.invocations.last?.env)
+        #expect(env["AWS_SECRET_ACCESS_KEY"] == "previewed-value")
+    }
+
     @Test("remote destination: a ProcessRunning timeout is offline, not error")
     func remoteTimeoutIsOffline() async throws {
         let dest = Destination(id: Self.destId, label: "R2", repoURL: "s3:https://x/bucket", isPrimary: false)

@@ -89,6 +89,10 @@ public enum PruneRepositorySkipReason: Equatable, Sendable {
     case busy
     case secretUnavailable
     case staleMirror
+    case previewChanged
+    /// The preview token could not be read because another helper briefly
+    /// owns the machine-global token-store lock.  It remains valid to retry.
+    case previewUnavailable
 }
 
 public enum PruneRepositoryFailure: Equatable, Sendable {
@@ -281,7 +285,7 @@ public final class BackupEngine: Sendable {
                 logWriter?.appendLine("probe primary \"\(primary.label)\": \(describe(probe))")
                 record(probe: probe, for: primary)
                 guard probe == .reachable else {
-                    return "primary unreachable: \(describe(probe))"
+                    return .reason("primary unreachable: \(describe(probe))")
                 }
                 return nil
             }
@@ -628,6 +632,10 @@ public final class BackupEngine: Sendable {
     public func runPruneRepository(
         set: BackupSet,
         destination: Destination,
+        destinationSecretEnv: [String: String]? = nil,
+        authorization: MaintenancePruneAuthorization? = nil,
+        resticExecutablePath: String? = nil,
+        resticExecutableIdentity: String? = nil,
         dryRun: Bool = false
     ) async -> PruneRepositoryResult {
         guard set.destinations.contains(where: { $0.id == destination.id }) else {
@@ -635,10 +643,18 @@ public final class BackupEngine: Sendable {
             return .failed(.didNotRun)
         }
         guard await secretsAvailable(for: [destination]) else { return .skipped(.secretUnavailable) }
+        let executablePath = authorization?.resticExecutablePath ?? resticExecutablePath
+        let executableIdentity = authorization?.resticExecutableIdentity ?? resticExecutableIdentity
 
         let lock = makeSetLock(setId: set.id)
         guard lock.tryAcquire() else {
-            recordSkipped(kind: .prune, setId: set.id, destId: destination.id, trigger: .manual)
+            // A preview is an unrecorded read-only query, even when it is
+            // refused because another set operation holds the lock. Recording
+            // that refusal as a prune would replace the last real cleanup in
+            // status/history despite no restic prune having run.
+            if !dryRun {
+                recordSkipped(kind: .prune, setId: set.id, destId: destination.id, trigger: .manual)
+            }
             return .skipped(.busy)
         }
         defer { lock.release() }
@@ -659,7 +675,10 @@ public final class BackupEngine: Sendable {
             }
         }
 
-        let probe = await reachability.probe(destination)
+        let probe = await reachability.probe(
+            destination,
+            destinationSecretEnv: destinationSecretEnv
+        )
         record(probe: probe, for: destination)
         switch probe {
         case .reachable:
@@ -676,7 +695,12 @@ public final class BackupEngine: Sendable {
             // make the Runs screen claim that pack space was reclaimed.
             switch await execute(
                 .prune(repo: destination.repoURL, dryRun: true),
-                invocation: ResticInvocation(destination: destination),
+                invocation: ResticInvocation(
+                    destination: destination,
+                    destinationSecretEnv: destinationSecretEnv,
+                    resticPathOverride: executablePath,
+                    expectedExecutableIdentity: executableIdentity
+                ),
                 logWriter: nil,
                 reporter: nil
             ) {
@@ -694,6 +718,27 @@ public final class BackupEngine: Sendable {
             }
         }
 
+        let consumePreviewToken: (@Sendable () throws -> Void)?
+        if let authorization {
+            let previewTokens = previewTokens
+            let token = authorization.token
+            let machineId = authorization.machineId
+            let effectiveDestinationFingerprint = authorization.effectiveDestinationFingerprint
+            let setId = set.id
+            let destinationId = destination.id
+            consumePreviewToken = {
+                try previewTokens.consumeMaintenancePrune(
+                    token,
+                    machineId: machineId,
+                    setId: setId,
+                    destinationId: destinationId,
+                    effectiveDestinationFingerprint: effectiveDestinationFingerprint
+                )
+            }
+        } else {
+            consumePreviewToken = nil
+        }
+
         let prune = await performChild(
             kind: .prune,
             setId: set.id,
@@ -702,10 +747,25 @@ public final class BackupEngine: Sendable {
             groupId: nil,
             phase: "pruning",
             command: .prune(repo: destination.repoURL, dryRun: false),
-            invocation: ResticInvocation(destination: destination),
-            streamProgress: false
+            invocation: ResticInvocation(
+                destination: destination,
+                destinationSecretEnv: destinationSecretEnv,
+                resticPathOverride: executablePath,
+                expectedExecutableIdentity: executableIdentity
+            ),
+            streamProgress: false,
+            preflightPhase: authorization == nil ? nil : "validating preview",
+            beforeLaunch: consumePreviewToken
         )
         guard let prune else { return .failed(.didNotRun) }
+        switch prune.preflightFailure {
+        case .previewChanged:
+            return .skipped(.previewChanged)
+        case .previewUnavailable:
+            return .skipped(.previewUnavailable)
+        case .reason, .none:
+            break
+        }
         guard prune.child.status == .failed else { return .completed(prune.child.status) }
         if let outcome = prune.outcome {
             return .failed(.restic(outcome.status))
@@ -1233,6 +1293,23 @@ public final class BackupEngine: Sendable {
     private struct ChildRun {
         let child: SetRunChild
         let outcome: ResticOutcome?
+        let preflightFailure: PreflightFailure?
+    }
+
+    private enum PreflightFailure: Sendable {
+        case reason(String)
+        case previewChanged
+        case previewUnavailable
+
+        var message: String {
+            switch self {
+            case .reason(let reason): return reason
+            case .previewChanged:
+                return "Destination configuration changed after the reclaim preview. Run a new dry run before pruning."
+            case .previewUnavailable:
+                return "The reclaim confirmation is temporarily unavailable. Try confirming again."
+            }
+        }
     }
 
     /// Runs one restic command as one recorded run: `begin` → open the run
@@ -1244,7 +1321,7 @@ public final class BackupEngine: Sendable {
     ///
     /// - Parameters:
     ///   - preflightPhase: written to `current-run` before `preflight` runs.
-    ///   - preflight: returns a failure reason to abort the run *before*
+    ///   - preflight: returns a failure classification to abort the run *before*
     ///     spawning restic (used for the primary reachability probe), or
     ///     `nil` to proceed.
     ///   - downgradeSuccessToWarning: inspected on an otherwise successful
@@ -1260,7 +1337,8 @@ public final class BackupEngine: Sendable {
         invocation: ResticInvocation,
         streamProgress: Bool,
         preflightPhase: String? = nil,
-        preflight: (@Sendable (LogWriter?) async -> String?)? = nil,
+        preflight: (@Sendable (LogWriter?) async -> PreflightFailure?)? = nil,
+        beforeLaunch: (@Sendable () throws -> Void)? = nil,
         downgradeSuccessToWarning: (@Sendable (ResticOutcome) -> Bool)? = nil,
         purgeSnapshotRewrites: (@Sendable (ResticOutcome) -> [String: String]?)? = nil
     ) async -> ChildRun? {
@@ -1291,12 +1369,25 @@ public final class BackupEngine: Sendable {
         reporter.startHeartbeat()
         defer { reporter.stopHeartbeat() }
 
-        if let preflight, let reason = await preflight(logWriter) {
-            logWriter?.appendLine("aborted: \(reason)")
-            finish(run, status: .failed, errorSummary: reason)
+        if let preflight, let failure = await preflight(logWriter) {
+            logWriter?.appendLine("aborted: \(failure.message)")
+            if case .previewUnavailable = failure {
+                do {
+                    try runStore.discardUnstarted(run)
+                    return ChildRun(
+                        child: SetRunChild(runId: run.runId, kind: kind, destId: destination.id, status: .skipped),
+                        outcome: nil,
+                        preflightFailure: failure
+                    )
+                } catch {
+                    logWarning("BackupEngine: could not discard unavailable preflight run \(run.runId): \(error)")
+                }
+            }
+            finish(run, status: .failed, errorSummary: failure.message)
             return ChildRun(
                 child: SetRunChild(runId: run.runId, kind: kind, destId: destination.id, status: .failed),
-                outcome: nil
+                outcome: nil,
+                preflightFailure: failure
             )
         }
 
@@ -1308,8 +1399,30 @@ public final class BackupEngine: Sendable {
             command,
             invocation: invocation,
             logWriter: logWriter,
-            reporter: streamProgress ? reporter : nil
+            reporter: streamProgress ? reporter : nil,
+            beforeLaunch: beforeLaunch
         )
+
+        if case .didNotRun(_, let launchPreflightFailure?) = result {
+            if case .previewUnavailable = launchPreflightFailure {
+                do {
+                    try runStore.discardUnstarted(run)
+                    return ChildRun(
+                        child: SetRunChild(runId: run.runId, kind: kind, destId: destination.id, status: .skipped),
+                        outcome: nil,
+                        preflightFailure: launchPreflightFailure
+                    )
+                } catch {
+                    logWarning("BackupEngine: could not discard unavailable launch preflight run \(run.runId): \(error)")
+                }
+            }
+            finish(run, status: .failed, errorSummary: launchPreflightFailure.message)
+            return ChildRun(
+                child: SetRunChild(runId: run.runId, kind: kind, destId: destination.id, status: .failed),
+                outcome: nil,
+                preflightFailure: launchPreflightFailure
+            )
+        }
 
         let status: RunStatus
         var errorSummary: String?
@@ -1317,7 +1430,7 @@ public final class BackupEngine: Sendable {
         var exitCode: Int32?
 
         switch result {
-        case .didNotRun(let reason):
+        case .didNotRun(let reason, _):
             status = .failed
             errorSummary = reason
         case .ranToCompletion(let outcome):
@@ -1356,7 +1469,8 @@ public final class BackupEngine: Sendable {
         )
         return ChildRun(
             child: SetRunChild(runId: run.runId, kind: kind, destId: destination.id, status: status),
-            outcome: result.outcome
+            outcome: result.outcome,
+            preflightFailure: nil
         )
     }
 
@@ -1365,7 +1479,7 @@ public final class BackupEngine: Sendable {
         case ranToCompletion(ResticOutcome)
         /// restic produced no outcome at all (launch failure, timeout,
         /// secret read failure mid-run, cancellation).
-        case didNotRun(reason: String)
+        case didNotRun(reason: String, preflightFailure: PreflightFailure? = nil)
 
         var outcome: ResticOutcome? {
             if case .ranToCompletion(let outcome) = self { return outcome }
@@ -1382,9 +1496,16 @@ public final class BackupEngine: Sendable {
         _ command: ResticCommand,
         invocation: ResticInvocation,
         logWriter: LogWriter?,
-        reporter: ProgressReporter?
+        reporter: ProgressReporter?,
+        beforeLaunch: (@Sendable () throws -> Void)? = nil
     ) async -> ExecuteResult {
-        let first = await spawn(command, invocation: invocation, logWriter: logWriter, reporter: reporter)
+        let first = await spawn(
+            command,
+            invocation: invocation,
+            logWriter: logWriter,
+            reporter: reporter,
+            beforeLaunch: beforeLaunch
+        )
         guard case .ranToCompletion(let outcome) = first, outcome.status == .repoLocked else {
             return first
         }
@@ -1395,7 +1516,12 @@ public final class BackupEngine: Sendable {
         )
         _ = await spawn(
             .unlock(repo: invocation.destination.repoURL),
-            invocation: ResticInvocation(destination: invocation.destination),
+            invocation: ResticInvocation(
+                destination: invocation.destination,
+                destinationSecretEnv: invocation.destinationSecretEnv,
+                resticPathOverride: invocation.resticPathOverride,
+                expectedExecutableIdentity: invocation.expectedExecutableIdentity
+            ),
             logWriter: logWriter,
             reporter: nil
         )
@@ -1407,7 +1533,8 @@ public final class BackupEngine: Sendable {
         _ command: ResticCommand,
         invocation: ResticInvocation,
         logWriter: LogWriter?,
-        reporter: ProgressReporter?
+        reporter: ProgressReporter?,
+        beforeLaunch: (@Sendable () throws -> Void)? = nil
     ) async -> ExecuteResult {
         do {
             let outcome = try await restic.run(
@@ -1419,9 +1546,14 @@ public final class BackupEngine: Sendable {
                 },
                 onRawLine: { line in
                     logWriter?.appendLine(line)
-                }
+                },
+                beforeLaunch: beforeLaunch
             )
             return .ranToCompletion(outcome)
+        } catch let error as PreviewTokenError {
+            let failure: PreflightFailure = error == .unavailable ? .previewUnavailable : .previewChanged
+            logWriter?.appendLine("restic did not run: \(failure.message)")
+            return .didNotRun(reason: failure.message, preflightFailure: failure)
         } catch let error as ResticRunnerError {
             logWriter?.appendLine("restic did not run: \(error.description)")
             return .didNotRun(reason: error.userFacingMessage)

@@ -58,6 +58,89 @@ struct ResticRunnerTests {
         return store
     }
 
+    @Test("maintenance executable identity changes when the binary is replaced")
+    func maintenanceExecutableIdentityBindsBinaryContents() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-executable-identity-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let executable = root.appendingPathComponent("restic", isDirectory: false)
+        try Data("previewed binary".utf8).write(to: executable)
+
+        let runner = ResticRunner(
+            resticPath: executable.path,
+            paths: Self.paths(),
+            secrets: FakeSecretStore(defaultPassword: Self.password),
+            runner: FakeProcessRunner()
+        )
+        let previewIdentity = try #require(runner.maintenanceExecutable()?.identity)
+        try Data("replacement binary".utf8).write(to: executable)
+
+        #expect(previewIdentity != runner.maintenanceExecutable()?.identity)
+    }
+
+    @Test("maintenance runner keeps the previewed executable when its symlink retargets")
+    func maintenanceExecutableIdentityUsesCanonicalExecutablePath() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-executable-link-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let previewed = root.appendingPathComponent("restic-previewed", isDirectory: false)
+        let replacement = root.appendingPathComponent("restic-replacement", isDirectory: false)
+        try Data("previewed binary".utf8).write(to: previewed)
+        try Data("replacement binary".utf8).write(to: replacement)
+        let link = root.appendingPathComponent("restic", isDirectory: false)
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: previewed)
+        let fake = FakeProcessRunner(script: [.init(argvPrefix: [previewed.path, "-r", Self.primary.repoURL, "backup", "--json"])])
+        let runner = ResticRunner(
+            resticPath: link.path,
+            paths: Self.paths(),
+            secrets: FakeSecretStore(defaultPassword: Self.password),
+            runner: fake
+        )
+        let previewedExecutable = try #require(runner.maintenanceExecutable())
+        try FileManager.default.removeItem(at: link)
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: replacement)
+
+        #expect(previewedExecutable != runner.maintenanceExecutable())
+        _ = try await runner.run(
+            .backup(repo: Self.primary.repoURL, sources: ["/tmp/source"]),
+            for: ResticInvocation(destination: Self.primary, resticPathOverride: previewedExecutable.path)
+        )
+        #expect(fake.invocations.first?.argv.first == previewed.path)
+    }
+
+    @Test("maintenance executable replacement is refused before spawning restic")
+    func maintenanceExecutableReplacementIsRejectedAtLaunch() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-executable-recheck-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let executable = root.appendingPathComponent("restic", isDirectory: false)
+        try Data("previewed binary".utf8).write(to: executable)
+        let fake = FakeProcessRunner()
+        let runner = ResticRunner(
+            resticPath: executable.path,
+            paths: Self.paths(),
+            secrets: FakeSecretStore(defaultPassword: Self.password),
+            runner: fake
+        )
+        let previewed = try #require(runner.maintenanceExecutable())
+        try Data("replacement binary".utf8).write(to: executable)
+
+        await #expect(throws: ResticRunnerError.launchFailed("the restic executable changed after the maintenance preview")) {
+            try await runner.run(
+                .backup(repo: Self.primary.repoURL, sources: ["/tmp/source"]),
+                for: ResticInvocation(
+                    destination: Self.primary,
+                    resticPathOverride: previewed.path,
+                    expectedExecutableIdentity: previewed.identity
+                )
+            )
+        }
+        #expect(fake.invocations.isEmpty)
+    }
+
     // MARK: - Environment assembly
 
     @Test("single destination: exact password command, cache dir, secret env injected, nothing inherited")
@@ -228,6 +311,28 @@ struct ResticRunnerTests {
 
         let env = try #require(fake.invocations[0].env)
         #expect(env["AWS_SECRET_ACCESS_KEY"] == "from-the-store")
+    }
+
+    @Test("a supplied destination secret snapshot is used without rereading the store")
+    func suppliedDestinationSecretEnvIsUsedVerbatim() async throws {
+        let fake = FakeProcessRunner(script: [
+            .init(argvPrefix: [Self.resticPath, "-r", "/repo", "snapshots", "--json"]),
+        ])
+        let runner = Self.makeRunner(fake, secrets: Self.secretStore(
+            for: Self.primaryId,
+            secretEnv: ["AWS_SECRET_ACCESS_KEY": "changed-after-preview"]
+        ))
+
+        _ = try await runner.run(
+            .snapshots(repo: "/repo"),
+            for: ResticInvocation(
+                destination: Self.primary,
+                destinationSecretEnv: ["AWS_SECRET_ACCESS_KEY": "previewed-value"]
+            )
+        )
+
+        let env = try #require(fake.invocations[0].env)
+        #expect(env["AWS_SECRET_ACCESS_KEY"] == "previewed-value")
     }
 
     /// End-to-end env assembly with the *real* file backend, on every

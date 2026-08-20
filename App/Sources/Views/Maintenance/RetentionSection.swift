@@ -32,12 +32,7 @@ struct RetentionSection: View {
     }
 
     private var hasICloudRepository: Bool {
-        let root = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Mobile Documents", isDirectory: true)
-            .path
-        return backupSet.destinations.contains { destination in
-            destination.repoURL == root || destination.repoURL.hasPrefix(root + "/")
-        }
+        backupSet.destinations.contains(where: MaintenanceModel.isICloudRepository)
     }
 
     var body: some View {

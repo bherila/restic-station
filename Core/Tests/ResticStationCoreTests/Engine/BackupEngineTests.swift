@@ -1271,21 +1271,62 @@ struct BackupEngineTests {
         #expect(env.entries(kind: .prune).count == 1)
     }
 
-    @Test("standalone prune: a stale mirror is never touched")
+    @Test("standalone prune: automatic unlock reuses its confirmed secret snapshot")
+    func standalonePruneUnlockUsesConfirmedSecretSnapshot() async throws {
+        let env = Self.makeEnv(script: [], retention: nil)
+        defer { env.cleanUp() }
+        let snapshot = ["RESTIC_PASSWORD": "previewed-password", "RCLONE_CONFIG_REMOTE": "previewed-remote"]
+        var script: [FakeProcessRunner.Expectation] = []
+        script += Self.resticCall(["-r", env.primary.repoURL, "prune"], dest: Self.primaryId, exitCode: 11)
+        script += Self.resticCall(["-r", env.primary.repoURL, "unlock"], dest: Self.primaryId)
+        script += Self.resticCall(["-r", env.primary.repoURL, "prune"], dest: Self.primaryId)
+        env.fake.script = script
+
+        let status = await env.engine.runPruneRepository(
+            set: env.set,
+            destination: env.primary,
+            destinationSecretEnv: snapshot
+        )
+
+        #expect(status == .completed(.success))
+        let resticInvocations = env.fake.invocations.filter { $0.argv.first == Self.resticPath }
+        #expect(resticInvocations.count == 3)
+        #expect(resticInvocations[1].env == resticInvocations[0].env)
+        #expect(resticInvocations[1].env == resticInvocations[2].env)
+    }
+
+    @Test("standalone prune: a stale mirror is never touched or consumes its preview token")
     func standalonePruneRefusesStaleMirror() async throws {
         let env = Self.makeEnv(script: [], retention: nil)
         defer { env.cleanUp() }
         let mirror = env.secondaries[0]
+        let fingerprint = mirror.pruneConfirmationFingerprint(secretEnv: [:])
+        let token = try PreviewTokenStore(paths: env.paths).issueMaintenancePrune(
+            machineId: env.machineId,
+            setId: env.set.id,
+            destinationId: mirror.id,
+            effectiveDestinationFingerprint: fingerprint
+        )
+        let authorization = MaintenancePruneAuthorization(
+            token: token,
+            machineId: env.machineId,
+            effectiveDestinationFingerprint: fingerprint
+        )
         try env.stateStore.updateRepoStatus(destId: env.primary.id) { $0.lastSyncedAt = Self.t0 }
         try env.stateStore.updateRepoStatus(destId: mirror.id) {
             $0.lastSyncedAt = Self.t0.addingTimeInterval(-1)
         }
 
-        let status = await env.engine.runPruneRepository(set: env.set, destination: mirror)
+        let status = await env.engine.runPruneRepository(
+            set: env.set,
+            destination: mirror,
+            authorization: authorization
+        )
 
         #expect(status == .skipped(.staleMirror))
         #expect(env.fake.invocations.isEmpty)
         #expect(env.entries(kind: .prune).isEmpty)
+        #expect(try PreviewTokenStore(paths: env.paths).token(token).value == token)
     }
 
     @Test("standalone prune: dry run never spawns a modifying restic command")
@@ -1304,6 +1345,142 @@ struct BackupEngineTests {
         #expect(env.resticArgvs == [[Self.resticPath, "-r", env.primary.repoURL, "prune", "--dry-run"]])
         #expect(env.resticArgvs.allSatisfy { $0.contains("--dry-run") })
         #expect(env.entries(kind: .prune).isEmpty, "a preview must not replace the last real prune run")
+    }
+
+    @Test("standalone prune: a busy dry run is also absent from history")
+    func standalonePruneBusyDryRunIsUnrecorded() async throws {
+        let env = Self.makeEnv(script: [], retention: nil)
+        defer { env.cleanUp() }
+        try env.paths.ensureDirectories()
+        let heldLock = FileLock(path: env.paths.setLockFile(setId: env.set.id))
+        #expect(heldLock.tryAcquire())
+        defer { heldLock.release() }
+
+        let result = await env.engine.runPruneRepository(
+            set: env.set,
+            destination: env.primary,
+            dryRun: true
+        )
+
+        #expect(result == .skipped(.busy))
+        #expect(env.fake.invocations.isEmpty)
+        #expect(env.entries(kind: .prune).isEmpty)
+    }
+
+    @Test("standalone prune: a busy confirmation does not consume its preview token")
+    func standalonePruneBusyConfirmationRetainsItsPreviewToken() async throws {
+        let env = Self.makeEnv(script: [], retention: nil)
+        defer { env.cleanUp() }
+        let fingerprint = env.primary.pruneConfirmationFingerprint(secretEnv: [:])
+        let token = try PreviewTokenStore(paths: env.paths).issueMaintenancePrune(
+            machineId: env.machineId,
+            setId: env.set.id,
+            destinationId: env.primary.id,
+            effectiveDestinationFingerprint: fingerprint
+        )
+        let authorization = MaintenancePruneAuthorization(
+            token: token,
+            machineId: env.machineId,
+            effectiveDestinationFingerprint: fingerprint
+        )
+        try env.paths.ensureDirectories()
+        let heldLock = FileLock(path: env.paths.setLockFile(setId: env.set.id))
+        #expect(heldLock.tryAcquire())
+
+        let busy = await env.engine.runPruneRepository(
+            set: env.set,
+            destination: env.primary,
+            authorization: authorization
+        )
+        heldLock.release()
+
+        #expect(busy == .skipped(.busy))
+        #expect(try PreviewTokenStore(paths: env.paths).token(token).value == token)
+
+        env.fake.script = Self.resticCall(["-r", env.primary.repoURL, "prune"], dest: Self.primaryId)
+        let completed = await env.engine.runPruneRepository(
+            set: env.set,
+            destination: env.primary,
+            authorization: authorization
+        )
+        #expect(completed == .completed(.success))
+    }
+
+    @Test("standalone prune: an invalid confirmation remains previewChanged")
+    func standalonePruneInvalidConfirmationIsPreviewChanged() async throws {
+        let env = Self.makeEnv(script: [], retention: nil)
+        defer { env.cleanUp() }
+        let result = await env.engine.runPruneRepository(
+            set: env.set,
+            destination: env.primary,
+            authorization: MaintenancePruneAuthorization(
+                token: "not-a-preview-token",
+                machineId: env.machineId,
+                effectiveDestinationFingerprint: env.primary.pruneConfirmationFingerprint(secretEnv: [:])
+            )
+        )
+
+        #expect(result == .skipped(.previewChanged))
+        #expect(env.fake.invocations.isEmpty)
+    }
+
+    @Test("standalone prune: token-store contention preserves the preview for retry")
+    func standalonePruneUnavailableConfirmationRetainsItsPreviewToken() async throws {
+        let env = Self.makeEnv(script: [], retention: nil)
+        defer { env.cleanUp() }
+        let fingerprint = env.primary.pruneConfirmationFingerprint(secretEnv: [:])
+        let token = try PreviewTokenStore(paths: env.paths).issueMaintenancePrune(
+            machineId: env.machineId,
+            setId: env.set.id,
+            destinationId: env.primary.id,
+            effectiveDestinationFingerprint: fingerprint
+        )
+        try env.paths.ensureDirectories()
+        let heldTokenStoreLock = FileLock(path: env.paths.previewTokensLockFile)
+        #expect(heldTokenStoreLock.tryAcquire())
+
+        let result = await env.engine.runPruneRepository(
+            set: env.set,
+            destination: env.primary,
+            authorization: MaintenancePruneAuthorization(
+                token: token,
+                machineId: env.machineId,
+                effectiveDestinationFingerprint: fingerprint
+            )
+        )
+        heldTokenStoreLock.release()
+
+        #expect(result == .skipped(.previewUnavailable))
+        #expect(try PreviewTokenStore(paths: env.paths).token(token).value == token)
+        #expect(env.fake.invocations.isEmpty)
+        #expect(env.entries(kind: .prune).isEmpty)
+    }
+
+    @Test("standalone prune: a launch-time secret failure retains its preview token")
+    func standalonePruneSecretFailureRetainsItsPreviewToken() async throws {
+        let env = Self.makeEnv(secretsUnavailableFor: [Self.primaryId], script: [], retention: nil)
+        defer { env.cleanUp() }
+        let fingerprint = env.primary.pruneConfirmationFingerprint(secretEnv: [:])
+        let token = try PreviewTokenStore(paths: env.paths).issueMaintenancePrune(
+            machineId: env.machineId,
+            setId: env.set.id,
+            destinationId: env.primary.id,
+            effectiveDestinationFingerprint: fingerprint
+        )
+
+        let result = await env.engine.runPruneRepository(
+            set: env.set,
+            destination: env.primary,
+            authorization: MaintenancePruneAuthorization(
+                token: token,
+                machineId: env.machineId,
+                effectiveDestinationFingerprint: fingerprint
+            )
+        )
+
+        #expect(result == .skipped(.secretUnavailable))
+        #expect(try PreviewTokenStore(paths: env.paths).token(token).value == token)
+        #expect(env.fake.invocations.isEmpty)
     }
 
     @Test("standalone prune: an unavailable secret is distinguished from success")

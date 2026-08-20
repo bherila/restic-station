@@ -482,6 +482,38 @@ let dataModelMachinesExampleJSON = """
         let destination = Destination(id: UUID(), label: "x", repoURL: repoURL, isPrimary: true)
         #expect(destination.kind == expectedKind)
     }
+
+    @Test("maintenance bindings resolve a local repository symlink")
+    func maintenanceBindingUsesResolvedLocalRepository() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-destination-link-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let first = root.appendingPathComponent("first.restic", isDirectory: true)
+        let second = root.appendingPathComponent("second.restic", isDirectory: true)
+        try FileManager.default.createDirectory(at: first, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: second, withIntermediateDirectories: true)
+        let link = root.appendingPathComponent("current.restic", isDirectory: true)
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: first)
+
+        let destination = Destination(id: UUID(), label: "Primary", repoURL: link.path, isPrimary: true)
+        let firstFingerprint = destination.pruneConfirmationFingerprint(secretEnv: [:])
+        #expect(destination.pruneInvocationDestination().repoURL == first.path)
+
+        try FileManager.default.removeItem(at: link)
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: second)
+
+        #expect(destination.pruneInvocationDestination().repoURL == second.path)
+        #expect(firstFingerprint != destination.pruneConfirmationFingerprint(secretEnv: [:]))
+    }
+
+    @Test("maintenance binding includes the previewed executable identity")
+    func maintenanceBindingUsesExecutableIdentity() {
+        let destination = Destination(id: UUID(), label: "Primary", repoURL: "/tmp/repo", isPrimary: true)
+        #expect(destination.pruneConfirmationFingerprint(secretEnv: [:], executableIdentity: "restic-a")
+            != destination.pruneConfirmationFingerprint(secretEnv: [:], executableIdentity: "restic-b"))
+    }
 }
 
 @Suite struct RetentionPolicyTests {

@@ -6,6 +6,114 @@ import Testing
 @Suite("AppModel machine override wiring", .serialized)
 @MainActor
 struct AppModelMachineOverrideTests {
+    @Test("reclaim plan retains its previewed destination and recognizes normalized iCloud paths")
+    func reclaimPlanCapturesDestinationIdentity() throws {
+        let destination = Destination(
+            id: UUID(),
+            label: "iCloud repository",
+            repoURL: FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Library/Temporary/../Mobile Documents/restic", isDirectory: true)
+                .path,
+            isPrimary: true
+        )
+        let plan = PrunePlan(
+            setId: UUID(),
+            setName: "Documents",
+            destination: destination,
+            isICloud: MaintenanceModel.isICloudRepository(destination),
+            confirmationBinding: "preview-binding"
+        )
+
+        guard case .reclaimSpace(let previewedDestination, let isICloud, let binding) = plan.action else {
+            Issue.record("expected a reclaim plan")
+            return
+        }
+        #expect(previewedDestination == destination)
+        #expect(isICloud)
+        #expect(binding == "preview-binding")
+    }
+
+    @Test("reclaim plan recognizes repositories reached through an iCloud symlink")
+    func reclaimPlanRecognizesICloudSymlink() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-icloud-link-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let iCloudRoot = root.appendingPathComponent("Mobile Documents", isDirectory: true)
+        try FileManager.default.createDirectory(at: iCloudRoot, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(
+            at: iCloudRoot.appendingPathComponent("restic", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        let alias = root.appendingPathComponent("repository-alias", isDirectory: true)
+        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: iCloudRoot)
+        let destination = Destination(
+            id: UUID(),
+            label: "iCloud repository",
+            repoURL: alias.appendingPathComponent("restic", isDirectory: true).path,
+            isPrimary: true
+        )
+
+        #expect(MaintenanceModel.isICloudRepository(destination, iCloudRoot: iCloudRoot.path))
+    }
+
+    @Test("reclaim plan never treats remote repository URLs as iCloud paths")
+    func reclaimPlanDoesNotClassifyRemoteURLAsICloud() {
+        let destination = Destination(id: UUID(), label: "Remote", repoURL: "s3:bucket/prefix", isPrimary: true)
+        #expect(!MaintenanceModel.isICloudRepository(destination, iCloudRoot: "/tmp"))
+    }
+
+    @Test("reclaim preview decodes its JSON envelope without stderr diagnostics")
+    func reclaimPreviewUsesStdoutForJSON() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-preview-helper-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let helper = root.appendingPathComponent("helper", isDirectory: false)
+        let script = """
+        #!/bin/sh
+        printf '%s\\n' '{"ok":true,"data":{"label":"Primary","dryRun":true,"status":"success","confirmationBinding":"opaque-binding","destinationFingerprint":"public-fingerprint"}}'
+        printf '%s\\n' 'diagnostic emitted on stderr' >&2
+        """
+        try script.write(to: helper, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: helper.path)
+
+        let preview = await HelperInvoker(helperURL: helper).previewReclaimSpace(
+            setId: UUID(),
+            destId: UUID()
+        )
+
+        #expect(preview.result.isSuccess)
+        #expect(preview.confirmationBinding == "opaque-binding")
+        #expect(preview.destinationFingerprint == "public-fingerprint")
+    }
+
+    @Test("reclaim preview decodes its JSON failure envelope without stderr diagnostics")
+    func reclaimPreviewUsesStdoutForJSONFailure() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-preview-helper-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let helper = root.appendingPathComponent("helper", isDirectory: false)
+        let script = """
+        #!/bin/sh
+        printf '%s\\n' '{"schemaVersion":1,"ok":false,"data":null,"error":{"code":"stale_mirror","message":"Mirror 1 is behind the primary; run a new backup first."}}'
+        printf '%s\\n' 'diagnostic emitted on stderr' >&2
+        exit 1
+        """
+        try script.write(to: helper, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: helper.path)
+
+        let preview = await HelperInvoker(helperURL: helper).previewReclaimSpace(
+            setId: UUID(),
+            destId: UUID()
+        )
+
+        #expect(preview.result == .failed(output: "Mirror 1 is behind the primary; run a new backup first."))
+        #expect(preview.confirmationBinding == nil)
+    }
+
     @Test("known machines and effective-plan preview include exclusions and replacements")
     func effectivePlanPreview() throws {
         let setId = UUID()

@@ -8,10 +8,30 @@ import Foundation
 public struct ResticInvocation: Sendable {
     public let destination: Destination
     public let fromDestination: Destination?
+    /// A caller-supplied secret-env snapshot. Destructive preview/confirm
+    /// flows use this to ensure the environment they validate is exactly the
+    /// one passed to restic; ordinary invocations read the current store value.
+    public let destinationSecretEnv: [String: String]?
+    /// A helper-validated, canonical restic executable for a destructive
+    /// preview/confirmation. Normal calls leave this nil and use the runner's
+    /// configured path unchanged.
+    public let resticPathOverride: String?
+    /// Opaque digest binding for a helper-confirmed maintenance executable.
+    /// The runner rechecks it immediately before the child is spawned.
+    public let expectedExecutableIdentity: String?
 
-    public init(destination: Destination, fromDestination: Destination? = nil) {
+    public init(
+        destination: Destination,
+        fromDestination: Destination? = nil,
+        destinationSecretEnv: [String: String]? = nil,
+        resticPathOverride: String? = nil,
+        expectedExecutableIdentity: String? = nil
+    ) {
         self.destination = destination
         self.fromDestination = fromDestination
+        self.destinationSecretEnv = destinationSecretEnv
+        self.resticPathOverride = resticPathOverride
+        self.expectedExecutableIdentity = expectedExecutableIdentity
     }
 }
 
@@ -88,6 +108,11 @@ public final class ResticRunner: Sendable {
     private let runner: ProcessRunning
     private let decoder = ResticMessageDecoder()
 
+    public struct MaintenanceExecutable: Equatable, Sendable {
+        public let path: String
+        public let identity: String
+    }
+
     public init(resticPath: String, paths: AppPaths, secrets: any SecretStore, runner: ProcessRunning) {
         self.resticPath = resticPath
         self.paths = paths
@@ -113,7 +138,8 @@ public final class ResticRunner: Sendable {
         for inv: ResticInvocation,
         onLine: (@Sendable (ResticMessage) -> Void)? = nil,
         onRawLine: (@Sendable (String) -> Void)? = nil,
-        timeout: TimeInterval? = nil
+        timeout: TimeInterval? = nil,
+        beforeLaunch: (@Sendable () throws -> Void)? = nil
     ) async throws -> ResticOutcome {
         try Task.checkCancellation()
 
@@ -128,7 +154,16 @@ public final class ResticRunner: Sendable {
         }
 
         let env = try await environment(for: inv)
-        return try await execute(cmd, env: env, onLine: onLine, onRawLine: onRawLine, timeout: timeout)
+        return try await execute(
+            cmd,
+            env: env,
+            executablePath: inv.resticPathOverride,
+            expectedExecutableIdentity: inv.expectedExecutableIdentity,
+            beforeLaunch: beforeLaunch,
+            onLine: onLine,
+            onRawLine: onRawLine,
+            timeout: timeout
+        )
     }
 
     /// Runs a command that targets no repository — currently only
@@ -156,6 +191,15 @@ public final class ResticRunner: Sendable {
     /// actually in use rather than for the host OS.
     public var secretBackend: SecretBackend {
         secrets.backend
+    }
+
+    /// A stable identity for the executable that will receive a destructive
+    /// maintenance command.  The resolved path catches symlink changes and
+    /// the content digest catches an in-place replacement at the same path.
+    /// It is intentionally an opaque input to the helper's preview binding,
+    /// never emitted in a report or run log.
+    public func maintenanceExecutable() -> MaintenanceExecutable? {
+        maintenanceExecutable(path: resticPath)
     }
 
     // MARK: - Secret-store pre-flight
@@ -195,7 +239,13 @@ public final class ResticRunner: Sendable {
             env.merge(try await secretEnv(for: fromDestination)) { _, new in new }
         }
         env.merge(inv.destination.nonSecretEnv) { _, new in new }
-        env.merge(try await secretEnv(for: inv.destination)) { _, new in new }
+        let destinationSecretEnv: [String: String]
+        if let supplied = inv.destinationSecretEnv {
+            destinationSecretEnv = supplied
+        } else {
+            destinationSecretEnv = try await secretEnv(for: inv.destination)
+        }
+        env.merge(destinationSecretEnv) { _, new in new }
 
         // Written last: these must not be overridable by configured env.
         env["RESTIC_CACHE_DIR"] = paths.resticCacheDir.path
@@ -242,11 +292,24 @@ public final class ResticRunner: Sendable {
     private func execute(
         _ cmd: ResticCommand,
         env: [String: String],
+        executablePath: String? = nil,
+        expectedExecutableIdentity: String? = nil,
+        beforeLaunch: (@Sendable () throws -> Void)? = nil,
         onLine: (@Sendable (ResticMessage) -> Void)?,
         onRawLine: (@Sendable (String) -> Void)?,
         timeout: TimeInterval?
     ) async throws -> ResticOutcome {
-        let argv = [resticPath] + cmd.argv
+        let resolvedExecutablePath = executablePath ?? resticPath
+        if let expectedExecutableIdentity,
+           maintenanceExecutable(path: resolvedExecutablePath)?.identity != expectedExecutableIdentity {
+            throw ResticRunnerError.launchFailed("the restic executable changed after the maintenance preview")
+        }
+        // Destructive preview tokens are consumed here, after every launch
+        // prerequisite has passed but immediately before the process runner
+        // receives the argv. A failed secret read or executable revalidation
+        // must leave confirmation retryable.
+        try beforeLaunch?()
+        let argv = [resolvedExecutablePath] + cmd.argv
         let collector = MessageCollector()
         let decoder = self.decoder
 
@@ -286,6 +349,18 @@ public final class ResticRunner: Sendable {
             status: Self.status(exitCode: result.exitCode, messages: messages, stderr: stderrText),
             messages: messages,
             rawOutput: stdoutText + stderrText
+        )
+    }
+
+    private func maintenanceExecutable(path: String) -> MaintenanceExecutable? {
+        guard path.hasPrefix("/") else { return nil }
+        let executable = URL(fileURLWithPath: path)
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+        guard let data = try? Data(contentsOf: executable) else { return nil }
+        return MaintenanceExecutable(
+            path: executable.path,
+            identity: "\(executable.path):\(SHA256Digest.hex(data))"
         )
     }
 

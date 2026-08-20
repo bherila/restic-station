@@ -19,7 +19,35 @@ public struct PreviewTokenDestination: Codable, Equatable, Sendable {
     }
 }
 
-/// The persisted capability behind a destructive purge/retention action.
+/// Helper-private evidence required to consume a standalone-prune preview.
+/// The secret-sensitive fingerprint stays in helper/engine memory and is
+/// never serialized into the app's command line or JSON response.
+public struct MaintenancePruneAuthorization: Sendable {
+    public let token: String
+    public let machineId: String
+    public let effectiveDestinationFingerprint: String
+    /// Canonical executable selected and hashed for this helper invocation.
+    /// It stays helper-private and is never emitted in CLI JSON or logs.
+    public let resticExecutablePath: String?
+    public let resticExecutableIdentity: String?
+
+    public init(
+        token: String,
+        machineId: String,
+        effectiveDestinationFingerprint: String,
+        resticExecutablePath: String? = nil,
+        resticExecutableIdentity: String? = nil
+    ) {
+        self.token = token
+        self.machineId = machineId
+        self.effectiveDestinationFingerprint = effectiveDestinationFingerprint
+        self.resticExecutablePath = resticExecutablePath
+        self.resticExecutableIdentity = resticExecutableIdentity
+    }
+}
+
+/// The persisted capability behind a destructive purge, retention, or
+/// standalone-prune action.
 ///
 /// The opaque `value` is intentionally only ever written to the owner-only
 /// ``PreviewTokenStore`` index and returned by a successful preview.  It
@@ -110,6 +138,68 @@ public struct PreviewTokenStore: Sendable {
             index.tokens[token.value] = token
             try writeIndex(index)
             return token
+        }
+    }
+
+    /// Issues the opaque capability for a standalone prune dry run. Unlike a
+    /// purge token, the fingerprint is supplied by the helper after it has
+    /// included the destination's secret environment; only the owner-only
+    /// token index ever contains that fingerprint.
+    public func issueMaintenancePrune(
+        machineId: String,
+        setId: UUID,
+        destinationId: UUID,
+        effectiveDestinationFingerprint: String,
+        lifetime: TimeInterval = defaultLifetime
+    ) throws -> String {
+        try withStoreLock {
+            let createdAt = now()
+            var index = try readIndex()
+            discardExpiredEntries(from: &index, at: createdAt)
+            let token = PreviewToken(
+                value: Self.randomValue(),
+                machineId: machineId,
+                setId: setId,
+                destinations: [PreviewTokenDestination(destinationId: destinationId, snapshotIDs: [])],
+                configFingerprint: effectiveDestinationFingerprint,
+                patterns: ["maintenance-prune"],
+                createdAt: createdAt,
+                expiresAt: createdAt.addingTimeInterval(lifetime)
+            )
+            index.tokens[token.value] = token
+            try writeIndex(index)
+            return token.value
+        }
+    }
+
+    /// Consumes a standalone-prune capability only when this helper's freshly
+    /// loaded effective destination is identical to the one its dry run used.
+    /// A mismatch is deliberately `unknown`: callers get one fail-closed
+    /// message without learning whether a token is valid or how it differed.
+    public func consumeMaintenancePrune(
+        _ value: String,
+        machineId: String,
+        setId: UUID,
+        destinationId: UUID,
+        effectiveDestinationFingerprint: String
+    ) throws {
+        try withStoreLock {
+            var index = try readIndex()
+            guard var token = index.tokens[value] else { throw PreviewTokenError.unknown }
+            let consumedAt = now()
+            if token.expiresAt <= consumedAt { throw PreviewTokenError.expired }
+            if token.usedAt != nil { throw PreviewTokenError.alreadyUsed }
+            guard token.machineId == machineId,
+                  token.setId == setId,
+                  token.destinations == [PreviewTokenDestination(destinationId: destinationId, snapshotIDs: [])],
+                  token.configFingerprint == effectiveDestinationFingerprint,
+                  token.patterns == ["maintenance-prune"] else {
+                throw PreviewTokenError.unknown
+            }
+            token.usedAt = consumedAt
+            index.tokens[value] = token
+            discardExpiredEntries(from: &index, at: consumedAt)
+            try writeIndex(index)
         }
     }
 
