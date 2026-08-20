@@ -1306,6 +1306,26 @@ struct BackupEngineTests {
         #expect(env.entries(kind: .prune).isEmpty, "a preview must not replace the last real prune run")
     }
 
+    @Test("standalone prune: a busy dry run is also absent from history")
+    func standalonePruneBusyDryRunIsUnrecorded() async throws {
+        let env = Self.makeEnv(script: [], retention: nil)
+        defer { env.cleanUp() }
+        try env.paths.ensureDirectories()
+        let heldLock = FileLock(path: env.paths.setLockFile(setId: env.set.id))
+        #expect(heldLock.tryAcquire())
+        defer { heldLock.release() }
+
+        let result = await env.engine.runPruneRepository(
+            set: env.set,
+            destination: env.primary,
+            dryRun: true
+        )
+
+        #expect(result == .skipped(.busy))
+        #expect(env.fake.invocations.isEmpty)
+        #expect(env.entries(kind: .prune).isEmpty)
+    }
+
     @Test("standalone prune: an unavailable secret is distinguished from success")
     func standalonePruneReportsSecretUnavailable() async throws {
         let env = Self.makeEnv(secretsUnavailableFor: [Self.primaryId], script: [], retention: nil)

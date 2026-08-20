@@ -638,7 +638,13 @@ public final class BackupEngine: Sendable {
 
         let lock = makeSetLock(setId: set.id)
         guard lock.tryAcquire() else {
-            recordSkipped(kind: .prune, setId: set.id, destId: destination.id, trigger: .manual)
+            // A preview is an unrecorded read-only query, even when it is
+            // refused because another set operation holds the lock. Recording
+            // that refusal as a prune would replace the last real cleanup in
+            // status/history despite no restic prune having run.
+            if !dryRun {
+                recordSkipped(kind: .prune, setId: set.id, destId: destination.id, trigger: .manual)
+            }
             return .skipped(.busy)
         }
         defer { lock.release() }

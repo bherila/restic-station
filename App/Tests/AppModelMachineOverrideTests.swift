@@ -6,6 +6,31 @@ import Testing
 @Suite("AppModel machine override wiring", .serialized)
 @MainActor
 struct AppModelMachineOverrideTests {
+    @Test("reclaim plan retains its previewed destination and recognizes normalized iCloud paths")
+    func reclaimPlanCapturesDestinationIdentity() throws {
+        let destination = Destination(
+            id: UUID(),
+            label: "iCloud repository",
+            repoURL: FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Library/Temporary/../Mobile Documents/restic", isDirectory: true)
+                .path,
+            isPrimary: true
+        )
+        let plan = PrunePlan(
+            setId: UUID(),
+            setName: "Documents",
+            destination: destination,
+            isICloud: MaintenanceModel.isICloudRepository(destination)
+        )
+
+        guard case .reclaimSpace(let previewedDestination, let isICloud) = plan.action else {
+            Issue.record("expected a reclaim plan")
+            return
+        }
+        #expect(previewedDestination == destination)
+        #expect(isICloud)
+    }
+
     @Test("known machines and effective-plan preview include exclusions and replacements")
     func effectivePlanPreview() throws {
         let setId = UUID()
