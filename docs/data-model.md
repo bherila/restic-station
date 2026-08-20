@@ -424,7 +424,17 @@ The net effect on an existing single-machine install is that `"version": 1` beco
 
 ## Headless CLI `--json` shapes (T27)
 
-`config show`, `status`, `sets list`, `runs list` and `runs show` all accept `--json`. This is documented **as an interface**, not as debug output: a script that pipes one of these into `jq` today must keep working across releases the same way `runs/index.jsonl` does. The conventions from the preamble apply identically — `.sortedKeys` + `.prettyPrinted`, ISO 8601 dates with fractional seconds, every optional field encoded as explicit `null` rather than omitted (`ConfigStore.makeEncoder()`, reused verbatim by the CLI's `CLIJSON.print(_:)`).
+Eleven commands accept `--json`; **`cli-json.md` holds the command matrix, the envelope, the error taxonomy and the versioning policy**, and is the normative document for all of it. This section documents the *payload shapes* those commands put in `data`, because they are made of the same types the state files are.
+
+This is documented **as an interface**, not as debug output: a script that pipes one of these into `jq` today must keep working across releases the same way `runs/index.jsonl` does. The conventions from the preamble apply identically — `.sortedKeys` + `.prettyPrinted`, ISO 8601 dates with fractional seconds, every optional field encoded as explicit `null` rather than omitted (`ConfigStore.makeEncoder()`, reused verbatim by the CLI's `CLIJSON.print(_:)`).
+
+**Every payload below is the `data` value, not the whole document.** `CLIJSON.print` wraps it:
+
+```json
+{ "schemaVersion": 1, "ok": true, "data": { … the shapes in this section … } }
+```
+
+So `status --json | jq '.data.health'`, not `.health`. See `cli-json.md` §Migrating from the unwrapped shape — this changed, and the old bare form is gone.
 
 Every `--json` mode writes *only* JSON to stdout; diagnostics go to stderr. `runs list --json` and `runs show --json` reuse `RunIndexEntry` and `RunMetadata` verbatim (§runs/index.jsonl, §runs/\<runId\>/metadata.json above) — no separate shape to document.
 

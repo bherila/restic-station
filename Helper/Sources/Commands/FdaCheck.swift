@@ -21,26 +21,74 @@ import ResticStationCore
 /// Does not go through `HelperContext.make()`: no restic path is needed to
 /// probe FDA, and this command must succeed even before restic is
 /// configured (it's part of onboarding, which runs before that).
-struct FdaCheck: AsyncParsableCommand {
+struct FdaCheck: AsyncParsableCommand, JSONRenderable {
     static let configuration = CommandConfiguration(
         commandName: "fda-check",
         abstract: "Probe Full Disk Access and record the result to state/fda-check.json "
-            + "(macOS only; a no-op elsewhere). Always exits 0."
+            + "(macOS only; a no-op elsewhere). --json for scripting. Always exits 0."
     )
 
     @Option(name: .long, help: "Which process context ran the probe: \"launchd\" or \"app\".")
     var context: String = "launchd"
 
+    @Flag(name: .long, help: "Emit JSON. Only JSON reaches stdout in this mode.")
+    var json = false
+
+    /// `fda-check --json`'s shape — see `docs/cli-json.md`.
+    ///
+    /// `applicable: false` off macOS is the machine-readable form of the
+    /// human "not applicable" line, and mirrors the file-level rule: an
+    /// absent `state/fda-check.json` means *unknown*, never *denied*. A
+    /// caller must branch on `applicable` before reading `granted`.
+    struct Report: Encodable {
+        let applicable: Bool
+        let granted: Bool?
+        let probedPath: String?
+        let checkedAt: Date?
+        let context: String
+
+        // Explicit `null` for the three that are absent off macOS — see the
+        // encoding convention in `docs/data-model.md`. A missing key and a
+        // null one must not be two ways of saying "not applicable".
+        private enum CodingKeys: String, CodingKey {
+            case applicable, granted, probedPath, checkedAt, context
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(applicable, forKey: .applicable)
+            try container.encode(granted, forKey: .granted)
+            try container.encode(probedPath, forKey: .probedPath)
+            try container.encode(checkedAt, forKey: .checkedAt)
+            try container.encode(context, forKey: .context)
+        }
+    }
+
     func run() async throws {
-        guard let result = Self.probeAndRecord(
+        let result = Self.probeAndRecord(
             context: context,
             stateStore: StateStore(paths: AppPaths.default())
-        ) else {
-            print("full disk access: not applicable on this platform (no TCC outside macOS); "
-                + "state/fda-check.json not written.")
+        )
+
+        guard json else {
+            guard let result else {
+                print("full disk access: not applicable on this platform (no TCC outside macOS); "
+                    + "state/fda-check.json not written.")
+                return
+            }
+            print("full disk access: \(result.hasFullDiskAccess ? "granted" : "not granted") (probed \(result.probedPath), context: \(context))")
             return
         }
-        print("full disk access: \(result.hasFullDiskAccess ? "granted" : "not granted") (probed \(result.probedPath), context: \(context))")
+
+        CLIJSON.print(
+            Report(
+                applicable: result != nil,
+                granted: result?.hasFullDiskAccess,
+                probedPath: result?.probedPath,
+                checkedAt: result?.checkedAt,
+                context: context
+            )
+        )
     }
 
     /// Probes and records in one step. Also called by `tick` on every firing,

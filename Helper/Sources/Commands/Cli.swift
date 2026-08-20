@@ -126,14 +126,17 @@ struct CliUninstall: AsyncParsableCommand {
 
 // MARK: - cli status
 
-struct CliStatus: AsyncParsableCommand {
+struct CliStatus: AsyncParsableCommand, JSONRenderable {
     static let configuration = CommandConfiguration(
         commandName: "status",
         abstract: "Report whether the restic-station symlink is installed, where it resolves to, and "
-            + "whether the install directory is on PATH. Exit 0 ok."
+            + "whether the install directory is on PATH. --json for scripting. Exit 0 ok."
     )
 
     @OptionGroup var options: CliPrefixOptions
+
+    @Flag(name: .long, help: "Emit JSON. Only JSON reaches stdout in this mode.")
+    var json = false
 
     func run() async throws {
         let directory = options.directory
@@ -143,6 +146,14 @@ struct CliStatus: AsyncParsableCommand {
             currentTarget: target,
             pathEnvironment: ProcessInfo.processInfo.environment["PATH"]
         )
+
+        if json {
+            // `CLIInstaller.Status` is already the model the human renderer
+            // reads; emitting it directly is what keeps the two from
+            // drifting, rather than re-deriving the same booleans here.
+            CLIJSON.print(status)
+            HelperExit.code(0)
+        }
 
         if status.installed {
             let staleness = status.upToDate

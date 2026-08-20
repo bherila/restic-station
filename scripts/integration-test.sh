@@ -789,9 +789,9 @@ JSON
 
     [[ $rc -eq 1 ]] || fail "$step" "expected status --json to exit 1 with an abandoned run, got $rc: $out"
     local health is_running abandoned
-    health="$(printf '%s' "$out" | jq -r '.health')"
-    is_running="$(printf '%s' "$out" | jq -r --arg id "$SET_ID" '.sets[] | select(.id == $id) | .isRunning')"
-    abandoned="$(printf '%s' "$out" | jq -r --arg id "$SET_ID" '.sets[] | select(.id == $id) | .abandonedRun.runId')"
+    health="$(printf '%s' "$out" | jq -r '.data | .health')"
+    is_running="$(printf '%s' "$out" | jq -r --arg id "$SET_ID" '.data | .sets[] | select(.id == $id) | .isRunning')"
+    abandoned="$(printf '%s' "$out" | jq -r --arg id "$SET_ID" '.data | .sets[] | select(.id == $id) | .abandonedRun.runId')"
     [[ "$health" == "warning" ]] || fail "$step" "expected health=warning, got '$health'"
     [[ "$is_running" == "false" ]] || fail "$step" "expected isRunning=false, got '$is_running'"
     [[ "$abandoned" == "20260101T000000Z-backup-deadbeef" ]] \
@@ -864,7 +864,7 @@ JSON
     set +e
     out="$("$HELPER" status --json 2>&1)"
     set -e
-    abandoned="$(printf '%s' "$out" | jq -r --arg id "$SET_ID" '.sets[] | select(.id == $id) | .abandonedRun.runId')"
+    abandoned="$(printf '%s' "$out" | jq -r --arg id "$SET_ID" '.data | .sets[] | select(.id == $id) | .abandonedRun.runId')"
     [[ "$abandoned" == "$run_id" ]] \
         || fail "$step" "precondition: expected the abandoned run to be named before the tick, got '$abandoned'"
 
@@ -879,7 +879,7 @@ JSON
     set +e
     out="$("$HELPER" status --json 2>&1)"
     set -e
-    abandoned="$(printf '%s' "$out" | jq -r --arg id "$SET_ID" '.sets[] | select(.id == $id) | .abandonedRun')"
+    abandoned="$(printf '%s' "$out" | jq -r --arg id "$SET_ID" '.data | .sets[] | select(.id == $id) | .abandonedRun')"
     [[ "$abandoned" == "null" ]] \
         || fail "$step" "expected no abandoned run after the tick, got '$abandoned': $out"
 
@@ -1170,43 +1170,43 @@ assert_fixture_flow() {
     # will not. Assert the answer is internally consistent in either state.
     if [[ "$OS_NAME" == "Linux" ]]; then
         [[ $status_rc -eq 1 ]] || fail "$step" "expected exit 1 with no timer installed, got $status_rc"
-        echo "$status_json" | jq -e '.scheduler.healthy == false' >/dev/null \
+        echo "$status_json" | jq -e '.data | .scheduler.healthy == false' >/dev/null \
             || fail "$step" "expected scheduler.healthy=false with no timer installed: $status_json"
-        echo "$status_json" | jq -e '.scheduler.problems | index("unitsMissing")' >/dev/null \
+        echo "$status_json" | jq -e '.data | .scheduler.problems | index("unitsMissing")' >/dev/null \
             || fail "$step" "expected scheduler.problems to name unitsMissing: $status_json"
     else
-        echo "$status_json" | jq -e '.scheduler.kind == "launchd-agent"' >/dev/null \
+        echo "$status_json" | jq -e '.data | .scheduler.kind == "launchd-agent"' >/dev/null \
             || fail "$step" "expected a launchd-agent scheduler probe on macOS: $status_json"
         local scheduler_health
-        scheduler_health="$(echo "$status_json" | jq -r '.scheduler.healthy')"
+        scheduler_health="$(echo "$status_json" | jq -r '.data | .scheduler.healthy')"
         case "$scheduler_health" in
             true)
                 [[ $status_rc -eq 0 ]] || fail "$step" "healthy LaunchAgent should exit 0, got $status_rc: $status_json"
                 ;;
             false)
                 [[ $status_rc -eq 1 ]] || fail "$step" "missing LaunchAgent should exit 1, got $status_rc: $status_json"
-                echo "$status_json" | jq -e '.scheduler.problems | index("agentNotLoaded")' >/dev/null \
+                echo "$status_json" | jq -e '.data | .scheduler.problems | index("agentNotLoaded")' >/dev/null \
                     || fail "$step" "missing LaunchAgent did not name agentNotLoaded: $status_json"
                 ;;
             null)
                 [[ $status_rc -eq 0 ]] || fail "$step" "unknown LaunchAgent state should not fail status: $status_json"
-                echo "$status_json" | jq -e '.scheduler.problems | index("launchctlProbeFailed")' >/dev/null \
+                echo "$status_json" | jq -e '.data | .scheduler.problems | index("launchctlProbeFailed")' >/dev/null \
                     || fail "$step" "unknown LaunchAgent state did not name launchctlProbeFailed: $status_json"
                 ;;
             *) fail "$step" "unexpected LaunchAgent health '$scheduler_health': $status_json" ;;
         esac
     fi
-    echo "$status_json" | jq -e '.sets | length == 1' >/dev/null \
+    echo "$status_json" | jq -e '.data | .sets | length == 1' >/dev/null \
         || fail "$step" "expected exactly one set in status --json (the disabled-here set must not appear): $status_json"
-    echo "$status_json" | jq -e '.sets[0].name == "Projects"' >/dev/null \
+    echo "$status_json" | jq -e '.data | .sets[0].name == "Projects"' >/dev/null \
         || fail "$step" "status --json did not report the \"Projects\" set: $status_json"
-    echo "$status_json" | jq -e '.sets[0].lastBackup.status == "success"' >/dev/null \
+    echo "$status_json" | jq -e '.data | .sets[0].lastBackup.status == "success"' >/dev/null \
         || fail "$step" "status --json did not reflect the successful backup: $status_json"
-    echo "$status_json" | jq -e '.excludedHere | length == 1' >/dev/null \
+    echo "$status_json" | jq -e '.data | .excludedHere | length == 1' >/dev/null \
         || fail "$step" "expected exactly one exclusion in status --json: $status_json"
-    echo "$status_json" | jq -e '.excludedHere[0].reason == "disabledForMachine"' >/dev/null \
+    echo "$status_json" | jq -e '.data | .excludedHere[0].reason == "disabledForMachine"' >/dev/null \
         || fail "$step" "status --json's exclusion reason was not disabledForMachine: $status_json"
-    echo "$status_json" | jq -e --arg id "$FIXTURE_DISABLED_SET_ID" '.excludedHere[0].id == $id' >/dev/null \
+    echo "$status_json" | jq -e --arg id "$FIXTURE_DISABLED_SET_ID" '.data | .excludedHere[0].id == $id' >/dev/null \
         || fail "$step" "status --json's exclusion named the wrong set (expected $FIXTURE_DISABLED_SET_ID): $status_json"
     log "$step OK"
 

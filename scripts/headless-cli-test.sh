@@ -24,6 +24,8 @@
 #      grepped for the fixture secret value at the very end.
 #   7. Exit-code contract (0 ok / 1 error) spot-checked for the new
 #      subcommands on both the happy and unhappy path.
+#   9. Every `--json` command emits one success envelope
+#      ({schemaVersion, ok, data}) on stdout and nothing else (issue #79).
 #   8. A failing `--json` command emits exactly one error envelope on
 #      stdout with the documented `error.code` (issue #81,
 #      `docs/cli-json.md`), human mode is unchanged, and a nonzero exit
@@ -105,7 +107,7 @@ expect_rc() {
 # status exit 1, while healthy or unknown scheduler state contributes 0.
 CLEAN_STATUS_RC=0
 capture_clean_status_rc() {
-    if jq -e '.scheduler.healthy == false' "$OUT_FILE" >/dev/null; then
+    if jq -e '.data | .scheduler.healthy == false' "$OUT_FILE" >/dev/null; then
         CLEAN_STATUS_RC=1
     else
         CLEAN_STATUS_RC=0
@@ -176,9 +178,9 @@ ok "real import installs config.json"
 
 RESTIC_STATION_DATA_DIR="$LINUX_DATA" run_helper config show --json
 expect_rc 0
-echo "$(cat "$OUT_FILE")" | jq -e '.sets[0].name == "Projects"' >/dev/null \
+echo "$(cat "$OUT_FILE")" | jq -e '.data | .sets[0].name == "Projects"' >/dev/null \
     || fail "imported config does not resolve the same set on the new host"
-echo "$(cat "$OUT_FILE")" | jq -e '.sets[0].destinations | length == 2' >/dev/null \
+echo "$(cat "$OUT_FILE")" | jq -e '.data | .sets[0].destinations | length == 2' >/dev/null \
     || fail "imported config lost a destination"
 ok "config show --json on the importing host matches the exported set semantically"
 
@@ -328,6 +330,7 @@ RESTIC_STATION_DATA_DIR="$HEALTHY" run_helper status --json
 capture_clean_status_rc
 expect_rc "$CLEAN_STATUS_RC"
 jq -e '
+    .data |
     .sets[0].needsAttention == false
     and .sets[0].lastBackup.status == "success"
     and .health == (if .scheduler.healthy == false then "warning" else "idle" end)
@@ -340,7 +343,7 @@ make_status_fixture "$FIRST_BACKUP_FRESH"
 RESTIC_STATION_DATA_DIR="$FIRST_BACKUP_FRESH" run_helper status --json
 capture_clean_status_rc
 expect_rc "$CLEAN_STATUS_RC"
-echo "$(cat "$OUT_FILE")" | jq -e '.sets[0].firstBackupOverdue == false' >/dev/null \
+echo "$(cat "$OUT_FILE")" | jq -e '.data | .sets[0].firstBackupOverdue == false' >/dev/null \
     || fail "a fresh never-run set warned before its first-backup grace elapsed"
 
 FIRST_BACKUP_OVERDUE="$WORK/status-first-backup-overdue"
@@ -353,6 +356,7 @@ touch -t 202001010000 "$FIRST_BACKUP_OVERDUE/config.json" "$FIRST_BACKUP_OVERDUE
 RESTIC_STATION_DATA_DIR="$FIRST_BACKUP_OVERDUE" run_helper status --json
 expect_rc 1
 echo "$(cat "$OUT_FILE")" | jq -e '
+    .data |
     .health == "warning"
     and .sets[0].lastBackup == null
     and .sets[0].firstBackupOverdue == true
@@ -378,10 +382,10 @@ EOF
 RESTIC_STATION_DATA_DIR="$INFLIGHT" run_helper status --json
 capture_clean_status_rc
 expect_rc "$CLEAN_STATUS_RC"
-echo "$(cat "$OUT_FILE")" | jq -e '.health == "running"' >/dev/null || fail "in-flight fixture did not report running"
-echo "$(cat "$OUT_FILE")" | jq -e '.sets[0].currentRun.phase == "backing-up-primary"' >/dev/null \
+echo "$(cat "$OUT_FILE")" | jq -e '.data | .health == "running"' >/dev/null || fail "in-flight fixture did not report running"
+echo "$(cat "$OUT_FILE")" | jq -e '.data | .sets[0].currentRun.phase == "backing-up-primary"' >/dev/null \
     || fail "in-flight fixture did not surface live progress"
-echo "$(cat "$OUT_FILE")" | jq -e '.sets[0].abandonedRun == null' >/dev/null \
+echo "$(cat "$OUT_FILE")" | jq -e '.data | .sets[0].abandonedRun == null' >/dev/null \
     || fail "a live run was misreported as abandoned"
 ok "in-flight fixture: health=running, live progress surfaced; exit reflects the host scheduler"
 
@@ -400,6 +404,7 @@ EOF
 RESTIC_STATION_DATA_DIR="$STALLED" run_helper status --json
 expect_rc 1
 jq -e '
+    .data |
     .health == "warning"
     and .sets[0].isRunning == false
     and .sets[0].currentRun == null
@@ -426,11 +431,11 @@ cat > "$ABANDONED/state/current-run-$SET_ID.json" <<EOF
 EOF
 RESTIC_STATION_DATA_DIR="$ABANDONED" run_helper status --json
 expect_rc 1
-echo "$(cat "$OUT_FILE")" | jq -e '.health == "warning"' >/dev/null \
+echo "$(cat "$OUT_FILE")" | jq -e '.data | .health == "warning"' >/dev/null \
     || fail "abandoned fixture did not report warning"
-echo "$(cat "$OUT_FILE")" | jq -e '.sets[0].isRunning == false' >/dev/null \
+echo "$(cat "$OUT_FILE")" | jq -e '.data | .sets[0].isRunning == false' >/dev/null \
     || fail "abandoned fixture still reported the set as running"
-echo "$(cat "$OUT_FILE")" | jq -e '.sets[0].abandonedRun.runId == "r-dead"' >/dev/null \
+echo "$(cat "$OUT_FILE")" | jq -e '.data | .sets[0].abandonedRun.runId == "r-dead"' >/dev/null \
     || fail "abandoned fixture did not name the abandoned run"
 ok "abandoned fixture: status --json exits 1, health=warning, the dead run is named"
 
@@ -457,6 +462,7 @@ EOF
 RESTIC_STATION_DATA_DIR="$UNATTRIBUTED" run_helper status --json
 expect_rc 1
 echo "$(cat "$OUT_FILE")" | jq -e '
+    .data |
     (.sets | length) == 0
     and (.unattributedRuns | length) == 2
     and any(.unattributedRuns[]; .currentRun.runId == "r-unattributed-live" and .liveness == "live")
@@ -480,8 +486,8 @@ cat > "$FAILED/runs/index.jsonl" <<EOF
 EOF
 RESTIC_STATION_DATA_DIR="$FAILED" run_helper status --json
 expect_rc 1
-echo "$(cat "$OUT_FILE")" | jq -e '.health == "warning"' >/dev/null || fail "failed fixture did not report warning"
-echo "$(cat "$OUT_FILE")" | jq -e '.sets[0].needsAttention == true' >/dev/null \
+echo "$(cat "$OUT_FILE")" | jq -e '.data | .health == "warning"' >/dev/null || fail "failed fixture did not report warning"
+echo "$(cat "$OUT_FILE")" | jq -e '.data | .sets[0].needsAttention == true' >/dev/null \
     || fail "failed fixture's set was not flagged needsAttention"
 ok "failed fixture: status --json exits 1, health=warning"
 
@@ -500,8 +506,8 @@ cat > "$STALE/state/repo-status-$PRIMARY_ID.json" <<EOF
 EOF
 RESTIC_STATION_DATA_DIR="$STALE" run_helper status --json
 expect_rc 1
-echo "$(cat "$OUT_FILE")" | jq -e '.health == "warning"' >/dev/null || fail "stale fixture did not report warning"
-echo "$(cat "$OUT_FILE")" | jq -e '.sets[0].destinations[0].stale == true' >/dev/null \
+echo "$(cat "$OUT_FILE")" | jq -e '.data | .health == "warning"' >/dev/null || fail "stale fixture did not report warning"
+echo "$(cat "$OUT_FILE")" | jq -e '.data | .sets[0].destinations[0].stale == true' >/dev/null \
     || fail "stale fixture's destination was not flagged stale"
 ok "stale-mirror fixture: status --json exits 1, health=warning, destination flagged stale"
 
@@ -527,9 +533,9 @@ NOW_TS=$(date -u +%s)
 } > "$CROWDED/runs/index.jsonl"
 RESTIC_STATION_DATA_DIR="$CROWDED" run_helper status --json
 expect_rc 1
-echo "$(cat "$OUT_FILE")" | jq -e '.health == "warning"' >/dev/null \
+echo "$(cat "$OUT_FILE")" | jq -e '.data | .health == "warning"' >/dev/null \
     || fail "a quiet set's failed last run must not be hidden behind 200+ newer runs from another set"
-echo "$(cat "$OUT_FILE")" | jq -e '.sets[0].needsAttention == true' >/dev/null \
+echo "$(cat "$OUT_FILE")" | jq -e '.data | .sets[0].needsAttention == true' >/dev/null \
     || fail "the quiet, configured set was not flagged needsAttention despite its last run having failed"
 ok "a quiet set's failed last run survives 200+ newer runs from another set — status --json exit code stays 1"
 
@@ -541,15 +547,15 @@ log "5. --json output is parseable JSON with nothing else on stdout"
 RESTIC_STATION_DATA_DIR="$HEALTHY" run_helper status --json
 capture_clean_status_rc
 expect_rc "$CLEAN_STATUS_RC"
-jq -e '.machineId | length > 0' "$OUT_FILE" >/dev/null \
+jq -e '.data | .machineId | length > 0' "$OUT_FILE" >/dev/null \
     || fail "status --json did not produce clean JSON"
-RESTIC_STATION_DATA_DIR="$HEALTHY" "$HELPER" sets list --json | jq -e 'type == "array"' >/dev/null \
+RESTIC_STATION_DATA_DIR="$HEALTHY" "$HELPER" sets list --json | jq -e '.data | type == "array"' >/dev/null \
     || fail "sets list --json did not pipe cleanly through jq"
-RESTIC_STATION_DATA_DIR="$HEALTHY" "$HELPER" runs list --json | jq -e 'type == "array"' >/dev/null \
+RESTIC_STATION_DATA_DIR="$HEALTHY" "$HELPER" runs list --json | jq -e '.data | type == "array"' >/dev/null \
     || fail "runs list --json did not pipe cleanly through jq"
-RESTIC_STATION_DATA_DIR="$HEALTHY" "$HELPER" config show --json | jq -e '.machineId | length > 0' >/dev/null \
+RESTIC_STATION_DATA_DIR="$HEALTHY" "$HELPER" config show --json | jq -e '.data | .machineId | length > 0' >/dev/null \
     || fail "config show --json did not pipe cleanly through jq"
-RESTIC_STATION_DATA_DIR="$HEALTHY" "$HELPER" runs show r-healthy --json | jq -e '.runId == "r-healthy"' >/dev/null \
+RESTIC_STATION_DATA_DIR="$HEALTHY" "$HELPER" runs show r-healthy --json | jq -e '.data | .runId == "r-healthy"' >/dev/null \
     || fail "runs show --json did not pipe cleanly through jq"
 ok "status, sets list, runs list, runs show, config show --json all parse cleanly through jq"
 
@@ -666,7 +672,7 @@ EOF
     RESTIC_STATION_DATA_DIR="$REAL_DATA" run_helper status --json
     capture_clean_status_rc
     expect_rc "$CLEAN_STATUS_RC"
-    echo "$(cat "$OUT_FILE")" | jq -e '.sets[0].lastBackup.status == "success"' >/dev/null \
+    echo "$(cat "$OUT_FILE")" | jq -e '.data | .sets[0].lastBackup.status == "success"' >/dev/null \
         || fail "status did not reflect the real backup that just ran"
     ok "a real run-set backup is reflected by status --json"
 
@@ -696,7 +702,12 @@ echo 'not valid json{{{' > "$ENVELOPE_DATA/config.json"
 # never loads config.json, so an unloadable config is not a failure for it —
 # it correctly reports an empty history and exits 0. Its own failure path is
 # asserted separately below.
-for CMD in "status" "sets list" "config show"; do
+# `secret list` is in this loop because its setup path is a *different* one:
+# it does not go through `HelperContext.make()` at all (entering a password
+# must work before restic is configured), so it had its own `HelperExit.fail`
+# and answered a broken config with an empty stdout long after the other
+# commands stopped doing that.
+for CMD in "status" "sets list" "config show" "secret list"; do
     # shellcheck disable=SC2086
     RESTIC_STATION_DATA_DIR="$ENVELOPE_DATA" run_helper_split $CMD --json
     expect_rc 1
@@ -710,6 +721,25 @@ for CMD in "status" "sets list" "config show"; do
         || fail "\`$CMD --json\` marked an invalid config retryable"
 done
 ok "every --json command reports an unloadable config.json as config_invalid, exit 1"
+
+# `config validate --json` has a second setup failure of its own: with no
+# `--machine`, the answer comes from this host's `machine.json`, and an
+# unreadable one used to exit with prose rather than an envelope. The config
+# here is *valid* — this is specifically the identity path, not the config
+# path the loop above covers.
+MACHINE_DATA="$WORK/bad-machine"
+mkdir -p "$MACHINE_DATA"
+cp "$HEALTHY/config.json" "$MACHINE_DATA/config.json"
+echo 'not valid json{{{' > "$MACHINE_DATA/machine.json"
+RESTIC_STATION_DATA_DIR="$MACHINE_DATA" run_helper_split config validate --json
+expect_rc 1
+jq -e . "$OUT_FILE" >/dev/null 2>&1 \
+    || fail "config validate --json on an unreadable machine.json put no JSON document on stdout"
+[[ "$(jq -r '.error.code' "$OUT_FILE")" == "config_invalid" ]] \
+    || fail "config validate --json reported $(jq -r '.error.code' "$OUT_FILE") for an unreadable machine.json"
+jq -e '.error.message | test("machine")' "$OUT_FILE" >/dev/null \
+    || fail "the envelope did not say which file it was: $(jq -r '.error.message' "$OUT_FILE")"
+ok "config validate --json reports an unreadable machine.json as config_invalid, exit 1"
 
 # `runs list`'s own classified failure: its --limit check is hand-written
 # rather than an ArgumentParser `validate()` throw, specifically so it exits
@@ -762,11 +792,153 @@ ok "--json --help still prints help and exits 0"
 # stay a StatusReport, never an error envelope.
 RESTIC_STATION_DATA_DIR="$FAILED" run_helper_split status --json
 expect_rc 1
-jq -e '.sets' "$OUT_FILE" >/dev/null \
+jq -e '.data | .sets' "$OUT_FILE" >/dev/null \
     || fail "status --json stopped emitting a report when health is warning"
 jq -e 'has("error") | not' "$OUT_FILE" >/dev/null \
     || fail "status --json turned a warning-level report into an error envelope"
 ok "status --json exit 1 on a warning is still a report, not an error envelope"
+
+# ─────────────────────────────────────────────────────────────────────────
+# 9. The success envelope, across every --json command (issue #79).
+#
+#    The Swift suite checks that each of these conforms to JSONRenderable;
+#    what only a real process can show is that stdout carries exactly one
+#    envelope and nothing else — no progress prose, no warning line, no
+#    ANSI. Stdout and stderr are captured separately for that reason.
+# ─────────────────────────────────────────────────────────────────────────
+log "9. every --json command emits one success envelope on stdout"
+
+# `probe-repo` is deliberately absent from this loop and handled below:
+# it is the only command here that must resolve a usable restic before it
+# can produce any report at all, so on a host without one its correct
+# output is an error envelope, not a success. The `linux` CI job is exactly
+# such a host.
+ENVELOPE_CMDS=(
+    "version"
+    "status"
+    "sets list"
+    "runs list"
+    "runs show r-healthy"
+    "config show"
+    "config validate"
+    "secret list"
+    "cli status"
+    "fda-check"
+)
+
+for CMD in "${ENVELOPE_CMDS[@]}"; do
+    # shellcheck disable=SC2086
+    RESTIC_STATION_DATA_DIR="$HEALTHY" run_helper_split $CMD --json
+    jq -e . "$OUT_FILE" >/dev/null 2>&1 \
+        || fail "\`$CMD --json\` did not put exactly one JSON document on stdout: $(cat "$OUT_FILE")"
+    [[ "$(jq -r '.ok' "$OUT_FILE")" == "true" ]] \
+        || fail "\`$CMD --json\` did not report ok=true (got $(jq -c '.' "$OUT_FILE"))"
+    [[ "$(jq -r '.schemaVersion' "$OUT_FILE")" == "1" ]] \
+        || fail "\`$CMD --json\` did not pin schemaVersion 1"
+    jq -e 'has("data")' "$OUT_FILE" >/dev/null \
+        || fail "\`$CMD --json\` emitted no data key"
+    # The three envelope keys and nothing else: a command that leaks an
+    # extra top-level field has escaped CLIJSON.
+    [[ "$(jq -r 'keys | join(",")' "$OUT_FILE")" == "data,ok,schemaVersion" ]] \
+        || fail "\`$CMD --json\` has unexpected top-level keys: $(jq -r 'keys | join(",")' "$OUT_FILE")"
+done
+ok "all ${#ENVELOPE_CMDS[@]} restic-independent --json commands emit {schemaVersion, ok, data} and nothing else"
+
+# The payload each one actually carries, spot-checked so the envelope test
+# above cannot pass on an empty or wrong `data`.
+RESTIC_STATION_DATA_DIR="$HEALTHY" run_helper_split version --json
+[[ "$(jq -r '.data.name' "$OUT_FILE")" == "restic-station-helper" ]] || fail "version --json lost its name"
+[[ -n "$(jq -r '.data.platform' "$OUT_FILE")" ]] || fail "version --json did not name a platform"
+
+# probe-repo, on both kinds of host.
+#
+# With a usable restic its *outcome mapping* is what gets pinned, not one
+# outcome — whether the fixture's repository path happens to exist is not
+# this test's subject. Every outcome is a success envelope, and the exit
+# code is the coarse shell signal for the same fact; an offline destination
+# reported as an error envelope would make a sleeping NAS look like a
+# broken config.
+#
+# Without one, `HelperContext.make()` fails before any probe happens and
+# restic_not_found is the correct answer. Asserting that rather than
+# skipping keeps the no-restic host covered instead of silently untested.
+RESTIC_STATION_DATA_DIR="$HEALTHY" run_helper_split probe-repo --set "$SET_ID" --dest "$PRIMARY_ID" --json
+PROBE_RC="$RC"
+# Branch on what the helper actually reported, not on `command -v restic`:
+# discovery also searches well-known absolute paths, so a host can have a
+# usable restic that is not on PATH and the two would disagree.
+if [[ "$(jq -r '.ok' "$OUT_FILE")" == "false" ]]; then
+    # The only legitimate failures here are the two that mean "no usable
+    # restic". Any other code is a regression, not an environment.
+    PROBE_CODE="$(jq -r '.error.code' "$OUT_FILE")"
+    case "$PROBE_CODE" in
+        restic_not_found|restic_unsupported) ;;
+        *) fail "probe-repo --json failed with $PROBE_CODE, which is not a restic-availability problem" ;;
+    esac
+    [[ "$PROBE_RC" -eq 1 ]] || fail "$PROBE_CODE must exit 1, got $PROBE_RC"
+    ok "probe-repo --json on a host with no usable restic reports $PROBE_CODE, exit 1"
+else
+    PROBE_OUTCOME="$(jq -r '.data.outcome' "$OUT_FILE")"
+    [[ "$(jq -r '.ok' "$OUT_FILE")" == "true" ]] \
+        || fail "probe-repo --json reported an error envelope for outcome=$PROBE_OUTCOME"
+    case "$PROBE_OUTCOME" in
+        reachable) [[ "$PROBE_RC" -eq 0 ]] || fail "probe-repo reachable must exit 0, got $PROBE_RC" ;;
+        offline)   [[ "$PROBE_RC" -eq 3 ]] || fail "probe-repo offline must exit 3, got $PROBE_RC" ;;
+        error)     [[ "$PROBE_RC" -eq 1 ]] || fail "probe-repo error must exit 1, got $PROBE_RC" ;;
+        *)         fail "probe-repo --json reported an unknown outcome: $PROBE_OUTCOME" ;;
+    esac
+    [[ "$(jq -r '.data.reachable' "$OUT_FILE")" == "$([[ "$PROBE_OUTCOME" == "reachable" ]] && echo true || echo false)" ]] \
+        || fail "probe-repo's reachable flag disagrees with its outcome"
+    # The optional field is present as an explicit null, never omitted.
+    jq -e 'has("reason")' <<<"$(jq -c '.data' "$OUT_FILE")" >/dev/null \
+        || fail "probe-repo --json omitted the reason key instead of encoding null"
+    ok "probe-repo --json maps every outcome to a success envelope and its exit code"
+fi
+
+RESTIC_STATION_DATA_DIR="$HEALTHY" run_helper_split config validate --json
+[[ "$(jq -r '.data.nothingRunsHere' "$OUT_FILE")" == "false" ]] \
+    || fail "config validate --json did not report that something runs here"
+jq -e '.data.effective.sets | length >= 1' "$OUT_FILE" >/dev/null \
+    || fail "config validate --json carried no effective plan"
+
+# secret list reports presence, never values — the reason it can have a JSON
+# mode at all. Asserted structurally, not just by the end-of-run grep.
+RESTIC_STATION_DATA_DIR="$HEALTHY" run_helper_split secret list --json
+jq -e '[.data[] | keys] | flatten | unique | inside(["destId","label","setName","hasPassword","secretEnvCount"])' \
+    "$OUT_FILE" >/dev/null \
+    || fail "secret list --json grew a field beyond presence metadata: $(jq -c '.data' "$OUT_FILE")"
+# Both modes list the same destinations. JSON mode used to serialize every
+# configured destination, including the ones with nothing stored, while
+# human mode filtered them — so an empty store answered `[]` to a person
+# and a full array of "has nothing" rows to a script.
+jq -e 'all(.data[]; .hasPassword or .secretEnvCount > 0)' "$OUT_FILE" >/dev/null \
+    || fail "secret list --json listed a destination with nothing stored: $(jq -c '.data' "$OUT_FILE")"
+# Nothing is stored in this fixture, so both modes must say so — `[]` and
+# the sentence, not a row per configured destination.
+[[ "$(jq -r '.data | length' "$OUT_FILE")" -eq 0 ]] \
+    || fail "secret list --json listed destinations from a store with nothing in it: $(jq -c '.data' "$OUT_FILE")"
+RESTIC_STATION_DATA_DIR="$HEALTHY" run_helper_split secret list
+grep -q "no destination has a stored password" "$OUT_FILE" \
+    || fail "secret list (human) did not report an empty store: $(cat "$OUT_FILE")"
+
+# ...and with one stored, both modes list exactly it. The two counts are
+# what caught the divergence: JSON mode served every configured destination
+# while human mode filtered, so the modes disagreed about the result set.
+printf '%s' "$SECRET_PASSWORD" \
+    | RESTIC_STATION_DATA_DIR="$HEALTHY" "$HELPER" secret set --dest "$PRIMARY_ID" >>"$COMBINED_LOG" 2>&1 \
+    || fail "could not store a password in the healthy fixture"
+RESTIC_STATION_DATA_DIR="$HEALTHY" run_helper_split secret list --json
+JSON_ROWS="$(jq -r '.data | length' "$OUT_FILE")"
+[[ "$JSON_ROWS" -eq 1 ]] || fail "secret list --json listed $JSON_ROWS destinations, expected 1"
+jq -e --arg id "$PRIMARY_ID" '.data[0] | .destId == $id and .hasPassword' "$OUT_FILE" >/dev/null \
+    || fail "secret list --json did not report the stored password: $(jq -c '.data' "$OUT_FILE")"
+RESTIC_STATION_DATA_DIR="$HEALTHY" run_helper_split secret list
+HUMAN_ROWS="$(grep -c "$PRIMARY_ID" "$OUT_FILE" || true)"
+[[ "$JSON_ROWS" -eq "$HUMAN_ROWS" ]] \
+    || fail "secret list listed $HUMAN_ROWS destinations to a human and $JSON_ROWS to a script"
+RESTIC_STATION_DATA_DIR="$HEALTHY" "$HELPER" secret rm --dest "$PRIMARY_ID" >>"$COMBINED_LOG" 2>&1 \
+    || fail "could not remove the fixture password again"
+ok "payloads carry what they claim, secret list --json stays presence-only and agrees with human mode"
 
 # ─────────────────────────────────────────────────────────────────────────
 # 6. THE secret-leak check: every byte this script's helper invocations

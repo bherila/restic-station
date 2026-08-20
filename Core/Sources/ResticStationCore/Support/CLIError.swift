@@ -518,10 +518,15 @@ extension CLIFailure {
     /// The path stays in `message` and out of `details` — a data-directory
     /// path carries a home directory, and `details` is the half of the
     /// envelope that promises to be safe to log.
-    public static func machineIdentityUnreadable(path: String, underlying: any Error) -> CLIFailure {
-        CLIFailure(
+    /// `underlying` is optional because one caller reaches this having
+    /// already decided the identity is unusable without holding the error
+    /// that says why — and a message that names the file is still the right
+    /// answer there, just a shorter one.
+    public static func machineIdentityUnreadable(path: String, underlying: (any Error)? = nil) -> CLIFailure {
+        let reason = underlying.map { ": \($0)" } ?? ""
+        return CLIFailure(
             code: .configInvalid,
-            message: bounded("could not read this machine's identity (\(path)): \(underlying)")
+            message: bounded("could not read this machine's identity (\(path))\(reason)")
         )
     }
 
@@ -722,6 +727,45 @@ extension CLIFailure {
                 diagnosticReference: diagnosticReference
             )
         )
+    }
+}
+
+// MARK: - CLISuccessEnvelope
+
+/// The exact document a `--json` command writes to stdout when it succeeds
+/// (`docs/cli-json.md`, issue #79).
+///
+/// ```json
+/// { "schemaVersion": 1, "ok": true, "data": { … } }
+/// ```
+///
+/// Deliberately the same three top-level keys as ``CLIErrorEnvelope``, with
+/// `data` where that has `error`. A caller reads `ok` once and knows which
+/// key to look in — it never has to probe for the presence of `error`, and
+/// never has to know which command it called to know the shape.
+///
+/// **This replaced a bare payload**, so it is a breaking change for anyone
+/// who was reading `.health` rather than `.data.health`. The migration note
+/// is in `docs/cli-json.md` §Migrating from the unwrapped shape.
+public struct CLISuccessEnvelope<Payload: Encodable>: Encodable {
+
+    /// Shared with ``CLIErrorEnvelope/schemaVersion`` on purpose: the two
+    /// are one contract with two branches, and a caller that has pinned
+    /// `schemaVersion: 1` has pinned both. Bumping one without the other
+    /// would mean a document whose version says nothing about half the
+    /// shapes it can take.
+    public static var schemaVersion: Int { CLIErrorEnvelope.schemaVersion }
+
+    public let schemaVersion: Int
+    /// Always `true`. Present so `ok` is the single discriminator rather
+    /// than "does an `error` key exist".
+    public let ok: Bool
+    public let data: Payload
+
+    public init(_ data: Payload) {
+        self.schemaVersion = Self.schemaVersion
+        self.ok = true
+        self.data = data
     }
 }
 

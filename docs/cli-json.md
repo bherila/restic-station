@@ -1,4 +1,4 @@
-# The `--json` error envelope
+# The `--json` contract
 
 **Normative.** The contract in this document is what automated callers of
 `restic-station-helper` are entitled to rely on. Implemented by
@@ -19,7 +19,59 @@ Rather than allocate a new exit code per failure — which would break every
 existing caller — the precise classification moves into the JSON payload and
 **the exit code stays exactly what it always was**.
 
-## The envelope
+## The two envelopes
+
+Every `--json` command emits exactly one document with the same three
+top-level keys. `ok` is the only discriminator a caller needs — it never has
+to probe for the presence of a key, and never has to know which command it
+called to know the shape.
+
+```json
+{ "schemaVersion": 1, "ok": true,  "data":  { … } }
+{ "schemaVersion": 1, "ok": false, "error": { … } }
+```
+
+`schemaVersion` covers both branches: they are one contract, and a caller
+that has pinned `1` has pinned both.
+
+The wrapping happens in one place (`CLIJSON.print`), which is what stops it
+from being something each command has to remember. `config export` is the
+single deliberate exception — it emits the exported `config.json` document
+itself, unwrapped, because its output is meant to be fed straight back into
+`config import`.
+
+## Command matrix
+
+| Command | `--json` | Payload (`data`) |
+|---|---|---|
+| `version` | ✅ | `{ name, version, platform }` |
+| `status` | ✅ | `StatusReport` — see `data-model.md` §`status --json` |
+| `sets list` | ✅ | array of set entries — `data-model.md` §`sets list --json` |
+| `runs list` | ✅ | array of `RunIndexEntry` |
+| `runs show <id>` | ✅ | `RunMetadata` |
+| `config show` | ✅ | effective-config report |
+| `config validate` | ✅ | `{ machineId, errors, warnings, effective, nothingRunsHere }` |
+| `probe-repo` | ✅ | `{ setId, destinationId, label, outcome, reachable, reason }` |
+| `secret list` | ✅ | array of `{ destId, label, setName, hasPassword, secretEnvCount }` — only destinations that have something stored, the same set human mode prints |
+| `cli status` | ✅ | `CLIInstaller.Status` |
+| `fda-check` | ✅ | `{ applicable, granted, probedPath, checkedAt, context }` |
+| `config export` | — | **Unwrapped by design.** The exported config document itself, so it round-trips into `config import`. |
+| `timer status` (Linux) | — | **Human-only.** Its report is narrative assembled while probing; the machine-readable equivalent is `status --json`'s `.scheduler`, in the same problem vocabulary. |
+| `print-password` | — | Hidden; exists for `RESTIC_PASSWORD_COMMAND` and writes a secret to stdout. |
+| `tick`, `run-set`, `restore`, `init-secondary`, `unlock`, `config import`, `secret set`/`set-env`/`rm`, `cli install`/`uninstall`, `timer install`/`uninstall` | — | Mutating, not inspection. Progress is a human/log concern; the machine-readable record of what happened is the run record (`runs show --json`). |
+
+Two payload notes that are easy to get wrong:
+
+- **`probe-repo` reports offline as a success.** `outcome: "offline"` with
+  `ok: true` and exit 3. An unplugged drive is a destination's expected
+  state, not a fault — an error envelope would make a sleeping NAS
+  indistinguishable from a broken config. Branch on `outcome`.
+- **`fda-check` has three states, not two.** Off macOS, `applicable` is
+  `false` and `granted` is `null`. A caller must check `applicable` before
+  reading `granted`, exactly as an absent `state/fda-check.json` means
+  *unknown* rather than *denied*.
+
+## The error branch
 
 On a handled failure in `--json` mode, stdout contains exactly one document:
 
@@ -45,7 +97,7 @@ never match on it. `details` is omitted entirely when empty.
 | `code` | `retryable` | exit | Meaning |
 |---|---|---|---|
 | `invalid_arguments` | no | 64 / 1 | Arguments missing, malformed, or out of range. See §Argument-parser failures for the two exit codes. |
-| `config_invalid` | no | 1 | A configuration file on this host will not load — `config.json` undecodable, failing `validate()`, or written by a newer build; or `machine.json` unreadable. `message` names which. |
+| `config_invalid` | no | 1 | A configuration file on this host will not load — `config.json` undecodable, failing `validate()`, or written by a newer build; `machine.json` unreadable; or `RESTIC_STATION_SECRET_BACKEND` naming a backend that does not exist. `message` names which. |
 | `set_not_found` | no | 1 | No backup set with that id. |
 | `set_disabled_here` | no | 1 | The set exists in the shared config but is switched off for this machine. |
 | `destination_not_found` | no | 1 | No such destination in that set. |
@@ -168,15 +220,37 @@ code alone.
 
 ## Coverage today
 
-`status`, `sets list`, `runs list`, `runs show`, and `config show`. The
-remaining commands are human-only and still write prose to stderr; #79 converts
-them as it gives them their own `--json`. That boundary is stated here rather
-than papered over.
+Eleven commands, listed in the matrix above. The mutating commands remain
+human-only and still write prose to stderr — the boundary is stated in the
+matrix rather than papered over.
 
 Two codes have no producer yet — `repository_offline` (#79 wires the
 reachability probe) and `operation_not_allowed` (the engine invariants refuse
 before throwing). They are defined because the mapping is settled, and their
 absence is asserted, not assumed.
+
+## Migrating from the unwrapped shape
+
+Before this contract, the five commands that had `--json` emitted their
+payload bare: `status --json` was the `StatusReport` object itself, and
+`sets list --json` was a bare array. Every one of them is now wrapped.
+
+The migration is mechanical — prefix the path:
+
+```console
+# before
+$ restic-station-helper status --json | jq -r '.health'
+$ restic-station-helper sets list --json | jq 'length'
+
+# after
+$ restic-station-helper status --json | jq -r '.data.health'
+$ restic-station-helper sets list --json | jq '.data | length'
+```
+
+This was a deliberate break rather than an additive `schemaVersion` key.
+Two shapes coexisting — some commands wrapped, some bare, arrays unable to
+carry a version at all — would have been permanent, and the alternative cost
+is one `.data` in each caller while the tool is pre-1.0.
 
 ## Versioning
 

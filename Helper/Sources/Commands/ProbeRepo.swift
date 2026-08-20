@@ -5,11 +5,11 @@ import ResticStationCore
 /// `probe-repo --set <uuid> --dest <uuid>` — an on-demand reachability
 /// probe (the app's manual "check now" action; also what `tick` does for
 /// every destination every 30 minutes, inline).
-struct ProbeRepo: AsyncParsableCommand {
+struct ProbeRepo: AsyncParsableCommand, JSONRenderable {
     static let configuration = CommandConfiguration(
         commandName: "probe-repo",
         abstract: "Probe one destination's reachability and record the result. "
-            + "Exit 0 reachable, 3 offline, 1 error."
+            + "--json for scripting. Exit 0 reachable, 3 offline, 1 error."
     )
 
     @Option(name: .long, help: "The backup set's UUID.")
@@ -18,16 +18,60 @@ struct ProbeRepo: AsyncParsableCommand {
     @Option(name: .long, help: "The destination UUID to probe.")
     var dest: UUID
 
+    @Flag(name: .long, help: "Emit JSON. Only JSON reaches stdout in this mode.")
+    var json = false
+
+    /// `probe-repo --json`'s shape — see `docs/cli-json.md`.
+    ///
+    /// **Offline is reported as a success, not as an error envelope.** An
+    /// unplugged drive is the expected state of a destination, not a fault,
+    /// and the exit code (3) already says so. Wrapping it as a failure would
+    /// make a caller treat "your NAS is asleep" the same as "your config is
+    /// broken". `outcome` is the field to branch on.
+    struct Report: Encodable {
+        enum Outcome: String, Encodable {
+            case reachable
+            case offline
+            case error
+        }
+        let setId: UUID
+        let destinationId: UUID
+        let label: String
+        let outcome: Outcome
+        let reachable: Bool
+        /// Why, when `outcome` is not `reachable`. Never a repository URL
+        /// or a credential — it is `Reachability`'s own bounded reason.
+        let reason: String?
+
+        // Explicit `null`, never an omitted key: that is the convention
+        // every other `--json` shape follows (`docs/data-model.md`
+        // §Encoding conventions), and the synthesized encoder would use
+        // `encodeIfPresent` and drop it.
+        private enum CodingKeys: String, CodingKey {
+            case setId, destinationId, label, outcome, reachable, reason
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(setId, forKey: .setId)
+            try container.encode(destinationId, forKey: .destinationId)
+            try container.encode(label, forKey: .label)
+            try container.encode(outcome, forKey: .outcome)
+            try container.encode(reachable, forKey: .reachable)
+            try container.encode(reason, forKey: .reason)
+        }
+    }
+
     func run() async throws {
         let context = try await HelperContext.make()
         // Repository utilities address every repository in the shared config,
         // including sets this machine does not back up (T24): `addressable`,
         // not `scheduled`.
         guard let backupSet = context.addressable.set(id: set) else {
-            HelperExit.fail("no backup set with id \(set)")
+            throw CLIFailure.setNotFound(setId: set)
         }
         guard let destination = backupSet.destinations.first(where: { $0.id == dest }) else {
-            HelperExit.fail("destination \(dest) does not belong to backup set \(set)")
+            throw CLIFailure.destinationNotFound(setId: set, destinationId: dest)
         }
 
         let probe = await context.reachability.probe(destination)
@@ -51,16 +95,39 @@ struct ProbeRepo: AsyncParsableCommand {
             FileHandle.standardError.write(Data("probe-repo: could not write repo-status: \(error)\n".utf8))
         }
 
+        let outcome: Report.Outcome
+        let reason: String?
+        let exitCode: Int32
         switch probe {
         case .reachable:
-            print("\"\(destination.label)\": reachable")
-            HelperExit.code(0)
-        case .offline(let reason):
-            print("\"\(destination.label)\": offline — \(reason)")
-            HelperExit.code(3)
+            (outcome, reason, exitCode) = (.reachable, nil, HelperExitCode.ok.rawValue)
+        case .offline(let text):
+            (outcome, reason, exitCode) = (.offline, text, HelperExitCode.offline.rawValue)
         case .error(let exitClass):
-            print("\"\(destination.label)\": error — \(exitClass.userFacingMessage)")
-            HelperExit.code(1)
+            (outcome, reason, exitCode) = (.error, exitClass.userFacingMessage, HelperExitCode.error.rawValue)
         }
+
+        if json {
+            CLIJSON.print(
+                Report(
+                    setId: set,
+                    destinationId: destination.id,
+                    label: destination.label,
+                    outcome: outcome,
+                    reachable: outcome == .reachable,
+                    reason: reason
+                )
+            )
+        } else {
+            switch outcome {
+            case .reachable:
+                print("\"\(destination.label)\": reachable")
+            case .offline:
+                print("\"\(destination.label)\": offline — \(reason ?? "")")
+            case .error:
+                print("\"\(destination.label)\": error — \(reason ?? "")")
+            }
+        }
+        HelperExit.code(exitCode)
     }
 }

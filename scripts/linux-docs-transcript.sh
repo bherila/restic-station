@@ -153,11 +153,11 @@ STATUS_JSON="$(restic-station-helper status --json)"
 echo "$STATUS_JSON" | jq . >/dev/null 2>&1
 
 run restic-station-helper runs list
-RUN_ID="$(restic-station-helper runs list --json | jq -r '[.[] | select(.kind=="backup")][0].runId')"
+RUN_ID="$(restic-station-helper runs list --json | jq -r '.data | [.[] | select(.kind=="backup")][0].runId')"
 printf '\n(runId captured for the next command: %s)\n' "$RUN_ID"
 run restic-station-helper runs show "$RUN_ID" --log
 
-SNAPSHOT_ID="$(restic-station-helper runs show "$RUN_ID" --json | jq -r '.snapshotId')"
+SNAPSHOT_ID="$(restic-station-helper runs show "$RUN_ID" --json | jq -r '.data.snapshotId')"
 
 # ===========================================================================
 section "Restore"
@@ -355,7 +355,7 @@ printf '%s' 'fire-check-password' \
 RESTIC_PASSWORD_COMMAND="$BIN_DIR/restic-station-helper print-password --dest $FIRE_PRIMARY_ID" \
     RESTIC_STATION_DATA_DIR="$FIRE_DATA" restic -r "$FIRE_REPO" init >/dev/null
 
-BEFORE=$(RESTIC_STATION_DATA_DIR="$FIRE_DATA" restic-station-helper runs list --json | jq 'length')
+BEFORE=$(RESTIC_STATION_DATA_DIR="$FIRE_DATA" restic-station-helper runs list --json | jq '.data | length')
 echo
 echo "runs recorded for \"Fire Check\" before installing its timer: $BEFORE (expect 0)"
 JOURNAL_START="$(date --iso-8601=seconds)"
@@ -378,7 +378,7 @@ ELAPSED=0
 while [[ $ELAPSED -lt $WAIT_SECONDS ]]; do
     sleep 10
     ELAPSED=$((ELAPSED + 10))
-    AFTER=$(RESTIC_STATION_DATA_DIR="$FIRE_DATA" restic-station-helper runs list --json | jq 'length' 2>/dev/null || echo "$BEFORE")
+    AFTER=$(RESTIC_STATION_DATA_DIR="$FIRE_DATA" restic-station-helper runs list --json | jq '.data | length' 2>/dev/null || echo "$BEFORE")
     SERVICE_STARTS=$(service_start_count)
     printf '  t=+%3ds  service starts=%s  backup runs=%s\n' "$ELAPSED" "$SERVICE_STARTS" "$AFTER"
     if [[ "$AFTER" -gt "$BEFORE" ]]; then
@@ -443,11 +443,11 @@ if [[ "$STATUS_RC" -ne 1 ]]; then
     echo "expected 1. This is the exact 'green while broken' failure issue #46 tracked."
     exit 1
 fi
-echo "$SCHED_JSON" | jq -e '.scheduler.healthy == false' >/dev/null || {
+echo "$SCHED_JSON" | jq -e '.data | .scheduler.healthy == false' >/dev/null || {
     echo "REGRESSION: status --json did not report the scheduler as unhealthy"
     exit 1
 }
-echo "$SCHED_JSON" | jq -e '.scheduler.problems | index("unitsMissing")' >/dev/null || {
+echo "$SCHED_JSON" | jq -e '.data | .scheduler.problems | index("unitsMissing")' >/dev/null || {
     echo "REGRESSION: status --json did not name unitsMissing as the reason"
     exit 1
 }
@@ -477,7 +477,7 @@ section "Monitoring: a killed run does not leave the host reporting healthy fore
 # run id points at a run directory that does not exist, which is the same
 # thing a killed run looks like once its metadata has been recovered.
 FIRE_SET_ID="$(RESTIC_STATION_DATA_DIR="$FIRE_DATA" restic-station-helper status --json \
-    | jq -r '.sets[0].id')"
+    | jq -r '.data.sets[0].id')"
 WRECKAGE="$FIRE_DATA/state/current-run-$FIRE_SET_ID.json"
 cat >"$WRECKAGE" <<JSON
 {
@@ -498,18 +498,18 @@ echo "--- a current-run file whose process is gone (updatedAt is *now*, so no ti
 echo "    heuristic would catch it) ---"
 WRECK_RC=0
 WRECK_JSON="$(RESTIC_STATION_DATA_DIR="$FIRE_DATA" restic-station-helper status --json)" || WRECK_RC=$?
-echo "$WRECK_JSON" | jq '{health, sets: [.sets[] | {name, isRunning, needsAttention, abandonedRun}]}'
+echo "$WRECK_JSON" | jq '.data | {health, sets: [.sets[] | {name, isRunning, needsAttention, abandonedRun}]}'
 echo "exit $WRECK_RC"
 echo
-echo "$WRECK_JSON" | jq -e '.health == "warning"' >/dev/null || {
-    echo "REGRESSION: an abandoned run left health as $(echo "$WRECK_JSON" | jq -r .health), not warning"
+echo "$WRECK_JSON" | jq -e '.data | .health == "warning"' >/dev/null || {
+    echo "REGRESSION: an abandoned run left health as $(echo "$WRECK_JSON" | jq -r '.data.health'), not warning"
     exit 1
 }
-echo "$WRECK_JSON" | jq -e '.sets[0].isRunning == false' >/dev/null || {
+echo "$WRECK_JSON" | jq -e '.data | .sets[0].isRunning == false' >/dev/null || {
     echo "REGRESSION: an abandoned run still reports isRunning"
     exit 1
 }
-echo "$WRECK_JSON" | jq -e '.sets[0].abandonedRun != null' >/dev/null || {
+echo "$WRECK_JSON" | jq -e '.data | .sets[0].abandonedRun != null' >/dev/null || {
     echo "REGRESSION: the abandoned run was discarded rather than reported"
     exit 1
 }

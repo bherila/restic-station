@@ -19,21 +19,36 @@ import Testing
 @Suite("--json mode detection")
 struct JSONModeDetectionTests {
 
+    /// The complete set of `--json`-capable commands, and the same list
+    /// `docs/cli-json.md`'s matrix publishes. A new `--json` command that
+    /// forgets the `JSONRenderable` conformance shows up here as a missing
+    /// entry rather than as silent prose on stdout when it fails.
+    ///
+    /// `timer status` is deliberately absent — it is Linux-only and
+    /// documented as human-only, its machine-readable equivalent being
+    /// `status --json`'s `.scheduler` object.
+    static let jsonCapable: [[String]] = [
+        ["version", "--json"],
+        ["status", "--json"],
+        ["sets", "list", "--json"],
+        ["runs", "list", "--json"],
+        ["runs", "show", "some-run-id", "--json"],
+        ["config", "show", "--json"],
+        ["config", "validate", "--json"],
+        [
+            "probe-repo", "--set", "00000000-0000-0000-0000-000000000001",
+            "--dest", "00000000-0000-0000-0000-000000000002", "--json",
+        ],
+        ["secret", "list", "--json"],
+        ["cli", "status", "--json"],
+        ["fda-check", "--json"],
+    ]
+
     @Test("every command with a --json flag reports it through JSONRenderable")
-    func theFiveAreRenderable() throws {
+    func everyJSONCommandIsRenderable() throws {
         // Parsed rather than constructed: this asserts the flag is actually
         // wired to the protocol, which a hand-built instance would not.
-        // The list is the whole set of `--json` commands today; #79 extends
-        // it, and a new `--json` command that forgets the conformance shows
-        // up here as a missing entry rather than as silent prose on stdout.
-        let invocations: [[String]] = [
-            ["status", "--json"],
-            ["sets", "list", "--json"],
-            ["runs", "list", "--json"],
-            ["runs", "show", "some-run-id", "--json"],
-            ["config", "show", "--json"],
-        ]
-        for argv in invocations {
+        for argv in Self.jsonCapable {
             let command = try HelperMain.parseAsRoot(argv)
             #expect(
                 command is JSONRenderable,
@@ -45,16 +60,13 @@ struct JSONModeDetectionTests {
 
     @Test("the same commands report human mode without the flag")
     func withoutTheFlagTheyAreHuman() throws {
-        let invocations: [[String]] = [
-            ["status"],
-            ["sets", "list"],
-            ["runs", "list"],
-            ["runs", "show", "some-run-id"],
-            ["config", "show"],
-        ]
-        for argv in invocations {
-            let command = try HelperMain.parseAsRoot(argv)
-            #expect(!HelperOutput.wantsJSON(command))
+        for argv in Self.jsonCapable {
+            let human = argv.filter { $0 != "--json" }
+            let command = try HelperMain.parseAsRoot(human)
+            #expect(
+                !HelperOutput.wantsJSON(command),
+                "\(human.joined(separator: " ")) reported JSON mode without the flag"
+            )
         }
     }
 
@@ -214,7 +226,12 @@ struct CommandFailureClassificationTests {
         setenv("RESTIC_STATION_DATA_DIR", directory.path, 1)
         defer { unsetenv("RESTIC_STATION_DATA_DIR") }
 
-        for argv in [["sets", "list"], ["status"], ["config", "show"]] {
+        // `secret list` is in this list because it reaches its config
+        // through `SecretContext.make()`, not `HelperContext.make()` —
+        // entering a password has to work before restic is configured — so
+        // it had a second setup path with its own `HelperExit.fail` and kept
+        // answering a broken config with an empty stdout.
+        for argv in [["sets", "list"], ["status"], ["config", "show"], ["secret", "list"]] {
             var command = try #require(HelperMain.parseAsRoot(argv) as? any AsyncParsableCommand)
             do {
                 try await command.run()

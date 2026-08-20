@@ -65,7 +65,7 @@ struct Tick: AsyncParsableCommand {
             return
         }
         let context: HelperContext
-        switch await HelperContext.makeTolerant(
+        switch try await HelperContext.makeTolerant(
             paths: paths,
             views: views,
             configStore: configStore
