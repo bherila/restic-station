@@ -162,6 +162,7 @@ public struct KeychainSecretStore: SecretStore {
         try await runner.run(
             argv,
             env: nil,
+            stdin: nil,
             currentDirectory: nil,
             onStdoutLine: nil,
             onStderrLine: nil,

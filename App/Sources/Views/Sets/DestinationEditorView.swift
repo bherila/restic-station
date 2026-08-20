@@ -234,6 +234,29 @@ struct DestinationEditorView: View {
         Section {
             TextField("Repository URL", text: $rawURL, prompt: Text(kind.rawURLPlaceholder))
                 .monospaced()
+            if kind == .sftp {
+                Toggle("Run pack reclamation on this SSH host", isOn: Binding(
+                    get: { draft.remoteMaintenance?.enabled ?? false },
+                    set: { enabled in
+                        var remote = draft.remoteMaintenance ?? RemoteMaintenance()
+                        remote.enabled = enabled
+                        draft.remoteMaintenance = remote
+                    }
+                ))
+                if draft.remoteMaintenance?.enabled == true {
+                    TextField("SSH target", text: remoteMaintenanceBinding(\.sshTarget))
+                        .monospaced()
+                    TextField("Remote repository path", text: remoteMaintenanceBinding(\.remoteRepoPath))
+                        .monospaced()
+                    TextField("Remote restic path", text: Binding(
+                        get: { draft.remoteMaintenance?.remoteResticPath ?? "restic" },
+                        set: { value in
+                            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                            draft.remoteMaintenance?.remoteResticPath = trimmed.isEmpty ? nil : trimmed
+                        }
+                    )).monospaced()
+                }
+            }
         } header: {
             Text(kind.title)
         } footer: {
@@ -296,6 +319,11 @@ struct DestinationEditorView: View {
             HStack(spacing: 12) {
                 Button("Test connection") { testConnection() }
                     .disabled(busy != nil)
+
+                if kind == .sftp, draft.remoteMaintenance?.enabled == true {
+                    Button("Test remote maintenance") { testRemoteMaintenance() }
+                        .disabled(busy != nil)
+                }
 
                 // Prominent exactly when the probe said the repository is
                 // missing (ui-spec: "surface Initialize prominently").
@@ -388,6 +416,9 @@ struct DestinationEditorView: View {
             get: { kind },
             set: { newKind in
                 kind = newKind
+                if newKind != .sftp {
+                    draft.remoteMaintenance = nil
+                }
                 probe = nil
                 message = nil
             }
@@ -474,6 +505,18 @@ struct DestinationEditorView: View {
         self.set.destinations.contains { $0.id != draft.id && $0.kind == .s3 }
     }
 
+    private func remoteMaintenanceBinding(
+        _ keyPath: WritableKeyPath<RemoteMaintenance, String?>
+    ) -> Binding<String> {
+        Binding(
+            get: { draft.remoteMaintenance?[keyPath: keyPath] ?? "" },
+            set: { value in
+                let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                draft.remoteMaintenance?[keyPath: keyPath] = trimmed.isEmpty ? nil : trimmed
+            }
+        )
+    }
+
     // MARK: - Actions
 
     private func openMachineOverrides() {
@@ -514,6 +557,20 @@ struct DestinationEditorView: View {
             probe = nil
             guard let updated = await commitDraft(), persistSet(updated) else { return }
             probe = await model.probeDestination(setId: updated.id, destId: draft.id)
+        }
+    }
+
+    private func testRemoteMaintenance() {
+        Task {
+            busy = .testingRemoteMaintenance
+            defer { busy = nil }
+            guard let updated = await commitDraft(), persistSet(updated) else { return }
+            switch await model.testRemoteMaintenance(setId: updated.id, destId: draft.id) {
+            case .available(let text):
+                message = .success(text)
+            case .failed(let text):
+                message = .error(text)
+            }
         }
     }
 
@@ -648,12 +705,14 @@ struct DestinationEditorView: View {
 
     enum BusyKind: Equatable {
         case testing
+        case testingRemoteMaintenance
         case initializing
         case saving
 
         var label: String {
             switch self {
             case .testing: return "Probing the repository…"
+            case .testingRemoteMaintenance: return "Testing SSH and remote restic…"
             case .initializing: return "Initializing…"
             case .saving: return "Saving…"
             }

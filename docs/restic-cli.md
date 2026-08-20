@@ -34,6 +34,16 @@ Everything in this document was **verified against restic 0.18.1 on macOS (arm64
 - Add `--json` to every command that supports it. `check` and `unlock` have no JSON mode — capture text.
 - Never pass `--no-lock`.
 
+## Remote maintenance
+
+For an `sftp:` destination whose `remoteMaintenance.enabled` is true,
+standalone pack reclamation runs on the SSH host. Restic Station invokes SSH
+with BatchMode, strict host-key acceptance, and a 15-second connection limit;
+the remote login shell receives every operand single-quote escaped. The
+repository password is written only to SSH stdin and remote restic reads it
+with `-p /dev/stdin`. If SSH or remote restic is unavailable, prune fails; it
+never falls back to a local network prune. Rewrite remains local.
+
 ## Exit codes (verified)
 
 | Code | Meaning | Category (see architecture.md) |

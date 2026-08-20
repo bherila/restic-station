@@ -29,6 +29,38 @@ private func makeValidConfig() -> AppConfig {
         try makeValidConfig().validate()
     }
 
+    @Test("remote maintenance is sftp-only")
+    func remoteMaintenanceRequiresSFTP() {
+        var config = makeValidConfig()
+        let destinationId = config.sets[0].destinations[0].id
+        config.sets[0].destinations[0].remoteMaintenance = RemoteMaintenance(enabled: true)
+        #expect(throws: ConfigError.remoteMaintenanceRequiresSFTP(destinationId: destinationId)) {
+            try config.validate()
+        }
+    }
+
+    @Test("remote maintenance operands and mode bind a prune confirmation")
+    func remoteMaintenanceChangesPruneConfirmationFingerprint() {
+        var destination = Destination(
+            id: UUID(),
+            label: "SFTP",
+            repoURL: "sftp:backup@example:/srv/restic",
+            isPrimary: true,
+            remoteMaintenance: RemoteMaintenance(enabled: true)
+        )
+        let baseline = destination.pruneConfirmationFingerprint(secretEnv: [:])
+        var targetChanged = destination
+        targetChanged.remoteMaintenance?.sshTarget = "other@example"
+        #expect(targetChanged.pruneConfirmationFingerprint(secretEnv: [:]) != baseline)
+        var resticChanged = destination
+        resticChanged.remoteMaintenance?.remoteResticPath = "/opt/restic"
+        #expect(resticChanged.pruneConfirmationFingerprint(secretEnv: [:]) != baseline)
+        destination.remoteMaintenance?.remoteRepoPath = "/srv/other"
+        #expect(destination.pruneConfirmationFingerprint(secretEnv: [:]) != baseline)
+        destination.remoteMaintenance?.enabled = false
+        #expect(destination.pruneConfirmationFingerprint(secretEnv: [:]) != baseline)
+    }
+
     // Invariant 1: exactly one primary.
 
     @Test func zeroPrimariesThrows() {

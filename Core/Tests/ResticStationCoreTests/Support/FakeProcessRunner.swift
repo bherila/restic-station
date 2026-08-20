@@ -43,7 +43,7 @@ final class FakeProcessRunner: ProcessRunning, @unchecked Sendable {
 
     private let lock = NSLock()
     private var _script: [Expectation]
-    private var _invocations: [(argv: [String], env: [String: String]?)] = []
+    private var _invocations: [(argv: [String], env: [String: String]?, stdin: Data?)] = []
 
     init(script: [Expectation] = []) {
         self._script = script
@@ -54,7 +54,7 @@ final class FakeProcessRunner: ProcessRunning, @unchecked Sendable {
         set { withLock { _script = newValue } }
     }
 
-    private(set) var invocations: [(argv: [String], env: [String: String]?)] {
+    private(set) var invocations: [(argv: [String], env: [String: String]?, stdin: Data?)] {
         get { withLock { _invocations } }
         set { withLock { _invocations = newValue } }
     }
@@ -62,12 +62,13 @@ final class FakeProcessRunner: ProcessRunning, @unchecked Sendable {
     func run(
         _ argv: [String],
         env: [String: String]?,
+        stdin: Data?,
         currentDirectory: String?,
         onStdoutLine: (@Sendable (String) -> Void)?,
         onStderrLine: (@Sendable (String) -> Void)?,
         timeout: TimeInterval?
     ) async throws -> ProcessResult {
-        withLock { _invocations.append((argv, env)) }
+        withLock { _invocations.append((argv, env, stdin)) }
 
         guard let expectation = withLock({ () -> Expectation? in
             guard !_script.isEmpty else { return nil }

@@ -277,6 +277,9 @@ public struct Destination: Codable, Equatable, Identifiable, Sendable {
     /// Per-machine overrides, keyed by `MachineConfig.machineId` (schema v2).
     /// `nil`, or no entry for this machine, means inherit and use.
     public var machines: [String: DestinationMachineOverride]?
+    /// Optional sftp-only settings for running pack reclamation beside the
+    /// repository rather than streaming packs back to this host.
+    public var remoteMaintenance: RemoteMaintenance?
 
     public init(
         id: UUID,
@@ -284,7 +287,8 @@ public struct Destination: Codable, Equatable, Identifiable, Sendable {
         repoURL: String,
         isPrimary: Bool,
         nonSecretEnv: [String: String] = [:],
-        machines: [String: DestinationMachineOverride]? = nil
+        machines: [String: DestinationMachineOverride]? = nil,
+        remoteMaintenance: RemoteMaintenance? = nil
     ) {
         self.id = id
         self.label = label
@@ -292,10 +296,11 @@ public struct Destination: Codable, Equatable, Identifiable, Sendable {
         self.isPrimary = isPrimary
         self.nonSecretEnv = nonSecretEnv
         self.machines = machines
+        self.remoteMaintenance = remoteMaintenance
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, label, repoURL, isPrimary, nonSecretEnv, machines
+        case id, label, repoURL, isPrimary, nonSecretEnv, machines, remoteMaintenance
     }
 
     // `machines` uses `encodeIfPresent` for the same reason as
@@ -309,6 +314,7 @@ public struct Destination: Codable, Equatable, Identifiable, Sendable {
         try container.encode(isPrimary, forKey: .isPrimary)
         try container.encode(nonSecretEnv, forKey: .nonSecretEnv)
         try container.encodeIfPresent(machines, forKey: .machines)
+        try container.encodeIfPresent(remoteMaintenance, forKey: .remoteMaintenance)
     }
 
     /// Derived from `repoURL`'s scheme prefix. Not encoded.
@@ -331,7 +337,36 @@ public struct Destination: Codable, Equatable, Identifiable, Sendable {
     }
 }
 
+/// Remote sftp maintenance settings. Nil operands inherit the corresponding
+/// component from `sftp:user@host:/repository`; callers fail closed when that
+/// URL cannot supply a required value.
+public struct RemoteMaintenance: Codable, Equatable, Sendable {
+    public var enabled: Bool
+    public var sshTarget: String?
+    public var remoteRepoPath: String?
+    public var remoteResticPath: String?
+
+    public init(enabled: Bool = false, sshTarget: String? = nil, remoteRepoPath: String? = nil, remoteResticPath: String? = nil) {
+        self.enabled = enabled
+        self.sshTarget = sshTarget
+        self.remoteRepoPath = remoteRepoPath
+        self.remoteResticPath = remoteResticPath
+    }
+}
+
 public extension Destination {
+    func remoteMaintenanceOperands() -> (sshTarget: String, repoPath: String, resticPath: String)? {
+        guard kind == .sftp else { return nil }
+        let configured = remoteMaintenance ?? RemoteMaintenance()
+        let raw = String(repoURL.dropFirst("sftp:".count))
+        let split = raw.firstIndex(of: ":")
+        let parsedTarget = split.map { String(raw[..<$0]) }
+        let parsedPath = split.map { String(raw[raw.index(after: $0)...]) }
+        guard let sshTarget = configured.sshTarget ?? parsedTarget, !sshTarget.isEmpty,
+              let repoPath = configured.remoteRepoPath ?? parsedPath, !repoPath.isEmpty else { return nil }
+        return (sshTarget, repoPath, configured.remoteResticPath ?? "restic")
+    }
+
     /// The repository identity a maintenance preview authorizes. Local paths
     /// are resolved before binding so a symlink retarget between preview and
     /// confirmation invalidates the capability instead of redirecting prune
@@ -368,6 +403,18 @@ public extension Destination {
             let nonSecretEnv: [String: String]
             let secretEnv: [String: String]
             let executableIdentity: String?
+            let remoteMaintenance: RemoteMaintenanceBinding?
+        }
+
+        /// Bind every value that changes the remote command, but omit dormant
+        /// settings when maintenance is off: they cannot affect a local
+        /// prune. Enabled-but-unparseable settings encode nil operands so the
+        /// binding remains fail-closed until configuration is corrected.
+        struct RemoteMaintenanceBinding: Codable {
+            let enabled: Bool
+            let sshTarget: String?
+            let repoPath: String?
+            let resticPath: String?
         }
 
         let encoder = JSONEncoder()
@@ -376,7 +423,15 @@ public extension Destination {
             repoURL: pruneRepositoryURL(),
             nonSecretEnv: nonSecretEnv,
             secretEnv: secretEnv,
-            executableIdentity: executableIdentity
+            executableIdentity: executableIdentity,
+            remoteMaintenance: remoteMaintenance?.enabled == true
+                ? RemoteMaintenanceBinding(
+                    enabled: true,
+                    sshTarget: remoteMaintenanceOperands()?.sshTarget,
+                    repoPath: remoteMaintenanceOperands()?.repoPath,
+                    resticPath: remoteMaintenanceOperands()?.resticPath
+                )
+                : nil
         )
         // Encoding an in-memory String dictionary cannot fail in practice;
         // fail closed with an impossible-to-match fingerprint if it ever did.
@@ -534,6 +589,7 @@ public struct CheckPolicy: Codable, Equatable, Sendable {
 
 /// Errors thrown by `AppConfig.validate()` and `ConfigStore`.
 public enum ConfigError: Error, Equatable, Sendable, CustomStringConvertible {
+    case remoteMaintenanceRequiresSFTP(destinationId: UUID)
     /// `config.version` is greater than `AppConfig.currentVersion` — refuse
     /// to load a config written by a newer build.
     case newerVersion(found: Int, supported: Int)
@@ -564,6 +620,8 @@ public enum ConfigError: Error, Equatable, Sendable, CustomStringConvertible {
 
     public var description: String {
         switch self {
+        case .remoteMaintenanceRequiresSFTP(let destinationId):
+            return "destination \(destinationId) enables remote maintenance but is not an sftp repository"
         case .newerVersion(let found, let supported):
             return "config written by a newer Restic Station (version \(found), this build supports up to \(supported))"
         case .notExactlyOnePrimaryDestination(let setId, let count):
@@ -625,6 +683,9 @@ extension AppConfig {
                     throw ConfigError.duplicateIdentifier(destination.id)
                 }
                 seenIDs.insert(destination.id)
+                if destination.remoteMaintenance?.enabled == true, destination.kind != .sftp {
+                    throw ConfigError.remoteMaintenanceRequiresSFTP(destinationId: destination.id)
+                }
             }
 
             // Invariant 3: sources non-empty; every source absolute.

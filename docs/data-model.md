@@ -93,8 +93,16 @@ public struct Destination: Codable, Equatable, Identifiable {
     public var isPrimary: Bool
     public var nonSecretEnv: [String: String]  // extra env, non-secret only
     public var machines: [String: DestinationMachineOverride]?  // v2; nil = used everywhere
+    public var remoteMaintenance: RemoteMaintenance? // sftp-only remote prune settings
 
     public var kind: DestinationKind { /* derived, not encoded */ }
+}
+
+public struct RemoteMaintenance: Codable, Equatable {
+    public var enabled: Bool
+    public var sshTarget: String?       // default: target parsed from sftp URL
+    public var remoteRepoPath: String?  // default: path parsed from sftp URL
+    public var remoteResticPath: String? // default: "restic"
 }
 
 // Per-machine overrides (v2). Keyed by MachineConfig.machineId.

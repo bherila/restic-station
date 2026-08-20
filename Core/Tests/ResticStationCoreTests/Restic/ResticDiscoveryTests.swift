@@ -63,6 +63,7 @@ import Testing
         func run(
             _ argv: [String],
             env: [String: String]?,
+            stdin: Data?,
             currentDirectory: String?,
             onStdoutLine: (@Sendable (String) -> Void)?,
             onStderrLine: (@Sendable (String) -> Void)?,

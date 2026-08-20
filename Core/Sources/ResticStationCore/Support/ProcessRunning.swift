@@ -48,11 +48,34 @@ public protocol ProcessRunning: Sendable {
     func run(
         _ argv: [String],
         env: [String: String]?,
+        stdin: Data?,
         currentDirectory: String?,
         onStdoutLine: (@Sendable (String) -> Void)?,
         onStderrLine: (@Sendable (String) -> Void)?,
         timeout: TimeInterval?
     ) async throws -> ProcessResult
+}
+
+public extension ProcessRunning {
+    /// Convenience for the overwhelmingly common no-stdin subprocess.
+    func run(
+        _ argv: [String],
+        env: [String: String]?,
+        currentDirectory: String?,
+        onStdoutLine: (@Sendable (String) -> Void)?,
+        onStderrLine: (@Sendable (String) -> Void)?,
+        timeout: TimeInterval?
+    ) async throws -> ProcessResult {
+        try await run(
+            argv,
+            env: env,
+            stdin: nil,
+            currentDirectory: currentDirectory,
+            onStdoutLine: onStdoutLine,
+            onStderrLine: onStderrLine,
+            timeout: timeout
+        )
+    }
 }
 
 /// Production `ProcessRunning` implementation backed by `Foundation.Process`
@@ -65,6 +88,7 @@ public struct DefaultProcessRunner: ProcessRunning {
     public func run(
         _ argv: [String],
         env: [String: String]?,
+        stdin: Data?,
         currentDirectory: String?,
         onStdoutLine: (@Sendable (String) -> Void)?,
         onStderrLine: (@Sendable (String) -> Void)?,
@@ -86,8 +110,10 @@ public struct DefaultProcessRunner: ProcessRunning {
 
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
+        let stdinPipe = Pipe()
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
+        process.standardInput = stdinPipe
 
         // Termination is observed via `terminationHandler` (delivered on an
         // internal Foundation queue), NEVER `waitUntilExit()`: waitUntilExit
@@ -107,6 +133,10 @@ public struct DefaultProcessRunner: ProcessRunning {
         } catch {
             throw ProcessRunnerError.launchFailed(String(describing: error))
         }
+        if let stdin {
+            stdinPipe.fileHandleForWriting.write(stdin)
+        }
+        try? stdinPipe.fileHandleForWriting.close()
 
         // Plain `Task`s (not `async let`) so they can be captured by the
         // nested task-group closure below.
