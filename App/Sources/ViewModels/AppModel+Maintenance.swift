@@ -707,7 +707,10 @@ final class MaintenanceModel: ObservableObject {
         let iCloudRoot = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Mobile Documents", isDirectory: true)
             .path
-        let path = (destination.repoURL as NSString).standardizingPath
+        let path = URL(fileURLWithPath: destination.repoURL)
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+            .path
         return path == iCloudRoot || path.hasPrefix(iCloudRoot + "/")
     }
 

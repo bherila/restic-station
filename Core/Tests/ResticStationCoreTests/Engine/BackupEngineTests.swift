@@ -1271,21 +1271,38 @@ struct BackupEngineTests {
         #expect(env.entries(kind: .prune).count == 1)
     }
 
-    @Test("standalone prune: a stale mirror is never touched")
+    @Test("standalone prune: a stale mirror is never touched or consumes its preview token")
     func standalonePruneRefusesStaleMirror() async throws {
         let env = Self.makeEnv(script: [], retention: nil)
         defer { env.cleanUp() }
         let mirror = env.secondaries[0]
+        let fingerprint = mirror.pruneConfirmationFingerprint(secretEnv: [:])
+        let token = try PreviewTokenStore(paths: env.paths).issueMaintenancePrune(
+            machineId: env.machineId,
+            setId: env.set.id,
+            destinationId: mirror.id,
+            effectiveDestinationFingerprint: fingerprint
+        )
+        let authorization = MaintenancePruneAuthorization(
+            token: token,
+            machineId: env.machineId,
+            effectiveDestinationFingerprint: fingerprint
+        )
         try env.stateStore.updateRepoStatus(destId: env.primary.id) { $0.lastSyncedAt = Self.t0 }
         try env.stateStore.updateRepoStatus(destId: mirror.id) {
             $0.lastSyncedAt = Self.t0.addingTimeInterval(-1)
         }
 
-        let status = await env.engine.runPruneRepository(set: env.set, destination: mirror)
+        let status = await env.engine.runPruneRepository(
+            set: env.set,
+            destination: mirror,
+            authorization: authorization
+        )
 
         #expect(status == .skipped(.staleMirror))
         #expect(env.fake.invocations.isEmpty)
         #expect(env.entries(kind: .prune).isEmpty)
+        #expect(try PreviewTokenStore(paths: env.paths).token(token).value == token)
     }
 
     @Test("standalone prune: dry run never spawns a modifying restic command")

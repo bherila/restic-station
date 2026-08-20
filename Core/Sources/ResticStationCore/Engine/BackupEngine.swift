@@ -653,20 +653,6 @@ public final class BackupEngine: Sendable {
         defer { lock.release() }
         defer { try? stateStore.clearCurrentRun(setId: set.id) }
 
-        if let authorization {
-            do {
-                try previewTokens.consumeMaintenancePrune(
-                    authorization.token,
-                    machineId: authorization.machineId,
-                    setId: set.id,
-                    destinationId: destination.id,
-                    effectiveDestinationFingerprint: authorization.effectiveDestinationFingerprint
-                )
-            } catch {
-                return .skipped(.previewChanged)
-            }
-        }
-
         // Read both timestamps only while the set lock is held. A backup can
         // advance the primary and leave a mirror behind, so checking before
         // lock acquisition would create a prune-after-stale race.
@@ -682,7 +668,10 @@ public final class BackupEngine: Sendable {
             }
         }
 
-        let probe = await reachability.probe(destination)
+        let probe = await reachability.probe(
+            destination,
+            destinationSecretEnv: destinationSecretEnv
+        )
         record(probe: probe, for: destination)
         switch probe {
         case .reachable:
@@ -720,6 +709,32 @@ public final class BackupEngine: Sendable {
             }
         }
 
+        let previewValidation: (@Sendable (LogWriter?) async -> String?)?
+        if let authorization {
+            let previewTokens = previewTokens
+            let token = authorization.token
+            let machineId = authorization.machineId
+            let effectiveDestinationFingerprint = authorization.effectiveDestinationFingerprint
+            let setId = set.id
+            let destinationId = destination.id
+            previewValidation = { _ in
+                do {
+                    try previewTokens.consumeMaintenancePrune(
+                        token,
+                        machineId: machineId,
+                        setId: setId,
+                        destinationId: destinationId,
+                        effectiveDestinationFingerprint: effectiveDestinationFingerprint
+                    )
+                    return nil
+                } catch {
+                    return "Destination configuration changed after the reclaim preview. Run a new dry run before pruning."
+                }
+            }
+        } else {
+            previewValidation = nil
+        }
+
         let prune = await performChild(
             kind: .prune,
             setId: set.id,
@@ -732,7 +747,9 @@ public final class BackupEngine: Sendable {
                 destination: destination,
                 destinationSecretEnv: destinationSecretEnv
             ),
-            streamProgress: false
+            streamProgress: false,
+            preflightPhase: authorization == nil ? nil : "validating preview",
+            preflight: previewValidation
         )
         guard let prune else { return .failed(.didNotRun) }
         guard prune.child.status == .failed else { return .completed(prune.child.status) }

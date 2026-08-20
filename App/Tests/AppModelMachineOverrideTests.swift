@@ -33,6 +33,27 @@ struct AppModelMachineOverrideTests {
         #expect(binding == "preview-binding")
     }
 
+    @Test("reclaim plan recognizes repositories reached through an iCloud symlink")
+    func reclaimPlanRecognizesICloudSymlink() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-icloud-link-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let iCloudRoot = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Mobile Documents", isDirectory: true)
+        let alias = root.appendingPathComponent("repository-alias", isDirectory: true)
+        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: iCloudRoot)
+        let destination = Destination(
+            id: UUID(),
+            label: "iCloud repository",
+            repoURL: alias.appendingPathComponent("restic", isDirectory: true).path,
+            isPrimary: true
+        )
+
+        #expect(MaintenanceModel.isICloudRepository(destination))
+    }
+
     @Test("known machines and effective-plan preview include exclusions and replacements")
     func effectivePlanPreview() throws {
         let setId = UUID()
