@@ -234,6 +234,18 @@ struct DestinationEditorView: View {
         Section {
             TextField("Repository URL", text: $rawURL, prompt: Text(kind.rawURLPlaceholder))
                 .monospaced()
+            if kind == .sftp {
+                Toggle("Run pack reclamation on this SSH host", isOn: Binding(
+                    get: { draft.remoteMaintenance?.enabled ?? false },
+                    set: { enabled in draft.remoteMaintenance = RemoteMaintenance(enabled: enabled) }
+                ))
+                if draft.remoteMaintenance?.enabled == true {
+                    TextField("Remote restic path", text: Binding(
+                        get: { draft.remoteMaintenance?.remoteResticPath ?? "restic" },
+                        set: { value in draft.remoteMaintenance?.remoteResticPath = value }
+                    )).monospaced()
+                }
+            }
         } header: {
             Text(kind.title)
         } footer: {
