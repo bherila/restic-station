@@ -87,20 +87,29 @@ struct HelperContext {
     /// loads config from disk (a hard I/O/decode/version error → exit 1),
     /// then resolves a restic path (unresolvable → exit 1 with
     /// `resticNotFoundMessage`).
-    static func make() async -> HelperContext {
+    ///
+    /// Throws ``CLIFailure`` rather than exiting, so the failure can be
+    /// rendered as a JSON envelope for a caller that asked for one
+    /// (`docs/cli-json.md`). The exit codes and the human wording are
+    /// unchanged — `resticNotFoundMessage` still builds the prose, and the
+    /// classification is derived from the same discovery result it reads.
+    static func make() async throws -> HelperContext {
         let paths = AppPaths.default()
         let configStore = ConfigStore(paths: paths)
         let views: Views
         do {
             views = try loadViews(paths: paths, configStore: configStore)
         } catch {
-            HelperExit.fail("could not load configuration: \(error)")
+            throw CLIFailure.configInvalid(underlying: error)
         }
         switch await makeTolerant(paths: paths, views: views, configStore: configStore) {
         case .ready(let context):
             return context
         case .noRestic(let result):
-            HelperExit.fail(resticNotFoundMessage(paths: paths, result: result))
+            throw CLIFailure.resticUnavailable(
+                result: result,
+                message: resticNotFoundMessage(paths: paths, result: result)
+            )
         }
     }
 

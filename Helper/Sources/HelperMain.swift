@@ -1,7 +1,79 @@
 import ArgumentParser
+import ResticStationCore
 
 @main
 struct HelperMain: AsyncParsableCommand {
+
+    /// Replaces the `main()` `AsyncParsableCommand` synthesizes, which is
+    /// reproduced verbatim below apart from the two `catch` clauses.
+    ///
+    /// Taking it over is what makes an **argument-parser failure**
+    /// classifiable at all: `run()` is never reached for one, so a command
+    /// cannot report it no matter how it is written. It is also what keeps
+    /// human mode byte-identical — anything this does not deliberately own
+    /// is handed straight back to `exit(withError:)`, which is what prints
+    /// usage text, exits `--help` cleanly with 0, and exits usage errors
+    /// with `EX_USAGE`.
+    ///
+    /// `parsed` is captured so the failure path can ask the command the user
+    /// actually invoked whether it wanted JSON, instead of guessing.
+    /// - Note: the **synchronous** `parseAsRoot()`, not the `asyncParseAsRoot()`
+    ///   the synthesized `main()` uses. `any ParsableCommand` is not
+    ///   `Sendable`, and Swift 6.1 — the toolchain the `linux` CI job builds
+    ///   with — rejects awaiting a non-Sendable result from a nonisolated
+    ///   context. (6.3 accepts it, so this compiles locally and fails only in
+    ///   CI; ArgumentParser's own copy is exempt because the library itself
+    ///   builds in a different language mode.) The two parse paths differ
+    ///   only in supporting async *shell completions*, and this project
+    ///   declares no custom completions at all, so nothing is given up.
+    static func main() async {
+        var parsed: ParsableCommand?
+        do {
+            var command = try parseAsRoot()
+            parsed = command
+            if var asyncCommand = command as? AsyncParsableCommand {
+                try await asyncCommand.run()
+            } else {
+                try command.run()
+            }
+        } catch let failure as CLIFailure {
+            // Rendered here in **both** modes, never handed to
+            // `exit(withError:)`: that would print ArgumentParser's
+            // `Error: <the struct>` rather than the sentence these commands
+            // have always written to stderr.
+            HelperOutput.renderFailure(failure, json: Self.wantsJSON(parsed))
+        } catch {
+            // `--help` and other clean exits are not failures, whatever mode
+            // the caller asked for. Checked first so `status --json --help`
+            // still prints help rather than an envelope claiming success is
+            // an error.
+            let exitCode = Self.exitCode(for: error)
+            guard exitCode != ExitCode.success, Self.wantsJSON(parsed) else {
+                Self.exit(withError: error)
+            }
+
+            if parsed == nil {
+                // Parsing itself failed. `message(for:)` is the one-line
+                // reason without the usage block, which is what belongs in
+                // a JSON `message`; the exit code stays whatever
+                // ArgumentParser would have used, so both modes agree on it.
+                HelperOutput.renderFailure(
+                    .invalidArguments(Self.message(for: error)),
+                    json: true,
+                    exitCode: exitCode.rawValue
+                )
+            }
+            HelperOutput.renderFailure(CLIFailure.classify(error), json: true)
+        }
+    }
+
+    /// Whether the caller asked for JSON: the parsed command is the
+    /// authority, and argv is only consulted when parsing never produced
+    /// one. See ``HelperOutput/argvRequestsJSON(_:)``.
+    private static func wantsJSON(_ parsed: ParsableCommand?) -> Bool {
+        parsed.map(HelperOutput.wantsJSON) ?? HelperOutput.argvRequestsJSON()
+    }
+
     /// A computed property, not `static let`: the printed name depends on
     /// `CommandLine.arguments`, which is not available until the process
     /// has actually started.

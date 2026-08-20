@@ -96,6 +96,16 @@ public struct Reachability: Sendable {
                 // file backend does not record "keychain locked"; the
                 // keychain backend's string is unchanged from before T23.
                 return .offline(reason: restic.secretBackend.unavailableProbeReason)
+            case .secretsNotConfigured:
+                // Not environmental: nothing is stored, and no amount of
+                // waiting changes that. Still `.offline` rather than
+                // `.error` because `.error` carries a `ResticExitClass` and
+                // restic never ran — inventing `wrongPassword` here would
+                // publish an exit code that did not happen. The reason
+                // string is deliberately outside `SetsBadges`'s
+                // environmental list, so the badge reads "Error" (needs
+                // attention) rather than "Offline" (try later).
+                return .offline(reason: "no password stored for this destination")
             case .timedOut:
                 return .offline(reason: "timed out")
             case .launchFailed(let reason):

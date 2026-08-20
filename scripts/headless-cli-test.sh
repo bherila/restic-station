@@ -24,6 +24,11 @@
 #      grepped for the fixture secret value at the very end.
 #   7. Exit-code contract (0 ok / 1 error) spot-checked for the new
 #      subcommands on both the happy and unhappy path.
+#   8. A failing `--json` command emits exactly one error envelope on
+#      stdout with the documented `error.code` (issue #81,
+#      `docs/cli-json.md`), human mode is unchanged, and a nonzero exit
+#      that is *not* a failure — `status --json` on a warning — still
+#      emits its report rather than an envelope.
 #
 # Usage:
 #   scripts/headless-cli-test.sh [path-to-restic-station-helper]
@@ -70,6 +75,20 @@ run_helper() {
     RC=$?
     set -e
     cat "$OUT_FILE" >>"$COMBINED_LOG"
+}
+
+# Same as `run_helper`, but keeps the two streams apart in $OUT_FILE and
+# $ERR_FILE. Needed by section 8: "exactly one JSON document on stdout" is
+# only a claim about stdout, and `run_helper` merges stderr into it.
+ERR_FILE="$WORK/last-stderr"
+run_helper_split() {
+    OUT_FILE="$WORK/out-$$-$RANDOM"
+    ERR_FILE="$WORK/err-$$-$RANDOM"
+    set +e
+    "$HELPER" "$@" >"$OUT_FILE" 2>"$ERR_FILE"
+    RC=$?
+    set -e
+    cat "$OUT_FILE" "$ERR_FILE" >>"$COMBINED_LOG"
 }
 
 expect_rc() {
@@ -658,6 +677,96 @@ EOF
     ok "config export of a set with a stored password does not leak it"
     unset RESTIC_STATION_DATA_DIR
 fi
+
+# ─────────────────────────────────────────────────────────────────────────
+# 8. The --json error envelope (issue #81, docs/cli-json.md).
+#
+#    Before this, a --json command that failed wrote prose to stderr and
+#    left stdout completely empty — a caller that had already committed to
+#    `jq` got nothing at all. What is asserted here is the part the Swift
+#    tests cannot reach: the real binary's real streams and real exit codes.
+# ─────────────────────────────────────────────────────────────────────────
+log "8. --json failures emit one error envelope on stdout"
+
+ENVELOPE_DATA="$WORK/envelope-data"
+mkdir -p "$ENVELOPE_DATA"
+echo 'not valid json{{{' > "$ENVELOPE_DATA/config.json"
+
+# `runs list` is deliberately absent: it reads only runs/index.jsonl and
+# never loads config.json, so an unloadable config is not a failure for it —
+# it correctly reports an empty history and exits 0. Its own failure path is
+# asserted separately below.
+for CMD in "status" "sets list" "config show"; do
+    # shellcheck disable=SC2086
+    RESTIC_STATION_DATA_DIR="$ENVELOPE_DATA" run_helper_split $CMD --json
+    expect_rc 1
+    jq -e . "$OUT_FILE" >/dev/null 2>&1 \
+        || fail "\`$CMD --json\` on a broken config did not put one JSON document on stdout"
+    [[ "$(jq -r '.error.code' "$OUT_FILE")" == "config_invalid" ]] \
+        || fail "\`$CMD --json\` reported $(jq -r '.error.code' "$OUT_FILE"), expected config_invalid"
+    [[ "$(jq -r '.ok' "$OUT_FILE")" == "false" ]] || fail "\`$CMD --json\` did not set ok=false"
+    [[ "$(jq -r '.schemaVersion' "$OUT_FILE")" == "1" ]] || fail "\`$CMD --json\` did not pin schemaVersion 1"
+    [[ "$(jq -r '.error.retryable' "$OUT_FILE")" == "false" ]] \
+        || fail "\`$CMD --json\` marked an invalid config retryable"
+done
+ok "every --json command reports an unloadable config.json as config_invalid, exit 1"
+
+# `runs list`'s own classified failure: its --limit check is hand-written
+# rather than an ArgumentParser `validate()` throw, specifically so it exits
+# 1 rather than 64. That makes it the one invalid_arguments case carrying the
+# ordinary exit code, and both halves are worth pinning.
+run_helper_split runs list --limit 0 --json
+expect_rc 1
+[[ "$(jq -r '.error.code' "$OUT_FILE")" == "invalid_arguments" ]] \
+    || fail "runs list --limit 0 --json did not report invalid_arguments"
+ok "runs list --limit 0 --json is invalid_arguments at exit 1, not exit 64"
+
+# `runs show` takes an operand, so it is spelled out rather than folded into
+# the loop above — and it exercises a different code on the way.
+RESTIC_STATION_DATA_DIR="$ENVELOPE_DATA" run_helper_split runs show no-such-run-id --json
+expect_rc 1
+[[ "$(jq -r '.error.code' "$OUT_FILE")" == "run_not_found" ]] \
+    || fail "runs show <unknown> --json did not report run_not_found"
+[[ "$(jq -r '.error.details.runId' "$OUT_FILE")" == "no-such-run-id" ]] \
+    || fail "run_not_found did not carry the runId in details"
+ok "runs show <unknown-id> --json reports run_not_found with the id in details"
+
+# Human mode is unchanged: prose on stderr, nothing on stdout, same code.
+RESTIC_STATION_DATA_DIR="$ENVELOPE_DATA" run_helper_split sets list
+expect_rc 1
+[[ ! -s "$OUT_FILE" ]] || fail "human mode wrote to stdout on failure"
+grep -q 'could not load configuration' "$ERR_FILE" \
+    || fail "human mode stopped printing the load error to stderr"
+ok "human mode still writes prose to stderr and leaves stdout empty"
+
+# An argument-parser failure never reaches run(), so only the custom main()
+# can classify it. Both modes must agree on the exit code — ArgumentParser's
+# own EX_USAGE (64), not the 1 that invalid_arguments otherwise implies.
+run_helper_split runs show --json
+expect_rc 64
+jq -e '.error.code == "invalid_arguments"' "$OUT_FILE" >/dev/null \
+    || fail "a parse failure in --json mode did not produce an invalid_arguments envelope"
+run_helper_split runs show
+expect_rc 64
+[[ ! -s "$OUT_FILE" ]] || fail "a parse failure in human mode wrote to stdout"
+ok "a parse failure is invalid_arguments in --json mode and keeps exit 64 in both modes"
+
+# --help is a clean exit, not a failure, whatever mode was asked for.
+run_helper_split status --json --help
+expect_rc 0
+grep -q 'OVERVIEW' "$OUT_FILE" || fail "--json --help stopped printing help"
+ok "--json --help still prints help and exits 0"
+
+# THE TRAP: `status --json` exits 1 when health is warning. That is a
+# successful report with a nonzero exit — a Nagios/Icinga check — and must
+# stay a StatusReport, never an error envelope.
+RESTIC_STATION_DATA_DIR="$FAILED" run_helper_split status --json
+expect_rc 1
+jq -e '.sets' "$OUT_FILE" >/dev/null \
+    || fail "status --json stopped emitting a report when health is warning"
+jq -e 'has("error") | not' "$OUT_FILE" >/dev/null \
+    || fail "status --json turned a warning-level report into an error envelope"
+ok "status --json exit 1 on a warning is still a report, not an error envelope"
 
 # ─────────────────────────────────────────────────────────────────────────
 # 6. THE secret-leak check: every byte this script's helper invocations

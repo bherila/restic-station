@@ -19,7 +19,7 @@ struct ProbeRepo: AsyncParsableCommand {
     var dest: UUID
 
     func run() async throws {
-        let context = await HelperContext.make()
+        let context = try await HelperContext.make()
         // Repository utilities address every repository in the shared config,
         // including sets this machine does not back up (T24): `addressable`,
         // not `scheduled`.

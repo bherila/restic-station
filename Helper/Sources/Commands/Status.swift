@@ -16,7 +16,7 @@ import Darwin
 /// `HelperContext`'s doc comment states for resolution: if the CLI computed
 /// "needs attention" itself, it and the app's menu bar could quietly drift
 /// apart on what counts as a warning.
-struct Status: AsyncParsableCommand {
+struct Status: AsyncParsableCommand, JSONRenderable {
     static let configuration = CommandConfiguration(
         commandName: "status",
         abstract: "The headless menu bar: per set, last run outcome+age, next due time, any "
@@ -40,13 +40,13 @@ struct Status: AsyncParsableCommand {
         do {
             config = try configStore.load()
         } catch {
-            HelperExit.fail("could not load configuration: \(error)")
+            throw CLIFailure.configInvalid(underlying: error)
         }
         let machineId: String
         do {
             machineId = try MachineStore(paths: paths).load().machineId
         } catch {
-            HelperExit.fail("could not read this machine's identity (\(paths.machineFile.path)): \(error)")
+            throw CLIFailure.machineIdentityUnreadable(path: paths.machineFile.path, underlying: error)
         }
 
         // `.scheduling`: this is exactly the view `HealthDerivation` is
@@ -83,7 +83,9 @@ struct Status: AsyncParsableCommand {
         do {
             recentRuns = try runStore.recentRuns(limit: .max)
         } catch {
-            HelperExit.fail("could not read the run history (\(paths.runsIndexFile.path)): \(error)")
+            throw CLIFailure.stateUnreadable(
+                "could not read the run history (\(paths.runsIndexFile.path)): \(error)"
+            )
         }
 
         var currentRuns: [UUID: CurrentRunState] = [:]

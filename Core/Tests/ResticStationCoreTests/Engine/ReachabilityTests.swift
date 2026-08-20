@@ -195,6 +195,27 @@ struct ReachabilityTests {
         }
     }
 
+    @Test("remote destination: a destination with no password stored says so")
+    func remoteNoPasswordStoredIsDistinctFromUnreadable() async throws {
+        let dest = Destination(id: Self.destId, label: "R2", repoURL: "s3:https://x/bucket", isPrimary: false)
+        let fake = FakeProcessRunner()
+        // `defaultPassword: nil` is an empty store: `password(destId:)`
+        // raises `itemNotFound`, as a real one does for a destination
+        // nobody has run `secret set` for.
+        let secrets = FakeSecretStore(defaultPassword: nil)
+        let reachability = Self.makeReachability(fake, secrets: secrets)
+
+        let result = await reachability.probe(dest)
+        #expect(result == .offline(reason: "no password stored for this destination"))
+        // Not the unreadable-store reason, whichever backend answered: that
+        // string is on `SetsBadges`'s environmental list and would show this
+        // as "Offline — try later" when the remedy is `secret set`.
+        for backend in SecretBackend.allCases {
+            #expect(result != .offline(reason: backend.unavailableProbeReason))
+        }
+        #expect(fake.invocations.isEmpty)
+    }
+
     @Test("remote destination: launch failure is offline with the launch failure reason")
     func remoteLaunchFailureIsOffline() async throws {
         let dest = Destination(id: Self.destId, label: "R2", repoURL: "s3:https://x/bucket", isPrimary: false)

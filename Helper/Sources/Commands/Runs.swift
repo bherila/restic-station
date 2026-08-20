@@ -13,7 +13,7 @@ struct Runs: AsyncParsableCommand {
 
 // MARK: - runs list
 
-struct RunsList: AsyncParsableCommand {
+struct RunsList: AsyncParsableCommand, JSONRenderable {
     static let configuration = CommandConfiguration(
         commandName: "list",
         abstract: "List recent runs from runs/index.jsonl, newest first. --json for scripting. "
@@ -34,7 +34,7 @@ struct RunsList: AsyncParsableCommand {
         // path exits with ArgumentParser's own usage code (64), not the 0/1
         // contract every subcommand here otherwise honours.
         guard limit > 0 else {
-            HelperExit.fail("--limit must be positive; got \(limit)")
+            throw CLIFailure.invalidArguments("--limit must be positive; got \(limit)")
         }
 
         let paths = AppPaths.default()
@@ -48,7 +48,7 @@ struct RunsList: AsyncParsableCommand {
         do {
             entries = try runStore.recentRuns(setId: set, limit: limit)
         } catch {
-            HelperExit.fail("could not read runs/index.jsonl: \(error)")
+            throw CLIFailure.stateUnreadable("could not read runs/index.jsonl: \(error)")
         }
 
         if json {
@@ -72,7 +72,7 @@ struct RunsList: AsyncParsableCommand {
 
 // MARK: - runs show
 
-struct RunsShow: AsyncParsableCommand {
+struct RunsShow: AsyncParsableCommand, JSONRenderable {
     static let configuration = CommandConfiguration(
         commandName: "show",
         abstract: "Print one run's metadata (runs/<runId>/metadata.json). --log additionally "
@@ -97,7 +97,7 @@ struct RunsShow: AsyncParsableCommand {
         do {
             metadata = try runStore.metadata(runId: runId)
         } catch {
-            HelperExit.fail("could not read run \"\(runId)\": \(error)")
+            throw CLIFailure.runUnreadable(runId: runId, underlying: error)
         }
 
         if json {
@@ -136,7 +136,7 @@ struct RunsShow: AsyncParsableCommand {
         if log {
             let logURL = runStore.logURL(runId: runId)
             guard let data = try? Data(contentsOf: logURL), let text = String(data: data, encoding: .utf8) else {
-                HelperExit.fail("could not read \(logURL.path)")
+                throw CLIFailure.stateUnreadable("could not read \(logURL.path)")
             }
             print("")
             print(text, terminator: text.hasSuffix("\n") ? "" : "\n")

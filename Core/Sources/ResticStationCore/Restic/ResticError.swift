@@ -148,6 +148,19 @@ public enum ResticRunnerError: Error, Equatable, Sendable, CustomStringConvertib
     /// Deliberately carries only the destination id: the backend's own
     /// output is not embedded anywhere it could reach a log.
     case secretsUnavailable(destinationId: UUID)
+    /// The secret store answered, and the answer was that nothing is stored
+    /// for this destination (``SecretStoreError/itemNotFound``).
+    ///
+    /// Split from ``secretsUnavailable`` because the two need opposite
+    /// advice and, before the split, the runner's pre-flight collapsed them:
+    /// a locked keychain unlocks by itself, whereas a destination that never
+    /// had a password stored stays that way until someone runs `secret set`.
+    /// **Terminal**, not retryable — see `docs/architecture.md` §Error
+    /// taxonomy.
+    ///
+    /// Carries only the destination id, for the same reason
+    /// ``secretsUnavailable`` does.
+    case secretsNotConfigured(destinationId: UUID)
     /// The restic binary could not be spawned (missing/not executable).
     case launchFailed(String)
     /// The caller's timeout elapsed. `ProcessRunning` has already sent
@@ -158,6 +171,8 @@ public enum ResticRunnerError: Error, Equatable, Sendable, CustomStringConvertib
         switch self {
         case .secretsUnavailable(let destinationId):
             return "secret store unavailable for destination \(destinationId)"
+        case .secretsNotConfigured(let destinationId):
+            return "no password stored for destination \(destinationId)"
         case .launchFailed(let reason):
             return "failed to launch restic: \(reason)"
         case .timedOut:
@@ -169,7 +184,7 @@ public enum ResticRunnerError: Error, Equatable, Sendable, CustomStringConvertib
         switch self {
         case .secretsUnavailable:
             return .retryable
-        case .launchFailed, .timedOut:
+        case .secretsNotConfigured, .launchFailed, .timedOut:
             return .terminal
         }
     }
@@ -191,6 +206,13 @@ public enum ResticRunnerError: Error, Equatable, Sendable, CustomStringConvertib
             // (`BackupEngine`, `Reachability`) use the store's backend.
             let backend = SecretBackend.configured
             return "\(backend.unavailableSummary) \(backend.unavailableAdvice)"
+        case .secretsNotConfigured:
+            // Deliberately not worded per backend: "nothing is stored" is
+            // the same fact and the same next step whichever store answered,
+            // and naming the store would invite the reader to go looking in
+            // it for something that is not there.
+            return "No password is stored for this destination. "
+                + "Set one in Destinations (or run `restic-station-helper secret set`), then try again."
         case .launchFailed:
             return "The restic program could not be started. "
                 + "Check the restic path in Settings."

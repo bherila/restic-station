@@ -166,9 +166,22 @@ public final class ResticRunner: Sendable {
         } catch {
             // The underlying backend failure text is intentionally dropped
             // here rather than wrapped: it is of no use to the user and this
-            // error string ends up in run logs.
-            throw ResticRunnerError.secretsUnavailable(destinationId: destination.id)
+            // error string ends up in run logs. What is *not* dropped is
+            // which of the two conditions it was — collapsing "the store
+            // could not be read" into "nothing is stored" is what made a
+            // permanently missing password look retryable to every caller
+            // downstream of here.
+            throw Self.runnerError(for: error, destination: destination)
         }
+    }
+
+    /// Which pre-flight failure a secret-store error is, with the backend's
+    /// own text discarded either way.
+    private static func runnerError(for error: any Error, destination: Destination) -> ResticRunnerError {
+        if case SecretStoreError.itemNotFound = error {
+            return .secretsNotConfigured(destinationId: destination.id)
+        }
+        return .secretsUnavailable(destinationId: destination.id)
     }
 
     // MARK: - Environment
@@ -203,8 +216,9 @@ public final class ResticRunner: Sendable {
             return try await secrets.secretEnv(destId: destination.id)
         } catch {
             // Same reasoning as the pre-flight: a secret store that cannot be
-            // read is retryable, and the raw failure text never propagates.
-            throw ResticRunnerError.secretsUnavailable(destinationId: destination.id)
+            // read is retryable, one with nothing in it is not, and the raw
+            // failure text never propagates either way.
+            throw Self.runnerError(for: error, destination: destination)
         }
     }
 
