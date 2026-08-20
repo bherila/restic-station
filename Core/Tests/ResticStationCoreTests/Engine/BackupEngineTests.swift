@@ -1483,6 +1483,39 @@ struct BackupEngineTests {
         #expect(env.fake.invocations.isEmpty)
     }
 
+    @Test("standalone prune: a process launch failure restores its preview token")
+    func standalonePruneLaunchFailureRestoresItsPreviewToken() async throws {
+        let env = Self.makeEnv(script: [], retention: nil)
+        defer { env.cleanUp() }
+        let fingerprint = env.primary.pruneConfirmationFingerprint(secretEnv: [:])
+        let token = try PreviewTokenStore(paths: env.paths).issueMaintenancePrune(
+            machineId: env.machineId,
+            setId: env.set.id,
+            destinationId: env.primary.id,
+            effectiveDestinationFingerprint: fingerprint
+        )
+        env.fake.script = [
+            .init(
+                argvPrefix: [Self.resticPath, "-r", env.primary.repoURL, "prune"],
+                failure: .launchFailed("restic disappeared")
+            ),
+        ]
+
+        let result = await env.engine.runPruneRepository(
+            set: env.set,
+            destination: env.primary,
+            authorization: MaintenancePruneAuthorization(
+                token: token,
+                machineId: env.machineId,
+                effectiveDestinationFingerprint: fingerprint
+            )
+        )
+
+        #expect(result == .failed(.didNotRun))
+        #expect(try PreviewTokenStore(paths: env.paths).token(token).value == token)
+        #expect(env.resticArgvs == [[Self.resticPath, "-r", env.primary.repoURL, "prune"]])
+    }
+
     @Test("standalone prune: an unavailable secret is distinguished from success")
     func standalonePruneReportsSecretUnavailable() async throws {
         let env = Self.makeEnv(secretsUnavailableFor: [Self.primaryId], script: [], retention: nil)

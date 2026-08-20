@@ -719,6 +719,7 @@ public final class BackupEngine: Sendable {
         }
 
         let consumePreviewToken: (@Sendable () throws -> Void)?
+        let restorePreviewToken: (@Sendable () -> Void)?
         if let authorization {
             let previewTokens = previewTokens
             let token = authorization.token
@@ -735,8 +736,21 @@ public final class BackupEngine: Sendable {
                     effectiveDestinationFingerprint: effectiveDestinationFingerprint
                 )
             }
+            restorePreviewToken = {
+                // A restore failure intentionally leaves the token consumed:
+                // retrying a destructive action is never safer than asking
+                // for a fresh preview when capability storage is unavailable.
+                try? previewTokens.restoreMaintenancePrune(
+                    token,
+                    machineId: machineId,
+                    setId: setId,
+                    destinationId: destinationId,
+                    effectiveDestinationFingerprint: effectiveDestinationFingerprint
+                )
+            }
         } else {
             consumePreviewToken = nil
+            restorePreviewToken = nil
         }
 
         let prune = await performChild(
@@ -755,7 +769,8 @@ public final class BackupEngine: Sendable {
             ),
             streamProgress: false,
             preflightPhase: authorization == nil ? nil : "validating preview",
-            beforeLaunch: consumePreviewToken
+            beforeLaunch: consumePreviewToken,
+            afterLaunchFailure: restorePreviewToken
         )
         guard let prune else { return .failed(.didNotRun) }
         switch prune.preflightFailure {
@@ -1339,6 +1354,7 @@ public final class BackupEngine: Sendable {
         preflightPhase: String? = nil,
         preflight: (@Sendable (LogWriter?) async -> PreflightFailure?)? = nil,
         beforeLaunch: (@Sendable () throws -> Void)? = nil,
+        afterLaunchFailure: (@Sendable () -> Void)? = nil,
         downgradeSuccessToWarning: (@Sendable (ResticOutcome) -> Bool)? = nil,
         purgeSnapshotRewrites: (@Sendable (ResticOutcome) -> [String: String]?)? = nil
     ) async -> ChildRun? {
@@ -1400,7 +1416,8 @@ public final class BackupEngine: Sendable {
             invocation: invocation,
             logWriter: logWriter,
             reporter: streamProgress ? reporter : nil,
-            beforeLaunch: beforeLaunch
+            beforeLaunch: beforeLaunch,
+            afterLaunchFailure: afterLaunchFailure
         )
 
         if case .didNotRun(_, let launchPreflightFailure?) = result {
@@ -1497,14 +1514,16 @@ public final class BackupEngine: Sendable {
         invocation: ResticInvocation,
         logWriter: LogWriter?,
         reporter: ProgressReporter?,
-        beforeLaunch: (@Sendable () throws -> Void)? = nil
+        beforeLaunch: (@Sendable () throws -> Void)? = nil,
+        afterLaunchFailure: (@Sendable () -> Void)? = nil
     ) async -> ExecuteResult {
         let first = await spawn(
             command,
             invocation: invocation,
             logWriter: logWriter,
             reporter: reporter,
-            beforeLaunch: beforeLaunch
+            beforeLaunch: beforeLaunch,
+            afterLaunchFailure: afterLaunchFailure
         )
         guard case .ranToCompletion(let outcome) = first, outcome.status == .repoLocked else {
             return first
@@ -1534,7 +1553,8 @@ public final class BackupEngine: Sendable {
         invocation: ResticInvocation,
         logWriter: LogWriter?,
         reporter: ProgressReporter?,
-        beforeLaunch: (@Sendable () throws -> Void)? = nil
+        beforeLaunch: (@Sendable () throws -> Void)? = nil,
+        afterLaunchFailure: (@Sendable () -> Void)? = nil
     ) async -> ExecuteResult {
         do {
             let outcome = try await restic.run(
@@ -1547,7 +1567,8 @@ public final class BackupEngine: Sendable {
                 onRawLine: { line in
                     logWriter?.appendLine(line)
                 },
-                beforeLaunch: beforeLaunch
+                beforeLaunch: beforeLaunch,
+                afterLaunchFailure: afterLaunchFailure
             )
             return .ranToCompletion(outcome)
         } catch let error as PreviewTokenError {
