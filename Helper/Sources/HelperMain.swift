@@ -130,6 +130,7 @@ struct HelperMain: AsyncParsableCommand {
             Tick.self,
             RunSet.self,
             Purge.self,
+            Maintenance.self,
             InitSecondary.self,
             Restore.self,
             ProbeRepo.self,

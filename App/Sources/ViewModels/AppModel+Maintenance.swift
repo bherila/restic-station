@@ -209,10 +209,51 @@ enum RetentionPreviewState: Equatable {
 /// set of snapshots (T17 acceptance criterion: "Confirmation numbers always
 /// come from a fresh dry-run, never from the stale preview").
 struct PrunePlan: Identifiable, Equatable {
+    enum Action: Equatable {
+        case retention
+        case reclaimSpace(destinationId: UUID, label: String, isICloud: Bool)
+    }
+
     let id = UUID()
     let setId: UUID
     let setName: String
     let previews: [DestinationForgetPreview]
+    let action: Action
+
+    init(setId: UUID, setName: String, previews: [DestinationForgetPreview]) {
+        self.setId = setId
+        self.setName = setName
+        self.previews = previews
+        action = .retention
+    }
+
+    init(setId: UUID, setName: String, destination: Destination, isICloud: Bool) {
+        self.setId = setId
+        self.setName = setName
+        previews = []
+        action = .reclaimSpace(destinationId: destination.id, label: destination.label, isICloud: isICloud)
+    }
+
+    var confirmationTitle: String {
+        switch action {
+        case .retention: "Apply retention to \(setName)?"
+        case .reclaimSpace: "Reclaim space from \(setName)?"
+        }
+    }
+
+    var confirmationButton: String {
+        switch action {
+        case .retention: "Delete Snapshots"
+        case .reclaimSpace: "Reclaim Space"
+        }
+    }
+
+    var canConfirm: Bool {
+        switch action {
+        case .retention: totalRemoveCount > 0
+        case .reclaimSpace: true
+        }
+    }
 
     /// Destinations that would actually lose snapshots.
     var affected: [DestinationForgetPreview] {
@@ -234,6 +275,19 @@ struct PrunePlan: Identifiable, Equatable {
     /// one line per destination ("This will permanently delete N snapshots
     /// from <dest>."); the rest satisfies the destructive-confirmation rule.
     var confirmationMessage: String {
+        if case .reclaimSpace(_, let label, let isICloud) = action {
+            var lines = [
+                "This runs restic prune for \(label). It removes only pack data no current snapshot references; it does not change snapshot retention or touch source files.",
+                "Stop other repository activity until it finishes. Prune can take a long time."
+            ]
+            if isICloud {
+                lines.insert(
+                    "This repository is in iCloud Drive. Make sure every repository file is fully downloaded locally — not an evicted Optimize Mac Storage placeholder — before continuing. Prune rewrites pack files and iCloud must download then upload them.",
+                    at: 1
+                )
+            }
+            return lines.joined(separator: "\n\n")
+        }
         var lines: [String] = []
         if affected.isEmpty {
             lines.append("Nothing matches this set's retention policy right now — no snapshots will be deleted.")
@@ -294,6 +348,8 @@ enum MaintenanceAction: Equatable {
 ///   `forget --dry-run` for the preview and for the pre-confirmation
 ///   re-check. Nothing here mutates a repository or writes a run record.
 /// - **Via the helper:** the real `forget --prune` (`run-set --kind prune`),
+///   standalone `prune` (`maintenance prune`; its dry run is an unrecorded
+///   read-only helper query),
 ///   `check` (`run-set --kind check`), and `unlock`. Progress and results
 ///   come back through `StateWatcher`, exactly like "Back Up Now".
 @MainActor
@@ -471,6 +527,35 @@ final class MaintenanceModel: ObservableObject {
         }
     }
 
+    /// **Reclaim space**, step 1: run restic's non-mutating `prune
+    /// --dry-run` through the same helper boundary that will perform the real
+    /// prune. The one shared `prunePlan` confirmation is intentional: a
+    /// destructive action never gets a bypass simply because it leaves
+    /// snapshots in place.
+    func prepareReclaimSpace(for set: BackupSet, destination: Destination, in model: AppModel) {
+        isPreparingPrune = true
+        Task { [weak self] in
+            let result = await model.helper.pruneRepository(setId: set.id, destId: destination.id, dryRun: true)
+            guard let self else { return }
+            self.isPreparingPrune = false
+            guard result.isSuccess else {
+                self.activity = Self.activity(
+                    title: "Check reclaim space",
+                    subject: set.name,
+                    result: result,
+                    run: MaintenanceLookup.lastRun(model, setId: set.id, kind: .prune)
+                )
+                return
+            }
+            self.prunePlan = PrunePlan(
+                setId: set.id,
+                setName: set.name,
+                destination: destination,
+                isICloud: Self.isICloudRepository(destination)
+            )
+        }
+    }
+
     func cancelApplyRetention() {
         prunePlan = nil
     }
@@ -482,17 +567,43 @@ final class MaintenanceModel: ObservableObject {
         prunePlan = nil
         guard let set = MaintenanceLookup.set(model, id: plan.setId) else { return }
         busyAction = .prune(setId: plan.setId)
-        let destIds = set.destinations.map(\.id)
+        let existingPruneRunIds = Set(
+            model.stateWatcher.recentRuns.lazy
+                .filter { $0.kind == .prune && $0.setId == set.id }
+                .map(\.runId)
+        )
+        let destIds: [UUID]
+        let title: String
+        let resultTask: () async -> HelperResult
+        switch plan.action {
+        case .retention:
+            destIds = set.destinations.map(\.id)
+            title = "Apply retention"
+            resultTask = { await model.helper.prune(setId: plan.setId) }
+        case .reclaimSpace(let destinationId, _, _):
+            destIds = [destinationId]
+            title = "Reclaim space"
+            resultTask = { await model.helper.pruneRepository(setId: plan.setId, destId: destinationId, dryRun: false) }
+        }
         Task { [weak self] in
-            let result = await model.helper.prune(setId: plan.setId)
+            let result = await resultTask()
             guard let self else { return }
             self.busyAction = nil
             model.refresh()
+            let latestPrune = MaintenanceLookup.lastRun(model, setId: set.id, kind: .prune)
+            let recordedRun: RunIndexEntry?
+            if let latestPrune,
+               destIds.contains(latestPrune.destId),
+               !existingPruneRunIds.contains(latestPrune.runId) {
+                recordedRun = latestPrune
+            } else {
+                recordedRun = nil
+            }
             self.activity = Self.activity(
-                title: "Apply retention",
+                title: title,
                 subject: set.name,
                 result: result,
-                run: MaintenanceLookup.lastRun(model, setId: set.id, kind: .prune)
+                run: recordedRun
             )
             // Sizes and the keep/remove table both describe a repository
             // that just changed underneath them.
@@ -540,6 +651,13 @@ final class MaintenanceModel: ObservableObject {
             }
         }
         return previews
+    }
+
+    private nonisolated static func isICloudRepository(_ destination: Destination) -> Bool {
+        let iCloudRoot = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Mobile Documents", isDirectory: true)
+            .path
+        return destination.repoURL == iCloudRoot || destination.repoURL.hasPrefix(iCloudRoot + "/")
     }
 
     // MARK: - Integrity

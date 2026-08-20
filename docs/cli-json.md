@@ -57,6 +57,7 @@ itself, unwrapped, because its output is meant to be fed straight back into
 | `fda-check` | ✅ | `{ applicable, granted, probedPath, checkedAt, context }` |
 | `purge preview` | ✅ | array of per-destination purge plans: matched/changed/unattributed snapshots and patterns |
 | `purge apply` | ✅ | `{ setId, status, children }` for the token-gated destructive purge |
+| `maintenance prune` | ✅ | `{ setId, destinationId, label, dryRun, status }` for standalone pack reclamation |
 | `config export` | — | **Unwrapped by design.** The exported config document itself, so it round-trips into `config import`. |
 | `timer status` (Linux) | — | **Human-only.** Its report is narrative assembled while probing; the machine-readable equivalent is `status --json`'s `.scheduler`, in the same problem vocabulary. |
 | `print-password` | — | Hidden; exists for `RESTIC_PASSWORD_COMMAND` and writes a secret to stdout. |

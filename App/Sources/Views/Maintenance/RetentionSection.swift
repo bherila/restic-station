@@ -3,7 +3,8 @@ import SwiftUI
 
 /// Retention (`docs/ui-spec.md` §Maintenance): the set's policy, a
 /// **Preview cleanup** that renders `forget --dry-run` as a keep/remove
-/// table, and **Apply retention now**.
+/// table, **Apply retention now**, and a retention-independent **Reclaim
+/// space** action for packs left behind by a purge rewrite.
 ///
 /// The two halves are deliberately asymmetric, because only one of them
 /// deletes anything:
@@ -30,6 +31,15 @@ struct RetentionSection: View {
         maintenance.isBusy(.prune(setId: backupSet.id))
     }
 
+    private var hasICloudRepository: Bool {
+        let root = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Mobile Documents", isDirectory: true)
+            .path
+        return backupSet.destinations.contains { destination in
+            destination.repoURL == root || destination.repoURL.hasPrefix(root + "/")
+        }
+    }
+
     var body: some View {
         MaintenanceSection(
             "Retention",
@@ -42,17 +52,18 @@ struct RetentionSection: View {
                 policySummary
                 actions
                 previewResult
+                purgePlan
             }
         }
         .alert(
-            "Apply retention to \(backupSet.name)?",
+            maintenance.prunePlan?.confirmationTitle ?? "Confirm maintenance?",
             isPresented: confirmationBinding,
             presenting: maintenance.prunePlan
         ) { plan in
-            Button("Delete Snapshots", role: .destructive) {
+            Button(plan.confirmationButton, role: .destructive) {
                 maintenance.confirmApplyRetention(plan, in: model)
             }
-            .disabled(plan.totalRemoveCount == 0)
+            .disabled(!plan.canConfirm)
             Button("Cancel", role: .cancel) {
                 maintenance.cancelApplyRetention()
             }
@@ -84,40 +95,71 @@ struct RetentionSection: View {
     // MARK: - Actions
 
     private var actions: some View {
-        HStack(spacing: 10) {
-            Button {
-                maintenance.previewCleanup(for: backupSet, in: model)
-            } label: {
-                if case .loading = maintenance.retentionPreview {
-                    HStack(spacing: 6) {
-                        ProgressView().controlSize(.small)
-                        Text("Preview cleanup")
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 10) {
+                Button {
+                    maintenance.previewCleanup(for: backupSet, in: model)
+                } label: {
+                    if case .loading = maintenance.retentionPreview {
+                        HStack(spacing: 6) {
+                            ProgressView().controlSize(.small)
+                            Text("Preview cleanup")
+                        }
+                    } else {
+                        Label("Preview cleanup", systemImage: "eye")
                     }
-                } else {
-                    Label("Preview cleanup", systemImage: "eye")
                 }
-            }
-            .disabled(!hasPolicy || isPreviewing || maintenance.isPreparingPrune)
+                .disabled(!hasPolicy || isPreviewing || maintenance.isPreparingPrune)
+                .help("Preview is read-only. It does not change snapshots or pack storage.")
 
-            Button {
-                maintenance.prepareApplyRetention(for: backupSet, in: model)
-            } label: {
-                if maintenance.isPreparingPrune || isPruning {
-                    HStack(spacing: 6) {
-                        ProgressView().controlSize(.small)
-                        Text(isPruning ? "Cleaning up…" : "Checking…")
+                Button {
+                    maintenance.prepareApplyRetention(for: backupSet, in: model)
+                } label: {
+                    if maintenance.isPreparingPrune || isPruning {
+                        HStack(spacing: 6) {
+                            ProgressView().controlSize(.small)
+                            Text(isPruning ? "Cleaning up…" : "Checking…")
+                        }
+                    } else {
+                        Label("Apply retention now", systemImage: "trash")
                     }
-                } else {
-                    Label("Apply retention now", systemImage: "trash")
                 }
-            }
-            .disabled(!hasPolicy || isPruning || maintenance.isPreparingPrune || isPreviewing)
+                .disabled(!hasPolicy || isPruning || maintenance.isPreparingPrune || isPreviewing)
+                .help("Runs the retention policy. It permanently deletes snapshots the policy no longer keeps.")
 
-            Spacer(minLength: 0)
+                Menu {
+                    ForEach(backupSet.destinations) { destination in
+                        Button {
+                            maintenance.prepareReclaimSpace(for: backupSet, destination: destination, in: model)
+                        } label: {
+                            Text(destination.isPrimary ? "\(destination.label) (Primary)" : destination.label)
+                        }
+                    }
+                } label: {
+                    if maintenance.isPreparingPrune || isPruning {
+                        HStack(spacing: 6) {
+                            ProgressView().controlSize(.small)
+                            Text(isPruning ? "Reclaiming…" : "Checking…")
+                        }
+                    } else {
+                        Label("Reclaim space", systemImage: "externaldrive.badge.minus")
+                    }
+                }
+                .disabled(backupSet.destinations.isEmpty || isPruning || maintenance.isPreparingPrune || isPreviewing)
+                .help("Checks and prunes the selected repository. It frees unreferenced pack data without changing retention.")
+
+                Spacer(minLength: 0)
+            }
+            if hasICloudRepository {
+                Label(
+                    "This repository is in iCloud Drive. Before reclaiming space, fully download every repository file; evicted Optimize Mac Storage placeholders can make restic stall or fail while it rewrites pack files.",
+                    systemImage: "icloud.and.arrow.down"
+                )
+                .font(.caption)
+                .foregroundStyle(.orange)
+                .fixedSize(horizontal: false, vertical: true)
+            }
         }
-        .help(hasPolicy
-            ? "Preview is read-only. Applying deletes snapshots and cannot be undone."
-            : "This backup set keeps every snapshot. Add a retention policy in the set editor first.")
     }
 
     private var isPreviewing: Bool {
@@ -161,6 +203,37 @@ struct RetentionSection: View {
                 ForEach(previews) { preview in
                     ForgetPreviewTable(preview: preview)
                 }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var purgePlan: some View {
+        if backupSet.purgeExcludes.isEmpty {
+            EmptyView()
+        } else {
+            let applied = model.stateWatcher.scheduleState?.sets[backupSet.id]?.appliedPurgeExcludes ?? [:]
+            let pendingDestinations = backupSet.destinations.filter { destination in
+                Set(applied[destination.id] ?? []).isSuperset(of: Set(backupSet.purgeExcludes)) == false
+            }
+            if pendingDestinations.isEmpty {
+                EmptyView()
+            } else {
+                let destinationLabels = pendingDestinations.map(\.label).joined(separator: ", ")
+                VStack(alignment: .leading, spacing: 6) {
+                    Label("Purge exclusions", systemImage: "exclamationmark.triangle")
+                        .font(.headline)
+                        .foregroundStyle(.orange)
+                    Text(
+                        "\(backupSet.purgeExcludes.count) purge exclusion\(backupSet.purgeExcludes.count == 1 ? "" : "s") "
+                            + "remain pending for \(destinationLabels). "
+                            + "The next safe purge rewrites matching historical snapshots before a mirror copy. Rewriting removes their file data; run Reclaim space afterwards to free unused pack storage."
+                    )
+                    .font(.callout)
+                    .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(10)
+                .background(.orange.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
             }
         }
     }

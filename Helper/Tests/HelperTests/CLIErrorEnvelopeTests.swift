@@ -39,6 +39,7 @@ struct JSONModeDetectionTests {
             "probe-repo", "--set", "00000000-0000-0000-0000-000000000001",
             "--dest", "00000000-0000-0000-0000-000000000002", "--json",
         ],
+        ["maintenance", "prune", "--set", "00000000-0000-0000-0000-000000000001", "--json"],
         ["secret", "list", "--json"],
         ["cli", "status", "--json"],
         ["fda-check", "--json"],

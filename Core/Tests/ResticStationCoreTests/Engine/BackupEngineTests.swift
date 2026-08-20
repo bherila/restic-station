@@ -1258,6 +1258,97 @@ struct BackupEngineTests {
         #expect(env.indexEntries.isEmpty)
     }
 
+    @Test("standalone prune: a set with no retention can reclaim primary space")
+    func standalonePruneAllowsNoRetention() async throws {
+        let env = Self.makeEnv(script: [], retention: nil)
+        defer { env.cleanUp() }
+        env.fake.script = Self.resticCall(["-r", env.primary.repoURL, "prune"], dest: Self.primaryId)
+
+        let status = await env.engine.runPruneRepository(set: env.set, destination: env.primary)
+
+        #expect(status == .completed(.success))
+        #expect(env.resticArgvs == [[Self.resticPath, "-r", env.primary.repoURL, "prune"]])
+        #expect(env.entries(kind: .prune).count == 1)
+    }
+
+    @Test("standalone prune: a stale mirror is never touched")
+    func standalonePruneRefusesStaleMirror() async throws {
+        let env = Self.makeEnv(script: [], retention: nil)
+        defer { env.cleanUp() }
+        let mirror = env.secondaries[0]
+        try env.stateStore.updateRepoStatus(destId: env.primary.id) { $0.lastSyncedAt = Self.t0 }
+        try env.stateStore.updateRepoStatus(destId: mirror.id) {
+            $0.lastSyncedAt = Self.t0.addingTimeInterval(-1)
+        }
+
+        let status = await env.engine.runPruneRepository(set: env.set, destination: mirror)
+
+        #expect(status == .skipped(.staleMirror))
+        #expect(env.fake.invocations.isEmpty)
+        #expect(env.entries(kind: .prune).isEmpty)
+    }
+
+    @Test("standalone prune: dry run never spawns a modifying restic command")
+    func standalonePruneDryRunIsReadOnly() async throws {
+        let env = Self.makeEnv(script: [], retention: nil)
+        defer { env.cleanUp() }
+        env.fake.script = Self.resticCall(["-r", env.primary.repoURL, "prune", "--dry-run"], dest: Self.primaryId)
+
+        let status = await env.engine.runPruneRepository(
+            set: env.set,
+            destination: env.primary,
+            dryRun: true
+        )
+
+        #expect(status == .completed(.success))
+        #expect(env.resticArgvs == [[Self.resticPath, "-r", env.primary.repoURL, "prune", "--dry-run"]])
+        #expect(env.resticArgvs.allSatisfy { $0.contains("--dry-run") })
+        #expect(env.entries(kind: .prune).isEmpty, "a preview must not replace the last real prune run")
+    }
+
+    @Test("standalone prune: an unavailable secret is distinguished from success")
+    func standalonePruneReportsSecretUnavailable() async throws {
+        let env = Self.makeEnv(secretsUnavailableFor: [Self.primaryId], script: [], retention: nil)
+        defer { env.cleanUp() }
+
+        let result = await env.engine.runPruneRepository(set: env.set, destination: env.primary)
+
+        #expect(result == .skipped(.secretUnavailable))
+        #expect(env.fake.invocations.isEmpty)
+        #expect(env.entries(kind: .prune).isEmpty)
+    }
+
+    @Test("standalone prune: offline and restic failures retain their classifications")
+    func standalonePruneRetainsFailureClassification() async throws {
+        let offline = Self.makeEnv(script: [], retention: nil, primaryReachable: false)
+        defer { offline.cleanUp() }
+        let offlineResult = await offline.engine.runPruneRepository(set: offline.set, destination: offline.primary)
+        guard case .failed(.offline) = offlineResult else {
+            Issue.record("expected offline result, got \(offlineResult)")
+            return
+        }
+        #expect(offline.fake.invocations.isEmpty)
+
+        let locked = Self.makeEnv(script: [], retention: nil)
+        defer { locked.cleanUp() }
+        var lockedScript = Self.resticCall(
+            ["-r", locked.primary.repoURL, "prune"],
+            dest: Self.primaryId,
+            exitCode: 11
+        )
+        lockedScript += Self.resticCall(["-r", locked.primary.repoURL, "unlock"], dest: Self.primaryId)
+        lockedScript += Self.resticCall(
+            ["-r", locked.primary.repoURL, "prune"],
+            dest: Self.primaryId,
+            exitCode: 11
+        )
+        locked.fake.script = lockedScript
+
+        let lockedResult = await locked.engine.runPruneRepository(set: locked.set, destination: locked.primary)
+
+        #expect(lockedResult == .failed(.restic(.repoLocked)))
+    }
+
     // MARK: - purge preview
 
     /// The destructive path starts with an already-reviewed plan. These
