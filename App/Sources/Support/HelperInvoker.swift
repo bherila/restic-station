@@ -84,7 +84,10 @@ public struct HelperInvoker: Sendable {
         ))
         let result = invocation.result
         guard case .ok = result else {
-            return ReclaimPreviewResult(result: Self.humanResult(result), confirmationBinding: nil)
+            return ReclaimPreviewResult(
+                result: Self.humanResult(result, jsonOutput: invocation.stdout),
+                confirmationBinding: nil
+            )
         }
         guard let decoded = try? JSONDecoder().decode(
             ReclaimPreviewEnvelope.self,
@@ -291,9 +294,10 @@ private extension HelperInvoker {
         }
     }
 
-    static func humanResult(_ result: HelperResult) -> HelperResult {
+    static func humanResult(_ result: HelperResult, jsonOutput: String? = nil) -> HelperResult {
         func message(_ output: String) -> String {
-            (try? JSONDecoder().decode(JSONFailureEnvelope.self, from: Data(output.utf8)))?.error.message ?? output
+            let json = jsonOutput ?? output
+            return (try? JSONDecoder().decode(JSONFailureEnvelope.self, from: Data(json.utf8)))?.error.message ?? output
         }
         return switch result {
         case .ok: result

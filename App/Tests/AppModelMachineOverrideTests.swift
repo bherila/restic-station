@@ -83,6 +83,31 @@ struct AppModelMachineOverrideTests {
         #expect(preview.destinationFingerprint == "public-fingerprint")
     }
 
+    @Test("reclaim preview decodes its JSON failure envelope without stderr diagnostics")
+    func reclaimPreviewUsesStdoutForJSONFailure() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-preview-helper-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let helper = root.appendingPathComponent("helper", isDirectory: false)
+        let script = """
+        #!/bin/sh
+        printf '%s\\n' '{"schemaVersion":1,"ok":false,"data":null,"error":{"code":"stale_mirror","message":"Mirror 1 is behind the primary; run a new backup first."}}'
+        printf '%s\\n' 'diagnostic emitted on stderr' >&2
+        exit 1
+        """
+        try script.write(to: helper, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: helper.path)
+
+        let preview = await HelperInvoker(helperURL: helper).previewReclaimSpace(
+            setId: UUID(),
+            destId: UUID()
+        )
+
+        #expect(preview.result == .failed(output: "Mirror 1 is behind the primary; run a new backup first."))
+        #expect(preview.confirmationBinding == nil)
+    }
+
     @Test("known machines and effective-plan preview include exclusions and replacements")
     func effectivePlanPreview() throws {
         let setId = UUID()
