@@ -88,13 +88,18 @@ public struct HelperInvoker: Sendable {
         guard let decoded = try? JSONDecoder().decode(ReclaimPreviewEnvelope.self, from: Data(output.utf8)),
               decoded.ok,
               let binding = decoded.data.confirmationBinding,
-              !binding.isEmpty else {
+              !binding.isEmpty,
+              !decoded.data.destinationFingerprint.isEmpty else {
             return ReclaimPreviewResult(
                 result: .failed(output: "The reclaim preview did not return a confirmation binding. Run a new preview before reclaiming space."),
                 confirmationBinding: nil
             )
         }
-        return ReclaimPreviewResult(result: .ok(output: decoded.data.summary), confirmationBinding: binding)
+        return ReclaimPreviewResult(
+            result: .ok(output: decoded.data.summary),
+            confirmationBinding: binding,
+            destinationFingerprint: decoded.data.destinationFingerprint
+        )
     }
 
     public func check(setId: UUID) async -> HelperResult {
@@ -221,6 +226,13 @@ public struct HelperInvoker: Sendable {
 struct ReclaimPreviewResult: Sendable {
     let result: HelperResult
     let confirmationBinding: String?
+    let destinationFingerprint: String?
+
+    init(result: HelperResult, confirmationBinding: String?, destinationFingerprint: String? = nil) {
+        self.result = result
+        self.confirmationBinding = confirmationBinding
+        self.destinationFingerprint = destinationFingerprint
+    }
 }
 
 private extension HelperInvoker {
@@ -233,6 +245,7 @@ private extension HelperInvoker {
             let dryRun: Bool
             let status: RunStatus
             let confirmationBinding: String?
+            let destinationFingerprint: String
 
             var summary: String {
                 let qualifier = dryRun ? "dry run " : ""

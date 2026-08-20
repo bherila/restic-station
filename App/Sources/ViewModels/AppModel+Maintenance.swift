@@ -565,11 +565,12 @@ final class MaintenanceModel: ObservableObject {
                 )
                 return
             }
-            guard let confirmationBinding = preview.confirmationBinding else {
+            guard let confirmationBinding = preview.confirmationBinding,
+                  preview.destinationFingerprint == destination.pruneConfirmationFingerprint(secretEnv: [:]) else {
                 self.activity = Self.activity(
                     title: "Check reclaim space",
                     subject: set.name,
-                    result: .failed(output: "The reclaim preview did not return a confirmation binding. Run it again before reclaiming space."),
+                    result: .failed(output: "The reclaim preview no longer matches this destination. Reload settings and run it again before reclaiming space."),
                     run: nil
                 )
                 return

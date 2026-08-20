@@ -19,6 +19,21 @@ public struct PreviewTokenDestination: Codable, Equatable, Sendable {
     }
 }
 
+/// Helper-private evidence required to consume a standalone-prune preview.
+/// The secret-sensitive fingerprint stays in helper/engine memory and is
+/// never serialized into the app's command line or JSON response.
+public struct MaintenancePruneAuthorization: Sendable {
+    public let token: String
+    public let machineId: String
+    public let effectiveDestinationFingerprint: String
+
+    public init(token: String, machineId: String, effectiveDestinationFingerprint: String) {
+        self.token = token
+        self.machineId = machineId
+        self.effectiveDestinationFingerprint = effectiveDestinationFingerprint
+    }
+}
+
 /// The persisted capability behind a destructive purge, retention, or
 /// standalone-prune action.
 ///

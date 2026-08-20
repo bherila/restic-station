@@ -48,6 +48,10 @@ struct MaintenancePrune: AsyncParsableCommand, JSONRenderable {
         /// back on confirmation; the helper recomputes it from freshly loaded
         /// config plus secret storage before it allows a destructive prune.
         let confirmationBinding: String?
+        /// Non-secret identity of the destination the helper actually
+        /// previewed. The app compares it with the destination it displays
+        /// before offering a destructive confirmation.
+        let destinationFingerprint: String
     }
 
     func run() async throws {
@@ -77,24 +81,19 @@ struct MaintenancePrune: AsyncParsableCommand, JSONRenderable {
         )
         let effectiveFingerprint = destination.pruneConfirmationFingerprint(secretEnv: destinationSecretEnv)
 
-        if let expectedDestination {
-            do {
-                try PreviewTokenStore(paths: context.paths).consumeMaintenancePrune(
-                    expectedDestination,
-                    machineId: context.addressable.machineId,
-                    setId: set,
-                    destinationId: destination.id,
-                    effectiveDestinationFingerprint: effectiveFingerprint
-                )
-            } catch {
-                throw Self.previewChangedFailure(setId: set, destinationId: destination.id)
-            }
+        let authorization = expectedDestination.map {
+            MaintenancePruneAuthorization(
+                token: $0,
+                machineId: context.addressable.machineId,
+                effectiveDestinationFingerprint: effectiveFingerprint
+            )
         }
 
         let result = await context.engine.runPruneRepository(
             set: backupSet,
             destination: destination,
             destinationSecretEnv: destinationSecretEnv,
+            authorization: authorization,
             dryRun: dryRun
         )
         let status = try Self.status(
@@ -121,7 +120,8 @@ struct MaintenancePrune: AsyncParsableCommand, JSONRenderable {
             label: destination.label,
             dryRun: dryRun,
             status: status,
-            confirmationBinding: confirmationBinding
+            confirmationBinding: confirmationBinding,
+            destinationFingerprint: destination.pruneConfirmationFingerprint(secretEnv: [:])
         )
         if json {
             CLIJSON.print(report)
@@ -173,6 +173,8 @@ struct MaintenancePrune: AsyncParsableCommand, JSONRenderable {
                 message: "Mirror \"\(destination.label)\" is behind its primary; sync it before pruning.",
                 details: CLIErrorDetails(setId: setId, destinationId: destination.id)
             )
+        case .skipped(.previewChanged):
+            throw previewChangedFailure(setId: setId, destinationId: destination.id)
         case .failed(.offline(let reason)):
             throw CLIFailure(
                 code: .repositoryOffline,

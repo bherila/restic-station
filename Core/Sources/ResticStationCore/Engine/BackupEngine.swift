@@ -89,6 +89,7 @@ public enum PruneRepositorySkipReason: Equatable, Sendable {
     case busy
     case secretUnavailable
     case staleMirror
+    case previewChanged
 }
 
 public enum PruneRepositoryFailure: Equatable, Sendable {
@@ -629,6 +630,7 @@ public final class BackupEngine: Sendable {
         set: BackupSet,
         destination: Destination,
         destinationSecretEnv: [String: String]? = nil,
+        authorization: MaintenancePruneAuthorization? = nil,
         dryRun: Bool = false
     ) async -> PruneRepositoryResult {
         guard set.destinations.contains(where: { $0.id == destination.id }) else {
@@ -650,6 +652,20 @@ public final class BackupEngine: Sendable {
         }
         defer { lock.release() }
         defer { try? stateStore.clearCurrentRun(setId: set.id) }
+
+        if let authorization {
+            do {
+                try previewTokens.consumeMaintenancePrune(
+                    authorization.token,
+                    machineId: authorization.machineId,
+                    setId: set.id,
+                    destinationId: destination.id,
+                    effectiveDestinationFingerprint: authorization.effectiveDestinationFingerprint
+                )
+            } catch {
+                return .skipped(.previewChanged)
+            }
+        }
 
         // Read both timestamps only while the set lock is held. A backup can
         // advance the primary and leave a mirror behind, so checking before
