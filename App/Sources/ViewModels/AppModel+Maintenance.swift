@@ -704,9 +704,18 @@ final class MaintenanceModel: ObservableObject {
     /// Normalize before deciding whether destructive-maintenance warnings
     /// are required.
     nonisolated static func isICloudRepository(_ destination: Destination) -> Bool {
-        let iCloudRoot = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Mobile Documents", isDirectory: true)
-            .path
+        isICloudRepository(
+            destination,
+            iCloudRoot: FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Library/Mobile Documents", isDirectory: true)
+                .path
+        )
+    }
+
+    nonisolated static func isICloudRepository(
+        _ destination: Destination,
+        iCloudRoot: String
+    ) -> Bool {
         let path = URL(fileURLWithPath: destination.repoURL)
             .resolvingSymlinksInPath()
             .standardizedFileURL

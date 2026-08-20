@@ -40,8 +40,12 @@ struct AppModelMachineOverrideTests {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
 
-        let iCloudRoot = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Mobile Documents", isDirectory: true)
+        let iCloudRoot = root.appendingPathComponent("Mobile Documents", isDirectory: true)
+        try FileManager.default.createDirectory(at: iCloudRoot, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(
+            at: iCloudRoot.appendingPathComponent("restic", isDirectory: true),
+            withIntermediateDirectories: true
+        )
         let alias = root.appendingPathComponent("repository-alias", isDirectory: true)
         try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: iCloudRoot)
         let destination = Destination(
@@ -51,7 +55,7 @@ struct AppModelMachineOverrideTests {
             isPrimary: true
         )
 
-        #expect(MaintenanceModel.isICloudRepository(destination))
+        #expect(MaintenanceModel.isICloudRepository(destination, iCloudRoot: iCloudRoot.path))
     }
 
     @Test("known machines and effective-plan preview include exclusions and replacements")
