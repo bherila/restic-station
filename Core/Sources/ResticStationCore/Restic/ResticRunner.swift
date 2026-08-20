@@ -139,7 +139,8 @@ public final class ResticRunner: Sendable {
         onLine: (@Sendable (ResticMessage) -> Void)? = nil,
         onRawLine: (@Sendable (String) -> Void)? = nil,
         timeout: TimeInterval? = nil,
-        beforeLaunch: (@Sendable () throws -> Void)? = nil
+        beforeLaunch: (@Sendable () throws -> Void)? = nil,
+        afterLaunchFailure: (@Sendable () -> Void)? = nil
     ) async throws -> ResticOutcome {
         try Task.checkCancellation()
 
@@ -160,6 +161,7 @@ public final class ResticRunner: Sendable {
             executablePath: inv.resticPathOverride,
             expectedExecutableIdentity: inv.expectedExecutableIdentity,
             beforeLaunch: beforeLaunch,
+            afterLaunchFailure: afterLaunchFailure,
             onLine: onLine,
             onRawLine: onRawLine,
             timeout: timeout
@@ -295,6 +297,7 @@ public final class ResticRunner: Sendable {
         executablePath: String? = nil,
         expectedExecutableIdentity: String? = nil,
         beforeLaunch: (@Sendable () throws -> Void)? = nil,
+        afterLaunchFailure: (@Sendable () -> Void)? = nil,
         onLine: (@Sendable (ResticMessage) -> Void)?,
         onRawLine: (@Sendable (String) -> Void)?,
         timeout: TimeInterval?
@@ -331,6 +334,12 @@ public final class ResticRunner: Sendable {
                 timeout: timeout
             )
         } catch let error as ProcessRunnerError {
+            // `DefaultProcessRunner` emits `.launchFailed` only from
+            // `Process.run()`, before a child exists. Destructive callers
+            // may therefore safely restore their just-consumed capability.
+            if case .launchFailed = error {
+                afterLaunchFailure?()
+            }
             switch error {
             case .timeout:
                 throw ResticRunnerError.timedOut

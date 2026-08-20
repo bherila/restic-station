@@ -203,6 +203,34 @@ public struct PreviewTokenStore: Sendable {
         }
     }
 
+    /// Restores a standalone-prune capability after a confirmed process
+    /// launch failure. The caller may invoke this only when the process
+    /// runner guarantees that no child was started; a failed restoration
+    /// leaves the token consumed, which is the safer failure mode.
+    public func restoreMaintenancePrune(
+        _ value: String,
+        machineId: String,
+        setId: UUID,
+        destinationId: UUID,
+        effectiveDestinationFingerprint: String
+    ) throws {
+        try withStoreLock {
+            var index = try readIndex()
+            guard var token = index.tokens[value] else { throw PreviewTokenError.unknown }
+            guard token.usedAt != nil,
+                  token.machineId == machineId,
+                  token.setId == setId,
+                  token.destinations == [PreviewTokenDestination(destinationId: destinationId, snapshotIDs: [])],
+                  token.configFingerprint == effectiveDestinationFingerprint,
+                  token.patterns == ["maintenance-prune"] else {
+                throw PreviewTokenError.unknown
+            }
+            token.usedAt = nil
+            index.tokens[value] = token
+            try writeIndex(index)
+        }
+    }
+
     /// Reads a token without consuming it.  Callers must perform every
     /// repository/config check before invoking ``consume(_:)``.
     public func token(_ value: String) throws -> PreviewToken {
