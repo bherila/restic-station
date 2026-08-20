@@ -321,6 +321,7 @@ public final class ResticRunner: Sendable {
             result = try await runner.run(
                 argv,
                 env: env,
+                stdin: nil,
                 currentDirectory: nil,
                 onStdoutLine: { line in
                     onRawLine?(line)

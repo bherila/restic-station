@@ -197,6 +197,7 @@ public struct ResticDiscovery: Sendable {
             result = try await runner.run(
                 [path, "version", "--json"],
                 env: nil,
+                stdin: nil,
                 currentDirectory: nil,
                 onStdoutLine: nil,
                 onStderrLine: nil,

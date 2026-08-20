@@ -7,6 +7,25 @@ import Testing
 /// the `swift:6.1` Linux CI container (see docs/testing.md).
 @Suite("DefaultProcessRunner")
 struct DefaultProcessRunnerTests {
+    @Test("writes supplied stdin and closes it at EOF")
+    func writesStdin() async throws {
+        let runner = DefaultProcessRunner()
+        let password = Data("stdin-only-secret\n".utf8)
+
+        let result = try await runner.run(
+            ["/bin/sh", "-c", "IFS= read -r value; printf '%s' \"$value\""],
+            env: nil,
+            stdin: password,
+            currentDirectory: nil,
+            onStdoutLine: nil,
+            onStderrLine: nil,
+            timeout: nil
+        )
+
+        #expect(result.exitCode == 0)
+        #expect(result.stdout == Data("stdin-only-secret".utf8))
+    }
+
     @Test("runs /bin/echo, streams the line callback, and captures stdout")
     func echoSmokeTest() async throws {
         let runner = DefaultProcessRunner()

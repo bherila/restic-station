@@ -46,6 +46,7 @@ final class ObservingProcessRunner: ProcessRunning, @unchecked Sendable {
     func run(
         _ argv: [String],
         env: [String: String]?,
+        stdin: Data?,
         currentDirectory: String?,
         onStdoutLine: (@Sendable (String) -> Void)?,
         onStderrLine: (@Sendable (String) -> Void)?,
@@ -55,6 +56,7 @@ final class ObservingProcessRunner: ProcessRunning, @unchecked Sendable {
         return try await inner.run(
             argv,
             env: env,
+            stdin: stdin,
             currentDirectory: currentDirectory,
             onStdoutLine: onStdoutLine,
             onStderrLine: onStderrLine,
