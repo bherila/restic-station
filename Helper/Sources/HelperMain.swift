@@ -129,6 +129,7 @@ struct HelperMain: AsyncParsableCommand {
         var subcommands: [any ParsableCommand.Type] = [
             Tick.self,
             RunSet.self,
+            Purge.self,
             InitSecondary.self,
             Restore.self,
             ProbeRepo.self,

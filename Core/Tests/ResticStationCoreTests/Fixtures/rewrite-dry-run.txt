@@ -1,0 +1,8 @@
+
+snapshot 09b3295c of [/tmp/restic-station-purge-fixture.tyOGmf/source] at 2026-08-19 23:32:12.238741 -0700 PDT by bwh@Bens-Laptop
+would save new snapshot
+
+snapshot b2435423 of [/tmp/restic-station-purge-fixture.tyOGmf/source] at 2026-08-19 23:32:14.083168 -0700 PDT by bwh@Bens-Laptop
+would save new snapshot
+
+would modify 2 snapshots

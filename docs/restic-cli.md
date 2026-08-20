@@ -1,6 +1,6 @@
 # restic CLI contract
 
-Everything in this document was **verified against restic 0.18.1 on macOS (arm64)** — argv, exit codes, and every JSON sample below are captured real output (lightly sanitized paths/hostnames), stored verbatim in [`docs/fixtures/`](fixtures/). Parser implementations MUST be written against these fixtures (copied into `Core/Tests/ResticStationCoreTests/Fixtures/`) and MUST tolerate unknown extra fields (`init(from:)` via keyed containers or plain `Decodable` structs — never `assert` on shape).
+Everything in this document was **verified against restic 0.18.1 on macOS (arm64)** — argv, exit codes, and every JSON sample below are captured real output (lightly sanitized paths/hostnames), stored verbatim in [`docs/fixtures/`](fixtures/). The rewrite transcripts were additionally captured against restic 0.19.1 because that command has no JSON mode. Parser implementations MUST be written against these fixtures (copied into `Core/Tests/ResticStationCoreTests/Fixtures/`) and MUST tolerate unknown extra fields (`init(from:)` via keyed containers or plain `Decodable` structs — never `assert` on shape).
 
 ## General invocation rules
 
@@ -102,6 +102,26 @@ A fully-caught-up copy prints nothing (`copy-noop.txt` is empty) and exits 0. Pa
 restic -r <repo> snapshots --json
 ```
 Single JSON **array** (not NDJSON) — fixture `snapshots.json`. Key fields per element: `id`, `short_id`, `time`, `parent?`, `paths`, `hostname`, `username`, `program_version`, `summary{files_new,files_changed,data_added,total_bytes_processed,backup_start,backup_end,…}`. Copied snapshots additionally carry `original` (id in the source repo).
+
+### rewrite
+```
+restic -r <repo> rewrite [--forget] [--dry-run] [--exclude <pat>]... <snapshotID>...
+```
+`rewrite` has no JSON mode. Snapshot ids are required and are passed explicitly;
+omitting them rewrites every snapshot in the repository. `--exclude` may be
+repeated. `--dry-run` reports the snapshots that would be replaced without
+changing the repository (`rewrite-dry-run.txt`); `--forget` replaces the old
+snapshots and forgets them (`rewrite-forget.txt`). `--forget` does not reclaim
+pack space — only a later repository-wide `prune` does. Exit 0 means the
+requested rewrite completed (including a no-op); nonzero is a restic failure.
+
+### prune
+```
+restic -r <repo> prune [--dry-run]
+```
+Standalone repository-wide space reclamation. `--dry-run` reports the work
+without changing the repository. Exit 0 means prune completed; nonzero is a
+restic failure. Purge previews and purge applies never add `prune` implicitly.
 
 ### ls (lazy directory browsing)
 ```

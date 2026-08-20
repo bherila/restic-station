@@ -136,6 +136,11 @@ public final class BackupEngine: Sendable {
     private let reachability: Reachability
     private let now: @Sendable () -> Date
     private let uptime: @Sendable () -> TimeInterval
+    /// Raw shared-config source/hostname knowledge used by purge attribution.
+    /// Resolved configs deliberately strip machine overrides, so the helper
+    /// supplies these unions when it constructs the engine.
+    private let purgeSourcePaths: [UUID: Set<String>]
+    private let purgeHostnames: [UUID: Set<String>]
 
     public init(
         config: AppConfig,
@@ -146,7 +151,9 @@ public final class BackupEngine: Sendable {
         stateStore: StateStore,
         reachability: Reachability,
         now: @escaping @Sendable () -> Date = Date.init,
-        uptime: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
+        uptime: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+        purgeSourcePaths: [UUID: Set<String>] = [:],
+        purgeHostnames: [UUID: Set<String>] = [:]
     ) {
         self.config = config
         self.paths = paths
@@ -157,6 +164,8 @@ public final class BackupEngine: Sendable {
         self.reachability = reachability
         self.now = now
         self.uptime = uptime
+        self.purgeSourcePaths = purgeSourcePaths
+        self.purgeHostnames = purgeHostnames
     }
 
     // MARK: - runSet
@@ -511,6 +520,126 @@ public final class BackupEngine: Sendable {
         }
 
         return Self.worstStatus(statuses)
+    }
+
+    // MARK: - purge preview
+
+    /// Builds a read-only purge plan for one destination.
+    ///
+    /// The set lock prevents a preview from racing a backup or another
+    /// repository operation.  The only restic commands are reachability's
+    /// `cat config` where needed, `snapshots --json`, and `rewrite --dry-run`.
+    /// In particular, this method cannot reach `rewrite --forget`, `prune`, or
+    /// the run-record machinery.
+    public func previewPurge(set: BackupSet, destination: Destination) async -> PurgePlanResult {
+        let emptyPlan = PurgePlan(
+            destinationId: destination.id,
+            snapshots: [],
+            sourcePaths: sourcePaths(for: set),
+            hostnames: hostnames(for: set),
+            patterns: set.purgeExcludes
+        )
+
+        guard !set.purgeExcludes.isEmpty else {
+            return PurgePlanResult(
+                plan: emptyPlan,
+                status: .empty,
+                message: "nothing to purge: purgeExcludes is empty"
+            )
+        }
+
+        let lock = makeSetLock(setId: set.id)
+        guard lock.tryAcquire() else {
+            return PurgePlanResult(plan: emptyPlan, status: .busy, message: "another operation is running")
+        }
+        defer { lock.release() }
+
+        guard await secretsAvailable(for: [destination]) else {
+            return PurgePlanResult(plan: emptyPlan, status: .failed, message: "secret store unavailable")
+        }
+
+        let probe = await reachability.probe(destination)
+        switch probe {
+        case .reachable:
+            break
+        case .offline(let reason):
+            return PurgePlanResult(
+                plan: emptyPlan,
+                status: .offline,
+                message: reason
+            )
+        case .error(let exitClass):
+            return PurgePlanResult(
+                plan: emptyPlan,
+                status: .failed,
+                message: exitClass.userFacingMessage
+            )
+        }
+
+        let snapshotsOutcome: ResticOutcome
+        do {
+            snapshotsOutcome = try await restic.run(
+                .snapshots(repo: destination.repoURL),
+                for: ResticInvocation(destination: destination)
+            )
+        } catch {
+            return PurgePlanResult(plan: emptyPlan, status: .failed, message: "could not list snapshots: \(error)")
+        }
+        guard snapshotsOutcome.status == .success else {
+            return PurgePlanResult(
+                plan: emptyPlan,
+                status: .failed,
+                message: snapshotsOutcome.status.userFacingMessage
+            )
+        }
+
+        let snapshots: [Snapshot]
+        do {
+            snapshots = try parseSnapshots(Data(snapshotsOutcome.rawOutput.utf8))
+        } catch {
+            return PurgePlanResult(plan: emptyPlan, status: .failed, message: "could not parse snapshots: \(error)")
+        }
+
+        let plan = PurgePlan(
+            destinationId: destination.id,
+            snapshots: snapshots,
+            sourcePaths: sourcePaths(for: set),
+            hostnames: hostnames(for: set),
+            patterns: set.purgeExcludes
+        )
+        guard !plan.matched.isEmpty else {
+            return PurgePlanResult(
+                plan: plan,
+                status: .ready,
+                message: "no snapshots are attributed to this backup set"
+            )
+        }
+
+        let rewriteOutcome: ResticOutcome
+        do {
+            rewriteOutcome = try await restic.run(
+                .rewrite(
+                    repo: destination.repoURL,
+                    snapshotIDs: plan.matched.map(\.id),
+                    excludes: plan.patterns,
+                    dryRun: true
+                ),
+                for: ResticInvocation(destination: destination)
+            )
+        } catch {
+            return PurgePlanResult(plan: plan, status: .failed, message: "could not preview rewrite: \(error)")
+        }
+        guard rewriteOutcome.status == .success else {
+            return PurgePlanResult(
+                plan: plan,
+                status: .failed,
+                message: rewriteOutcome.status.userFacingMessage
+            )
+        }
+
+        let rewrite = parseRewrite(rewriteOutcome.rawOutput)
+        let changed = plan.matched.filter { rewrite.changedShortIDs.contains($0.shortId) }
+        return PurgePlanResult(plan: plan, changed: changed, rewrite: rewrite, status: .ready)
     }
 
     // MARK: - runRestore
@@ -1009,6 +1138,31 @@ public final class BackupEngine: Sendable {
         case .error(let exitClass):
             return exitClass.userFacingMessage
         }
+    }
+
+    private func sourcePaths(for set: BackupSet) -> Set<String> {
+        if let known = purgeSourcePaths[set.id] {
+            return known
+        }
+        var paths = Set(set.sources)
+        if let machines = set.machines {
+            for override in machines.values {
+                paths.formUnion(override.sources ?? [])
+            }
+        }
+        return paths
+    }
+
+    private func hostnames(for set: BackupSet) -> Set<String> {
+        if let known = purgeHostnames[set.id], !known.isEmpty {
+            return known
+        }
+        var names = Set<String>()
+        if let machines = set.machines {
+            names.formUnion(machines.keys)
+        }
+        names.insert(MachineIdentity.generate())
+        return names
     }
 
     /// How the engine names the secret store in its user-visible log lines

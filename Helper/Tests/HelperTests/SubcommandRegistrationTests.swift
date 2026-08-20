@@ -27,6 +27,7 @@ import Testing
         names == [
             "tick",
             "run-set",
+            "purge",
             "init-secondary",
             "restore",
             "probe-repo",
@@ -48,6 +49,7 @@ import Testing
         names == [
             "tick",
             "run-set",
+            "purge",
             "init-secondary",
             "restore",
             "probe-repo",

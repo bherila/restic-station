@@ -76,6 +76,44 @@ struct ResticCommandTests {
         #expect(cmd.argv == ["-r", Self.repo, "snapshots", "--json"])
     }
 
+    @Test("rewrite dry-run: forget/dry-run before repeated excludes and explicit ids")
+    func rewriteDryRun() {
+        // restic -r <repo> rewrite [--forget] [--dry-run] [--exclude <pat>]... <id>...
+        let cmd = ResticCommand.rewrite(
+            repo: Self.repo,
+            snapshotIDs: ["09b3295c", "b2435423"],
+            excludes: ["build/**"],
+            dryRun: true
+        )
+        #expect(cmd.argv == [
+            "-r", Self.repo, "rewrite", "--dry-run", "--exclude", "build/**",
+            "09b3295c", "b2435423",
+        ])
+        #expect(cmd.repoURL == Self.repo)
+    }
+
+    @Test("rewrite apply: explicit forget flag is before dry-run and excludes")
+    func rewriteForget() {
+        let cmd = ResticCommand.rewrite(
+            repo: Self.repo,
+            snapshotIDs: ["09b3295c"],
+            excludes: ["build/**", "*.tmp"],
+            forget: true
+        )
+        #expect(cmd.argv == [
+            "-r", Self.repo, "rewrite", "--forget",
+            "--exclude", "build/**", "--exclude", "*.tmp", "09b3295c",
+        ])
+    }
+
+    @Test("standalone prune")
+    func prune() {
+        // restic -r <repo> prune [--dry-run]
+        #expect(ResticCommand.prune(repo: Self.repo, dryRun: true).argv == [
+            "-r", Self.repo, "prune", "--dry-run",
+        ])
+    }
+
     @Test("ls with a directory argument")
     func lsWithPath() {
         // restic -r <repo> ls --json <snapshotID> <dir>

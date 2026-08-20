@@ -55,6 +55,7 @@ itself, unwrapped, because its output is meant to be fed straight back into
 | `secret list` | ✅ | array of `{ destId, label, setName, hasPassword, secretEnvCount }` — only destinations that have something stored, the same set human mode prints |
 | `cli status` | ✅ | `CLIInstaller.Status` |
 | `fda-check` | ✅ | `{ applicable, granted, probedPath, checkedAt, context }` |
+| `purge preview` | ✅ | array of per-destination purge plans: matched/changed/unattributed snapshots and patterns |
 | `config export` | — | **Unwrapped by design.** The exported config document itself, so it round-trips into `config import`. |
 | `timer status` (Linux) | — | **Human-only.** Its report is narrative assembled while probing; the machine-readable equivalent is `status --json`'s `.scheduler`, in the same problem vocabulary. |
 | `print-password` | — | Hidden; exists for `RESTIC_PASSWORD_COMMAND` and writes a secret to stdout. |
