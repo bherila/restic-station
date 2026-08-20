@@ -28,6 +28,7 @@ import Testing
             "tick",
             "run-set",
             "purge",
+            "maintenance",
             "init-secondary",
             "restore",
             "probe-repo",
@@ -50,6 +51,7 @@ import Testing
             "tick",
             "run-set",
             "purge",
+            "maintenance",
             "init-secondary",
             "restore",
             "probe-repo",
@@ -109,6 +111,13 @@ import Testing
         subcommand.configuration.commandName
     }
     #expect(names == ["preview", "apply"])
+}
+
+@Test func maintenanceExposesStandalonePrune() {
+    let names: [String?] = Maintenance.configuration.subcommands.map { subcommand in
+        subcommand.configuration.commandName
+    }
+    #expect(names == ["prune"])
 }
 
 /// T28 (issue #30): the `restic-station` PATH symlink manager.

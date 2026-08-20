@@ -728,14 +728,15 @@ ok "every --json command reports an unloadable config.json as config_invalid, ex
 # preview or a token-gated apply can touch a repository.
 for CMD in \
     "purge preview --set 6F9619FF-8B86-D011-B42D-00C04FC964FF" \
-    "purge apply --set 6F9619FF-8B86-D011-B42D-00C04FC964FF --preview-token deliberately-invalid"; do
+    "purge apply --set 6F9619FF-8B86-D011-B42D-00C04FC964FF --preview-token deliberately-invalid" \
+    "maintenance prune --set 6F9619FF-8B86-D011-B42D-00C04FC964FF --dry-run"; do
     # shellcheck disable=SC2086
     RESTIC_STATION_DATA_DIR="$ENVELOPE_DATA" run_helper_split $CMD --json
     expect_rc 1
     jq -e '.ok == false and .error.code == "config_invalid"' "$OUT_FILE" >/dev/null \
         || fail "\`$CMD --json\` on a broken config did not emit config_invalid"
 done
-ok "purge preview/apply --json preserve the setup-failure envelope"
+ok "purge and maintenance prune --json preserve the setup-failure envelope"
 
 # `config validate --json` has a second setup failure of its own: with no
 # `--machine`, the answer comes from this host's `machine.json`, and an

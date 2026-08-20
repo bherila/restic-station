@@ -122,6 +122,9 @@ restic -r <repo> prune [--dry-run]
 Standalone repository-wide space reclamation. `--dry-run` reports the work
 without changing the repository. Exit 0 means prune completed; nonzero is a
 restic failure. Purge previews and purge applies never add `prune` implicitly.
+Restic Station exposes it as `maintenance prune --set <uuid> [--dest <uuid>]
+[--dry-run] [--json]`; omitting `--dest` selects the primary. It may run with
+no retention policy, but refuses a mirror that is behind the primary.
 
 ### ls (lazy directory browsing)
 ```

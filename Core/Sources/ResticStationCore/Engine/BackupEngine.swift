@@ -77,6 +77,26 @@ public enum SetRunOutcome: Equatable, Sendable {
     case misconfigured(reason: String)
 }
 
+/// The standalone-prune result keeps non-destructive refusals distinct from
+/// restic failures so the helper can preserve the published JSON taxonomy.
+public enum PruneRepositoryResult: Equatable, Sendable {
+    case completed(RunStatus)
+    case skipped(PruneRepositorySkipReason)
+    case failed(PruneRepositoryFailure)
+}
+
+public enum PruneRepositorySkipReason: Equatable, Sendable {
+    case busy
+    case secretUnavailable
+    case staleMirror
+}
+
+public enum PruneRepositoryFailure: Equatable, Sendable {
+    case offline(String)
+    case restic(ResticExitClass)
+    case didNotRun
+}
+
 // MARK: - BackupEngine
 
 /// The orchestration heart: scheduled/manual set runs (backup → mirror →
@@ -594,6 +614,103 @@ public final class BackupEngine: Sendable {
         }
 
         return Self.worstStatus(statuses)
+    }
+
+    /// Reclaims unreferenced repository data without changing snapshot
+    /// retention. Unlike ``runPrune(_:)``, this is valid for a set with no
+    /// retention policy: `rewrite --forget` can leave unused packs behind
+    /// even when the set intentionally keeps every remaining snapshot.
+    ///
+    /// A secondary is still protected by the same freshness invariant as
+    /// retention pruning. Never prune a mirror that predates the primary's
+    /// last successful backup: it may be the only repository still holding
+    /// snapshots the primary has already changed or forgotten.
+    public func runPruneRepository(
+        set: BackupSet,
+        destination: Destination,
+        dryRun: Bool = false
+    ) async -> PruneRepositoryResult {
+        guard set.destinations.contains(where: { $0.id == destination.id }) else {
+            logWarning("BackupEngine: destination \(destination.id) is not in backup set \(set.id) — cannot prune")
+            return .failed(.didNotRun)
+        }
+        guard await secretsAvailable(for: [destination]) else { return .skipped(.secretUnavailable) }
+
+        let lock = makeSetLock(setId: set.id)
+        guard lock.tryAcquire() else {
+            recordSkipped(kind: .prune, setId: set.id, destId: destination.id, trigger: .manual)
+            return .skipped(.busy)
+        }
+        defer { lock.release() }
+        defer { try? stateStore.clearCurrentRun(setId: set.id) }
+
+        // Read both timestamps only while the set lock is held. A backup can
+        // advance the primary and leave a mirror behind, so checking before
+        // lock acquisition would create a prune-after-stale race.
+        if !destination.isPrimary {
+            guard let primary = set.destinations.first(where: { $0.isPrimary }),
+                  let primarySyncedAt = stateStore.readRepoStatus(destId: primary.id)?.lastSyncedAt,
+                  let mirrorSyncedAt = stateStore.readRepoStatus(destId: destination.id)?.lastSyncedAt,
+                  mirrorSyncedAt >= primarySyncedAt else {
+                logWarning(
+                    "BackupEngine: mirror \"\(destination.label)\" is behind the primary — refusing to prune it"
+                )
+                return .skipped(.staleMirror)
+            }
+        }
+
+        let probe = await reachability.probe(destination)
+        record(probe: probe, for: destination)
+        switch probe {
+        case .reachable:
+            break
+        case .offline(let reason):
+            return .failed(.offline(reason))
+        case .error(let exitClass):
+            return .failed(.restic(exitClass))
+        }
+
+        if dryRun {
+            // A preview is a read-only query. Like the app-direct retention
+            // preview, it must not replace the last real prune in history or
+            // make the Runs screen claim that pack space was reclaimed.
+            switch await execute(
+                .prune(repo: destination.repoURL, dryRun: true),
+                invocation: ResticInvocation(destination: destination),
+                logWriter: nil,
+                reporter: nil
+            ) {
+            case .ranToCompletion(let outcome):
+                switch outcome.status {
+                case .success:
+                    return .completed(.success)
+                case .warningIncompleteRead:
+                    return .completed(.warning)
+                default:
+                    return .failed(.restic(outcome.status))
+                }
+            case .didNotRun:
+                return .failed(.didNotRun)
+            }
+        }
+
+        let prune = await performChild(
+            kind: .prune,
+            setId: set.id,
+            destination: destination,
+            trigger: .manual,
+            groupId: nil,
+            phase: "pruning",
+            command: .prune(repo: destination.repoURL, dryRun: false),
+            invocation: ResticInvocation(destination: destination),
+            streamProgress: false
+        )
+        guard let prune else { return .failed(.didNotRun) }
+        guard prune.child.status == .failed else { return .completed(prune.child.status) }
+        if let outcome = prune.outcome {
+            return .failed(.restic(outcome.status))
+        }
+        return .failed(.didNotRun)
     }
 
     // MARK: - purge preview

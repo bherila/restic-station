@@ -72,6 +72,17 @@ private let destId = UUID(uuidString: "0B7A50D4-9C3E-4F5B-9A0E-8E1F2C3D4A5B")!
         #expect(HelperCommand.check(setId: setId).argv == expected)
     }
 
+    @Test func maintenancePrune() {
+        #expect(
+            HelperCommand.maintenancePrune(setId: setId, destId: destId, dryRun: true).argv
+                == ["maintenance", "prune", "--set", "6B29FC40-CA47-1067-B31D-00DD010662DA", "--dest", "0B7A50D4-9C3E-4F5B-9A0E-8E1F2C3D4A5B", "--dry-run"]
+        )
+        #expect(
+            HelperCommand.maintenancePrune(setId: setId, destId: nil, dryRun: false).argv
+                == ["maintenance", "prune", "--set", "6B29FC40-CA47-1067-B31D-00DD010662DA"]
+        )
+    }
+
     @Test func initSecondary() {
         var expected = ["init-secondary", "--set"]
         expected.append("6B29FC40-CA47-1067-B31D-00DD010662DA")
@@ -121,7 +132,7 @@ private let destId = UUID(uuidString: "0B7A50D4-9C3E-4F5B-9A0E-8E1F2C3D4A5B")!
     /// side only.
     @Test func everySubcommandNameIsRegistered() {
         let registered: Set<String> = [
-            "tick", "run-set", "init-secondary", "restore", "probe-repo", "unlock", "fda-check", "version",
+            "tick", "run-set", "maintenance", "init-secondary", "restore", "probe-repo", "unlock", "fda-check", "version",
         ]
         let restoreArgs = HelperRestoreArgs(
             setId: setId,
@@ -134,6 +145,7 @@ private let destId = UUID(uuidString: "0B7A50D4-9C3E-4F5B-9A0E-8E1F2C3D4A5B")!
             .backUpNow(setId: setId),
             .prune(setId: setId),
             .check(setId: setId),
+            .maintenancePrune(setId: setId, destId: destId, dryRun: true),
             .initSecondary(setId: setId, destId: destId),
             .probeRepo(setId: setId, destId: destId),
             .unlock(setId: setId, destId: destId),

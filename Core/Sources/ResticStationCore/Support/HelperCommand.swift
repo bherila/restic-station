@@ -26,6 +26,9 @@ public enum HelperCommand: Equatable, Sendable {
     case prune(setId: UUID)
     /// `run-set --set <uuid> --kind check`.
     case check(setId: UUID)
+    /// `maintenance prune --set <uuid> [--dest <uuid>] [--dry-run]`.
+    /// This reclaims unused packs without applying a retention policy.
+    case maintenancePrune(setId: UUID, destId: UUID?, dryRun: Bool)
     /// `init-secondary --set <uuid> --dest <uuid>`.
     case initSecondary(setId: UUID, destId: UUID)
     /// `probe-repo --set <uuid> --dest <uuid>` (exit 3 = offline).
@@ -65,6 +68,11 @@ public enum HelperCommand: Equatable, Sendable {
             return Self.runSet(setId: setId, kind: "prune")
         case .check(let setId):
             return Self.runSet(setId: setId, kind: "check")
+        case .maintenancePrune(let setId, let destId, let dryRun):
+            var argv = ["maintenance", "prune", "--set", Self.render(setId)]
+            if let destId { argv.append(contentsOf: ["--dest", Self.render(destId)]) }
+            if dryRun { argv.append("--dry-run") }
+            return argv
         case .initSecondary(let setId, let destId):
             return ["init-secondary", "--set", Self.render(setId), "--dest", Self.render(destId)]
         case .probeRepo(let setId, let destId):
