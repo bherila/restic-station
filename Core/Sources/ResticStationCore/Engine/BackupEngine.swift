@@ -718,7 +718,7 @@ public final class BackupEngine: Sendable {
             }
         }
 
-        let previewValidation: (@Sendable (LogWriter?) async -> PreflightFailure?)?
+        let consumePreviewToken: (@Sendable () throws -> Void)?
         if let authorization {
             let previewTokens = previewTokens
             let token = authorization.token
@@ -726,29 +726,17 @@ public final class BackupEngine: Sendable {
             let effectiveDestinationFingerprint = authorization.effectiveDestinationFingerprint
             let setId = set.id
             let destinationId = destination.id
-            previewValidation = { _ in
-                do {
-                    try previewTokens.consumeMaintenancePrune(
-                        token,
-                        machineId: machineId,
-                        setId: setId,
-                        destinationId: destinationId,
-                        effectiveDestinationFingerprint: effectiveDestinationFingerprint
-                    )
-                    return nil
-                } catch let error as PreviewTokenError {
-                    switch error {
-                    case .unavailable:
-                        return .previewUnavailable
-                    case .unknown, .expired, .alreadyUsed:
-                        return .previewChanged
-                    }
-                } catch {
-                    return .previewChanged
-                }
+            consumePreviewToken = {
+                try previewTokens.consumeMaintenancePrune(
+                    token,
+                    machineId: machineId,
+                    setId: setId,
+                    destinationId: destinationId,
+                    effectiveDestinationFingerprint: effectiveDestinationFingerprint
+                )
             }
         } else {
-            previewValidation = nil
+            consumePreviewToken = nil
         }
 
         let prune = await performChild(
@@ -767,7 +755,7 @@ public final class BackupEngine: Sendable {
             ),
             streamProgress: false,
             preflightPhase: authorization == nil ? nil : "validating preview",
-            preflight: previewValidation
+            beforeLaunch: consumePreviewToken
         )
         guard let prune else { return .failed(.didNotRun) }
         switch prune.preflightFailure {
@@ -1350,6 +1338,7 @@ public final class BackupEngine: Sendable {
         streamProgress: Bool,
         preflightPhase: String? = nil,
         preflight: (@Sendable (LogWriter?) async -> PreflightFailure?)? = nil,
+        beforeLaunch: (@Sendable () throws -> Void)? = nil,
         downgradeSuccessToWarning: (@Sendable (ResticOutcome) -> Bool)? = nil,
         purgeSnapshotRewrites: (@Sendable (ResticOutcome) -> [String: String]?)? = nil
     ) async -> ChildRun? {
@@ -1410,8 +1399,30 @@ public final class BackupEngine: Sendable {
             command,
             invocation: invocation,
             logWriter: logWriter,
-            reporter: streamProgress ? reporter : nil
+            reporter: streamProgress ? reporter : nil,
+            beforeLaunch: beforeLaunch
         )
+
+        if case .didNotRun(_, let launchPreflightFailure?) = result {
+            if case .previewUnavailable = launchPreflightFailure {
+                do {
+                    try runStore.discardUnstarted(run)
+                    return ChildRun(
+                        child: SetRunChild(runId: run.runId, kind: kind, destId: destination.id, status: .skipped),
+                        outcome: nil,
+                        preflightFailure: launchPreflightFailure
+                    )
+                } catch {
+                    logWarning("BackupEngine: could not discard unavailable launch preflight run \(run.runId): \(error)")
+                }
+            }
+            finish(run, status: .failed, errorSummary: launchPreflightFailure.message)
+            return ChildRun(
+                child: SetRunChild(runId: run.runId, kind: kind, destId: destination.id, status: .failed),
+                outcome: nil,
+                preflightFailure: launchPreflightFailure
+            )
+        }
 
         let status: RunStatus
         var errorSummary: String?
@@ -1419,7 +1430,7 @@ public final class BackupEngine: Sendable {
         var exitCode: Int32?
 
         switch result {
-        case .didNotRun(let reason):
+        case .didNotRun(let reason, _):
             status = .failed
             errorSummary = reason
         case .ranToCompletion(let outcome):
@@ -1468,7 +1479,7 @@ public final class BackupEngine: Sendable {
         case ranToCompletion(ResticOutcome)
         /// restic produced no outcome at all (launch failure, timeout,
         /// secret read failure mid-run, cancellation).
-        case didNotRun(reason: String)
+        case didNotRun(reason: String, preflightFailure: PreflightFailure? = nil)
 
         var outcome: ResticOutcome? {
             if case .ranToCompletion(let outcome) = self { return outcome }
@@ -1485,9 +1496,16 @@ public final class BackupEngine: Sendable {
         _ command: ResticCommand,
         invocation: ResticInvocation,
         logWriter: LogWriter?,
-        reporter: ProgressReporter?
+        reporter: ProgressReporter?,
+        beforeLaunch: (@Sendable () throws -> Void)? = nil
     ) async -> ExecuteResult {
-        let first = await spawn(command, invocation: invocation, logWriter: logWriter, reporter: reporter)
+        let first = await spawn(
+            command,
+            invocation: invocation,
+            logWriter: logWriter,
+            reporter: reporter,
+            beforeLaunch: beforeLaunch
+        )
         guard case .ranToCompletion(let outcome) = first, outcome.status == .repoLocked else {
             return first
         }
@@ -1515,7 +1533,8 @@ public final class BackupEngine: Sendable {
         _ command: ResticCommand,
         invocation: ResticInvocation,
         logWriter: LogWriter?,
-        reporter: ProgressReporter?
+        reporter: ProgressReporter?,
+        beforeLaunch: (@Sendable () throws -> Void)? = nil
     ) async -> ExecuteResult {
         do {
             let outcome = try await restic.run(
@@ -1527,9 +1546,14 @@ public final class BackupEngine: Sendable {
                 },
                 onRawLine: { line in
                     logWriter?.appendLine(line)
-                }
+                },
+                beforeLaunch: beforeLaunch
             )
             return .ranToCompletion(outcome)
+        } catch let error as PreviewTokenError {
+            let failure: PreflightFailure = error == .unavailable ? .previewUnavailable : .previewChanged
+            logWriter?.appendLine("restic did not run: \(failure.message)")
+            return .didNotRun(reason: failure.message, preflightFailure: failure)
         } catch let error as ResticRunnerError {
             logWriter?.appendLine("restic did not run: \(error.description)")
             return .didNotRun(reason: error.userFacingMessage)

@@ -138,7 +138,8 @@ public final class ResticRunner: Sendable {
         for inv: ResticInvocation,
         onLine: (@Sendable (ResticMessage) -> Void)? = nil,
         onRawLine: (@Sendable (String) -> Void)? = nil,
-        timeout: TimeInterval? = nil
+        timeout: TimeInterval? = nil,
+        beforeLaunch: (@Sendable () throws -> Void)? = nil
     ) async throws -> ResticOutcome {
         try Task.checkCancellation()
 
@@ -158,6 +159,7 @@ public final class ResticRunner: Sendable {
             env: env,
             executablePath: inv.resticPathOverride,
             expectedExecutableIdentity: inv.expectedExecutableIdentity,
+            beforeLaunch: beforeLaunch,
             onLine: onLine,
             onRawLine: onRawLine,
             timeout: timeout
@@ -292,6 +294,7 @@ public final class ResticRunner: Sendable {
         env: [String: String],
         executablePath: String? = nil,
         expectedExecutableIdentity: String? = nil,
+        beforeLaunch: (@Sendable () throws -> Void)? = nil,
         onLine: (@Sendable (ResticMessage) -> Void)?,
         onRawLine: (@Sendable (String) -> Void)?,
         timeout: TimeInterval?
@@ -301,6 +304,11 @@ public final class ResticRunner: Sendable {
            maintenanceExecutable(path: resolvedExecutablePath)?.identity != expectedExecutableIdentity {
             throw ResticRunnerError.launchFailed("the restic executable changed after the maintenance preview")
         }
+        // Destructive preview tokens are consumed here, after every launch
+        // prerequisite has passed but immediately before the process runner
+        // receives the argv. A failed secret read or executable revalidation
+        // must leave confirmation retryable.
+        try beforeLaunch?()
         let argv = [resolvedExecutablePath] + cmd.argv
         let collector = MessageCollector()
         let decoder = self.decoder
