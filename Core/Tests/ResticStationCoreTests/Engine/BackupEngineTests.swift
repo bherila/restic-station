@@ -1271,6 +1271,30 @@ struct BackupEngineTests {
         #expect(env.entries(kind: .prune).count == 1)
     }
 
+    @Test("standalone prune: automatic unlock reuses its confirmed secret snapshot")
+    func standalonePruneUnlockUsesConfirmedSecretSnapshot() async throws {
+        let env = Self.makeEnv(script: [], retention: nil)
+        defer { env.cleanUp() }
+        let snapshot = ["RESTIC_PASSWORD": "previewed-password", "RCLONE_CONFIG_REMOTE": "previewed-remote"]
+        var script: [FakeProcessRunner.Expectation] = []
+        script += Self.resticCall(["-r", env.primary.repoURL, "prune"], dest: Self.primaryId, exitCode: 11)
+        script += Self.resticCall(["-r", env.primary.repoURL, "unlock"], dest: Self.primaryId)
+        script += Self.resticCall(["-r", env.primary.repoURL, "prune"], dest: Self.primaryId)
+        env.fake.script = script
+
+        let status = await env.engine.runPruneRepository(
+            set: env.set,
+            destination: env.primary,
+            destinationSecretEnv: snapshot
+        )
+
+        #expect(status == .completed(.success))
+        let resticInvocations = env.fake.invocations.filter { $0.argv.first == Self.resticPath }
+        #expect(resticInvocations.count == 3)
+        #expect(resticInvocations[1].env == resticInvocations[0].env)
+        #expect(resticInvocations[1].env == resticInvocations[2].env)
+    }
+
     @Test("standalone prune: a stale mirror is never touched or consumes its preview token")
     func standalonePruneRefusesStaleMirror() async throws {
         let env = Self.makeEnv(script: [], retention: nil)

@@ -1445,7 +1445,10 @@ public final class BackupEngine: Sendable {
         )
         _ = await spawn(
             .unlock(repo: invocation.destination.repoURL),
-            invocation: ResticInvocation(destination: invocation.destination),
+            invocation: ResticInvocation(
+                destination: invocation.destination,
+                destinationSecretEnv: invocation.destinationSecretEnv
+            ),
             logWriter: logWriter,
             reporter: nil
         )
