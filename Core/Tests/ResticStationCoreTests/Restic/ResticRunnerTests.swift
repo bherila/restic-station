@@ -230,6 +230,28 @@ struct ResticRunnerTests {
         #expect(env["AWS_SECRET_ACCESS_KEY"] == "from-the-store")
     }
 
+    @Test("a supplied destination secret snapshot is used without rereading the store")
+    func suppliedDestinationSecretEnvIsUsedVerbatim() async throws {
+        let fake = FakeProcessRunner(script: [
+            .init(argvPrefix: [Self.resticPath, "-r", "/repo", "snapshots", "--json"]),
+        ])
+        let runner = Self.makeRunner(fake, secrets: Self.secretStore(
+            for: Self.primaryId,
+            secretEnv: ["AWS_SECRET_ACCESS_KEY": "changed-after-preview"]
+        ))
+
+        _ = try await runner.run(
+            .snapshots(repo: "/repo"),
+            for: ResticInvocation(
+                destination: Self.primary,
+                destinationSecretEnv: ["AWS_SECRET_ACCESS_KEY": "previewed-value"]
+            )
+        )
+
+        let env = try #require(fake.invocations[0].env)
+        #expect(env["AWS_SECRET_ACCESS_KEY"] == "previewed-value")
+    }
+
     /// End-to-end env assembly with the *real* file backend, on every
     /// platform: the assembled environment must carry both the password
     /// command and the two variables its child needs to find the same

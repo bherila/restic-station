@@ -628,6 +628,7 @@ public final class BackupEngine: Sendable {
     public func runPruneRepository(
         set: BackupSet,
         destination: Destination,
+        destinationSecretEnv: [String: String]? = nil,
         dryRun: Bool = false
     ) async -> PruneRepositoryResult {
         guard set.destinations.contains(where: { $0.id == destination.id }) else {
@@ -682,7 +683,10 @@ public final class BackupEngine: Sendable {
             // make the Runs screen claim that pack space was reclaimed.
             switch await execute(
                 .prune(repo: destination.repoURL, dryRun: true),
-                invocation: ResticInvocation(destination: destination),
+                invocation: ResticInvocation(
+                    destination: destination,
+                    destinationSecretEnv: destinationSecretEnv
+                ),
                 logWriter: nil,
                 reporter: nil
             ) {
@@ -708,7 +712,10 @@ public final class BackupEngine: Sendable {
             groupId: nil,
             phase: "pruning",
             command: .prune(repo: destination.repoURL, dryRun: false),
-            invocation: ResticInvocation(destination: destination),
+            invocation: ResticInvocation(
+                destination: destination,
+                destinationSecretEnv: destinationSecretEnv
+            ),
             streamProgress: false
         )
         guard let prune else { return .failed(.didNotRun) }

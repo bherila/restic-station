@@ -8,10 +8,19 @@ import Foundation
 public struct ResticInvocation: Sendable {
     public let destination: Destination
     public let fromDestination: Destination?
+    /// A caller-supplied secret-env snapshot. Destructive preview/confirm
+    /// flows use this to ensure the environment they validate is exactly the
+    /// one passed to restic; ordinary invocations read the current store value.
+    public let destinationSecretEnv: [String: String]?
 
-    public init(destination: Destination, fromDestination: Destination? = nil) {
+    public init(
+        destination: Destination,
+        fromDestination: Destination? = nil,
+        destinationSecretEnv: [String: String]? = nil
+    ) {
         self.destination = destination
         self.fromDestination = fromDestination
+        self.destinationSecretEnv = destinationSecretEnv
     }
 }
 
@@ -195,7 +204,13 @@ public final class ResticRunner: Sendable {
             env.merge(try await secretEnv(for: fromDestination)) { _, new in new }
         }
         env.merge(inv.destination.nonSecretEnv) { _, new in new }
-        env.merge(try await secretEnv(for: inv.destination)) { _, new in new }
+        let destinationSecretEnv: [String: String]
+        if let supplied = inv.destinationSecretEnv {
+            destinationSecretEnv = supplied
+        } else {
+            destinationSecretEnv = try await secretEnv(for: inv.destination)
+        }
+        env.merge(destinationSecretEnv) { _, new in new }
 
         // Written last: these must not be overridable by configured env.
         env["RESTIC_CACHE_DIR"] = paths.resticCacheDir.path

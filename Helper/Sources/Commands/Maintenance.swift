@@ -71,11 +71,13 @@ struct MaintenancePrune: AsyncParsableCommand, JSONRenderable {
             )
         }
 
+        let destinationSecretEnv = try await Self.destinationSecretEnv(
+            destination: destination,
+            secrets: context.secrets
+        )
+        let effectiveFingerprint = destination.pruneConfirmationFingerprint(secretEnv: destinationSecretEnv)
+
         if let expectedDestination {
-            let effectiveFingerprint = try await Self.effectiveDestinationFingerprint(
-                destination: destination,
-                secrets: context.secrets
-            )
             do {
                 try PreviewTokenStore(paths: context.paths).consumeMaintenancePrune(
                     expectedDestination,
@@ -92,6 +94,7 @@ struct MaintenancePrune: AsyncParsableCommand, JSONRenderable {
         let result = await context.engine.runPruneRepository(
             set: backupSet,
             destination: destination,
+            destinationSecretEnv: destinationSecretEnv,
             dryRun: dryRun
         )
         let status = try Self.status(
@@ -102,10 +105,6 @@ struct MaintenancePrune: AsyncParsableCommand, JSONRenderable {
         )
         let confirmationBinding: String?
         if dryRun {
-            let effectiveFingerprint = try await Self.effectiveDestinationFingerprint(
-                destination: destination,
-                secrets: context.secrets
-            )
             confirmationBinding = try PreviewTokenStore(paths: context.paths).issueMaintenancePrune(
                 machineId: context.addressable.machineId,
                 setId: set,
@@ -140,14 +139,12 @@ struct MaintenancePrune: AsyncParsableCommand, JSONRenderable {
         )
     }
 
-    private static func effectiveDestinationFingerprint(
+    private static func destinationSecretEnv(
         destination: Destination,
         secrets: any SecretStore
-    ) async throws -> String {
+    ) async throws -> [String: String] {
         do {
-            return destination.pruneConfirmationFingerprint(
-                secretEnv: try await secrets.secretEnv(destId: destination.id)
-            )
+            return try await secrets.secretEnv(destId: destination.id)
         } catch {
             throw CLIFailure.classify(error)
         }
