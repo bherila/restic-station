@@ -75,11 +75,12 @@ struct MaintenancePrune: AsyncParsableCommand, JSONRenderable {
             )
         }
 
+        let invocationDestination = destination.pruneInvocationDestination()
         let destinationSecretEnv = try await Self.destinationSecretEnv(
             destination: destination,
             secrets: context.secrets
         )
-        let effectiveFingerprint = destination.pruneConfirmationFingerprint(secretEnv: destinationSecretEnv)
+        let effectiveFingerprint = invocationDestination.pruneConfirmationFingerprint(secretEnv: destinationSecretEnv)
 
         let authorization = expectedDestination.map {
             MaintenancePruneAuthorization(
@@ -91,7 +92,7 @@ struct MaintenancePrune: AsyncParsableCommand, JSONRenderable {
 
         let result = await context.engine.runPruneRepository(
             set: backupSet,
-            destination: destination,
+            destination: invocationDestination,
             destinationSecretEnv: destinationSecretEnv,
             authorization: authorization,
             dryRun: dryRun
@@ -121,7 +122,7 @@ struct MaintenancePrune: AsyncParsableCommand, JSONRenderable {
             dryRun: dryRun,
             status: status,
             confirmationBinding: confirmationBinding,
-            destinationFingerprint: destination.pruneConfirmationFingerprint(secretEnv: [:])
+            destinationFingerprint: invocationDestination.pruneConfirmationFingerprint(secretEnv: [:])
         )
         if json {
             CLIJSON.print(report)

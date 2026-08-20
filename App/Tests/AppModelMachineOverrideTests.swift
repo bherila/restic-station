@@ -58,6 +58,31 @@ struct AppModelMachineOverrideTests {
         #expect(MaintenanceModel.isICloudRepository(destination, iCloudRoot: iCloudRoot.path))
     }
 
+    @Test("reclaim preview decodes its JSON envelope without stderr diagnostics")
+    func reclaimPreviewUsesStdoutForJSON() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-preview-helper-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let helper = root.appendingPathComponent("helper", isDirectory: false)
+        let script = """
+        #!/bin/sh
+        printf '%s\\n' '{"ok":true,"data":{"label":"Primary","dryRun":true,"status":"success","confirmationBinding":"opaque-binding","destinationFingerprint":"public-fingerprint"}}'
+        printf '%s\\n' 'diagnostic emitted on stderr' >&2
+        """
+        try script.write(to: helper, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: helper.path)
+
+        let preview = await HelperInvoker(helperURL: helper).previewReclaimSpace(
+            setId: UUID(),
+            destId: UUID()
+        )
+
+        #expect(preview.result.isSuccess)
+        #expect(preview.confirmationBinding == "opaque-binding")
+        #expect(preview.destinationFingerprint == "public-fingerprint")
+    }
+
     @Test("known machines and effective-plan preview include exclusions and replacements")
     func effectivePlanPreview() throws {
         let setId = UUID()

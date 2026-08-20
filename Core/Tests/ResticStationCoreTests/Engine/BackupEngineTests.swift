@@ -1382,6 +1382,24 @@ struct BackupEngineTests {
         #expect(completed == .completed(.success))
     }
 
+    @Test("standalone prune: an invalid confirmation remains previewChanged")
+    func standalonePruneInvalidConfirmationIsPreviewChanged() async throws {
+        let env = Self.makeEnv(script: [], retention: nil)
+        defer { env.cleanUp() }
+        let result = await env.engine.runPruneRepository(
+            set: env.set,
+            destination: env.primary,
+            authorization: MaintenancePruneAuthorization(
+                token: "not-a-preview-token",
+                machineId: env.machineId,
+                effectiveDestinationFingerprint: env.primary.pruneConfirmationFingerprint(secretEnv: [:])
+            )
+        )
+
+        #expect(result == .skipped(.previewChanged))
+        #expect(env.fake.invocations.isEmpty)
+    }
+
     @Test("standalone prune: an unavailable secret is distinguished from success")
     func standalonePruneReportsSecretUnavailable() async throws {
         let env = Self.makeEnv(secretsUnavailableFor: [Self.primaryId], script: [], retention: nil)

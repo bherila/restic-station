@@ -752,6 +752,7 @@ public final class BackupEngine: Sendable {
             preflight: previewValidation
         )
         guard let prune else { return .failed(.didNotRun) }
+        if prune.preflightFailed { return .skipped(.previewChanged) }
         guard prune.child.status == .failed else { return .completed(prune.child.status) }
         if let outcome = prune.outcome {
             return .failed(.restic(outcome.status))
@@ -1279,6 +1280,7 @@ public final class BackupEngine: Sendable {
     private struct ChildRun {
         let child: SetRunChild
         let outcome: ResticOutcome?
+        let preflightFailed: Bool
     }
 
     /// Runs one restic command as one recorded run: `begin` → open the run
@@ -1342,7 +1344,8 @@ public final class BackupEngine: Sendable {
             finish(run, status: .failed, errorSummary: reason)
             return ChildRun(
                 child: SetRunChild(runId: run.runId, kind: kind, destId: destination.id, status: .failed),
-                outcome: nil
+                outcome: nil,
+                preflightFailed: true
             )
         }
 
@@ -1402,7 +1405,8 @@ public final class BackupEngine: Sendable {
         )
         return ChildRun(
             child: SetRunChild(runId: run.runId, kind: kind, destId: destination.id, status: status),
-            outcome: result.outcome
+            outcome: result.outcome,
+            preflightFailed: false
         )
     }
 

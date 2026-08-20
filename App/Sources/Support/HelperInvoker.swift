@@ -75,17 +75,21 @@ public struct HelperInvoker: Sendable {
     /// its secret environment. Confirmation returns that binding to the
     /// helper, which revalidates it after reloading configuration.
     func previewReclaimSpace(setId: UUID, destId: UUID) async -> ReclaimPreviewResult {
-        let result = await run(.maintenancePrune(
+        let invocation = await runDetailed(.maintenancePrune(
             setId: setId,
             destId: destId,
             expectedDestination: nil,
             dryRun: true,
             json: true
         ))
-        guard case .ok(let output) = result else {
+        let result = invocation.result
+        guard case .ok = result else {
             return ReclaimPreviewResult(result: Self.humanResult(result), confirmationBinding: nil)
         }
-        guard let decoded = try? JSONDecoder().decode(ReclaimPreviewEnvelope.self, from: Data(output.utf8)),
+        guard let decoded = try? JSONDecoder().decode(
+            ReclaimPreviewEnvelope.self,
+            from: Data(invocation.stdout.utf8)
+        ),
               decoded.ok,
               let binding = decoded.data.confirmationBinding,
               !binding.isEmpty,
@@ -144,8 +148,12 @@ public struct HelperInvoker: Sendable {
     /// through the T10 contract. Never throws: every failure mode becomes
     /// a `HelperResult` the UI can render.
     func run(_ command: HelperCommand) async -> HelperResult {
+        await runDetailed(command).result
+    }
+
+    private func runDetailed(_ command: HelperCommand) async -> HelperInvocation {
         let executable = helperURL
-        return await withCheckedContinuation { (continuation: CheckedContinuation<HelperResult, Never>) in
+        return await withCheckedContinuation { (continuation: CheckedContinuation<HelperInvocation, Never>) in
             // The whole spawn + drain + wait happens on a utility queue:
             // `waitUntilExit()` blocks its thread, so it must never run on
             // a Swift-concurrency cooperative thread (or the main one).
@@ -155,10 +163,13 @@ public struct HelperInvoker: Sendable {
         }
     }
 
-    private static func runBlocking(executable: URL, command: HelperCommand) -> HelperResult {
+    private static func runBlocking(executable: URL, command: HelperCommand) -> HelperInvocation {
         guard FileManager.default.isExecutableFile(atPath: executable.path) else {
-            return .failed(output: "The Restic Station helper is missing from this copy of the app "
-                + "(expected at \(executable.path)). Reinstall Restic Station.")
+            return HelperInvocation(
+                result: .failed(output: "The Restic Station helper is missing from this copy of the app "
+                    + "(expected at \(executable.path)). Reinstall Restic Station."),
+                stdout: ""
+            )
         }
 
         let process = Process()
@@ -178,7 +189,10 @@ public struct HelperInvoker: Sendable {
         do {
             try process.run()
         } catch {
-            return .failed(output: "Could not start the helper: \(error.localizedDescription)")
+            return HelperInvocation(
+                result: .failed(output: "Could not start the helper: \(error.localizedDescription)"),
+                stdout: ""
+            )
         }
 
         // Both pipes are drained concurrently: a helper that writes enough
@@ -198,6 +212,7 @@ public struct HelperInvoker: Sendable {
         process.waitUntilExit()
 
         let output = collector.combinedText()
+        let stdout = collector.stdoutText()
 
         // A signalled process reports the *signal number* in
         // `terminationStatus` on Darwin — without this check a helper
@@ -205,22 +220,36 @@ public struct HelperInvoker: Sendable {
         // ("busy"), and SIGQUIT (3) as "offline".
         if process.terminationReason == .uncaughtSignal {
             let detail = output.isEmpty ? "" : "\n\(output)"
-            return .failed(output: "The helper was terminated by signal \(process.terminationStatus).\(detail)")
+            return HelperInvocation(
+                result: .failed(output: "The helper was terminated by signal \(process.terminationStatus).\(detail)"),
+                stdout: stdout
+            )
         }
 
         switch HelperExitCode.interpret(process.terminationStatus) {
         case .ok:
-            return .ok(output: output)
+            return HelperInvocation(result: .ok(output: output), stdout: stdout)
         case .busy:
-            return .busy
+            return HelperInvocation(result: .busy, stdout: stdout)
         case .offline:
-            return .offline(output: output)
+            return HelperInvocation(result: .offline(output: output), stdout: stdout)
         case .failed:
-            return .failed(output: output.isEmpty
-                ? "The helper failed (exit \(process.terminationStatus))."
-                : output)
+            return HelperInvocation(
+                result: .failed(output: output.isEmpty
+                    ? "The helper failed (exit \(process.terminationStatus))."
+                    : output),
+                stdout: stdout
+            )
         }
     }
+}
+
+/// Keeps JSON-mode stdout distinct from incidental helper diagnostics. The
+/// UI still renders combined output for human-mode failures, but structured
+/// envelopes are decoded exclusively from stdout by their contract.
+private struct HelperInvocation: Sendable {
+    let result: HelperResult
+    let stdout: String
 }
 
 struct ReclaimPreviewResult: Sendable {
@@ -348,5 +377,12 @@ private final class OutputCollector: @unchecked Sendable {
             .map { String(decoding: $0, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
         return parts.joined(separator: "\n")
+    }
+
+    func stdoutText() -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        return String(decoding: stdout, as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }

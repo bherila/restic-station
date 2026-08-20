@@ -332,6 +332,29 @@ public struct Destination: Codable, Equatable, Identifiable, Sendable {
 }
 
 public extension Destination {
+    /// The repository identity a maintenance preview authorizes. Local paths
+    /// are resolved before binding so a symlink retarget between preview and
+    /// confirmation invalidates the capability instead of redirecting prune
+    /// to an unpreviewed repository. Remote URLs are opaque to Foundation
+    /// and must remain verbatim.
+    func pruneRepositoryURL() -> String {
+        guard kind == .localPath else { return repoURL }
+        return URL(fileURLWithPath: repoURL)
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+            .path
+    }
+
+    /// The exact destination passed to the preview and destructive prune.
+    /// Keeping the resolved local URL in the invocation closes the remaining
+    /// time-of-check/time-of-use gap after its fingerprint was validated.
+    func pruneInvocationDestination() -> Destination {
+        guard kind == .localPath else { return self }
+        var resolved = self
+        resolved.repoURL = pruneRepositoryURL()
+        return resolved
+    }
+
     /// Stable binding for a destructive maintenance confirmation. The helper
     /// supplies the stored secret environment, so the binding covers every
     /// destination value that affects a restic invocation without ever
@@ -346,7 +369,7 @@ public extension Destination {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         let effective = EffectiveDestination(
-            repoURL: repoURL,
+            repoURL: pruneRepositoryURL(),
             nonSecretEnv: nonSecretEnv,
             secretEnv: secretEnv
         )
