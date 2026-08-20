@@ -31,7 +31,7 @@ public enum HelperCommand: Equatable, Sendable {
     /// `expectedDestination` binds a destructive confirmation to the full
     /// effective destination the preceding preview described; direct CLI
     /// callers may omit it.
-    case maintenancePrune(setId: UUID, destId: UUID?, expectedDestination: String?, dryRun: Bool)
+    case maintenancePrune(setId: UUID, destId: UUID?, expectedDestination: String?, dryRun: Bool, json: Bool = false)
     /// `init-secondary --set <uuid> --dest <uuid>`.
     case initSecondary(setId: UUID, destId: UUID)
     /// `probe-repo --set <uuid> --dest <uuid>` (exit 3 = offline).
@@ -71,11 +71,12 @@ public enum HelperCommand: Equatable, Sendable {
             return Self.runSet(setId: setId, kind: "prune")
         case .check(let setId):
             return Self.runSet(setId: setId, kind: "check")
-        case .maintenancePrune(let setId, let destId, let expectedDestination, let dryRun):
+        case .maintenancePrune(let setId, let destId, let expectedDestination, let dryRun, let json):
             var argv = ["maintenance", "prune", "--set", Self.render(setId)]
             if let destId { argv.append(contentsOf: ["--dest", Self.render(destId)]) }
             if let expectedDestination { argv.append(contentsOf: ["--expected-destination", expectedDestination]) }
             if dryRun { argv.append("--dry-run") }
+            if json { argv.append("--json") }
             return argv
         case .initSecondary(let setId, let destId):
             return ["init-secondary", "--set", Self.render(setId), "--dest", Self.render(destId)]

@@ -332,19 +332,24 @@ public struct Destination: Codable, Equatable, Identifiable, Sendable {
 }
 
 public extension Destination {
-    /// Stable binding for a destructive maintenance confirmation. These are
-    /// the complete destination values that affect a restic invocation after
-    /// machine resolution: the repository address and its non-secret
-    /// environment. It hashes rather than placing environment values on argv.
-    func pruneConfirmationFingerprint() -> String {
+    /// Stable binding for a destructive maintenance confirmation. The helper
+    /// supplies the stored secret environment, so the binding covers every
+    /// destination value that affects a restic invocation without ever
+    /// exposing a secret on argv or in app memory.
+    func pruneConfirmationFingerprint(secretEnv: [String: String]) -> String {
         struct EffectiveDestination: Codable {
             let repoURL: String
             let nonSecretEnv: [String: String]
+            let secretEnv: [String: String]
         }
 
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
-        let effective = EffectiveDestination(repoURL: repoURL, nonSecretEnv: nonSecretEnv)
+        let effective = EffectiveDestination(
+            repoURL: repoURL,
+            nonSecretEnv: nonSecretEnv,
+            secretEnv: secretEnv
+        )
         // Encoding an in-memory String dictionary cannot fail in practice;
         // fail closed with an impossible-to-match fingerprint if it ever did.
         guard let data = try? encoder.encode(effective) else { return "" }

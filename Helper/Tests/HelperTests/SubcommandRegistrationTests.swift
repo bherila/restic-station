@@ -140,7 +140,7 @@ import Testing
             repoURL: destination.repoURL,
             isPrimary: destination.isPrimary,
             nonSecretEnv: ["AWS_DEFAULT_REGION": "previewed"]
-        ).pruneConfirmationFingerprint(),
+        ).pruneConfirmationFingerprint(secretEnv: [:]),
     ]) as? MaintenancePrune)
     #expect(parsed.expectedDestination != nil)
 
@@ -148,7 +148,8 @@ import Testing
         try MaintenancePrune.validateExpectedDestination(
             parsed.expectedDestination,
             destination: destination,
-            setId: setId
+            setId: setId,
+            secretEnv: [:]
         )
         Issue.record("expected the helper to reject a destination changed after preview")
     } catch let failure as CLIFailure {
@@ -169,10 +170,38 @@ import Testing
     )
 
     try MaintenancePrune.validateExpectedDestination(
-        destination.pruneConfirmationFingerprint(),
+        destination.pruneConfirmationFingerprint(secretEnv: [:]),
         destination: destination,
-        setId: setId
+        setId: setId,
+        secretEnv: [:]
     )
+}
+
+@Test func maintenancePruneRejectsAChangedSecretEnvironment() throws {
+    let setId = UUID()
+    let destination = Destination(
+        id: UUID(),
+        label: "Primary",
+        repoURL: "s3:s3.us-east-1.amazonaws.com/example",
+        isPrimary: true
+    )
+    let previewBinding = destination.pruneConfirmationFingerprint(
+        secretEnv: ["AWS_ACCESS_KEY_ID": "preview-account"]
+    )
+
+    do {
+        try MaintenancePrune.validateExpectedDestination(
+            previewBinding,
+            destination: destination,
+            setId: setId,
+            secretEnv: ["AWS_ACCESS_KEY_ID": "changed-account"]
+        )
+        Issue.record("expected changed secret environment to invalidate the preview")
+    } catch let failure as CLIFailure {
+        #expect(failure.code == .operationNotAllowed)
+        #expect(failure.details.setId == setId)
+        #expect(failure.details.destinationId == destination.id)
+    }
 }
 
 /// T28 (issue #30): the `restic-station` PATH symlink manager.

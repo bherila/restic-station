@@ -70,6 +70,33 @@ public struct HelperInvoker: Sendable {
         ))
     }
 
+    /// Runs the non-mutating reclaim preview and decodes the opaque binding
+    /// that only the helper can construct from the effective destination and
+    /// its secret environment. Confirmation returns that binding to the
+    /// helper, which revalidates it after reloading configuration.
+    func previewReclaimSpace(setId: UUID, destId: UUID) async -> ReclaimPreviewResult {
+        let result = await run(.maintenancePrune(
+            setId: setId,
+            destId: destId,
+            expectedDestination: nil,
+            dryRun: true,
+            json: true
+        ))
+        guard case .ok(let output) = result else {
+            return ReclaimPreviewResult(result: Self.humanResult(result), confirmationBinding: nil)
+        }
+        guard let decoded = try? JSONDecoder().decode(ReclaimPreviewEnvelope.self, from: Data(output.utf8)),
+              decoded.ok,
+              let binding = decoded.data.confirmationBinding,
+              !binding.isEmpty else {
+            return ReclaimPreviewResult(
+                result: .failed(output: "The reclaim preview did not return a confirmation binding. Run a new preview before reclaiming space."),
+                confirmationBinding: nil
+            )
+        }
+        return ReclaimPreviewResult(result: .ok(output: decoded.data.summary), confirmationBinding: binding)
+    }
+
     public func check(setId: UUID) async -> HelperResult {
         await run(.check(setId: setId))
     }
@@ -187,6 +214,50 @@ public struct HelperInvoker: Sendable {
             return .failed(output: output.isEmpty
                 ? "The helper failed (exit \(process.terminationStatus))."
                 : output)
+        }
+    }
+}
+
+struct ReclaimPreviewResult: Sendable {
+    let result: HelperResult
+    let confirmationBinding: String?
+}
+
+private extension HelperInvoker {
+    struct ReclaimPreviewEnvelope: Decodable {
+        let ok: Bool
+        let data: Data
+
+        struct Data: Decodable {
+            let label: String
+            let dryRun: Bool
+            let status: RunStatus
+            let confirmationBinding: String?
+
+            var summary: String {
+                let qualifier = dryRun ? "dry run " : ""
+                return "\"\(label)\": prune \(qualifier)\(status.rawValue)"
+            }
+        }
+    }
+
+    struct JSONFailureEnvelope: Decodable {
+        let error: Error
+
+        struct Error: Decodable {
+            let message: String
+        }
+    }
+
+    static func humanResult(_ result: HelperResult) -> HelperResult {
+        func message(_ output: String) -> String {
+            (try? JSONDecoder().decode(JSONFailureEnvelope.self, from: Data(output.utf8)))?.error.message ?? output
+        }
+        return switch result {
+        case .ok: result
+        case .busy: result
+        case .offline(let output): .offline(output: message(output))
+        case .failed(let output): .failed(output: message(output))
         }
     }
 }

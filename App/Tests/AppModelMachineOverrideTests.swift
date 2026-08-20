@@ -20,15 +20,17 @@ struct AppModelMachineOverrideTests {
             setId: UUID(),
             setName: "Documents",
             destination: destination,
-            isICloud: MaintenanceModel.isICloudRepository(destination)
+            isICloud: MaintenanceModel.isICloudRepository(destination),
+            confirmationBinding: "preview-binding"
         )
 
-        guard case .reclaimSpace(let previewedDestination, let isICloud) = plan.action else {
+        guard case .reclaimSpace(let previewedDestination, let isICloud, let binding) = plan.action else {
             Issue.record("expected a reclaim plan")
             return
         }
         #expect(previewedDestination == destination)
         #expect(isICloud)
+        #expect(binding == "preview-binding")
     }
 
     @Test("known machines and effective-plan preview include exclusions and replacements")

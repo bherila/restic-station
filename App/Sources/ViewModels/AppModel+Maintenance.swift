@@ -215,7 +215,7 @@ struct PrunePlan: Identifiable, Equatable {
         /// Confirm revalidates this value before it asks the helper to make
         /// changes, so a concurrent config edit cannot redirect the prune to
         /// another repository after the user has read the warning.
-        case reclaimSpace(destination: Destination, isICloud: Bool)
+        case reclaimSpace(destination: Destination, isICloud: Bool, confirmationBinding: String)
     }
 
     let id = UUID()
@@ -231,11 +231,21 @@ struct PrunePlan: Identifiable, Equatable {
         action = .retention
     }
 
-    init(setId: UUID, setName: String, destination: Destination, isICloud: Bool) {
+    init(
+        setId: UUID,
+        setName: String,
+        destination: Destination,
+        isICloud: Bool,
+        confirmationBinding: String
+    ) {
         self.setId = setId
         self.setName = setName
         previews = []
-        action = .reclaimSpace(destination: destination, isICloud: isICloud)
+        action = .reclaimSpace(
+            destination: destination,
+            isICloud: isICloud,
+            confirmationBinding: confirmationBinding
+        )
     }
 
     var confirmationTitle: String {
@@ -279,7 +289,7 @@ struct PrunePlan: Identifiable, Equatable {
     /// one line per destination ("This will permanently delete N snapshots
     /// from <dest>."); the rest satisfies the destructive-confirmation rule.
     var confirmationMessage: String {
-        if case .reclaimSpace(let destination, let isICloud) = action {
+        if case .reclaimSpace(let destination, let isICloud, _) = action {
             var lines = [
                 "This runs restic prune for \(destination.label). It removes only pack data no current snapshot references; it does not change snapshot retention or touch source files.",
                 "Stop other repository activity until it finishes. Prune can take a long time."
@@ -539,7 +549,8 @@ final class MaintenanceModel: ObservableObject {
     func prepareReclaimSpace(for set: BackupSet, destination: Destination, in model: AppModel) {
         isPreparingPrune = true
         Task { [weak self] in
-            let result = await model.helper.pruneRepository(setId: set.id, destId: destination.id, dryRun: true)
+            let preview = await model.helper.previewReclaimSpace(setId: set.id, destId: destination.id)
+            let result = preview.result
             guard let self else { return }
             self.isPreparingPrune = false
             guard result.isSuccess else {
@@ -554,11 +565,21 @@ final class MaintenanceModel: ObservableObject {
                 )
                 return
             }
+            guard let confirmationBinding = preview.confirmationBinding else {
+                self.activity = Self.activity(
+                    title: "Check reclaim space",
+                    subject: set.name,
+                    result: .failed(output: "The reclaim preview did not return a confirmation binding. Run it again before reclaiming space."),
+                    run: nil
+                )
+                return
+            }
             self.prunePlan = PrunePlan(
                 setId: set.id,
                 setName: set.name,
                 destination: destination,
-                isICloud: Self.isICloudRepository(destination)
+                isICloud: Self.isICloudRepository(destination),
+                confirmationBinding: confirmationBinding
             )
         }
     }
@@ -581,7 +602,7 @@ final class MaintenanceModel: ObservableObject {
             destIds = set.destinations.map(\.id)
             title = "Apply retention"
             resultTask = { await model.helper.prune(setId: plan.setId) }
-        case .reclaimSpace(let previewedDestination, _):
+        case .reclaimSpace(let previewedDestination, _, let confirmationBinding):
             guard let destination = set.destinations.first(where: { $0.id == previewedDestination.id }),
                   destination == previewedDestination else {
                 self.activity = Self.activity(
@@ -599,7 +620,7 @@ final class MaintenanceModel: ObservableObject {
                     setId: plan.setId,
                     destId: destination.id,
                     dryRun: false,
-                    expectedDestination: previewedDestination.pruneConfirmationFingerprint()
+                    expectedDestination: confirmationBinding
                 )
             }
         }

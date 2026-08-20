@@ -45,6 +45,10 @@ struct MaintenancePrune: AsyncParsableCommand, JSONRenderable {
         let label: String
         let dryRun: Bool
         let status: RunStatus
+        /// Opaque and emitted only by a successful dry run. The app sends it
+        /// back on confirmation; the helper recomputes it from freshly loaded
+        /// config plus secret storage before it allows a destructive prune.
+        let confirmationBinding: String?
     }
 
     func run() async throws {
@@ -68,11 +72,14 @@ struct MaintenancePrune: AsyncParsableCommand, JSONRenderable {
             )
         }
 
-        try Self.validateExpectedDestination(
-            expectedDestination,
-            destination: destination,
-            setId: set
-        )
+        if let expectedDestination {
+            try Self.validateExpectedDestination(
+                expectedDestination,
+                destination: destination,
+                setId: set,
+                secretEnv: try await context.secrets.secretEnv(destId: destination.id)
+            )
+        }
 
         let result = await context.engine.runPruneRepository(
             set: backupSet,
@@ -85,13 +92,23 @@ struct MaintenancePrune: AsyncParsableCommand, JSONRenderable {
             destination: destination,
             context: context
         )
+        let confirmationBinding: String?
+        if dryRun {
+            confirmationBinding = try await Self.confirmationBinding(
+                destination: destination,
+                secrets: context.secrets
+            )
+        } else {
+            confirmationBinding = nil
+        }
 
         let report = Report(
             setId: set,
             destinationId: destination.id,
             label: destination.label,
             dryRun: dryRun,
-            status: status
+            status: status,
+            confirmationBinding: confirmationBinding
         )
         if json {
             CLIJSON.print(report)
@@ -108,15 +125,29 @@ struct MaintenancePrune: AsyncParsableCommand, JSONRenderable {
     static func validateExpectedDestination(
         _ expectedDestination: String?,
         destination: Destination,
-        setId: UUID
+        setId: UUID,
+        secretEnv: [String: String]
     ) throws {
         guard let expectedDestination,
-              destination.pruneConfirmationFingerprint() != expectedDestination else { return }
+              destination.pruneConfirmationFingerprint(secretEnv: secretEnv) != expectedDestination else { return }
         throw CLIFailure(
             code: .operationNotAllowed,
             message: "Destination configuration changed after the reclaim preview. Run a new dry run before pruning.",
             details: CLIErrorDetails(setId: setId, destinationId: destination.id)
         )
+    }
+
+    private static func confirmationBinding(
+        destination: Destination,
+        secrets: any SecretStore
+    ) async throws -> String {
+        do {
+            return destination.pruneConfirmationFingerprint(
+                secretEnv: try await secrets.secretEnv(destId: destination.id)
+            )
+        } catch {
+            throw CLIFailure.classify(error)
+        }
     }
 
     private static func status(
