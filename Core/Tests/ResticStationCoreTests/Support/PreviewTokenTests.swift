@@ -64,6 +64,47 @@ struct PreviewTokenStoreTests {
         _ = try store.consume(token.value)
         #expect(throws: PreviewTokenError.alreadyUsed) { try store.token(token.value) }
 
+        let maintenance = try store.issueMaintenancePrune(
+            machineId: "example-machine",
+            setId: setId,
+            destinationId: destinationId,
+            effectiveDestinationFingerprint: "secret-inclusive-preview"
+        )
+        #expect(maintenance.count >= 43)
+        #expect(maintenance != "secret-inclusive-preview")
+        try store.consumeMaintenancePrune(
+            maintenance,
+            machineId: "example-machine",
+            setId: setId,
+            destinationId: destinationId,
+            effectiveDestinationFingerprint: "secret-inclusive-preview"
+        )
+        #expect(throws: PreviewTokenError.alreadyUsed) {
+            try store.consumeMaintenancePrune(
+                maintenance,
+                machineId: "example-machine",
+                setId: setId,
+                destinationId: destinationId,
+                effectiveDestinationFingerprint: "secret-inclusive-preview"
+            )
+        }
+
+        let changed = try store.issueMaintenancePrune(
+            machineId: "example-machine",
+            setId: setId,
+            destinationId: destinationId,
+            effectiveDestinationFingerprint: "preview-secret-environment"
+        )
+        #expect(throws: PreviewTokenError.unknown) {
+            try store.consumeMaintenancePrune(
+                changed,
+                machineId: "example-machine",
+                setId: setId,
+                destinationId: destinationId,
+                effectiveDestinationFingerprint: "changed-secret-environment"
+            )
+        }
+
         let expiring = try store.issue(
             machineId: "example-machine",
             setId: setId,

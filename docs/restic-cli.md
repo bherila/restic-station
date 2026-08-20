@@ -123,7 +123,7 @@ Standalone repository-wide space reclamation. `--dry-run` reports the work
 without changing the repository. Exit 0 means prune completed; nonzero is a
 restic failure. Purge previews and purge applies never add `prune` implicitly.
 Restic Station exposes it as `maintenance prune --set <uuid> [--dest <uuid>]
-[--expected-destination <fingerprint>] [--dry-run] [--json]`; omitting `--dest`
+[--expected-destination <preview-token>] [--dry-run] [--json]`; omitting `--dest`
 selects the primary. The app obtains `--expected-destination` from the helper's
 JSON dry-run response, so the helper refuses a configuration or stored-secret
 environment change that would redirect the destructive command.

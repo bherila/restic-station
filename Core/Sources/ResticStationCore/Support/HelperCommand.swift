@@ -26,9 +26,9 @@ public enum HelperCommand: Equatable, Sendable {
     case prune(setId: UUID)
     /// `run-set --set <uuid> --kind check`.
     case check(setId: UUID)
-    /// `maintenance prune --set <uuid> [--dest <uuid>] [--expected-destination <fingerprint>] [--dry-run]`.
+    /// `maintenance prune --set <uuid> [--dest <uuid>] [--expected-destination <preview-token>] [--dry-run]`.
     /// This reclaims unused packs without applying a retention policy.
-    /// `expectedDestination` binds a destructive confirmation to the full
+    /// `expectedDestination` is an opaque helper-issued binding for the full
     /// effective destination the preceding preview described; direct CLI
     /// callers may omit it.
     case maintenancePrune(setId: UUID, destId: UUID?, expectedDestination: String?, dryRun: Bool, json: Bool = false)
