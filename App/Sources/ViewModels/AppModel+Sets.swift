@@ -313,6 +313,41 @@ extension AppModel {
     /// answered in two minutes is not going to.
     private static var primaryInitTimeout: TimeInterval { 120 }
 
+    /// Verifies the SSH transport and remote restic version used for SFTP
+    /// maintenance. This is deliberately a `version --json` invocation: it
+    /// neither reads nor sends the repository password and cannot fall back
+    /// to a local maintenance command.
+    func testRemoteMaintenance(setId: UUID, destId: UUID) async -> RemoteMaintenanceTestOutcome {
+        guard let destination = repositoryActionDestination(setId: setId, destId: destId),
+              destination.remoteMaintenance?.enabled == true,
+              let operands = destination.remoteMaintenanceOperands() else {
+            return .failed("Configure an SFTP destination and its remote maintenance details first.")
+        }
+        guard let resticPath, !resticPath.isEmpty else {
+            return .failed("No restic binary is configured. Set the restic path in Settings, then try again.")
+        }
+        guard let secrets = self.secrets else {
+            return .failed("Secret storage is misconfigured (check \(SecretBackend.environmentKey)).")
+        }
+
+        let runner = ResticRunner(
+            resticPath: resticPath,
+            paths: paths,
+            secrets: secrets,
+            runner: DefaultProcessRunner()
+        )
+        do {
+            let version = try await runner.verifyRemoteMaintenance(
+                .version(sshTarget: operands.sshTarget, resticPath: operands.resticPath)
+            )
+            return .available("SSH and remote restic \(version.version) are ready for pack reclamation.")
+        } catch let error as ResticRunnerError {
+            return .failed(error.userFacingMessage)
+        } catch {
+            return .failed("Remote maintenance could not be verified: \(error)")
+        }
+    }
+
     private static func trim(_ output: String, fallback: String) -> String {
         let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? fallback : trimmed
@@ -337,5 +372,11 @@ enum DestinationProbeOutcome: Equatable, Sendable {
 /// The result of *Initialize repository*.
 enum DestinationInitOutcome: Equatable, Sendable {
     case initialized(String)
+    case failed(String)
+}
+
+/// The result of testing remote SFTP maintenance from the destination editor.
+enum RemoteMaintenanceTestOutcome: Equatable, Sendable {
+    case available(String)
     case failed(String)
 }

@@ -192,7 +192,9 @@ public final class ResticRunner: Sendable {
     public func runRemoteMaintenance(
         _ command: RemoteResticCommand,
         destination: Destination,
-        onRawLine: (@Sendable (String) -> Void)? = nil
+        onRawLine: (@Sendable (String) -> Void)? = nil,
+        beforeLaunch: (@Sendable () throws -> Void)? = nil,
+        afterLaunchFailure: (@Sendable () -> Void)? = nil
     ) async throws -> ResticOutcome {
         let password: String
         do { password = try await secrets.password(destId: destination.id) }
@@ -201,10 +203,17 @@ public final class ResticRunner: Sendable {
         let collector = MessageCollector()
         let result: ProcessResult
         do {
+            // Match the local destructive-command invariant: consume a
+            // confirmation only after the password is available and directly
+            // before Process receives the SSH argv.
+            try beforeLaunch?()
             result = try await runner.run(command.argv, env: nil, stdin: command.password, currentDirectory: nil, onStdoutLine: { line in
                 onRawLine?(line); let message = self.decoder.decodeLine(line); collector.append(message)
             }, onStderrLine: { line in onRawLine?(line) }, timeout: nil)
         } catch let error as ProcessRunnerError {
+            if case .launchFailed = error {
+                afterLaunchFailure?()
+            }
             switch error { case .timeout: throw ResticRunnerError.timedOut; case .invalidArgv, .launchFailed: throw ResticRunnerError.launchFailed("remote maintenance ssh could not be launched") }
         }
         let stdout = String(decoding: result.stdout, as: UTF8.self)

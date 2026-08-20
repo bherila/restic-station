@@ -675,6 +675,41 @@ public final class BackupEngine: Sendable {
             }
         }
 
+        let consumePreviewToken: (@Sendable () throws -> Void)?
+        let restorePreviewToken: (@Sendable () -> Void)?
+        if let authorization {
+            let previewTokens = previewTokens
+            let token = authorization.token
+            let machineId = authorization.machineId
+            let effectiveDestinationFingerprint = authorization.effectiveDestinationFingerprint
+            let setId = set.id
+            let destinationId = destination.id
+            consumePreviewToken = {
+                try previewTokens.consumeMaintenancePrune(
+                    token,
+                    machineId: machineId,
+                    setId: setId,
+                    destinationId: destinationId,
+                    effectiveDestinationFingerprint: effectiveDestinationFingerprint
+                )
+            }
+            restorePreviewToken = {
+                // A restore failure intentionally leaves the token consumed:
+                // retrying a destructive action is never safer than asking
+                // for a fresh preview when capability storage is unavailable.
+                try? previewTokens.restoreMaintenancePrune(
+                    token,
+                    machineId: machineId,
+                    setId: setId,
+                    destinationId: destinationId,
+                    effectiveDestinationFingerprint: effectiveDestinationFingerprint
+                )
+            }
+        } else {
+            consumePreviewToken = nil
+            restorePreviewToken = nil
+        }
+
         if destination.remoteMaintenance?.enabled == true {
             guard let operands = destination.remoteMaintenanceOperands() else {
                 return .failed(.didNotRun)
@@ -685,6 +720,11 @@ public final class BackupEngine: Sendable {
                 repoPath: operands.repoPath,
                 dryRun: dryRun
             )
+            do {
+                _ = try await restic.verifyRemoteMaintenance(.version(sshTarget: operands.sshTarget, resticPath: operands.resticPath))
+            } catch {
+                return .failed(.didNotRun)
+            }
             if dryRun {
                 do {
                     let outcome = try await restic.runRemoteMaintenance(remote, destination: destination)
@@ -698,7 +738,10 @@ public final class BackupEngine: Sendable {
                 kind: .prune, setId: set.id, destination: destination, trigger: .manual, groupId: nil,
                 phase: "remote pruning", command: .prune(repo: destination.repoURL),
                 invocation: ResticInvocation(destination: destination), streamProgress: false,
-                remoteCommand: remote
+                remoteCommand: remote,
+                preflightPhase: authorization == nil ? nil : "validating preview",
+                beforeLaunch: consumePreviewToken,
+                afterLaunchFailure: restorePreviewToken
             )
             guard let prune else { return .failed(.didNotRun) }
             return prune.child.status == .failed ? .failed(.didNotRun) : .completed(prune.child.status)
@@ -745,41 +788,6 @@ public final class BackupEngine: Sendable {
             case .didNotRun:
                 return .failed(.didNotRun)
             }
-        }
-
-        let consumePreviewToken: (@Sendable () throws -> Void)?
-        let restorePreviewToken: (@Sendable () -> Void)?
-        if let authorization {
-            let previewTokens = previewTokens
-            let token = authorization.token
-            let machineId = authorization.machineId
-            let effectiveDestinationFingerprint = authorization.effectiveDestinationFingerprint
-            let setId = set.id
-            let destinationId = destination.id
-            consumePreviewToken = {
-                try previewTokens.consumeMaintenancePrune(
-                    token,
-                    machineId: machineId,
-                    setId: setId,
-                    destinationId: destinationId,
-                    effectiveDestinationFingerprint: effectiveDestinationFingerprint
-                )
-            }
-            restorePreviewToken = {
-                // A restore failure intentionally leaves the token consumed:
-                // retrying a destructive action is never safer than asking
-                // for a fresh preview when capability storage is unavailable.
-                try? previewTokens.restoreMaintenancePrune(
-                    token,
-                    machineId: machineId,
-                    setId: setId,
-                    destinationId: destinationId,
-                    effectiveDestinationFingerprint: effectiveDestinationFingerprint
-                )
-            }
-        } else {
-            consumePreviewToken = nil
-            restorePreviewToken = nil
         }
 
         let prune = await performChild(
@@ -1443,7 +1451,13 @@ public final class BackupEngine: Sendable {
 
         let result: ExecuteResult
         if let remoteCommand {
-            result = await spawnRemote(remoteCommand, destination: destination, logWriter: logWriter)
+            result = await spawnRemote(
+                remoteCommand,
+                destination: destination,
+                logWriter: logWriter,
+                beforeLaunch: beforeLaunch,
+                afterLaunchFailure: afterLaunchFailure
+            )
         } else {
             result = await execute(command, invocation: invocation, logWriter: logWriter, reporter: streamProgress ? reporter : nil, beforeLaunch: beforeLaunch, afterLaunchFailure: afterLaunchFailure)
         }
@@ -1612,9 +1626,25 @@ public final class BackupEngine: Sendable {
         }
     }
 
-    private func spawnRemote(_ command: RemoteResticCommand, destination: Destination, logWriter: LogWriter?) async -> ExecuteResult {
+    private func spawnRemote(
+        _ command: RemoteResticCommand,
+        destination: Destination,
+        logWriter: LogWriter?,
+        beforeLaunch: (@Sendable () throws -> Void)? = nil,
+        afterLaunchFailure: (@Sendable () -> Void)? = nil
+    ) async -> ExecuteResult {
         do {
-            return .ranToCompletion(try await restic.runRemoteMaintenance(command, destination: destination, onRawLine: { logWriter?.appendLine($0) }))
+            return .ranToCompletion(try await restic.runRemoteMaintenance(
+                command,
+                destination: destination,
+                onRawLine: { logWriter?.appendLine($0) },
+                beforeLaunch: beforeLaunch,
+                afterLaunchFailure: afterLaunchFailure
+            ))
+        } catch let error as PreviewTokenError {
+            let failure: PreflightFailure = error == .unavailable ? .previewUnavailable : .previewChanged
+            logWriter?.appendLine("remote maintenance did not run: \(failure.message)")
+            return .didNotRun(reason: failure.message, preflightFailure: failure)
         } catch let error as ResticRunnerError {
             logWriter?.appendLine("remote maintenance did not run: \(error.description)")
             return .didNotRun(reason: error.userFacingMessage)

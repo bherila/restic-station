@@ -185,6 +185,8 @@ enum SetsCopy {
     /// surface inline (map `ConfigError` cases to field-level messages)").
     static func fieldMessage(for error: ConfigError) -> (field: SetEditorField, message: String) {
         switch error {
+        case .remoteMaintenanceRequiresSFTP:
+            return (.destinations, "Remote maintenance is available only for SFTP destinations.")
         case .newerVersion:
             return (.general, error.description)
         case .notExactlyOnePrimaryDestination(_, let count):
