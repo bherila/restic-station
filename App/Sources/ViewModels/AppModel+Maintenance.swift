@@ -638,7 +638,12 @@ final class MaintenanceModel: ObservableObject {
             let result = await resultTask()
             guard let self else { return }
             self.busyAction = nil
-            if result != .busy || !retainsPlanWhenBusy {
+            if result == .busy, retainsPlanWhenBusy {
+                // SwiftUI closes the confirmation alert before this Task
+                // returns. Restore the still-valid capability so transient
+                // helper/token-store contention can be retried directly.
+                self.prunePlan = plan
+            } else {
                 self.prunePlan = nil
             }
             model.refresh()
@@ -722,6 +727,7 @@ final class MaintenanceModel: ObservableObject {
         _ destination: Destination,
         iCloudRoot: String
     ) -> Bool {
+        guard destination.kind == .localPath else { return false }
         let path = URL(fileURLWithPath: destination.repoURL)
             .resolvingSymlinksInPath()
             .standardizedFileURL

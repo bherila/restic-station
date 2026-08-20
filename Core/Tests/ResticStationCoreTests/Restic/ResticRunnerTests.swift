@@ -110,6 +110,37 @@ struct ResticRunnerTests {
         #expect(fake.invocations.first?.argv.first == previewed.path)
     }
 
+    @Test("maintenance executable replacement is refused before spawning restic")
+    func maintenanceExecutableReplacementIsRejectedAtLaunch() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-executable-recheck-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let executable = root.appendingPathComponent("restic", isDirectory: false)
+        try Data("previewed binary".utf8).write(to: executable)
+        let fake = FakeProcessRunner()
+        let runner = ResticRunner(
+            resticPath: executable.path,
+            paths: Self.paths(),
+            secrets: FakeSecretStore(defaultPassword: Self.password),
+            runner: fake
+        )
+        let previewed = try #require(runner.maintenanceExecutable())
+        try Data("replacement binary".utf8).write(to: executable)
+
+        await #expect(throws: ResticRunnerError.launchFailed("the restic executable changed after the maintenance preview")) {
+            try await runner.run(
+                .backup(repo: Self.primary.repoURL, sources: ["/tmp/source"]),
+                for: ResticInvocation(
+                    destination: Self.primary,
+                    resticPathOverride: previewed.path,
+                    expectedExecutableIdentity: previewed.identity
+                )
+            )
+        }
+        #expect(fake.invocations.isEmpty)
+    }
+
     // MARK: - Environment assembly
 
     @Test("single destination: exact password command, cache dir, secret env injected, nothing inherited")

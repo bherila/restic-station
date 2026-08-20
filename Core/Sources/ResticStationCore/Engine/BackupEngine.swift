@@ -635,6 +635,7 @@ public final class BackupEngine: Sendable {
         destinationSecretEnv: [String: String]? = nil,
         authorization: MaintenancePruneAuthorization? = nil,
         resticExecutablePath: String? = nil,
+        resticExecutableIdentity: String? = nil,
         dryRun: Bool = false
     ) async -> PruneRepositoryResult {
         guard set.destinations.contains(where: { $0.id == destination.id }) else {
@@ -643,6 +644,7 @@ public final class BackupEngine: Sendable {
         }
         guard await secretsAvailable(for: [destination]) else { return .skipped(.secretUnavailable) }
         let executablePath = authorization?.resticExecutablePath ?? resticExecutablePath
+        let executableIdentity = authorization?.resticExecutableIdentity ?? resticExecutableIdentity
 
         let lock = makeSetLock(setId: set.id)
         guard lock.tryAcquire() else {
@@ -696,7 +698,8 @@ public final class BackupEngine: Sendable {
                 invocation: ResticInvocation(
                     destination: destination,
                     destinationSecretEnv: destinationSecretEnv,
-                    resticPathOverride: executablePath
+                    resticPathOverride: executablePath,
+                    expectedExecutableIdentity: executableIdentity
                 ),
                 logWriter: nil,
                 reporter: nil
@@ -759,7 +762,8 @@ public final class BackupEngine: Sendable {
             invocation: ResticInvocation(
                 destination: destination,
                 destinationSecretEnv: destinationSecretEnv,
-                resticPathOverride: executablePath
+                resticPathOverride: executablePath,
+                expectedExecutableIdentity: executableIdentity
             ),
             streamProgress: false,
             preflightPhase: authorization == nil ? nil : "validating preview",
@@ -1497,7 +1501,8 @@ public final class BackupEngine: Sendable {
             invocation: ResticInvocation(
                 destination: invocation.destination,
                 destinationSecretEnv: invocation.destinationSecretEnv,
-                resticPathOverride: invocation.resticPathOverride
+                resticPathOverride: invocation.resticPathOverride,
+                expectedExecutableIdentity: invocation.expectedExecutableIdentity
             ),
             logWriter: logWriter,
             reporter: nil

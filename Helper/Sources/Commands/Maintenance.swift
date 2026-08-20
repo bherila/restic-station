@@ -97,7 +97,8 @@ struct MaintenancePrune: AsyncParsableCommand, JSONRenderable {
                 token: $0,
                 machineId: context.addressable.machineId,
                 effectiveDestinationFingerprint: effectiveFingerprint,
-                resticExecutablePath: executable.path
+                resticExecutablePath: executable.path,
+                resticExecutableIdentity: executable.identity
             )
         }
 
@@ -107,6 +108,7 @@ struct MaintenancePrune: AsyncParsableCommand, JSONRenderable {
             destinationSecretEnv: destinationSecretEnv,
             authorization: authorization,
             resticExecutablePath: executable.path,
+            resticExecutableIdentity: executable.identity,
             dryRun: dryRun
         )
         let status = try Self.status(

@@ -58,6 +58,12 @@ struct AppModelMachineOverrideTests {
         #expect(MaintenanceModel.isICloudRepository(destination, iCloudRoot: iCloudRoot.path))
     }
 
+    @Test("reclaim plan never treats remote repository URLs as iCloud paths")
+    func reclaimPlanDoesNotClassifyRemoteURLAsICloud() {
+        let destination = Destination(id: UUID(), label: "Remote", repoURL: "s3:bucket/prefix", isPrimary: true)
+        #expect(!MaintenanceModel.isICloudRepository(destination, iCloudRoot: "/tmp"))
+    }
+
     @Test("reclaim preview decodes its JSON envelope without stderr diagnostics")
     func reclaimPreviewUsesStdoutForJSON() async throws {
         let root = FileManager.default.temporaryDirectory
