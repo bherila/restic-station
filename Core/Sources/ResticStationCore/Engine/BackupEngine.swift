@@ -634,6 +634,7 @@ public final class BackupEngine: Sendable {
         destination: Destination,
         destinationSecretEnv: [String: String]? = nil,
         authorization: MaintenancePruneAuthorization? = nil,
+        resticExecutablePath: String? = nil,
         dryRun: Bool = false
     ) async -> PruneRepositoryResult {
         guard set.destinations.contains(where: { $0.id == destination.id }) else {
@@ -641,6 +642,7 @@ public final class BackupEngine: Sendable {
             return .failed(.didNotRun)
         }
         guard await secretsAvailable(for: [destination]) else { return .skipped(.secretUnavailable) }
+        let executablePath = authorization?.resticExecutablePath ?? resticExecutablePath
 
         let lock = makeSetLock(setId: set.id)
         guard lock.tryAcquire() else {
@@ -693,7 +695,8 @@ public final class BackupEngine: Sendable {
                 .prune(repo: destination.repoURL, dryRun: true),
                 invocation: ResticInvocation(
                     destination: destination,
-                    destinationSecretEnv: destinationSecretEnv
+                    destinationSecretEnv: destinationSecretEnv,
+                    resticPathOverride: executablePath
                 ),
                 logWriter: nil,
                 reporter: nil
@@ -755,7 +758,8 @@ public final class BackupEngine: Sendable {
             command: .prune(repo: destination.repoURL, dryRun: false),
             invocation: ResticInvocation(
                 destination: destination,
-                destinationSecretEnv: destinationSecretEnv
+                destinationSecretEnv: destinationSecretEnv,
+                resticPathOverride: executablePath
             ),
             streamProgress: false,
             preflightPhase: authorization == nil ? nil : "validating preview",
@@ -1374,6 +1378,18 @@ public final class BackupEngine: Sendable {
 
         if let preflight, let failure = await preflight(logWriter) {
             logWriter?.appendLine("aborted: \(failure.message)")
+            if case .previewUnavailable = failure {
+                do {
+                    try runStore.discardUnstarted(run)
+                    return ChildRun(
+                        child: SetRunChild(runId: run.runId, kind: kind, destId: destination.id, status: .skipped),
+                        outcome: nil,
+                        preflightFailure: failure
+                    )
+                } catch {
+                    logWarning("BackupEngine: could not discard unavailable preflight run \(run.runId): \(error)")
+                }
+            }
             finish(run, status: .failed, errorSummary: failure.message)
             return ChildRun(
                 child: SetRunChild(runId: run.runId, kind: kind, destId: destination.id, status: .failed),
@@ -1480,7 +1496,8 @@ public final class BackupEngine: Sendable {
             .unlock(repo: invocation.destination.repoURL),
             invocation: ResticInvocation(
                 destination: invocation.destination,
-                destinationSecretEnv: invocation.destinationSecretEnv
+                destinationSecretEnv: invocation.destinationSecretEnv,
+                resticPathOverride: invocation.resticPathOverride
             ),
             logWriter: logWriter,
             reporter: nil

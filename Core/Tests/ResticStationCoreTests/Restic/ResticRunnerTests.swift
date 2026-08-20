@@ -73,10 +73,41 @@ struct ResticRunnerTests {
             secrets: FakeSecretStore(defaultPassword: Self.password),
             runner: FakeProcessRunner()
         )
-        let previewIdentity = try #require(runner.maintenanceExecutableIdentity())
+        let previewIdentity = try #require(runner.maintenanceExecutable()?.identity)
         try Data("replacement binary".utf8).write(to: executable)
 
-        #expect(previewIdentity != runner.maintenanceExecutableIdentity())
+        #expect(previewIdentity != runner.maintenanceExecutable()?.identity)
+    }
+
+    @Test("maintenance runner keeps the previewed executable when its symlink retargets")
+    func maintenanceExecutableIdentityUsesCanonicalExecutablePath() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-executable-link-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let previewed = root.appendingPathComponent("restic-previewed", isDirectory: false)
+        let replacement = root.appendingPathComponent("restic-replacement", isDirectory: false)
+        try Data("previewed binary".utf8).write(to: previewed)
+        try Data("replacement binary".utf8).write(to: replacement)
+        let link = root.appendingPathComponent("restic", isDirectory: false)
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: previewed)
+        let fake = FakeProcessRunner(script: [.init(argvPrefix: [previewed.path, "-r", Self.primary.repoURL, "backup", "--json"])])
+        let runner = ResticRunner(
+            resticPath: link.path,
+            paths: Self.paths(),
+            secrets: FakeSecretStore(defaultPassword: Self.password),
+            runner: fake
+        )
+        let previewedExecutable = try #require(runner.maintenanceExecutable())
+        try FileManager.default.removeItem(at: link)
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: replacement)
+
+        #expect(previewedExecutable != runner.maintenanceExecutable())
+        _ = try await runner.run(
+            .backup(repo: Self.primary.repoURL, sources: ["/tmp/source"]),
+            for: ResticInvocation(destination: Self.primary, resticPathOverride: previewedExecutable.path)
+        )
+        #expect(fake.invocations.first?.argv.first == previewed.path)
     }
 
     // MARK: - Environment assembly

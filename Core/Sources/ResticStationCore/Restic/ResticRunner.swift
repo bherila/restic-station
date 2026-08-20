@@ -12,15 +12,21 @@ public struct ResticInvocation: Sendable {
     /// flows use this to ensure the environment they validate is exactly the
     /// one passed to restic; ordinary invocations read the current store value.
     public let destinationSecretEnv: [String: String]?
+    /// A helper-validated, canonical restic executable for a destructive
+    /// preview/confirmation. Normal calls leave this nil and use the runner's
+    /// configured path unchanged.
+    public let resticPathOverride: String?
 
     public init(
         destination: Destination,
         fromDestination: Destination? = nil,
-        destinationSecretEnv: [String: String]? = nil
+        destinationSecretEnv: [String: String]? = nil,
+        resticPathOverride: String? = nil
     ) {
         self.destination = destination
         self.fromDestination = fromDestination
         self.destinationSecretEnv = destinationSecretEnv
+        self.resticPathOverride = resticPathOverride
     }
 }
 
@@ -97,6 +103,11 @@ public final class ResticRunner: Sendable {
     private let runner: ProcessRunning
     private let decoder = ResticMessageDecoder()
 
+    public struct MaintenanceExecutable: Equatable, Sendable {
+        public let path: String
+        public let identity: String
+    }
+
     public init(resticPath: String, paths: AppPaths, secrets: any SecretStore, runner: ProcessRunning) {
         self.resticPath = resticPath
         self.paths = paths
@@ -137,7 +148,14 @@ public final class ResticRunner: Sendable {
         }
 
         let env = try await environment(for: inv)
-        return try await execute(cmd, env: env, onLine: onLine, onRawLine: onRawLine, timeout: timeout)
+        return try await execute(
+            cmd,
+            env: env,
+            executablePath: inv.resticPathOverride,
+            onLine: onLine,
+            onRawLine: onRawLine,
+            timeout: timeout
+        )
     }
 
     /// Runs a command that targets no repository — currently only
@@ -172,12 +190,16 @@ public final class ResticRunner: Sendable {
     /// the content digest catches an in-place replacement at the same path.
     /// It is intentionally an opaque input to the helper's preview binding,
     /// never emitted in a report or run log.
-    public func maintenanceExecutableIdentity() -> String? {
+    public func maintenanceExecutable() -> MaintenanceExecutable? {
+        guard resticPath.hasPrefix("/") else { return nil }
         let executable = URL(fileURLWithPath: resticPath)
             .resolvingSymlinksInPath()
             .standardizedFileURL
         guard let data = try? Data(contentsOf: executable) else { return nil }
-        return "\(executable.path):\(SHA256Digest.hex(data))"
+        return MaintenanceExecutable(
+            path: executable.path,
+            identity: "\(executable.path):\(SHA256Digest.hex(data))"
+        )
     }
 
     // MARK: - Secret-store pre-flight
@@ -270,11 +292,12 @@ public final class ResticRunner: Sendable {
     private func execute(
         _ cmd: ResticCommand,
         env: [String: String],
+        executablePath: String? = nil,
         onLine: (@Sendable (ResticMessage) -> Void)?,
         onRawLine: (@Sendable (String) -> Void)?,
         timeout: TimeInterval?
     ) async throws -> ResticOutcome {
-        let argv = [resticPath] + cmd.argv
+        let argv = [executablePath ?? resticPath] + cmd.argv
         let collector = MessageCollector()
         let decoder = self.decoder
 

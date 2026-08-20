@@ -26,11 +26,20 @@ public struct MaintenancePruneAuthorization: Sendable {
     public let token: String
     public let machineId: String
     public let effectiveDestinationFingerprint: String
+    /// Canonical executable selected and hashed for this helper invocation.
+    /// It stays helper-private and is never emitted in CLI JSON or logs.
+    public let resticExecutablePath: String?
 
-    public init(token: String, machineId: String, effectiveDestinationFingerprint: String) {
+    public init(
+        token: String,
+        machineId: String,
+        effectiveDestinationFingerprint: String,
+        resticExecutablePath: String? = nil
+    ) {
         self.token = token
         self.machineId = machineId
         self.effectiveDestinationFingerprint = effectiveDestinationFingerprint
+        self.resticExecutablePath = resticExecutablePath
     }
 }
 

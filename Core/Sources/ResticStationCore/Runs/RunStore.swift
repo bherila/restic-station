@@ -70,6 +70,9 @@ public enum CurrentRunLiveness: String, Equatable, Sendable {
 public enum RunStoreError: Error, Equatable, Sendable, CustomStringConvertible {
     case renameFailed(errno: Int32, from: String, to: String)
     case indexAppendFailed(errno: Int32, path: String)
+    /// A caller tried to discard something other than its own fresh,
+    /// still-running run directory.
+    case discardUnsafe(path: String)
     /// The `index.jsonl` companion lock could not be acquired within the
     /// bounded retry window — see `RunStore.indexLockTimeout`.
     case indexLockTimeout(path: String)
@@ -80,6 +83,8 @@ public enum RunStoreError: Error, Equatable, Sendable, CustomStringConvertible {
             return "rename(\(from), \(to)) failed: errno \(errno)"
         case .indexAppendFailed(let errno, let path):
             return "append to \(path) failed: errno \(errno)"
+        case .discardUnsafe(let path):
+            return "refusing to discard non-fresh run metadata at \(path)"
         case .indexLockTimeout(let path):
             return "timed out waiting for index lock \(path)"
         }
@@ -227,6 +232,23 @@ public struct RunStore: Sendable {
         )
         try writeMetadataAtomic(metadata)
         try appendIndexEntry(metadata.indexEntry)
+    }
+
+    /// Removes a just-created run before it reaches the index. This is only
+    /// for a preflight that was retryably unavailable before restic started;
+    /// presenting such contention as a failed maintenance run would replace
+    /// the last real cleanup despite modifying no repository data.
+    public func discardUnstarted(_ run: ActiveRun) throws {
+        let directory = paths.runDir(runId: run.runId)
+        let metadataURL = directory.appendingPathComponent("metadata.json", isDirectory: false)
+        let data = try Data(contentsOf: metadataURL)
+        let metadata = try ConfigStore.makeDecoder().decode(RunMetadata.self, from: data)
+        guard metadata.runId == run.runId,
+              metadata.status == .running,
+              metadata.pid == run.pid else {
+            throw RunStoreError.discardUnsafe(path: metadataURL.path)
+        }
+        try FileManager.default.removeItem(at: directory)
     }
 
     // MARK: - Crash recovery

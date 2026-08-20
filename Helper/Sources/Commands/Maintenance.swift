@@ -80,7 +80,7 @@ struct MaintenancePrune: AsyncParsableCommand, JSONRenderable {
             destination: destination,
             secrets: context.secrets
         )
-        guard let executableIdentity = context.restic.maintenanceExecutableIdentity() else {
+        guard let executable = context.restic.maintenanceExecutable() else {
             throw CLIFailure(
                 code: .resticNotFound,
                 message: "The configured restic executable could not be read. Recheck restic, then run a new reclaim preview.",
@@ -89,14 +89,15 @@ struct MaintenancePrune: AsyncParsableCommand, JSONRenderable {
         }
         let effectiveFingerprint = invocationDestination.pruneConfirmationFingerprint(
             secretEnv: destinationSecretEnv,
-            executableIdentity: executableIdentity
+            executableIdentity: executable.identity
         )
 
         let authorization = expectedDestination.map {
             MaintenancePruneAuthorization(
                 token: $0,
                 machineId: context.addressable.machineId,
-                effectiveDestinationFingerprint: effectiveFingerprint
+                effectiveDestinationFingerprint: effectiveFingerprint,
+                resticExecutablePath: executable.path
             )
         }
 
@@ -105,6 +106,7 @@ struct MaintenancePrune: AsyncParsableCommand, JSONRenderable {
             destination: invocationDestination,
             destinationSecretEnv: destinationSecretEnv,
             authorization: authorization,
+            resticExecutablePath: executable.path,
             dryRun: dryRun
         )
         let status = try Self.status(

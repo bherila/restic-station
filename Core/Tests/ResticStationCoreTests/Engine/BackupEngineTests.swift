@@ -1453,6 +1453,7 @@ struct BackupEngineTests {
         #expect(result == .skipped(.previewUnavailable))
         #expect(try PreviewTokenStore(paths: env.paths).token(token).value == token)
         #expect(env.fake.invocations.isEmpty)
+        #expect(env.entries(kind: .prune).isEmpty)
     }
 
     @Test("standalone prune: an unavailable secret is distinguished from success")
