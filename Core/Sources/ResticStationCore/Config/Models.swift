@@ -359,11 +359,15 @@ public extension Destination {
     /// supplies the stored secret environment, so the binding covers every
     /// destination value that affects a restic invocation without ever
     /// exposing a secret on argv or in app memory.
-    func pruneConfirmationFingerprint(secretEnv: [String: String]) -> String {
+    func pruneConfirmationFingerprint(
+        secretEnv: [String: String],
+        executableIdentity: String? = nil
+    ) -> String {
         struct EffectiveDestination: Codable {
             let repoURL: String
             let nonSecretEnv: [String: String]
             let secretEnv: [String: String]
+            let executableIdentity: String?
         }
 
         let encoder = JSONEncoder()
@@ -371,7 +375,8 @@ public extension Destination {
         let effective = EffectiveDestination(
             repoURL: pruneRepositoryURL(),
             nonSecretEnv: nonSecretEnv,
-            secretEnv: secretEnv
+            secretEnv: secretEnv,
+            executableIdentity: executableIdentity
         )
         // Encoding an in-memory String dictionary cannot fail in practice;
         // fail closed with an impossible-to-match fingerprint if it ever did.

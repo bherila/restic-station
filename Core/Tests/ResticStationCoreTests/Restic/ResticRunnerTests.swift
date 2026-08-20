@@ -58,6 +58,27 @@ struct ResticRunnerTests {
         return store
     }
 
+    @Test("maintenance executable identity changes when the binary is replaced")
+    func maintenanceExecutableIdentityBindsBinaryContents() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-executable-identity-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let executable = root.appendingPathComponent("restic", isDirectory: false)
+        try Data("previewed binary".utf8).write(to: executable)
+
+        let runner = ResticRunner(
+            resticPath: executable.path,
+            paths: Self.paths(),
+            secrets: FakeSecretStore(defaultPassword: Self.password),
+            runner: FakeProcessRunner()
+        )
+        let previewIdentity = try #require(runner.maintenanceExecutableIdentity())
+        try Data("replacement binary".utf8).write(to: executable)
+
+        #expect(previewIdentity != runner.maintenanceExecutableIdentity())
+    }
+
     // MARK: - Environment assembly
 
     @Test("single destination: exact password command, cache dir, secret env injected, nothing inherited")

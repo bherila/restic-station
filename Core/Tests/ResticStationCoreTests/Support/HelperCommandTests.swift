@@ -81,7 +81,7 @@ private let destId = UUID(uuidString: "0B7A50D4-9C3E-4F5B-9A0E-8E1F2C3D4A5B")!
                 dryRun: true,
                 json: true
             ).argv
-                == ["maintenance", "prune", "--set", "6B29FC40-CA47-1067-B31D-00DD010662DA", "--dest", "0B7A50D4-9C3E-4F5B-9A0E-8E1F2C3D4A5B", "--expected-destination", "preview-fingerprint", "--dry-run", "--json"]
+                == ["maintenance", "prune", "--set", "6B29FC40-CA47-1067-B31D-00DD010662DA", "--dest", "0B7A50D4-9C3E-4F5B-9A0E-8E1F2C3D4A5B", "--expected-destination=preview-fingerprint", "--dry-run", "--json"]
         )
         #expect(
             HelperCommand.maintenancePrune(setId: setId, destId: nil, expectedDestination: nil, dryRun: false).argv

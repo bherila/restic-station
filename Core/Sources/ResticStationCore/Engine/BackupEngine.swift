@@ -90,6 +90,9 @@ public enum PruneRepositorySkipReason: Equatable, Sendable {
     case secretUnavailable
     case staleMirror
     case previewChanged
+    /// The preview token could not be read because another helper briefly
+    /// owns the machine-global token-store lock.  It remains valid to retry.
+    case previewUnavailable
 }
 
 public enum PruneRepositoryFailure: Equatable, Sendable {
@@ -282,7 +285,7 @@ public final class BackupEngine: Sendable {
                 logWriter?.appendLine("probe primary \"\(primary.label)\": \(describe(probe))")
                 record(probe: probe, for: primary)
                 guard probe == .reachable else {
-                    return "primary unreachable: \(describe(probe))"
+                    return .reason("primary unreachable: \(describe(probe))")
                 }
                 return nil
             }
@@ -709,7 +712,7 @@ public final class BackupEngine: Sendable {
             }
         }
 
-        let previewValidation: (@Sendable (LogWriter?) async -> String?)?
+        let previewValidation: (@Sendable (LogWriter?) async -> PreflightFailure?)?
         if let authorization {
             let previewTokens = previewTokens
             let token = authorization.token
@@ -727,8 +730,15 @@ public final class BackupEngine: Sendable {
                         effectiveDestinationFingerprint: effectiveDestinationFingerprint
                     )
                     return nil
+                } catch let error as PreviewTokenError {
+                    switch error {
+                    case .unavailable:
+                        return .previewUnavailable
+                    case .unknown, .expired, .alreadyUsed:
+                        return .previewChanged
+                    }
                 } catch {
-                    return "Destination configuration changed after the reclaim preview. Run a new dry run before pruning."
+                    return .previewChanged
                 }
             }
         } else {
@@ -752,7 +762,14 @@ public final class BackupEngine: Sendable {
             preflight: previewValidation
         )
         guard let prune else { return .failed(.didNotRun) }
-        if prune.preflightFailed { return .skipped(.previewChanged) }
+        switch prune.preflightFailure {
+        case .previewChanged:
+            return .skipped(.previewChanged)
+        case .previewUnavailable:
+            return .skipped(.previewUnavailable)
+        case .reason, .none:
+            break
+        }
         guard prune.child.status == .failed else { return .completed(prune.child.status) }
         if let outcome = prune.outcome {
             return .failed(.restic(outcome.status))
@@ -1280,7 +1297,23 @@ public final class BackupEngine: Sendable {
     private struct ChildRun {
         let child: SetRunChild
         let outcome: ResticOutcome?
-        let preflightFailed: Bool
+        let preflightFailure: PreflightFailure?
+    }
+
+    private enum PreflightFailure: Sendable {
+        case reason(String)
+        case previewChanged
+        case previewUnavailable
+
+        var message: String {
+            switch self {
+            case .reason(let reason): return reason
+            case .previewChanged:
+                return "Destination configuration changed after the reclaim preview. Run a new dry run before pruning."
+            case .previewUnavailable:
+                return "The reclaim confirmation is temporarily unavailable. Try confirming again."
+            }
+        }
     }
 
     /// Runs one restic command as one recorded run: `begin` → open the run
@@ -1292,7 +1325,7 @@ public final class BackupEngine: Sendable {
     ///
     /// - Parameters:
     ///   - preflightPhase: written to `current-run` before `preflight` runs.
-    ///   - preflight: returns a failure reason to abort the run *before*
+    ///   - preflight: returns a failure classification to abort the run *before*
     ///     spawning restic (used for the primary reachability probe), or
     ///     `nil` to proceed.
     ///   - downgradeSuccessToWarning: inspected on an otherwise successful
@@ -1308,7 +1341,7 @@ public final class BackupEngine: Sendable {
         invocation: ResticInvocation,
         streamProgress: Bool,
         preflightPhase: String? = nil,
-        preflight: (@Sendable (LogWriter?) async -> String?)? = nil,
+        preflight: (@Sendable (LogWriter?) async -> PreflightFailure?)? = nil,
         downgradeSuccessToWarning: (@Sendable (ResticOutcome) -> Bool)? = nil,
         purgeSnapshotRewrites: (@Sendable (ResticOutcome) -> [String: String]?)? = nil
     ) async -> ChildRun? {
@@ -1339,13 +1372,13 @@ public final class BackupEngine: Sendable {
         reporter.startHeartbeat()
         defer { reporter.stopHeartbeat() }
 
-        if let preflight, let reason = await preflight(logWriter) {
-            logWriter?.appendLine("aborted: \(reason)")
-            finish(run, status: .failed, errorSummary: reason)
+        if let preflight, let failure = await preflight(logWriter) {
+            logWriter?.appendLine("aborted: \(failure.message)")
+            finish(run, status: .failed, errorSummary: failure.message)
             return ChildRun(
                 child: SetRunChild(runId: run.runId, kind: kind, destId: destination.id, status: .failed),
                 outcome: nil,
-                preflightFailed: true
+                preflightFailure: failure
             )
         }
 
@@ -1406,7 +1439,7 @@ public final class BackupEngine: Sendable {
         return ChildRun(
             child: SetRunChild(runId: run.runId, kind: kind, destId: destination.id, status: status),
             outcome: result.outcome,
-            preflightFailed: false
+            preflightFailure: nil
         )
     }
 

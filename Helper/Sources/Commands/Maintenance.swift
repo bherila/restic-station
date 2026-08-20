@@ -29,7 +29,7 @@ struct MaintenancePrune: AsyncParsableCommand, JSONRenderable {
     /// App confirmations carry an opaque, helper-issued preview binding. The
     /// helper owns the final check, because it reloads config after the app
     /// may have compared an earlier in-memory snapshot.
-    @Option(name: .long, help: "Require this helper-issued preview binding before pruning.")
+    @Option(name: .long, parsing: .unconditional, help: "Require this helper-issued preview binding before pruning.")
     var expectedDestination: String?
 
     @Flag(name: .long, help: "Ask restic what prune would reclaim without modifying the repository.")
@@ -80,7 +80,17 @@ struct MaintenancePrune: AsyncParsableCommand, JSONRenderable {
             destination: destination,
             secrets: context.secrets
         )
-        let effectiveFingerprint = invocationDestination.pruneConfirmationFingerprint(secretEnv: destinationSecretEnv)
+        guard let executableIdentity = context.restic.maintenanceExecutableIdentity() else {
+            throw CLIFailure(
+                code: .resticNotFound,
+                message: "The configured restic executable could not be read. Recheck restic, then run a new reclaim preview.",
+                details: CLIErrorDetails(setId: set, destinationId: destination.id)
+            )
+        }
+        let effectiveFingerprint = invocationDestination.pruneConfirmationFingerprint(
+            secretEnv: destinationSecretEnv,
+            executableIdentity: executableIdentity
+        )
 
         let authorization = expectedDestination.map {
             MaintenancePruneAuthorization(
@@ -176,6 +186,12 @@ struct MaintenancePrune: AsyncParsableCommand, JSONRenderable {
             )
         case .skipped(.previewChanged):
             throw previewChangedFailure(setId: setId, destinationId: destination.id)
+        case .skipped(.previewUnavailable):
+            throw CLIFailure(
+                code: .setBusy,
+                message: "The reclaim confirmation is temporarily unavailable. Try confirming again.",
+                details: CLIErrorDetails(setId: setId, destinationId: destination.id)
+            )
         case .failed(.offline(let reason)):
             throw CLIFailure(
                 code: .repositoryOffline,

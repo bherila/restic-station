@@ -153,6 +153,17 @@ import Testing
     ).pruneConfirmationFingerprint(secretEnv: [:]))
 }
 
+@Test func maintenancePruneAcceptsHyphenPrefixedPreviewBindings() throws {
+    let setId = UUID()
+    let destinationId = UUID()
+    let parsed = try #require(HelperMain.parseAsRoot([
+        "maintenance", "prune", "--set", setId.uuidString,
+        "--dest", destinationId.uuidString,
+        "--expected-destination", "-valid-preview-binding",
+    ]) as? MaintenancePrune)
+    #expect(parsed.expectedDestination == "-valid-preview-binding")
+}
+
 @Test func maintenancePruneAcceptsItsUnchangedEffectiveDestination() throws {
     let destination = Destination(
         id: UUID(),

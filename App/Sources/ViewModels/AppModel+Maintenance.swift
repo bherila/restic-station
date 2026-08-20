@@ -593,19 +593,21 @@ final class MaintenanceModel: ObservableObject {
     /// which goes through the helper, never through this process
     /// (`docs/architecture.md` §The single-code-path rule).
     func confirmApplyRetention(_ plan: PrunePlan, in model: AppModel) {
-        prunePlan = nil
         guard let set = MaintenanceLookup.set(model, id: plan.setId) else { return }
         let destIds: [UUID]
         let title: String
         let resultTask: () async -> HelperResult
+        let retainsPlanWhenBusy: Bool
         switch plan.action {
         case .retention:
             destIds = set.destinations.map(\.id)
             title = "Apply retention"
             resultTask = { await model.helper.prune(setId: plan.setId) }
+            retainsPlanWhenBusy = false
         case .reclaimSpace(let previewedDestination, _, let confirmationBinding):
             guard let destination = set.destinations.first(where: { $0.id == previewedDestination.id }),
                   destination == previewedDestination else {
+                self.prunePlan = nil
                 self.activity = Self.activity(
                     title: "Reclaim space",
                     subject: plan.setName,
@@ -616,6 +618,7 @@ final class MaintenanceModel: ObservableObject {
             }
             destIds = [destination.id]
             title = "Reclaim space"
+            retainsPlanWhenBusy = true
             resultTask = {
                 await model.helper.pruneRepository(
                     setId: plan.setId,
@@ -635,6 +638,9 @@ final class MaintenanceModel: ObservableObject {
             let result = await resultTask()
             guard let self else { return }
             self.busyAction = nil
+            if result != .busy || !retainsPlanWhenBusy {
+                self.prunePlan = nil
+            }
             model.refresh()
             let latestPrune = MaintenanceLookup.lastRun(model, setId: set.id, kind: .prune)
             let recordedRun: RunIndexEntry?

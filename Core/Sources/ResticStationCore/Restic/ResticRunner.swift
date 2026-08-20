@@ -167,6 +167,19 @@ public final class ResticRunner: Sendable {
         secrets.backend
     }
 
+    /// A stable identity for the executable that will receive a destructive
+    /// maintenance command.  The resolved path catches symlink changes and
+    /// the content digest catches an in-place replacement at the same path.
+    /// It is intentionally an opaque input to the helper's preview binding,
+    /// never emitted in a report or run log.
+    public func maintenanceExecutableIdentity() -> String? {
+        let executable = URL(fileURLWithPath: resticPath)
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+        guard let data = try? Data(contentsOf: executable) else { return nil }
+        return "\(executable.path):\(SHA256Digest.hex(data))"
+    }
+
     // MARK: - Secret-store pre-flight
 
     private func preflightSecrets(destination: Destination) async throws {

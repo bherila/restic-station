@@ -74,7 +74,9 @@ public enum HelperCommand: Equatable, Sendable {
         case .maintenancePrune(let setId, let destId, let expectedDestination, let dryRun, let json):
             var argv = ["maintenance", "prune", "--set", Self.render(setId)]
             if let destId { argv.append(contentsOf: ["--dest", Self.render(destId)]) }
-            if let expectedDestination { argv.append(contentsOf: ["--expected-destination", expectedDestination]) }
+            // Attach the opaque value so a valid base64url token beginning
+            // with `-` can never be reparsed as another option.
+            if let expectedDestination { argv.append("--expected-destination=\(expectedDestination)") }
             if dryRun { argv.append("--dry-run") }
             if json { argv.append("--json") }
             return argv

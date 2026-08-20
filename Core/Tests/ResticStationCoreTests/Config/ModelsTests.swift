@@ -507,6 +507,13 @@ let dataModelMachinesExampleJSON = """
         #expect(destination.pruneInvocationDestination().repoURL == second.path)
         #expect(firstFingerprint != destination.pruneConfirmationFingerprint(secretEnv: [:]))
     }
+
+    @Test("maintenance binding includes the previewed executable identity")
+    func maintenanceBindingUsesExecutableIdentity() {
+        let destination = Destination(id: UUID(), label: "Primary", repoURL: "/tmp/repo", isPrimary: true)
+        #expect(destination.pruneConfirmationFingerprint(secretEnv: [:], executableIdentity: "restic-a")
+            != destination.pruneConfirmationFingerprint(secretEnv: [:], executableIdentity: "restic-b"))
+    }
 }
 
 @Suite struct RetentionPolicyTests {
