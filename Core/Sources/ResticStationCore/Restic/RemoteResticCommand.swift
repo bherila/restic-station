@@ -5,7 +5,7 @@ import Foundation
 /// operand is quoted independently before it crosses the connection.
 public enum ShellQuote {
     public static func singleQuote(_ value: String) -> String {
-        "'" + value.replacingOccurrences(of: "'", with: "'\\\"'\\\"'") + "'"
+        "'" + value.replacingOccurrences(of: "'", with: "'\"'\"'") + "'"
     }
 }
 
@@ -20,7 +20,7 @@ public struct RemoteResticCommand: Equatable, Sendable {
         if dryRun { remote.append("--dry-run") }
         self.argv = [
             "/usr/bin/ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=15",
-            sshTarget, "--"
+            "--", sshTarget
         ] + remote.map(ShellQuote.singleQuote)
         self.password = password.map { Data(($0 + "\n").utf8) }
     }
@@ -29,7 +29,7 @@ public struct RemoteResticCommand: Equatable, Sendable {
         RemoteResticCommand(
             argv: [
                 "/usr/bin/ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=15",
-                sshTarget, "--", ShellQuote.singleQuote(resticPath), "'version'", "'--json'"
+                "--", sshTarget, ShellQuote.singleQuote(resticPath), "'version'", "'--json'"
             ],
             password: nil
         )

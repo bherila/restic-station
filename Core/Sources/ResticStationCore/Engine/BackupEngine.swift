@@ -744,7 +744,19 @@ public final class BackupEngine: Sendable {
                 afterLaunchFailure: restorePreviewToken
             )
             guard let prune else { return .failed(.didNotRun) }
-            return prune.child.status == .failed ? .failed(.didNotRun) : .completed(prune.child.status)
+            switch prune.preflightFailure {
+            case .previewChanged:
+                return .skipped(.previewChanged)
+            case .previewUnavailable:
+                return .skipped(.previewUnavailable)
+            case .reason, .none:
+                break
+            }
+            guard prune.child.status == .failed else { return .completed(prune.child.status) }
+            if let outcome = prune.outcome {
+                return .failed(.restic(outcome.status))
+            }
+            return .failed(.didNotRun)
         }
 
         let probe = await reachability.probe(

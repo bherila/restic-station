@@ -403,6 +403,18 @@ public extension Destination {
             let nonSecretEnv: [String: String]
             let secretEnv: [String: String]
             let executableIdentity: String?
+            let remoteMaintenance: RemoteMaintenanceBinding?
+        }
+
+        /// Bind every value that changes the remote command, but omit dormant
+        /// settings when maintenance is off: they cannot affect a local
+        /// prune. Enabled-but-unparseable settings encode nil operands so the
+        /// binding remains fail-closed until configuration is corrected.
+        struct RemoteMaintenanceBinding: Codable {
+            let enabled: Bool
+            let sshTarget: String?
+            let repoPath: String?
+            let resticPath: String?
         }
 
         let encoder = JSONEncoder()
@@ -411,7 +423,15 @@ public extension Destination {
             repoURL: pruneRepositoryURL(),
             nonSecretEnv: nonSecretEnv,
             secretEnv: secretEnv,
-            executableIdentity: executableIdentity
+            executableIdentity: executableIdentity,
+            remoteMaintenance: remoteMaintenance?.enabled == true
+                ? RemoteMaintenanceBinding(
+                    enabled: true,
+                    sshTarget: remoteMaintenanceOperands()?.sshTarget,
+                    repoPath: remoteMaintenanceOperands()?.repoPath,
+                    resticPath: remoteMaintenanceOperands()?.resticPath
+                )
+                : nil
         )
         // Encoding an in-memory String dictionary cannot fail in practice;
         // fail closed with an impossible-to-match fingerprint if it ever did.

@@ -416,6 +416,9 @@ struct DestinationEditorView: View {
             get: { kind },
             set: { newKind in
                 kind = newKind
+                if newKind != .sftp {
+                    draft.remoteMaintenance = nil
+                }
                 probe = nil
                 message = nil
             }

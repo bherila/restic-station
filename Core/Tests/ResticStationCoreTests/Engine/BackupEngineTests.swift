@@ -1378,6 +1378,76 @@ struct BackupEngineTests {
         #expect(env.fake.invocations.allSatisfy { $0.argv.first == "/usr/bin/ssh" })
     }
 
+    @Test("standalone prune: unavailable SFTP confirmation remains retryable")
+    func standalonePruneRemoteSFTPUnavailableConfirmationRemainsRetryable() async throws {
+        let env = Self.makeEnv(script: [], retention: nil)
+        defer { env.cleanUp() }
+        var destination = env.primary
+        destination.repoURL = "sftp:backup@example:/srv/repo"
+        destination.remoteMaintenance = RemoteMaintenance(enabled: true)
+        var set = env.set
+        set.destinations[0] = destination
+        let fingerprint = destination.pruneConfirmationFingerprint(secretEnv: [:])
+        let token = try PreviewTokenStore(paths: env.paths).issueMaintenancePrune(
+            machineId: env.machineId,
+            setId: set.id,
+            destinationId: destination.id,
+            effectiveDestinationFingerprint: fingerprint
+        )
+        env.fake.script = [
+            .init(
+                argvPrefix: RemoteResticCommand.version(sshTarget: "backup@example", resticPath: "restic").argv,
+                stdoutLines: ["{\"version\":\"0.18.1\"}"]
+            ),
+        ]
+        try env.paths.ensureDirectories()
+        let heldTokenStoreLock = FileLock(path: env.paths.previewTokensLockFile)
+        #expect(heldTokenStoreLock.tryAcquire())
+
+        let status = await env.engine.runPruneRepository(
+            set: set,
+            destination: destination,
+            authorization: MaintenancePruneAuthorization(
+                token: token,
+                machineId: env.machineId,
+                effectiveDestinationFingerprint: fingerprint
+            )
+        )
+        heldTokenStoreLock.release()
+
+        #expect(status == .skipped(.previewUnavailable))
+        #expect(try PreviewTokenStore(paths: env.paths).token(token).value == token)
+        #expect(env.fake.invocations.count == 1, "SSH prune must not launch when confirmation storage is busy")
+    }
+
+    @Test("standalone prune: remote restic failures retain their exit classification")
+    func standalonePruneRemoteSFTPRetainsResticFailureClassification() async throws {
+        let env = Self.makeEnv(script: [], retention: nil)
+        defer { env.cleanUp() }
+        var destination = env.primary
+        destination.repoURL = "sftp:backup@example:/srv/repo"
+        destination.remoteMaintenance = RemoteMaintenance(enabled: true)
+        var set = env.set
+        set.destinations[0] = destination
+        env.fake.script = [
+            .init(
+                argvPrefix: RemoteResticCommand.version(sshTarget: "backup@example", resticPath: "restic").argv,
+                stdoutLines: ["{\"version\":\"0.18.1\"}"]
+            ),
+            .init(
+                argvPrefix: RemoteResticCommand(
+                    sshTarget: "backup@example", resticPath: "restic", repoPath: "/srv/repo", dryRun: false,
+                    password: "repo-password"
+                ).argv,
+                exitCode: 11
+            ),
+        ]
+
+        let status = await env.engine.runPruneRepository(set: set, destination: destination)
+
+        #expect(status == .failed(.restic(.repoLocked)))
+    }
+
     @Test("standalone prune: automatic unlock reuses its confirmed secret snapshot")
     func standalonePruneUnlockUsesConfirmedSecretSnapshot() async throws {
         let env = Self.makeEnv(script: [], retention: nil)
