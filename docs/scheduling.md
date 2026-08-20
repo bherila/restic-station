@@ -282,6 +282,26 @@ Rules (anacron semantics):
 
 **Check scheduling:** fixed weekly cadence. `checkIsDue` = `lastCheckStart == nil || now − lastCheckStart ≥ 7 days`, evaluated only when no backup for the same set is due in the same tick (backup wins; check runs on a later tick). Each scheduled check uses `--read-data-subset=<cursor+1 mod t>/<t>` against the **primary**, advancing `checkSliceCursor` on success only. Secondaries are checked structure-only (no `--read-data-subset`) every 4th check *if reachable*.
 
+## Purge-exclusion ordering
+
+When a set has a `purgeExcludes` pattern absent from a destination's
+`appliedPurgeExcludes` state, the next successful backup run adds a purge
+phase. The fixed order is:
+
+1. back up the primary with the effective forward excludes;
+2. purge the primary with `rewrite --forget` over newly attributed snapshot
+   ids;
+3. for each reachable secondary, purge it first when stale, then copy from
+   the primary;
+4. run ordinary retention only where its existing freshness rules permit it.
+
+The primary purge failure stops mirroring. A secondary purge failure skips
+that secondary's copy but allows another mirror to proceed. Copying into an
+unpurged secondary would leave its old snapshots alongside the primary's
+rewritten replacements, so it is never allowed. The per-destination pattern
+watermark advances only after that destination's purge child succeeds; a
+removed pattern stays recorded and is never used to trigger a rewrite.
+
 ## Locking
 
 Two levels, both `flock(2)` `LOCK_EX | LOCK_NB` on files under `locks/` (advisory; auto-released by the kernel on process death — no stale-lock cleanup needed; the files themselves persist, their existence means nothing):

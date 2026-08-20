@@ -188,7 +188,8 @@ struct HelperContext {
             stateStore: stateStore,
             reachability: reachability,
             purgeSourcePaths: purgeSourcePaths,
-            purgeHostnames: purgeHostnames
+            purgeHostnames: purgeHostnames,
+            machineId: views.addressable.machineId
         )
         return .ready(HelperContext(
             paths: paths,

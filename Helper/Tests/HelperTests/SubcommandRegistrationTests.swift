@@ -104,6 +104,13 @@ import Testing
     #expect(names == ["list", "show"])
 }
 
+@Test func purgeExposesPreviewAndTokenGatedApply() {
+    let names: [String?] = Purge.configuration.subcommands.map { subcommand in
+        subcommand.configuration.commandName
+    }
+    #expect(names == ["preview", "apply"])
+}
+
 /// T28 (issue #30): the `restic-station` PATH symlink manager.
 @Test func cliExposesItsThreeSubcommands() {
     let names: [String?] = Cli.configuration.subcommands.map { subcommand in

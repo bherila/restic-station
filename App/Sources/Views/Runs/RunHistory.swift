@@ -205,6 +205,7 @@ struct RunFilter: Equatable {
 enum RunPhase {
     static func describe(_ phase: String) -> String {
         if phase.hasPrefix("copying") { return "copying to a mirror" }
+        if phase.hasPrefix("purging") { return "purging excluded files from history" }
         switch phase {
         case "probing": return "checking the repository"
         case "backing-up-primary": return "backing up"
@@ -226,6 +227,7 @@ extension RunKind {
         case .copy: return "Copy"
         case .check: return "Check"
         case .prune: return "Prune"
+        case .purge: return "Purge exclusions"
         case .restore: return "Restore"
         case .`init`: return "Initialize"
         }
@@ -237,6 +239,7 @@ extension RunKind {
         case .copy: return "doc.on.doc"
         case .check: return "checkmark.shield"
         case .prune: return "scissors"
+        case .purge: return "eraser"
         case .restore: return "arrow.uturn.backward"
         case .`init`: return "sparkles"
         }

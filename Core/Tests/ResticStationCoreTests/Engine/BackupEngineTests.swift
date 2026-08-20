@@ -92,6 +92,7 @@ struct BackupEngineTests {
         let runStore: RunStore
         let stateStore: StateStore
         let engine: BackupEngine
+        let machineId: String
         let set: BackupSet
         let primary: Destination
         let secondaries: [Destination]
@@ -137,7 +138,8 @@ struct BackupEngineTests {
         startingAt: Date = t0,
         onSpawn: (@Sendable ([String]) -> Void)? = nil,
         purgeSourcePaths: [UUID: Set<String>] = [:],
-        purgeHostnames: [UUID: Set<String>] = [:]
+        purgeHostnames: [UUID: Set<String>] = [:],
+        machineId: String = "example-machine"
     ) -> Env {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("restic-station-engine-\(UUID().uuidString)", isDirectory: true)
@@ -210,7 +212,8 @@ struct BackupEngineTests {
             reachability: Reachability(restic: restic),
             now: clock.now,
             purgeSourcePaths: purgeSourcePaths,
-            purgeHostnames: purgeHostnames
+            purgeHostnames: purgeHostnames,
+            machineId: machineId
         )
 
         return Env(
@@ -221,6 +224,7 @@ struct BackupEngineTests {
             runStore: runStore,
             stateStore: stateStore,
             engine: engine,
+            machineId: machineId,
             set: set,
             primary: primary,
             secondaries: secondaries
@@ -271,6 +275,14 @@ struct BackupEngineTests {
 
     static func forgetArgv(_ repo: String, keepLast: Int = 3) -> [String] {
         ["-r", repo, "forget", "--json", "--keep-last", String(keepLast), "--prune"]
+    }
+
+    static func rewriteArgv(_ repo: String, snapshotIDs: [String], patterns: [String]) -> [String] {
+        var argv = ["-r", repo, "rewrite", "--forget"]
+        for pattern in patterns {
+            argv += ["--exclude", pattern]
+        }
+        return argv + snapshotIDs
     }
 
     static func backupStream() -> [String] {
@@ -778,6 +790,15 @@ struct BackupEngineTests {
         )
         env.fake.script = script
 
+        // This case is about backup argv construction, not the scheduled
+        // purge phase. Seed its already-applied watermark so no additional
+        // repository commands obscure that assertion.
+        try env.stateStore.updateScheduleState(setId: Self.setId) { state in
+            for destination in env.set.destinations {
+                state.appliedPurgeExcludes[destination.id] = Array(expectedExcludes.suffix(2))
+            }
+        }
+
         let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
 
         #expect(env.resticArgvs == [[Self.resticPath] + Self.backupArgv(env.primary.repoURL, excludes: expectedExcludes)])
@@ -1238,6 +1259,210 @@ struct BackupEngineTests {
     }
 
     // MARK: - purge preview
+
+    /// The destructive path starts with an already-reviewed plan. These
+    /// tests deliberately build it from the captured snapshots fixture so
+    /// the only ids a `rewrite --forget` can ever receive are the pure
+    /// attribution result, never a caller-supplied filter.
+    @Test("runPurge: a valid token revalidates ids, records rewrite mapping, and is single-use")
+    func purgeApplyUsesTokenAndRecordsMapping() async throws {
+        let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]
+        let hostnames = [Self.setId: Set(["example-mac.local"])]
+        let env = Self.makeEnv(
+            script: [], retention: nil, purgeExcludes: ["build/**"], reachableSecondaries: [],
+            purgeSourcePaths: sourcePaths, purgeHostnames: hostnames
+        )
+        defer { env.cleanUp() }
+
+        let snapshotsJSON = try FixtureLoader.string("snapshots.json")
+        let snapshots = try parseSnapshots(Data(snapshotsJSON.utf8))
+        let plan = PurgePlan(
+            destinationId: env.primary.id, snapshots: snapshots,
+            sourcePaths: sourcePaths[Self.setId]!, hostnames: hostnames[Self.setId]!, patterns: env.set.purgeExcludes
+        )
+        let token = try #require(try env.engine.issuePurgeToken(
+            set: env.set, destinations: [env.primary], plans: [plan]
+        ))
+        // A repository can hold snapshots from another backup set. Fresh
+        // validation sees this one, but attribution declines it and its id
+        // must never reach the destructive argv.
+        let foreignSnapshot = "{\"time\":\"2026-07-26T16:57:06Z\",\"id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"short_id\":\"aaaaaaaa\",\"paths\":[\"/unrelated\"],\"hostname\":\"other-machine\",\"username\":\"other\"}"
+        let snapshotsAtApply = String(snapshotsJSON.trimmingCharacters(in: .whitespacesAndNewlines).dropLast())
+            + ",\(foreignSnapshot)]"
+        let rewrite = try FixtureLoader.string("rewrite-forget.txt")
+            .replacingOccurrences(of: "09b3295c", with: snapshots[0].shortId)
+            .replacingOccurrences(of: "b2435423", with: snapshots[1].shortId)
+        env.fake.script = Self.resticCall(
+            ["-r", env.primary.repoURL, "snapshots", "--json"], dest: Self.primaryId, stdoutLines: [snapshotsAtApply]
+        ) + Self.resticCall(
+            Self.rewriteArgv(env.primary.repoURL, snapshotIDs: snapshots.map(\.id), patterns: env.set.purgeExcludes),
+            dest: Self.primaryId, stdoutLines: rewrite.split(separator: "\n").map(String.init)
+        )
+
+        let result = try await env.engine.runPurge(set: env.set, destinations: [env.primary], token: token.value)
+
+        #expect(result.status == .success)
+        #expect(env.resticArgvs == [
+            [Self.resticPath, "-r", env.primary.repoURL, "snapshots", "--json"],
+            [Self.resticPath] + Self.rewriteArgv(
+                env.primary.repoURL, snapshotIDs: snapshots.map(\.id), patterns: env.set.purgeExcludes
+            ),
+        ])
+        let purgeRun = try #require(env.entries(kind: .purge).first)
+        let metadata = try env.runStore.metadata(runId: purgeRun.runId)
+        #expect(metadata.purgeSnapshotRewrites?[snapshots[0].id] == "14a53542")
+        #expect(metadata.purgeSnapshotRewrites?[snapshots[1].id] == "3ca2e0a5")
+        #expect(!env.log(runId: purgeRun.runId).contains(token.value))
+        #expect(env.resticArgvs.last?.contains("aaaaaaaa") == false)
+
+        do {
+            _ = try await env.engine.runPurge(set: env.set, destinations: [env.primary], token: token.value)
+            Issue.record("a consumed token must be refused")
+        } catch let error as PurgeApplyError {
+            #expect(error == .token(.alreadyUsed))
+        }
+        #expect(env.resticArgvs.count == 2, "a replay must not spawn restic")
+    }
+
+    @Test("runPurge: absent, expired, and changed snapshot-list tokens fail closed")
+    func purgeApplyRefusesInvalidTokens() async throws {
+        let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]
+        let hostnames = [Self.setId: Set(["example-mac.local"])]
+        let env = Self.makeEnv(
+            script: [], retention: nil, purgeExcludes: ["build/**"], reachableSecondaries: [],
+            purgeSourcePaths: sourcePaths, purgeHostnames: hostnames
+        )
+        defer { env.cleanUp() }
+        let snapshotsJSON = try FixtureLoader.string("snapshots.json")
+        let snapshots = try parseSnapshots(Data(snapshotsJSON.utf8))
+        let plan = PurgePlan(
+            destinationId: env.primary.id, snapshots: snapshots,
+            sourcePaths: sourcePaths[Self.setId]!, hostnames: hostnames[Self.setId]!, patterns: env.set.purgeExcludes
+        )
+
+        do {
+            _ = try await env.engine.runPurge(set: env.set, destinations: [env.primary], token: "")
+            Issue.record("an absent token must be refused")
+        } catch let error as PurgeApplyError {
+            #expect(error == .token(.unknown))
+        }
+
+        let expired = try #require(try env.engine.issuePurgeToken(
+            set: env.set, destinations: [env.primary], plans: [plan]
+        ))
+        env.clock.advance(PreviewTokenStore.defaultLifetime + 1)
+        do {
+            _ = try await env.engine.runPurge(set: env.set, destinations: [env.primary], token: expired.value)
+            Issue.record("an expired token must be refused")
+        } catch let error as PurgeApplyError {
+            #expect(error == .token(.expired))
+        }
+
+        let changed = try #require(try env.engine.issuePurgeToken(
+            set: env.set, destinations: [env.primary], plans: [plan]
+        ))
+        var snapshotObjects = try #require(JSONSerialization.jsonObject(with: Data(snapshotsJSON.utf8)) as? [[String: Any]])
+        snapshotObjects.removeLast()
+        let changedSnapshots = String(
+            decoding: try JSONSerialization.data(withJSONObject: snapshotObjects), as: UTF8.self
+        )
+        env.fake.script = Self.resticCall(
+            ["-r", env.primary.repoURL, "snapshots", "--json"], dest: Self.primaryId, stdoutLines: [changedSnapshots]
+        )
+        do {
+            _ = try await env.engine.runPurge(set: env.set, destinations: [env.primary], token: changed.value)
+            Issue.record("a changed snapshot list must be refused")
+        } catch let error as PurgeApplyError {
+            #expect(error == .tokenDoesNotMatchCurrentPlan)
+        }
+        #expect(env.resticArgvs == [[Self.resticPath, "-r", env.primary.repoURL, "snapshots", "--json"]])
+        #expect(env.entries(kind: .purge).isEmpty, "failed validation cannot create a purge run")
+    }
+
+    @Test("row purge 1: scheduled primary and stale secondary purge before copy exactly once")
+    func automaticPurgePrecedesCopy() async throws {
+        let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]
+        let hostnames = [Self.setId: Set(["example-mac.local"])]
+        let env = Self.makeEnv(
+            script: [], retention: nil, purgeExcludes: ["build/**"], reachableSecondaries: [true],
+            purgeSourcePaths: sourcePaths, purgeHostnames: hostnames
+        )
+        defer { env.cleanUp() }
+        let snapshotsJSON = try FixtureLoader.string("snapshots.json")
+        let snapshots = try parseSnapshots(Data(snapshotsJSON.utf8))
+        let rewrite = try FixtureLoader.string("rewrite-forget.txt")
+            .replacingOccurrences(of: "09b3295c", with: snapshots[0].shortId)
+            .replacingOccurrences(of: "b2435423", with: snapshots[1].shortId)
+        let rewriteLines = rewrite.split(separator: "\n").map(String.init)
+        let secondary = env.secondaries[0]
+        env.fake.script = Self.resticCall(Self.backupArgv(env.primary.repoURL, excludes: env.set.purgeExcludes), dest: Self.primaryId, stdoutLines: Self.backupStream())
+            + Self.resticCall(["-r", env.primary.repoURL, "snapshots", "--json"], dest: Self.primaryId, stdoutLines: [snapshotsJSON])
+            + Self.resticCall(["-r", env.primary.repoURL, "snapshots", "--json"], dest: Self.primaryId, stdoutLines: [snapshotsJSON])
+            + Self.resticCall(Self.rewriteArgv(env.primary.repoURL, snapshotIDs: snapshots.map(\.id), patterns: env.set.purgeExcludes), dest: Self.primaryId, stdoutLines: rewriteLines)
+            + Self.resticCall(["-r", secondary.repoURL, "snapshots", "--json"], dest: secondary.id, stdoutLines: [snapshotsJSON])
+            + Self.resticCall(["-r", secondary.repoURL, "snapshots", "--json"], dest: secondary.id, stdoutLines: [snapshotsJSON])
+            + Self.resticCall(Self.rewriteArgv(secondary.repoURL, snapshotIDs: snapshots.map(\.id), patterns: env.set.purgeExcludes), dest: secondary.id, stdoutLines: rewriteLines)
+            + Self.resticCall(Self.copyArgv(to: secondary.repoURL, from: env.primary.repoURL), dest: secondary.id, from: env.primary.id)
+
+        let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
+
+        let expectedArgvs: [[String]] = [
+            [Self.resticPath] + Self.backupArgv(env.primary.repoURL, excludes: env.set.purgeExcludes),
+            [Self.resticPath, "-r", env.primary.repoURL, "snapshots", "--json"],
+            [Self.resticPath, "-r", env.primary.repoURL, "snapshots", "--json"],
+            [Self.resticPath] + Self.rewriteArgv(env.primary.repoURL, snapshotIDs: snapshots.map(\.id), patterns: env.set.purgeExcludes),
+            [Self.resticPath, "-r", secondary.repoURL, "snapshots", "--json"],
+            [Self.resticPath, "-r", secondary.repoURL, "snapshots", "--json"],
+            [Self.resticPath] + Self.rewriteArgv(secondary.repoURL, snapshotIDs: snapshots.map(\.id), patterns: env.set.purgeExcludes),
+            [Self.resticPath] + Self.copyArgv(to: secondary.repoURL, from: env.primary.repoURL),
+        ]
+        #expect(env.resticArgvs == expectedArgvs)
+        guard case .completed(let status, _, let children) = outcome else {
+            Issue.record("expected .completed, got \(outcome)")
+            return
+        }
+        #expect(status == .success)
+        #expect(children.map(\.kind) == [.backup, .purge, .purge, .copy])
+        let applied = env.stateStore.readScheduleState()?.sets[Self.setId]?.appliedPurgeExcludes
+        #expect(applied?[env.primary.id] == env.set.purgeExcludes)
+        #expect(applied?[secondary.id] == env.set.purgeExcludes)
+    }
+
+    @Test("row purge 2: a stale secondary whose purge fails is never copied or marked applied")
+    func failedSecondaryPurgeSkipsCopy() async throws {
+        let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]
+        let hostnames = [Self.setId: Set(["example-mac.local"])]
+        let env = Self.makeEnv(
+            script: [], retention: nil, purgeExcludes: ["build/**"], reachableSecondaries: [true],
+            purgeSourcePaths: sourcePaths, purgeHostnames: hostnames
+        )
+        defer { env.cleanUp() }
+        let snapshotsJSON = try FixtureLoader.string("snapshots.json")
+        let snapshots = try parseSnapshots(Data(snapshotsJSON.utf8))
+        let rewrite = try FixtureLoader.string("rewrite-forget.txt")
+            .replacingOccurrences(of: "09b3295c", with: snapshots[0].shortId)
+            .replacingOccurrences(of: "b2435423", with: snapshots[1].shortId)
+        let secondary = env.secondaries[0]
+        env.fake.script = Self.resticCall(Self.backupArgv(env.primary.repoURL, excludes: env.set.purgeExcludes), dest: Self.primaryId, stdoutLines: Self.backupStream())
+            + Self.resticCall(["-r", env.primary.repoURL, "snapshots", "--json"], dest: Self.primaryId, stdoutLines: [snapshotsJSON])
+            + Self.resticCall(["-r", env.primary.repoURL, "snapshots", "--json"], dest: Self.primaryId, stdoutLines: [snapshotsJSON])
+            + Self.resticCall(Self.rewriteArgv(env.primary.repoURL, snapshotIDs: snapshots.map(\.id), patterns: env.set.purgeExcludes), dest: Self.primaryId, stdoutLines: rewrite.split(separator: "\n").map(String.init))
+            + Self.resticCall(["-r", secondary.repoURL, "snapshots", "--json"], dest: secondary.id, stdoutLines: [snapshotsJSON])
+            + Self.resticCall(["-r", secondary.repoURL, "snapshots", "--json"], dest: secondary.id, stdoutLines: [snapshotsJSON])
+            + Self.resticCall(Self.rewriteArgv(secondary.repoURL, snapshotIDs: snapshots.map(\.id), patterns: env.set.purgeExcludes), dest: secondary.id, stderr: "rewrite failed", exitCode: 1)
+
+        let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
+
+        guard case .completed(let status, _, _) = outcome else {
+            Issue.record("expected .completed, got \(outcome)")
+            return
+        }
+        #expect(status == .failed)
+        #expect(env.resticArgvs.allSatisfy { !$0.contains("copy") })
+        let applied = env.stateStore.readScheduleState()?.sets[Self.setId]?.appliedPurgeExcludes
+        #expect(applied?[env.primary.id] == env.set.purgeExcludes)
+        #expect(applied?[secondary.id] == nil)
+    }
 
     @Test("previewPurge: snapshots then rewrite dry-run only, with explicit attributed ids")
     func purgePreviewIsReadOnly() async throws {

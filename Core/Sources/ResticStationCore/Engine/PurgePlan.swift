@@ -92,3 +92,27 @@ public struct PurgePlanResult: Equatable, Sendable {
         self.message = message
     }
 }
+
+/// A completed token-gated purge group.  `children` are ordinary run records
+/// (`RunKind.purge`), so callers can report and audit every destination
+/// without ever exposing the preview token itself.
+public struct PurgeRunResult: Equatable, Sendable {
+    public let status: RunStatus
+    public let children: [SetRunChild]
+
+    public init(status: RunStatus, children: [SetRunChild]) {
+        self.status = status
+        self.children = children
+    }
+}
+
+/// Failures that prevent a token-gated purge before `rewrite --forget` can
+/// run.  Messages and CLI classification intentionally never carry a token,
+/// path, or repository URL.
+public enum PurgeApplyError: Error, Equatable, Sendable {
+    case token(PreviewTokenError)
+    case tokenDoesNotMatchCurrentPlan
+    case busy
+    case destinationOffline(destinationId: UUID)
+    case unavailable
+}

@@ -9,6 +9,9 @@ public enum RunKind: String, Codable, Equatable, Sendable, CaseIterable {
     case copy
     case check
     case prune
+    /// A token-gated `restic rewrite --forget` purge. Unlike `prune`, this
+    /// changes snapshot history but does not reclaim pack space.
+    case purge
     case restore
     /// Repository initialization. `init` is a reserved word, hence the
     /// backticks — the raw value (and every persisted representation) is
@@ -152,6 +155,10 @@ public struct RunMetadata: Codable, Equatable, Sendable {
     /// Full decoded summary message where applicable (e.g. a `backup` or
     /// `copy` run). `nil` for kinds with no such summary (e.g. `prune`).
     public var stats: BackupSummary?
+    /// Old full snapshot id → new snapshot id reported by `restic rewrite
+    /// --forget`. Present only for successful/partially successful purge
+    /// runs; historical run records deliberately remain untouched.
+    public var purgeSnapshotRewrites: [String: String]?
 
     public init(
         runId: String,
@@ -171,7 +178,8 @@ public struct RunMetadata: Codable, Equatable, Sendable {
         filesChanged: Int?,
         dataAdded: Int?,
         errorSummary: String?,
-        stats: BackupSummary?
+        stats: BackupSummary?,
+        purgeSnapshotRewrites: [String: String]? = nil
     ) {
         self.runId = runId
         self.kind = kind
@@ -191,12 +199,13 @@ public struct RunMetadata: Codable, Equatable, Sendable {
         self.dataAdded = dataAdded
         self.errorSummary = errorSummary
         self.stats = stats
+        self.purgeSnapshotRewrites = purgeSnapshotRewrites
     }
 
     private enum CodingKeys: String, CodingKey {
         case runId, kind, setId, destId, groupId, status, trigger, start, end
         case pid, resticExitCode, argvRedacted
-        case snapshotId, filesNew, filesChanged, dataAdded, errorSummary, stats
+        case snapshotId, filesNew, filesChanged, dataAdded, errorSummary, stats, purgeSnapshotRewrites
     }
 
     // Explicit `null` for nil optionals — see AppConfig.encode(to:).
@@ -220,6 +229,7 @@ public struct RunMetadata: Codable, Equatable, Sendable {
         try container.encode(dataAdded, forKey: .dataAdded)
         try container.encode(errorSummary, forKey: .errorSummary)
         try container.encode(stats, forKey: .stats)
+        try container.encode(purgeSnapshotRewrites, forKey: .purgeSnapshotRewrites)
     }
 
     /// The compact index-line projection of this metadata, appended to

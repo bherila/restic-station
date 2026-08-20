@@ -175,7 +175,8 @@ public struct RunStore: Sendable {
             filesChanged: nil,
             dataAdded: nil,
             errorSummary: nil,
-            stats: nil
+            stats: nil,
+            purgeSnapshotRewrites: nil
         )
         try FileManager.default.createDirectory(at: paths.runDir(runId: runId), withIntermediateDirectories: true)
         try writeMetadataAtomic(metadata)
@@ -200,7 +201,8 @@ public struct RunStore: Sendable {
         status: RunStatus,
         stats: BackupSummary? = nil,
         errorSummary: String? = nil,
-        resticExitCode: Int32? = nil
+        resticExitCode: Int32? = nil,
+        purgeSnapshotRewrites: [String: String]? = nil
     ) throws {
         let metadata = RunMetadata(
             runId: run.runId,
@@ -220,7 +222,8 @@ public struct RunStore: Sendable {
             filesChanged: stats?.filesChanged,
             dataAdded: stats?.dataAdded,
             errorSummary: errorSummary,
-            stats: stats
+            stats: stats,
+            purgeSnapshotRewrites: purgeSnapshotRewrites
         )
         try writeMetadataAtomic(metadata)
         try appendIndexEntry(metadata.indexEntry)

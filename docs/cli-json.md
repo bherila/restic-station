@@ -56,6 +56,7 @@ itself, unwrapped, because its output is meant to be fed straight back into
 | `cli status` | ✅ | `CLIInstaller.Status` |
 | `fda-check` | ✅ | `{ applicable, granted, probedPath, checkedAt, context }` |
 | `purge preview` | ✅ | array of per-destination purge plans: matched/changed/unattributed snapshots and patterns |
+| `purge apply` | ✅ | `{ setId, status, children }` for the token-gated destructive purge |
 | `config export` | — | **Unwrapped by design.** The exported config document itself, so it round-trips into `config import`. |
 | `timer status` (Linux) | — | **Human-only.** Its report is narrative assembled while probing; the machine-readable equivalent is `status --json`'s `.scheduler`, in the same problem vocabulary. |
 | `print-password` | — | Hidden; exists for `RESTIC_PASSWORD_COMMAND` and writes a secret to stdout. |
@@ -115,6 +116,7 @@ never match on it. `details` is omitted entirely when empty.
 | `restic_unsupported` | no | 1 | A restic was found and ran, but is below the minimum or is not restic. |
 | `restic_failed` | no | 1 | restic ran and failed. |
 | `operation_timed_out` | **yes** | 1 | The operation exceeded the caller's timeout and was stopped; restic never reported. A stalled network or a spinning-up remote clears on its own. |
+| `preview_expired` | no | 1 | A destructive preview token has expired. Run a fresh preview; the old token can never be applied. |
 | `operation_not_allowed` | no | 1 | Refused by a safety invariant — `forget` with an empty retention policy, `prune` on a mirror behind its primary (`architecture.md` §Invariants). |
 | `internal_error` | no | 1 | An unexpected failure. Bounded; never a serialized object description. |
 
@@ -271,9 +273,9 @@ arrive:
 
 - **`config_missing`** — a missing `config.json` is not an error.
   `ConfigStore.load()` returns an empty `AppConfig`.
-- **`preview_required` / `preview_expired` / `preview_stale` /
-  `preview_already_used`** — the preview-token mechanism lands with #82/#88;
-  the codes land with it.
+- **`preview_required` / `preview_stale` / `preview_already_used`** — these
+  may be useful for a future preview-token operation, but no current path
+  produces them. `preview_expired` is defined above because purge does.
 - **`cloud_repository_not_hydrated`** — no detector exists. Inferring it would
   mean matching restic's English stderr, which is exactly the practice this
   contract exists to stop.

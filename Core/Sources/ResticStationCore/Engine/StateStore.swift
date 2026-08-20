@@ -78,21 +78,47 @@ public struct SetScheduleState: Codable, Equatable, Sendable {
     /// files carry no version and are regenerable caches
     /// (`docs/data-model.md` §Versioning & migration).
     public var checkCount: Int?
+    /// Per destination, the purge patterns that have already been rewritten
+    /// out of that repository. Removing a pattern deliberately does not
+    /// remove it from this audit state: history cannot be restored, and a
+    /// smaller list must never cause a wasteful rewrite.
+    public var appliedPurgeExcludes: [UUID: [String]]
 
     public init(
         lastBackupStart: Date? = nil,
         lastCheckStart: Date? = nil,
         checkSliceCursor: Int? = nil,
-        checkCount: Int? = nil
+        checkCount: Int? = nil,
+        appliedPurgeExcludes: [UUID: [String]] = [:]
     ) {
         self.lastBackupStart = lastBackupStart
         self.lastCheckStart = lastCheckStart
         self.checkSliceCursor = checkSliceCursor
         self.checkCount = checkCount
+        self.appliedPurgeExcludes = appliedPurgeExcludes
     }
 
     private enum CodingKeys: String, CodingKey {
-        case lastBackupStart, lastCheckStart, checkSliceCursor, checkCount
+        case lastBackupStart, lastCheckStart, checkSliceCursor, checkCount, appliedPurgeExcludes
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        lastBackupStart = try container.decodeIfPresent(Date.self, forKey: .lastBackupStart)
+        lastCheckStart = try container.decodeIfPresent(Date.self, forKey: .lastCheckStart)
+        checkSliceCursor = try container.decodeIfPresent(Int.self, forKey: .checkSliceCursor)
+        checkCount = try container.decodeIfPresent(Int.self, forKey: .checkCount)
+        guard container.contains(.appliedPurgeExcludes), !(try container.decodeNil(forKey: .appliedPurgeExcludes)) else {
+            appliedPurgeExcludes = [:]
+            return
+        }
+        let nested = try container.nestedContainer(keyedBy: DynamicCodingKey.self, forKey: .appliedPurgeExcludes)
+        var values: [UUID: [String]] = [:]
+        for key in nested.allKeys {
+            guard let id = UUID(uuidString: key.stringValue) else { continue }
+            values[id] = try nested.decode([String].self, forKey: key)
+        }
+        appliedPurgeExcludes = values
     }
 
     // Explicit `null` for nil optionals — see AppConfig.encode(to:).
@@ -102,6 +128,11 @@ public struct SetScheduleState: Codable, Equatable, Sendable {
         try container.encode(lastCheckStart, forKey: .lastCheckStart)
         try container.encode(checkSliceCursor, forKey: .checkSliceCursor)
         try container.encode(checkCount, forKey: .checkCount)
+        var nested = container.nestedContainer(keyedBy: DynamicCodingKey.self, forKey: .appliedPurgeExcludes)
+        for (id, patterns) in appliedPurgeExcludes {
+            guard let key = DynamicCodingKey(stringValue: id.uuidString) else { continue }
+            try nested.encode(patterns, forKey: key)
+        }
     }
 }
 
@@ -113,8 +144,9 @@ public struct SetScheduleState: Codable, Equatable, Sendable {
 public struct CurrentRunState: Codable, Equatable, Sendable {
     public var runId: String
     public var kind: RunKind
-    /// `probing` | `backing-up-primary` | `copying-<destId>` | `retention` |
-    /// `checking` — free-form because `copying-<destId>` embeds a
+    /// `probing` | `backing-up-primary` | `purging-<destId>` |
+    /// `copying-<destId>` | `retention` | `checking` — free-form because
+    /// `purging-<destId>` and `copying-<destId>` embed a
     /// destination id, so this is not a fixed-case enum.
     public var phase: String
     public var percentDone: Double

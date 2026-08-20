@@ -1,0 +1,253 @@
+import Foundation
+
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#endif
+
+/// One destination's exact, attributed snapshot ids in a destructive preview.
+public struct PreviewTokenDestination: Codable, Equatable, Sendable {
+    public let destinationId: UUID
+    public let snapshotIDs: [String]
+
+    public init(destinationId: UUID, snapshotIDs: [String]) {
+        self.destinationId = destinationId
+        self.snapshotIDs = snapshotIDs.sorted()
+    }
+}
+
+/// The persisted capability behind a destructive purge/retention action.
+///
+/// The opaque `value` is intentionally only ever written to the owner-only
+/// ``PreviewTokenStore`` index and returned by a successful preview.  It
+/// never belongs in a run record, run log, or error envelope.
+public struct PreviewToken: Codable, Equatable, Sendable {
+    public let value: String
+    public let machineId: String
+    public let setId: UUID
+    public let destinations: [PreviewTokenDestination]
+    public let configFingerprint: String
+    public let patterns: [String]
+    public let createdAt: Date
+    public let expiresAt: Date
+    public var usedAt: Date?
+
+    public init(
+        value: String,
+        machineId: String,
+        setId: UUID,
+        destinations: [PreviewTokenDestination],
+        configFingerprint: String,
+        patterns: [String],
+        createdAt: Date,
+        expiresAt: Date,
+        usedAt: Date? = nil
+    ) {
+        self.value = value
+        self.machineId = machineId
+        self.setId = setId
+        self.destinations = destinations.sorted { $0.destinationId.uuidString < $1.destinationId.uuidString }
+        self.configFingerprint = configFingerprint
+        self.patterns = patterns
+        self.createdAt = createdAt
+        self.expiresAt = expiresAt
+        self.usedAt = usedAt
+    }
+}
+
+/// Fail-closed failures while looking up or consuming a destructive preview.
+/// None carries the token value: an error can safely reach a bounded CLI
+/// message without leaking a live capability.
+public enum PreviewTokenError: Error, Equatable, Sendable {
+    case unavailable
+    case unknown
+    case expired
+    case alreadyUsed
+}
+
+/// Owner-only on-disk store for short-lived destructive-operation previews.
+///
+/// The token value is a 256-bit CSPRNG capability.  Entries are retained
+/// briefly after use/expiry so a replay gets a deliberate refusal rather than
+/// looking like a missing token; old entries are swept during every write.
+public struct PreviewTokenStore: Sendable {
+    public static let defaultLifetime: TimeInterval = 15 * 60
+    private static let retentionAfterExpiry: TimeInterval = 24 * 60 * 60
+
+    public let paths: AppPaths
+    private let now: @Sendable () -> Date
+
+    public init(paths: AppPaths, now: @escaping @Sendable () -> Date = Date.init) {
+        self.paths = paths
+        self.now = now
+    }
+
+    public func issue(
+        machineId: String,
+        setId: UUID,
+        destinations: [PreviewTokenDestination],
+        config: AppConfig,
+        patterns: [String],
+        lifetime: TimeInterval = defaultLifetime
+    ) throws -> PreviewToken {
+        try withStoreLock {
+            let createdAt = now()
+            var index = try readIndex()
+            discardExpiredEntries(from: &index, at: createdAt)
+            let token = PreviewToken(
+                value: Self.randomValue(),
+                machineId: machineId,
+                setId: setId,
+                destinations: destinations,
+                configFingerprint: try Self.configFingerprint(config),
+                patterns: patterns,
+                createdAt: createdAt,
+                expiresAt: createdAt.addingTimeInterval(lifetime)
+            )
+            index.tokens[token.value] = token
+            try writeIndex(index)
+            return token
+        }
+    }
+
+    /// Reads a token without consuming it.  Callers must perform every
+    /// repository/config check before invoking ``consume(_:)``.
+    public func token(_ value: String) throws -> PreviewToken {
+        try withStoreLock {
+            let index = try readIndex()
+            guard let token = index.tokens[value] else { throw PreviewTokenError.unknown }
+            if token.expiresAt <= now() { throw PreviewTokenError.expired }
+            if token.usedAt != nil { throw PreviewTokenError.alreadyUsed }
+            return token
+        }
+    }
+
+    /// Atomically-ish records consumption after the caller has revalidated
+    /// the plan, making any later replay fail closed.  The set lock held by
+    /// the engine serializes competing applies for the same set.
+    public func consume(_ value: String) throws -> PreviewToken {
+        try withStoreLock {
+            var index = try readIndex()
+            guard var token = index.tokens[value] else { throw PreviewTokenError.unknown }
+            let consumedAt = now()
+            if token.expiresAt <= consumedAt { throw PreviewTokenError.expired }
+            if token.usedAt != nil { throw PreviewTokenError.alreadyUsed }
+            token.usedAt = consumedAt
+            index.tokens[value] = token
+            discardExpiredEntries(from: &index, at: consumedAt)
+            try writeIndex(index)
+            return token
+        }
+    }
+
+    /// SHA-256 of the canonical persisted configuration bytes.  A full
+    /// config change invalidates a destructive preview rather than trying to
+    /// guess whether the changed field was relevant to an operation.
+    public static func configFingerprint(_ config: AppConfig) throws -> String {
+        let data = try ConfigStore.makeEncoder().encode(config)
+        return SHA256Digest.hex(data)
+    }
+
+    private struct Index: Codable, Sendable {
+        var tokens: [String: PreviewToken] = [:]
+    }
+
+    /// The token index is global to the local machine, while set locks are
+    /// per backup set. This separate lock prevents two previews for different
+    /// sets from losing one another's entries, and makes consume/replay
+    /// behavior single-use even across helper processes.
+    private func withStoreLock<T>(_ body: () throws -> T) throws -> T {
+        do {
+            try paths.ensureDirectories()
+            let lock = FileLock(path: paths.previewTokensLockFile)
+            guard lock.tryAcquire() else { throw PreviewTokenError.unavailable }
+            defer { lock.release() }
+            return try body()
+        } catch let error as PreviewTokenError {
+            throw error
+        } catch {
+            throw PreviewTokenError.unavailable
+        }
+    }
+
+    private func readIndex() throws -> Index {
+        let url = paths.previewTokensFile
+        guard FileManager.default.fileExists(atPath: url.path) else { return Index() }
+        guard Self.isOwnerOnly(url) else { throw PreviewTokenError.unavailable }
+        do {
+            return try ConfigStore.makeDecoder().decode(Index.self, from: Data(contentsOf: url))
+        } catch {
+            throw PreviewTokenError.unavailable
+        }
+    }
+
+    private func writeIndex(_ index: Index) throws {
+        do {
+            try paths.ensureDirectories()
+            let target = paths.previewTokensFile
+            let temp = target.deletingLastPathComponent()
+                .appendingPathComponent(target.lastPathComponent + ".tmp", isDirectory: false)
+            let data = try ConfigStore.makeEncoder().encode(index)
+            try Self.writeOwnerOnly(data, to: temp)
+            try AtomicFile.rename(from: temp, to: target)
+            _ = chmod(target.path, 0o600)
+        } catch {
+            throw PreviewTokenError.unavailable
+        }
+    }
+
+    private func discardExpiredEntries(from index: inout Index, at date: Date) {
+        index.tokens = index.tokens.filter { _, token in
+            token.expiresAt.addingTimeInterval(Self.retentionAfterExpiry) > date
+        }
+    }
+
+    private static func randomValue() -> String {
+        var generator = SystemRandomNumberGenerator()
+        let bytes = (0..<32).map { _ in UInt8.random(in: UInt8.min...UInt8.max, using: &generator) }
+        return Data(bytes)
+            .base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+    }
+
+    private static func isOwnerOnly(_ url: URL) -> Bool {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let mode = attributes[.posixPermissions] as? NSNumber else {
+            return false
+        }
+        return mode.intValue & 0o077 == 0
+    }
+
+    private static func writeOwnerOnly(_ data: Data, to url: URL) throws {
+        let path = url.path
+        _ = unlink(path)
+        let fd = path.withCString { open($0, O_WRONLY | O_CREAT | O_TRUNC, 0o600) }
+        guard fd >= 0 else { throw PreviewTokenError.unavailable }
+        defer {
+            #if canImport(Darwin)
+            _ = Darwin.close(fd)
+            #elseif canImport(Glibc)
+            _ = Glibc.close(fd)
+            #elseif canImport(Musl)
+            _ = Musl.close(fd)
+            #endif
+        }
+        let wroteAll = data.withUnsafeBytes { raw -> Bool in
+            guard var pointer = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return data.isEmpty }
+            var remaining = data.count
+            while remaining > 0 {
+                let written = write(fd, pointer, remaining)
+                if written <= 0 { return false }
+                pointer += written
+                remaining -= written
+            }
+            return true
+        }
+        guard wroteAll, chmod(path, 0o600) == 0 else { throw PreviewTokenError.unavailable }
+    }
+}
