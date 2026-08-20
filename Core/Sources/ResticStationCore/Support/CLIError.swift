@@ -119,6 +119,9 @@ public enum CLIErrorCode: String, Sendable, Codable, CaseIterable, Equatable {
     /// `restic_failed` told an agent the opposite of what the same failure
     /// told a person.
     case operationTimedOut = "operation_timed_out"
+    /// A destructive-preview capability passed its bounded lifetime. A new
+    /// read-only preview is required before anything can be changed.
+    case previewExpired = "preview_expired"
 
     // ── Refused on purpose ────────────────────────────────────────────────
 
@@ -157,7 +160,7 @@ extension CLIErrorCode {
              .repositoryLocked, .secretUnavailable, .secretRejected,
              .secretNotConfigured,
              .repositoryNotInitialized, .resticNotFound, .resticUnsupported,
-             .resticFailed, .operationTimedOut, .operationNotAllowed,
+             .resticFailed, .operationTimedOut, .previewExpired, .operationNotAllowed,
              .internalError:
             return .error
         }
@@ -180,7 +183,7 @@ extension CLIErrorCode {
              .destinationNotFound, .destinationDisabledHere, .runNotFound,
              .secretRejected, .secretNotConfigured,
              .repositoryNotInitialized, .resticNotFound,
-             .resticUnsupported, .resticFailed, .operationNotAllowed,
+             .resticUnsupported, .resticFailed, .previewExpired, .operationNotAllowed,
              .internalError:
             return false
         case .operationTimedOut:
@@ -387,6 +390,43 @@ public struct CLIFailure: Error, Equatable, Sendable {
 /// invent its own code *and* its own wording, which is precisely the drift
 /// this contract exists to prevent.
 extension CLIFailure {
+
+    /// Error mapping for token-gated destructive operations. Token material
+    /// never reaches the envelope; ids make the refusal actionable without
+    /// disclosing a capability or repository path.
+    public static func classifyPurgeApply(_ error: any Error, setId: UUID) -> CLIFailure {
+        guard let purgeError = error as? PurgeApplyError else {
+            return classify(error)
+        }
+        switch purgeError {
+        case .token(.expired):
+            return CLIFailure(
+                code: .previewExpired,
+                message: "The purge preview has expired. Run purge preview again.",
+                details: CLIErrorDetails(setId: setId)
+            )
+        case .token, .tokenDoesNotMatchCurrentPlan:
+            return CLIFailure(
+                code: .operationNotAllowed,
+                message: "The purge preview does not match the current plan. Run purge preview again.",
+                details: CLIErrorDetails(setId: setId)
+            )
+        case .busy:
+            return CLIFailure.setBusy(setId: setId)
+        case .destinationOffline(let destinationId):
+            return CLIFailure(
+                code: .repositoryOffline,
+                message: "The destination is offline. Reconnect it and run purge preview again.",
+                details: CLIErrorDetails(setId: setId, destinationId: destinationId)
+            )
+        case .unavailable:
+            return CLIFailure(
+                code: .secretUnavailable,
+                message: "The purge could not be prepared. Try again after checking secret storage.",
+                details: CLIErrorDetails(setId: setId)
+            )
+        }
+    }
 
     public static func invalidArguments(_ message: String) -> CLIFailure {
         CLIFailure(code: .invalidArguments, message: bounded(message))

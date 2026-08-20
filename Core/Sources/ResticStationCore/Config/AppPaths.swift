@@ -184,6 +184,19 @@ public struct AppPaths: Equatable, Sendable {
         stateDir.appendingPathComponent("fda-check.json", isDirectory: false)
     }
 
+    /// `state/preview-tokens.json` — the local, owner-only index behind
+    /// short-lived destructive-operation preview tokens.  This is state,
+    /// not shared configuration: a token is bound to one machine and must
+    /// never be copied with `config.json`.
+    public var previewTokensFile: URL {
+        stateDir.appendingPathComponent("preview-tokens.json", isDirectory: false)
+    }
+
+    /// Serializes destructive-preview token index updates across backup sets.
+    public var previewTokensLockFile: URL {
+        stateDir.appendingPathComponent("preview-tokens.lock", isDirectory: false)
+    }
+
     // MARK: - locks/
 
     public var locksDir: URL {

@@ -50,12 +50,12 @@ private let representative: [CLIErrorCode: CLIFailure] = [
     ),
     .resticFailed: .classify(exitClass: .fatal(stderrSummary: "repository is damaged")),
     .operationTimedOut: .classify(ResticRunnerError.timedOut),
+    .previewExpired: .classifyPurgeApply(PurgeApplyError.token(.expired), setId: setId),
     .internalError: .classify(ConfigStoreError.renameFailed(errno: 13, from: "a", to: "b")),
-    // These two have no typed error yet: `repositoryOffline` is produced by
-    // a `Reachability` *result* (#79 wires it), and `operationNotAllowed` by
-    // engine invariants that today refuse before throwing. Constructed
-    // directly and deliberately, so `everyCodeIsReachable` stays meaningful
-    // for the rest.
+    // `repositoryOffline` is a `Reachability` result rather than an Error,
+    // so this representative remains direct. `operationNotAllowed` is also
+    // reachable from `PurgeApplyError`, but stays direct here because the
+    // public code-table test deliberately does not import an engine fixture.
     .repositoryOffline: CLIFailure(
         code: .repositoryOffline,
         message: "The destination did not answer.",
@@ -103,9 +103,10 @@ struct CLIErrorContractTests {
         #expect(CLIErrorCode.resticUnsupported.rawValue == "restic_unsupported")
         #expect(CLIErrorCode.resticFailed.rawValue == "restic_failed")
         #expect(CLIErrorCode.operationTimedOut.rawValue == "operation_timed_out")
+        #expect(CLIErrorCode.previewExpired.rawValue == "preview_expired")
         #expect(CLIErrorCode.operationNotAllowed.rawValue == "operation_not_allowed")
         #expect(CLIErrorCode.internalError.rawValue == "internal_error")
-        #expect(CLIErrorCode.allCases.count == 20)
+        #expect(CLIErrorCode.allCases.count == 21)
     }
 
     @Test("only busy and offline leave exit 1 — the coarse shell contract is unchanged")
@@ -137,12 +138,26 @@ struct CLIErrorContractTests {
         #expect(rejected.code == .secretRejected)
         #expect(!rejected.retryable)
         #expect(CLIErrorCode.secretUnavailable.retryable)
+        #expect(!CLIErrorCode.previewExpired.retryable)
         // And a destination whose password was never stored: the backend
         // answered, the answer will not change on its own, and a caller
         // told `retryable: true` would loop until a human runs `secret set`.
         let missing = CLIFailure.classify(SecretStoreError.itemNotFound)
         #expect(missing.code == .secretNotConfigured)
         #expect(!missing.retryable)
+    }
+
+    @Test("purge token refusals use safe, actionable envelope codes")
+    func purgeTokenClassification() {
+        let expired = CLIFailure.classifyPurgeApply(PurgeApplyError.token(.expired), setId: setId)
+        #expect(expired.code == .previewExpired)
+        #expect(expired.details.setId == setId)
+        #expect(!expired.retryable)
+
+        let stale = CLIFailure.classifyPurgeApply(PurgeApplyError.tokenDoesNotMatchCurrentPlan, setId: setId)
+        #expect(stale.code == .operationNotAllowed)
+        #expect(stale.details.setId == setId)
+        #expect(!stale.message.contains("token"), "capabilities never appear in an envelope")
     }
 }
 

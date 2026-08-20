@@ -2,13 +2,11 @@ import ArgumentParser
 import Foundation
 import ResticStationCore
 
-/// `purge preview` is intentionally the only purge surface in #87.  Apply is
-/// introduced later, behind a preview token, in #88.
 struct Purge: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "purge",
         abstract: "Inspect snapshots that purge exclusions would rewrite.",
-        subcommands: [PurgePreview.self]
+        subcommands: [PurgePreview.self, PurgeApply.self]
     )
 }
 
@@ -54,13 +52,22 @@ struct PurgePreview: AsyncParsableCommand, JSONRenderable {
         let unattributed: [SnapshotReport]
         let rewriteOutput: String?
         let message: String?
+        /// One capability shared by every destination in this preview. It is
+        /// intentionally data (a human must carry it to `purge apply`), not
+        /// an error detail or a run-record field.
+        let previewToken: String?
 
         private enum CodingKeys: String, CodingKey {
             case setId, destinationId, label, status, patterns, matched, changed
-            case unattributed, rewriteOutput, message
+            case unattributed, rewriteOutput, message, previewToken
         }
 
-        init(setId: UUID, destination: Destination, result: PurgePlanResult) {
+        init(
+            setId: UUID,
+            destination: Destination,
+            result: PurgePlanResult,
+            previewToken: String?
+        ) {
             self.setId = setId
             self.destinationId = destination.id
             self.label = destination.label
@@ -71,6 +78,7 @@ struct PurgePreview: AsyncParsableCommand, JSONRenderable {
             self.unattributed = result.plan.unattributed.map(SnapshotReport.init)
             self.rewriteOutput = result.rewrite?.rawOutput
             self.message = result.message
+            self.previewToken = previewToken
         }
 
         // The optional fields are part of a reported payload, so they are
@@ -87,6 +95,7 @@ struct PurgePreview: AsyncParsableCommand, JSONRenderable {
             try container.encode(unattributed, forKey: .unattributed)
             try container.encode(rewriteOutput, forKey: .rewriteOutput)
             try container.encode(message, forKey: .message)
+            try container.encode(previewToken, forKey: .previewToken)
         }
     }
 
@@ -106,11 +115,19 @@ struct PurgePreview: AsyncParsableCommand, JSONRenderable {
             destinations = backupSet.destinations
         }
 
-        var reports: [Report] = []
+        var results: [(destination: Destination, result: PurgePlanResult)] = []
         for destination in destinations {
             let result = await context.engine.previewPurge(set: backupSet, destination: destination)
             try Self.validate(result: result, setId: set, destination: destination)
-            reports.append(Report(setId: set, destination: destination, result: result))
+            results.append((destination, result))
+        }
+        let previewToken = try context.engine.issuePurgeToken(
+            set: backupSet,
+            destinations: results.map(\.destination),
+            plans: results.map { $0.result.plan }
+        )?.value
+        let reports = results.map {
+            Report(setId: set, destination: $0.destination, result: $0.result, previewToken: previewToken)
         }
 
         if json {
@@ -168,9 +185,106 @@ struct PurgePreview: AsyncParsableCommand, JSONRenderable {
                 }
             }
             print("  space is not reclaimed until a prune runs")
+            if let previewToken = report.previewToken {
+                print("  apply with: purge apply --set \(report.setId.uuidString) --preview-token \(previewToken)")
+            }
         case .busy, .offline, .failed:
             // These states are rejected before a report is printed.
             break
         }
+    }
+}
+
+/// The token-gated destructive half of purge. There is intentionally no
+/// force/yes/environment bypass: `BackupEngine` refuses every request that
+/// is not bound to a successful, current preview.
+struct PurgeApply: AsyncParsableCommand, JSONRenderable {
+    static let configuration = CommandConfiguration(
+        commandName: "apply",
+        abstract: "Apply a reviewed purge preview token."
+    )
+
+    @Option(name: .long, help: "The backup set's UUID.")
+    var set: UUID
+
+    @Option(name: .long, help: "The short-lived token returned by purge preview.")
+    var previewToken: String
+
+    @Flag(name: .long, help: "Emit JSON. Only JSON reaches stdout in this mode.")
+    var json = false
+
+    private struct ChildReport: Encodable {
+        let runId: String
+        let kind: RunKind
+        let destinationId: UUID
+        let status: RunStatus
+    }
+
+    private struct Report: Encodable {
+        let setId: UUID
+        let status: RunStatus
+        let children: [ChildReport]
+    }
+
+    func run() async throws {
+        let context = try await HelperContext.make()
+        guard let backupSet = context.addressable.set(id: set) else {
+            throw CLIFailure.setNotFound(setId: set)
+        }
+
+        let destinationIDs: [UUID]
+        do {
+            destinationIDs = try context.engine.purgeTokenDestinationIDs(previewToken)
+        } catch {
+            throw CLIFailure.classifyPurgeApply(error, setId: set)
+        }
+        let destinations = destinationIDs.compactMap { id in
+            backupSet.destinations.first(where: { $0.id == id })
+        }
+        guard destinations.count == destinationIDs.count else {
+            throw CLIFailure(
+                code: .operationNotAllowed,
+                message: "The purge preview does not match the current backup set.",
+                details: CLIErrorDetails(setId: set)
+            )
+        }
+
+        let result: PurgeRunResult
+        do {
+            result = try await context.engine.runPurge(
+                set: backupSet,
+                destinations: destinations,
+                token: previewToken
+            )
+        } catch {
+            throw CLIFailure.classifyPurgeApply(error, setId: set)
+        }
+
+        guard result.status == .success else {
+            throw CLIFailure(
+                code: .resticFailed,
+                message: "Purge failed. See the run record for details.",
+                details: CLIErrorDetails(
+                    setId: set,
+                    diagnosticReference: result.children.first?.runId
+                )
+            )
+        }
+
+        let report = Report(
+            setId: set,
+            status: result.status,
+            children: result.children.map {
+                ChildReport(runId: $0.runId, kind: $0.kind, destinationId: $0.destId, status: $0.status)
+            }
+        )
+        if json {
+            CLIJSON.print(report)
+        } else if result.children.isEmpty {
+            print("purge completed: no attributed snapshots needed rewriting")
+        } else {
+            print("purge \(result.status.rawValue): \(result.children.count) destination(s) processed")
+        }
+        HelperExit.code(0)
     }
 }

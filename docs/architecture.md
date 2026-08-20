@@ -28,12 +28,12 @@ Secrets: macOS login Keychain (service "restic-station")
 ```
 
 1. **`ResticStationCore`** — local Swift package at `Core/`. Contains **all** logic: config model + store, keychain client, restic runner + command builders + parsers, restic discovery, schedule math, run store, file locking, backup engine, reachability, state store. No UI. Depends only on Foundation (+ swift-argument-parser is *not* here; it's a Helper dependency). `Package.swift` declares `platforms: [.macOS(.v14)]` so `swift test --package-path Core` works standalone.
-2. **`restic-station-helper`** — command-line executable target, embedded in the app bundle at `Contents/MacOS/restic-station-helper`. Uses swift-argument-parser. Subcommands: `tick`, `run-set`, `init-secondary`, `restore`, `probe-repo`, `unlock`, `fda-check`, `secret`, `config`, `status`, `sets`, `runs`, `timer` (Linux only), `version`. Each invocation does its work and **exits** — it never daemonizes. launchd re-fires it via `StartInterval`; on Linux a systemd `--user` timer does (`timer install`, T26). The last four (`config`, `status`, `sets`, `runs`, T27) are the headless CLI surface: on Linux, where there is no app, they are the entire user interface for moving a shared `config.json` between machines and observing what happened; they are available and identical on macOS too.
+2. **`restic-station-helper`** — command-line executable target, embedded in the app bundle at `Contents/MacOS/restic-station-helper`. Uses swift-argument-parser. Subcommands: `tick`, `run-set`, `purge preview`/token-gated `purge apply`, `init-secondary`, `restore`, `probe-repo`, `unlock`, `fda-check`, `secret`, `config`, `status`, `sets`, `runs`, `timer` (Linux only), `version`. Each invocation does its work and **exits** — it never daemonizes. launchd re-fires it via `StartInterval`; on Linux a systemd `--user` timer does (`timer install`, T26). The last four (`config`, `status`, `sets`, `runs`, T27) are the headless CLI surface: on Linux, where there is no app, they are the entire user interface for moving a shared `config.json` between machines and observing what happened; they are available and identical on macOS too.
 3. **`Restic Station.app`** — SwiftUI app. Regular app (Dock icon + windows) plus a `MenuBarExtra`. Registers the helper's LaunchAgent via `SMAppService`.
 
 ## The single-code-path rule
 
-**Every restic operation that mutates a repository goes through the helper binary.** The app never runs `restic backup`, `copy`, `forget`, `restore`, `init`, or `unlock` itself — for manual actions ("Back Up Now", restore, prune-now, init-secondary) it spawns the embedded helper with the corresponding subcommand. This guarantees identical behavior for scheduled and manual runs: same locking, same run recording, same state updates.
+**Every restic operation that mutates a repository goes through the helper binary.** The app never runs `restic backup`, `copy`, `forget`, `rewrite --forget`, `restore`, `init`, or `unlock` itself — for manual actions ("Back Up Now", restore, purge, prune-now, init-secondary) it spawns the embedded helper with the corresponding subcommand. This guarantees identical behavior for scheduled and manual runs: same locking, same run recording, same state updates. `rewrite --forget` has an additional boundary: it is reachable only through `BackupEngine.runPurge`, using explicit snapshot ids revalidated from a short-lived, single-use local preview token.
 
 **The one sanctioned exception:** the app MAY execute **read-only** restic queries directly (`snapshots`, `ls`, `find`, `stats`, `cat config`, `version`) for interactive browsing in the Restore and Maintenance screens, using the same `ResticRunner` from Core. Read-only queries take no repository lock that matters and produce no run records.
 
@@ -155,6 +155,7 @@ State — not config — is the right XDG base dir for `root`: `config.json` is 
 | `runs/<runId>/log.txt` | full streamed log of the run |
 | `runs/index.jsonl` | append-only, one summary JSON line per finished run |
 | `state/schedule-state.json` | last-start times + check-slice cursors per set |
+| `state/preview-tokens.json` | owner-only (`0600`) short-lived destructive-preview capabilities; never copied into runs or logs |
 | `state/current-run-<setId>.json` | live progress plus an independent 30-second awake-time heartbeat (deleted on completion) |
 | `state/repo-status-<destId>.json` | reachability + last-synced info per destination |
 | `state/fda-check.json` | result of the helper's Full Disk Access probe |

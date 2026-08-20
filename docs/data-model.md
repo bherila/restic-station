@@ -290,11 +290,11 @@ Secret-env item is optional (absent for local/sftp destinations without credenti
 {"runId":"20260726T205704Z-backup-6f9619ff","kind":"backup","setId":"6F9619FF-...","destId":"0A1B2C3D-...","status":"success","start":"2026-07-26T20:57:04Z","end":"2026-07-26T20:58:11Z","trigger":"scheduled","snapshotId":"f391ba97c096...","filesNew":3,"filesChanged":1,"dataAdded":67860,"errorSummary":null}
 ```
 
-`kind`: `backup` | `copy` | `check` | `prune` | `restore` | `init`. A scheduled set run produces **multiple** index lines: one `backup` (primary), one `copy` per attempted secondary, one `prune` per repo where retention ran. They share a `groupId` field (= the backup's runId) so the UI can nest them.
+`kind`: `backup` | `copy` | `check` | `prune` | `purge` | `restore` | `init`. A scheduled set run produces **multiple** index lines: one `backup` (primary), an optional `purge` per destination with newly added `purgeExcludes`, one `copy` per attempted secondary, one `prune` per repo where retention ran. They share a `groupId` field (= the backup's runId) so the UI can nest them.
 
 ## runs/<runId>/metadata.json — `RunMetadata`
 
-Superset of the index line, plus: `pid`, `resticExitCode`, `argvRedacted` (argv with env not included), `stats` (full decoded summary message where applicable), `groupId`. Written once at start (`status: "running"`, no `end`) and atomically rewritten on completion.
+Superset of the index line, plus: `pid`, `resticExitCode`, `argvRedacted` (argv with env not included), `stats` (full decoded summary message where applicable), `groupId`. A successful `purge` run additionally carries `purgeSnapshotRewrites`, an old full snapshot id → new snapshot id mapping. It is an audit record only: older run records continue to name their historical snapshot ids. Written once at start (`status: "running"`, no `end`) and atomically rewritten on completion.
 
 ## state/schedule-state.json
 
@@ -304,13 +304,16 @@ Superset of the index line, plus: `pid`, `resticExitCode`, `argvRedacted` (argv 
     "6F9619FF-...": {
       "lastBackupStart": "2026-07-26T20:57:04Z",
       "lastCheckStart": "2026-07-20T03:00:00Z",
-      "checkSliceCursor": 7
+      "checkSliceCursor": 7,
+      "appliedPurgeExcludes": {
+        "0A1B2C3D-...": ["DerivedData"]
+      }
     }
   }
 }
 ```
 
-`lastBackupStart` is the *start* time of the last **attempted** scheduled backup (success or failure) — due-computation keys off attempts, so a failing set retries at its next slot, not every tick. Manual runs also update it (a manual backup satisfies the schedule). `checkSliceCursor` is the `n` most recently used in `--read-data-subset=n/t`.
+`lastBackupStart` is the *start* time of the last **attempted** scheduled backup (success or failure) — due-computation keys off attempts, so a failing set retries at its next slot, not every tick. Manual runs also update it (a manual backup satisfies the schedule). `checkSliceCursor` is the `n` most recently used in `--read-data-subset=n/t`. `appliedPurgeExcludes` records, per destination UUID, only patterns whose `rewrite --forget` child succeeded. Removing a pattern never removes it from this watermark: history cannot be restored, and a smaller list must not trigger a pointless rewrite.
 
 ## state/repo-status-<destId>.json
 
@@ -345,7 +348,7 @@ Superset of the index line, plus: `pid`, `resticExitCode`, `argvRedacted` (argv 
 }
 ```
 
-`phase`: `probing` | `backing-up-primary` | `copying-<destId>` | `retention` | `checking`.
+`phase`: `probing` | `backing-up-primary` | `purging-<destId>` | `copying-<destId>` | `retention` | `checking`.
 
 **Presence does not mean "running".** The file is deleted by a `defer` at the
 end of every run, so a `SIGKILL`, an OOM kill or a power cut leaves it behind

@@ -80,7 +80,7 @@ public enum SetRunOutcome: Equatable, Sendable {
 // MARK: - BackupEngine
 
 /// The orchestration heart: scheduled/manual set runs (backup → mirror →
-/// retention), checks, prune, restore and secondary initialization, plus all
+/// retention), purge, checks, prune, restore and secondary initialization, plus all
 /// run-record and state bookkeeping.
 ///
 /// Implements `docs/tasks/T09-backup-engine.md` (the numbered `runSet`
@@ -104,6 +104,10 @@ public enum SetRunOutcome: Equatable, Sendable {
 /// 4. Every restic child the engine spawns streams its raw stdout *and*
 ///    stderr into that run's `log.txt` before any parsing decision is made.
 /// 5. `checkSliceCursor` advances only after a check that succeeded.
+/// 6. `rewrite --forget` is reached only by a valid, unexpired, single-use
+///    preview capability whose attributed snapshot ids are revalidated while
+///    the set lock is held. A stale secondary is purged before a copy, never
+///    afterwards.
 ///
 /// Nothing here reads the wall clock directly: `now` is injected (as are the
 /// process runner, via `ResticRunner`, and every store), which is what makes
@@ -136,6 +140,8 @@ public final class BackupEngine: Sendable {
     private let reachability: Reachability
     private let now: @Sendable () -> Date
     private let uptime: @Sendable () -> TimeInterval
+    private let machineId: String
+    private let previewTokens: PreviewTokenStore
     /// Raw shared-config source/hostname knowledge used by purge attribution.
     /// Resolved configs deliberately strip machine overrides, so the helper
     /// supplies these unions when it constructs the engine.
@@ -153,7 +159,9 @@ public final class BackupEngine: Sendable {
         now: @escaping @Sendable () -> Date = Date.init,
         uptime: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
         purgeSourcePaths: [UUID: Set<String>] = [:],
-        purgeHostnames: [UUID: Set<String>] = [:]
+        purgeHostnames: [UUID: Set<String>] = [:],
+        machineId: String = MachineIdentity.generate(),
+        previewTokens: PreviewTokenStore? = nil
     ) {
         self.config = config
         self.paths = paths
@@ -164,6 +172,8 @@ public final class BackupEngine: Sendable {
         self.reachability = reachability
         self.now = now
         self.uptime = uptime
+        self.machineId = machineId
+        self.previewTokens = previewTokens ?? PreviewTokenStore(paths: paths, now: now)
         self.purgeSourcePaths = purgeSourcePaths
         self.purgeHostnames = purgeHostnames
     }
@@ -182,10 +192,11 @@ public final class BackupEngine: Sendable {
     /// 5. `backup` (exit 3 ⇒ `.warning` and continue; exit 11 ⇒ `unlock` +
     ///    exactly one retry; 1/2/10/12 ⇒ `.failed`, stop — no copies, no
     ///    retention);
-    /// 6. every secondary in config order: probe, copy, then retention on
-    ///    that secondary only if its copy succeeded;
-    /// 7. retention on the primary if the policy is non-nil and non-empty;
-    /// 8. clear `current-run`, release the lock (also on every failure path),
+    /// 6. purge the primary if it has newly added purge exclusions;
+    /// 7. every secondary in config order: probe, purge it if needed, copy,
+    ///    then retention only if that copy succeeded;
+    /// 8. retention on the primary if the policy is non-nil and non-empty;
+    /// 9. clear `current-run`, release the lock (also on every failure path),
     ///    group outcome = worst child status.
     public func runSet(_ set: BackupSet, trigger: RunTrigger) async -> SetRunOutcome {
         guard let primary = set.destinations.first(where: { $0.isPrimary }) else {
@@ -273,7 +284,37 @@ public final class BackupEngine: Sendable {
         // in sync as of now.
         markSynced(primary)
 
-        // ── Step 6: secondaries, in config order ────────────────────────
+        // A changed purge rule must rewrite the primary before it can be
+        // copied anywhere. A failed primary purge terminates the group: a
+        // copy would otherwise propagate rewritten snapshots while leaving
+        // their originals on an unpurged mirror.
+        let primaryPurgePatterns = pendingPurgePatterns(
+            setId: set.id,
+            set: set,
+            destinationId: primary.id
+        )
+        if !primaryPurgePatterns.isEmpty {
+            do {
+                let purge = try await runAutomaticPurge(
+                    set: set,
+                    destination: primary,
+                    patterns: primaryPurgePatterns,
+                    trigger: trigger,
+                    groupId: groupId
+                )
+                children.append(contentsOf: purge.children)
+                guard purge.status == .success else {
+                    return .completed(status: .failed, groupId: groupId, children: children)
+                }
+            } catch {
+                logWarning(
+                    "BackupEngine: could not purge primary \"\(primary.label)\" before mirroring: \(error)"
+                )
+                return .completed(status: .failed, groupId: groupId, children: children)
+            }
+        }
+
+        // ── Step 7: secondaries, in config order ────────────────────────
         for secondary in set.destinations where !secondary.isPrimary {
             let probe = await reachability.probe(secondary)
             record(probe: probe, for: secondary)
@@ -286,6 +327,39 @@ public final class BackupEngine: Sendable {
                     "BackupEngine: skipping secondary \"\(secondary.label)\": \(describe(probe))"
                 )
                 continue
+            }
+
+            // A mirror with stale purge state cannot receive a copy: restic
+            // would retain its old snapshots alongside the primary's rewritten
+            // replacements. A failed purge skips only this secondary; another
+            // mirror can still make a safe copy.
+            let secondaryPurgePatterns = pendingPurgePatterns(
+                setId: set.id,
+                set: set,
+                destinationId: secondary.id
+            )
+            if !secondaryPurgePatterns.isEmpty {
+                do {
+                    let purge = try await runAutomaticPurge(
+                        set: set,
+                        destination: secondary,
+                        patterns: secondaryPurgePatterns,
+                        trigger: trigger,
+                        groupId: groupId
+                    )
+                    children.append(contentsOf: purge.children)
+                    guard purge.status == .success else {
+                        logWarning(
+                            "BackupEngine: purge of secondary \"\(secondary.label)\" did not succeed — skipping copy"
+                        )
+                        continue
+                    }
+                } catch {
+                    logWarning(
+                        "BackupEngine: could not purge secondary \"\(secondary.label)\" before copy: \(error)"
+                    )
+                    continue
+                }
             }
 
             let copy = await performChild(
@@ -326,7 +400,7 @@ public final class BackupEngine: Sendable {
             }
         }
 
-        // ── Step 7: retention on the primary ────────────────────────────
+        // ── Step 8: retention on the primary ────────────────────────────
         if let prune = await forgetChild(
             destination: primary,
             policy: set.retention,
@@ -337,7 +411,7 @@ public final class BackupEngine: Sendable {
             children.append(prune.child)
         }
 
-        // ── Step 8: current-run cleared and lock released by the defers ─
+        // ── Step 9: current-run cleared and lock released by the defers ─
         return .completed(
             status: Self.worstStatus(children.map(\.status)),
             groupId: groupId,
@@ -642,6 +716,267 @@ public final class BackupEngine: Sendable {
         return PurgePlanResult(plan: plan, changed: changed, rewrite: rewrite, status: .ready)
     }
 
+    /// Stores the approved result of one or more successful purge previews.
+    /// An empty plan gets no capability: there is nothing destructive to do.
+    public func issuePurgeToken(
+        set: BackupSet,
+        destinations: [Destination],
+        plans: [PurgePlan]
+    ) throws -> PreviewToken? {
+        guard !set.purgeExcludes.isEmpty, destinations.count == plans.count else { return nil }
+        guard Set(plans.map(\.destinationId)).count == plans.count else { return nil }
+        let plansByDestination = Dictionary(uniqueKeysWithValues: plans.map { ($0.destinationId, $0) })
+        guard destinations.allSatisfy({ plansByDestination[$0.id]?.patterns == set.purgeExcludes }) else {
+            return nil
+        }
+        let tokenDestinations = destinations.compactMap { destination -> PreviewTokenDestination? in
+            guard let plan = plansByDestination[destination.id] else { return nil }
+            return PreviewTokenDestination(
+                destinationId: destination.id,
+                snapshotIDs: plan.matched.map(\.id)
+            )
+        }
+        guard tokenDestinations.contains(where: { !$0.snapshotIDs.isEmpty }) else { return nil }
+        return try previewTokens.issue(
+            machineId: machineId,
+            setId: set.id,
+            destinations: tokenDestinations,
+            config: config,
+            patterns: set.purgeExcludes
+        )
+    }
+
+    /// Lets the helper choose exactly the destinations an opaque token bound.
+    /// It does not consume the token; `runPurge` rechecks and consumes it
+    /// under the set lock immediately before the first destructive command.
+    public func purgeTokenDestinationIDs(_ token: String) throws -> [UUID] {
+        do {
+            return try previewTokens.token(token).destinations.map(\.destinationId)
+        } catch let error as PreviewTokenError {
+            throw PurgeApplyError.token(error)
+        } catch {
+            throw PurgeApplyError.unavailable
+        }
+    }
+
+    /// Applies a previously reviewed purge preview.  The token is validated
+    /// against this machine, resolved config, selected destinations, patterns
+    /// and fresh repository snapshot attribution before it is consumed.
+    public func runPurge(
+        set: BackupSet,
+        destinations: [Destination],
+        token: String
+    ) async throws -> PurgeRunResult {
+        let lock = makeSetLock(setId: set.id)
+        guard lock.tryAcquire() else { throw PurgeApplyError.busy }
+        defer { lock.release() }
+        defer { try? stateStore.clearCurrentRun(setId: set.id) }
+        return try await runPurgeLocked(
+            set: set,
+            destinations: destinations,
+            token: token,
+            trigger: .manual,
+            groupId: nil
+        )
+    }
+
+    /// `runSet` owns the set lock already, so automatic purge reaches this
+    /// private path after minting an equally constrained local token.
+    private func runPurgeLocked(
+        set: BackupSet,
+        destinations: [Destination],
+        token: String,
+        trigger: RunTrigger,
+        groupId: String?
+    ) async throws -> PurgeRunResult {
+        let preview: PreviewToken
+        do {
+            preview = try previewTokens.token(token)
+        } catch let error as PreviewTokenError {
+            throw PurgeApplyError.token(error)
+        } catch {
+            throw PurgeApplyError.unavailable
+        }
+
+        let requestedIds = Set(destinations.map(\.id))
+        let tokenIds = Set(preview.destinations.map(\.destinationId))
+        let fingerprint: String
+        do {
+            fingerprint = try PreviewTokenStore.configFingerprint(config)
+        } catch {
+            throw PurgeApplyError.unavailable
+        }
+        guard preview.machineId == machineId,
+              preview.setId == set.id,
+              requestedIds == tokenIds,
+              preview.configFingerprint == fingerprint,
+              Set(preview.patterns).isSubset(of: Set(set.purgeExcludes)) else {
+            throw PurgeApplyError.tokenDoesNotMatchCurrentPlan
+        }
+
+        guard await secretsAvailable(for: destinations) else { throw PurgeApplyError.unavailable }
+
+        var plans: [(destination: Destination, plan: PurgePlan)] = []
+        for destination in destinations.sorted(by: { $0.id.uuidString < $1.id.uuidString }) {
+            let plan = try await currentPurgePlan(
+                set: set,
+                destination: destination,
+                patterns: preview.patterns
+            )
+            guard let tokenDestination = preview.destinations.first(where: { $0.destinationId == destination.id }),
+                  tokenDestination.snapshotIDs.sorted() == plan.matched.map(\.id).sorted() else {
+                throw PurgeApplyError.tokenDoesNotMatchCurrentPlan
+            }
+            plans.append((destination, plan))
+        }
+
+        do {
+            _ = try previewTokens.consume(token)
+        } catch let error as PreviewTokenError {
+            throw PurgeApplyError.token(error)
+        } catch {
+            throw PurgeApplyError.unavailable
+        }
+
+        var children: [SetRunChild] = []
+        var resolvedGroupId = groupId
+        for (destination, plan) in plans {
+            guard !plan.matched.isEmpty else {
+                markPurgePatternsApplied(setId: set.id, destinationId: destination.id, patterns: preview.patterns)
+                continue
+            }
+            guard let purge = await purgeChild(
+                destination: destination,
+                snapshotIDs: plan.matched.map(\.id),
+                patterns: preview.patterns,
+                setId: set.id,
+                trigger: trigger,
+                groupId: resolvedGroupId
+            ) else {
+                return PurgeRunResult(status: .failed, children: children)
+            }
+            children.append(purge.child)
+            if resolvedGroupId == nil { resolvedGroupId = purge.child.runId }
+            if purge.child.status == .success {
+                markPurgePatternsApplied(setId: set.id, destinationId: destination.id, patterns: preview.patterns)
+            }
+        }
+        return PurgeRunResult(status: Self.worstStatus(children.map(\.status)), children: children)
+    }
+
+    /// Obtains a fresh attributed plan for token validation.  It is purposely
+    /// independent of the earlier dry-run transcript: a repository can
+    /// change during the preview window, and the apply must fail closed.
+    private func currentPurgePlan(
+        set: BackupSet,
+        destination: Destination,
+        patterns: [String]
+    ) async throws -> PurgePlan {
+        let probe = await reachability.probe(destination)
+        guard probe == .reachable else {
+            throw PurgeApplyError.destinationOffline(destinationId: destination.id)
+        }
+        let outcome: ResticOutcome
+        do {
+            outcome = try await restic.run(
+                .snapshots(repo: destination.repoURL),
+                for: ResticInvocation(destination: destination)
+            )
+        } catch {
+            throw PurgeApplyError.unavailable
+        }
+        guard outcome.status == .success,
+              let snapshots = try? parseSnapshots(Data(outcome.rawOutput.utf8)) else {
+            throw PurgeApplyError.unavailable
+        }
+        return PurgePlan(
+            destinationId: destination.id,
+            snapshots: snapshots,
+            sourcePaths: sourcePaths(for: set),
+            hostnames: hostnames(for: set),
+            patterns: patterns
+        )
+    }
+
+    /// The only `rewrite --forget` call site.  It receives explicit ids from
+    /// the just-revalidated token and records the old→new mapping in the
+    /// purge run metadata; it never accepts a caller-supplied broad filter.
+    private func purgeChild(
+        destination: Destination,
+        snapshotIDs: [String],
+        patterns: [String],
+        setId: UUID,
+        trigger: RunTrigger,
+        groupId: String?
+    ) async -> ChildRun? {
+        let fullIDByShortID = Dictionary(
+            snapshotIDs.map { (String($0.prefix(8)), $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        return await performChild(
+            kind: .purge,
+            setId: setId,
+            destination: destination,
+            trigger: trigger,
+            groupId: groupId,
+            phase: "purging-\(destination.id.uuidString)",
+            command: .rewrite(
+                repo: destination.repoURL,
+                snapshotIDs: snapshotIDs,
+                excludes: patterns,
+                forget: true
+            ),
+            invocation: ResticInvocation(destination: destination),
+            streamProgress: false,
+            purgeSnapshotRewrites: { outcome in
+                Dictionary(uniqueKeysWithValues: parseRewrite(outcome.rawOutput).snapshots.compactMap { rewrite in
+                    guard let oldID = fullIDByShortID[rewrite.shortID], let newID = rewrite.newSnapshotShortID else {
+                        return nil
+                    }
+                    return (oldID, newID)
+                })
+            }
+        )
+    }
+
+    private func pendingPurgePatterns(setId: UUID, set: BackupSet, destinationId: UUID) -> [String] {
+        let applied = stateStore.readScheduleState()?.sets[setId]?.appliedPurgeExcludes[destinationId] ?? []
+        return set.purgeExcludes.filter { !applied.contains($0) }
+    }
+
+    /// Mints a local token from a fresh plan and consumes it through the same
+    /// `runPurgeLocked` path as manual apply.  Automatic purge therefore has
+    /// no back door around the token validation or audit guarantees.
+    private func runAutomaticPurge(
+        set: BackupSet,
+        destination: Destination,
+        patterns: [String],
+        trigger: RunTrigger,
+        groupId: String
+    ) async throws -> PurgeRunResult {
+        guard await secretsAvailable(for: [destination]) else { throw PurgeApplyError.unavailable }
+        let plan = try await currentPurgePlan(set: set, destination: destination, patterns: patterns)
+        let token: PreviewToken
+        do {
+            token = try previewTokens.issue(
+                machineId: machineId,
+                setId: set.id,
+                destinations: [PreviewTokenDestination(destinationId: destination.id, snapshotIDs: plan.matched.map(\.id))],
+                config: config,
+                patterns: patterns
+            )
+        } catch {
+            throw PurgeApplyError.unavailable
+        }
+        return try await runPurgeLocked(
+            set: set,
+            destinations: [destination],
+            token: token.value,
+            trigger: trigger,
+            groupId: groupId
+        )
+    }
+
     // MARK: - runRestore
 
     /// Restores from one destination under the **set** lock, so a restore
@@ -809,7 +1144,8 @@ public final class BackupEngine: Sendable {
         streamProgress: Bool,
         preflightPhase: String? = nil,
         preflight: (@Sendable (LogWriter?) async -> String?)? = nil,
-        downgradeSuccessToWarning: (@Sendable (ResticOutcome) -> Bool)? = nil
+        downgradeSuccessToWarning: (@Sendable (ResticOutcome) -> Bool)? = nil,
+        purgeSnapshotRewrites: (@Sendable (ResticOutcome) -> [String: String]?)? = nil
     ) async -> ChildRun? {
         var run: ActiveRun
         do {
@@ -887,7 +1223,20 @@ public final class BackupEngine: Sendable {
             }
         }
 
-        finish(run, status: status, stats: stats, errorSummary: errorSummary, resticExitCode: exitCode)
+        let rewrites: [String: String]?
+        if status == .success, case .ranToCompletion(let outcome) = result {
+            rewrites = purgeSnapshotRewrites?(outcome)
+        } else {
+            rewrites = nil
+        }
+        finish(
+            run,
+            status: status,
+            stats: stats,
+            errorSummary: errorSummary,
+            resticExitCode: exitCode,
+            purgeSnapshotRewrites: rewrites
+        )
         return ChildRun(
             child: SetRunChild(runId: run.runId, kind: kind, destId: destination.id, status: status),
             outcome: result.outcome
@@ -972,7 +1321,8 @@ public final class BackupEngine: Sendable {
         status: RunStatus,
         stats: BackupSummary? = nil,
         errorSummary: String? = nil,
-        resticExitCode: Int32? = nil
+        resticExitCode: Int32? = nil,
+        purgeSnapshotRewrites: [String: String]? = nil
     ) {
         do {
             try runStore.finish(
@@ -980,7 +1330,8 @@ public final class BackupEngine: Sendable {
                 status: status,
                 stats: stats,
                 errorSummary: errorSummary,
-                resticExitCode: resticExitCode
+                resticExitCode: resticExitCode,
+                purgeSnapshotRewrites: purgeSnapshotRewrites
             )
         } catch {
             logWarning("BackupEngine: could not finish run \(run.runId): \(error)")
@@ -1036,6 +1387,20 @@ public final class BackupEngine: Sendable {
             try stateStore.updateScheduleState(setId: setId, mutate: mutate)
         } catch {
             logWarning("BackupEngine: could not update schedule state for set \(setId): \(error)")
+        }
+    }
+
+    /// Advances the purge-exclusion watermark only after the matching
+    /// repository rewrite succeeded. Existing snapshots are never inferred
+    /// from this state; it merely prevents a newly added exclusion from
+    /// running again on every scheduled backup.
+    private func markPurgePatternsApplied(setId: UUID, destinationId: UUID, patterns: [String]) {
+        updateScheduleState(setId: setId) { state in
+            var applied = state.appliedPurgeExcludes[destinationId] ?? []
+            for pattern in patterns where !applied.contains(pattern) {
+                applied.append(pattern)
+            }
+            state.appliedPurgeExcludes[destinationId] = applied
         }
     }
 
