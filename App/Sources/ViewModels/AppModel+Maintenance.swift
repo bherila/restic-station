@@ -599,7 +599,7 @@ final class MaintenanceModel: ObservableObject {
                     setId: plan.setId,
                     destId: destination.id,
                     dryRun: false,
-                    expectedRepository: previewedDestination.repoURL
+                    expectedDestination: previewedDestination.pruneConfirmationFingerprint()
                 )
             }
         }

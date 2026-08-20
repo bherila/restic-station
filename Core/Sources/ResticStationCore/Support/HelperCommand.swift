@@ -26,11 +26,12 @@ public enum HelperCommand: Equatable, Sendable {
     case prune(setId: UUID)
     /// `run-set --set <uuid> --kind check`.
     case check(setId: UUID)
-    /// `maintenance prune --set <uuid> [--dest <uuid>] [--expected-repo <url>] [--dry-run]`.
+    /// `maintenance prune --set <uuid> [--dest <uuid>] [--expected-destination <fingerprint>] [--dry-run]`.
     /// This reclaims unused packs without applying a retention policy.
-    /// `expectedRepository` binds a destructive confirmation to the repo the
-    /// preceding preview described; direct CLI callers may omit it.
-    case maintenancePrune(setId: UUID, destId: UUID?, expectedRepository: String?, dryRun: Bool)
+    /// `expectedDestination` binds a destructive confirmation to the full
+    /// effective destination the preceding preview described; direct CLI
+    /// callers may omit it.
+    case maintenancePrune(setId: UUID, destId: UUID?, expectedDestination: String?, dryRun: Bool)
     /// `init-secondary --set <uuid> --dest <uuid>`.
     case initSecondary(setId: UUID, destId: UUID)
     /// `probe-repo --set <uuid> --dest <uuid>` (exit 3 = offline).
@@ -70,10 +71,10 @@ public enum HelperCommand: Equatable, Sendable {
             return Self.runSet(setId: setId, kind: "prune")
         case .check(let setId):
             return Self.runSet(setId: setId, kind: "check")
-        case .maintenancePrune(let setId, let destId, let expectedRepository, let dryRun):
+        case .maintenancePrune(let setId, let destId, let expectedDestination, let dryRun):
             var argv = ["maintenance", "prune", "--set", Self.render(setId)]
             if let destId { argv.append(contentsOf: ["--dest", Self.render(destId)]) }
-            if let expectedRepository { argv.append(contentsOf: ["--expected-repo", expectedRepository]) }
+            if let expectedDestination { argv.append(contentsOf: ["--expected-destination", expectedDestination]) }
             if dryRun { argv.append("--dry-run") }
             return argv
         case .initSecondary(let setId, let destId):

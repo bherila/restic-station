@@ -60,12 +60,12 @@ public struct HelperInvoker: Sendable {
         setId: UUID,
         destId: UUID?,
         dryRun: Bool,
-        expectedRepository: String? = nil
+        expectedDestination: String? = nil
     ) async -> HelperResult {
         await run(.maintenancePrune(
             setId: setId,
             destId: destId,
-            expectedRepository: expectedRepository,
+            expectedDestination: expectedDestination,
             dryRun: dryRun
         ))
     }

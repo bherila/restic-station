@@ -122,24 +122,31 @@ import Testing
     #expect(names == ["prune"])
 }
 
-@Test func maintenancePruneBindsConfirmedRepositoryToItsPreview() throws {
+@Test func maintenancePruneBindsConfirmedDestinationToItsPreview() throws {
     let setId = UUID()
     let destination = Destination(
         id: UUID(),
         label: "Primary",
         repoURL: "/Volumes/current.restic",
-        isPrimary: true
+        isPrimary: true,
+        nonSecretEnv: ["AWS_DEFAULT_REGION": "current"]
     )
     let parsed = try #require(HelperMain.parseAsRoot([
         "maintenance", "prune", "--set", setId.uuidString,
         "--dest", destination.id.uuidString,
-        "--expected-repo", "/Volumes/previewed.restic",
+        "--expected-destination", Destination(
+            id: destination.id,
+            label: destination.label,
+            repoURL: destination.repoURL,
+            isPrimary: destination.isPrimary,
+            nonSecretEnv: ["AWS_DEFAULT_REGION": "previewed"]
+        ).pruneConfirmationFingerprint(),
     ]) as? MaintenancePrune)
-    #expect(parsed.expectedRepo == "/Volumes/previewed.restic")
+    #expect(parsed.expectedDestination != nil)
 
     do {
-        try MaintenancePrune.validateExpectedRepository(
-            parsed.expectedRepo,
+        try MaintenancePrune.validateExpectedDestination(
+            parsed.expectedDestination,
             destination: destination,
             setId: setId
         )
@@ -149,6 +156,23 @@ import Testing
         #expect(failure.details.setId == setId)
         #expect(failure.details.destinationId == destination.id)
     }
+}
+
+@Test func maintenancePruneAcceptsItsUnchangedEffectiveDestination() throws {
+    let setId = UUID()
+    let destination = Destination(
+        id: UUID(),
+        label: "Primary",
+        repoURL: "s3:s3.us-east-1.amazonaws.com/example",
+        isPrimary: true,
+        nonSecretEnv: ["AWS_DEFAULT_REGION": "us-east-1"]
+    )
+
+    try MaintenancePrune.validateExpectedDestination(
+        destination.pruneConfirmationFingerprint(),
+        destination: destination,
+        setId: setId
+    )
 }
 
 /// T28 (issue #30): the `restic-station` PATH symlink manager.
