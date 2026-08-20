@@ -53,7 +53,7 @@ struct SecretSet: AsyncParsableCommand {
     var dest: UUID
 
     func run() async throws {
-        let context = SecretContext.make()
+        let context = try SecretContext.make()
         let destination = context.destination(dest)
 
         let password = SecretInput.read(prompt: "Password for \"\(destination.label)\": ")
@@ -85,7 +85,7 @@ struct SecretSetEnv: AsyncParsableCommand {
     var dest: UUID
 
     func run() async throws {
-        let context = SecretContext.make()
+        let context = try SecretContext.make()
         let destination = context.destination(dest)
 
         let raw = SecretInput.readAllStdin()
@@ -128,7 +128,7 @@ struct SecretRemove: AsyncParsableCommand {
     var env = false
 
     func run() async throws {
-        let context = SecretContext.make()
+        let context = try SecretContext.make()
         let destination = context.destination(dest)
 
         do {
@@ -162,7 +162,7 @@ struct SecretList: AsyncParsableCommand, JSONRenderable {
     var json = false
 
     func run() async throws {
-        let context = SecretContext.make()
+        let context = try SecretContext.make()
 
         var rows: [SecretListing.Row] = []
         for entry in context.destinations {
@@ -202,7 +202,15 @@ struct SecretList: AsyncParsableCommand, JSONRenderable {
             // password or an env *value* — it counts them. That is the same
             // redaction-by-shape rule `CLIErrorDetails` follows, and it is
             // why this command can have a JSON mode at all.
-            CLIJSON.print(rows)
+            //
+            // Filtered by `hasAnything`, exactly as `SecretListing.format`
+            // filters for human mode: this command lists "destinations that
+            // have a stored password and/or secret environment", so an empty
+            // store must answer `[]` rather than one row per configured
+            // destination saying it has nothing. The two modes disagreeing
+            // about the result set is the trap a shared payload exists to
+            // remove.
+            CLIJSON.print(rows.filter(\.hasAnything))
         } else {
             for line in SecretListing.format(rows) {
                 print(line)
@@ -241,7 +249,7 @@ struct PrintPassword: AsyncParsableCommand {
 
     func run() async throws {
         let paths = AppPaths.default()
-        let store = HelperContext.makeSecretStore(paths: paths, runner: DefaultProcessRunner())
+        let store = try HelperContext.makeSecretStore(paths: paths, runner: DefaultProcessRunner())
 
         let password: String
         do {

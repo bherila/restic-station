@@ -436,7 +436,18 @@ struct ConfigValidate: AsyncParsableCommand, JSONRenderable {
             print("")
         }
 
-        let localMachineId = try? MachineStore(paths: context.paths).load().machineId
+        // The error is kept, not discarded: `localMachineId` is optional on
+        // purpose — with `--machine` given, this host's own identity is only
+        // used to widen the `confirmable` set below, and an unreadable one
+        // is not fatal there. But when it *is* the answer, the reason it
+        // could not be read is the whole failure, and `try?` threw it away.
+        var localMachineId: String?
+        var localMachineIdError: (any Error)?
+        do {
+            localMachineId = try MachineStore(paths: context.paths).load().machineId
+        } catch {
+            localMachineIdError = error
+        }
         let targetMachineId: String
         if let machine {
             try ConfigCLIContext.requireValidMachineId(machine)
@@ -444,7 +455,14 @@ struct ConfigValidate: AsyncParsableCommand, JSONRenderable {
         } else if let localMachineId {
             targetMachineId = localMachineId
         } else {
-            HelperExit.fail("could not read this machine's identity (\(context.paths.machineFile.path))")
+            // Thrown, not exited: this command promises an envelope in
+            // `--json` mode, and exiting here answered a corrupt
+            // `machine.json` with an empty stdout and prose on stderr —
+            // the one shape the contract exists to remove.
+            throw CLIFailure.machineIdentityUnreadable(
+                path: context.paths.machineFile.path,
+                underlying: localMachineIdError
+            )
         }
 
         let scheduled = config.resolved(for: targetMachineId)

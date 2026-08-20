@@ -518,10 +518,15 @@ extension CLIFailure {
     /// The path stays in `message` and out of `details` — a data-directory
     /// path carries a home directory, and `details` is the half of the
     /// envelope that promises to be safe to log.
-    public static func machineIdentityUnreadable(path: String, underlying: any Error) -> CLIFailure {
-        CLIFailure(
+    /// `underlying` is optional because one caller reaches this having
+    /// already decided the identity is unusable without holding the error
+    /// that says why — and a message that names the file is still the right
+    /// answer there, just a shorter one.
+    public static func machineIdentityUnreadable(path: String, underlying: (any Error)? = nil) -> CLIFailure {
+        let reason = underlying.map { ": \($0)" } ?? ""
+        return CLIFailure(
             code: .configInvalid,
-            message: bounded("could not read this machine's identity (\(path)): \(underlying)")
+            message: bounded("could not read this machine's identity (\(path))\(reason)")
         )
     }
 

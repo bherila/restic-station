@@ -702,7 +702,12 @@ echo 'not valid json{{{' > "$ENVELOPE_DATA/config.json"
 # never loads config.json, so an unloadable config is not a failure for it —
 # it correctly reports an empty history and exits 0. Its own failure path is
 # asserted separately below.
-for CMD in "status" "sets list" "config show"; do
+# `secret list` is in this loop because its setup path is a *different* one:
+# it does not go through `HelperContext.make()` at all (entering a password
+# must work before restic is configured), so it had its own `HelperExit.fail`
+# and answered a broken config with an empty stdout long after the other
+# commands stopped doing that.
+for CMD in "status" "sets list" "config show" "secret list"; do
     # shellcheck disable=SC2086
     RESTIC_STATION_DATA_DIR="$ENVELOPE_DATA" run_helper_split $CMD --json
     expect_rc 1
@@ -716,6 +721,25 @@ for CMD in "status" "sets list" "config show"; do
         || fail "\`$CMD --json\` marked an invalid config retryable"
 done
 ok "every --json command reports an unloadable config.json as config_invalid, exit 1"
+
+# `config validate --json` has a second setup failure of its own: with no
+# `--machine`, the answer comes from this host's `machine.json`, and an
+# unreadable one used to exit with prose rather than an envelope. The config
+# here is *valid* — this is specifically the identity path, not the config
+# path the loop above covers.
+MACHINE_DATA="$WORK/bad-machine"
+mkdir -p "$MACHINE_DATA"
+cp "$HEALTHY/config.json" "$MACHINE_DATA/config.json"
+echo 'not valid json{{{' > "$MACHINE_DATA/machine.json"
+RESTIC_STATION_DATA_DIR="$MACHINE_DATA" run_helper_split config validate --json
+expect_rc 1
+jq -e . "$OUT_FILE" >/dev/null 2>&1 \
+    || fail "config validate --json on an unreadable machine.json put no JSON document on stdout"
+[[ "$(jq -r '.error.code' "$OUT_FILE")" == "config_invalid" ]] \
+    || fail "config validate --json reported $(jq -r '.error.code' "$OUT_FILE") for an unreadable machine.json"
+jq -e '.error.message | test("machine")' "$OUT_FILE" >/dev/null \
+    || fail "the envelope did not say which file it was: $(jq -r '.error.message' "$OUT_FILE")"
+ok "config validate --json reports an unreadable machine.json as config_invalid, exit 1"
 
 # `runs list`'s own classified failure: its --limit check is hand-written
 # rather than an ArgumentParser `validate()` throw, specifically so it exits
@@ -883,7 +907,38 @@ RESTIC_STATION_DATA_DIR="$HEALTHY" run_helper_split secret list --json
 jq -e '[.data[] | keys] | flatten | unique | inside(["destId","label","setName","hasPassword","secretEnvCount"])' \
     "$OUT_FILE" >/dev/null \
     || fail "secret list --json grew a field beyond presence metadata: $(jq -c '.data' "$OUT_FILE")"
-ok "payloads carry what they claim, and secret list --json stays presence-only"
+# Both modes list the same destinations. JSON mode used to serialize every
+# configured destination, including the ones with nothing stored, while
+# human mode filtered them — so an empty store answered `[]` to a person
+# and a full array of "has nothing" rows to a script.
+jq -e 'all(.data[]; .hasPassword or .secretEnvCount > 0)' "$OUT_FILE" >/dev/null \
+    || fail "secret list --json listed a destination with nothing stored: $(jq -c '.data' "$OUT_FILE")"
+# Nothing is stored in this fixture, so both modes must say so — `[]` and
+# the sentence, not a row per configured destination.
+[[ "$(jq -r '.data | length' "$OUT_FILE")" -eq 0 ]] \
+    || fail "secret list --json listed destinations from a store with nothing in it: $(jq -c '.data' "$OUT_FILE")"
+RESTIC_STATION_DATA_DIR="$HEALTHY" run_helper_split secret list
+grep -q "no destination has a stored password" "$OUT_FILE" \
+    || fail "secret list (human) did not report an empty store: $(cat "$OUT_FILE")"
+
+# ...and with one stored, both modes list exactly it. The two counts are
+# what caught the divergence: JSON mode served every configured destination
+# while human mode filtered, so the modes disagreed about the result set.
+printf '%s' "$SECRET_PASSWORD" \
+    | RESTIC_STATION_DATA_DIR="$HEALTHY" "$HELPER" secret set --dest "$PRIMARY_ID" >>"$COMBINED_LOG" 2>&1 \
+    || fail "could not store a password in the healthy fixture"
+RESTIC_STATION_DATA_DIR="$HEALTHY" run_helper_split secret list --json
+JSON_ROWS="$(jq -r '.data | length' "$OUT_FILE")"
+[[ "$JSON_ROWS" -eq 1 ]] || fail "secret list --json listed $JSON_ROWS destinations, expected 1"
+jq -e --arg id "$PRIMARY_ID" '.data[0] | .destId == $id and .hasPassword' "$OUT_FILE" >/dev/null \
+    || fail "secret list --json did not report the stored password: $(jq -c '.data' "$OUT_FILE")"
+RESTIC_STATION_DATA_DIR="$HEALTHY" run_helper_split secret list
+HUMAN_ROWS="$(grep -c "$PRIMARY_ID" "$OUT_FILE" || true)"
+[[ "$JSON_ROWS" -eq "$HUMAN_ROWS" ]] \
+    || fail "secret list listed $HUMAN_ROWS destinations to a human and $JSON_ROWS to a script"
+RESTIC_STATION_DATA_DIR="$HEALTHY" "$HELPER" secret rm --dest "$PRIMARY_ID" >>"$COMBINED_LOG" 2>&1 \
+    || fail "could not remove the fixture password again"
+ok "payloads carry what they claim, secret list --json stays presence-only and agrees with human mode"
 
 # ─────────────────────────────────────────────────────────────────────────
 # 6. THE secret-leak check: every byte this script's helper invocations

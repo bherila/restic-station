@@ -102,7 +102,7 @@ struct HelperContext {
         } catch {
             throw CLIFailure.configInvalid(underlying: error)
         }
-        switch await makeTolerant(paths: paths, views: views, configStore: configStore) {
+        switch try await makeTolerant(paths: paths, views: views, configStore: configStore) {
         case .ready(let context):
             return context
         case .noRestic(let result):
@@ -127,11 +127,15 @@ struct HelperContext {
         case noRestic(ResticDiscoveryResult)
     }
 
+    /// - Throws: only ``CLIFailure`` from ``makeSecretStore(paths:runner:)``,
+    ///   which is a misconfigured backend selection — a hard error in every
+    ///   caller including `tick`, and one that exited 1 here before it was
+    ///   made throwable.
     static func makeTolerant(
         paths: AppPaths,
         views: Views,
         configStore: ConfigStore
-    ) async -> TolerantOutcome {
+    ) async throws -> TolerantOutcome {
         let resticPath: String
         switch await resolveResticPath(resolved: views.scheduled) {
         case .resolved(let path):
@@ -140,7 +144,7 @@ struct HelperContext {
             return .noRestic(result)
         }
         let processRunner = DefaultProcessRunner()
-        let secrets = makeSecretStore(paths: paths, runner: processRunner)
+        let secrets = try makeSecretStore(paths: paths, runner: processRunner)
         let restic = ResticRunner(resticPath: resticPath, paths: paths, secrets: secrets, runner: processRunner)
         let runStore = RunStore(paths: paths)
         let stateStore = StateStore(paths: paths)
@@ -188,7 +192,12 @@ struct HelperContext {
     /// file backend's `RESTIC_PASSWORD_COMMAND` — the app must pass its
     /// embedded helper's path instead, which is why the factory has no
     /// default.
-    static func makeSecretStore(paths: AppPaths, runner: ProcessRunning) -> any SecretStore {
+    /// - Throws: ``CLIFailure`` rather than exiting, so a `--json` caller of
+    ///   `secret list` gets the envelope instead of prose on stderr. The
+    ///   only way this fails is a bad `RESTIC_STATION_SECRET_BACKEND`, which
+    ///   is a misconfiguration of this host that a human has to fix — hence
+    ///   `config_invalid` and not the retryable `secret_unavailable`.
+    static func makeSecretStore(paths: AppPaths, runner: ProcessRunning) throws -> any SecretStore {
         do {
             return try SecretStoreFactory.make(
                 paths: paths,
@@ -196,7 +205,8 @@ struct HelperContext {
                 helperExecutablePath: FileSecretStore.currentExecutablePath()
             )
         } catch {
-            HelperExit.fail("secret storage is misconfigured: \(error)")
+            // Wording preserved from the `HelperExit.fail` this replaced.
+            throw CLIFailure(code: .configInvalid, message: "secret storage is misconfigured: \(error)")
         }
     }
 }
@@ -212,17 +222,21 @@ struct SecretContext {
     let store: any SecretStore
     let config: AppConfig
 
-    static func make() -> SecretContext {
+    /// - Throws: ``CLIFailure``. Every failure here is one the `--json`
+    ///   commands promise to report as an envelope, and exiting from inside
+    ///   the setup path is how `secret list --json` used to answer an
+    ///   unloadable `config.json` with an empty stdout.
+    static func make() throws -> SecretContext {
         let paths = AppPaths.default()
         let config: AppConfig
         do {
             config = try ConfigStore(paths: paths).load()
         } catch {
-            HelperExit.fail("could not load configuration: \(error)")
+            throw CLIFailure.configInvalid(underlying: error)
         }
         return SecretContext(
             paths: paths,
-            store: HelperContext.makeSecretStore(paths: paths, runner: DefaultProcessRunner()),
+            store: try HelperContext.makeSecretStore(paths: paths, runner: DefaultProcessRunner()),
             config: config
         )
     }

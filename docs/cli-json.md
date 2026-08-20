@@ -52,7 +52,7 @@ itself, unwrapped, because its output is meant to be fed straight back into
 | `config show` | ✅ | effective-config report |
 | `config validate` | ✅ | `{ machineId, errors, warnings, effective, nothingRunsHere }` |
 | `probe-repo` | ✅ | `{ setId, destinationId, label, outcome, reachable, reason }` |
-| `secret list` | ✅ | array of `{ destId, label, setName, hasPassword, secretEnvCount }` |
+| `secret list` | ✅ | array of `{ destId, label, setName, hasPassword, secretEnvCount }` — only destinations that have something stored, the same set human mode prints |
 | `cli status` | ✅ | `CLIInstaller.Status` |
 | `fda-check` | ✅ | `{ applicable, granted, probedPath, checkedAt, context }` |
 | `config export` | — | **Unwrapped by design.** The exported config document itself, so it round-trips into `config import`. |
@@ -97,7 +97,7 @@ never match on it. `details` is omitted entirely when empty.
 | `code` | `retryable` | exit | Meaning |
 |---|---|---|---|
 | `invalid_arguments` | no | 64 / 1 | Arguments missing, malformed, or out of range. See §Argument-parser failures for the two exit codes. |
-| `config_invalid` | no | 1 | A configuration file on this host will not load — `config.json` undecodable, failing `validate()`, or written by a newer build; or `machine.json` unreadable. `message` names which. |
+| `config_invalid` | no | 1 | A configuration file on this host will not load — `config.json` undecodable, failing `validate()`, or written by a newer build; `machine.json` unreadable; or `RESTIC_STATION_SECRET_BACKEND` naming a backend that does not exist. `message` names which. |
 | `set_not_found` | no | 1 | No backup set with that id. |
 | `set_disabled_here` | no | 1 | The set exists in the shared config but is switched off for this machine. |
 | `destination_not_found` | no | 1 | No such destination in that set. |

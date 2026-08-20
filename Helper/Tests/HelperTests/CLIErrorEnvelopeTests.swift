@@ -226,7 +226,12 @@ struct CommandFailureClassificationTests {
         setenv("RESTIC_STATION_DATA_DIR", directory.path, 1)
         defer { unsetenv("RESTIC_STATION_DATA_DIR") }
 
-        for argv in [["sets", "list"], ["status"], ["config", "show"]] {
+        // `secret list` is in this list because it reaches its config
+        // through `SecretContext.make()`, not `HelperContext.make()` —
+        // entering a password has to work before restic is configured — so
+        // it had a second setup path with its own `HelperExit.fail` and kept
+        // answering a broken config with an empty stdout.
+        for argv in [["sets", "list"], ["status"], ["config", "show"], ["secret", "list"]] {
             var command = try #require(HelperMain.parseAsRoot(argv) as? any AsyncParsableCommand)
             do {
                 try await command.run()
