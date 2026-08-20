@@ -135,7 +135,9 @@ struct BackupEngineTests {
         primaryReachable: Bool = true,
         reachableSecondaries: [Bool] = [true, true],
         startingAt: Date = t0,
-        onSpawn: (@Sendable ([String]) -> Void)? = nil
+        onSpawn: (@Sendable ([String]) -> Void)? = nil,
+        purgeSourcePaths: [UUID: Set<String>] = [:],
+        purgeHostnames: [UUID: Set<String>] = [:]
     ) -> Env {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("restic-station-engine-\(UUID().uuidString)", isDirectory: true)
@@ -206,7 +208,9 @@ struct BackupEngineTests {
             runStore: runStore,
             stateStore: stateStore,
             reachability: Reachability(restic: restic),
-            now: clock.now
+            now: clock.now,
+            purgeSourcePaths: purgeSourcePaths,
+            purgeHostnames: purgeHostnames
         )
 
         return Env(
@@ -1231,6 +1235,66 @@ struct BackupEngineTests {
         #expect(status == .skipped)
         #expect(env.fake.invocations.isEmpty, "nothing spawned — the guard is the first thing checked")
         #expect(env.indexEntries.isEmpty)
+    }
+
+    // MARK: - purge preview
+
+    @Test("previewPurge: snapshots then rewrite dry-run only, with explicit attributed ids")
+    func purgePreviewIsReadOnly() async throws {
+        let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]
+        let hostnames = [Self.setId: Set(["example-mac.local"])]
+        let env = Self.makeEnv(
+            script: [],
+            retention: nil,
+            purgeExcludes: ["build/**"],
+            reachableSecondaries: [],
+            purgeSourcePaths: sourcePaths,
+            purgeHostnames: hostnames
+        )
+        defer { env.cleanUp() }
+
+        let snapshotsJSON = try FixtureLoader.string("snapshots.json")
+        let snapshots = try parseSnapshots(Data(snapshotsJSON.utf8))
+        let snapshotIDs = snapshots.map(\.id)
+        let dryRunText = try FixtureLoader.string("rewrite-dry-run.txt")
+            .replacingOccurrences(of: "09b3295c", with: snapshots[0].shortId)
+            .replacingOccurrences(of: "b2435423", with: snapshots[1].shortId)
+        let dryRun = dryRunText
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map(String.init)
+        env.fake.script = Self.resticCall(
+            ["-r", env.primary.repoURL, "snapshots", "--json"],
+            dest: Self.primaryId,
+            stdoutLines: [snapshotsJSON]
+        ) + Self.resticCall(
+            ["-r", env.primary.repoURL, "rewrite", "--dry-run", "--exclude", "build/**"] + snapshotIDs,
+            dest: Self.primaryId,
+            stdoutLines: dryRun
+        )
+
+        let result = await env.engine.previewPurge(set: env.set, destination: env.primary)
+
+        #expect(result.status == .ready)
+        #expect(result.plan.matched.map(\.id) == snapshotIDs)
+        #expect(result.changed.map(\.id) == snapshotIDs)
+        #expect(env.resticArgvs == [
+            [Self.resticPath, "-r", env.primary.repoURL, "snapshots", "--json"],
+            [Self.resticPath, "-r", env.primary.repoURL, "rewrite", "--dry-run", "--exclude", "build/**"] + snapshotIDs,
+        ])
+        #expect(env.fake.invocations.allSatisfy { !$0.argv.contains("--forget") })
+        #expect(env.indexEntries.isEmpty, "a read-only preview creates no run record")
+    }
+
+    @Test("previewPurge with no patterns is empty and spawns nothing")
+    func purgePreviewEmpty() async throws {
+        let env = Self.makeEnv(script: [], retention: nil, purgeExcludes: [], reachableSecondaries: [])
+        defer { env.cleanUp() }
+
+        let result = await env.engine.previewPurge(set: env.set, destination: env.primary)
+
+        #expect(result.status == .empty)
+        #expect(result.plan.matched.isEmpty)
+        #expect(env.fake.invocations.isEmpty)
     }
 
     // MARK: - runRestore

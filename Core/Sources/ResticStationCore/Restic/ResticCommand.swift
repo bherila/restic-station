@@ -115,6 +115,38 @@ public struct ResticCommand: Equatable, Sendable {
         ResticCommand(argv: ["-r", repo, "snapshots", "--json"], repoURL: repo)
     }
 
+    /// `restic -r <repo> rewrite [--forget] [--dry-run] [--exclude <pat>]... <snapshotID>...`
+    ///
+    /// Snapshot ids are deliberately required.  Without them restic rewrites
+    /// every snapshot in the repository, which is never safe for a repository
+    /// shared by more than one backup set.
+    public static func rewrite(
+        repo: String,
+        snapshotIDs: [String],
+        excludes: [String],
+        forget: Bool = false,
+        dryRun: Bool = false
+    ) -> ResticCommand {
+        precondition(!snapshotIDs.isEmpty, "ResticCommand.rewrite requires at least one snapshot ID")
+        precondition(!excludes.isEmpty, "ResticCommand.rewrite requires at least one exclude pattern")
+        var argv = ["-r", repo, "rewrite"]
+        if forget { argv.append("--forget") }
+        if dryRun { argv.append("--dry-run") }
+        for exclude in excludes {
+            argv.append("--exclude")
+            argv.append(exclude)
+        }
+        argv.append(contentsOf: snapshotIDs)
+        return ResticCommand(argv: argv, repoURL: repo)
+    }
+
+    /// `restic -r <repo> prune [--dry-run]`
+    public static func prune(repo: String, dryRun: Bool = false) -> ResticCommand {
+        var argv = ["-r", repo, "prune"]
+        if dryRun { argv.append("--dry-run") }
+        return ResticCommand(argv: argv, repoURL: repo)
+    }
+
     /// `restic -r <repo> ls --json <snapshotID> [<dir>]`
     ///
     /// `path` is an **in-snapshot** path (restic-cli.md §ls). Omitting it

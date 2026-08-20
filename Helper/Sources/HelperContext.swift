@@ -63,6 +63,10 @@ struct HelperContext {
     /// The two per-machine views of `config.json`, resolved once. The single
     /// place resolution happens on the helper side.
     struct Views {
+        /// The shared, unresolved config is retained only for purge
+        /// attribution.  The engine still receives the addressable resolved
+        /// config for all repository lookups.
+        let shared: AppConfig
         let scheduled: ResolvedConfig
         let addressable: ResolvedConfig
     }
@@ -78,6 +82,7 @@ struct HelperContext {
         let config = try configStore.load()
         let machine = try MachineStore(paths: paths).load()
         return Views(
+            shared: config,
             scheduled: config.resolved(for: machine),
             addressable: config.addressable(for: machine)
         )
@@ -156,6 +161,24 @@ struct HelperContext {
         // serialized correctly, so the engine needs the superset. What the
         // engine *backs up* is decided by the `BackupSet` its callers hand
         // to `runSet`, and those come from `scheduled`.
+        var purgeSourcePaths: [UUID: Set<String>] = [:]
+        var purgeHostnames: [UUID: Set<String>] = [:]
+        for set in views.shared.sets {
+            var sources = Set(set.sources)
+            var hostnames = Set<String>()
+            if let machines = set.machines {
+                hostnames.formUnion(machines.keys)
+                for override in machines.values {
+                    sources.formUnion(override.sources ?? [])
+                }
+            }
+            purgeSourcePaths[set.id] = sources
+            // Machine ids are generated from hostnames and are the only
+            // fleet-wide hostname inventory persisted by the application.
+            // Include this machine even when the set has no override map.
+            hostnames.insert(views.addressable.machineId)
+            purgeHostnames[set.id] = hostnames
+        }
         let engine = BackupEngine(
             config: views.addressable.config,
             paths: paths,
@@ -163,7 +186,9 @@ struct HelperContext {
             secrets: secrets,
             runStore: runStore,
             stateStore: stateStore,
-            reachability: reachability
+            reachability: reachability,
+            purgeSourcePaths: purgeSourcePaths,
+            purgeHostnames: purgeHostnames
         )
         return .ready(HelperContext(
             paths: paths,
