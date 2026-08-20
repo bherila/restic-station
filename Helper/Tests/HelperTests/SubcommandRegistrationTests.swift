@@ -1,3 +1,5 @@
+import Foundation
+import ResticStationCore
 import Testing
 
 @testable import restic_station_helper
@@ -118,6 +120,35 @@ import Testing
         subcommand.configuration.commandName
     }
     #expect(names == ["prune"])
+}
+
+@Test func maintenancePruneBindsConfirmedRepositoryToItsPreview() throws {
+    let setId = UUID()
+    let destination = Destination(
+        id: UUID(),
+        label: "Primary",
+        repoURL: "/Volumes/current.restic",
+        isPrimary: true
+    )
+    let parsed = try #require(HelperMain.parseAsRoot([
+        "maintenance", "prune", "--set", setId.uuidString,
+        "--dest", destination.id.uuidString,
+        "--expected-repo", "/Volumes/previewed.restic",
+    ]) as? MaintenancePrune)
+    #expect(parsed.expectedRepo == "/Volumes/previewed.restic")
+
+    do {
+        try MaintenancePrune.validateExpectedRepository(
+            parsed.expectedRepo,
+            destination: destination,
+            setId: setId
+        )
+        Issue.record("expected the helper to reject a destination changed after preview")
+    } catch let failure as CLIFailure {
+        #expect(failure.code == .operationNotAllowed)
+        #expect(failure.details.setId == setId)
+        #expect(failure.details.destinationId == destination.id)
+    }
 }
 
 /// T28 (issue #30): the `restic-station` PATH symlink manager.

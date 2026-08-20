@@ -74,11 +74,16 @@ private let destId = UUID(uuidString: "0B7A50D4-9C3E-4F5B-9A0E-8E1F2C3D4A5B")!
 
     @Test func maintenancePrune() {
         #expect(
-            HelperCommand.maintenancePrune(setId: setId, destId: destId, dryRun: true).argv
-                == ["maintenance", "prune", "--set", "6B29FC40-CA47-1067-B31D-00DD010662DA", "--dest", "0B7A50D4-9C3E-4F5B-9A0E-8E1F2C3D4A5B", "--dry-run"]
+            HelperCommand.maintenancePrune(
+                setId: setId,
+                destId: destId,
+                expectedRepository: "/Volumes/Backups/projects.restic",
+                dryRun: true
+            ).argv
+                == ["maintenance", "prune", "--set", "6B29FC40-CA47-1067-B31D-00DD010662DA", "--dest", "0B7A50D4-9C3E-4F5B-9A0E-8E1F2C3D4A5B", "--expected-repo", "/Volumes/Backups/projects.restic", "--dry-run"]
         )
         #expect(
-            HelperCommand.maintenancePrune(setId: setId, destId: nil, dryRun: false).argv
+            HelperCommand.maintenancePrune(setId: setId, destId: nil, expectedRepository: nil, dryRun: false).argv
                 == ["maintenance", "prune", "--set", "6B29FC40-CA47-1067-B31D-00DD010662DA"]
         )
     }
@@ -145,7 +150,7 @@ private let destId = UUID(uuidString: "0B7A50D4-9C3E-4F5B-9A0E-8E1F2C3D4A5B")!
             .backUpNow(setId: setId),
             .prune(setId: setId),
             .check(setId: setId),
-            .maintenancePrune(setId: setId, destId: destId, dryRun: true),
+            .maintenancePrune(setId: setId, destId: destId, expectedRepository: nil, dryRun: true),
             .initSecondary(setId: setId, destId: destId),
             .probeRepo(setId: setId, destId: destId),
             .unlock(setId: setId, destId: destId),

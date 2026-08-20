@@ -26,6 +26,12 @@ struct MaintenancePrune: AsyncParsableCommand, JSONRenderable {
     @Option(name: .long, help: "Destination UUID. Defaults to the primary destination.")
     var dest: UUID?
 
+    /// App confirmations carry the repository address that their dry run
+    /// inspected. The helper owns the final check, because it reloads config
+    /// after the app may have compared an earlier in-memory snapshot.
+    @Option(name: .long, help: "Require the resolved destination to use this repository address.")
+    var expectedRepo: String?
+
     @Flag(name: .long, help: "Ask restic what prune would reclaim without modifying the repository.")
     var dryRun = false
 
@@ -61,6 +67,12 @@ struct MaintenancePrune: AsyncParsableCommand, JSONRenderable {
             )
         }
 
+        try Self.validateExpectedRepository(
+            expectedRepo,
+            destination: destination,
+            setId: set
+        )
+
         let result = await context.engine.runPruneRepository(
             set: backupSet,
             destination: destination,
@@ -86,6 +98,23 @@ struct MaintenancePrune: AsyncParsableCommand, JSONRenderable {
             let qualifier = dryRun ? "dry run " : ""
             print("\"\(destination.label)\": prune \(qualifier)\(status.rawValue)")
         }
+    }
+
+    /// The destructive command must validate against the helper's freshly
+    /// loaded config, not only against the app's earlier in-memory view. Kept
+    /// separate for a focused regression that proves the check happens before
+    /// an engine/restic invocation can be reached.
+    static func validateExpectedRepository(
+        _ expectedRepo: String?,
+        destination: Destination,
+        setId: UUID
+    ) throws {
+        guard let expectedRepo, destination.repoURL != expectedRepo else { return }
+        throw CLIFailure(
+            code: .operationNotAllowed,
+            message: "Destination configuration changed after the reclaim preview. Run a new dry run before pruning.",
+            details: CLIErrorDetails(setId: setId, destinationId: destination.id)
+        )
     }
 
     private static func status(

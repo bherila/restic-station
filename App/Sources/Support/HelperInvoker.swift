@@ -56,8 +56,18 @@ public struct HelperInvoker: Sendable {
 
     /// Reclaims unused packs without applying retention. The helper owns the
     /// lock, mirror-freshness guard, reachability probe, and run record.
-    public func pruneRepository(setId: UUID, destId: UUID?, dryRun: Bool) async -> HelperResult {
-        await run(.maintenancePrune(setId: setId, destId: destId, dryRun: dryRun))
+    public func pruneRepository(
+        setId: UUID,
+        destId: UUID?,
+        dryRun: Bool,
+        expectedRepository: String? = nil
+    ) async -> HelperResult {
+        await run(.maintenancePrune(
+            setId: setId,
+            destId: destId,
+            expectedRepository: expectedRepository,
+            dryRun: dryRun
+        ))
     }
 
     public func check(setId: UUID) async -> HelperResult {

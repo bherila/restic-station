@@ -547,7 +547,10 @@ final class MaintenanceModel: ObservableObject {
                     title: "Check reclaim space",
                     subject: set.name,
                     result: result,
-                    run: MaintenanceLookup.lastRun(model, setId: set.id, kind: .prune)
+                    // Standalone prune previews are deliberately unrecorded,
+                    // including a busy refusal. Never attach an unrelated
+                    // historical prune to this preview failure.
+                    run: nil
                 )
                 return
             }
@@ -591,7 +594,14 @@ final class MaintenanceModel: ObservableObject {
             }
             destIds = [destination.id]
             title = "Reclaim space"
-            resultTask = { await model.helper.pruneRepository(setId: plan.setId, destId: destination.id, dryRun: false) }
+            resultTask = {
+                await model.helper.pruneRepository(
+                    setId: plan.setId,
+                    destId: destination.id,
+                    dryRun: false,
+                    expectedRepository: previewedDestination.repoURL
+                )
+            }
         }
         busyAction = .prune(setId: plan.setId)
         let existingPruneRunIds = Set(
