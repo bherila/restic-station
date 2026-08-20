@@ -29,6 +29,16 @@ private func makeValidConfig() -> AppConfig {
         try makeValidConfig().validate()
     }
 
+    @Test("remote maintenance is sftp-only")
+    func remoteMaintenanceRequiresSFTP() {
+        var config = makeValidConfig()
+        let destinationId = config.sets[0].destinations[0].id
+        config.sets[0].destinations[0].remoteMaintenance = RemoteMaintenance(enabled: true)
+        #expect(throws: ConfigError.remoteMaintenanceRequiresSFTP(destinationId: destinationId)) {
+            try config.validate()
+        }
+    }
+
     // Invariant 1: exactly one primary.
 
     @Test func zeroPrimariesThrows() {

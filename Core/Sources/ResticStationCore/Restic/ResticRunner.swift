@@ -186,6 +186,42 @@ public final class ResticRunner: Sendable {
         return try await execute(cmd, env: baseEnvironment(), onLine: onLine, onRawLine: onRawLine, timeout: timeout)
     }
 
+    /// Runs an ssh-wrapped maintenance command. The destination password is
+    /// delivered solely on the local ssh process stdin; it is never present
+    /// in argv or environment.
+    public func runRemoteMaintenance(
+        _ command: RemoteResticCommand,
+        destination: Destination,
+        onRawLine: (@Sendable (String) -> Void)? = nil
+    ) async throws -> ResticOutcome {
+        let password: String
+        do { password = try await secrets.password(destId: destination.id) }
+        catch { throw Self.runnerError(for: error, destination: destination) }
+        let command = command.withPassword(password)
+        let collector = MessageCollector()
+        let result: ProcessResult
+        do {
+            result = try await runner.run(command.argv, env: nil, stdin: command.password, currentDirectory: nil, onStdoutLine: { line in
+                onRawLine?(line); let message = self.decoder.decodeLine(line); collector.append(message)
+            }, onStderrLine: { line in onRawLine?(line) }, timeout: nil)
+        } catch let error as ProcessRunnerError {
+            switch error { case .timeout: throw ResticRunnerError.timedOut; case .invalidArgv, .launchFailed: throw ResticRunnerError.launchFailed("remote maintenance ssh could not be launched") }
+        }
+        let stdout = String(decoding: result.stdout, as: UTF8.self)
+        let stderr = String(decoding: result.stderr, as: UTF8.self)
+        return ResticOutcome(exitCode: result.exitCode, status: Self.status(exitCode: result.exitCode, messages: collector.messages, stderr: stderr), messages: collector.messages, rawOutput: stdout + stderr)
+    }
+
+    public func verifyRemoteMaintenance(_ command: RemoteResticCommand) async throws -> VersionInfo {
+        let result: ProcessResult
+        do { result = try await runner.run(command.argv, env: nil, stdin: nil, currentDirectory: nil, onStdoutLine: nil, onStderrLine: nil, timeout: 20) }
+        catch { throw ResticRunnerError.launchFailed("remote maintenance SSH could not be launched") }
+        guard result.exitCode == 0, let info = try? parseVersion(result.stdout), info.meetsMinimum("0.17.0") else {
+            throw ResticRunnerError.launchFailed("remote restic is unavailable or below version 0.17")
+        }
+        return info
+    }
+
     /// Which secret backend this runner reads passwords from.
     ///
     /// Exposed so collaborators that only hold a `ResticRunner` — notably

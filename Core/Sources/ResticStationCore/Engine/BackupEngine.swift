@@ -675,6 +675,35 @@ public final class BackupEngine: Sendable {
             }
         }
 
+        if destination.remoteMaintenance?.enabled == true {
+            guard let operands = destination.remoteMaintenanceOperands() else {
+                return .failed(.didNotRun)
+            }
+            let remote = RemoteResticCommand(
+                sshTarget: operands.sshTarget,
+                resticPath: operands.resticPath,
+                repoPath: operands.repoPath,
+                dryRun: dryRun
+            )
+            if dryRun {
+                do {
+                    let outcome = try await restic.runRemoteMaintenance(remote, destination: destination)
+                    return outcome.status == .success ? .completed(.success) : .failed(.restic(outcome.status))
+                } catch {
+                    return .failed(.didNotRun)
+                }
+            }
+
+            let prune = await performChild(
+                kind: .prune, setId: set.id, destination: destination, trigger: .manual, groupId: nil,
+                phase: "remote pruning", command: .prune(repo: destination.repoURL),
+                invocation: ResticInvocation(destination: destination), streamProgress: false,
+                remoteCommand: remote
+            )
+            guard let prune else { return .failed(.didNotRun) }
+            return prune.child.status == .failed ? .failed(.didNotRun) : .completed(prune.child.status)
+        }
+
         let probe = await reachability.probe(
             destination,
             destinationSecretEnv: destinationSecretEnv
@@ -1351,6 +1380,7 @@ public final class BackupEngine: Sendable {
         command: ResticCommand,
         invocation: ResticInvocation,
         streamProgress: Bool,
+        remoteCommand: RemoteResticCommand? = nil,
         preflightPhase: String? = nil,
         preflight: (@Sendable (LogWriter?) async -> PreflightFailure?)? = nil,
         beforeLaunch: (@Sendable () throws -> Void)? = nil,
@@ -1374,7 +1404,7 @@ public final class BackupEngine: Sendable {
         // Reproduces the exact spawned command line: `ResticRunner` prepends
         // the binary path from the same config value. Secrets never appear
         // in argv (`ResticCommand`'s invariant 1), so this is safe to persist.
-        run.argvRedacted = [config.resticPath].compactMap { $0 } + command.argv
+        run.argvRedacted = remoteCommand?.argv ?? ([config.resticPath].compactMap { $0 } + command.argv)
 
         let logWriter = try? LogWriter(url: paths.runLogFile(runId: run.runId), now: now)
         defer { logWriter?.close() }
@@ -1411,14 +1441,12 @@ public final class BackupEngine: Sendable {
             reporter.beginPhase(phase)
         }
 
-        let result = await execute(
-            command,
-            invocation: invocation,
-            logWriter: logWriter,
-            reporter: streamProgress ? reporter : nil,
-            beforeLaunch: beforeLaunch,
-            afterLaunchFailure: afterLaunchFailure
-        )
+        let result: ExecuteResult
+        if let remoteCommand {
+            result = await spawnRemote(remoteCommand, destination: destination, logWriter: logWriter)
+        } else {
+            result = await execute(command, invocation: invocation, logWriter: logWriter, reporter: streamProgress ? reporter : nil, beforeLaunch: beforeLaunch, afterLaunchFailure: afterLaunchFailure)
+        }
 
         if case .didNotRun(_, let launchPreflightFailure?) = result {
             if case .previewUnavailable = launchPreflightFailure {
@@ -1581,6 +1609,18 @@ public final class BackupEngine: Sendable {
         } catch {
             logWriter?.appendLine("restic did not run: \(error)")
             return .didNotRun(reason: "The operation did not complete. Open the run log for details.")
+        }
+    }
+
+    private func spawnRemote(_ command: RemoteResticCommand, destination: Destination, logWriter: LogWriter?) async -> ExecuteResult {
+        do {
+            return .ranToCompletion(try await restic.runRemoteMaintenance(command, destination: destination, onRawLine: { logWriter?.appendLine($0) }))
+        } catch let error as ResticRunnerError {
+            logWriter?.appendLine("remote maintenance did not run: \(error.description)")
+            return .didNotRun(reason: error.userFacingMessage)
+        } catch {
+            logWriter?.appendLine("remote maintenance did not run")
+            return .didNotRun(reason: "Remote maintenance could not start. Check SSH and the remote restic installation.")
         }
     }
 
