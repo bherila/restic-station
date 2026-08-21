@@ -40,6 +40,11 @@ struct JSONModeDetectionTests {
             "--dest", "00000000-0000-0000-0000-000000000002", "--json",
         ],
         ["maintenance", "prune", "--set", "00000000-0000-0000-0000-000000000001", "--json"],
+        ["purge", "preview", "--set", "00000000-0000-0000-0000-000000000001", "--json"],
+        [
+            "purge", "apply", "--set", "00000000-0000-0000-0000-000000000001",
+            "--preview-token", "not-a-real-token", "--json",
+        ],
         ["secret", "list", "--json"],
         ["cli", "status", "--json"],
         ["fda-check", "--json"],

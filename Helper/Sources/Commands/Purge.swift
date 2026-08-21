@@ -185,8 +185,11 @@ struct PurgePreview: AsyncParsableCommand, JSONRenderable {
                 }
             }
             print("  space is not reclaimed until a prune runs")
-            if let previewToken = report.previewToken {
-                print("  apply with: purge apply --set \(report.setId.uuidString) --preview-token \(previewToken)")
+            // Attached form, so a copy-paste survives a token that starts
+            // with `-` regardless of how the option is parsed. Suppressed
+            // when nothing would change: there is nothing to apply.
+            if let previewToken = report.previewToken, !report.changed.isEmpty {
+                print("  apply with: purge apply --set \(report.setId.uuidString) --preview-token=\(previewToken)")
             }
         case .busy, .offline, .failed:
             // These states are rejected before a report is printed.
@@ -207,7 +210,12 @@ struct PurgeApply: AsyncParsableCommand, JSONRenderable {
     @Option(name: .long, help: "The backup set's UUID.")
     var set: UUID
 
-    @Option(name: .long, help: "The short-lived token returned by purge preview.")
+    /// `.unconditional` because the token is opaque base64url: roughly one
+    /// in 64 begins with `-`, and ArgumentParser would otherwise read it as
+    /// the next option and reject the exact space-separated form that
+    /// `purge preview` prints. The user's 15-minute reviewed token would be
+    /// burned on a usage error they had no way to avoid.
+    @Option(name: .long, parsing: .unconditional, help: "The short-lived token returned by purge preview.")
     var previewToken: String
 
     @Flag(name: .long, help: "Emit JSON. Only JSON reaches stdout in this mode.")
