@@ -26,6 +26,66 @@ struct DefaultProcessRunnerTests {
         #expect(result.stdout == Data("stdin-only-secret".utf8))
     }
 
+    /// A child that exits without reading closes the read end of the stdin
+    /// pipe. Writing into it then fails with EPIPE and raises SIGPIPE, which
+    /// by default kills the writer — here, the helper, mid-maintenance. The
+    /// payload deliberately exceeds one pipe buffer so the write cannot be
+    /// absorbed and returned before the child is gone.
+    ///
+    /// The time limit is a backstop, not the assertion: readers start before
+    /// the stdin write, so a full buffer can drain rather than deadlock.
+    @Test("survives a child that exits without draining a large stdin", .timeLimit(.minutes(1)))
+    func stdinWriteToClosedChildDoesNotKillTheProcess() async throws {
+        let runner = DefaultProcessRunner()
+
+        let result = try await runner.run(
+            ["/bin/sh", "-c", "exit 0"],
+            env: nil,
+            stdin: Data(repeating: UInt8(ascii: "x"), count: 1 << 20),
+            currentDirectory: nil,
+            onStdoutLine: nil,
+            onStderrLine: nil,
+            timeout: 30
+        )
+
+        #expect(result.exitCode == 0)
+    }
+
+    /// The SIGPIPE protection must stay the parent's. POSIX preserves an
+    /// *ignored* disposition across `exec`, so a process-wide
+    /// `signal(SIGPIPE, SIG_IGN)` would silently become a property of every
+    /// restic invocation too — a child that relies on dying on a broken pipe
+    /// would continue or hang instead. Signal 13 here means the child still
+    /// has the default disposition.
+    @Test("does not leak SIGPIPE suppression into spawned children")
+    func childrenKeepTheDefaultSIGPIPEDisposition() async throws {
+        let runner = DefaultProcessRunner()
+
+        // Run the stdin path first, so any leaked suppression is in place.
+        _ = try await runner.run(
+            ["/bin/sh", "-c", "exit 0"],
+            env: nil,
+            stdin: Data("x".utf8),
+            currentDirectory: nil,
+            onStdoutLine: nil,
+            onStderrLine: nil,
+            timeout: 30
+        )
+
+        let result = try await runner.run(
+            ["/bin/sh", "-c", "kill -PIPE $$; echo survived"],
+            env: nil,
+            stdin: nil,
+            currentDirectory: nil,
+            onStdoutLine: nil,
+            onStderrLine: nil,
+            timeout: 30
+        )
+
+        #expect(result.exitCode == 13)
+        #expect(result.stdout.isEmpty)
+    }
+
     @Test("runs /bin/echo, streams the line callback, and captures stdout")
     func echoSmokeTest() async throws {
         let runner = DefaultProcessRunner()

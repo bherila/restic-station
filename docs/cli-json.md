@@ -57,7 +57,7 @@ itself, unwrapped, because its output is meant to be fed straight back into
 | `fda-check` | ✅ | `{ applicable, granted, probedPath, checkedAt, context }` |
 | `purge preview` | ✅ | array of per-destination purge plans: matched/changed/unattributed snapshots and patterns |
 | `purge apply` | ✅ | `{ setId, status, children }` for the token-gated destructive purge |
-| `maintenance prune` | ✅ | `{ setId, destinationId, label, dryRun, status, confirmationBinding, destinationFingerprint }` for standalone pack reclamation; `confirmationBinding` is an opaque, short-lived token present only for a successful dry run, and `destinationFingerprint` binds that preview to the displayed destination |
+| `maintenance prune` | ✅ | `{ setId, destinationId, label, dryRun, status, confirmationBinding, destinationFingerprint }` for standalone pack reclamation; `confirmationBinding` is an opaque, short-lived token present only for a dry run that completed (`success` or `warning`), and `destinationFingerprint` binds that preview to the displayed destination |
 | `config export` | — | **Unwrapped by design.** The exported config document itself, so it round-trips into `config import`. |
 | `timer status` (Linux) | — | **Human-only.** Its report is narrative assembled while probing; the machine-readable equivalent is `status --json`'s `.scheduler`, in the same problem vocabulary. |
 | `print-password` | — | Hidden; exists for `RESTIC_PASSWORD_COMMAND` and writes a secret to stdout. |
@@ -224,14 +224,31 @@ code alone.
 
 ## Coverage today
 
-Eleven commands, listed in the matrix above. The mutating commands remain
+Fourteen commands, listed in the matrix above. The mutating commands remain
 human-only and still write prose to stderr — the boundary is stated in the
-matrix rather than papered over.
+matrix rather than papered over. `purge apply` and `maintenance prune` are the
+exception: they mutate, and they carry `--json` because the app drives them.
 
-Two codes have no producer yet — `repository_offline` (#79 wires the
-reachability probe) and `operation_not_allowed` (the engine invariants refuse
-before throwing). They are defined because the mapping is settled, and their
-absence is asserted, not assumed.
+Every defined code now has a producer. `repository_offline` was wired by #79
+and is also emitted by `purge preview` (exit 3); `operation_not_allowed` is
+emitted by `purge apply` and `maintenance prune` when a confirmation does not
+match the current plan. `preview_expired` is emitted by both when a binding
+outlives `PreviewTokenStore.defaultLifetime`.
+
+## Confirmation bindings are an app gate, not a CLI gate
+
+`purge apply` cannot run without a valid `--preview-token`: `BackupEngine`
+refuses every request not bound to a current preview, and there is no force,
+yes, or environment bypass.
+
+`maintenance prune` is deliberately different. `--expected-destination` is
+optional, and omitting it runs a real `restic prune` with no binding check —
+this is the documented behaviour for a direct CLI operator, who is trusted the
+same way they are trusted to run `restic prune` themselves. The app always
+sends the binding. Note what prune does and does not destroy: it removes
+unreferenced pack data only, so snapshots stay restorable; what it
+irrevocably finalises is a purge rewrite that already happened. The set lock
+and the stale-mirror invariant still apply either way.
 
 ## Migrating from the unwrapped shape
 

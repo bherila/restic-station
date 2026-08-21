@@ -1,5 +1,13 @@
 import Foundation
 
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#endif
+
 // MARK: - MachineConfig
 
 /// The host-local half of the configuration (`machine.json`).
@@ -112,6 +120,37 @@ public enum MachineIdentity {
     /// nothing — a fresh lowercased UUID (which is itself a valid slug).
     public static func generate(hostName: String = ProcessInfo.processInfo.hostName) -> String {
         slugify(hostName) ?? UUID().uuidString.lowercased()
+    }
+
+    /// The kernel hostname, i.e. `gethostname(2)` — which is what Go's
+    /// `os.Hostname` returns and therefore what **restic stamps into every
+    /// snapshot**.
+    ///
+    /// This is not the same string as ``generate(hostName:)`` uses.
+    /// `ProcessInfo.hostName` is the reverse-DNS name and on macOS usually
+    /// carries a `.local` suffix the kernel name does not: on a stock Mac,
+    /// `ProcessInfo.hostName` is `bens-laptop.local` (→ machineId
+    /// `bens-laptop-local`) while restic records `Bens-Laptop` (→
+    /// `bens-laptop`). Purge attribution compares against snapshot
+    /// hostnames, so it must know both or it matches nothing this machine
+    /// ever wrote.
+    public static func kernelHostName() -> String? {
+        var buffer = [CChar](repeating: 0, count: 256)
+        guard gethostname(&buffer, buffer.count) == 0 else { return nil }
+        let name = String(cString: buffer)
+        return name.isEmpty ? nil : name
+    }
+
+    /// Every slug that may legitimately identify **this** host in a restic
+    /// snapshot: the configured `machineId` and the kernel hostname restic
+    /// actually records. Callers attributing snapshots must use this rather
+    /// than `machineId` alone.
+    public static func localHostnameSlugs(machineId: String) -> Set<String> {
+        var slugs: Set<String> = [machineId]
+        if let kernel = kernelHostName(), let slug = slugify(kernel) {
+            slugs.insert(slug)
+        }
+        return slugs
     }
 }
 

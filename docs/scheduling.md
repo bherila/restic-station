@@ -295,12 +295,45 @@ phase. The fixed order is:
    the primary;
 4. run ordinary retention only where its existing freshness rules permit it.
 
+**Attribution** decides which snapshots a purge is allowed to touch, and is
+therefore normative. A repository-wide `snapshots --json` listing is filtered
+in Swift; a snapshot is attributed to the set when **both** hold:
+
+- every path in the snapshot is a member of the set's source union — the
+  shared `sources` plus every machine override's `sources`, since an override
+  replaces rather than merges; and
+- the snapshot's hostname matches the local machine identity or one of the
+  set's `machines` keys, compared after `MachineIdentity.slugify`.
+
+Everything else is *unattributed* and is listed as such in the preview rather
+than silently skipped. Two consequences are deliberate:
+
+- The machine running the purge is **always** in the hostname set, whether or
+  not the set has a `machines` entry for it (`HelperContext` inserts its own
+  `machineId`). Its own snapshots are therefore attributable. What no
+  `machines` entry protects is a snapshot written by some *other* host: that
+  host's name is not in the set, so this machine never purges it.
+  Under-purging is recoverable; over-purging is not.
+- Membership is by subset, not equality, because a set's `sources` change over
+  time and historical snapshots carry the older list. Where several sets share
+  one `repoURL` on one machine, a snapshot of set A whose paths all fall inside
+  set B's source union is attributable to **both**. The preview lists the exact
+  snapshot ids and the confirmation token is bound to that list, so the
+  operator sees them — but sets that share a repository should not overlap in
+  sources if only one of them is meant to be purged.
+
 The primary purge failure stops mirroring. A secondary purge failure skips
 that secondary's copy but allows another mirror to proceed. Copying into an
 unpurged secondary would leave its old snapshots alongside the primary's
 rewritten replacements, so it is never allowed. The per-destination pattern
-watermark advances only after that destination's purge child succeeds; a
-removed pattern stays recorded and is never used to trigger a rewrite.
+watermark advances only after that destination's purge child succeeds, or
+when the plan matched nothing **and** nothing was declined — an empty
+repository has nothing to rewrite. It deliberately does not advance when the
+plan matched nothing while snapshots *were* declined: that combination is
+evidence attribution is wrong, and recording the patterns as applied would
+skip the rewrite permanently, silently, and with a success-shaped outcome.
+The engine logs the decline instead. A removed pattern stays recorded and is
+never used to trigger a rewrite.
 
 ## Locking
 

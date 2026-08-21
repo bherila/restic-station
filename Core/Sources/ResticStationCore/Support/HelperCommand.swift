@@ -189,8 +189,9 @@ public enum HelperExitCode: Int32, Sendable, CaseIterable {
     case ok = 0
     case error = 1
     case busy = 2
-    /// `probe-repo` only: the destination is not reachable right now. Not
-    /// an error — the expected state of an unplugged external drive.
+    /// `probe-repo` and `purge preview`: the destination is not reachable
+    /// right now. Not an error — the expected state of an unplugged external
+    /// drive.
     case offline = 3
 
     /// Maps a raw process exit status onto the contract. Any code outside

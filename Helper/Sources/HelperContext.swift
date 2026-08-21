@@ -173,10 +173,16 @@ struct HelperContext {
                 }
             }
             purgeSourcePaths[set.id] = sources
-            // Machine ids are generated from hostnames and are the only
-            // fleet-wide hostname inventory persisted by the application.
-            // Include this machine even when the set has no override map.
-            hostnames.insert(views.addressable.machineId)
+            // Machine ids are the only fleet-wide hostname inventory the
+            // application persists, so they identify *other* hosts. They do
+            // NOT reliably identify this one: `machineId` is slugified from
+            // `ProcessInfo.hostName` (reverse-DNS, `bens-laptop.local`)
+            // while restic stamps the kernel hostname (`Bens-Laptop`). Using
+            // machineId alone attributed nothing this machine had written,
+            // so a purge found zero snapshots and reported success.
+            hostnames.formUnion(
+                MachineIdentity.localHostnameSlugs(machineId: views.addressable.machineId)
+            )
             purgeHostnames[set.id] = hostnames
         }
         let engine = BackupEngine(

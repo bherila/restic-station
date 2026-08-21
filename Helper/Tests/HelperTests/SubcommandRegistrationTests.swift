@@ -164,6 +164,26 @@ import Testing
     #expect(parsed.expectedDestination == "-valid-preview-binding")
 }
 
+/// The token is opaque base64url, so roughly one in 64 begins with `-`.
+/// Without `.unconditional`, ArgumentParser reads it as the next option and
+/// rejects the space-separated form that `purge preview` itself prints —
+/// burning a reviewed, 15-minute token on a usage error the operator had no
+/// way to avoid. Both spellings must parse.
+@Test func purgeApplyAcceptsHyphenPrefixedPreviewTokens() throws {
+    let setId = UUID()
+    let spaced = try #require(HelperMain.parseAsRoot([
+        "purge", "apply", "--set", setId.uuidString,
+        "--preview-token", "-Abc123_token",
+    ]) as? PurgeApply)
+    #expect(spaced.previewToken == "-Abc123_token")
+
+    let attached = try #require(HelperMain.parseAsRoot([
+        "purge", "apply", "--set", setId.uuidString,
+        "--preview-token=-Abc123_token",
+    ]) as? PurgeApply)
+    #expect(attached.previewToken == "-Abc123_token")
+}
+
 @Test func maintenancePruneAcceptsItsUnchangedEffectiveDestination() throws {
     let destination = Destination(
         id: UUID(),

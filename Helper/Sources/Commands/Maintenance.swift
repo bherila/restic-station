@@ -119,11 +119,12 @@ struct MaintenancePrune: AsyncParsableCommand, JSONRenderable {
         )
         let confirmationBinding: String?
         if dryRun {
-            confirmationBinding = try PreviewTokenStore(paths: context.paths).issueMaintenancePrune(
+            confirmationBinding = try Self.issueBinding(
+                store: PreviewTokenStore(paths: context.paths),
                 machineId: context.addressable.machineId,
                 setId: set,
                 destinationId: destination.id,
-                effectiveDestinationFingerprint: effectiveFingerprint
+                fingerprint: effectiveFingerprint
             )
         } else {
             confirmationBinding = nil
@@ -143,6 +144,34 @@ struct MaintenancePrune: AsyncParsableCommand, JSONRenderable {
         } else {
             let qualifier = dryRun ? "dry run " : ""
             print("\"\(destination.label)\": prune \(qualifier)\(status.rawValue)")
+        }
+    }
+
+    /// Issues the dry run's binding, keeping token-store contention
+    /// retryable. The generic catch classified it `internal_error` with the
+    /// bare message "unavailable" — telling an agent not to retry a
+    /// condition this same file calls `set_busy` when it happens at consume
+    /// time, and which clears as soon as the other helper releases the lock.
+    private static func issueBinding(
+        store: PreviewTokenStore,
+        machineId: String,
+        setId: UUID,
+        destinationId: UUID,
+        fingerprint: String
+    ) throws -> String {
+        do {
+            return try store.issueMaintenancePrune(
+                machineId: machineId,
+                setId: setId,
+                destinationId: destinationId,
+                effectiveDestinationFingerprint: fingerprint
+            )
+        } catch PreviewTokenError.unavailable {
+            throw CLIFailure(
+                code: .setBusy,
+                message: "The reclaim confirmation is temporarily unavailable. Run the dry run again.",
+                details: CLIErrorDetails(setId: setId, destinationId: destinationId)
+            )
         }
     }
 
@@ -190,6 +219,17 @@ struct MaintenancePrune: AsyncParsableCommand, JSONRenderable {
             )
         case .skipped(.previewChanged):
             throw previewChangedFailure(setId: setId, destinationId: destination.id)
+        case .skipped(.previewExpired):
+            // Expiry gets its own code and its own sentence. Reporting it as
+            // `operation_not_allowed` / "configuration changed" told the
+            // caller something factually untrue about their destination, and
+            // disagreed with `purge apply`, which has always said
+            // `preview_expired` for the same condition.
+            throw CLIFailure(
+                code: .previewExpired,
+                message: "The reclaim preview has expired. Run a new dry run before pruning.",
+                details: CLIErrorDetails(setId: setId, destinationId: destination.id)
+            )
         case .skipped(.previewUnavailable):
             throw CLIFailure(
                 code: .setBusy,

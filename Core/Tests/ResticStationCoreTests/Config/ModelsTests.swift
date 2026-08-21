@@ -508,6 +508,39 @@ let dataModelMachinesExampleJSON = """
         #expect(firstFingerprint != destination.pruneConfirmationFingerprint(secretEnv: [:]))
     }
 
+    @Test("remote maintenance operands come only from the sftp shorthand form")
+    func remoteMaintenanceOperandsDeclineTheURLForm() {
+        let enabled = RemoteMaintenance(enabled: true)
+
+        let shorthand = Destination(
+            id: UUID(), label: "Remote", repoURL: "sftp:backup@example.com:/srv/repo",
+            isPrimary: true, remoteMaintenance: enabled
+        )
+        let operands = shorthand.remoteMaintenanceOperands()
+        #expect(operands?.sshTarget == "backup@example.com")
+        #expect(operands?.repoPath == "/srv/repo")
+
+        // `//` means restic's URL form, whose first colon is the port. Split
+        // there and ssh would be aimed at "//backup@example.com" with the repo
+        // path "2222/srv/repo".
+        let urlForm = Destination(
+            id: UUID(), label: "Remote", repoURL: "sftp://backup@example.com:2222/srv/repo",
+            isPrimary: true, remoteMaintenance: enabled
+        )
+        #expect(urlForm.remoteMaintenanceOperands() == nil)
+
+        // Explicit operands still drive the URL form.
+        let overridden = Destination(
+            id: UUID(), label: "Remote", repoURL: "sftp://backup@example.com:2222/srv/repo",
+            isPrimary: true,
+            remoteMaintenance: RemoteMaintenance(
+                enabled: true, sshTarget: "backup@example.com", remoteRepoPath: "/srv/repo"
+            )
+        )
+        #expect(overridden.remoteMaintenanceOperands()?.sshTarget == "backup@example.com")
+        #expect(overridden.remoteMaintenanceOperands()?.repoPath == "/srv/repo")
+    }
+
     @Test("maintenance binding includes the previewed executable identity")
     func maintenanceBindingUsesExecutableIdentity() {
         let destination = Destination(id: UUID(), label: "Primary", repoURL: "/tmp/repo", isPrimary: true)
