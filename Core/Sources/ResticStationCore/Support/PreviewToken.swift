@@ -119,6 +119,7 @@ public struct PreviewTokenStore: Sendable {
         destinations: [PreviewTokenDestination],
         config: AppConfig,
         patterns: [String],
+        executableIdentity: String?,
         lifetime: TimeInterval = defaultLifetime
     ) throws -> PreviewToken {
         try withStoreLock {
@@ -130,7 +131,7 @@ public struct PreviewTokenStore: Sendable {
                 machineId: machineId,
                 setId: setId,
                 destinations: destinations,
-                configFingerprint: try Self.configFingerprint(config),
+                configFingerprint: try Self.purgeFingerprint(config, executableIdentity: executableIdentity),
                 patterns: patterns,
                 createdAt: createdAt,
                 expiresAt: createdAt.addingTimeInterval(lifetime)
@@ -269,6 +270,20 @@ public struct PreviewTokenStore: Sendable {
         return SHA256Digest.hex(data)
     }
 
+    /// What a **purge** token binds. Config alone left a gap the maintenance
+    /// binding did not have: `pruneConfirmationFingerprint` also covers the
+    /// restic executable's identity, so an in-place binary swap between
+    /// preview and apply invalidates a reclaim confirmation but did not
+    /// invalidate a purge one — even though purge is the operation that
+    /// rewrites snapshot history.
+    public static func purgeFingerprint(
+        _ config: AppConfig,
+        executableIdentity: String?
+    ) throws -> String {
+        let base = try configFingerprint(config)
+        return SHA256Digest.hex(Data("\(base):\(executableIdentity ?? "none")".utf8))
+    }
+
     private struct Index: Codable, Sendable {
         var tokens: [String: PreviewToken] = [:]
     }
@@ -282,6 +297,10 @@ public struct PreviewTokenStore: Sendable {
             try paths.ensureDirectories()
             let lock = FileLock(path: paths.previewTokensLockFile)
             guard lock.tryAcquire() else { throw PreviewTokenError.unavailable }
+            // Owner-only: a lock file another user can open is a lock another
+            // user can hold, which would wedge every destructive confirmation
+            // on the machine. Fail-closed, but total.
+            _ = chmod(paths.previewTokensLockFile.path, 0o600)
             defer { lock.release() }
             return try body()
         } catch let error as PreviewTokenError {
@@ -344,7 +363,13 @@ public struct PreviewTokenStore: Sendable {
     private static func writeOwnerOnly(_ data: Data, to url: URL) throws {
         let path = url.path
         _ = unlink(path)
-        let fd = path.withCString { open($0, O_WRONLY | O_CREAT | O_TRUNC, 0o600) }
+        // O_EXCL|O_NOFOLLOW: refuse to write through a symlink or into a file
+        // someone else recreated between the unlink and the open. The 0700
+        // root makes that unreachable cross-user today, which is exactly why
+        // it should stay unreachable if the root is ever loosened.
+        let fd = path.withCString {
+            open($0, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600)
+        }
         guard fd >= 0 else { throw PreviewTokenError.unavailable }
         defer {
             #if canImport(Darwin)

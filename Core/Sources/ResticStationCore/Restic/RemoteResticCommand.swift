@@ -21,7 +21,14 @@ public struct RemoteResticCommand: Equatable, Sendable {
     static let sshPrefix = [
         "/usr/bin/ssh",
         "-o", "BatchMode=yes",
-        "-o", "StrictHostKeyChecking=accept-new",
+        // `yes`, not `accept-new`. This channel carries the repository
+        // password on stdin for `restic -p /dev/stdin`, so trust-on-first-use
+        // means a MITM present at first contact is handed the password and
+        // then answers `restic version` convincingly. The operator has
+        // already ssh'd to this host to set the destination up, so the key is
+        // normally pinned; when it is not, failing with an actionable message
+        // is better than silently trusting whoever answers.
+        "-o", "StrictHostKeyChecking=yes",
         "-o", "ConnectTimeout=15",
         "-o", "ServerAliveInterval=15",
         "-o", "ServerAliveCountMax=3",

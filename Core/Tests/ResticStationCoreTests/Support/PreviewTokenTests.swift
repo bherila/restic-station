@@ -65,7 +65,8 @@ struct PreviewTokenStoreTests {
             setId: setId,
             destinations: [PreviewTokenDestination(destinationId: destinationId, snapshotIDs: ["b", "a"])],
             config: config,
-            patterns: ["DerivedData"]
+            patterns: ["DerivedData"],
+            executableIdentity: "restic-under-test"
         )
 
         #expect(token.value.count >= 43, "a URL-safe encoding of 256 random bits")
@@ -126,6 +127,7 @@ struct PreviewTokenStoreTests {
             destinations: [PreviewTokenDestination(destinationId: destinationId, snapshotIDs: [])],
             config: config,
             patterns: ["DerivedData"],
+            executableIdentity: "restic-under-test",
             lifetime: 1
         )
         clock.advance(1)

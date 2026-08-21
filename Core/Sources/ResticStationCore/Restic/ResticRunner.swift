@@ -231,6 +231,17 @@ public final class ResticRunner: Sendable {
         do { result = try await runner.run(command.argv, env: nil, stdin: nil, currentDirectory: nil, onStdoutLine: nil, onStderrLine: nil, timeout: 20) }
         catch { throw ResticRunnerError.launchFailed("remote maintenance SSH could not be launched") }
         guard result.exitCode == 0, let info = try? parseVersion(result.stdout), info.meetsMinimum("0.17.0") else {
+            // An unpinned host key is the one failure here with a specific,
+            // actionable remedy, and it is invisible in the generic message.
+            let stderr = String(decoding: result.stderr, as: UTF8.self)
+            if stderr.contains("Host key verification failed")
+                || stderr.contains("No RSA host key is known")
+                || stderr.contains("no matching host key") {
+                throw ResticRunnerError.launchFailed(
+                    "the maintenance host's SSH key is not known. Connect to it once with ssh to "
+                        + "verify and record the key, then retry."
+                )
+            }
             throw ResticRunnerError.launchFailed("remote restic is unavailable or below version 0.17")
         }
         return info
