@@ -69,7 +69,19 @@ struct RunSet: AsyncParsableCommand {
             // the context has resolved it — not against a separately re-read
             // file, which would leave the decoded value and the hashed value
             // as two different snapshots.
+            var pinnedExecutable: String?
             if let expectedConfig {
+                // Required, not optional. Encoding `nil` on both sides makes
+                // the fingerprints match while binding no executable at all —
+                // the check would pass and authorize an unpinned launch.
+                guard let executable = context.restic.maintenanceExecutable() else {
+                    throw CLIFailure(
+                        code: .resticNotFound,
+                        message: "The configured restic executable could not be read, so this "
+                            + "operation cannot be bound to it. Recheck restic and try again.",
+                        details: CLIErrorDetails(setId: set)
+                    )
+                }
                 let store = ConfigStore(paths: context.paths)
                 let snapshot = try? store.snapshot()
                 let current = MaintenanceBinding.effectiveSetFingerprint(
@@ -77,7 +89,7 @@ struct RunSet: AsyncParsableCommand {
                     set: backupSet,
                     configFingerprint: snapshot?.fingerprint ?? "unreadable",
                     machineFingerprint: store.machineFileFingerprint(),
-                    resticExecutableIdentity: context.restic.maintenanceExecutable()?.identity
+                    resticExecutableIdentity: executable.identity
                 )
                 guard current == expectedConfig else {
                     throw CLIFailure(
@@ -87,9 +99,15 @@ struct RunSet: AsyncParsableCommand {
                         details: CLIErrorDetails(setId: set)
                     )
                 }
+                // Carried to every `forget --prune` below, so the binary that
+                // was validated is the binary that runs.
+                pinnedExecutable = executable.identity
             }
             let before = Date()
-            let status = await context.engine.runPrune(backupSet)
+            let status = await context.engine.runPrune(
+                backupSet,
+                expectedExecutableIdentity: pinnedExecutable
+            )
             handle(status, kind: .prune, setId: backupSet.id, since: before, context: context)
         }
     }

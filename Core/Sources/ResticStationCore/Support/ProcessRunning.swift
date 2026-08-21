@@ -83,7 +83,15 @@ public extension ProcessRunning {
 /// work on Linux via swift-corelibs-foundation) plus `kill(2)` for signaling,
 /// imported from `Darwin` or `Glibc` depending on platform.
 public struct DefaultProcessRunner: ProcessRunning {
-    public init() {}
+    public init() {
+        // Install before anything can spawn, rather than lazily inside the
+        // call that also spawns. `static let` initialization is thread-safe,
+        // but doing it at first use leaves one window where a thread is
+        // inside `posix_spawn` — which reads the process's signal
+        // dispositions — while another installs the handler. Nothing is known
+        // to have gone wrong there, but the ordering is free.
+        SIGPIPEGuard.ensureInstalled()
+    }
 
     private static func withSIGPIPEIgnored<T>(_ body: () -> T) -> T {
         SIGPIPEGuard.withIgnored(body)
@@ -371,27 +379,34 @@ private actor TimeoutFlag {
 /// Installed **once**, permanently, as a no-op *handler* — deliberately not
 /// `SIG_IGN`. POSIX resets signals "set to be caught" to the default action on
 /// `exec`, while it preserves an *ignored* disposition. So a handler protects
-/// the parent and every child still dies on a broken pipe exactly as before,
+/// this process and every child still dies on a broken pipe exactly as before,
 /// with no window to serialize and no lock to contend on.
 ///
-/// The earlier design scoped `SIG_IGN` to each write under a lock shared with
-/// `Process.run()`. That was correct, but it coupled two unrelated things: a
-/// slow or blocked write to stdout held the lock, and every subprocess spawn
-/// in the process queued behind it. No failure was ever traced to that
-/// coupling — this is removing a hazard, not fixing a proven bug — but the
-/// handler achieves the same guarantee with no shared state at all.
+/// Both halves rest on deterministic experiments, not inference:
 ///
-/// Verified from both directions by `childrenKeepTheDefaultSIGPIPEDisposition`
-/// (child still exits with signal 13, and the Linux container proves it, since
-/// swift-corelibs-foundation does not scrub child dispositions the way macOS
-/// Foundation does) and `standardStreamSurvivesAClosedReader` (this process
-/// gets `EPIPE` instead of dying).
+/// - A permanent `SIG_IGN` **does** leak. Linux CI failed
+///   `childrenKeepTheDefaultSIGPIPEDisposition` against it — the child printed
+///   `survived` and exited 0 — because swift-corelibs-foundation does not
+///   reset child dispositions, though macOS's Foundation does, which hides it
+///   locally.
+/// - A no-op handler does **not** leak: with one installed, a spawned
+///   `kill -PIPE $$; echo survived` still exits with signal 13 and prints
+///   nothing, while a write to a closed pipe in this process throws `EPIPE`
+///   instead of dying.
+/// - `pthread_sigmask` around the write is not sufficient on its own; that was
+///   tried first and the process still died.
 enum SIGPIPEGuard {
     /// `Void` static: the runtime guarantees exactly one initialization,
     /// whichever thread gets there first.
     private static let installed: Void = {
         _ = signal(SIGPIPE, { _ in })
     }()
+
+    /// Forces installation at a deterministic point, before any subprocess
+    /// work begins.
+    static func ensureInstalled() {
+        _ = installed
+    }
 
     static func withIgnored<T>(_ body: () -> T) -> T {
         _ = installed

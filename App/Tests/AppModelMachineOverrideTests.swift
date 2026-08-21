@@ -287,4 +287,88 @@ struct AppModelMachineOverrideTests {
         #expect(maintenance.shouldPublish(generation))
         #expect(maintenance.isPreparingPrune)
     }
+
+    /// **Apply Retention must use the scheduling view, not the addressable
+    /// one.** The Maintenance screen reads addressable — right for sizes,
+    /// inspection and restore — but `run-set --kind prune` resolves
+    /// scheduling, where a destination disabled here has been dropped.
+    ///
+    /// Binding the addressable set made the app and helper fingerprint
+    /// different `BackupSet` values for a perfectly valid configuration, so
+    /// every apply failed closed with `operation_not_allowed`; and the
+    /// dialog would have counted snapshots on a destination that was never
+    /// going to be touched.
+    @Test("Apply Retention resolves the scheduling set, not the addressable one")
+    func applyRetentionUsesTheSchedulingSet() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-app-tests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let paths = AppPaths(root: root)
+        let machineId = "test-mac"
+        let setId = UUID()
+        let primary = Destination(id: UUID(), label: "Primary", repoURL: "/repos/primary", isPrimary: true)
+        let disabledMirror = Destination(
+            id: UUID(), label: "Mirror", repoURL: "/repos/mirror", isPrimary: false,
+            machines: [machineId: DestinationMachineOverride(enabled: false)]
+        )
+        let set = BackupSet(
+            id: setId, name: "Documents", sources: ["/Users/shared/Documents"],
+            schedule: .daily(hour: 2, minute: 30),
+            retention: RetentionPolicy(keepLast: 3),
+            destinations: [primary, disabledMirror]
+        )
+        try ConfigStore(paths: paths).save(AppConfig(sets: [set]))
+        try MachineStore(paths: paths).save(MachineConfig(machineId: machineId))
+
+        let model = AppModel(paths: paths)
+
+        let addressable = try #require(MaintenanceLookup.set(model, id: setId))
+        let scheduled = try #require(MaintenanceModel.scheduledSet(model, id: setId))
+
+        // Addressable still reaches the mirror; scheduling has dropped it.
+        #expect(addressable.destinations.count == 2)
+        #expect(scheduled.destinations.count == 1)
+        #expect(scheduled.destinations.first?.label == "Primary")
+
+        // Which is exactly why binding the addressable set could never match
+        // what the helper computes.
+        func fingerprint(_ set: BackupSet) -> String {
+            MaintenanceBinding.effectiveSetFingerprint(
+                machineId: machineId, set: set,
+                configFingerprint: "c", machineFingerprint: "m",
+                resticExecutableIdentity: "restic"
+            )
+        }
+        #expect(fingerprint(addressable) != fingerprint(scheduled))
+        // The helper resolves scheduling, so this is the pair that must agree.
+        #expect(fingerprint(scheduled) == fingerprint(scheduled))
+    }
+
+    /// A set disabled outright on this machine has no scheduling
+    /// representation, so Apply Retention must be refused rather than offered.
+    @Test("a set that does not run here has no scheduling set to apply retention to")
+    func disabledSetHasNoSchedulingSet() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-app-tests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let paths = AppPaths(root: root)
+        let machineId = "test-mac"
+        let setId = UUID()
+        let set = BackupSet(
+            id: setId, name: "Documents", sources: ["/Users/shared/Documents"],
+            schedule: .daily(hour: 2, minute: 30),
+            retention: RetentionPolicy(keepLast: 3),
+            destinations: [Destination(id: UUID(), label: "Primary", repoURL: "/repos/p", isPrimary: true)],
+            machines: [machineId: BackupSetMachineOverride(enabled: false)]
+        )
+        try ConfigStore(paths: paths).save(AppConfig(sets: [set]))
+        try MachineStore(paths: paths).save(MachineConfig(machineId: machineId))
+
+        let model = AppModel(paths: paths)
+
+        #expect(MaintenanceLookup.set(model, id: setId) != nil)      // still addressable
+        #expect(MaintenanceModel.scheduledSet(model, id: setId) == nil)  // but never scheduled
+    }
 }

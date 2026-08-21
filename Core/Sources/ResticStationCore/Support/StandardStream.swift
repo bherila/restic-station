@@ -14,17 +14,15 @@ import Musl
 /// back to the app. If the app crashes or is force-quit mid-operation, the
 /// next write raises SIGPIPE, whose default disposition kills the helper —
 /// and `FileHandle.write(_:)` additionally raises an uncatchable ObjC
-/// exception rather than throwing. A helper that dies at, say, the warning it
-/// emits when `RunStore.finish` fails takes the run record with it: the one
-/// artifact that would have explained what happened.
+/// exception rather than throwing. A death at, say, the warning emitted when
+/// `RunStore.finish` fails takes the run record with it: the one artifact
+/// that would have explained what happened.
 ///
-/// The guard is the same one `DefaultProcessRunner` uses for child stdin, and
-/// for the same reason it must not be left installed process-wide: POSIX
-/// preserves an *ignored* disposition across `exec`, and
-/// swift-corelibs-foundation does not reset child dispositions, so a restic
-/// child spawned inside the window would stop dying on a broken pipe. Sharing
-/// `SIGPIPEGuard` means these writes and every spawn take one lock, so the
-/// window can never overlap a `posix_spawn`.
+/// Protection comes from `SIGPIPEGuard`'s permanently installed no-op
+/// handler, which covers the whole process on both platforms and costs
+/// nothing here: no lock, no per-call state, and nothing a logging call can
+/// do to perturb subprocess creation. The throwing `write(contentsOf:)` then
+/// surfaces `EPIPE` as an ordinary error instead of an exception.
 public enum StandardStream {
     public static func write(_ text: String, to handle: FileHandle) {
         write(Data(text.utf8), to: handle)
@@ -33,9 +31,8 @@ public enum StandardStream {
     /// Best-effort by design: if the reader is gone there is nowhere left to
     /// report that fact, and the caller's real work must continue.
     public static func write(_ data: Data, to handle: FileHandle) {
-        SIGPIPEGuard.withIgnored {
-            try? handle.write(contentsOf: data)
-        }
+        SIGPIPEGuard.ensureInstalled()
+        try? handle.write(contentsOf: data)
     }
 
     /// Spelled out for call sites whose argument spans several lines, where

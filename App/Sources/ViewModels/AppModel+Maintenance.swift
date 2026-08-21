@@ -586,7 +586,24 @@ final class MaintenanceModel: ObservableObject {
     /// from the same data, so what the user reads in the dialog and what they
     /// see behind it are the same measurement.
     func prepareApplyRetention(for set: BackupSet, in model: AppModel) {
-        guard let policy = set.retention, !policy.isEmpty else {
+        // **Scheduling scope, not addressable.** The Maintenance screen reads
+        // the addressable view — correct for sizes, inspection and restore,
+        // which must see every repository this machine can reach. But Apply
+        // Retention runs through `run-set --kind prune`, and that resolves
+        // the *scheduling* view, where a destination disabled by a machine
+        // override has been dropped. Previewing and fingerprinting the
+        // addressable set would describe a destination list the helper will
+        // never produce: the fingerprints disagree for a perfectly valid
+        // configuration and every apply fails closed with
+        // `operation_not_allowed`. Worse, the dialog would count snapshots on
+        // a destination that is not going to be touched.
+        guard let scheduledSet = Self.scheduledSet(model, id: set.id) else {
+            retentionPreview = .failed(
+                "This backup set does not run on this machine, so retention cannot be applied here."
+            )
+            return
+        }
+        guard let policy = scheduledSet.retention, !policy.isEmpty else {
             retentionPreview = .failed(MaintenanceError.noRetentionPolicy.localizedDescription)
             return
         }
@@ -600,17 +617,29 @@ final class MaintenanceModel: ObservableObject {
         // The fingerprint must describe a configuration that resolves to the
         // set this preview is about to measure. Fingerprinting the bytes
         // alone is not enough: if `config.json` was replaced by fleet sync or
-        // `config import` while the app has been open, `set`, `policy` and
-        // the runner still come from the app's *old* in-memory config, while
-        // the bytes on disk are the *new* one. The helper would then load the
-        // new config, see the fingerprint match, and apply a retention plan
+        // `config import` while the app has been open, the set, policy and
+        // runner still come from the app's *old* in-memory config, while the
+        // bytes on disk are the *new* one. The helper would then load the new
+        // config, see the fingerprint match, and apply a retention plan
         // nobody reviewed — the exact failure this binding exists to stop.
         let store = ConfigStore(paths: model.paths)
         guard let snapshot = try? store.snapshot(),
-              snapshot.config.addressable(for: model.machine).set(id: set.id) == set else {
+              snapshot.config.resolved(for: model.machine).config.sets
+                  .first(where: { $0.id == set.id }) == scheduledSet else {
             retentionPreview = .failed(
                 "Settings on disk have changed since this window loaded them. "
                     + "Reload settings, then preview cleanup again."
+            )
+            return
+        }
+        // Required, not best-effort: encoding `nil` on both sides would make
+        // the fingerprints match while binding no executable at all, and the
+        // helper refuses an unbound destructive launch anyway.
+        guard let executableIdentity = (try? MaintenanceLookup.resticRunner(model))?
+            .maintenanceExecutable()?.identity else {
+            retentionPreview = .failed(
+                "The configured restic executable could not be read, so this operation "
+                    + "cannot be bound to it. Recheck restic and try again."
             )
             return
         }
@@ -622,28 +651,34 @@ final class MaintenanceModel: ObservableObject {
         // still matched.
         let expectedConfig = MaintenanceBinding.effectiveSetFingerprint(
             machineId: model.machine.machineId,
-            set: set,
+            set: scheduledSet,
             configFingerprint: snapshot.fingerprint,
             machineFingerprint: store.machineFileFingerprint(),
-            resticExecutableIdentity: (try? MaintenanceLookup.resticRunner(model))?
-                .maintenanceExecutable()?.identity
+            resticExecutableIdentity: executableIdentity
         )
-        let previewedDestinations = set.destinations
+        let previewedDestinations = scheduledSet.destinations
         let generation = beginPreparation()
         Task { [weak self] in
-            let previews = await Self.dryRun(set: set, policy: policy, runner: runner)
+            let previews = await Self.dryRun(set: scheduledSet, policy: policy, runner: runner)
             guard let self, self.shouldPublish(generation) else { return }
             self.isPreparingPrune = false
             let now = Date()
             self.retentionPreview = .ready(previews: previews, at: now)
             self.prunePlan = PrunePlan(
-                setId: set.id,
-                setName: set.name,
+                setId: scheduledSet.id,
+                setName: scheduledSet.name,
                 previews: previews,
                 expectedConfig: expectedConfig,
                 previewedDestinations: previewedDestinations
             )
         }
+    }
+
+    /// The set as **`run-set` will resolve it**: scheduling scope, with
+    /// anything disabled on this machine already dropped. `nil` means the set
+    /// does not run here at all.
+    static func scheduledSet(_ model: AppModel, id: UUID) -> BackupSet? {
+        model.resolvedConfig.sets.first { $0.id == id }
     }
 
     /// **Reclaim space**, step 1: run restic's non-mutating `prune
@@ -715,11 +750,11 @@ final class MaintenanceModel: ObservableObject {
         let resultTask: () async -> HelperResult
         switch plan.action {
         case .retention(let expectedConfig, let previewedDestinations):
-            // Fail closed exactly like reclaim. The dialog names a snapshot
-            // count computed against a specific destination list; if that
-            // list moved underneath us, the count is about a different
-            // repository set than the one we are about to change.
-            guard set.destinations == previewedDestinations else {
+            // Fail closed exactly like reclaim, and against the same
+            // scheduling-scoped set the preview measured — comparing the
+            // addressable destinations here would reintroduce the mismatch.
+            guard let scheduled = Self.scheduledSet(model, id: plan.setId),
+                  scheduled.destinations == previewedDestinations else {
                 self.prunePlan = nil
                 self.activity = Self.activity(
                     title: "Apply retention",
@@ -729,7 +764,7 @@ final class MaintenanceModel: ObservableObject {
                 )
                 return
             }
-            destIds = set.destinations.map(\.id)
+            destIds = scheduled.destinations.map(\.id)
             title = "Apply retention"
             // The helper independently re-checks this against config.json on
             // disk: the app's in-memory copy is not evidence about what the

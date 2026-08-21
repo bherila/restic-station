@@ -557,7 +557,20 @@ public final class BackupEngine: Sendable {
     ///
     /// A dry run first is the UI's job (`ResticCommand.forget(dryRun:)`);
     /// this is the real one.
-    public func runPrune(_ set: BackupSet) async -> RunStatus {
+    /// `expectedExecutableIdentity` binds every `forget --prune` this call
+    /// makes to one restic binary. It is what makes the caller's fingerprint
+    /// check more than advisory: validating the executable and then launching
+    /// unpinned leaves a window — across the lock acquisition and every
+    /// earlier destination — in which a replacement receives the destructive
+    /// command instead.
+    ///
+    /// `nil` means the caller made no such promise, which is the scheduled
+    /// path. A *bound* caller must pass a real identity and refuse if it
+    /// cannot read one; see `RunSet`.
+    public func runPrune(
+        _ set: BackupSet,
+        expectedExecutableIdentity: String? = nil
+    ) async -> RunStatus {
         guard let primary = set.destinations.first(where: { $0.isPrimary }) else {
             logWarning("BackupEngine: backup set \"\(set.name)\" has no primary destination — cannot prune")
             return .failed
@@ -587,7 +600,8 @@ public final class BackupEngine: Sendable {
             policy: retention,
             setId: set.id,
             trigger: .manual,
-            groupId: nil
+            groupId: nil,
+            expectedExecutableIdentity: expectedExecutableIdentity
         ) else {
             return .skipped
         }
@@ -616,7 +630,8 @@ public final class BackupEngine: Sendable {
                 policy: retention,
                 setId: set.id,
                 trigger: .manual,
-                groupId: groupId
+                groupId: groupId,
+                expectedExecutableIdentity: expectedExecutableIdentity
             ) {
                 statuses.append(prune.child.status)
             }
@@ -1383,7 +1398,13 @@ public final class BackupEngine: Sendable {
         policy: RetentionPolicy?,
         setId: UUID,
         trigger: RunTrigger,
-        groupId: String?
+        groupId: String?,
+        /// Non-nil when the caller authorized this operation against a
+        /// specific restic binary. `ResticRunner` rechecks it immediately
+        /// before spawning, so a binary replaced after authorization — the
+        /// window spans every earlier destination in a multi-destination
+        /// prune — never receives `forget --prune`.
+        expectedExecutableIdentity: String? = nil
     ) async -> ChildRun? {
         guard let policy, !policy.isEmpty else {
             return nil
@@ -1396,7 +1417,10 @@ public final class BackupEngine: Sendable {
             groupId: groupId,
             phase: "retention",
             command: .forget(repo: destination.repoURL, policy: policy, prune: true),
-            invocation: ResticInvocation(destination: destination),
+            invocation: ResticInvocation(
+                destination: destination,
+                expectedExecutableIdentity: expectedExecutableIdentity
+            ),
             streamProgress: false
         )
     }

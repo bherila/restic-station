@@ -441,21 +441,28 @@ struct StateStoreTests {
         defer { try? FileManager.default.removeItem(at: root) }
 
         let setIds = (0..<8).map { _ in UUID() }
-        // Real threads, not a `TaskGroup`. `updateScheduleState` blocks —
-        // it sleeps between lock attempts — and the writers sleep inside the
-        // critical section on purpose to widen the read/write window. Doing
-        // that on Swift Concurrency's cooperative pool starves it: on a
-        // two-core CI runner the lock holder cannot be scheduled to release
-        // while every thread sits in `usleep`, so waiters spin to the 5s
-        // timeout and every other async test in the suite stalls behind them.
-        // That is exactly what happened — the whole 674-test run took 60s and
-        // unrelated parsing tests reported 50s wall time.
-        DispatchQueue.concurrentPerform(iterations: setIds.count) { index in
-            try? store.updateScheduleState(setId: setIds[index]) { entry in
-                usleep(20_000)
-                entry.checkSliceCursor = index
+        // Dedicated threads, deliberately not a `TaskGroup` and not the
+        // global concurrent queue.
+        //
+        // `updateScheduleState` blocks — it sleeps between lock attempts —
+        // and the writers sleep inside the critical section on purpose to
+        // widen the read/write window. Blocking Swift Concurrency's
+        // cooperative pool starves it, so the lock holder cannot be scheduled
+        // to release and waiters spin to the timeout. Blocking the global
+        // dispatch pool is nearly as rude: it is shared with Foundation's own
+        // machinery, including `Process`, and this suite spawns subprocesses
+        // concurrently. Owning the threads keeps the pressure local to this
+        // test.
+        let threads = setIds.enumerated().map { index, setId in
+            Thread {
+                try? store.updateScheduleState(setId: setId) { entry in
+                    usleep(20_000)
+                    entry.checkSliceCursor = index
+                }
             }
         }
+        threads.forEach { $0.start() }
+        while threads.contains(where: { !$0.isFinished }) { usleep(2_000) }
 
         let state = try #require(store.readScheduleState())
         for (index, setId) in setIds.enumerated() {
