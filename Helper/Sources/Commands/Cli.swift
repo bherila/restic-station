@@ -180,7 +180,7 @@ enum CliPathWarning {
         guard !CLIInstaller.isDirectoryOnPath(directory, pathEnvironment: environment["PATH"]) else {
             return
         }
-        FileHandle.standardError.write(Data(
+        StandardStream.writeToStandardError(Data(
             ("warning: \(directory.path) is not on PATH — add it to your shell profile, e.g. "
                 + "`export PATH=\"\(directory.path):$PATH\"`, so restic-station is found.\n").utf8
         ))

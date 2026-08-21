@@ -41,7 +41,7 @@ enum HelperOutput {
         if json {
             writeEnvelope(failure)
         } else {
-            FileHandle.standardError.write(Data((failure.message + "\n").utf8))
+            StandardStream.write(Data((failure.message + "\n").utf8), to: .standardError)
         }
         exit(code)
     }
@@ -61,8 +61,8 @@ enum HelperOutput {
         } catch {
             data = Data(Self.lastResortEnvelope.utf8)
         }
-        FileHandle.standardOutput.write(data)
-        FileHandle.standardOutput.write(Data("\n".utf8))
+        StandardStream.write(data, to: .standardOutput)
+        StandardStream.write(Data("\n".utf8), to: .standardOutput)
     }
 
     /// Hand-written so it cannot itself fail to encode.

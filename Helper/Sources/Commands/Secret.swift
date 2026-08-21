@@ -263,7 +263,7 @@ struct PrintPassword: AsyncParsableCommand {
         // Raw bytes, no newline: restic trims a trailing newline itself, but
         // emitting one would make `secret set` / `print-password` a lossy
         // round trip for a password that legitimately ends in one.
-        FileHandle.standardOutput.write(Data(password.utf8))
+        StandardStream.write(Data(password.utf8), to: .standardOutput)
         HelperExit.code(0)
     }
 }
@@ -285,11 +285,11 @@ enum SecretInput {
         guard isatty(STDIN_FILENO) == 1 else {
             return stripOneTrailingNewline(readAllStdin())
         }
-        FileHandle.standardError.write(Data(prompt.utf8))
+        StandardStream.write(Data(prompt.utf8), to: .standardError)
         let line = withEchoDisabled { readLine(strippingNewline: true) ?? "" }
         // The user's Return was swallowed by the disabled echo; put the
         // cursor back on its own line.
-        FileHandle.standardError.write(Data("\n".utf8))
+        StandardStream.write(Data("\n".utf8), to: .standardError)
         return line
     }
 

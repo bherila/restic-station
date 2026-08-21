@@ -165,6 +165,6 @@ enum ResticResolution: Sendable {
 /// systemd capture both streams anyway.
 enum HelperLog {
     static func info(_ message: String) {
-        FileHandle.standardError.write(Data("info: \(message)\n".utf8))
+        StandardStream.write(Data("info: \(message)\n".utf8), to: .standardError)
     }
 }

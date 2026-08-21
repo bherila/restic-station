@@ -129,8 +129,8 @@ struct ConfigExport: AsyncParsableCommand {
             // No `--out`: stdout IS the export, so nothing else may share
             // it — matches the `--json` convention even though this isn't
             // spelled `--json` (the output *is* config.json's own bytes).
-            FileHandle.standardOutput.write(data)
-            FileHandle.standardOutput.write(Data("\n".utf8))
+            StandardStream.write(data, to: .standardOutput)
+            StandardStream.write(Data("\n".utf8), to: .standardOutput)
         }
         HelperExit.code(0)
     }

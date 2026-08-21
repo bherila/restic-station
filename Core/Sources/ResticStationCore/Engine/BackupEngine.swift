@@ -992,7 +992,8 @@ public final class BackupEngine: Sendable {
             setId: set.id,
             destinations: tokenDestinations,
             config: config,
-            patterns: set.purgeExcludes
+            patterns: set.purgeExcludes,
+            executableIdentity: restic.maintenanceExecutable()?.identity
         )
     }
 
@@ -1052,7 +1053,13 @@ public final class BackupEngine: Sendable {
         let tokenIds = Set(preview.destinations.map(\.destinationId))
         let fingerprint: String
         do {
-            fingerprint = try PreviewTokenStore.configFingerprint(config)
+            // Recomputed here, from the executable this process would
+            // actually run: a token issued against a different restic binary
+            // must not authorize a rewrite by this one.
+            fingerprint = try PreviewTokenStore.purgeFingerprint(
+                config,
+                executableIdentity: restic.maintenanceExecutable()?.identity
+            )
         } catch {
             throw PurgeApplyError.unavailable
         }
@@ -1227,7 +1234,8 @@ public final class BackupEngine: Sendable {
                 setId: set.id,
                 destinations: [PreviewTokenDestination(destinationId: destination.id, snapshotIDs: plan.matched.map(\.id))],
                 config: config,
-                patterns: patterns
+                patterns: patterns,
+                executableIdentity: restic.maintenanceExecutable()?.identity
             )
         } catch {
             throw PurgeApplyError.unavailable
@@ -2171,5 +2179,5 @@ final class ProgressReporter: @unchecked Sendable {
 // MARK: - Logging
 
 private func logWarning(_ message: String) {
-    FileHandle.standardError.write(Data((message + "\n").utf8))
+    StandardStream.write(Data((message + "\n").utf8), to: .standardError)
 }

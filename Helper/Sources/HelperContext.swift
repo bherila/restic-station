@@ -20,7 +20,7 @@ enum HelperExit {
     /// Writes `message` to stderr, then exits with `code` (default 1 —
     /// "error" in the T10 contract).
     static func fail(_ message: String, code: Int32 = 1) -> Never {
-        FileHandle.standardError.write(Data((message + "\n").utf8))
+        StandardStream.write(Data((message + "\n").utf8), to: .standardError)
         exit(code)
     }
 

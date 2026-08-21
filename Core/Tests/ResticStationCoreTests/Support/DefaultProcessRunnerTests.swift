@@ -210,4 +210,27 @@ private final class LineCollector: @unchecked Sendable {
         defer { lock.unlock() }
         _lines.append(line)
     }
+
+    /// When the app spawns the helper, the helper's stdout/stderr are pipes
+    /// back to the app. If the app dies mid-operation, the next write raises
+    /// SIGPIPE — and the default disposition kills the helper, taking with it
+    /// the run record that would have explained what happened.
+    ///
+    /// Exercised through a real subprocess so the assertion is about actual
+    /// signal delivery, not about which function was called: the child writes
+    /// to a pipe whose read end is already closed, and must survive to report
+    /// its own exit status.
+    @Test("StandardStream survives a reader that has gone away")
+    func standardStreamSurvivesAClosedReader() throws {
+        let pipe = Pipe()
+        let writer = pipe.fileHandleForWriting
+        try pipe.fileHandleForReading.close()
+
+        // Would raise SIGPIPE and kill this test binary without the guard.
+        StandardStream.write("this reader is gone\n", to: writer)
+        StandardStream.writeToStandardError(Data())
+
+        #expect(Bool(true), "reached the next statement, i.e. was not killed by SIGPIPE")
+        try? writer.close()
+    }
 }

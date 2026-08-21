@@ -85,50 +85,12 @@ public extension ProcessRunning {
 public struct DefaultProcessRunner: ProcessRunning {
     public init() {}
 
-    /// Serializes the SIGPIPE window below against every `posix_spawn`.
-    ///
-    /// The disposition is process-wide state, and POSIX preserves an
-    /// *ignored* disposition across `exec`. swift-corelibs-foundation does
-    /// not reset child dispositions (macOS's Foundation happens to, which
-    /// hides this locally), so a child spawned while SIGPIPE is ignored
-    /// inherits that and no longer dies on a broken pipe. Holding this lock
-    /// across both the spawn and the window makes that overlap impossible.
-    private static let spawnLock = NSLock()
-
-    /// Runs `body` with SIGPIPE ignored, then restores the previous
-    /// disposition.
-    ///
-    /// Writing to a subprocess pipe whose read end is already closed raises
-    /// SIGPIPE, whose default disposition terminates the process. A helper
-    /// that dies that way in the middle of a destructive maintenance command
-    /// leaves no run record and no diagnosis.
-    ///
-    /// The signal is raised synchronously on the writing thread, so the
-    /// window only has to cover this call. It is deliberately not left
-    /// installed process-wide: see ``spawnLock``, and
-    /// `childrenKeepTheDefaultSIGPIPEDisposition`, which fails on Linux
-    /// against a permanent `signal(SIGPIPE, SIG_IGN)`.
     private static func withSIGPIPEIgnored<T>(_ body: () -> T) -> T {
-        spawnLock.lock()
-        let previous = signal(SIGPIPE, SIG_IGN)
-        defer {
-            // C function pointers are not Equatable; compare the raw bit
-            // patterns so a failed `signal` is never restored as a handler.
-            if unsafeBitCast(previous, to: UInt.self) != unsafeBitCast(SIG_ERR, to: UInt.self) {
-                signal(SIGPIPE, previous)
-            }
-            spawnLock.unlock()
-        }
-        return body()
+        SIGPIPEGuard.withIgnored(body)
     }
 
-    /// Spawns under ``spawnLock``. Synchronous on purpose: `NSLock` is
-    /// unavailable from an async context, and the critical section must not
-    /// suspend anyway.
     private static func launch(_ process: Process) throws {
-        spawnLock.lock()
-        defer { spawnLock.unlock() }
-        try process.run()
+        try SIGPIPEGuard.launch(process)
     }
 
     public func run(
@@ -400,5 +362,46 @@ private actor TimeoutFlag {
 
     func trigger() {
         triggered = true
+    }
+}
+
+/// The process-wide SIGPIPE disposition, and the lock that keeps it from
+/// leaking into a child.
+///
+/// SIGPIPE has to be handled process-wide rather than with a
+/// `pthread_sigmask`: Foundation does not always raise it on the thread that
+/// called `write`. But POSIX preserves an *ignored* disposition across
+/// `exec`, and swift-corelibs-foundation does not reset child dispositions
+/// (macOS's Foundation happens to, which hides this locally) — so a child
+/// spawned while SIGPIPE is ignored inherits that and no longer dies on a
+/// broken pipe. Every spawn and every ignore-window therefore take this one
+/// lock, making the overlap impossible.
+///
+/// Pinned by `childrenKeepTheDefaultSIGPIPEDisposition`, which fails on Linux
+/// against a permanently installed `signal(SIGPIPE, SIG_IGN)`.
+enum SIGPIPEGuard {
+    private static let lock = NSLock()
+
+    static func withIgnored<T>(_ body: () -> T) -> T {
+        lock.lock()
+        let previous = signal(SIGPIPE, SIG_IGN)
+        defer {
+            // C function pointers are not Equatable; compare the raw bit
+            // patterns so a failed `signal` is never restored as a handler.
+            if unsafeBitCast(previous, to: UInt.self) != unsafeBitCast(SIG_ERR, to: UInt.self) {
+                signal(SIGPIPE, previous)
+            }
+            lock.unlock()
+        }
+        return body()
+    }
+
+    /// Spawns under the same lock, so the disposition is always the default
+    /// at `posix_spawn` time. Synchronous on purpose: `NSLock` is unavailable
+    /// from an async context, and the critical section must not suspend.
+    static func launch(_ process: Process) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        try process.run()
     }
 }
