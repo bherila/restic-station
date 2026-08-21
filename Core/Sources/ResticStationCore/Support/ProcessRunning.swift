@@ -365,43 +365,41 @@ private actor TimeoutFlag {
     }
 }
 
-/// The process-wide SIGPIPE disposition, and the lock that keeps it from
-/// leaking into a child.
+/// Keeps a broken pipe from killing this process, without changing what any
+/// child inherits.
 ///
-/// SIGPIPE has to be handled process-wide rather than with a
-/// `pthread_sigmask`: Foundation does not always raise it on the thread that
-/// called `write`. But POSIX preserves an *ignored* disposition across
-/// `exec`, and swift-corelibs-foundation does not reset child dispositions
-/// (macOS's Foundation happens to, which hides this locally) — so a child
-/// spawned while SIGPIPE is ignored inherits that and no longer dies on a
-/// broken pipe. Every spawn and every ignore-window therefore take this one
-/// lock, making the overlap impossible.
+/// Installed **once**, permanently, as a no-op *handler* — deliberately not
+/// `SIG_IGN`. POSIX resets signals "set to be caught" to the default action on
+/// `exec`, while it preserves an *ignored* disposition. So a handler protects
+/// the parent and every child still dies on a broken pipe exactly as before,
+/// with no window to serialize and no lock to contend on.
 ///
-/// Pinned by `childrenKeepTheDefaultSIGPIPEDisposition`, which fails on Linux
-/// against a permanently installed `signal(SIGPIPE, SIG_IGN)`.
+/// The earlier design scoped `SIG_IGN` to each write under a lock shared with
+/// `Process.run()`. That was correct, but it coupled two unrelated things: a
+/// slow or blocked write to stdout held the lock, and every subprocess spawn
+/// in the process queued behind it. No failure was ever traced to that
+/// coupling — this is removing a hazard, not fixing a proven bug — but the
+/// handler achieves the same guarantee with no shared state at all.
+///
+/// Verified from both directions by `childrenKeepTheDefaultSIGPIPEDisposition`
+/// (child still exits with signal 13, and the Linux container proves it, since
+/// swift-corelibs-foundation does not scrub child dispositions the way macOS
+/// Foundation does) and `standardStreamSurvivesAClosedReader` (this process
+/// gets `EPIPE` instead of dying).
 enum SIGPIPEGuard {
-    private static let lock = NSLock()
+    /// `Void` static: the runtime guarantees exactly one initialization,
+    /// whichever thread gets there first.
+    private static let installed: Void = {
+        _ = signal(SIGPIPE, { _ in })
+    }()
 
     static func withIgnored<T>(_ body: () -> T) -> T {
-        lock.lock()
-        let previous = signal(SIGPIPE, SIG_IGN)
-        defer {
-            // C function pointers are not Equatable; compare the raw bit
-            // patterns so a failed `signal` is never restored as a handler.
-            if unsafeBitCast(previous, to: UInt.self) != unsafeBitCast(SIG_ERR, to: UInt.self) {
-                signal(SIGPIPE, previous)
-            }
-            lock.unlock()
-        }
+        _ = installed
         return body()
     }
 
-    /// Spawns under the same lock, so the disposition is always the default
-    /// at `posix_spawn` time. Synchronous on purpose: `NSLock` is unavailable
-    /// from an async context, and the critical section must not suspend.
     static func launch(_ process: Process) throws {
-        lock.lock()
-        defer { lock.unlock() }
+        _ = installed
         try process.run()
     }
 }
