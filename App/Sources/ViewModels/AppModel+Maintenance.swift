@@ -389,16 +389,7 @@ final class MaintenanceModel: ObservableObject {
     @Published var selectedSetId: UUID? {
         didSet {
             guard oldValue != selectedSetId else { return }
-            prunePlan = nil
-            retentionPreview = .idle
-            activity = nil
-            // Clearing is not enough on its own. A dry run already awaiting
-            // I/O — easily seconds against a remote repository, and the
-            // picker stays enabled throughout — will still complete and
-            // write its result back, restoring the *previous* set's preview,
-            // activity and (destructive) plan under the newly selected set.
-            // Bumping the generation makes those completions no-ops.
-            previewGeneration &+= 1
+            invalidatePreviewWork()
         }
     }
 
@@ -406,6 +397,45 @@ final class MaintenanceModel: ObservableObject {
     /// selection must be discarded. Every async maintenance preview captures
     /// it and refuses to publish if it has moved.
     private var previewGeneration: UInt64 = 0
+
+    /// Discards everything measured against the previous selection, in one
+    /// place so no field is forgotten.
+    ///
+    /// Clearing published state is not enough on its own: a dry run already
+    /// awaiting I/O — easily seconds against a remote repository, and the
+    /// picker stays enabled throughout — completes later and would write the
+    /// previous set's preview, activity and destructive plan back under the
+    /// newly selected set. Bumping the generation makes those completions
+    /// no-ops.
+    ///
+    /// `isPreparingPrune` must be reset here too, and that is the subtle
+    /// part: a generation-checked completion returns *before* it would have
+    /// cleared the flag, so leaving it set wedges every retention and
+    /// reclaim control until the model is recreated. Ownership of the flag
+    /// belongs to whoever is current, not to a task that has been discarded.
+    /// Marks preview preparation in flight and returns the generation that
+    /// owns it. Ownership is the point: only the generation that set the flag
+    /// may clear it, so a discarded completion cannot release a newer task's
+    /// busy state — nor, as happened here, decline to release its own and
+    /// wedge every control that keys off it.
+    func beginPreparation() -> UInt64 {
+        isPreparingPrune = true
+        return previewGeneration
+    }
+
+    /// Whether a completion measured against `generation` may still publish.
+    /// When it may not, it must also not touch `isPreparingPrune`.
+    func shouldPublish(_ generation: UInt64) -> Bool {
+        previewGeneration == generation
+    }
+
+    func invalidatePreviewWork() {
+        previewGeneration &+= 1
+        prunePlan = nil
+        retentionPreview = .idle
+        activity = nil
+        isPreparingPrune = false
+    }
 
     @Published private(set) var sizes: [UUID: SizeState] = [:]
     @Published private(set) var retentionPreview: RetentionPreviewState = .idle
@@ -546,7 +576,7 @@ final class MaintenanceModel: ObservableObject {
         let generation = previewGeneration
         Task { [weak self] in
             let previews = await Self.dryRun(set: set, policy: policy, runner: runner)
-            guard let self, self.previewGeneration == generation else { return }
+            guard let self, self.shouldPublish(generation) else { return }
             self.retentionPreview = .ready(previews: previews, at: Date())
         }
     }
@@ -576,21 +606,33 @@ final class MaintenanceModel: ObservableObject {
         // new config, see the fingerprint match, and apply a retention plan
         // nobody reviewed — the exact failure this binding exists to stop.
         let store = ConfigStore(paths: model.paths)
-        let expectedConfig = store.fileFingerprint()
-        guard let onDisk = try? store.load(),
-              onDisk.addressable(for: model.machine).set(id: set.id) == set else {
+        guard let snapshot = try? store.snapshot(),
+              snapshot.config.addressable(for: model.machine).set(id: set.id) == set else {
             retentionPreview = .failed(
                 "Settings on disk have changed since this window loaded them. "
                     + "Reload settings, then preview cleanup again."
             )
             return
         }
-        isPreparingPrune = true
+        // Binds the whole effective picture — machine identity, both files,
+        // the resolved set and the restic binary — not just the shared
+        // config. `machine.json` decides which overrides apply and which
+        // destinations are enabled here, so hashing `config.json` alone let
+        // the helper resolve a different destination list while the hash
+        // still matched.
+        let expectedConfig = MaintenanceBinding.effectiveSetFingerprint(
+            machineId: model.machine.machineId,
+            set: set,
+            configFingerprint: snapshot.fingerprint,
+            machineFingerprint: store.machineFileFingerprint(),
+            resticExecutableIdentity: (try? MaintenanceLookup.resticRunner(model))?
+                .maintenanceExecutable()?.identity
+        )
         let previewedDestinations = set.destinations
-        let generation = previewGeneration
+        let generation = beginPreparation()
         Task { [weak self] in
             let previews = await Self.dryRun(set: set, policy: policy, runner: runner)
-            guard let self, self.previewGeneration == generation else { return }
+            guard let self, self.shouldPublish(generation) else { return }
             self.isPreparingPrune = false
             let now = Date()
             self.retentionPreview = .ready(previews: previews, at: now)
@@ -610,12 +652,11 @@ final class MaintenanceModel: ObservableObject {
     /// destructive action never gets a bypass simply because it leaves
     /// snapshots in place.
     func prepareReclaimSpace(for set: BackupSet, destination: Destination, in model: AppModel) {
-        isPreparingPrune = true
-        let generation = previewGeneration
+        let generation = beginPreparation()
         Task { [weak self] in
             let preview = await model.helper.previewReclaimSpace(setId: set.id, destId: destination.id)
             let result = preview.result
-            guard let self, self.previewGeneration == generation else { return }
+            guard let self, self.shouldPublish(generation) else { return }
             self.isPreparingPrune = false
             guard result.isSuccess else {
                 self.activity = Self.activity(

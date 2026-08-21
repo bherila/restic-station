@@ -238,4 +238,53 @@ struct AppModelMachineOverrideTests {
             #expect(resolved.nonSecretEnv != rawEnvironment)
         }
     }
+
+    /// Switching sets while a preview is in flight must discard that
+    /// preview's result *and* release the busy state it took.
+    ///
+    /// The generation check alone caused a regression: a discarded completion
+    /// returns before it would clear `isPreparingPrune`, and nothing else
+    /// reset it, so every retention and reclaim control stayed disabled until
+    /// the model was recreated. This drives the real ownership seams rather
+    /// than a copy of the logic.
+    @Test("changing sets during a preview releases the busy state it took")
+    func selectionChangeReleasesPreviewBusyState() {
+        let maintenance = MaintenanceModel()
+        maintenance.selectedSetId = UUID()
+
+        let generation = maintenance.beginPreparation()
+        #expect(maintenance.isPreparingPrune)
+        #expect(maintenance.shouldPublish(generation))
+
+        maintenance.selectedSetId = UUID()
+
+        // The in-flight completion is now stale...
+        #expect(!maintenance.shouldPublish(generation))
+        // ...and must not have taken the busy flag with it.
+        #expect(!maintenance.isPreparingPrune)
+        #expect(maintenance.prunePlan == nil)
+        #expect(maintenance.activity == nil)
+        if case .idle = maintenance.retentionPreview {} else {
+            Issue.record("retention preview should be idle after a selection change")
+        }
+
+        // A new operation on the newly selected set can still start.
+        let next = maintenance.beginPreparation()
+        #expect(maintenance.shouldPublish(next))
+        #expect(maintenance.isPreparingPrune)
+    }
+
+    /// Re-selecting the same set must not discard work in flight for it.
+    @Test("re-selecting the same set does not invalidate its preview")
+    func reselectingSameSetKeepsPreview() {
+        let maintenance = MaintenanceModel()
+        let setId = UUID()
+        maintenance.selectedSetId = setId
+
+        let generation = maintenance.beginPreparation()
+        maintenance.selectedSetId = setId
+
+        #expect(maintenance.shouldPublish(generation))
+        #expect(maintenance.isPreparingPrune)
+    }
 }

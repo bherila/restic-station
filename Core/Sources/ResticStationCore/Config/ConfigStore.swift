@@ -41,6 +41,53 @@ public struct ConfigStore: Sendable {
             .appendingPathComponent(paths.configFile.lastPathComponent + ".tmp", isDirectory: false)
     }
 
+    /// One read of `config.json`: the bytes, their fingerprint, and the
+    /// configuration decoded **from those same bytes**.
+    ///
+    /// `load()` followed by `fileFingerprint()` is two reads, so the decoded
+    /// value and the hashed value are not guaranteed to be the same snapshot
+    /// — a file replaced between them yields a configuration that does not
+    /// correspond to the fingerprint a destructive confirmation is checked
+    /// against. This closes that window.
+    ///
+    /// A migration rewrites the file, so when one happens the snapshot is
+    /// retaken over the post-migration bytes. Migration is one-way and
+    /// terminates, so the retry cannot loop.
+    public func snapshot() throws -> ConfigSnapshot {
+        guard let bytes = try? Data(contentsOf: paths.configFile) else {
+            return ConfigSnapshot(bytes: Data(), fingerprint: "absent", config: AppConfig())
+        }
+        let decoded = try Self.makeDecoder().decode(AppConfig.self, from: bytes)
+        if decoded.version > AppConfig.currentVersion {
+            throw ConfigError.newerVersion(found: decoded.version, supported: AppConfig.currentVersion)
+        }
+        try decoded.validate()
+        guard decoded.version == AppConfig.currentVersion else {
+            _ = try load()   // migrates and rewrites
+            return try snapshotAfterMigration()
+        }
+        return ConfigSnapshot(bytes: bytes, fingerprint: SHA256Digest.hex(bytes), config: decoded)
+    }
+
+    private func snapshotAfterMigration() throws -> ConfigSnapshot {
+        guard let bytes = try? Data(contentsOf: paths.configFile) else {
+            return ConfigSnapshot(bytes: Data(), fingerprint: "absent", config: AppConfig())
+        }
+        let decoded = try Self.makeDecoder().decode(AppConfig.self, from: bytes)
+        try decoded.validate()
+        return ConfigSnapshot(bytes: bytes, fingerprint: SHA256Digest.hex(bytes), config: decoded)
+    }
+
+    /// Fingerprint of `machine.json`'s bytes. It is not part of
+    /// `config.json`, but it decides machine identity, which overrides apply,
+    /// which destinations are enabled here, and the restic path — so a
+    /// destructive confirmation that binds only the shared config can still
+    /// be honoured against a materially different effective set.
+    public func machineFileFingerprint() -> String {
+        guard let data = try? Data(contentsOf: paths.machineFile) else { return "absent" }
+        return SHA256Digest.hex(data)
+    }
+
     /// A fingerprint of `config.json` **as bytes on disk**, for binding a
     /// destructive confirmation to the configuration the operator reviewed.
     ///
@@ -336,5 +383,20 @@ public enum ConfigStoreError: Error, Equatable, Sendable, CustomStringConvertibl
         case .renameFailed(let errno, let from, let to):
             return "rename(\(from), \(to)) failed: errno \(errno)"
         }
+    }
+}
+
+/// `config.json`'s bytes, their fingerprint, and the configuration decoded
+/// from exactly those bytes — so a caller cannot bind a hash of one revision
+/// while acting on another.
+public struct ConfigSnapshot: Sendable {
+    public let bytes: Data
+    public let fingerprint: String
+    public let config: AppConfig
+
+    public init(bytes: Data, fingerprint: String, config: AppConfig) {
+        self.bytes = bytes
+        self.fingerprint = fingerprint
+        self.config = config
     }
 }
