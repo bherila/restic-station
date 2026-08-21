@@ -31,6 +31,21 @@ struct PreviewTokenStoreTests {
             + "27ae41e4649b934ca495991b7852b855")
         #expect(SHA256Digest.hex(Data("abc".utf8)) == "ba7816bf8f01cfea414140de5dae2223"
             + "b00361a396177a9cb410ff61f20015ad")
+
+        // Both vectors above are shorter than one 64-byte block, so neither
+        // reaches the multi-block loop or the padding branch that spills a
+        // length into a second block. Every fingerprint this type actually
+        // computes is a serialized config or destination, i.e. multi-block.
+        // 55/56/64 bytes bracket the padding boundary; 200 bytes is four
+        // blocks.
+        #expect(SHA256Digest.hex(Data(repeating: UInt8(ascii: "x"), count: 55))
+            == "d5e285683cd4efc02d021a5c62014694958901005d6f71e89e0989fac77e4072")
+        #expect(SHA256Digest.hex(Data(repeating: UInt8(ascii: "x"), count: 56))
+            == "04c26261370ee7541549d16dee320c723e3fd14671e66a099afe0a377c16888e")
+        #expect(SHA256Digest.hex(Data(repeating: UInt8(ascii: "x"), count: 64))
+            == "7ce100971f64e7001e8fe5a51973ecdfe1ced42befe7ee8d5fd6219506b5393c")
+        #expect(SHA256Digest.hex(Data(String(repeating: "abcdefghij", count: 20).utf8))
+            == "5d21f71a6600f3754431bf20ce4c69e7ff23f66d3140b8a8346e5e26eab201dc")
     }
 
     @Test("tokens are random, owner-only, scoped, expiring, and single-use")

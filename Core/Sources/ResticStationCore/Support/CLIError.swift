@@ -420,9 +420,14 @@ extension CLIFailure {
                 details: CLIErrorDetails(setId: setId, destinationId: destinationId)
             )
         case .unavailable:
+            // `.unavailable` covers secret storage, the token index, and a
+            // failed `snapshots` listing alike, so the advice stays
+            // cause-neutral: naming secret storage sent an agent to the wrong
+            // subsystem whenever restic was the one that failed. The code
+            // stays retryable, which is true of all three.
             return CLIFailure(
                 code: .secretUnavailable,
-                message: "The purge could not be prepared. Try again after checking secret storage.",
+                message: "The purge could not be prepared. Check the repository and secret storage, then try again.",
                 details: CLIErrorDetails(setId: setId)
             )
         }
