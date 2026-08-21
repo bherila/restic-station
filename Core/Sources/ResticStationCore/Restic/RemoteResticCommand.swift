@@ -10,6 +10,23 @@ public enum ShellQuote {
 }
 
 public struct RemoteResticCommand: Equatable, Sendable {
+    /// `ConnectTimeout` bounds only the handshake. Once a prune is running,
+    /// a silent partition — a NAT or firewall dropping an idle flow — leaves
+    /// local ssh blocked on a dead TCP session with no keepalive and no
+    /// timeout, and the helper hangs **holding the set lock**, so every
+    /// scheduled backup for that set stops until someone kills it by hand.
+    /// That is the T19 failure this codebase has already been bitten by, so
+    /// the session is kept under active keepalive: three missed 15-second
+    /// probes tears it down and prune fails honestly instead of hanging.
+    static let sshPrefix = [
+        "/usr/bin/ssh",
+        "-o", "BatchMode=yes",
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-o", "ConnectTimeout=15",
+        "-o", "ServerAliveInterval=15",
+        "-o", "ServerAliveCountMax=3",
+    ]
+
     public let argv: [String]
     public let password: Data?
 
@@ -18,17 +35,13 @@ public struct RemoteResticCommand: Equatable, Sendable {
         if password != nil { remote += ["-p", "/dev/stdin"] }
         remote.append("prune")
         if dryRun { remote.append("--dry-run") }
-        self.argv = [
-            "/usr/bin/ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=15",
-            "--", sshTarget
-        ] + remote.map(ShellQuote.singleQuote)
+        self.argv = Self.sshPrefix + ["--", sshTarget] + remote.map(ShellQuote.singleQuote)
         self.password = password.map { Data(($0 + "\n").utf8) }
     }
 
     public static func version(sshTarget: String, resticPath: String) -> RemoteResticCommand {
         RemoteResticCommand(
-            argv: [
-                "/usr/bin/ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=15",
+            argv: Self.sshPrefix + [
                 "--", sshTarget, ShellQuote.singleQuote(resticPath), "'version'", "'--json'"
             ],
             password: nil

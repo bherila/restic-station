@@ -209,6 +209,11 @@ public final class ResticRunner: Sendable {
             try beforeLaunch?()
             result = try await runner.run(command.argv, env: nil, stdin: command.password, currentDirectory: nil, onStdoutLine: { line in
                 onRawLine?(line); let message = self.decoder.decodeLine(line); collector.append(message)
+                // No wall-clock timeout on purpose: a legitimate prune on a
+                // large repository runs for hours, and killing it partway is
+                // worse than waiting. A *dead* session is bounded instead by
+                // ssh's ServerAlive keepalive in `RemoteResticCommand`, which
+                // distinguishes "slow" from "gone" — a timeout here cannot.
             }, onStderrLine: { line in onRawLine?(line) }, timeout: nil)
         } catch let error as ProcessRunnerError {
             if case .launchFailed = error {

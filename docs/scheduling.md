@@ -326,8 +326,14 @@ The primary purge failure stops mirroring. A secondary purge failure skips
 that secondary's copy but allows another mirror to proceed. Copying into an
 unpurged secondary would leave its old snapshots alongside the primary's
 rewritten replacements, so it is never allowed. The per-destination pattern
-watermark advances only after that destination's purge child succeeds; a
-removed pattern stays recorded and is never used to trigger a rewrite.
+watermark advances only after that destination's purge child succeeds, or
+when the plan matched nothing **and** nothing was declined — an empty
+repository has nothing to rewrite. It deliberately does not advance when the
+plan matched nothing while snapshots *were* declined: that combination is
+evidence attribution is wrong, and recording the patterns as applied would
+skip the rewrite permanently, silently, and with a success-shaped outcome.
+The engine logs the decline instead. A removed pattern stays recorded and is
+never used to trigger a rewrite.
 
 ## Locking
 

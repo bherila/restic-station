@@ -86,4 +86,47 @@ struct PurgePlanTests {
         #expect(plan.matched.isEmpty)
         #expect(plan.unattributed.map(\.id) == [snapshot.id])
     }
+
+    /// Attribution decides what a purge is allowed to destroy, and it
+    /// compares against the hostname **restic** stamps into snapshots — the
+    /// kernel name from `gethostname(2)`. `machineId` is slugified from
+    /// `ProcessInfo.hostName` instead, which on a stock Mac carries a
+    /// `.local` the kernel name lacks (`bens-laptop.local` → machineId
+    /// `bens-laptop-local`, vs restic's `Bens-Laptop` → `bens-laptop`).
+    ///
+    /// When those diverged, a set with no `machines` map attributed **zero**
+    /// of its own snapshots: the scheduled purge found nothing, marked the
+    /// patterns applied, and never rewrote anything again — reporting
+    /// success the whole time. This asserts against the live system APIs
+    /// rather than a fixture, so it stays honest on any host.
+    @Test("a snapshot this machine wrote is attributable to this machine")
+    func localSnapshotsAreAttributableToTheLocalMachine() throws {
+        let machineId = MachineIdentity.generate()
+        let kernelHostname = try #require(MachineIdentity.kernelHostName())
+
+        let mine = snapshot(
+            id: "aaaaaaaaaaaaaaaa",
+            paths: ["/Users/example/Documents"],
+            hostname: kernelHostname
+        )
+
+        let plan = PurgePlan(
+            destinationId: Self.destinationId,
+            snapshots: [mine],
+            sourcePaths: ["/Users/example/Documents"],
+            hostnames: MachineIdentity.localHostnameSlugs(machineId: machineId),
+            patterns: ["DerivedData"]
+        )
+
+        #expect(plan.matched.count == 1)
+        #expect(plan.unattributed.isEmpty)
+    }
+
+    @Test("the local hostname set covers both the machineId and the kernel name")
+    func localHostnameSlugsCoverBothNames() throws {
+        let slugs = MachineIdentity.localHostnameSlugs(machineId: "configured-id")
+        #expect(slugs.contains("configured-id"))
+        let kernel = try #require(MachineIdentity.kernelHostName())
+        #expect(slugs.contains(try #require(MachineIdentity.slugify(kernel))))
+    }
 }

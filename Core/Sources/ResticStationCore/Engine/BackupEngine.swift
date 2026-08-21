@@ -1092,7 +1092,21 @@ public final class BackupEngine: Sendable {
         var resolvedGroupId = groupId
         for (destination, plan) in plans {
             guard !plan.matched.isEmpty else {
-                markPurgePatternsApplied(setId: set.id, destinationId: destination.id, patterns: preview.patterns)
+                // Nothing to rewrite. Advancing the watermark is only correct
+                // when the repository genuinely holds nothing this machine
+                // may purge. If snapshots WERE declined, the empty match is
+                // evidence attribution is wrong — and advancing here would
+                // record the purge as applied, permanently, with no rewrite
+                // ever run and no error shown. Leave it pending and say so.
+                if plan.unattributed.isEmpty {
+                    markPurgePatternsApplied(setId: set.id, destinationId: destination.id, patterns: preview.patterns)
+                } else {
+                    logWarning(
+                        "BackupEngine: purge of \"\(destination.label)\" matched none of "
+                            + "\(plan.unattributed.count) snapshot(s) in the repository — leaving the "
+                            + "patterns pending rather than recording them as applied"
+                    )
+                }
                 continue
             }
             guard let purge = await purgeChild(
@@ -1902,7 +1916,12 @@ public final class BackupEngine: Sendable {
         if let machines = set.machines {
             names.formUnion(machines.keys)
         }
-        names.insert(MachineIdentity.generate())
+        // The engine's own `machineId` — which honours machine.json and
+        // `RESTIC_STATION_MACHINE_ID` — plus the kernel hostname restic
+        // actually records. `MachineIdentity.generate()` was neither: it
+        // re-derived a slug from `ProcessInfo.hostName`, ignoring the
+        // override and missing the name in the snapshots.
+        names.formUnion(MachineIdentity.localHostnameSlugs(machineId: machineId))
         return names
     }
 
