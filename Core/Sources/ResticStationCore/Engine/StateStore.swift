@@ -321,6 +321,14 @@ public struct StateStore: Sendable {
     /// before A's write and write after it, silently discarding A's entry.
     /// That entry now carries `appliedPurgeExcludes`, i.e. destructive
     /// bookkeeping, so a lost update is no longer merely scheduling hygiene.
+    ///
+    /// **This method blocks** while waiting for the lock. That is fine for the
+    /// helper, which is a one-shot process whose contention is with *other
+    /// processes*, but callers must not fan it out across Swift Concurrency
+    /// tasks: blocking the cooperative pool prevents the lock holder from
+    /// being scheduled to release, so waiters spin to the timeout. A test that
+    /// did exactly that turned a 0.3s case into a 50s one on a two-core runner
+    /// and stalled the whole suite behind it.
     @discardableResult
     public func updateScheduleState(
         setId: UUID,

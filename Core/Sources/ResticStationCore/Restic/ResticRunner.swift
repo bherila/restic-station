@@ -423,16 +423,26 @@ public final class ResticRunner: Sendable {
         )
     }
 
+    /// Digesting the restic binary is not cheap — it is ~28 MB, and
+    /// `SHA256Digest` is a dependency-free Swift implementation, so a single
+    /// call costs about 10s in a debug build and is far from free in a
+    /// release one. A purge preview and apply ask for the identity several
+    /// times each, which turned one engine test from 0.3s into 40s.
+    ///
+    /// Cached per process, keyed by the file's identity *and* its mutable
+    /// metadata, so an in-place replacement invalidates the entry. This does
+    /// not weaken the binding it feeds: preview and confirmation run in
+    /// **different** helper processes, so the cross-process check that
+    /// actually guards the destructive operation still re-reads and re-hashes
+    /// the file.
+    private static let executableCache = ExecutableIdentityCache()
+
     private func maintenanceExecutable(path: String) -> MaintenanceExecutable? {
         guard path.hasPrefix("/") else { return nil }
         let executable = URL(fileURLWithPath: path)
             .resolvingSymlinksInPath()
             .standardizedFileURL
-        guard let data = try? Data(contentsOf: executable) else { return nil }
-        return MaintenanceExecutable(
-            path: executable.path,
-            identity: "\(executable.path):\(SHA256Digest.hex(data))"
-        )
+        return Self.executableCache.identity(for: executable)
     }
 
     /// Classifies a finished run.
@@ -477,5 +487,42 @@ private final class MessageCollector: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         _messages.append(message)
+    }
+}
+
+/// Process-local memo for ``ResticRunner/MaintenanceExecutable``.
+///
+/// The cache key includes device, inode, size and mtime, so replacing the
+/// binary — the exact thing the digest exists to detect — misses the cache
+/// and is re-hashed. Only a byte-identical file at the same inode with
+/// unchanged metadata reuses an entry.
+final class ExecutableIdentityCache: @unchecked Sendable {
+    private let lock = NSLock()
+    private var entries: [String: ResticRunner.MaintenanceExecutable] = [:]
+
+    func identity(for executable: URL) -> ResticRunner.MaintenanceExecutable? {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: executable.path) else {
+            return nil
+        }
+        let size = (attributes[.size] as? NSNumber)?.uint64Value ?? 0
+        let modified = (attributes[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+        let inode = (attributes[.systemFileNumber] as? NSNumber)?.uint64Value ?? 0
+        let device = (attributes[.systemNumber] as? NSNumber)?.uint64Value ?? 0
+        let key = "\(executable.path)|\(device)|\(inode)|\(size)|\(modified)"
+
+        lock.lock()
+        let cached = entries[key]
+        lock.unlock()
+        if let cached { return cached }
+
+        guard let data = try? Data(contentsOf: executable) else { return nil }
+        let value = ResticRunner.MaintenanceExecutable(
+            path: executable.path,
+            identity: "\(executable.path):\(SHA256Digest.hex(data))"
+        )
+        lock.lock()
+        entries[key] = value
+        lock.unlock()
+        return value
     }
 }

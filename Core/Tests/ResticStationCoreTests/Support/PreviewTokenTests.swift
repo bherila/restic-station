@@ -25,6 +25,18 @@ struct PreviewTokenStoreTests {
         }
     }
 
+    /// Both implementations, on every platform. `digest` uses CryptoKit where
+    /// it exists, so without this the portable path would go unexercised on
+    /// macOS — and it is the one that runs in the Linux container.
+    @Test("both SHA-256 implementations agree, and match published vectors")
+    func portableAndPlatformDigestsAgree() {
+        for sample in [Data(), Data("abc".utf8),
+                       Data(repeating: 0x61, count: 55), Data(repeating: 0x61, count: 56),
+                       Data(repeating: 0x61, count: 64), Data(repeating: 0x61, count: 1000)] {
+            #expect(SHA256Digest.digest(sample) == SHA256Digest.portableDigest(sample))
+        }
+    }
+
     @Test("SHA-256 config fingerprint primitive matches published vectors")
     func sha256Vectors() {
         #expect(SHA256Digest.hex(Data()) == "e3b0c44298fc1c149afbf4c8996fb924"

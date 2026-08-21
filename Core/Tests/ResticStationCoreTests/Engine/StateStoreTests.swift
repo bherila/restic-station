@@ -436,20 +436,24 @@ struct StateStoreTests {
     /// section, so a read-modify-write that is not held under a lock will
     /// overlap and lose an entry essentially every run.
     @Test("concurrent updates for different sets do not lose one another")
-    func concurrentScheduleStateUpdatesDoNotLoseEntries() async throws {
+    func concurrentScheduleStateUpdatesDoNotLoseEntries() throws {
         let (store, root) = makeStore()
         defer { try? FileManager.default.removeItem(at: root) }
 
         let setIds = (0..<8).map { _ in UUID() }
-        await withTaskGroup(of: Void.self) { group in
-            for (index, setId) in setIds.enumerated() {
-                group.addTask {
-                    try? store.updateScheduleState(setId: setId) { entry in
-                        // Widen the window between read and write.
-                        usleep(20_000)
-                        entry.checkSliceCursor = index
-                    }
-                }
+        // Real threads, not a `TaskGroup`. `updateScheduleState` blocks —
+        // it sleeps between lock attempts — and the writers sleep inside the
+        // critical section on purpose to widen the read/write window. Doing
+        // that on Swift Concurrency's cooperative pool starves it: on a
+        // two-core CI runner the lock holder cannot be scheduled to release
+        // while every thread sits in `usleep`, so waiters spin to the 5s
+        // timeout and every other async test in the suite stalls behind them.
+        // That is exactly what happened — the whole 674-test run took 60s and
+        // unrelated parsing tests reported 50s wall time.
+        DispatchQueue.concurrentPerform(iterations: setIds.count) { index in
+            try? store.updateScheduleState(setId: setIds[index]) { entry in
+                usleep(20_000)
+                entry.checkSliceCursor = index
             }
         }
 
