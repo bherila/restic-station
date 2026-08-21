@@ -1,5 +1,13 @@
 import Foundation
 
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#endif
+
 /// Single source of truth for every runtime path Restic Station reads or
 /// writes. Never hard-code a path elsewhere — go through `AppPaths`.
 ///
@@ -197,6 +205,14 @@ public struct AppPaths: Equatable, Sendable {
         stateDir.appendingPathComponent("preview-tokens.lock", isDirectory: false)
     }
 
+    /// Serializes the read-modify-write of `schedule-state.json`, which is
+    /// one file shared by every set. The per-set locks cannot cover it: two
+    /// helper processes operating on *different* sets both rewrite the whole
+    /// document, so without this one can clobber the other's entry.
+    public var scheduleStateLockFile: URL {
+        stateDir.appendingPathComponent("schedule-state.lock", isDirectory: false)
+    }
+
     // MARK: - locks/
 
     public var locksDir: URL {
@@ -270,5 +286,15 @@ public struct AppPaths: Equatable, Sendable {
         for directory in [runsDir, stateDir, locksDir] {
             try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
         }
+        // `state/` holds `preview-tokens.json` — live capabilities for
+        // destructive operations — so it is owner-only regardless of umask,
+        // and re-asserted rather than set once at creation.
+        //
+        // `root` is deliberately NOT re-tightened here. An operator's chosen
+        // data directory mode is theirs (`scripts/secret-cli-test.sh` pins a
+        // pre-existing 755 dir staying 755), and the protection that matters
+        // is per-file: the token index is 0600 and refuses to load if it is
+        // not. This narrows the exposure without overriding that choice.
+        _ = chmod(stateDir.path, 0o700)
     }
 }

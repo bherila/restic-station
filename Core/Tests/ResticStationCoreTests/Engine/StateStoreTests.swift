@@ -424,4 +424,38 @@ struct StateStoreTests {
         formatter.formatOptions = [.withInternetDateTime]
         return formatter.date(from: iso)!
     }
+
+    /// `schedule-state.json` is one document shared by every set, while the
+    /// only other lock is per-set — so two helper processes working on
+    /// *different* sets take no common lock and each rewrite the whole file.
+    /// Without the companion lock, one reads before the other's write and
+    /// writes after it, silently discarding the other's entry. That entry now
+    /// carries `appliedPurgeExcludes`, i.e. destructive bookkeeping.
+    ///
+    /// Interleaved deliberately: each mutation sleeps inside the critical
+    /// section, so a read-modify-write that is not held under a lock will
+    /// overlap and lose an entry essentially every run.
+    @Test("concurrent updates for different sets do not lose one another")
+    func concurrentScheduleStateUpdatesDoNotLoseEntries() async throws {
+        let (store, root) = makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let setIds = (0..<8).map { _ in UUID() }
+        await withTaskGroup(of: Void.self) { group in
+            for (index, setId) in setIds.enumerated() {
+                group.addTask {
+                    try? store.updateScheduleState(setId: setId) { entry in
+                        // Widen the window between read and write.
+                        usleep(20_000)
+                        entry.checkSliceCursor = index
+                    }
+                }
+            }
+        }
+
+        let state = try #require(store.readScheduleState())
+        for (index, setId) in setIds.enumerated() {
+            #expect(state.sets[setId]?.checkSliceCursor == index, "lost the entry for set \(index)")
+        }
+    }
 }

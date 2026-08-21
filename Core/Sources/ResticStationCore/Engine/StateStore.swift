@@ -262,11 +262,16 @@ public struct FdaCheckResult: Codable, Equatable, Sendable {
 
 public enum StateStoreError: Error, Equatable, Sendable, CustomStringConvertible {
     case renameFailed(errno: Int32, from: String, to: String)
+    /// `schedule-state.json`'s companion lock could not be acquired within
+    /// the bounded retry window.
+    case scheduleStateLockTimeout(path: String)
 
     public var description: String {
         switch self {
         case .renameFailed(let errno, let from, let to):
             return "rename(\(from), \(to)) failed: errno \(errno)"
+        case .scheduleStateLockTimeout(let path):
+            return "timed out waiting for schedule state lock \(path)"
         }
     }
 }
@@ -297,14 +302,41 @@ public struct StateStore: Sendable {
         read(ScheduleState.self, from: paths.scheduleStateFile)
     }
 
+    /// How long to retry for the schedule-state lock before giving up. The
+    /// critical section is a decode, one dictionary mutation and an atomic
+    /// write, so real contention is measured in milliseconds.
+    private static let stateLockTimeout: TimeInterval = 5
+    private static let stateLockPollInterval: UInt32 = 20_000  // 20ms
+
     /// Loads the current `ScheduleState` (or an empty one), applies
     /// `mutate` to `setId`'s entry (creating it if absent), and writes the
     /// result back atomically.
+    ///
+    /// Held under ``AppPaths/scheduleStateLockFile`` for the whole
+    /// read-modify-write. The write itself was always atomic, but atomicity
+    /// is not isolation: `schedule-state.json` is one document shared by
+    /// every set, while the only other lock is per-set. A scheduled tick for
+    /// set A and a manual operation on set B run in different processes,
+    /// take no common lock, and each rewrite the whole file — so B could read
+    /// before A's write and write after it, silently discarding A's entry.
+    /// That entry now carries `appliedPurgeExcludes`, i.e. destructive
+    /// bookkeeping, so a lost update is no longer merely scheduling hygiene.
     @discardableResult
     public func updateScheduleState(
         setId: UUID,
         mutate: (inout SetScheduleState) -> Void
     ) throws -> ScheduleState {
+        try paths.ensureDirectories()
+        let lock = FileLock(path: paths.scheduleStateLockFile)
+        let deadline = Date().addingTimeInterval(Self.stateLockTimeout)
+        while !lock.tryAcquire() {
+            if Date() > deadline {
+                throw StateStoreError.scheduleStateLockTimeout(path: paths.scheduleStateLockFile.path)
+            }
+            usleep(Self.stateLockPollInterval)
+        }
+        defer { lock.release() }
+
         var state = readScheduleState() ?? ScheduleState()
         var entry = state.sets[setId] ?? SetScheduleState()
         mutate(&entry)
