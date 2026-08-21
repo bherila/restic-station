@@ -141,7 +141,11 @@ struct BackupEngineTests {
         onSpawn: (@Sendable ([String]) -> Void)? = nil,
         purgeSourcePaths: [UUID: Set<String>] = [:],
         purgeHostnames: [UUID: Set<String>] = [:],
-        machineId: String = "example-machine"
+        machineId: String = "example-machine",
+        /// Overridable so a test can point the engine at a binary it is
+        /// allowed to modify, and assert what happens when restic is
+        /// replaced mid-operation.
+        resticPath: String = BackupEngineTests.resticPath
     ) -> Env {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("restic-station-engine-\(UUID().uuidString)", isDirectory: true)
@@ -1742,6 +1746,70 @@ struct BackupEngineTests {
     /// tests deliberately build it from the captured snapshots fixture so
     /// the only ids a `rewrite --forget` can ever receive are the pure
     /// attribution result, never a caller-supplied filter.
+    /// The purge token binds the restic executable's identity, but binding is
+    /// only meaningful if the validated executable is the one that actually
+    /// receives `rewrite --forget`. It was not: the destructive child was
+    /// launched with an unpinned invocation, so a binary swapped after
+    /// validation — the window includes `currentPurgePlan`'s repository
+    /// queries, which are slow — would have run under an already-consumed
+    /// token.
+    @Test("runPurge: a restic replaced after validation never receives the rewrite")
+    func purgeApplyRefusesASwappedExecutable() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-swap-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fakeRestic = root.appendingPathComponent("restic", isDirectory: false)
+        try Data("original restic".utf8).write(to: fakeRestic)
+
+        let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]
+        let hostnames = [Self.setId: Set(["example-mac.local"])]
+        // Swap the binary from inside the `snapshots` spawn — i.e. *after*
+        // the token fingerprint has been revalidated (an earlier swap is
+        // already refused as `tokenDoesNotMatchCurrentPlan`) and while
+        // `currentPurgePlan` is querying the repository. Only a recheck at
+        // launch can catch this one.
+        let swapPath = fakeRestic.path
+        let env = Self.makeEnv(
+            script: [], retention: nil, purgeExcludes: ["build/**"], reachableSecondaries: [],
+            onSpawn: { argv in
+                guard argv.contains("snapshots") else { return }
+                try? Data("a different restic entirely".utf8)
+                    .write(to: URL(fileURLWithPath: swapPath))
+            },
+            purgeSourcePaths: sourcePaths, purgeHostnames: hostnames,
+            resticPath: fakeRestic.path
+        )
+        defer { env.cleanUp() }
+
+        let snapshotsJSON = try FixtureLoader.string("snapshots.json")
+        let snapshots = try parseSnapshots(Data(snapshotsJSON.utf8))
+        let plan = PurgePlan(
+            destinationId: env.primary.id, snapshots: snapshots,
+            sourcePaths: sourcePaths[Self.setId]!, hostnames: hostnames[Self.setId]!,
+            patterns: env.set.purgeExcludes
+        )
+        let token = try #require(try env.engine.issuePurgeToken(
+            set: env.set, destinations: [env.primary], plans: [plan]
+        ))
+
+        // Built against the injected path, not the shared `resticPath` helper.
+        env.fake.script = [
+            .init(
+                argvPrefix: [fakeRestic.path, "-r", env.primary.repoURL, "snapshots", "--json"],
+                stdoutLines: [snapshotsJSON]
+            ),
+        ]
+
+        let result = try await env.engine.runPurge(
+            set: env.set, destinations: [env.primary], token: token.value
+        )
+
+        #expect(result.status == .failed)
+        // The decisive assertion: no rewrite argv was ever produced.
+        #expect(!env.resticArgvs.contains { $0.contains("rewrite") })
+    }
+
     @Test("runPurge: a valid token revalidates ids, records rewrite mapping, and is single-use")
     func purgeApplyUsesTokenAndRecordsMapping() async throws {
         let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]

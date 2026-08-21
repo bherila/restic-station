@@ -1051,6 +1051,9 @@ public final class BackupEngine: Sendable {
 
         let requestedIds = Set(destinations.map(\.id))
         let tokenIds = Set(preview.destinations.map(\.destinationId))
+        // Resolved once and carried all the way to the launch, so the value
+        // that is validated is the value that runs.
+        let executable = restic.maintenanceExecutable()
         let fingerprint: String
         do {
             // Recomputed here, from the executable this process would
@@ -1058,7 +1061,7 @@ public final class BackupEngine: Sendable {
             // must not authorize a rewrite by this one.
             fingerprint = try PreviewTokenStore.purgeFingerprint(
                 config,
-                executableIdentity: restic.maintenanceExecutable()?.identity
+                executableIdentity: executable?.identity
             )
         } catch {
             throw PurgeApplyError.unavailable
@@ -1122,7 +1125,8 @@ public final class BackupEngine: Sendable {
                 patterns: preview.patterns,
                 setId: set.id,
                 trigger: trigger,
-                groupId: resolvedGroupId
+                groupId: resolvedGroupId,
+                executable: executable
             ) else {
                 return PurgeRunResult(status: .failed, children: children)
             }
@@ -1178,7 +1182,8 @@ public final class BackupEngine: Sendable {
         patterns: [String],
         setId: UUID,
         trigger: RunTrigger,
-        groupId: String?
+        groupId: String?,
+        executable: ResticRunner.MaintenanceExecutable?
     ) async -> ChildRun? {
         let fullIDByShortID = Dictionary(
             snapshotIDs.map { (String($0.prefix(8)), $0) },
@@ -1197,7 +1202,22 @@ public final class BackupEngine: Sendable {
                 excludes: patterns,
                 forget: true
             ),
-            invocation: ResticInvocation(destination: destination),
+            // Pin the executable the token was validated against. Without
+            // this the fingerprint check was advisory: restic could be
+            // replaced between validation and launch — the window includes
+            // `currentPurgePlan`'s repository queries, which are slow — and
+            // the replacement would run `rewrite --forget` under an
+            // already-consumed token. `ResticRunner` rechecks the identity
+            // immediately before it spawns.
+            //
+            // Identity only, deliberately no `resticPathOverride`: the runner
+            // resolves symlinks when it recomputes, so a retargeted link
+            // still fails the check, while `argv[0]` stays the configured
+            // path the golden argv tests and `docs/restic-cli.md` describe.
+            invocation: ResticInvocation(
+                destination: destination,
+                expectedExecutableIdentity: executable?.identity
+            ),
             streamProgress: false,
             purgeSnapshotRewrites: { outcome in
                 Dictionary(uniqueKeysWithValues: parseRewrite(outcome.rawOutput).snapshots.compactMap { rewrite in

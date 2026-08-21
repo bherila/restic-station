@@ -392,8 +392,20 @@ final class MaintenanceModel: ObservableObject {
             prunePlan = nil
             retentionPreview = .idle
             activity = nil
+            // Clearing is not enough on its own. A dry run already awaiting
+            // I/O — easily seconds against a remote repository, and the
+            // picker stays enabled throughout — will still complete and
+            // write its result back, restoring the *previous* set's preview,
+            // activity and (destructive) plan under the newly selected set.
+            // Bumping the generation makes those completions no-ops.
+            previewGeneration &+= 1
         }
     }
+
+    /// Incremented whenever a completion measured against an earlier
+    /// selection must be discarded. Every async maintenance preview captures
+    /// it and refuses to publish if it has moved.
+    private var previewGeneration: UInt64 = 0
 
     @Published private(set) var sizes: [UUID: SizeState] = [:]
     @Published private(set) var retentionPreview: RetentionPreviewState = .idle
@@ -531,9 +543,11 @@ final class MaintenanceModel: ObservableObject {
             return
         }
         retentionPreview = .loading
+        let generation = previewGeneration
         Task { [weak self] in
             let previews = await Self.dryRun(set: set, policy: policy, runner: runner)
-            self?.retentionPreview = .ready(previews: previews, at: Date())
+            guard let self, self.previewGeneration == generation else { return }
+            self.retentionPreview = .ready(previews: previews, at: Date())
         }
     }
 
@@ -553,15 +567,30 @@ final class MaintenanceModel: ObservableObject {
             retentionPreview = .failed(Self.describe(error))
             return
         }
+        // The fingerprint must describe a configuration that resolves to the
+        // set this preview is about to measure. Fingerprinting the bytes
+        // alone is not enough: if `config.json` was replaced by fleet sync or
+        // `config import` while the app has been open, `set`, `policy` and
+        // the runner still come from the app's *old* in-memory config, while
+        // the bytes on disk are the *new* one. The helper would then load the
+        // new config, see the fingerprint match, and apply a retention plan
+        // nobody reviewed — the exact failure this binding exists to stop.
+        let store = ConfigStore(paths: model.paths)
+        let expectedConfig = store.fileFingerprint()
+        guard let onDisk = try? store.load(),
+              onDisk.addressable(for: model.machine).set(id: set.id) == set else {
+            retentionPreview = .failed(
+                "Settings on disk have changed since this window loaded them. "
+                    + "Reload settings, then preview cleanup again."
+            )
+            return
+        }
         isPreparingPrune = true
-        // Captured before the dry run, so the fingerprint describes the
-        // configuration the counts were measured against — not whatever the
-        // file happens to be by the time the user reads them.
-        let expectedConfig = ConfigStore(paths: model.paths).fileFingerprint()
         let previewedDestinations = set.destinations
+        let generation = previewGeneration
         Task { [weak self] in
             let previews = await Self.dryRun(set: set, policy: policy, runner: runner)
-            guard let self else { return }
+            guard let self, self.previewGeneration == generation else { return }
             self.isPreparingPrune = false
             let now = Date()
             self.retentionPreview = .ready(previews: previews, at: now)
@@ -582,10 +611,11 @@ final class MaintenanceModel: ObservableObject {
     /// snapshots in place.
     func prepareReclaimSpace(for set: BackupSet, destination: Destination, in model: AppModel) {
         isPreparingPrune = true
+        let generation = previewGeneration
         Task { [weak self] in
             let preview = await model.helper.previewReclaimSpace(setId: set.id, destId: destination.id)
             let result = preview.result
-            guard let self else { return }
+            guard let self, self.previewGeneration == generation else { return }
             self.isPreparingPrune = false
             guard result.isSuccess else {
                 self.activity = Self.activity(
