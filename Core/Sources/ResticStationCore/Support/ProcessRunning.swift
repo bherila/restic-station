@@ -85,6 +85,15 @@ public extension ProcessRunning {
 public struct DefaultProcessRunner: ProcessRunning {
     public init() {}
 
+    /// Writing to a subprocess pipe whose read end is already closed raises
+    /// SIGPIPE, whose default disposition terminates the process. A helper
+    /// that dies that way in the middle of a destructive maintenance command
+    /// leaves no run record and no diagnosis, so the signal is masked once
+    /// and the failing `write` is handled as an ordinary error instead.
+    private static let ignoreSIGPIPE: Void = {
+        signal(SIGPIPE, SIG_IGN)
+    }()
+
     public func run(
         _ argv: [String],
         env: [String: String]?,
@@ -97,6 +106,7 @@ public struct DefaultProcessRunner: ProcessRunning {
         guard !argv.isEmpty else {
             throw ProcessRunnerError.invalidArgv
         }
+        _ = Self.ignoreSIGPIPE
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: argv[0])
@@ -133,15 +143,29 @@ public struct DefaultProcessRunner: ProcessRunning {
         } catch {
             throw ProcessRunnerError.launchFailed(String(describing: error))
         }
-        if let stdin {
-            stdinPipe.fileHandleForWriting.write(stdin)
-        }
-        try? stdinPipe.fileHandleForWriting.close()
-
         // Plain `Task`s (not `async let`) so they can be captured by the
         // nested task-group closure below.
+        //
+        // These start BEFORE the stdin write. The write below is synchronous
+        // and blocks once the stdin pipe buffer fills, so a child that writes
+        // its own output before draining stdin would deadlock against readers
+        // that had not started yet. Today's only stdin payload is a password,
+        // far under the buffer, but the ordering costs nothing and removes
+        // the whole failure class.
         let stdoutTask = Task { await Self.readPipeToCompletion(stdoutPipe, onLine: onStdoutLine) }
         let stderrTask = Task { await Self.readPipeToCompletion(stderrPipe, onLine: onStderrLine) }
+
+        if let stdin {
+            // `write(contentsOf:)`, never `write(_:)`: the latter raises an
+            // uncatchable ObjC exception when the child has already closed
+            // its stdin, which for a fast-failing `ssh` (BatchMode, rejected
+            // key) is a live race against the password write. Combined with
+            // the SIGPIPE mask above, an early exit now surfaces as the
+            // child's real exit status instead of killing the helper
+            // mid-destructive-operation.
+            try? stdinPipe.fileHandleForWriting.write(contentsOf: stdin)
+        }
+        try? stdinPipe.fileHandleForWriting.close()
 
         let timeoutFlag = TimeoutFlag()
         let cancellationFlag = CancellationFlag()
