@@ -210,7 +210,11 @@ enum RetentionPreviewState: Equatable {
 /// come from a fresh dry-run, never from the stale preview").
 struct PrunePlan: Identifiable, Equatable {
     enum Action: Equatable {
-        case retention
+        /// The `config.json` fingerprint and destination list the keep/remove
+        /// table was computed from. Retention's preview is app-direct, so
+        /// unlike reclaim there is no helper-issued token — the helper is
+        /// given this fingerprint instead and refuses if the file moved.
+        case retention(expectedConfig: String, previewedDestinations: [Destination])
         /// The exact addressable destination that the dry-run described.
         /// Confirm revalidates this value before it asks the helper to make
         /// changes, so a concurrent config edit cannot redirect the prune to
@@ -224,11 +228,17 @@ struct PrunePlan: Identifiable, Equatable {
     let previews: [DestinationForgetPreview]
     let action: Action
 
-    init(setId: UUID, setName: String, previews: [DestinationForgetPreview]) {
+    init(
+        setId: UUID,
+        setName: String,
+        previews: [DestinationForgetPreview],
+        expectedConfig: String,
+        previewedDestinations: [Destination]
+    ) {
         self.setId = setId
         self.setName = setName
         self.previews = previews
-        action = .retention
+        action = .retention(expectedConfig: expectedConfig, previewedDestinations: previewedDestinations)
     }
 
     init(
@@ -370,7 +380,20 @@ enum MaintenanceAction: Equatable {
 final class MaintenanceModel: ObservableObject {
 
     /// `nil` until the first render picks the first configured set.
-    @Published var selectedSetId: UUID?
+    ///
+    /// Changing it discards everything measured against the previous set.
+    /// `prunePlan`, `retentionPreview` and `activity` all describe one
+    /// specific set; left in place they render under the *next* set's
+    /// heading — a keep/remove table attributed to the wrong repository, or
+    /// a destructive confirmation appearing over a screen it does not name.
+    @Published var selectedSetId: UUID? {
+        didSet {
+            guard oldValue != selectedSetId else { return }
+            prunePlan = nil
+            retentionPreview = .idle
+            activity = nil
+        }
+    }
 
     @Published private(set) var sizes: [UUID: SizeState] = [:]
     @Published private(set) var retentionPreview: RetentionPreviewState = .idle
@@ -531,13 +554,24 @@ final class MaintenanceModel: ObservableObject {
             return
         }
         isPreparingPrune = true
+        // Captured before the dry run, so the fingerprint describes the
+        // configuration the counts were measured against — not whatever the
+        // file happens to be by the time the user reads them.
+        let expectedConfig = ConfigStore(paths: model.paths).fileFingerprint()
+        let previewedDestinations = set.destinations
         Task { [weak self] in
             let previews = await Self.dryRun(set: set, policy: policy, runner: runner)
             guard let self else { return }
             self.isPreparingPrune = false
             let now = Date()
             self.retentionPreview = .ready(previews: previews, at: now)
-            self.prunePlan = PrunePlan(setId: set.id, setName: set.name, previews: previews)
+            self.prunePlan = PrunePlan(
+                setId: set.id,
+                setName: set.name,
+                previews: previews,
+                expectedConfig: expectedConfig,
+                previewedDestinations: previewedDestinations
+            )
         }
     }
 
@@ -593,17 +627,43 @@ final class MaintenanceModel: ObservableObject {
     /// which goes through the helper, never through this process
     /// (`docs/architecture.md` §The single-code-path rule).
     func confirmApplyRetention(_ plan: PrunePlan, in model: AppModel) {
-        guard let set = MaintenanceLookup.set(model, id: plan.setId) else { return }
+        guard let set = MaintenanceLookup.set(model, id: plan.setId) else {
+            // Silently closing the dialog leaves the user believing a
+            // destructive action ran.
+            prunePlan = nil
+            activity = Self.activity(
+                title: "Maintenance",
+                subject: plan.setName,
+                result: .failed(output: "That backup set no longer exists. Reload settings and try again."),
+                run: nil
+            )
+            return
+        }
         let destIds: [UUID]
         let title: String
         let resultTask: () async -> HelperResult
-        let retainsPlanWhenBusy: Bool
         switch plan.action {
-        case .retention:
+        case .retention(let expectedConfig, let previewedDestinations):
+            // Fail closed exactly like reclaim. The dialog names a snapshot
+            // count computed against a specific destination list; if that
+            // list moved underneath us, the count is about a different
+            // repository set than the one we are about to change.
+            guard set.destinations == previewedDestinations else {
+                self.prunePlan = nil
+                self.activity = Self.activity(
+                    title: "Apply retention",
+                    subject: plan.setName,
+                    result: .failed(output: "The destinations changed after the cleanup preview. Review the updated settings and preview again before applying retention."),
+                    run: nil
+                )
+                return
+            }
             destIds = set.destinations.map(\.id)
             title = "Apply retention"
-            resultTask = { await model.helper.prune(setId: plan.setId) }
-            retainsPlanWhenBusy = false
+            // The helper independently re-checks this against config.json on
+            // disk: the app's in-memory copy is not evidence about what the
+            // helper will load a moment later.
+            resultTask = { await model.helper.prune(setId: plan.setId, expectedConfig: expectedConfig) }
         case .reclaimSpace(let previewedDestination, _, let confirmationBinding):
             guard let destination = set.destinations.first(where: { $0.id == previewedDestination.id }),
                   destination == previewedDestination else {
@@ -618,7 +678,6 @@ final class MaintenanceModel: ObservableObject {
             }
             destIds = [destination.id]
             title = "Reclaim space"
-            retainsPlanWhenBusy = true
             resultTask = {
                 await model.helper.pruneRepository(
                     setId: plan.setId,
@@ -638,14 +697,12 @@ final class MaintenanceModel: ObservableObject {
             let result = await resultTask()
             guard let self else { return }
             self.busyAction = nil
-            if result == .busy, retainsPlanWhenBusy {
-                // SwiftUI closes the confirmation alert before this Task
-                // returns. Restore the still-valid capability so transient
-                // helper/token-store contention can be retried directly.
-                self.prunePlan = plan
-            } else {
-                self.prunePlan = nil
-            }
+            // Never re-present the destructive alert. SwiftUI has already
+            // closed it, and reopening it with no user gesture puts a
+            // prominent "Reclaim Space" button under an in-flight Return
+            // keypress. The busy banner tells the user to try again; the
+            // capability is still valid and the button is still there.
+            self.prunePlan = nil
             model.refresh()
             let latestPrune = MaintenanceLookup.lastRun(model, setId: set.id, kind: .prune)
             let recordedRun: RunIndexEntry?
@@ -663,7 +720,12 @@ final class MaintenanceModel: ObservableObject {
                 run: recordedRun
             )
             // Sizes and the keep/remove table both describe a repository
-            // that just changed underneath them.
+            // that just changed underneath them — but only if something
+            // actually ran. A busy refusal changed nothing, so throwing away
+            // the preview the user is reading and re-running `stats` against
+            // every destination is pure waste, and remote repositories pay
+            // for it.
+            guard result != .busy else { return }
             MaintenanceStatsCache.shared.invalidate(destIds: destIds)
             self.retentionPreview = .idle
             self.loadSizes(for: set, in: model, force: true)
