@@ -85,27 +85,51 @@ public extension ProcessRunning {
 public struct DefaultProcessRunner: ProcessRunning {
     public init() {}
 
+    /// Serializes the SIGPIPE window below against every `posix_spawn`.
+    ///
+    /// The disposition is process-wide state, and POSIX preserves an
+    /// *ignored* disposition across `exec`. swift-corelibs-foundation does
+    /// not reset child dispositions (macOS's Foundation happens to, which
+    /// hides this locally), so a child spawned while SIGPIPE is ignored
+    /// inherits that and no longer dies on a broken pipe. Holding this lock
+    /// across both the spawn and the window makes that overlap impossible.
+    private static let spawnLock = NSLock()
+
+    /// Runs `body` with SIGPIPE ignored, then restores the previous
+    /// disposition.
+    ///
     /// Writing to a subprocess pipe whose read end is already closed raises
     /// SIGPIPE, whose default disposition terminates the process. A helper
     /// that dies that way in the middle of a destructive maintenance command
-    /// leaves no run record and no diagnosis, so the signal is ignored once
-    /// and the failing `write` is handled as an ordinary error instead.
+    /// leaves no run record and no diagnosis.
     ///
-    /// This is process-wide rather than a `pthread_sigmask` around the write
-    /// because Foundation does not raise the signal on the writing thread:
-    /// with SIGPIPE blocked on that thread and the raw `write` correctly
-    /// returning `EPIPE`, the process still died on an internal queue thread.
-    /// A per-thread mask cannot cover a thread we do not own.
-    ///
-    /// POSIX preserves an *ignored* disposition across `exec`, so the obvious
-    /// worry is that every restic child inherits it and no longer dies on a
-    /// broken pipe. Foundation's `Process` resets child dispositions, which
-    /// is not documented — so it is pinned by
-    /// `childrenKeepTheDefaultSIGPIPEDisposition`, which runs on both macOS
-    /// and the Linux CI container rather than trusting either platform.
-    private static let ignoreSIGPIPE: Void = {
-        signal(SIGPIPE, SIG_IGN)
-    }()
+    /// The signal is raised synchronously on the writing thread, so the
+    /// window only has to cover this call. It is deliberately not left
+    /// installed process-wide: see ``spawnLock``, and
+    /// `childrenKeepTheDefaultSIGPIPEDisposition`, which fails on Linux
+    /// against a permanent `signal(SIGPIPE, SIG_IGN)`.
+    private static func withSIGPIPEIgnored<T>(_ body: () -> T) -> T {
+        spawnLock.lock()
+        let previous = signal(SIGPIPE, SIG_IGN)
+        defer {
+            // C function pointers are not Equatable; compare the raw bit
+            // patterns so a failed `signal` is never restored as a handler.
+            if unsafeBitCast(previous, to: UInt.self) != unsafeBitCast(SIG_ERR, to: UInt.self) {
+                signal(SIGPIPE, previous)
+            }
+            spawnLock.unlock()
+        }
+        return body()
+    }
+
+    /// Spawns under ``spawnLock``. Synchronous on purpose: `NSLock` is
+    /// unavailable from an async context, and the critical section must not
+    /// suspend anyway.
+    private static func launch(_ process: Process) throws {
+        spawnLock.lock()
+        defer { spawnLock.unlock() }
+        try process.run()
+    }
 
     public func run(
         _ argv: [String],
@@ -119,7 +143,6 @@ public struct DefaultProcessRunner: ProcessRunning {
         guard !argv.isEmpty else {
             throw ProcessRunnerError.invalidArgv
         }
-        _ = Self.ignoreSIGPIPE
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: argv[0])
@@ -152,7 +175,9 @@ public struct DefaultProcessRunner: ProcessRunning {
         }
 
         do {
-            try process.run()
+            // Under the same lock as the SIGPIPE window, so no child is ever
+            // created while that signal is ignored and inherits it.
+            try Self.launch(process)
         } catch {
             throw ProcessRunnerError.launchFailed(String(describing: error))
         }
@@ -175,7 +200,9 @@ public struct DefaultProcessRunner: ProcessRunning {
             // key) is a live race against the password write. With SIGPIPE
             // ignored, an early exit now surfaces as the child's real exit
             // status instead of killing the helper mid-operation.
-            try? stdinPipe.fileHandleForWriting.write(contentsOf: stdin)
+            Self.withSIGPIPEIgnored {
+                try? stdinPipe.fileHandleForWriting.write(contentsOf: stdin)
+            }
         }
         try? stdinPipe.fileHandleForWriting.close()
 
