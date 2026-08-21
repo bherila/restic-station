@@ -359,7 +359,14 @@ public extension Destination {
         guard kind == .sftp else { return nil }
         let configured = remoteMaintenance ?? RemoteMaintenance()
         let raw = String(repoURL.dropFirst("sftp:".count))
-        let split = raw.firstIndex(of: ":")
+        // Only the `sftp:user@host:/repository` shorthand can be split on its
+        // first colon. In restic's `sftp://user@host:port/repository` URL form
+        // that colon introduces the port, so the same split would aim ssh at
+        // "//user@host" and hand restic "port/repository". Decline to infer
+        // rather than build a nonsense remote command; explicit `sshTarget`
+        // and `remoteRepoPath` still drive that form.
+        let shorthand = raw.hasPrefix("//") ? nil : raw
+        let split = shorthand.flatMap { $0.firstIndex(of: ":") }
         let parsedTarget = split.map { String(raw[..<$0]) }
         let parsedPath = split.map { String(raw[raw.index(after: $0)...]) }
         guard let sshTarget = configured.sshTarget ?? parsedTarget, !sshTarget.isEmpty,
@@ -433,9 +440,15 @@ public extension Destination {
                 )
                 : nil
         )
-        // Encoding an in-memory String dictionary cannot fail in practice;
-        // fail closed with an impossible-to-match fingerprint if it ever did.
-        guard let data = try? encoder.encode(effective) else { return "" }
+        // Encoding an in-memory String dictionary cannot fail in practice.
+        // If it ever did, a fixed sentinel would be worse than useless: the
+        // preview and the confirmation would compute the same one and match,
+        // authorizing a destructive prune on an unfingerprinted destination.
+        // A fresh random value can never equal a stored one, so the failure
+        // mode is a refused confirmation.
+        guard let data = try? encoder.encode(effective) else {
+            return "unfingerprintable-" + UUID().uuidString
+        }
         return SHA256Digest.hex(data)
     }
 }
