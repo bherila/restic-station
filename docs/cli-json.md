@@ -232,7 +232,8 @@ exception: they mutate, and they carry `--json` because the app drives them.
 Every defined code now has a producer. `repository_offline` was wired by #79
 and is also emitted by `purge preview` (exit 3); `operation_not_allowed` is
 emitted by `purge apply` and `maintenance prune` when a confirmation does not
-match the current plan. `preview_expired` is emitted by both when a binding
+match the current plan, and by `run-set` when `--expected-config` no longer
+matches `config.json`. `preview_expired` is emitted by both when a binding
 outlives `PreviewTokenStore.defaultLifetime`.
 
 ## Confirmation bindings are an app gate, not a CLI gate
@@ -240,6 +241,13 @@ outlives `PreviewTokenStore.defaultLifetime`.
 `purge apply` cannot run without a valid `--preview-token`: `BackupEngine`
 refuses every request not bound to a current preview, and there is no force,
 yes, or environment bypass.
+
+`run-set --kind prune` (the app's **Apply retention now**) takes
+`--expected-config`, a SHA-256 of `config.json`'s bytes. Retention's preview
+runs in the app rather than through the helper, so there is no helper-issued
+token to mint; the file fingerprint is what both processes can compute
+identically, and the helper refuses if the file moved between the preview the
+operator read and the run they authorised.
 
 `maintenance prune` is deliberately different. `--expected-destination` is
 optional, and omitting it runs a real `restic prune` with no binding check —
