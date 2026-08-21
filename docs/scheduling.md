@@ -308,8 +308,12 @@ in Swift; a snapshot is attributed to the set when **both** hold:
 Everything else is *unattributed* and is listed as such in the preview rather
 than silently skipped. Two consequences are deliberate:
 
-- A snapshot written by a machine with no `machines` entry is never purged
-  from this host. Under-purging is recoverable; over-purging is not.
+- The machine running the purge is **always** in the hostname set, whether or
+  not the set has a `machines` entry for it (`HelperContext` inserts its own
+  `machineId`). Its own snapshots are therefore attributable. What no
+  `machines` entry protects is a snapshot written by some *other* host: that
+  host's name is not in the set, so this machine never purges it.
+  Under-purging is recoverable; over-purging is not.
 - Membership is by subset, not equality, because a set's `sources` change over
   time and historical snapshots carry the older list. Where several sets share
   one `repoURL` on one machine, a snapshot of set A whose paths all fall inside

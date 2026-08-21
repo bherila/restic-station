@@ -51,6 +51,41 @@ struct DefaultProcessRunnerTests {
         #expect(result.exitCode == 0)
     }
 
+    /// The SIGPIPE protection must stay the parent's. POSIX preserves an
+    /// *ignored* disposition across `exec`, so a process-wide
+    /// `signal(SIGPIPE, SIG_IGN)` would silently become a property of every
+    /// restic invocation too — a child that relies on dying on a broken pipe
+    /// would continue or hang instead. Signal 13 here means the child still
+    /// has the default disposition.
+    @Test("does not leak SIGPIPE suppression into spawned children")
+    func childrenKeepTheDefaultSIGPIPEDisposition() async throws {
+        let runner = DefaultProcessRunner()
+
+        // Run the stdin path first, so any leaked suppression is in place.
+        _ = try await runner.run(
+            ["/bin/sh", "-c", "exit 0"],
+            env: nil,
+            stdin: Data("x".utf8),
+            currentDirectory: nil,
+            onStdoutLine: nil,
+            onStderrLine: nil,
+            timeout: 30
+        )
+
+        let result = try await runner.run(
+            ["/bin/sh", "-c", "kill -PIPE $$; echo survived"],
+            env: nil,
+            stdin: nil,
+            currentDirectory: nil,
+            onStdoutLine: nil,
+            onStderrLine: nil,
+            timeout: 30
+        )
+
+        #expect(result.exitCode == 13)
+        #expect(result.stdout.isEmpty)
+    }
+
     @Test("runs /bin/echo, streams the line callback, and captures stdout")
     func echoSmokeTest() async throws {
         let runner = DefaultProcessRunner()

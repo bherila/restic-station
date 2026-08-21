@@ -88,8 +88,21 @@ public struct DefaultProcessRunner: ProcessRunning {
     /// Writing to a subprocess pipe whose read end is already closed raises
     /// SIGPIPE, whose default disposition terminates the process. A helper
     /// that dies that way in the middle of a destructive maintenance command
-    /// leaves no run record and no diagnosis, so the signal is masked once
+    /// leaves no run record and no diagnosis, so the signal is ignored once
     /// and the failing `write` is handled as an ordinary error instead.
+    ///
+    /// This is process-wide rather than a `pthread_sigmask` around the write
+    /// because Foundation does not raise the signal on the writing thread:
+    /// with SIGPIPE blocked on that thread and the raw `write` correctly
+    /// returning `EPIPE`, the process still died on an internal queue thread.
+    /// A per-thread mask cannot cover a thread we do not own.
+    ///
+    /// POSIX preserves an *ignored* disposition across `exec`, so the obvious
+    /// worry is that every restic child inherits it and no longer dies on a
+    /// broken pipe. Foundation's `Process` resets child dispositions, which
+    /// is not documented — so it is pinned by
+    /// `childrenKeepTheDefaultSIGPIPEDisposition`, which runs on both macOS
+    /// and the Linux CI container rather than trusting either platform.
     private static let ignoreSIGPIPE: Void = {
         signal(SIGPIPE, SIG_IGN)
     }()
@@ -159,10 +172,9 @@ public struct DefaultProcessRunner: ProcessRunning {
             // `write(contentsOf:)`, never `write(_:)`: the latter raises an
             // uncatchable ObjC exception when the child has already closed
             // its stdin, which for a fast-failing `ssh` (BatchMode, rejected
-            // key) is a live race against the password write. Combined with
-            // the SIGPIPE mask above, an early exit now surfaces as the
-            // child's real exit status instead of killing the helper
-            // mid-destructive-operation.
+            // key) is a live race against the password write. With SIGPIPE
+            // ignored, an early exit now surfaces as the child's real exit
+            // status instead of killing the helper mid-operation.
             try? stdinPipe.fileHandleForWriting.write(contentsOf: stdin)
         }
         try? stdinPipe.fileHandleForWriting.close()
