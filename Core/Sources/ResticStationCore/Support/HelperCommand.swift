@@ -23,7 +23,10 @@ public enum HelperCommand: Equatable, Sendable {
     /// `run-set --set <uuid> --kind backup` — "Back Up Now".
     case backUpNow(setId: UUID)
     /// `run-set --set <uuid> --kind prune`.
-    case prune(setId: UUID)
+    /// `run-set --set <uuid> --kind prune [--expected-config <fingerprint>]`.
+    /// `expectedConfig` is the `config.json` fingerprint the caller reviewed;
+    /// the helper refuses if the file changed underneath it.
+    case prune(setId: UUID, expectedConfig: String? = nil)
     /// `run-set --set <uuid> --kind check`.
     case check(setId: UUID)
     /// `maintenance prune --set <uuid> [--dest <uuid>] [--expected-destination <preview-token>] [--dry-run]`.
@@ -67,8 +70,11 @@ public enum HelperCommand: Equatable, Sendable {
             return ["tick"]
         case .backUpNow(let setId):
             return Self.runSet(setId: setId, kind: "backup")
-        case .prune(let setId):
-            return Self.runSet(setId: setId, kind: "prune")
+        case .prune(let setId, let expectedConfig):
+            var argv = Self.runSet(setId: setId, kind: "prune")
+            // Attached form so a fingerprint can never be reparsed as an option.
+            if let expectedConfig { argv.append("--expected-config=\(expectedConfig)") }
+            return argv
         case .check(let setId):
             return Self.runSet(setId: setId, kind: "check")
         case .maintenancePrune(let setId, let destId, let expectedDestination, let dryRun, let json):

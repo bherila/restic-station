@@ -24,8 +24,30 @@ struct RunSet: AsyncParsableCommand {
     @Option(name: .long, help: "Which operation to run.")
     var kind: Kind = .backup
 
+    /// Refuse unless `config.json` is byte-identical to what the caller
+    /// reviewed. The app sends this for **Apply retention now**, whose
+    /// preview is app-direct and therefore has no helper-issued token the
+    /// way `maintenance prune` does. Without it, a config change landing
+    /// between the dialog and the click — a hand edit, or this fleet's
+    /// config sync — silently applied a policy the operator never saw to a
+    /// destination list they were never shown.
+    @Option(name: .long, parsing: .unconditional,
+            help: "Refuse unless config.json still matches this fingerprint.")
+    var expectedConfig: String?
+
     func run() async throws {
         let context = try await HelperContext.make()
+        if let expectedConfig {
+            let current = ConfigStore(paths: context.paths).fileFingerprint()
+            guard current == expectedConfig else {
+                throw CLIFailure(
+                    code: .operationNotAllowed,
+                    message: "The configuration changed after this operation was reviewed. "
+                        + "Review the updated settings and try again.",
+                    details: CLIErrorDetails(setId: set)
+                )
+            }
+        }
         // `scheduled`: backup, check and prune are all things this machine
         // *does to* a set, so a set disabled here must not run — unlike the
         // repository utilities, which use `addressable`.

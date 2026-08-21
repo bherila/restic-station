@@ -41,6 +41,22 @@ public struct ConfigStore: Sendable {
             .appendingPathComponent(paths.configFile.lastPathComponent + ".tmp", isDirectory: false)
     }
 
+    /// A fingerprint of `config.json` **as bytes on disk**, for binding a
+    /// destructive confirmation to the configuration the operator reviewed.
+    ///
+    /// Deliberately hashes the file rather than a decoded `AppConfig`: the
+    /// app and the helper are separate processes that resolve and migrate
+    /// config differently, so hashing decoded objects would make them
+    /// disagree and refuse legitimate operations. The bytes are the one
+    /// thing both sides see identically.
+    ///
+    /// A missing file is a valid, empty configuration (see ``load()``), so
+    /// it fingerprints as a fixed sentinel rather than failing.
+    public func fileFingerprint() -> String {
+        guard let data = try? Data(contentsOf: paths.configFile) else { return "absent" }
+        return SHA256Digest.hex(data)
+    }
+
     /// Missing file → default empty config. Version newer than this build
     /// supports → `ConfigError.newerVersion`. Otherwise decodes, validates
     /// (`AppConfig.validate()` is called on every load) and, for an older
@@ -218,7 +234,7 @@ public struct ConfigStore: Sendable {
     }
 
     private static func warn(_ message: String) {
-        FileHandle.standardError.write(Data("restic-station: config migration: \(message)\n".utf8))
+        StandardStream.write(Data("restic-station: config migration: \(message)\n".utf8), to: .standardError)
     }
 
     /// Validates, encodes (`.sortedKeys` + `.prettyPrinted` + ISO 8601 with
