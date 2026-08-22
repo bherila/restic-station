@@ -37,12 +37,20 @@ Everything in this document was **verified against restic 0.18.1 on macOS (arm64
 ## Remote maintenance
 
 For an `sftp:` destination whose `remoteMaintenance.enabled` is true,
-standalone pack reclamation runs on the SSH host. Restic Station invokes SSH
-with BatchMode, strict host-key acceptance, and a 15-second connection limit;
-the remote login shell receives every operand single-quote escaped. The
-repository password is written only to SSH stdin and remote restic reads it
-with `-p /dev/stdin`. If SSH or remote restic is unavailable, prune fails; it
-never falls back to a local network prune. Rewrite remains local.
+standalone pack reclamation runs on the SSH host. The remote login shell
+receives every operand single-quote escaped. The repository password is
+written only to SSH stdin and remote restic reads it with `-p /dev/stdin`. If
+SSH or remote restic is unavailable, prune fails; it never falls back to a
+local network prune. Rewrite remains local.
+
+SSH options, and why each is there:
+
+| Option | Reason |
+|---|---|
+| `BatchMode=yes` | Never prompt. A scheduled helper has no one to answer. |
+| `StrictHostKeyChecking=yes` | **Not `accept-new`.** This channel carries the repository password, so trust-on-first-use would hand it to whoever answers the first connection — and that MITM then satisfies the `restic version` preflight. The operator has already ssh'd to the host to configure the destination, so the key is normally pinned; when it is not, the preflight recognises the host-key failure and says to connect once with `ssh` to verify and record the key. |
+| `ConnectTimeout=15` | Bounds the handshake. |
+| `ServerAliveInterval=15`, `ServerAliveCountMax=3` | Bounds a session that is *established but dead*. `ConnectTimeout` does not cover this: a NAT or firewall dropping an idle flow mid-prune leaves ssh blocked forever, and the helper hangs **holding the set lock**, silently stopping every scheduled backup for that set. A wall-clock timeout is deliberately not used instead — a legitimate prune runs for hours, and only a keepalive distinguishes slow from gone. |
 
 ## Exit codes (verified)
 

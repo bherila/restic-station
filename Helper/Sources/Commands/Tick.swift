@@ -137,7 +137,7 @@ struct Tick: AsyncParsableCommand {
                         }
                     }
                 } catch {
-                    FileHandle.standardError.write(
+                    StandardStream.writeToStandardError(
                         Data("tick: could not write repo-status for \(destination.id): \(error)\n".utf8)
                     )
                 }
@@ -158,7 +158,7 @@ struct Tick: AsyncParsableCommand {
                 print("recovered interrupted run \(run.runId)")
             }
         } catch {
-            FileHandle.standardError.write(Data("tick: could not recover interrupted runs: \(error)\n".utf8))
+            StandardStream.write(Data("tick: could not recover interrupted runs: \(error)\n".utf8), to: .standardError)
         }
 
         // Unconditionally, not only for what `recoverInterrupted()` just
@@ -235,7 +235,7 @@ struct Tick: AsyncParsableCommand {
                 try stateStore.clearCurrentRun(setId: setId)
                 print("  cleared abandoned progress \(paths.currentRunFile(setId: setId).lastPathComponent)")
             } catch {
-                FileHandle.standardError.write(
+                StandardStream.writeToStandardError(
                     Data("tick: could not clear abandoned progress for set \(setId): \(error)\n".utf8)
                 )
             }

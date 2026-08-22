@@ -50,8 +50,10 @@ public struct HelperInvoker: Sendable {
         await run(.backUpNow(setId: setId))
     }
 
-    public func prune(setId: UUID) async -> HelperResult {
-        await run(.prune(setId: setId))
+    /// `expectedConfig` binds the run to the `config.json` the caller
+    /// reviewed; the helper refuses if the file changed underneath it.
+    public func prune(setId: UUID, expectedConfig: String? = nil) async -> HelperResult {
+        await run(.prune(setId: setId, expectedConfig: expectedConfig))
     }
 
     /// Reclaims unused packs without applying retention. The helper owns the

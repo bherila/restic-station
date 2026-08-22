@@ -231,6 +231,17 @@ public final class ResticRunner: Sendable {
         do { result = try await runner.run(command.argv, env: nil, stdin: nil, currentDirectory: nil, onStdoutLine: nil, onStderrLine: nil, timeout: 20) }
         catch { throw ResticRunnerError.launchFailed("remote maintenance SSH could not be launched") }
         guard result.exitCode == 0, let info = try? parseVersion(result.stdout), info.meetsMinimum("0.17.0") else {
+            // An unpinned host key is the one failure here with a specific,
+            // actionable remedy, and it is invisible in the generic message.
+            let stderr = String(decoding: result.stderr, as: UTF8.self)
+            if stderr.contains("Host key verification failed")
+                || stderr.contains("No RSA host key is known")
+                || stderr.contains("no matching host key") {
+                throw ResticRunnerError.launchFailed(
+                    "the maintenance host's SSH key is not known. Connect to it once with ssh to "
+                        + "verify and record the key, then retry."
+                )
+            }
             throw ResticRunnerError.launchFailed("remote restic is unavailable or below version 0.17")
         }
         return info
@@ -252,6 +263,13 @@ public final class ResticRunner: Sendable {
     /// never emitted in a report or run log.
     public func maintenanceExecutable() -> MaintenanceExecutable? {
         maintenanceExecutable(path: resticPath)
+    }
+
+    /// The identity as of *right now*, hashed rather than recalled. Used
+    /// only where the answer authorizes a destructive launch; see
+    /// ``ExecutableIdentityCache``.
+    func revalidatedMaintenanceExecutable(path: String) -> MaintenanceExecutable? {
+        maintenanceExecutable(path: path, bypassingCache: true)
     }
 
     // MARK: - Secret-store pre-flight
@@ -353,8 +371,12 @@ public final class ResticRunner: Sendable {
         timeout: TimeInterval?
     ) async throws -> ResticOutcome {
         let resolvedExecutablePath = executablePath ?? resticPath
+        // `revalidated…`, not the cached accessor: the whole point of this
+        // check is that the bytes on disk may have changed since the
+        // preview, and a metadata-keyed cache cannot see an in-place
+        // overwrite that preserves size and mtime.
         if let expectedExecutableIdentity,
-           maintenanceExecutable(path: resolvedExecutablePath)?.identity != expectedExecutableIdentity {
+           revalidatedMaintenanceExecutable(path: resolvedExecutablePath)?.identity != expectedExecutableIdentity {
             throw ResticRunnerError.launchFailed("the restic executable changed after the maintenance preview")
         }
         // Destructive preview tokens are consumed here, after every launch
@@ -412,16 +434,26 @@ public final class ResticRunner: Sendable {
         )
     }
 
-    private func maintenanceExecutable(path: String) -> MaintenanceExecutable? {
+    /// Digesting the restic binary is not cheap — it is ~28 MB, and
+    /// `SHA256Digest` is a dependency-free Swift implementation, so a single
+    /// call costs about 10s in a debug build and is far from free in a
+    /// release one. A purge preview and apply ask for the identity several
+    /// times each, which turned one engine test from 0.3s into 40s.
+    ///
+    /// Cached per process, keyed by the file's identity *and* its mutable
+    /// metadata, so an in-place replacement invalidates the entry. This does
+    /// not weaken the binding it feeds: preview and confirmation run in
+    /// **different** helper processes, so the cross-process check that
+    /// actually guards the destructive operation still re-reads and re-hashes
+    /// the file.
+    private static let executableCache = ExecutableIdentityCache()
+
+    private func maintenanceExecutable(path: String, bypassingCache: Bool = false) -> MaintenanceExecutable? {
         guard path.hasPrefix("/") else { return nil }
         let executable = URL(fileURLWithPath: path)
             .resolvingSymlinksInPath()
             .standardizedFileURL
-        guard let data = try? Data(contentsOf: executable) else { return nil }
-        return MaintenanceExecutable(
-            path: executable.path,
-            identity: "\(executable.path):\(SHA256Digest.hex(data))"
-        )
+        return Self.executableCache.identity(for: executable, bypassingCache: bypassingCache)
     }
 
     /// Classifies a finished run.
@@ -466,5 +498,56 @@ private final class MessageCollector: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         _messages.append(message)
+    }
+}
+
+/// Process-local memo for ``ResticRunner/MaintenanceExecutable``.
+///
+/// The cache key includes device, inode, size and mtime, so *most* ways of
+/// replacing the binary miss the cache and are re-hashed.
+///
+/// **Metadata is not a substitute for the bytes, and this cache must never
+/// be trusted to enforce a pin.** An in-place overwrite that keeps the same
+/// inode, writes the same number of bytes and restores the original mtime —
+/// exactly what an updater preserving timestamps does — produces an
+/// unchanged key and returns the *previous* digest. The launch-time
+/// revalidation would then compare a stale identity to itself and let the
+/// replacement receive the destructive command, defeating the pin it exists
+/// to enforce. So every revalidation passes `bypassingCache: true` and
+/// hashes the file (#109 exact-head review).
+///
+/// The cache still does its job — `335e33d` added it so a multi-step purge
+/// does not re-hash restic on every step — because only the comparatively
+/// rare destructive *launch* pays for a fresh hash.
+final class ExecutableIdentityCache: @unchecked Sendable {
+    private let lock = NSLock()
+    private var entries: [String: ResticRunner.MaintenanceExecutable] = [:]
+
+    func identity(for executable: URL, bypassingCache: Bool = false) -> ResticRunner.MaintenanceExecutable? {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: executable.path) else {
+            return nil
+        }
+        let size = (attributes[.size] as? NSNumber)?.uint64Value ?? 0
+        let modified = (attributes[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+        let inode = (attributes[.systemFileNumber] as? NSNumber)?.uint64Value ?? 0
+        let device = (attributes[.systemNumber] as? NSNumber)?.uint64Value ?? 0
+        let key = "\(executable.path)|\(device)|\(inode)|\(size)|\(modified)"
+
+        if !bypassingCache {
+            lock.lock()
+            let cached = entries[key]
+            lock.unlock()
+            if let cached { return cached }
+        }
+
+        guard let data = try? Data(contentsOf: executable) else { return nil }
+        let value = ResticRunner.MaintenanceExecutable(
+            path: executable.path,
+            identity: "\(executable.path):\(SHA256Digest.hex(data))"
+        )
+        lock.lock()
+        entries[key] = value
+        lock.unlock()
+        return value
     }
 }

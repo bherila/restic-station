@@ -115,4 +115,9 @@ public enum PurgeApplyError: Error, Equatable, Sendable {
     case busy
     case destinationOffline(destinationId: UUID)
     case unavailable
+    /// No restic executable could be identified, so no destructive purge
+    /// capability may be minted or honoured. Distinct from ``unavailable``
+    /// because the remedy is specific: restore the configured binary
+    /// (#109 exact-head review).
+    case resticUnavailable
 }

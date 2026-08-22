@@ -1,15 +1,36 @@
 import Foundation
 
-/// Minimal dependency-free SHA-256 for fingerprints that must be identical
-/// on macOS and the `swift:6.1` Linux container. The token store needs a
-/// collision-resistant config binding, but Core deliberately has no
-/// swift-crypto package dependency.
+#if canImport(CryptoKit)
+import CryptoKit
+#endif
+
+/// SHA-256 for fingerprints that must be identical on macOS and the
+/// `swift:6.1` Linux container. The token store needs a collision-resistant
+/// binding, but Core deliberately has no swift-crypto package dependency —
+/// hence the portable implementation below.
+///
+/// On Darwin it defers to CryptoKit, which is a system framework (no new
+/// dependency) and hardware-accelerated. That matters because these digests
+/// cover whole files: hashing the 28 MB restic binary for a maintenance
+/// binding costs ~0.2s through the Swift implementation in a release build
+/// and **~10s in a debug build**, which made one engine test take 40s. Both
+/// paths are pinned to the same published vectors by `sha256Vectors`.
 enum SHA256Digest {
     static func hex(_ data: Data) -> String {
         digest(data).map { String(format: "%02x", $0) }.joined()
     }
 
     static func digest(_ data: Data) -> [UInt8] {
+        #if canImport(CryptoKit)
+        return Array(CryptoKit.SHA256.hash(data: data))
+        #else
+        return portableDigest(data)
+        #endif
+    }
+
+    /// Exposed unconditionally so the vectors exercise it on every platform,
+    /// not only the one that lacks CryptoKit.
+    static func portableDigest(_ data: Data) -> [UInt8] {
         var message = Array(data)
         let bitLength = UInt64(message.count) &* 8
         message.append(0x80)

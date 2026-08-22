@@ -102,7 +102,7 @@ struct RunsShow: AsyncParsableCommand, JSONRenderable {
 
         if json {
             if log {
-                FileHandle.standardError.write(
+                StandardStream.writeToStandardError(
                     Data("--log has no effect with --json; the log is not part of the metadata shape\n".utf8)
                 )
             }

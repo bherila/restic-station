@@ -72,7 +72,29 @@ struct BackupEngineTests {
 
     // MARK: Fixed identifiers / clock
 
-    static let resticPath = "/opt/homebrew/bin/restic"
+    /// A **real file**, not merely a plausible path.
+    ///
+    /// `maintenanceExecutable()` hashes the bytes at this path, and since the
+    /// #109 exact-head fix a purge refuses to mint or honour a destructive
+    /// capability when it cannot identify a binary. A fixture path that only
+    /// looks like restic therefore passes on a dev Mac that happens to have
+    /// it installed at `/opt/homebrew/bin/restic` and fails in the Linux CI
+    /// container, which does not — the tests were silently depending on
+    /// ambient host state, and tolerating a nil identity is what hid it.
+    ///
+    /// Used for `argv[0]` as well, so the golden argv assertions keep
+    /// comparing the configured path against itself on both platforms.
+    static let resticPath: String = {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-fixture-restic", isDirectory: false)
+        if !FileManager.default.fileExists(atPath: url.path) {
+            FileManager.default.createFile(
+                atPath: url.path,
+                contents: Data("restic fixture binary".utf8)
+            )
+        }
+        return url.path
+    }()
     static let setId = UUID(uuidString: "6F9619FF-8B86-D011-B42D-00C04FC964FF")!
     static let primaryId = UUID(uuidString: "0A1B2C3D-8B86-D011-B42D-00C04FC964FF")!
     static let secondaryAId = UUID(uuidString: "1B2C3D4E-8B86-D011-B42D-00C04FC964FF")!
@@ -141,7 +163,11 @@ struct BackupEngineTests {
         onSpawn: (@Sendable ([String]) -> Void)? = nil,
         purgeSourcePaths: [UUID: Set<String>] = [:],
         purgeHostnames: [UUID: Set<String>] = [:],
-        machineId: String = "example-machine"
+        machineId: String = "example-machine",
+        /// Overridable so a test can point the engine at a binary it is
+        /// allowed to modify, and assert what happens when restic is
+        /// replaced mid-operation.
+        resticPath: String = BackupEngineTests.resticPath
     ) -> Env {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("restic-station-engine-\(UUID().uuidString)", isDirectory: true)
@@ -1742,6 +1768,235 @@ struct BackupEngineTests {
     /// tests deliberately build it from the captured snapshots fixture so
     /// the only ids a `rewrite --forget` can ever receive are the pure
     /// attribution result, never a caller-supplied filter.
+    /// The purge token binds the restic executable's identity, but binding is
+    /// only meaningful if the validated executable is the one that actually
+    /// receives `rewrite --forget`. It was not: the destructive child was
+    /// launched with an unpinned invocation, so a binary swapped after
+    /// validation — the window includes `currentPurgePlan`'s repository
+    /// queries, which are slow — would have run under an already-consumed
+    /// token.
+    @Test("runPurge: a restic replaced after validation never receives the rewrite")
+    func purgeApplyRefusesASwappedExecutable() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-swap-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fakeRestic = root.appendingPathComponent("restic", isDirectory: false)
+        try Data("original restic".utf8).write(to: fakeRestic)
+
+        let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]
+        let hostnames = [Self.setId: Set(["example-mac.local"])]
+        // Swap the binary from inside the `snapshots` spawn — i.e. *after*
+        // the token fingerprint has been revalidated (an earlier swap is
+        // already refused as `tokenDoesNotMatchCurrentPlan`) and while
+        // `currentPurgePlan` is querying the repository. Only a recheck at
+        // launch can catch this one.
+        let swapPath = fakeRestic.path
+        let env = Self.makeEnv(
+            script: [], retention: nil, purgeExcludes: ["build/**"], reachableSecondaries: [],
+            onSpawn: { argv in
+                guard argv.contains("snapshots") else { return }
+                try? Data("a different restic entirely".utf8)
+                    .write(to: URL(fileURLWithPath: swapPath))
+            },
+            purgeSourcePaths: sourcePaths, purgeHostnames: hostnames,
+            resticPath: fakeRestic.path
+        )
+        defer { env.cleanUp() }
+
+        let snapshotsJSON = try FixtureLoader.string("snapshots.json")
+        let snapshots = try parseSnapshots(Data(snapshotsJSON.utf8))
+        let plan = PurgePlan(
+            destinationId: env.primary.id, snapshots: snapshots,
+            sourcePaths: sourcePaths[Self.setId]!, hostnames: hostnames[Self.setId]!,
+            patterns: env.set.purgeExcludes
+        )
+        let token = try #require(try env.engine.issuePurgeToken(
+            set: env.set, destinations: [env.primary], plans: [plan]
+        ))
+
+        // Built against the injected path, not the shared `resticPath` helper.
+        env.fake.script = [
+            .init(
+                argvPrefix: [fakeRestic.path, "-r", env.primary.repoURL, "snapshots", "--json"],
+                stdoutLines: [snapshotsJSON]
+            ),
+        ]
+
+        let result = try await env.engine.runPurge(
+            set: env.set, destinations: [env.primary], token: token.value
+        )
+
+        #expect(result.status == .failed)
+        // The decisive assertion: no rewrite argv was ever produced.
+        #expect(!env.resticArgvs.contains { $0.contains("rewrite") })
+    }
+
+    // MARK: - #109 exact-head review: no unbound destructive capability
+
+    /// The token issuer used to accept a missing executable and fold it to
+    /// the literal `"none"`. A token minted that way bound no binary at all,
+    /// and an apply that also saw no restic recomputed the same `"none"`
+    /// fingerprint and matched — so a replacement appearing in between could
+    /// run `rewrite --forget` unpinned.
+    @Test("purge preview mints no token at all when restic has vanished")
+    func purgeTokenRefusesWithoutAnExecutable() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-purge-noexec-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fakeRestic = root.appendingPathComponent("restic", isDirectory: false)
+        try Data("original restic".utf8).write(to: fakeRestic)
+
+        let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]
+        let hostnames = [Self.setId: Set(["example-mac.local"])]
+        let env = Self.makeEnv(
+            script: [], retention: nil, purgeExcludes: ["build/**"], reachableSecondaries: [],
+            purgeSourcePaths: sourcePaths, purgeHostnames: hostnames,
+            resticPath: fakeRestic.path
+        )
+        defer { env.cleanUp() }
+
+        let snapshots = try parseSnapshots(Data(try FixtureLoader.string("snapshots.json").utf8))
+        let plan = PurgePlan(
+            destinationId: env.primary.id, snapshots: snapshots,
+            sourcePaths: sourcePaths[Self.setId]!, hostnames: hostnames[Self.setId]!,
+            patterns: env.set.purgeExcludes
+        )
+
+        // The preview queries have completed; restic disappears before the
+        // capability is minted. That is the window the finding describes.
+        try FileManager.default.removeItem(at: fakeRestic)
+
+        #expect(throws: PurgeApplyError.resticUnavailable) {
+            _ = try env.engine.issuePurgeToken(
+                set: env.set, destinations: [env.primary], plans: [plan]
+            )
+        }
+    }
+
+    /// The other half: even a token minted while restic existed must not be
+    /// honoured once it cannot be identified at apply time. Without this the
+    /// nil-bound fingerprint compared equal and `purgeChild` was launched
+    /// with no `expectedExecutableIdentity`.
+    @Test("purge apply refuses a token when restic cannot be identified")
+    func purgeApplyRefusesWithoutAnExecutable() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-purge-noexec2-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fakeRestic = root.appendingPathComponent("restic", isDirectory: false)
+        try Data("original restic".utf8).write(to: fakeRestic)
+
+        let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]
+        let hostnames = [Self.setId: Set(["example-mac.local"])]
+        let env = Self.makeEnv(
+            script: [], retention: nil, purgeExcludes: ["build/**"], reachableSecondaries: [],
+            purgeSourcePaths: sourcePaths, purgeHostnames: hostnames,
+            resticPath: fakeRestic.path
+        )
+        defer { env.cleanUp() }
+
+        let snapshots = try parseSnapshots(Data(try FixtureLoader.string("snapshots.json").utf8))
+        let plan = PurgePlan(
+            destinationId: env.primary.id, snapshots: snapshots,
+            sourcePaths: sourcePaths[Self.setId]!, hostnames: hostnames[Self.setId]!,
+            patterns: env.set.purgeExcludes
+        )
+        let token = try #require(try env.engine.issuePurgeToken(
+            set: env.set, destinations: [env.primary], plans: [plan]
+        ))
+
+        try FileManager.default.removeItem(at: fakeRestic)
+
+        await #expect(throws: PurgeApplyError.resticUnavailable) {
+            _ = try await env.engine.runPurge(
+                set: env.set, destinations: [env.primary], token: token.value
+            )
+        }
+        // The decisive assertion, as elsewhere in this suite: nothing
+        // destructive was ever spawned.
+        #expect(!env.resticArgvs.contains { $0.contains("rewrite") })
+    }
+
+    /// The pin added in `9d47b55` reads the executable identity through a
+    /// metadata-keyed cache. An updater that overwrites restic in place,
+    /// writes the same number of bytes and restores the original mtime
+    /// leaves device, inode, size and mtime untouched — so the cache key is
+    /// unchanged, the launch check compares the *previous* digest to itself,
+    /// and the replacement binary receives `rewrite --forget`.
+    ///
+    /// The mtime is pinned to a fixed whole-second value on **both** writes
+    /// rather than captured and restored. A captured mtime does not
+    /// round-trip: `setAttributes` loses sub-microsecond precision, so the
+    /// key changes, the cache misses, and the test passes without ever
+    /// exercising the path it is about. It did exactly that on first
+    /// writing.
+    @Test("a same-size, same-mtime in-place swap still fails the destructive launch check")
+    func purgeRefusesACacheDefeatingSwap() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-purge-swap-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fakeRestic = root.appendingPathComponent("restic", isDirectory: false)
+        let pinnedMtime = Date(timeIntervalSince1970: 1_700_000_000)
+        try Data("original restic!".utf8).write(to: fakeRestic)
+        try FileManager.default.setAttributes(
+            [.modificationDate: pinnedMtime], ofItemAtPath: fakeRestic.path
+        )
+
+        let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]
+        let hostnames = [Self.setId: Set(["example-mac.local"])]
+        let swapPath = fakeRestic.path
+        let env = Self.makeEnv(
+            script: [], retention: nil, purgeExcludes: ["build/**"], reachableSecondaries: [],
+            onSpawn: { argv in
+                guard argv.contains("snapshots") else { return }
+                // Same inode, same 16-byte length, same pinned mtime: every
+                // field of the cache key is identical to the entry the
+                // preview populated, so a cached lookup returns the *old*
+                // digest for genuinely different bytes.
+                let handle = FileHandle(forWritingAtPath: swapPath)
+                try? handle?.write(contentsOf: Data("a totally other!".utf8))
+                try? handle?.close()
+                try? FileManager.default.setAttributes(
+                    [.modificationDate: pinnedMtime], ofItemAtPath: swapPath
+                )
+            },
+            purgeSourcePaths: sourcePaths, purgeHostnames: hostnames,
+            resticPath: fakeRestic.path
+        )
+        defer { env.cleanUp() }
+
+        let snapshotsJSON = try FixtureLoader.string("snapshots.json")
+        let snapshots = try parseSnapshots(Data(snapshotsJSON.utf8))
+        let plan = PurgePlan(
+            destinationId: env.primary.id, snapshots: snapshots,
+            sourcePaths: sourcePaths[Self.setId]!, hostnames: hostnames[Self.setId]!,
+            patterns: env.set.purgeExcludes
+        )
+        let token = try #require(try env.engine.issuePurgeToken(
+            set: env.set, destinations: [env.primary], plans: [plan]
+        ))
+
+        env.fake.script = [
+            .init(
+                argvPrefix: [fakeRestic.path, "-r", env.primary.repoURL, "snapshots", "--json"],
+                stdoutLines: [snapshotsJSON]
+            ),
+        ]
+
+        let result = try await env.engine.runPurge(
+            set: env.set, destinations: [env.primary], token: token.value
+        )
+
+        #expect(result.status == .failed)
+        #expect(
+            !env.resticArgvs.contains { $0.contains("rewrite") },
+            "a cache-defeating in-place swap must not reach the destructive command"
+        )
+    }
+
     @Test("runPurge: a valid token revalidates ids, records rewrite mapping, and is single-use")
     func purgeApplyUsesTokenAndRecordsMapping() async throws {
         let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]

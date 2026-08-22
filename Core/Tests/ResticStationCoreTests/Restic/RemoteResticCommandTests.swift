@@ -52,6 +52,10 @@ import Testing
             #expect(argv.contains("ServerAliveCountMax=3"))
             #expect(argv.contains("BatchMode=yes"))
             #expect(argv.contains("ConnectTimeout=15"))
+            // Never `accept-new`: this channel carries the repository
+            // password, so trust-on-first-use hands it to whoever answers.
+            #expect(argv.contains("StrictHostKeyChecking=yes"))
+            #expect(!argv.contains("StrictHostKeyChecking=accept-new"))
         }
     }
 }

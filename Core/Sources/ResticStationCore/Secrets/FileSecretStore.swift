@@ -93,7 +93,7 @@ public struct FileSecretStore: SecretStore {
                 _ = path.withCString { chmod($0, mode) }
             },
             warningHandler: { message in
-                FileHandle.standardError.write(Data((message + "\n").utf8))
+                StandardStream.write(Data((message + "\n").utf8), to: .standardError)
             }
         )
     }

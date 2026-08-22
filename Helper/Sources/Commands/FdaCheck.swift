@@ -118,7 +118,7 @@ struct FdaCheck: AsyncParsableCommand, JSONRenderable {
         do {
             try stateStore.writeFdaCheck(result)
         } catch {
-            FileHandle.standardError.write(Data("fda-check: could not write state: \(error)\n".utf8))
+            StandardStream.write(Data("fda-check: could not write state: \(error)\n".utf8), to: .standardError)
         }
         return result
         #else

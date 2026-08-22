@@ -24,6 +24,22 @@ struct RunSet: AsyncParsableCommand {
     @Option(name: .long, help: "Which operation to run.")
     var kind: Kind = .backup
 
+    /// Refuse unless the **effective set** still matches what the caller
+    /// reviewed. The app sends this for **Apply retention now**, whose
+    /// preview is app-direct and therefore has no helper-issued token the
+    /// way `maintenance prune` does. Without it, a configuration change
+    /// landing between the dialog and the click — a hand edit, or this
+    /// fleet's config sync — silently applied a policy the operator never
+    /// saw to a destination list they were never shown.
+    ///
+    /// This binds the resolved set, machine identity, both configuration
+    /// files and the restic executable, not just `config.json`: the helper
+    /// resolves what it prunes from `machine.json` too, so hashing the
+    /// shared config alone left a real gap.
+    @Option(name: .long, parsing: .unconditional,
+            help: "Refuse unless the effective backup set still matches this fingerprint.")
+    var expectedConfig: String?
+
     func run() async throws {
         let context = try await HelperContext.make()
         // `scheduled`: backup, check and prune are all things this machine
@@ -49,8 +65,49 @@ struct RunSet: AsyncParsableCommand {
             let status = await context.engine.runCheck(backupSet, trigger: .manual)
             handle(status, kind: .check, setId: backupSet.id, since: before, context: context)
         case .prune:
+            // Checked against the set the engine is about to receive, after
+            // the context has resolved it — not against a separately re-read
+            // file, which would leave the decoded value and the hashed value
+            // as two different snapshots.
+            var pinnedExecutable: String?
+            if let expectedConfig {
+                // Required, not optional. Encoding `nil` on both sides makes
+                // the fingerprints match while binding no executable at all —
+                // the check would pass and authorize an unpinned launch.
+                guard let executable = context.restic.maintenanceExecutable() else {
+                    throw CLIFailure(
+                        code: .resticNotFound,
+                        message: "The configured restic executable could not be read, so this "
+                            + "operation cannot be bound to it. Recheck restic and try again.",
+                        details: CLIErrorDetails(setId: set)
+                    )
+                }
+                let store = ConfigStore(paths: context.paths)
+                let snapshot = try? store.snapshot()
+                let current = MaintenanceBinding.effectiveSetFingerprint(
+                    machineId: context.scheduled.machineId,
+                    set: backupSet,
+                    configFingerprint: snapshot?.fingerprint ?? "unreadable",
+                    machineFingerprint: store.machineFileFingerprint(),
+                    resticExecutableIdentity: executable.identity
+                )
+                guard current == expectedConfig else {
+                    throw CLIFailure(
+                        code: .operationNotAllowed,
+                        message: "The configuration changed after this operation was reviewed. "
+                            + "Review the updated settings and try again.",
+                        details: CLIErrorDetails(setId: set)
+                    )
+                }
+                // Carried to every `forget --prune` below, so the binary that
+                // was validated is the binary that runs.
+                pinnedExecutable = executable.identity
+            }
             let before = Date()
-            let status = await context.engine.runPrune(backupSet)
+            let status = await context.engine.runPrune(
+                backupSet,
+                expectedExecutableIdentity: pinnedExecutable
+            )
             handle(status, kind: .prune, setId: backupSet.id, since: before, context: context)
         }
     }

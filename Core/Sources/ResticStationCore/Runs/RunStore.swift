@@ -547,5 +547,5 @@ public struct RunStore: Sendable {
 }
 
 private func warn(_ message: String) {
-    FileHandle.standardError.write(Data((message + "\n").utf8))
+    StandardStream.write(Data((message + "\n").utf8), to: .standardError)
 }

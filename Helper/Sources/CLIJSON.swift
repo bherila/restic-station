@@ -30,8 +30,8 @@ enum CLIJSON {
     static func print<T: Encodable>(_ value: T) {
         do {
             let data = try ConfigStore.makeEncoder().encode(CLISuccessEnvelope(value))
-            FileHandle.standardOutput.write(data)
-            FileHandle.standardOutput.write(Data("\n".utf8))
+            StandardStream.write(data, to: .standardOutput)
+            StandardStream.write(Data("\n".utf8), to: .standardOutput)
         } catch {
             // Encoding one of these value types failing is a programmer
             // error (they are plain Codable structs of strings/numbers/

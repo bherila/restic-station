@@ -25,6 +25,18 @@ struct PreviewTokenStoreTests {
         }
     }
 
+    /// Both implementations, on every platform. `digest` uses CryptoKit where
+    /// it exists, so without this the portable path would go unexercised on
+    /// macOS — and it is the one that runs in the Linux container.
+    @Test("both SHA-256 implementations agree, and match published vectors")
+    func portableAndPlatformDigestsAgree() {
+        for sample in [Data(), Data("abc".utf8),
+                       Data(repeating: 0x61, count: 55), Data(repeating: 0x61, count: 56),
+                       Data(repeating: 0x61, count: 64), Data(repeating: 0x61, count: 1000)] {
+            #expect(SHA256Digest.digest(sample) == SHA256Digest.portableDigest(sample))
+        }
+    }
+
     @Test("SHA-256 config fingerprint primitive matches published vectors")
     func sha256Vectors() {
         #expect(SHA256Digest.hex(Data()) == "e3b0c44298fc1c149afbf4c8996fb924"
@@ -65,7 +77,8 @@ struct PreviewTokenStoreTests {
             setId: setId,
             destinations: [PreviewTokenDestination(destinationId: destinationId, snapshotIDs: ["b", "a"])],
             config: config,
-            patterns: ["DerivedData"]
+            patterns: ["DerivedData"],
+            executableIdentity: "restic-under-test"
         )
 
         #expect(token.value.count >= 43, "a URL-safe encoding of 256 random bits")
@@ -126,9 +139,61 @@ struct PreviewTokenStoreTests {
             destinations: [PreviewTokenDestination(destinationId: destinationId, snapshotIDs: [])],
             config: config,
             patterns: ["DerivedData"],
+            executableIdentity: "restic-under-test",
             lifetime: 1
         )
         clock.advance(1)
         #expect(throws: PreviewTokenError.expired) { try store.token(expiring.value) }
+    }
+
+    /// The app previews Apply Retention and the helper executes it in two
+    /// different processes; they must derive byte-identical fingerprints from
+    /// the same state, and must diverge whenever anything the helper resolves
+    /// from has changed.
+    @Test("the effective-set binding matches across processes and moves with every input")
+    func effectiveSetBindingIsStableAndComplete() {
+        let destination = Destination(id: UUID(), label: "Primary", repoURL: "/repo", isPrimary: true)
+        let set = BackupSet(
+            id: UUID(), name: "Docs", sources: ["/Users/example/Docs"],
+            schedule: .daily(hour: 2, minute: 0),
+            retention: RetentionPolicy(keepLast: 3),
+            destinations: [destination]
+        )
+        func fingerprint(
+            machineId: String = "example-mac",
+            set: BackupSet = set,
+            config: String = "config-a",
+            machine: String = "machine-a",
+            identity: String? = "restic-a"
+        ) -> String {
+            MaintenanceBinding.effectiveSetFingerprint(
+                machineId: machineId, set: set,
+                configFingerprint: config, machineFingerprint: machine,
+                resticExecutableIdentity: identity
+            )
+        }
+
+        // Same inputs, independently computed — the cross-process contract.
+        #expect(fingerprint() == fingerprint())
+
+        // Every input must move it. `machineFingerprint` is the one the
+        // shared-config-only binding missed: machine.json decides which
+        // overrides apply and which destinations are enabled here.
+        #expect(fingerprint() != fingerprint(machineId: "other-mac"))
+        #expect(fingerprint() != fingerprint(config: "config-b"))
+        #expect(fingerprint() != fingerprint(machine: "machine-b"))
+        #expect(fingerprint() != fingerprint(identity: "restic-b"))
+
+        // A dropped destination — exactly what scheduling-scope resolution
+        // does to a destination disabled on this machine — must not compare
+        // equal to the set that still has it.
+        var withoutDestination = set
+        withoutDestination.destinations = []
+        #expect(fingerprint() != fingerprint(set: withoutDestination))
+
+        // And a changed retention policy, since that is what gets applied.
+        var otherPolicy = set
+        otherPolicy.retention = RetentionPolicy(keepLast: 9)
+        #expect(fingerprint() != fingerprint(set: otherPolicy))
     }
 }

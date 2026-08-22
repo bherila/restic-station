@@ -424,4 +424,49 @@ struct StateStoreTests {
         formatter.formatOptions = [.withInternetDateTime]
         return formatter.date(from: iso)!
     }
+
+    /// `schedule-state.json` is one document shared by every set, while the
+    /// only other lock is per-set — so two helper processes working on
+    /// *different* sets take no common lock and each rewrite the whole file.
+    /// Without the companion lock, one reads before the other's write and
+    /// writes after it, silently discarding the other's entry. That entry now
+    /// carries `appliedPurgeExcludes`, i.e. destructive bookkeeping.
+    ///
+    /// Interleaved deliberately: each mutation sleeps inside the critical
+    /// section, so a read-modify-write that is not held under a lock will
+    /// overlap and lose an entry essentially every run.
+    @Test("concurrent updates for different sets do not lose one another")
+    func concurrentScheduleStateUpdatesDoNotLoseEntries() throws {
+        let (store, root) = makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let setIds = (0..<8).map { _ in UUID() }
+        // Dedicated threads, deliberately not a `TaskGroup` and not the
+        // global concurrent queue.
+        //
+        // `updateScheduleState` blocks — it sleeps between lock attempts —
+        // and the writers sleep inside the critical section on purpose to
+        // widen the read/write window. Blocking Swift Concurrency's
+        // cooperative pool starves it, so the lock holder cannot be scheduled
+        // to release and waiters spin to the timeout. Blocking the global
+        // dispatch pool is nearly as rude: it is shared with Foundation's own
+        // machinery, including `Process`, and this suite spawns subprocesses
+        // concurrently. Owning the threads keeps the pressure local to this
+        // test.
+        let threads = setIds.enumerated().map { index, setId in
+            Thread {
+                try? store.updateScheduleState(setId: setId) { entry in
+                    usleep(20_000)
+                    entry.checkSliceCursor = index
+                }
+            }
+        }
+        threads.forEach { $0.start() }
+        while threads.contains(where: { !$0.isFinished }) { usleep(2_000) }
+
+        let state = try #require(store.readScheduleState())
+        for (index, setId) in setIds.enumerated() {
+            #expect(state.sets[setId]?.checkSliceCursor == index, "lost the entry for set \(index)")
+        }
+    }
 }

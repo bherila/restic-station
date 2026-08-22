@@ -92,7 +92,7 @@ struct ProbeRepo: AsyncParsableCommand, JSONRenderable {
                 }
             }
         } catch {
-            FileHandle.standardError.write(Data("probe-repo: could not write repo-status: \(error)\n".utf8))
+            StandardStream.write(Data("probe-repo: could not write repo-status: \(error)\n".utf8), to: .standardError)
         }
 
         let outcome: Report.Outcome

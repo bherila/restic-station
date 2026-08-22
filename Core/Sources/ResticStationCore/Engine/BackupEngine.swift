@@ -557,7 +557,20 @@ public final class BackupEngine: Sendable {
     ///
     /// A dry run first is the UI's job (`ResticCommand.forget(dryRun:)`);
     /// this is the real one.
-    public func runPrune(_ set: BackupSet) async -> RunStatus {
+    /// `expectedExecutableIdentity` binds every `forget --prune` this call
+    /// makes to one restic binary. It is what makes the caller's fingerprint
+    /// check more than advisory: validating the executable and then launching
+    /// unpinned leaves a window — across the lock acquisition and every
+    /// earlier destination — in which a replacement receives the destructive
+    /// command instead.
+    ///
+    /// `nil` means the caller made no such promise, which is the scheduled
+    /// path. A *bound* caller must pass a real identity and refuse if it
+    /// cannot read one; see `RunSet`.
+    public func runPrune(
+        _ set: BackupSet,
+        expectedExecutableIdentity: String? = nil
+    ) async -> RunStatus {
         guard let primary = set.destinations.first(where: { $0.isPrimary }) else {
             logWarning("BackupEngine: backup set \"\(set.name)\" has no primary destination — cannot prune")
             return .failed
@@ -587,7 +600,8 @@ public final class BackupEngine: Sendable {
             policy: retention,
             setId: set.id,
             trigger: .manual,
-            groupId: nil
+            groupId: nil,
+            expectedExecutableIdentity: expectedExecutableIdentity
         ) else {
             return .skipped
         }
@@ -616,7 +630,8 @@ public final class BackupEngine: Sendable {
                 policy: retention,
                 setId: set.id,
                 trigger: .manual,
-                groupId: groupId
+                groupId: groupId,
+                expectedExecutableIdentity: expectedExecutableIdentity
             ) {
                 statuses.append(prune.child.status)
             }
@@ -987,12 +1002,20 @@ public final class BackupEngine: Sendable {
             )
         }
         guard tokenDestinations.contains(where: { !$0.snapshotIDs.isEmpty }) else { return nil }
+        // Thrown, not `return nil`. `nil` from this method means "there is
+        // nothing destructive to do", and a restic binary that cannot be
+        // identified is emphatically not that — returning nil would report
+        // an empty plan for a set that has one.
+        guard let executable = restic.maintenanceExecutable() else {
+            throw PurgeApplyError.resticUnavailable
+        }
         return try previewTokens.issue(
             machineId: machineId,
             setId: set.id,
             destinations: tokenDestinations,
             config: config,
-            patterns: set.purgeExcludes
+            patterns: set.purgeExcludes,
+            executableIdentity: executable.identity
         )
     }
 
@@ -1050,9 +1073,21 @@ public final class BackupEngine: Sendable {
 
         let requestedIds = Set(destinations.map(\.id))
         let tokenIds = Set(preview.destinations.map(\.destinationId))
+        // Resolved once and carried all the way to the launch, so the value
+        // that is validated is the value that runs — and *required*, because
+        // a nil on both sides used to compare equal while binding nothing.
+        guard let executable = restic.maintenanceExecutable() else {
+            throw PurgeApplyError.resticUnavailable
+        }
         let fingerprint: String
         do {
-            fingerprint = try PreviewTokenStore.configFingerprint(config)
+            // Recomputed here, from the executable this process would
+            // actually run: a token issued against a different restic binary
+            // must not authorize a rewrite by this one.
+            fingerprint = try PreviewTokenStore.purgeFingerprint(
+                config,
+                executableIdentity: executable.identity
+            )
         } catch {
             throw PurgeApplyError.unavailable
         }
@@ -1115,7 +1150,8 @@ public final class BackupEngine: Sendable {
                 patterns: preview.patterns,
                 setId: set.id,
                 trigger: trigger,
-                groupId: resolvedGroupId
+                groupId: resolvedGroupId,
+                executable: executable
             ) else {
                 return PurgeRunResult(status: .failed, children: children)
             }
@@ -1171,7 +1207,8 @@ public final class BackupEngine: Sendable {
         patterns: [String],
         setId: UUID,
         trigger: RunTrigger,
-        groupId: String?
+        groupId: String?,
+        executable: ResticRunner.MaintenanceExecutable
     ) async -> ChildRun? {
         let fullIDByShortID = Dictionary(
             snapshotIDs.map { (String($0.prefix(8)), $0) },
@@ -1190,7 +1227,22 @@ public final class BackupEngine: Sendable {
                 excludes: patterns,
                 forget: true
             ),
-            invocation: ResticInvocation(destination: destination),
+            // Pin the executable the token was validated against. Without
+            // this the fingerprint check was advisory: restic could be
+            // replaced between validation and launch — the window includes
+            // `currentPurgePlan`'s repository queries, which are slow — and
+            // the replacement would run `rewrite --forget` under an
+            // already-consumed token. `ResticRunner` rechecks the identity
+            // immediately before it spawns.
+            //
+            // Identity only, deliberately no `resticPathOverride`: the runner
+            // resolves symlinks when it recomputes, so a retargeted link
+            // still fails the check, while `argv[0]` stays the configured
+            // path the golden argv tests and `docs/restic-cli.md` describe.
+            invocation: ResticInvocation(
+                destination: destination,
+                expectedExecutableIdentity: executable.identity
+            ),
             streamProgress: false,
             purgeSnapshotRewrites: { outcome in
                 Dictionary(uniqueKeysWithValues: parseRewrite(outcome.rawOutput).snapshots.compactMap { rewrite in
@@ -1220,6 +1272,9 @@ public final class BackupEngine: Sendable {
     ) async throws -> PurgeRunResult {
         guard await secretsAvailable(for: [destination]) else { throw PurgeApplyError.unavailable }
         let plan = try await currentPurgePlan(set: set, destination: destination, patterns: patterns)
+        guard let executable = restic.maintenanceExecutable() else {
+            throw PurgeApplyError.resticUnavailable
+        }
         let token: PreviewToken
         do {
             token = try previewTokens.issue(
@@ -1227,8 +1282,11 @@ public final class BackupEngine: Sendable {
                 setId: set.id,
                 destinations: [PreviewTokenDestination(destinationId: destination.id, snapshotIDs: plan.matched.map(\.id))],
                 config: config,
-                patterns: patterns
+                patterns: patterns,
+                executableIdentity: executable.identity
             )
+        } catch let error as PurgeApplyError {
+            throw error
         } catch {
             throw PurgeApplyError.unavailable
         }
@@ -1355,7 +1413,13 @@ public final class BackupEngine: Sendable {
         policy: RetentionPolicy?,
         setId: UUID,
         trigger: RunTrigger,
-        groupId: String?
+        groupId: String?,
+        /// Non-nil when the caller authorized this operation against a
+        /// specific restic binary. `ResticRunner` rechecks it immediately
+        /// before spawning, so a binary replaced after authorization — the
+        /// window spans every earlier destination in a multi-destination
+        /// prune — never receives `forget --prune`.
+        expectedExecutableIdentity: String? = nil
     ) async -> ChildRun? {
         guard let policy, !policy.isEmpty else {
             return nil
@@ -1368,7 +1432,10 @@ public final class BackupEngine: Sendable {
             groupId: groupId,
             phase: "retention",
             command: .forget(repo: destination.repoURL, policy: policy, prune: true),
-            invocation: ResticInvocation(destination: destination),
+            invocation: ResticInvocation(
+                destination: destination,
+                expectedExecutableIdentity: expectedExecutableIdentity
+            ),
             streamProgress: false
         )
     }
@@ -2171,5 +2238,5 @@ final class ProgressReporter: @unchecked Sendable {
 // MARK: - Logging
 
 private func logWarning(_ message: String) {
-    FileHandle.standardError.write(Data((message + "\n").utf8))
+    StandardStream.write(Data((message + "\n").utf8), to: .standardError)
 }

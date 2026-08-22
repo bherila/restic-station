@@ -27,6 +27,14 @@ struct RetentionSection: View {
         return !retention.isEmpty
     }
 
+    /// **Apply retention now** goes through `run-set --kind prune`, which
+    /// resolves the *scheduling* view. A set disabled on this machine is not
+    /// in that view at all, so the helper would refuse — better to say so
+    /// than to offer a destructive button that cannot work.
+    private var runsOnThisMachine: Bool {
+        MaintenanceModel.scheduledSet(model, id: backupSet.id) != nil
+    }
+
     private var isPruning: Bool {
         maintenance.isBusy(.prune(setId: backupSet.id))
     }
@@ -119,8 +127,11 @@ struct RetentionSection: View {
                         Label("Apply retention now", systemImage: "trash")
                     }
                 }
-                .disabled(!hasPolicy || isPruning || maintenance.isPreparingPrune || isPreviewing)
-                .help("Runs the retention policy. It permanently deletes snapshots the policy no longer keeps.")
+                .disabled(!hasPolicy || !runsOnThisMachine || isPruning
+                    || maintenance.isPreparingPrune || isPreviewing)
+                .help(runsOnThisMachine
+                    ? "Runs the retention policy. It permanently deletes snapshots the policy no longer keeps."
+                    : "This backup set does not run on this machine, so retention cannot be applied here.")
 
                 Menu {
                     ForEach(backupSet.destinations) { destination in

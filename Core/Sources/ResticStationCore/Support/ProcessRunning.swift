@@ -83,52 +83,22 @@ public extension ProcessRunning {
 /// work on Linux via swift-corelibs-foundation) plus `kill(2)` for signaling,
 /// imported from `Darwin` or `Glibc` depending on platform.
 public struct DefaultProcessRunner: ProcessRunning {
-    public init() {}
-
-    /// Serializes the SIGPIPE window below against every `posix_spawn`.
-    ///
-    /// The disposition is process-wide state, and POSIX preserves an
-    /// *ignored* disposition across `exec`. swift-corelibs-foundation does
-    /// not reset child dispositions (macOS's Foundation happens to, which
-    /// hides this locally), so a child spawned while SIGPIPE is ignored
-    /// inherits that and no longer dies on a broken pipe. Holding this lock
-    /// across both the spawn and the window makes that overlap impossible.
-    private static let spawnLock = NSLock()
-
-    /// Runs `body` with SIGPIPE ignored, then restores the previous
-    /// disposition.
-    ///
-    /// Writing to a subprocess pipe whose read end is already closed raises
-    /// SIGPIPE, whose default disposition terminates the process. A helper
-    /// that dies that way in the middle of a destructive maintenance command
-    /// leaves no run record and no diagnosis.
-    ///
-    /// The signal is raised synchronously on the writing thread, so the
-    /// window only has to cover this call. It is deliberately not left
-    /// installed process-wide: see ``spawnLock``, and
-    /// `childrenKeepTheDefaultSIGPIPEDisposition`, which fails on Linux
-    /// against a permanent `signal(SIGPIPE, SIG_IGN)`.
-    private static func withSIGPIPEIgnored<T>(_ body: () -> T) -> T {
-        spawnLock.lock()
-        let previous = signal(SIGPIPE, SIG_IGN)
-        defer {
-            // C function pointers are not Equatable; compare the raw bit
-            // patterns so a failed `signal` is never restored as a handler.
-            if unsafeBitCast(previous, to: UInt.self) != unsafeBitCast(SIG_ERR, to: UInt.self) {
-                signal(SIGPIPE, previous)
-            }
-            spawnLock.unlock()
-        }
-        return body()
+    public init() {
+        // Install before anything can spawn, rather than lazily inside the
+        // call that also spawns. `static let` initialization is thread-safe,
+        // but doing it at first use leaves one window where a thread is
+        // inside `posix_spawn` — which reads the process's signal
+        // dispositions — while another installs the handler. Nothing is known
+        // to have gone wrong there, but the ordering is free.
+        SIGPIPEGuard.ensureInstalled()
     }
 
-    /// Spawns under ``spawnLock``. Synchronous on purpose: `NSLock` is
-    /// unavailable from an async context, and the critical section must not
-    /// suspend anyway.
+    private static func withSIGPIPEIgnored<T>(_ body: () -> T) -> T {
+        SIGPIPEGuard.withIgnored(body)
+    }
+
     private static func launch(_ process: Process) throws {
-        spawnLock.lock()
-        defer { spawnLock.unlock() }
-        try process.run()
+        try SIGPIPEGuard.launch(process)
     }
 
     public func run(
@@ -400,5 +370,51 @@ private actor TimeoutFlag {
 
     func trigger() {
         triggered = true
+    }
+}
+
+/// Keeps a broken pipe from killing this process, without changing what any
+/// child inherits.
+///
+/// Installed **once**, permanently, as a no-op *handler* — deliberately not
+/// `SIG_IGN`. POSIX resets signals "set to be caught" to the default action on
+/// `exec`, while it preserves an *ignored* disposition. So a handler protects
+/// this process and every child still dies on a broken pipe exactly as before,
+/// with no window to serialize and no lock to contend on.
+///
+/// Both halves rest on deterministic experiments, not inference:
+///
+/// - A permanent `SIG_IGN` **does** leak. Linux CI failed
+///   `childrenKeepTheDefaultSIGPIPEDisposition` against it — the child printed
+///   `survived` and exited 0 — because swift-corelibs-foundation does not
+///   reset child dispositions, though macOS's Foundation does, which hides it
+///   locally.
+/// - A no-op handler does **not** leak: with one installed, a spawned
+///   `kill -PIPE $$; echo survived` still exits with signal 13 and prints
+///   nothing, while a write to a closed pipe in this process throws `EPIPE`
+///   instead of dying.
+/// - `pthread_sigmask` around the write is not sufficient on its own; that was
+///   tried first and the process still died.
+enum SIGPIPEGuard {
+    /// `Void` static: the runtime guarantees exactly one initialization,
+    /// whichever thread gets there first.
+    private static let installed: Void = {
+        _ = signal(SIGPIPE, { _ in })
+    }()
+
+    /// Forces installation at a deterministic point, before any subprocess
+    /// work begins.
+    static func ensureInstalled() {
+        _ = installed
+    }
+
+    static func withIgnored<T>(_ body: () -> T) -> T {
+        _ = installed
+        return body()
+    }
+
+    static func launch(_ process: Process) throws {
+        _ = installed
+        try process.run()
     }
 }
