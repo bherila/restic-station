@@ -24,6 +24,7 @@ final class FakeSecretStore: SecretStore, @unchecked Sendable {
     private var _failingPasswords: Set<UUID> = []
     private var _failingSecretEnvs: Set<UUID> = []
     private let defaultPassword: String?
+    private let onPasswordRead: (@Sendable (UUID) -> Void)?
 
     /// Which backend this fake stands in for. Defaults to the platform's, so
     /// a test that does not care gets the wording a real host would produce.
@@ -37,10 +38,12 @@ final class FakeSecretStore: SecretStore, @unchecked Sendable {
     ///     wording derived from it.
     init(
         defaultPassword: String? = FakeSecretStore.standardPassword,
-        backend: SecretBackend = .platformDefault
+        backend: SecretBackend = .platformDefault,
+        onPasswordRead: (@Sendable (UUID) -> Void)? = nil
     ) {
         self.defaultPassword = defaultPassword
         self.backend = backend
+        self.onPasswordRead = onPasswordRead
     }
 
     // MARK: - Test configuration
@@ -72,6 +75,7 @@ final class FakeSecretStore: SecretStore, @unchecked Sendable {
     }
 
     func password(destId: UUID) async throws -> String {
+        onPasswordRead?(destId)
         let outcome: Result<String, SecretStoreError> = withLock {
             if _failingPasswords.contains(destId) {
                 return .failure(.backendFailed("fake: password read failed"))

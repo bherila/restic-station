@@ -115,18 +115,31 @@ struct PurgePreview: AsyncParsableCommand, JSONRenderable {
             destinations = backupSet.destinations
         }
 
-        var results: [(destination: Destination, result: PurgePlanResult)] = []
-        for destination in destinations {
-            let result = await context.engine.previewPurge(set: backupSet, destination: destination)
-            try Self.validate(result: result, setId: set, destination: destination)
-            results.append((destination, result))
+        // One session, so every destination's transcript and the token that
+        // follows them describe the same restic binary. Previewing each
+        // destination here and attaching an identity afterwards is exactly
+        // the ordering #118 removed.
+        let session: PurgePreviewSession
+        do {
+            session = try await context.engine.previewPurgeSession(
+                set: backupSet,
+                destinations: destinations
+            )
+        } catch {
+            // Classified, not rethrown bare. `PurgeApplyError` means nothing
+            // to the generic mapper, which lands every case on
+            // `internal_error` — so "restic is missing" reached the operator
+            // as an internal fault, in the one command whose entire job is
+            // to tell them what is about to happen.
+            throw CLIFailure.classifyPurgeOperation(error, setId: set)
         }
-        let previewToken = try context.engine.issuePurgeToken(
-            set: backupSet,
-            destinations: results.map(\.destination),
-            plans: results.map { $0.result.plan }
-        )?.value
-        let reports = results.map {
+        // The session stops at the first destination that did not finish, so
+        // this reports that destination's failure and never a later one's.
+        for preview in session.previews {
+            try Self.validate(result: preview.result, setId: set, destination: preview.destination)
+        }
+        let previewToken = session.token?.value
+        let reports = session.previews.map {
             Report(setId: set, destination: $0.destination, result: $0.result, previewToken: previewToken)
         }
 
@@ -254,7 +267,7 @@ struct PurgeApply: AsyncParsableCommand, JSONRenderable {
         do {
             destinationIDs = try context.engine.purgeTokenDestinationIDs(previewToken)
         } catch {
-            throw CLIFailure.classifyPurgeApply(error, setId: set)
+            throw CLIFailure.classifyPurgeOperation(error, setId: set)
         }
         let destinations = destinationIDs.compactMap { id in
             backupSet.destinations.first(where: { $0.id == id })
@@ -275,7 +288,7 @@ struct PurgeApply: AsyncParsableCommand, JSONRenderable {
                 token: previewToken
             )
         } catch {
-            throw CLIFailure.classifyPurgeApply(error, setId: set)
+            throw CLIFailure.classifyPurgeOperation(error, setId: set)
         }
 
         guard result.status == .success else {
