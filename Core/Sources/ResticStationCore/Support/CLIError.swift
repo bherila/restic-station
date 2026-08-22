@@ -394,7 +394,13 @@ extension CLIFailure {
     /// Error mapping for token-gated destructive operations. Token material
     /// never reaches the envelope; ids make the refusal actionable without
     /// disclosing a capability or repository path.
-    public static func classifyPurgeApply(_ error: any Error, setId: UUID) -> CLIFailure {
+    ///
+    /// Named for the whole purge *operation*, not just apply: `purge
+    /// preview` mints the capability and so raises the same errors. While
+    /// this was called `classifyPurgeApply` the preview command did not
+    /// call it at all, and reported a missing restic binary as
+    /// `internal_error` (#118).
+    public static func classifyPurgeOperation(_ error: any Error, setId: UUID) -> CLIFailure {
         guard let purgeError = error as? PurgeApplyError else {
             return classify(error)
         }

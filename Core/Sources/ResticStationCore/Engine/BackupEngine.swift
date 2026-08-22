@@ -918,7 +918,19 @@ public final class BackupEngine: Sendable {
     /// `cat config` where needed, `snapshots --json`, and `rewrite --dry-run`.
     /// In particular, this method cannot reach `rewrite --forget`, `prune`, or
     /// the run-record machinery.
-    public func previewPurge(set: BackupSet, destination: Destination) async -> PurgePlanResult {
+    ///
+    /// `executable` is the binary this preview is *attributed to*: both
+    /// queries are pinned to it, so a transcript can only be produced by the
+    /// program the resulting token will name.  Deliberately not resolved
+    /// here — one preview pass over several destinations must be one binary,
+    /// which only the caller above can guarantee, so
+    /// ``previewPurgeSession(set:destinations:)`` is the entry point and
+    /// this is internal (#118).
+    func previewPurge(
+        set: BackupSet,
+        destination: Destination,
+        executable: ResticRunner.MaintenanceExecutable
+    ) async -> PurgePlanResult {
         let emptyPlan = PurgePlan(
             destinationId: destination.id,
             snapshots: [],
@@ -977,7 +989,10 @@ public final class BackupEngine: Sendable {
         do {
             snapshotsOutcome = try await restic.run(
                 .snapshots(repo: destination.repoURL),
-                for: ResticInvocation(destination: destination)
+                for: ResticInvocation(
+                    destination: destination,
+                    expectedExecutableIdentity: executable.identity
+                )
             )
         } catch {
             return PurgePlanResult(plan: emptyPlan, status: .failed, message: "could not list snapshots: \(error)")
@@ -1021,7 +1036,10 @@ public final class BackupEngine: Sendable {
                     excludes: plan.patterns,
                     dryRun: true
                 ),
-                for: ResticInvocation(destination: destination)
+                for: ResticInvocation(
+                    destination: destination,
+                    expectedExecutableIdentity: executable.identity
+                )
             )
         } catch {
             return PurgePlanResult(plan: plan, status: .failed, message: "could not preview rewrite: \(error)")
@@ -1039,12 +1057,64 @@ public final class BackupEngine: Sendable {
         return PurgePlanResult(plan: plan, changed: changed, rewrite: rewrite, status: .ready)
     }
 
+    /// Previews a purge across `destinations` and mints the capability for
+    /// what it found — the only public way to obtain a purge token.
+    ///
+    /// The restic executable is resolved **once, before the first query**,
+    /// and that one identity pins every preview command and binds the token.
+    /// #109 bound the token to the executable observed *after* the previews
+    /// had run, which left a real gap: a binary replaced between the last
+    /// dry-run and issuance produced a transcript from one program and a
+    /// capability naming another.  Multi-destination made that window wide
+    /// rather than theoretical, because issuance waited for every
+    /// destination's network round trips (#118).
+    ///
+    /// A destination that does not finish its preview ends the pass with no
+    /// token: a capability must never describe a plan the operator could not
+    /// be shown in full.  The caller still sees the partial results and
+    /// reports the failure from them.
+    public func previewPurgeSession(
+        set: BackupSet,
+        destinations: [Destination]
+    ) async throws -> PurgePreviewSession {
+        // Before any query, so there is no window in which a preview could
+        // have been produced by a binary this pass never identified.
+        guard let executable = restic.maintenanceExecutable() else {
+            throw PurgeApplyError.resticUnavailable
+        }
+        var previews: [PurgePreviewSession.DestinationPreview] = []
+        for destination in destinations {
+            let result = await previewPurge(set: set, destination: destination, executable: executable)
+            previews.append(PurgePreviewSession.DestinationPreview(destination: destination, result: result))
+            switch result.status {
+            case .empty, .ready:
+                continue
+            case .busy, .offline, .failed:
+                return PurgePreviewSession(previews: previews, token: nil)
+            }
+        }
+        return PurgePreviewSession(
+            previews: previews,
+            token: try issuePurgeToken(
+                set: set,
+                destinations: previews.map(\.destination),
+                plans: previews.map(\.result.plan),
+                executable: executable
+            )
+        )
+    }
+
     /// Stores the approved result of one or more successful purge previews.
     /// An empty plan gets no capability: there is nothing destructive to do.
-    public func issuePurgeToken(
+    ///
+    /// `executable` is passed in rather than resolved, so this cannot bind a
+    /// capability to a binary that did not produce `plans`.  Internal for the
+    /// same reason ``previewPurge`` is: the pairing is the guarantee.
+    func issuePurgeToken(
         set: BackupSet,
         destinations: [Destination],
-        plans: [PurgePlan]
+        plans: [PurgePlan],
+        executable: ResticRunner.MaintenanceExecutable
     ) throws -> PreviewToken? {
         guard !set.purgeExcludes.isEmpty, destinations.count == plans.count else { return nil }
         guard Set(plans.map(\.destinationId)).count == plans.count else { return nil }
@@ -1060,21 +1130,24 @@ public final class BackupEngine: Sendable {
             )
         }
         guard tokenDestinations.contains(where: { !$0.snapshotIDs.isEmpty }) else { return nil }
-        // Thrown, not `return nil`. `nil` from this method means "there is
-        // nothing destructive to do", and a restic binary that cannot be
-        // identified is emphatically not that — returning nil would report
-        // an empty plan for a set that has one.
-        guard let executable = restic.maintenanceExecutable() else {
-            throw PurgeApplyError.resticUnavailable
+        // Wrapped exactly as `runPurgeLocked` wraps its own token reads. A
+        // bare `PreviewTokenError` means nothing to `classifyPurgeOperation`,
+        // so an unusable confirmation store reached the operator as
+        // `internal_error` — losing the specific "check the permissions on
+        // the data directory" advice #117 added, on the one path where the
+        // store is being *written* and is therefore likeliest to be broken.
+        do {
+            return try previewTokens.issue(
+                machineId: machineId,
+                setId: set.id,
+                destinations: tokenDestinations,
+                config: config,
+                patterns: set.purgeExcludes,
+                executableIdentity: executable.identity
+            )
+        } catch let error as PreviewTokenError {
+            throw PurgeApplyError.token(error)
         }
-        return try previewTokens.issue(
-            machineId: machineId,
-            setId: set.id,
-            destinations: tokenDestinations,
-            config: config,
-            patterns: set.purgeExcludes,
-            executableIdentity: executable.identity
-        )
     }
 
     /// Lets the helper choose exactly the destinations an opaque token bound.
@@ -1174,7 +1247,8 @@ public final class BackupEngine: Sendable {
             let plan = try await currentPurgePlan(
                 set: set,
                 destination: destination,
-                patterns: preview.patterns
+                patterns: preview.patterns,
+                executable: executable
             )
             guard let tokenDestination = preview.destinations.first(where: { $0.destinationId == destination.id }),
                   tokenDestination.snapshotIDs.sorted() == plan.matched.map(\.id).sorted() else {
@@ -1235,10 +1309,20 @@ public final class BackupEngine: Sendable {
     /// Obtains a fresh attributed plan for token validation.  It is purposely
     /// independent of the earlier dry-run transcript: a repository can
     /// change during the preview window, and the apply must fail closed.
+    ///
+    /// Pinned to the executable the apply captured, so the program that
+    /// answers "is this token still valid?" is the program that will act on
+    /// the answer.  Unpinned, a binary substituted during this query could
+    /// return a listing matching the token while the repository had in fact
+    /// changed — the staleness check would pass on a lie.  It could not
+    /// widen the purge, because the ids must equal the token's exactly, and
+    /// the launch itself already failed closed on the mismatch; this closes
+    /// the validation half too (#118).
     private func currentPurgePlan(
         set: BackupSet,
         destination: Destination,
-        patterns: [String]
+        patterns: [String],
+        executable: ResticRunner.MaintenanceExecutable
     ) async throws -> PurgePlan {
         let probe = await reachability.probe(destination)
         guard probe == .reachable else {
@@ -1248,7 +1332,10 @@ public final class BackupEngine: Sendable {
         do {
             outcome = try await restic.run(
                 .snapshots(repo: destination.repoURL),
-                for: ResticInvocation(destination: destination)
+                for: ResticInvocation(
+                    destination: destination,
+                    expectedExecutableIdentity: executable.identity
+                )
             )
         } catch {
             throw PurgeApplyError.unavailable
@@ -1339,10 +1426,18 @@ public final class BackupEngine: Sendable {
         groupId: String
     ) async throws -> PurgeRunResult {
         guard await secretsAvailable(for: [destination]) else { throw PurgeApplyError.unavailable }
-        let plan = try await currentPurgePlan(set: set, destination: destination, patterns: patterns)
+        // Captured before the plan query, not after it: the automatic path
+        // mints and spends its own token, so the same "one binary for the
+        // whole operation" rule applies here (#118).
         guard let executable = restic.maintenanceExecutable() else {
             throw PurgeApplyError.resticUnavailable
         }
+        let plan = try await currentPurgePlan(
+            set: set,
+            destination: destination,
+            patterns: patterns,
+            executable: executable
+        )
         let token: PreviewToken
         do {
             token = try previewTokens.issue(
