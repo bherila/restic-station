@@ -93,6 +93,40 @@ public struct PurgePlanResult: Equatable, Sendable {
     }
 }
 
+/// One purge preview pass over a set's destinations, together with the
+/// capability it earned.
+///
+/// This type exists so that the preview and the token cannot disagree about
+/// which restic binary they describe.  ``BackupEngine/previewPurgeSession``
+/// resolves the executable **once, before the first query**, pins every
+/// preview command to it, and mints the token against that same identity —
+/// so "what the operator reviewed" and "what the token authorizes" are the
+/// same program by construction, not by the caller remembering to make them
+/// so (#118).
+///
+/// ``token`` is `nil` when there is nothing destructive to authorize: no
+/// patterns, no attributed snapshots, or a destination that did not finish
+/// its preview.
+public struct PurgePreviewSession: Sendable {
+    public struct DestinationPreview: Sendable {
+        public let destination: Destination
+        public let result: PurgePlanResult
+
+        public init(destination: Destination, result: PurgePlanResult) {
+            self.destination = destination
+            self.result = result
+        }
+    }
+
+    public let previews: [DestinationPreview]
+    public let token: PreviewToken?
+
+    public init(previews: [DestinationPreview], token: PreviewToken?) {
+        self.previews = previews
+        self.token = token
+    }
+}
+
 /// A completed token-gated purge group.  `children` are ordinary run records
 /// (`RunKind.purge`), so callers can report and audit every destination
 /// without ever exposing the preview token itself.
