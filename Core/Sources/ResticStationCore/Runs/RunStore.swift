@@ -76,6 +76,9 @@ public enum RunStoreError: Error, Equatable, Sendable, CustomStringConvertible {
     /// The `index.jsonl` companion lock could not be acquired within the
     /// bounded retry window — see `RunStore.indexLockTimeout`.
     case indexLockTimeout(path: String)
+    /// The `index.jsonl` companion lock could not be used at all — wrong
+    /// owner, unopenable, or an uncreatable `runs/` (#110).
+    case lockUnusable(LockFailure)
 
     public var description: String {
         switch self {
@@ -87,6 +90,8 @@ public enum RunStoreError: Error, Equatable, Sendable, CustomStringConvertible {
             return "refusing to discard non-fresh run metadata at \(path)"
         case .indexLockTimeout(let path):
             return "timed out waiting for index lock \(path)"
+        case .lockUnusable(let failure):
+            return "run-index lock unusable: \(failure)"
         }
     }
 }
@@ -506,11 +511,22 @@ public struct RunStore: Sendable {
 
         let lock = FileLock(path: indexLockFile)
         let deadline = now().addingTimeInterval(Self.indexLockTimeout)
-        while !lock.tryAcquire() {
-            if now() > deadline {
-                throw RunStoreError.indexLockTimeout(path: indexLockFile.path)
+        // Contention is waited out; a lock that cannot be opened is not
+        // (#110) — see the same reasoning in `StateStore`.
+        while true {
+            switch lock.acquire() {
+            case .acquired:
+                break
+            case .busy:
+                if now() > deadline {
+                    throw RunStoreError.indexLockTimeout(path: indexLockFile.path)
+                }
+                usleep(Self.indexLockPollInterval)
+                continue
+            case .failed(let failure):
+                throw RunStoreError.lockUnusable(failure)
             }
-            usleep(Self.indexLockPollInterval)
+            break
         }
         defer { lock.release() }
 

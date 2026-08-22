@@ -2,6 +2,14 @@ import Foundation
 import Testing
 @testable import ResticStationCore
 
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#endif
+
 // MARK: - Test doubles
 
 /// Injectable clock. `now` is deliberately a stored closure so the same
@@ -737,7 +745,7 @@ struct BackupEngineTests {
         // A separate FileLock (separate open file description) genuinely
         // contends, even in-process — see FileLock's documentation.
         let holder = FileLock(path: env.paths.setLockFile(setId: Self.setId))
-        #expect(holder.tryAcquire())
+        #expect(holder.acquire() == .acquired)
         defer { holder.release() }
 
         let outcome = await env.engine.runSet(env.set, trigger: .manual)
@@ -752,6 +760,90 @@ struct BackupEngineTests {
         #expect(
             env.stateStore.readScheduleState()?.sets[Self.setId]?.lastBackupStart == nil,
             "step 3 happens after the lock is taken — a busy lock must not consume the schedule slot"
+        )
+    }
+
+    // MARK: - Row 10b — set lock unusable (#110)
+
+    @Test("row 10b: an unusable set lock is a .failed record, not a .skipped one")
+    func rowTenLockUnusable() async throws {
+        let env = Self.makeEnv(script: [])
+        defer { env.cleanUp() }
+        try env.paths.ensureDirectories()
+
+        // A directory where the set's lock *file* belongs. Chosen over
+        // `chmod`-ing `locks/` so the fault is injectable as root too — the
+        // Linux CI container runs as root, where mode bits are advisory and
+        // a permissions-based injection would have to be skipped. Only the
+        // lock path is touched, so the run store can still record what
+        // happened; that is the whole point of the assertion below.
+        try FileManager.default.createDirectory(
+            at: env.paths.setLockFile(setId: Self.setId),
+            withIntermediateDirectories: true
+        )
+
+        let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
+
+        // Before #110 this was `.skipped` with a `.skipped` index record —
+        // which `HealthDerivation` does not count, so the machine went on
+        // reporting healthy while every scheduled backup silently did
+        // nothing, forever.
+        // `.infrastructureFailure`, distinct from `.misconfigured`: the
+        // machine is broken, not the configuration, and only this case makes
+        // the scheduled tick exit non-zero.
+        guard case .infrastructureFailure(let reason) = outcome else {
+            Issue.record("a broken lock must not be reported as ordinary contention: \(outcome)")
+            return
+        }
+        #expect(reason.contains("lock"))
+        #expect(env.resticArgvs.isEmpty, "nothing may be spawned without the lock")
+
+        let entries = env.indexEntries
+        #expect(entries.count == 1)
+        #expect(entries[0].kind == .backup)
+        #expect(entries[0].status == .failed, "a .skipped record here is invisible to health derivation")
+        #expect(entries[0].errorSummary?.contains("lock") == true)
+        #expect(
+            env.stateStore.readScheduleState()?.sets[Self.setId]?.lastBackupStart == nil,
+            "a run that never started must not consume the schedule slot"
+        )
+    }
+
+    /// The health consequence of the record above, asserted end to end
+    /// rather than assumed: a `.failed` last run is what makes
+    /// `hasWarningConditions` true, and therefore what makes `status --json`
+    /// exit 1 instead of reporting an idle, healthy machine.
+    @Test("row 10b: the recorded failure actually reaches health derivation")
+    func rowTenLockUnusableIsUnhealthy() async throws {
+        let env = Self.makeEnv(script: [])
+        defer { env.cleanUp() }
+        try env.paths.ensureDirectories()
+        try FileManager.default.createDirectory(
+            at: env.paths.setLockFile(setId: Self.setId),
+            withIntermediateDirectories: true
+        )
+
+        _ = await env.engine.runSet(env.set, trigger: .scheduled)
+
+        let health = HealthDerivation.setHealth(
+            set: env.set,
+            recentRuns: env.indexEntries.reversed(),
+            currentRun: nil,
+            repoStatuses: [:],
+            setScheduleState: env.stateStore.readScheduleState()?.sets[Self.setId],
+            now: Self.t0,
+            calendar: Calendar(identifier: .gregorian)
+        )
+        #expect(health.lastRunFailed)
+        #expect(health.needsAttention)
+        #expect(
+            HealthDerivation.hasWarningConditions(
+                setHealths: [health],
+                runsInFlight: [],
+                fullDiskAccessDenied: false,
+                backgroundAgentEnabled: true
+            ),
+            "status --json must exit 1 on a machine that cannot take its own locks"
         )
     }
 
@@ -1205,7 +1297,7 @@ struct BackupEngineTests {
         defer { env.cleanUp() }
         try env.paths.ensureDirectories()
         let holder = FileLock(path: env.paths.setLockFile(setId: Self.setId))
-        #expect(holder.tryAcquire())
+        #expect(holder.acquire() == .acquired)
         defer { holder.release() }
 
         let status = await env.engine.runCheck(env.set)
@@ -1428,7 +1520,7 @@ struct BackupEngineTests {
         ]
         try env.paths.ensureDirectories()
         let heldTokenStoreLock = FileLock(path: env.paths.previewTokensLockFile)
-        #expect(heldTokenStoreLock.tryAcquire())
+        #expect(heldTokenStoreLock.acquire() == .acquired)
 
         let status = await env.engine.runPruneRepository(
             set: set,
@@ -1556,7 +1648,7 @@ struct BackupEngineTests {
         defer { env.cleanUp() }
         try env.paths.ensureDirectories()
         let heldLock = FileLock(path: env.paths.setLockFile(setId: env.set.id))
-        #expect(heldLock.tryAcquire())
+        #expect(heldLock.acquire() == .acquired)
         defer { heldLock.release() }
 
         let result = await env.engine.runPruneRepository(
@@ -1588,7 +1680,7 @@ struct BackupEngineTests {
         )
         try env.paths.ensureDirectories()
         let heldLock = FileLock(path: env.paths.setLockFile(setId: env.set.id))
-        #expect(heldLock.tryAcquire())
+        #expect(heldLock.acquire() == .acquired)
 
         let busy = await env.engine.runPruneRepository(
             set: env.set,
@@ -1640,7 +1732,7 @@ struct BackupEngineTests {
         )
         try env.paths.ensureDirectories()
         let heldTokenStoreLock = FileLock(path: env.paths.previewTokensLockFile)
-        #expect(heldTokenStoreLock.tryAcquire())
+        #expect(heldTokenStoreLock.acquire() == .acquired)
 
         let result = await env.engine.runPruneRepository(
             set: env.set,
@@ -2301,7 +2393,7 @@ struct BackupEngineTests {
         defer { env.cleanUp() }
         try env.paths.ensureDirectories()
         let holder = FileLock(path: env.paths.setLockFile(setId: Self.setId))
-        #expect(holder.tryAcquire())
+        #expect(holder.acquire() == .acquired)
         defer { holder.release() }
 
         let status = await env.engine.runRestore(request: RestoreRequest(

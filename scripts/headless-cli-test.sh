@@ -957,6 +957,81 @@ RESTIC_STATION_DATA_DIR="$HEALTHY" "$HELPER" secret rm --dest "$PRIMARY_ID" >>"$
 ok "payloads carry what they claim, secret list --json stays presence-only and agrees with human mode"
 
 # ─────────────────────────────────────────────────────────────────────────
+# 10. #110: a machine that cannot take its own locks must not look idle.
+#
+#     The unit tests prove `FileLock` tells contention apart from breakage
+#     and that the engine records the fault. Only a real process can show
+#     the end of that chain: `tick` exiting non-zero so launchd/systemd sees
+#     a failing unit, and `status --json` refusing to report a healthy,
+#     idle machine. That is the pair the issue's acceptance criteria name.
+#
+#     The fault is a *directory* where `locks/tick.lock` belongs. Root
+#     ignores file modes — and the `linux` CI job runs as root — so a
+#     chmod-based denial would pass there for the wrong reason. A directory
+#     cannot be opened as a regular file by anyone, root included. Same
+#     reasoning as the run-index step in ci.yml.
+# ─────────────────────────────────────────────────────────────────────────
+log "10. broken locking is never reported as a healthy, idle machine"
+
+BROKEN_LOCKS="$WORK/broken-locks"
+mkdir -p "$BROKEN_LOCKS/locks/tick.lock"
+
+RESTIC_STATION_DATA_DIR="$BROKEN_LOCKS" run_helper tick
+[[ "$RC" -ne 0 ]] \
+    || fail "tick exited 0 on a tick lock it could not use — the silent-stoppage bug (#110)"
+grep -q "could not acquire the tick lock" "$OUT_FILE" \
+    || fail "tick did not say which lock it could not use: $(cat "$OUT_FILE")"
+ok "tick exits non-zero and names the lock, instead of exiting 0 like a busy tick"
+
+RESTIC_STATION_DATA_DIR="$BROKEN_LOCKS" run_helper_split status --json
+[[ "$RC" -ne 0 ]] \
+    || fail "status --json exited 0 on a machine that cannot take a lock"
+[[ "$(jq -r '.data.locking.usable' "$OUT_FILE")" == "false" ]] \
+    || fail "status --json did not report locking as unusable: $(jq -c '.data.locking' "$OUT_FILE")"
+[[ "$(jq -r '.data.health' "$OUT_FILE")" == "warning" ]] \
+    || fail "status --json reported health $(jq -r '.data.health' "$OUT_FILE"), expected warning"
+jq -e '.data.locking | has("problem") and .problem != null' "$OUT_FILE" >/dev/null \
+    || fail "status --json did not name the specific fault"
+ok "status --json reports locking.usable false, health warning, and exits non-zero"
+
+RESTIC_STATION_DATA_DIR="$BROKEN_LOCKS" run_helper status
+grep -q "NOTHING CAN RUN ON THIS MACHINE" "$OUT_FILE" \
+    || fail "human status did not state the locking failure plainly: $(cat "$OUT_FILE")"
+ok "human status states it plainly, above the scheduler line"
+
+# #117 review: a hostile *per-set* lock, with `locks/` and `tick.lock` both
+# perfectly usable. The set can never run again, so neither the tick nor
+# status may report success — previously the tick printed the failure and
+# exited 0, and the live probe only ever looked at `tick.lock`.
+BROKEN_SET_LOCK="$WORK/broken-set-lock"
+mkdir -p "$BROKEN_SET_LOCK"
+cp -R "$HEALTHY/." "$BROKEN_SET_LOCK/" 2>/dev/null || true
+SET_UUID="$(RESTIC_STATION_DATA_DIR="$BROKEN_SET_LOCK" "$HELPER" sets list --json 2>/dev/null \
+    | jq -r '.data[0].id' 2>/dev/null || true)"
+if [[ -n "$SET_UUID" && "$SET_UUID" != "null" ]]; then
+    mkdir -p "$BROKEN_SET_LOCK/locks/set-$SET_UUID.lock"
+    RESTIC_STATION_DATA_DIR="$BROKEN_SET_LOCK" run_helper_split status --json
+    [[ "$RC" -ne 0 ]] \
+        || fail "status --json exited 0 with an unusable per-set lock"
+    [[ "$(jq -r '.data.locking.usable' "$OUT_FILE")" == "false" ]] \
+        || fail "status --json missed a hostile per-set lock: $(jq -c '.data.locking' "$OUT_FILE")"
+    grep -q "$SET_UUID" <<<"$(jq -r '.data.locking.problem' "$OUT_FILE")" \
+        || fail "status --json did not name the offending set lock"
+    ok "a hostile per-set lock is reported even when locks/ and tick.lock are fine"
+else
+    echo "  (skipped per-set lock assertion: could not resolve a set id from the fixture)"
+fi
+
+# The control: the same commands on a healthy fixture must not trip any of
+# the above. A check that fires everywhere is not a check.
+RESTIC_STATION_DATA_DIR="$HEALTHY" run_helper_split status --json
+[[ "$(jq -r '.data.locking.usable' "$OUT_FILE")" == "true" ]] \
+    || fail "a healthy fixture was reported as having unusable locking"
+[[ "$(jq -r '.data.locking.problem' "$OUT_FILE")" == "null" ]] \
+    || fail "a healthy fixture reported a locking problem"
+ok "a healthy data directory still reports usable locking and no problem"
+
+# ─────────────────────────────────────────────────────────────────────────
 # 6. THE secret-leak check: every byte this script's helper invocations
 #    produced, grepped for the fixture secret value.
 # ─────────────────────────────────────────────────────────────────────────

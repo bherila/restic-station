@@ -144,6 +144,40 @@ struct StateStoreTests {
 
     // MARK: - Missing / corrupt files never throw
 
+    /// #110: the 5-second poll is for *contention*. Spending it on a lock
+    /// that cannot be opened, and then reporting a timeout, names a peer
+    /// process as the cause of a permissions fault and sends whoever reads
+    /// it hunting for a helper that was never running.
+    ///
+    /// The fault is injected at the lock *path* rather than by chmod-ing
+    /// `state/`: `ensureDirectories()` deliberately re-asserts `0700` on
+    /// that directory on every call, so a mode injected there is undone
+    /// before the lock is ever opened.
+    @Test("an unusable schedule-state lock throws immediately, not after the timeout")
+    func unusableStateLockFailsFast() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-statelock-\(UUID().uuidString)", isDirectory: true)
+        let paths = AppPaths(root: root)
+        try paths.ensureDirectories()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        // A directory where the lock file belongs: unopenable as a regular
+        // file, and nothing a caller can wait out.
+        try FileManager.default.createDirectory(
+            at: paths.scheduleStateLockFile,
+            withIntermediateDirectories: true
+        )
+
+        let store = StateStore(paths: paths)
+        let started = Date()
+        #expect(throws: StateStoreError.self) {
+            try store.updateScheduleState(setId: UUID()) { $0.lastBackupStart = Date() }
+        }
+        // The timeout is 5s; a fail-fast refusal is orders of magnitude
+        // quicker. Generous bound so a loaded CI runner cannot flake it.
+        #expect(Date().timeIntervalSince(started) < 2.0, "a broken lock must not be waited out")
+    }
+
     @Test("reads of missing files return nil, never throw")
     func missingFilesReturnNil() {
         let (store, root) = makeStore()

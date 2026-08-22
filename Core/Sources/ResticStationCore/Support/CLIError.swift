@@ -405,6 +405,22 @@ extension CLIFailure {
                 message: "The purge preview has expired. Run purge preview again.",
                 details: CLIErrorDetails(setId: setId)
             )
+        case .token(.storeUnusable(let detail)):
+            // Not the catch-all below. `.storeUnusable` exists precisely to
+            // separate "the confirmation store is broken" from "your preview
+            // is stale", and routing it here told the operator to run purge
+            // preview again — advice no retry can satisfy, which defeated
+            // the whole point of the distinction. Same non-retryable
+            // data-directory error `MaintenancePrune.issueBinding` uses.
+            // Found by review on #117.
+            return CLIFailure(
+                code: .internalError,
+                message: CLIFailure.bounded(
+                    "The confirmation store could not be used: \(detail). "
+                        + "Check the permissions on the Restic Station data directory."
+                ),
+                details: CLIErrorDetails(setId: setId)
+            )
         case .token, .tokenDoesNotMatchCurrentPlan:
             return CLIFailure(
                 code: .operationNotAllowed,
@@ -423,6 +439,18 @@ extension CLIFailure {
                 code: .resticNotFound,
                 message: "The restic executable could not be identified, so the purge was refused. "
                     + "Restore the configured restic binary and run purge preview again.",
+                details: CLIErrorDetails(setId: setId)
+            )
+        case .lockUnusable(let detail):
+            // Deliberately not `set_busy`. An agent — and the GUI — treat
+            // `set_busy` as "wait and try again", and the lock directory
+            // being unopenable is not something waiting fixes (#110).
+            return CLIFailure(
+                code: .internalError,
+                message: CLIFailure.bounded(
+                    "The backup-set lock could not be used: \(detail). "
+                        + "Check the permissions on the Restic Station data directory."
+                ),
                 details: CLIErrorDetails(setId: setId)
             )
         case .destinationOffline(let destinationId):

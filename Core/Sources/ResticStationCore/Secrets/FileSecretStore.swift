@@ -394,15 +394,28 @@ public struct FileSecretStore: SecretStore {
         try prepareDirectories(reportWarnings: false)
         let lock = FileLock(path: lockFileURL)
         let deadline = Date().addingTimeInterval(Self.lockTimeout)
-        while !lock.tryAcquire() {
-            guard Date() < deadline else {
-                throw SecretStoreError.backendFailed(
-                    "timed out after \(Int(Self.lockTimeout))s waiting for the secrets lock at "
-                        + "\(lockFileURL.path). Another Restic Station process may be stuck; "
-                        + "check for running restic-station-helper processes."
-                )
+        while true {
+            switch lock.acquire() {
+            case .acquired:
+                break
+            case .busy:
+                guard Date() < deadline else {
+                    throw SecretStoreError.backendFailed(
+                        "timed out after \(Int(Self.lockTimeout))s waiting for the secrets lock at "
+                            + "\(lockFileURL.path). Another Restic Station process may be stuck; "
+                            + "check for running restic-station-helper processes."
+                    )
+                }
+                try await Task.sleep(nanoseconds: Self.lockPollNanoseconds)
+                continue
+            case .failed(let failure):
+                // Reported as itself rather than waited out and then blamed
+                // on a stuck peer: the advice above ("check for running
+                // helper processes") is actively misleading when the lock
+                // file is simply unopenable or owned by another user (#110).
+                throw SecretStoreError.backendFailed("secrets lock unusable: \(failure)")
             }
-            try await Task.sleep(nanoseconds: Self.lockPollNanoseconds)
+            break
         }
         defer { lock.release() }
         try body()
