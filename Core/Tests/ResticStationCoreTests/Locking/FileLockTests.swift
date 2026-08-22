@@ -11,14 +11,17 @@ import Musl
 #endif
 
 @Suite struct FileLockTests {
-    private func makeLockURL() -> URL {
-        FileManager.default.temporaryDirectory
-            .appendingPathComponent("restic-station-filelock-test-\(UUID().uuidString).lock")
+    private func makeLockURL() throws -> URL {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-filelock-test-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+        return directory.appendingPathComponent("test.lock", isDirectory: false)
     }
 
     @Test func secondInstanceCannotAcquireWhileFirstHolds() throws {
-        let url = makeLockURL()
-        defer { try? FileManager.default.removeItem(at: url) }
+        let url = try makeLockURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
 
         // Two separate FileLock instances on the same path == two separate
         // open file descriptions, so they genuinely contend even though
@@ -37,8 +40,8 @@ import Musl
     }
 
     @Test func deinitReleasesTheLock() throws {
-        let url = makeLockURL()
-        defer { try? FileManager.default.removeItem(at: url) }
+        let url = try makeLockURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
 
         var holder: FileLock? = FileLock(path: url)
         #expect(holder?.acquire() == .acquired)
@@ -51,8 +54,8 @@ import Musl
     }
 
     @Test func lockFileItselfPersistingMeansNothing() throws {
-        let url = makeLockURL()
-        defer { try? FileManager.default.removeItem(at: url) }
+        let url = try makeLockURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
 
         let lock = FileLock(path: url)
         #expect(lock.acquire() == .acquired)
@@ -68,8 +71,8 @@ import Musl
     }
 
     @Test func reacquireBySameInstanceAfterReleaseSucceeds() throws {
-        let url = makeLockURL()
-        defer { try? FileManager.default.removeItem(at: url) }
+        let url = try makeLockURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
 
         let lock = FileLock(path: url)
         #expect(lock.acquire() == .acquired)
