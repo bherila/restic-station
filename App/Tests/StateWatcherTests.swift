@@ -6,8 +6,8 @@ import Testing
 @Suite("StateWatcher lock health", .serialized)
 @MainActor
 struct StateWatcherTests {
-    @Test("a replaced locks directory is reopened and refreshes lock health")
-    func replacedLocksDirectoryRefreshesHealth() async throws {
+    @Test("lock permission changes and directory renames refresh lock health")
+    func lockMetadataAndRenameRefreshHealth() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("restic-station-lock-watcher-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -22,9 +22,30 @@ struct StateWatcherTests {
         defer { watcher.stop() }
         #expect(watcher.lockingFailure == nil)
 
-        // Exercise the delete/reopen path, not just a write delivered by the
+        // A metadata-only permission change must make the app unhealthy even
+        // though no file in state/ or runs/ changed.
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o770], ofItemAtPath: paths.locksDir.path
+        )
+        for _ in 0..<40 {
+            if watcher.lockingFailure?.scope == .machine { break }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        #expect(watcher.lockingFailure?.scope == .machine)
+
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o700], ofItemAtPath: paths.locksDir.path
+        )
+        for _ in 0..<40 {
+            if watcher.lockingFailure == nil { break }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        #expect(watcher.lockingFailure == nil)
+
+        // Exercise the rename/reopen path, not just a write delivered by the
         // source installed during start().
-        try FileManager.default.removeItem(at: paths.locksDir)
+        let movedLocks = root.appendingPathComponent("locks-old", isDirectory: true)
+        try FileManager.default.moveItem(at: paths.locksDir, to: movedLocks)
         try FileManager.default.createDirectory(
             at: paths.locksDir,
             withIntermediateDirectories: true,

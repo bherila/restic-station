@@ -255,14 +255,16 @@ public final class StateWatcher: ObservableObject {
 
     // MARK: - Directory watch sources
 
-    /// Opens `url` `O_EVTONLY` and wires up a `[.write, .delete]`
+    /// Opens `url` `O_EVTONLY` and wires up a source for content,
+    /// permission, deletion, and rename changes.
     /// `DispatchSourceFileSystemObject`. Returns `nil` if `open(2)` fails
     /// (most commonly: the directory doesn't exist yet) — callers track
     /// that as "pending" and retry later rather than treating it as fatal.
     ///
-    /// - Parameter reportDeleteAsDirectory: when non-nil, a `.delete` event
-    ///   is treated as "this watched *sub*directory was removed" and
-    ///   routed to `handleDirectoryDeleted(_:)` for that
+    /// - Parameter reportDeleteAsDirectory: when non-nil, a `.delete` or
+    ///   `.rename` event is treated as "this watched *sub*directory is no
+    ///   longer reachable at its configured path" and
+    ///   routed to `handleDirectoryInvalidated(_:)` for that
     ///   `WatchedDirectory`. `nil` for the root watcher, which exists only
     ///   to notice churn in `paths.root`'s children and drive reopen
     ///   retries — root itself is not expected to disappear.
@@ -275,18 +277,18 @@ public final class StateWatcher: ObservableObject {
 
         let source = DispatchSource.makeFileSystemObjectSource(
             fileDescriptor: fd,
-            eventMask: [.write, .delete],
+            eventMask: [.write, .attrib, .delete, .rename],
             queue: watchQueue
         )
         source.setEventHandler { [weak self] in
             guard let self else { return }
-            let isDelete = source.data.contains(.delete)
+            let needsReopen = source.data.contains(.delete) || source.data.contains(.rename)
             // The event handler is already scheduled on `watchQueue`
             // (`.main`), so this is a synchronous, same-thread hop into
             // actor-isolated state — no `Task` needed.
             MainActor.assumeIsolated {
-                if let directory, isDelete {
-                    self.handleDirectoryDeleted(directory)
+                if let directory, needsReopen {
+                    self.handleDirectoryInvalidated(directory)
                 } else if directory == nil {
                     // Root watcher: opportunistically retry any directory
                     // that's been waiting to be reopened since a prior
@@ -305,13 +307,13 @@ public final class StateWatcher: ObservableObject {
         return source
     }
 
-    /// A watched subdirectory (`state/`, `runs/`, or `locks/`) was deleted out from
-    /// under us: the now-stale fd/source is torn down and an immediate
+    /// A watched subdirectory (`state/`, `runs/`, or `locks/`) was deleted or
+    /// renamed out from under us: the now-stale fd/source is torn down and an immediate
     /// reopen is attempted (covers the common `rm -rf && mkdir` race where
     /// recreation has already happened by the time this handler runs). If
     /// that also fails, the directory is marked pending and will be
     /// retried the next time `rootDirSource` fires (see `makeSource`).
-    private func handleDirectoryDeleted(_ directory: WatchedDirectory) {
+    private func handleDirectoryInvalidated(_ directory: WatchedDirectory) {
         invalidateSource(for: directory)
         attemptReopen(directory)
     }

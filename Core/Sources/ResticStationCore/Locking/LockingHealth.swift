@@ -69,13 +69,11 @@ public enum LockingHealth {
         if let failure = FileLock.probeCreation(in: paths.locksDir, trustedRoot: paths.root) {
             return machine(failure)
         }
-        if let failure = probeExistingSetLocks(paths: paths) {
-            return failure
-        }
-
         // These companion locks protect shared local state outside
         // `locks/`. Probe known files without creating them, then separately
-        // prove their parent directories can create a future lock.
+        // prove their parent directories can create a future lock. Shared
+        // machine-wide faults must be selected before a narrower per-set
+        // fault so status never understates the outage.
         for lockFile in [
             paths.secretsLockFile,
             paths.scheduleStateLockFile,
@@ -93,7 +91,7 @@ public enum LockingHealth {
                 return machine(failure)
             }
         }
-        return nil
+        return probeExistingSetLocks(paths: paths)
     }
 
     /// The first unusable `locks/set-*.lock` already on disk, if any.

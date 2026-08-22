@@ -306,6 +306,26 @@ let canInjectPermissionFaults = geteuid() != 0
         #expect(failure.scope == .set(setId))
     }
 
+    @Test("LockingHealth prefers a simultaneous machine-wide fault over a set fault")
+    func lockingHealthPrefersMachineWideFault() throws {
+        let root = makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = AppPaths(root: root)
+        try paths.ensureDirectories()
+
+        let setId = UUID()
+        try FileManager.default.createDirectory(
+            at: paths.setLockFile(setId: setId), withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            at: paths.scheduleStateLockFile, withIntermediateDirectories: true
+        )
+
+        let failure = try #require(LockingHealth.probe(paths: paths))
+        #expect(failure.scope == .machine)
+        #expect(failure.path == paths.scheduleStateLockFile.path)
+    }
+
     @Test("LockingHealth exercises flock on its dedicated stable inode")
     func lockingHealthExercisesFlock() throws {
         let root = makeDirectory()
