@@ -72,7 +72,29 @@ struct BackupEngineTests {
 
     // MARK: Fixed identifiers / clock
 
-    static let resticPath = "/opt/homebrew/bin/restic"
+    /// A **real file**, not merely a plausible path.
+    ///
+    /// `maintenanceExecutable()` hashes the bytes at this path, and since the
+    /// #109 exact-head fix a purge refuses to mint or honour a destructive
+    /// capability when it cannot identify a binary. A fixture path that only
+    /// looks like restic therefore passes on a dev Mac that happens to have
+    /// it installed at `/opt/homebrew/bin/restic` and fails in the Linux CI
+    /// container, which does not — the tests were silently depending on
+    /// ambient host state, and tolerating a nil identity is what hid it.
+    ///
+    /// Used for `argv[0]` as well, so the golden argv assertions keep
+    /// comparing the configured path against itself on both platforms.
+    static let resticPath: String = {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-fixture-restic", isDirectory: false)
+        if !FileManager.default.fileExists(atPath: url.path) {
+            FileManager.default.createFile(
+                atPath: url.path,
+                contents: Data("restic fixture binary".utf8)
+            )
+        }
+        return url.path
+    }()
     static let setId = UUID(uuidString: "6F9619FF-8B86-D011-B42D-00C04FC964FF")!
     static let primaryId = UUID(uuidString: "0A1B2C3D-8B86-D011-B42D-00C04FC964FF")!
     static let secondaryAId = UUID(uuidString: "1B2C3D4E-8B86-D011-B42D-00C04FC964FF")!

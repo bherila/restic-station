@@ -773,3 +773,69 @@ private final class MessageBox: @unchecked Sendable {
         _raw.append(line)
     }
 }
+
+// MARK: - #109: the identity cache must never be trusted to enforce a pin
+
+@Suite("ExecutableIdentityCache")
+struct ExecutableIdentityCacheTests {
+    /// A whole-second mtime, set explicitly on **both** writes. A captured
+    /// mtime does not round-trip through `setAttributes` — it loses
+    /// sub-microsecond precision — which changes the cache key and makes a
+    /// test of this hazard pass without reaching it.
+    private static let pinnedMtime = Date(timeIntervalSince1970: 1_700_000_000)
+
+    private func write(_ contents: String, to url: URL) throws {
+        try Data(contents.utf8).write(to: url)
+        try FileManager.default.setAttributes(
+            [.modificationDate: Self.pinnedMtime], ofItemAtPath: url.path
+        )
+    }
+
+    private func cacheKeyFields(_ path: String) throws -> String {
+        let a = try FileManager.default.attributesOfItem(atPath: path)
+        let size = (a[.size] as? NSNumber)?.uint64Value ?? 0
+        let inode = (a[.systemFileNumber] as? NSNumber)?.uint64Value ?? 0
+        let device = (a[.systemNumber] as? NSNumber)?.uint64Value ?? 0
+        let mtime = (a[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+        return "\(device)|\(inode)|\(size)|\(mtime)"
+    }
+
+    @Test("an in-place swap that preserves every key field returns a stale digest unless bypassed")
+    func bypassRehashesWhereTheKeyCannotSeeTheChange() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-idcache-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let binary = root.appendingPathComponent("restic", isDirectory: false)
+
+        try write("original restic!", to: binary)
+        let keyBefore = try cacheKeyFields(binary.path)
+
+        let cache = ExecutableIdentityCache()
+        let first = try #require(cache.identity(for: binary))
+
+        // Same inode, same 16-byte length, same pinned mtime.
+        let handle = try #require(FileHandle(forWritingAtPath: binary.path))
+        try handle.write(contentsOf: Data("a totally other!".utf8))
+        try handle.close()
+        try FileManager.default.setAttributes(
+            [.modificationDate: Self.pinnedMtime], ofItemAtPath: binary.path
+        )
+
+        // The precondition this test is *about*. If a platform cannot
+        // reproduce an identical key, say so instead of reporting a pass
+        // that proved nothing.
+        try #require(
+            cacheKeyFields(binary.path) == keyBefore,
+            "could not reproduce an identical cache key on this platform — the hazard was not exercised"
+        )
+
+        // The hazard, stated as an assertion: the cached read cannot see it.
+        #expect(
+            cache.identity(for: binary)?.identity == first.identity,
+            "the metadata key is unchanged, so a cached read necessarily returns the old digest"
+        )
+        // The fix: revalidation hashes the bytes and sees the new binary.
+        #expect(cache.identity(for: binary, bypassingCache: true)?.identity != first.identity)
+    }
+}
