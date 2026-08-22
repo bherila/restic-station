@@ -1208,7 +1208,7 @@ public final class BackupEngine: Sendable {
         setId: UUID,
         trigger: RunTrigger,
         groupId: String?,
-        executable: ResticRunner.MaintenanceExecutable?
+        executable: ResticRunner.MaintenanceExecutable
     ) async -> ChildRun? {
         let fullIDByShortID = Dictionary(
             snapshotIDs.map { (String($0.prefix(8)), $0) },
@@ -1241,7 +1241,7 @@ public final class BackupEngine: Sendable {
             // path the golden argv tests and `docs/restic-cli.md` describe.
             invocation: ResticInvocation(
                 destination: destination,
-                expectedExecutableIdentity: executable?.identity
+                expectedExecutableIdentity: executable.identity
             ),
             streamProgress: false,
             purgeSnapshotRewrites: { outcome in
