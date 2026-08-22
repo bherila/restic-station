@@ -85,12 +85,13 @@ import Musl
 /// to be the single `false` that callers read as "someone else is running",
 /// which is how an unusable data directory became a silent, permanent,
 /// exit-0 stoppage of every scheduled backup.
-@Suite struct FileLockFaultTests {
-    /// `chmod` means nothing to root, and the Linux CI container runs as
-    /// root. A test that silently passes because the fault could not be
-    /// injected is worse than one that says it was skipped.
-    private var canInjectPermissionFaults: Bool { getuid() != 0 }
+/// `chmod` means nothing to root, and the Linux CI container runs as root,
+/// so a permissions-based fault cannot be injected there. Tests that need
+/// one are genuinely skipped via `.enabled(if:)` — note that `#require`
+/// would *fail* them instead, which is how this first reached CI.
+let canInjectPermissionFaults = getuid() != 0
 
+@Suite struct FileLockFaultTests {
     private func makeDirectory() -> URL {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("restic-station-lockfault-\(UUID().uuidString)", isDirectory: true)
@@ -98,9 +99,11 @@ import Musl
         return url
     }
 
-    @Test("an unwritable directory is .failed(EACCES), never .busy")
+    @Test(
+        "an unwritable directory is .failed(EACCES), never .busy",
+        .enabled(if: canInjectPermissionFaults, "chmod means nothing to root")
+    )
     func unwritableDirectoryIsAFailure() throws {
-        try #require(canInjectPermissionFaults, "cannot inject a permission fault as root")
         let directory = makeDirectory()
         defer {
             try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
@@ -210,17 +213,20 @@ import Musl
         #expect(FileLock(path: lockPath).probe() == nil, "a held lock is working locking, not a fault")
     }
 
+    /// Root-proof by construction: `chmod` is advisory to root, but a
+    /// regular file where a parent directory has to be is `ENOTDIR` for
+    /// everyone. That matters because the Linux CI container runs as root,
+    /// where a permissions-based injection would have to be skipped.
     @Test("LockingHealth reports an uncreatable data directory")
     func lockingHealthReportsUncreatableRoot() throws {
-        try #require(canInjectPermissionFaults, "cannot inject a permission fault as root")
         let parent = makeDirectory()
-        defer {
-            try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: parent.path)
-            try? FileManager.default.removeItem(at: parent)
-        }
-        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: parent.path)
+        defer { try? FileManager.default.removeItem(at: parent) }
 
-        let paths = AppPaths(root: parent.appendingPathComponent("data", isDirectory: true))
+        // `data` is a file, so `data/locks` can never be created.
+        let blocker = parent.appendingPathComponent("data")
+        FileManager.default.createFile(atPath: blocker.path, contents: Data())
+
+        let paths = AppPaths(root: blocker)
         let failure = try #require(
             LockingHealth.probe(paths: paths),
             "an uncreatable data directory must be reported, not stepped over"

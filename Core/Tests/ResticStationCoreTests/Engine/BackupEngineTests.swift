@@ -767,25 +767,20 @@ struct BackupEngineTests {
 
     @Test("row 10b: an unusable set lock is a .failed record, not a .skipped one")
     func rowTenLockUnusable() async throws {
-        try #require(getuid() != 0, "cannot inject a permission fault as root")
         let env = Self.makeEnv(script: [])
         defer { env.cleanUp() }
         try env.paths.ensureDirectories()
 
-        // `locks/` exists but nothing can be created in it — the shape a
-        // botched restore, a bad umask or a copied home directory leaves
-        // behind. Only `locks/` is touched, so the run store can still
-        // record what happened; that is the whole point of the assertion.
-        try FileManager.default.setAttributes(
-            [.posixPermissions: 0o500],
-            ofItemAtPath: env.paths.locksDir.path
+        // A directory where the set's lock *file* belongs. Chosen over
+        // `chmod`-ing `locks/` so the fault is injectable as root too — the
+        // Linux CI container runs as root, where mode bits are advisory and
+        // a permissions-based injection would have to be skipped. Only the
+        // lock path is touched, so the run store can still record what
+        // happened; that is the whole point of the assertion below.
+        try FileManager.default.createDirectory(
+            at: env.paths.setLockFile(setId: Self.setId),
+            withIntermediateDirectories: true
         )
-        defer {
-            try? FileManager.default.setAttributes(
-                [.posixPermissions: 0o700],
-                ofItemAtPath: env.paths.locksDir.path
-            )
-        }
 
         let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
 
@@ -817,20 +812,13 @@ struct BackupEngineTests {
     /// exit 1 instead of reporting an idle, healthy machine.
     @Test("row 10b: the recorded failure actually reaches health derivation")
     func rowTenLockUnusableIsUnhealthy() async throws {
-        try #require(getuid() != 0, "cannot inject a permission fault as root")
         let env = Self.makeEnv(script: [])
         defer { env.cleanUp() }
         try env.paths.ensureDirectories()
-        try FileManager.default.setAttributes(
-            [.posixPermissions: 0o500],
-            ofItemAtPath: env.paths.locksDir.path
+        try FileManager.default.createDirectory(
+            at: env.paths.setLockFile(setId: Self.setId),
+            withIntermediateDirectories: true
         )
-        defer {
-            try? FileManager.default.setAttributes(
-                [.posixPermissions: 0o700],
-                ofItemAtPath: env.paths.locksDir.path
-            )
-        }
 
         _ = await env.engine.runSet(env.set, trigger: .scheduled)
 
