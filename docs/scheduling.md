@@ -344,14 +344,14 @@ Two levels, both `flock(2)` `LOCK_EX | LOCK_NB` on files under `locks/` (advisor
 | `tick.lock` | the whole tick | prevent overlapping scheduled evaluations when a backup outlives StartInterval |
 | `set-<setId>.lock` | any run touching that set (scheduled or manual, incl. restore & prune) | one operation per set at a time |
 
-`FileLock` API: `init(path:)`, `acquire() -> LockAcquireResult`, `probe() -> LockFailure?`, `release()`, RAII deinit-release. Lock files are opened `O_NOFOLLOW | O_CLOEXEC` at `0600`, and an `fstat` on the descriptor requires a regular file owned by the current uid.
+`FileLock` API: `init(path:)`, `acquire() -> LockAcquireResult`, `probe() -> LockFailure?`, `release()`, RAII deinit-release. Lock files are opened `O_NOFOLLOW | O_CLOEXEC` at `0600`, and an `fstat` on the descriptor requires a regular file owned by the effective uid. A pre-existing broader mode is tightened through the open descriptor; failure to tighten or verify the resulting owner-only mode is a lock failure. `O_CLOEXEC` is descriptor hygiene, not orphan-process supervision: `Foundation.Process` closes unknown descriptors independently, so lock continuity must not depend on accidental inheritance.
 
 **`busy` and `failed` are different answers, and callers must treat them differently** (#110). `acquire()` returns `busy` only for `EWOULDBLOCK`/`EAGAIN` — a peer genuinely holding the lock. Everything else — an uncreatable `locks/`, `EACCES`, a symlink at the path, a lock file belonging to another user — is `failed`, and:
 
 - `tick` exits **non-zero** rather than returning quietly, so launchd/systemd sees a failing unit instead of a clean pass;
 - `BackupEngine` records a **`.failed`** index entry, not the benign `.skipped` one, so `HealthDerivation` counts it and the menu bar and `status` both show a warning;
 - the polling lock users (`schedule-state`, `runs/index.jsonl`, the secret store) throw **immediately** instead of spending their whole timeout and then blaming contention;
-- `status --json` probes independently and live (`LockingHealth`), because the fault usually prevents writing the very record that would report it.
+- `status --json` probes independently and live (`LockingHealth`), because the fault usually prevents writing the very record that would report it. A non-creating per-set probe uses `lstat` so dangling symlinks are still refused, and inability to enumerate `locks/` is itself unhealthy rather than an empty, healthy result.
 
 These were one `false` until #110, which is how an unusable data directory became a silent, permanent, exit-0 stoppage of every scheduled backup.
 

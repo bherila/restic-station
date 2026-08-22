@@ -17,7 +17,7 @@ import Musl
 public struct LockFailure: Error, Equatable, Sendable, CustomStringConvertible {
     public let path: String
     /// The failing syscall or check: `"open"`, `"flock"`, `"fstat"`,
-    /// `"ownership"`, `"file type"`.
+    /// `"fchmod"`, `"ownership"`, `"permissions"`, `"file type"`.
     public let operation: String
     public let errnoValue: Int32
     /// Set when the fault came from a Swift error rather than a syscall —
@@ -95,10 +95,10 @@ public final class FileLock: @unchecked Sendable {
     ///   the descriptor somewhere else. A symlink fails with `ELOOP`, which
     ///   is a ``LockAcquireResult/failed`` — not silently followed, and not
     ///   mistaken for contention.
-    /// - `O_CLOEXEC` so the descriptor does not leak into restic. A leaked
-    ///   descriptor keeps the `flock()` alive in the child, so a restic
-    ///   process outliving its parent would hold the set lock with nothing
-    ///   able to release it.
+    /// - `O_CLOEXEC` is defense in depth: lock descriptors are process-control
+    ///   capabilities and must not leak into subprocesses. `Foundation.Process`
+    ///   currently closes unknown descriptors independently, so orphan-process
+    ///   safety must not rely on accidental descriptor inheritance.
     /// - `0600` on creation, then an `fstat` on the descriptor (not the
     ///   path — no second lookup to race) requiring a regular file owned by
     ///   this uid. A lock file another user can open is a lock another user
@@ -146,11 +146,21 @@ public final class FileLock: @unchecked Sendable {
         guard info.st_mode & S_IFMT == S_IFREG else {
             return LockFailure(path: path, operation: "file type", errnoValue: 0)
         }
-        guard info.st_uid == getuid() else {
+        guard info.st_uid == geteuid() else {
             return LockFailure(path: path, operation: "ownership", errnoValue: 0)
         }
         if info.st_mode & (S_IRWXG | S_IRWXO) != 0 {
-            _ = fchmod(fd, 0o600)
+            guard fchmod(fd, 0o600) == 0 else {
+                return LockFailure(path: path, operation: "fchmod", errnoValue: errno)
+            }
+
+            var tightened = stat()
+            guard fstat(fd, &tightened) == 0 else {
+                return LockFailure(path: path, operation: "fstat after fchmod", errnoValue: errno)
+            }
+            guard tightened.st_mode & (S_IRWXG | S_IRWXO) == 0 else {
+                return LockFailure(path: path, operation: "permissions", errnoValue: 0)
+            }
         }
         return nil
     }
@@ -175,8 +185,16 @@ public final class FileLock: @unchecked Sendable {
         var flags = O_RDWR | O_NOFOLLOW | O_CLOEXEC
         if createIfMissing {
             flags |= O_CREAT
-        } else if !FileManager.default.fileExists(atPath: path.path) {
-            return nil
+        } else {
+            // `fileExists` follows symlinks, so a dangling symlink looks
+            // absent and would bypass the `O_NOFOLLOW` refusal below.
+            var info = stat()
+            let result = path.path.withCString { lstat($0, &info) }
+            if result != 0 {
+                let code = errno
+                if code == ENOENT { return nil }
+                return LockFailure(path: path.path, operation: "lstat", errnoValue: code)
+            }
         }
         let opened = path.path.withCString { open($0, flags, 0o600) }
         guard opened >= 0 else {

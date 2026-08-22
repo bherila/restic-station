@@ -40,10 +40,16 @@ public enum LockingHealth {
 
     /// The first unusable `locks/set-*.lock` already on disk, if any.
     private static func probeExistingSetLocks(paths: AppPaths) -> LockFailure? {
-        guard let entries = try? FileManager.default.contentsOfDirectory(
-            atPath: paths.locksDir.path
-        ) else {
-            return nil
+        let entries: [String]
+        do {
+            entries = try FileManager.default.contentsOfDirectory(atPath: paths.locksDir.path)
+        } catch {
+            return LockFailure(
+                path: paths.locksDir.path,
+                operation: "enumerate lock directory",
+                errnoValue: 0,
+                underlying: "\(error)"
+            )
         }
         for name in entries.sorted() where name.hasPrefix("set-") && name.hasSuffix(".lock") {
             let url = paths.locksDir.appendingPathComponent(name, isDirectory: false)

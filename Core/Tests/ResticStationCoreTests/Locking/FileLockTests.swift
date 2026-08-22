@@ -89,7 +89,7 @@ import Musl
 /// so a permissions-based fault cannot be injected there. Tests that need
 /// one are genuinely skipped via `.enabled(if:)` — note that `#require`
 /// would *fail* them instead, which is how this first reached CI.
-let canInjectPermissionFaults = getuid() != 0
+let canInjectPermissionFaults = geteuid() != 0
 
 @Suite struct FileLockFaultTests {
     private func makeDirectory() -> URL {
@@ -139,6 +139,23 @@ let canInjectPermissionFaults = getuid() != 0
         #expect(failure.operation == "open")
         // ELOOP on both platforms; the point is that it is a fault, not
         // contention, and that `elsewhere` was never opened.
+        #expect(failure.errnoValue == ELOOP)
+    }
+
+    @Test("a non-creating probe refuses a dangling symlink")
+    func nonCreatingProbeRefusesDanglingSymlink() throws {
+        let directory = makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let missingTarget = directory.appendingPathComponent("missing")
+        let lockPath = directory.appendingPathComponent("set-dangling.lock")
+        try FileManager.default.createSymbolicLink(at: lockPath, withDestinationURL: missingTarget)
+
+        let failure = try #require(
+            FileLock(path: lockPath).probe(createIfMissing: false),
+            "a dangling symlink exists even though its target does not"
+        )
+        #expect(failure.operation == "open")
         #expect(failure.errnoValue == ELOOP)
     }
 
@@ -257,6 +274,36 @@ let canInjectPermissionFaults = getuid() != 0
             "a per-set lock that cannot be opened must not read as a healthy machine"
         )
         #expect(String(describing: failure).contains(setId.uuidString))
+    }
+
+    @Test(
+        "LockingHealth reports a lock directory it cannot enumerate",
+        .enabled(if: canInjectPermissionFaults, "root can enumerate mode-0300 directories")
+    )
+    func lockingHealthReportsEnumerationFailure() throws {
+        let root = makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = AppPaths(root: root)
+        try paths.ensureDirectories()
+
+        // Keep tick.lock openable while denying directory reads. This lets
+        // the first probe pass and isolates the enumeration failure.
+        FileManager.default.createFile(atPath: paths.tickLockFile.path, contents: Data())
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o300], ofItemAtPath: paths.locksDir.path
+        )
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o700], ofItemAtPath: paths.locksDir.path
+            )
+        }
+
+        let failure = try #require(
+            LockingHealth.probe(paths: paths),
+            "failure to inspect per-set locks must not report healthy"
+        )
+        #expect(failure.operation == "enumerate lock directory")
+        #expect(failure.path == paths.locksDir.path)
     }
 
     /// The probe must not manufacture the very files it reports on: a
