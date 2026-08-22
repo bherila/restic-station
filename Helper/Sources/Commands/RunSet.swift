@@ -61,9 +61,8 @@ struct RunSet: AsyncParsableCommand {
             let outcome = await context.engine.runSet(backupSet, trigger: .manual)
             handle(outcome)
         case .check:
-            let before = Date()
-            let status = await context.engine.runCheck(backupSet, trigger: .manual)
-            handle(status, kind: .check, setId: backupSet.id, since: before, context: context)
+            let outcome = await context.engine.runCheck(backupSet, trigger: .manual)
+            handle(outcome)
         case .prune:
             // Checked against the set the engine is about to receive, after
             // the context has resolved it — not against a separately re-read
@@ -138,11 +137,34 @@ struct RunSet: AsyncParsableCommand {
         }
     }
 
-    // MARK: - RunStatus (check / prune)
+    // MARK: - CheckRunOutcome
 
-    /// `runCheck`/`runPrune` return a bare `RunStatus`, whose `.skipped`
-    /// case is overloaded (lock busy *or* an unavailable keychain,
-    /// unlike `SetRunOutcome`'s two distinct cases). Disambiguated here by
+    private func handle(_ outcome: CheckRunOutcome) {
+        switch outcome {
+        case .completed(let status):
+            switch status {
+            case .success, .warning, .running:
+                print("check \(status.rawValue)")
+            case .failed:
+                HelperExit.fail("check failed — see the run log")
+            case .skipped:
+                print("check deferred — will retry next tick")
+            }
+        case .skipped:
+            HelperExit.fail("another operation for this backup set is already running", code: 2)
+        case .retryable(let reason):
+            print("check deferred (\(reason)) — will retry next tick")
+        case .misconfigured(let reason):
+            HelperExit.fail("backup set is misconfigured: \(reason)")
+        case .infrastructureFailure(let reason):
+            HelperExit.fail("this machine cannot run the check: \(reason)")
+        }
+    }
+
+    // MARK: - RunStatus (prune)
+
+    /// `runPrune` returns a bare `RunStatus`, whose `.skipped` case is
+    /// overloaded (lock busy *or* an unavailable keychain). Disambiguated here by
     /// checking whether a `.skipped` run record was *just* written with the
     /// lock-busy message (`BackupEngine.recordSkipped`) — no run record at
     /// all means the keychain-retryable path.

@@ -337,12 +337,16 @@ never used to trigger a rewrite.
 
 ## Locking
 
-Two levels, both `flock(2)` `LOCK_EX | LOCK_NB` on files under `locks/` (advisory; auto-released by the kernel on process death — no stale-lock cleanup needed; the files themselves persist, their existence means nothing):
+The operation-exclusion locks use `flock(2)` `LOCK_EX | LOCK_NB` on files under `locks/` (advisory; auto-released by the kernel on process death — no stale-lock cleanup needed; the files themselves persist, their existence means nothing). Companion locks use the same primitive to serialize shared local files:
 
 | Lock | Held by | Purpose |
 |---|---|---|
 | `tick.lock` | the whole tick | prevent overlapping scheduled evaluations when a backup outlives StartInterval |
 | `set-<setId>.lock` | any run touching that set (scheduled or manual, incl. restore & prune) | one operation per set at a time |
+| `secrets.lock` | a Linux secret-store mutation | serialize owner-only `secrets.json` read-modify-write |
+| `state/schedule-state.lock` | a schedule-state mutation | serialize schedule timestamps, check cursors, and purge watermarks across sets |
+| `state/preview-tokens.lock` | a preview-token mutation | preserve single-use destructive capabilities across sets |
+| `runs/index.jsonl.lock` | a run-index append | keep append ordering and records intact across sets |
 
 `FileLock` API: `init(path:)`, `acquire() -> LockAcquireResult`, `probe() -> LockFailure?`, `release()`, RAII deinit-release. Lock files are opened `O_NOFOLLOW | O_CLOEXEC` at `0600`, and an `fstat` on the descriptor requires a regular file owned by the effective uid. A pre-existing broader mode is tightened through the open descriptor; failure to tighten or verify the resulting owner-only mode is a lock failure. `O_CLOEXEC` is descriptor hygiene, not orphan-process supervision: `Foundation.Process` closes unknown descriptors independently, so lock continuity must not depend on accidental inheritance.
 
@@ -351,7 +355,9 @@ Two levels, both `flock(2)` `LOCK_EX | LOCK_NB` on files under `locks/` (advisor
 - `tick` exits **non-zero** rather than returning quietly, so launchd/systemd sees a failing unit instead of a clean pass;
 - `BackupEngine` records a **`.failed`** index entry, not the benign `.skipped` one, so `HealthDerivation` counts it and the menu bar and `status` both show a warning;
 - the polling lock users (`schedule-state`, `runs/index.jsonl`, the secret store) throw **immediately** instead of spending their whole timeout and then blaming contention;
-- `status --json` probes independently and live (`LockingHealth`), because the fault usually prevents writing the very record that would report it. A non-creating per-set probe uses `lstat` so dangling symlinks are still refused, and inability to enumerate `locks/` is itself unhealthy rather than an empty, healthy result.
+- `status --json` probes independently and live (`LockingHealth`), because the fault usually prevents writing the very record that would report it. It probes every known companion lock without creating it, uses `lstat` so dangling symlinks are still refused, reports inability to enumerate `locks/`, and uses a non-mutating `faccessat(..., AT_EACCESS)` check in each lock-owning directory so an existing lock file cannot mask loss of effective-identity `O_CREAT` capability or make the health probe trigger its own filesystem watcher.
+
+The schedule-state lock is part of operation correctness, not logging hygiene. A backup or check does not launch restic unless its attempt timestamp can be stored; a successful purge does not report success unless its watermark can be stored; and a scheduled check returns a typed infrastructure failure so `tick` exits non-zero. Otherwise a broken companion lock could repeat backups, checks, or destructive rewrites while both the command and health record looked successful.
 
 These were one `false` until #110, which is how an unusable data directory became a silent, permanent, exit-0 stoppage of every scheduled backup.
 

@@ -126,10 +126,9 @@ public struct FileSecretStore: SecretStore {
         paths.root.appendingPathComponent("secrets.json.tmp", isDirectory: false)
     }
 
-    /// `locks/secrets.lock`. Composed here rather than in `AppPaths` only
-    /// because `AppPaths` is owned elsewhere right now; it belongs there.
+    /// `locks/secrets.lock`.
     var lockFileURL: URL {
-        paths.locksDir.appendingPathComponent("secrets.lock", isDirectory: false)
+        paths.secretsLockFile
     }
 
     // MARK: - Repo password

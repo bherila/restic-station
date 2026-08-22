@@ -151,6 +151,11 @@ public struct AppPaths: Equatable, Sendable {
         runsDir.appendingPathComponent("index.jsonl", isDirectory: false)
     }
 
+    /// Serializes appends to ``runsIndexFile`` across helper processes.
+    public var runsIndexLockFile: URL {
+        runsDir.appendingPathComponent("index.jsonl.lock", isDirectory: false)
+    }
+
     public func runDir(runId: String) -> URL {
         runsDir.appendingPathComponent(runId, isDirectory: true)
     }
@@ -222,6 +227,11 @@ public struct AppPaths: Equatable, Sendable {
     /// `locks/tick.lock` — flock file (see `docs/scheduling.md`).
     public var tickLockFile: URL {
         locksDir.appendingPathComponent("tick.lock", isDirectory: false)
+    }
+
+    /// Serializes Linux file-secret read-modify-write operations.
+    public var secretsLockFile: URL {
+        locksDir.appendingPathComponent("secrets.lock", isDirectory: false)
     }
 
     /// `locks/set-<setId>.lock` — flock file (see `docs/scheduling.md`).

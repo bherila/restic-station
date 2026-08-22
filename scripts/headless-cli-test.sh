@@ -1018,6 +1018,26 @@ if [[ -n "$SET_UUID" && "$SET_UUID" != "null" ]]; then
     grep -q "$SET_UUID" <<<"$(jq -r '.data.locking.problem' "$OUT_FILE")" \
         || fail "status --json did not name the offending set lock"
     ok "a hostile per-set lock is reported even when locks/ and tick.lock are fine"
+
+    # Make only the check due: a fresh backup timestamp suppresses the
+    # backup, while a nil check timestamp fires immediately. This pins the
+    # separate check outcome path that used to print `failed` and exit 0.
+    jq '.sets[0].checkPolicy = {"enabled": true, "readDataSubsetSlices": 20}' \
+        "$BROKEN_SET_LOCK/config.json" > "$BROKEN_SET_LOCK/config.json.tmp"
+    mv "$BROKEN_SET_LOCK/config.json.tmp" "$BROKEN_SET_LOCK/config.json"
+    cat > "$BROKEN_SET_LOCK/state/schedule-state.json" <<EOF
+{"sets":{"$SET_UUID":{"lastBackupStart":"$NOW_ISO","lastCheckStart":null,"checkSliceCursor":null,"checkCount":null,"appliedPurgeExcludes":{}}}}
+EOF
+    printf '%s\n' "$SECRET_PASSWORD" \
+        | RESTIC_STATION_DATA_DIR="$BROKEN_SET_LOCK" "$HELPER" secret set --dest "$PRIMARY_ID" \
+            >>"$COMBINED_LOG" 2>&1 \
+        || fail "could not seed the due-check fixture's password"
+    RESTIC_STATION_DATA_DIR="$BROKEN_SET_LOCK" run_helper tick
+    [[ "$RC" -ne 0 ]] \
+        || fail "tick exited 0 when a due check could not use its set lock: $(cat "$OUT_FILE")"
+    grep -q 'check cannot run here' "$OUT_FILE" \
+        || fail "tick did not classify the due check as infrastructure failure: $(cat "$OUT_FILE")"
+    ok "a due check with an unusable set lock makes tick exit non-zero"
 else
     echo "  (skipped per-set lock assertion: could not resolve a set id from the fixture)"
 fi

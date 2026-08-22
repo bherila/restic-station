@@ -277,6 +277,76 @@ let canInjectPermissionFaults = geteuid() != 0
     }
 
     @Test(
+        "LockingHealth proves a new set lock can be created even when tick.lock already exists",
+        .enabled(if: canInjectPermissionFaults, "root ignores directory write-mode denial")
+    )
+    func lockingHealthChecksLockCreationCapability() throws {
+        let root = makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = AppPaths(root: root)
+        try paths.ensureDirectories()
+
+        // Opening this existing file still succeeds after locks/ becomes
+        // read-only. The missing set lock is the operation that would fail.
+        FileManager.default.createFile(atPath: paths.tickLockFile.path, contents: Data())
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o500], ofItemAtPath: paths.locksDir.path
+        )
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o700], ofItemAtPath: paths.locksDir.path
+            )
+        }
+
+        let failure = try #require(
+            LockingHealth.probe(paths: paths),
+            "an existing tick.lock must not mask inability to create the next set lock"
+        )
+        #expect(failure.operation == "create lock")
+        #expect(failure.path == paths.locksDir.path)
+    }
+
+    @Test("LockingHealth probes every known companion lock")
+    func lockingHealthProbesCompanionLocks() throws {
+        let lockPaths: [(String, (AppPaths) -> URL)] = [
+            ("secrets", { $0.secretsLockFile }),
+            ("schedule state", { $0.scheduleStateLockFile }),
+            ("preview tokens", { $0.previewTokensLockFile }),
+            ("run index", { $0.runsIndexLockFile }),
+        ]
+
+        for (name, lockPath) in lockPaths {
+            let root = makeDirectory()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let paths = AppPaths(root: root)
+            try paths.ensureDirectories()
+            let hostile = lockPath(paths)
+            try FileManager.default.createDirectory(at: hostile, withIntermediateDirectories: true)
+
+            let failure = try #require(
+                LockingHealth.probe(paths: paths),
+                "a hostile \(name) lock must not leave locking health green"
+            )
+            #expect(failure.path == hostile.path)
+        }
+    }
+
+    @Test("a successful directory-creation probe does not mutate the directory")
+    func creationProbeDoesNotMutateDirectory() throws {
+        let directory = makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let sentinel = directory.appendingPathComponent("sentinel")
+        FileManager.default.createFile(atPath: sentinel.path, contents: Data())
+        let before = try FileManager.default.attributesOfItem(atPath: directory.path)[.modificationDate] as? Date
+
+        #expect(FileLock.probeCreation(in: directory) == nil)
+        let entries = try FileManager.default.contentsOfDirectory(atPath: directory.path)
+        let after = try FileManager.default.attributesOfItem(atPath: directory.path)[.modificationDate] as? Date
+        #expect(entries == ["sentinel"])
+        #expect(after == before)
+    }
+
+    @Test(
         "LockingHealth reports a lock directory it cannot enumerate",
         .enabled(if: canInjectPermissionFaults, "root can enumerate mode-0300 directories")
     )

@@ -500,7 +500,7 @@ public struct RunStore: Sendable {
     // MARK: - Index append
 
     private var indexLockFile: URL {
-        paths.runsDir.appendingPathComponent("index.jsonl.lock", isDirectory: false)
+        paths.runsIndexLockFile
     }
 
     /// Appends one compact JSON line under `FileLock` on the `index.jsonl`

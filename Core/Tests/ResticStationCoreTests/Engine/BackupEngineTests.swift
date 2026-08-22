@@ -809,6 +809,27 @@ struct BackupEngineTests {
         )
     }
 
+    @Test("an unusable schedule-state lock stops a backup before restic launches")
+    func scheduleStateLockUnusableStopsBackup() async throws {
+        let env = Self.makeEnv(script: [])
+        defer { env.cleanUp() }
+        try env.paths.ensureDirectories()
+        try FileManager.default.createDirectory(
+            at: env.paths.scheduleStateLockFile,
+            withIntermediateDirectories: true
+        )
+
+        let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
+
+        guard case .infrastructureFailure(let reason) = outcome else {
+            Issue.record("a backup without durable scheduling state must not run: \(outcome)")
+            return
+        }
+        #expect(reason.contains("schedule state"))
+        #expect(env.resticArgvs.isEmpty)
+        #expect(env.entries(kind: .backup).first?.status == .failed)
+    }
+
     /// The health consequence of the record above, asserted end to end
     /// rather than assumed: a `.failed` last run is what makes
     /// `hasWarningConditions` true, and therefore what makes `status --json`
@@ -1202,9 +1223,9 @@ struct BackupEngineTests {
         )
         env.fake.script = script
 
-        let status = await env.engine.runCheck(env.set)
+        let outcome = await env.engine.runCheck(env.set)
 
-        #expect(status == .success)
+        #expect(outcome == .completed(.success))
         #expect(env.resticArgvs == [
             [Self.resticPath, "-r", env.primary.repoURL, "check", "--read-data-subset=8/20"],
         ])
@@ -1240,9 +1261,9 @@ struct BackupEngineTests {
         )
         env.fake.script = script
 
-        let status = await env.engine.runCheck(env.set)
+        let outcome = await env.engine.runCheck(env.set)
 
-        #expect(status == .failed)
+        #expect(outcome == .completed(.failed))
         let state = try #require(env.stateStore.readScheduleState()?.sets[Self.setId])
         #expect(state.checkSliceCursor == 7, "the same slice must be re-verified next time")
         #expect(state.checkCount == 1)
@@ -1277,9 +1298,9 @@ struct BackupEngineTests {
         )
         env.fake.script = script
 
-        let status = await env.engine.runCheck(env.set)
+        let outcome = await env.engine.runCheck(env.set)
 
-        #expect(status == .success)
+        #expect(outcome == .completed(.success))
         #expect(env.resticArgvs == [
             [Self.resticPath, "-r", env.primary.repoURL, "check", "--read-data-subset=4/20"],
             [Self.resticPath, "-r", reachable.repoURL, "check"],
@@ -1300,11 +1321,33 @@ struct BackupEngineTests {
         #expect(holder.acquire() == .acquired)
         defer { holder.release() }
 
-        let status = await env.engine.runCheck(env.set)
+        let outcome = await env.engine.runCheck(env.set)
 
-        #expect(status == .skipped)
+        #expect(outcome == .skipped)
         #expect(env.resticArgvs.isEmpty)
         #expect(env.entries(kind: .check).first?.status == .skipped)
+        #expect(env.stateStore.readScheduleState()?.sets[Self.setId]?.lastCheckStart == nil)
+    }
+
+    @Test("runCheck: an unusable set lock is infrastructure failure, not a failed check")
+    func checkLockUnusable() async throws {
+        let env = Self.makeEnv(script: [], reachableSecondaries: [])
+        defer { env.cleanUp() }
+        try env.paths.ensureDirectories()
+        try FileManager.default.createDirectory(
+            at: env.paths.setLockFile(setId: Self.setId),
+            withIntermediateDirectories: true
+        )
+
+        let outcome = await env.engine.runCheck(env.set, trigger: .scheduled)
+
+        guard case .infrastructureFailure(let reason) = outcome else {
+            Issue.record("an unusable check lock must be a tick-failing infrastructure error: \(outcome)")
+            return
+        }
+        #expect(reason.contains("lock"))
+        #expect(env.resticArgvs.isEmpty)
+        #expect(env.entries(kind: .check).first?.status == .failed)
         #expect(env.stateStore.readScheduleState()?.sets[Self.setId]?.lastCheckStart == nil)
     }
 
@@ -2251,6 +2294,100 @@ struct BackupEngineTests {
         let applied = env.stateStore.readScheduleState()?.sets[Self.setId]?.appliedPurgeExcludes
         #expect(applied?[env.primary.id] == env.set.purgeExcludes)
         #expect(applied?[secondary.id] == env.set.purgeExcludes)
+    }
+
+    @Test("automatic purge: unusable preview-token storage is an infrastructure failure")
+    func automaticPurgeTokenStoreFailureIsInfrastructureFailure() async throws {
+        let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]
+        let hostnames = [Self.setId: Set(["example-mac.local"])]
+        let env = Self.makeEnv(
+            script: [], retention: nil, purgeExcludes: ["build/**"], reachableSecondaries: [],
+            purgeSourcePaths: sourcePaths, purgeHostnames: hostnames
+        )
+        defer { env.cleanUp() }
+        let snapshotsJSON = try FixtureLoader.string("snapshots.json")
+        try env.paths.ensureDirectories()
+        try FileManager.default.createDirectory(
+            at: env.paths.previewTokensLockFile,
+            withIntermediateDirectories: true
+        )
+        env.fake.script = Self.resticCall(
+            Self.backupArgv(env.primary.repoURL, excludes: env.set.purgeExcludes),
+            dest: Self.primaryId,
+            stdoutLines: Self.backupStream()
+        ) + Self.resticCall(
+            ["-r", env.primary.repoURL, "snapshots", "--json"],
+            dest: Self.primaryId,
+            stdoutLines: [snapshotsJSON]
+        )
+
+        let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
+
+        guard case .infrastructureFailure(let reason) = outcome else {
+            Issue.record("an unusable token store must fail the scheduled tick: \(outcome)")
+            return
+        }
+        #expect(reason.contains("preview-token store unusable"))
+        #expect(env.resticArgvs.count == 2)
+    }
+
+    @Test("automatic purge: a successful rewrite without a durable watermark is infrastructure failure")
+    func automaticPurgeWatermarkFailureIsInfrastructureFailure() async throws {
+        let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]
+        let hostnames = [Self.setId: Set(["example-mac.local"])]
+        let paths = Box<AppPaths?>(nil)
+        let env = Self.makeEnv(
+            script: [], retention: nil, purgeExcludes: ["build/**"], reachableSecondaries: [],
+            onSpawn: { argv in
+                guard argv.contains("rewrite"),
+                      !argv.contains("--dry-run"),
+                      let paths = paths.value else { return }
+                try? FileManager.default.removeItem(at: paths.scheduleStateLockFile)
+                try? FileManager.default.createDirectory(
+                    at: paths.scheduleStateLockFile,
+                    withIntermediateDirectories: true
+                )
+            },
+            purgeSourcePaths: sourcePaths,
+            purgeHostnames: hostnames
+        )
+        paths.value = env.paths
+        defer { env.cleanUp() }
+        let snapshotsJSON = try FixtureLoader.string("snapshots.json")
+        let snapshots = try parseSnapshots(Data(snapshotsJSON.utf8))
+        let rewrite = try FixtureLoader.string("rewrite-forget.txt")
+            .replacingOccurrences(of: "09b3295c", with: snapshots[0].shortId)
+            .replacingOccurrences(of: "b2435423", with: snapshots[1].shortId)
+        env.fake.script = Self.resticCall(
+            Self.backupArgv(env.primary.repoURL, excludes: env.set.purgeExcludes),
+            dest: Self.primaryId,
+            stdoutLines: Self.backupStream()
+        ) + Self.resticCall(
+            ["-r", env.primary.repoURL, "snapshots", "--json"],
+            dest: Self.primaryId,
+            stdoutLines: [snapshotsJSON]
+        ) + Self.resticCall(
+            ["-r", env.primary.repoURL, "snapshots", "--json"],
+            dest: Self.primaryId,
+            stdoutLines: [snapshotsJSON]
+        ) + Self.resticCall(
+            Self.rewriteArgv(
+                env.primary.repoURL,
+                snapshotIDs: snapshots.map(\.id),
+                patterns: env.set.purgeExcludes
+            ),
+            dest: Self.primaryId,
+            stdoutLines: rewrite.split(separator: "\n").map(String.init)
+        )
+
+        let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
+
+        guard case .infrastructureFailure(let reason) = outcome else {
+            Issue.record("a lost purge watermark must fail the scheduled tick: \(outcome)")
+            return
+        }
+        #expect(reason.contains("purge watermark"))
+        #expect(env.entries(kind: .purge).first?.status == .success)
     }
 
     @Test("row purge 2: a stale secondary whose purge fails is never copied or marked applied")

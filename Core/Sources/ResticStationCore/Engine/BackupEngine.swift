@@ -86,6 +86,20 @@ public enum SetRunOutcome: Equatable, Sendable {
     case infrastructureFailure(reason: String)
 }
 
+/// The result of `BackupEngine.runCheck(_:trigger:)`, keeping lock and local
+/// state failures distinct from a repository check that ran and failed.
+public enum CheckRunOutcome: Equatable, Sendable {
+    case completed(RunStatus)
+    /// A peer holds the set lock. Expected and retryable.
+    case skipped
+    /// No run record was created, so a later tick can retry cleanly.
+    case retryable(reason: String)
+    case misconfigured(reason: String)
+    /// The set or schedule-state lock is unusable. Scheduled callers must
+    /// exit non-zero rather than flattening this to an ordinary failed check.
+    case infrastructureFailure(reason: String)
+}
+
 /// The standalone-prune result keeps non-destructive refusals distinct from
 /// restic failures so the helper can preserve the published JSON taxonomy.
 public enum PruneRepositoryResult: Equatable, Sendable {
@@ -278,7 +292,19 @@ public final class BackupEngine: Sendable {
         defer { try? stateStore.clearCurrentRun(setId: set.id) }
 
         // ── Step 3: attempt-based lastBackupStart ───────────────────────
-        updateScheduleState(setId: set.id) { $0.lastBackupStart = self.now() }
+        do {
+            try updateScheduleState(setId: set.id) { $0.lastBackupStart = self.now() }
+        } catch {
+            let reason = "schedule state unusable — \(error)"
+            recordInfrastructureFailure(
+                kind: .backup,
+                setId: set.id,
+                destId: primary.id,
+                trigger: trigger,
+                reason: reason
+            )
+            return .infrastructureFailure(reason: reason)
+        }
 
         var children: [SetRunChild] = []
 
@@ -356,6 +382,9 @@ public final class BackupEngine: Sendable {
                 logWarning(
                     "BackupEngine: could not purge primary \"\(primary.label)\" before mirroring: \(error)"
                 )
+                if let reason = Self.purgeInfrastructureFailureReason(error) {
+                    return .infrastructureFailure(reason: reason)
+                }
                 return .completed(status: .failed, groupId: groupId, children: children)
             }
         }
@@ -404,6 +433,9 @@ public final class BackupEngine: Sendable {
                     logWarning(
                         "BackupEngine: could not purge secondary \"\(secondary.label)\" before copy: \(error)"
                     )
+                    if let reason = Self.purgeInfrastructureFailureReason(error) {
+                        return .infrastructureFailure(reason: reason)
+                    }
                     continue
                 }
             }
@@ -477,16 +509,19 @@ public final class BackupEngine: Sendable {
     /// **only** when the primary check succeeded — a failed check must
     /// re-verify the same slice next time rather than skip past it.
     ///
-    /// - Parameter trigger: defaults to ``RunTrigger/scheduled`` — `tick`'s
-    ///   call sites are unaffected. `run-set --kind check` passes
-    ///   ``RunTrigger/manual`` so the run record reflects a manual trigger
-    ///   (issue #9's close: this is the one permitted post-T09 Core change).
-    public func runCheck(_ set: BackupSet, trigger: RunTrigger = .scheduled) async -> RunStatus {
+    /// Returns a ``CheckRunOutcome`` so callers cannot confuse a repository
+    /// check that ran and failed with lock or schedule-state infrastructure
+    /// that prevented a safe attempt. `run-set --kind check` passes
+    /// ``RunTrigger/manual`` so the run record reflects a manual trigger.
+    public func runCheck(_ set: BackupSet, trigger: RunTrigger = .scheduled) async -> CheckRunOutcome {
         guard let primary = set.destinations.first(where: { $0.isPrimary }) else {
-            logWarning("BackupEngine: backup set \"\(set.name)\" has no primary destination — cannot check")
-            return .failed
+            let reason = "backup set \"\(set.name)\" has no primary destination"
+            logWarning("BackupEngine: \(reason) — cannot check")
+            return .misconfigured(reason: reason)
         }
-        guard await secretsAvailable(for: [primary]) else { return .skipped }
+        guard await secretsAvailable(for: [primary]) else {
+            return .retryable(reason: "the secret store is unavailable")
+        }
 
         let (lock, acquisition) = acquireSetLock(setId: set.id)
         switch acquisition {
@@ -499,7 +534,7 @@ public final class BackupEngine: Sendable {
             recordLockFailure(
                 kind: .check, setId: set.id, destId: primary.id, trigger: trigger, failure: failure
             )
-            return .failed
+            return .infrastructureFailure(reason: "backup-set lock unusable — \(failure)")
         }
         defer { lock.release() }
         // Declared after the lock defer, so it unwinds *first*: the live
@@ -508,7 +543,19 @@ public final class BackupEngine: Sendable {
         defer { try? stateStore.clearCurrentRun(setId: set.id) }
 
         // Attempt semantics, exactly like `lastBackupStart`.
-        updateScheduleState(setId: set.id) { $0.lastCheckStart = self.now() }
+        do {
+            try updateScheduleState(setId: set.id) { $0.lastCheckStart = self.now() }
+        } catch {
+            let reason = "schedule state unusable — \(error)"
+            recordInfrastructureFailure(
+                kind: .check,
+                setId: set.id,
+                destId: primary.id,
+                trigger: trigger,
+                reason: reason
+            )
+            return .infrastructureFailure(reason: reason)
+        }
 
         let totalSlices = set.checkPolicy?.readDataSubsetSlices ?? Self.defaultCheckSlices
         let previousState = stateStore.readScheduleState()?.sets[set.id]
@@ -530,15 +577,21 @@ public final class BackupEngine: Sendable {
             streamProgress: false
         )
         guard let primaryCheck else {
-            return .skipped
+            return .retryable(reason: "the run record could not be created")
         }
         var statuses = [primaryCheck.child.status]
 
         if primaryCheck.child.status == .success {
             // SAFETY: cursor advances only on success.
-            updateScheduleState(setId: set.id) { state in
-                state.checkSliceCursor = slice.newCursor
-                state.checkCount = checkCount
+            do {
+                try updateScheduleState(setId: set.id) { state in
+                    state.checkSliceCursor = slice.newCursor
+                    state.checkCount = checkCount
+                }
+            } catch {
+                let reason = "could not persist the successful check cursor — \(error)"
+                logWarning("BackupEngine: \(reason)")
+                return .infrastructureFailure(reason: reason)
             }
 
             if checkCount % Self.secondaryCheckEveryNChecks == 0 {
@@ -565,7 +618,7 @@ public final class BackupEngine: Sendable {
             }
         }
 
-        return Self.worstStatus(statuses)
+        return .completed(Self.worstStatus(statuses))
     }
 
     // MARK: - runPrune
@@ -1202,7 +1255,9 @@ public final class BackupEngine: Sendable {
                 // record the purge as applied, permanently, with no rewrite
                 // ever run and no error shown. Leave it pending and say so.
                 if plan.unattributed.isEmpty {
-                    markPurgePatternsApplied(setId: set.id, destinationId: destination.id, patterns: preview.patterns)
+                    try markPurgePatternsApplied(
+                        setId: set.id, destinationId: destination.id, patterns: preview.patterns
+                    )
                 } else {
                     logWarning(
                         "BackupEngine: purge of \"\(destination.label)\" matched none of "
@@ -1226,7 +1281,9 @@ public final class BackupEngine: Sendable {
             children.append(purge.child)
             if resolvedGroupId == nil { resolvedGroupId = purge.child.runId }
             if purge.child.status == .success {
-                markPurgePatternsApplied(setId: set.id, destinationId: destination.id, patterns: preview.patterns)
+                try markPurgePatternsApplied(
+                    setId: set.id, destinationId: destination.id, patterns: preview.patterns
+                )
             }
         }
         return PurgeRunResult(status: Self.worstStatus(children.map(\.status)), children: children)
@@ -1353,8 +1410,8 @@ public final class BackupEngine: Sendable {
                 patterns: patterns,
                 executableIdentity: executable.identity
             )
-        } catch let error as PurgeApplyError {
-            throw error
+        } catch let error as PreviewTokenError {
+            throw PurgeApplyError.token(error)
         } catch {
             throw PurgeApplyError.unavailable
         }
@@ -1946,16 +2003,32 @@ public final class BackupEngine: Sendable {
         trigger: RunTrigger,
         failure: LockFailure
     ) {
-        logWarning("BackupEngine: cannot acquire the set lock: \(failure)")
+        recordInfrastructureFailure(
+            kind: kind,
+            setId: setId,
+            destId: destId,
+            trigger: trigger,
+            reason: "could not acquire the backup-set lock — \(failure)"
+        )
+    }
+
+    private func recordInfrastructureFailure(
+        kind: RunKind,
+        setId: UUID,
+        destId: UUID,
+        trigger: RunTrigger,
+        reason: String
+    ) {
+        logWarning("BackupEngine: \(reason)")
         do {
             let run = try runStore.begin(kind: kind, setId: setId, destId: destId, trigger: trigger)
             try runStore.finish(
                 run,
                 status: .failed,
-                errorSummary: "could not acquire the backup-set lock — \(failure)"
+                errorSummary: reason
             )
         } catch {
-            logWarning("BackupEngine: could not record the lock failure: \(error)")
+            logWarning("BackupEngine: could not record the infrastructure failure: \(error)")
         }
     }
 
@@ -1972,25 +2045,44 @@ public final class BackupEngine: Sendable {
         )
     }
 
-    private func updateScheduleState(setId: UUID, mutate: (inout SetScheduleState) -> Void) {
-        do {
-            try stateStore.updateScheduleState(setId: setId, mutate: mutate)
-        } catch {
-            logWarning("BackupEngine: could not update schedule state for set \(setId): \(error)")
-        }
+    private func updateScheduleState(
+        setId: UUID,
+        mutate: (inout SetScheduleState) -> Void
+    ) throws {
+        try stateStore.updateScheduleState(setId: setId, mutate: mutate)
     }
 
     /// Advances the purge-exclusion watermark only after the matching
     /// repository rewrite succeeded. Existing snapshots are never inferred
     /// from this state; it merely prevents a newly added exclusion from
     /// running again on every scheduled backup.
-    private func markPurgePatternsApplied(setId: UUID, destinationId: UUID, patterns: [String]) {
-        updateScheduleState(setId: setId) { state in
-            var applied = state.appliedPurgeExcludes[destinationId] ?? []
-            for pattern in patterns where !applied.contains(pattern) {
-                applied.append(pattern)
+    private func markPurgePatternsApplied(
+        setId: UUID,
+        destinationId: UUID,
+        patterns: [String]
+    ) throws {
+        do {
+            try updateScheduleState(setId: setId) { state in
+                var applied = state.appliedPurgeExcludes[destinationId] ?? []
+                for pattern in patterns where !applied.contains(pattern) {
+                    applied.append(pattern)
+                }
+                state.appliedPurgeExcludes[destinationId] = applied
             }
-            state.appliedPurgeExcludes[destinationId] = applied
+        } catch {
+            throw PurgeApplyError.lockUnusable("could not persist the purge watermark — \(error)")
+        }
+    }
+
+    private static func purgeInfrastructureFailureReason(_ error: Error) -> String? {
+        guard let error = error as? PurgeApplyError else { return nil }
+        switch error {
+        case .lockUnusable(let detail):
+            return detail
+        case .token(.storeUnusable(let detail)):
+            return "preview-token store unusable — \(detail)"
+        default:
+            return nil
         }
     }
 

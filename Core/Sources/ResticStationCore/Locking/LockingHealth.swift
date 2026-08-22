@@ -11,16 +11,14 @@ import Foundation
 public enum LockingHealth {
     /// `nil` when the data directory and its lock files are usable.
     ///
-    /// Checks `tick.lock`, which covers the directory-scoped faults — an
-    /// uncreatable, unwritable or hostile `locks/` — **and every per-set lock
-    /// file that already exists**. A single hostile `set-<id>.lock` (a
-    /// directory, a symlink, another user's file) blocks that one set
-    /// forever while `locks/` itself is perfectly fine, so probing only the
-    /// tick lock left that alarm green; found by review on #117.
+    /// Checks the existing tick, per-set and shared-state lock files, plus
+    /// live creation capability in each parent directory. A single hostile
+    /// `set-<id>.lock` (a directory, a symlink, another user's file) blocks
+    /// that one set forever while `locks/` itself is perfectly fine, and an
+    /// existing `tick.lock` alone does not prove another lock can be created.
     ///
-    /// Existing files only. Per-set locks are created on demand, and a
-    /// read-only status query must not bring one into being for every
-    /// configured set as a side effect.
+    /// Per-set locks are created on demand, so a read-only status query must
+    /// not bring one into being for every configured set as a side effect.
     public static func probe(paths: AppPaths) -> LockFailure? {
         do {
             try paths.ensureDirectories()
@@ -35,7 +33,32 @@ public enum LockingHealth {
         if let failure = FileLock(path: paths.tickLockFile).probe() {
             return failure
         }
-        return probeExistingSetLocks(paths: paths)
+        if let failure = FileLock.probeCreation(in: paths.locksDir) {
+            return failure
+        }
+        if let failure = probeExistingSetLocks(paths: paths) {
+            return failure
+        }
+
+        // These companion locks protect shared local state outside
+        // `locks/`. Probe known files without creating them, then separately
+        // prove their parent directories can create a future lock.
+        for lockFile in [
+            paths.secretsLockFile,
+            paths.scheduleStateLockFile,
+            paths.previewTokensLockFile,
+            paths.runsIndexLockFile,
+        ] {
+            if let failure = FileLock(path: lockFile).probe(createIfMissing: false) {
+                return failure
+            }
+        }
+        for directory in [paths.stateDir, paths.runsDir] {
+            if let failure = FileLock.probeCreation(in: directory) {
+                return failure
+            }
+        }
+        return nil
     }
 
     /// The first unusable `locks/set-*.lock` already on disk, if any.

@@ -208,6 +208,26 @@ public final class FileLock: @unchecked Sendable {
         return Self.verify(fd: opened, path: path.path)
     }
 
+    /// Verifies that the effective process identity may create a new lock
+    /// file without touching any production lock path or taking an `flock`.
+    ///
+    /// Probing only an already-existing `tick.lock` is insufficient: opening
+    /// that file can succeed after the directory loses write permission,
+    /// while the next set whose lock does not yet exist fails at `O_CREAT`.
+    /// `faccessat(..., AT_EACCESS)` applies the same effective uid/gid that
+    /// performs `open(O_CREAT)` while remaining non-mutating. This matters
+    /// for `state/` and `runs/`, whose filesystem watchers recompute health:
+    /// creating a probe there would trigger its own next health check.
+    public static func probeCreation(in directory: URL) -> LockFailure? {
+        let permitted = directory.path.withCString {
+            faccessat(AT_FDCWD, $0, W_OK | X_OK, AT_EACCESS)
+        }
+        guard permitted == 0 else {
+            return LockFailure(path: directory.path, operation: "create lock", errnoValue: errno)
+        }
+        return nil
+    }
+
     /// Releases the lock (if held) and closes the file descriptor. Safe to
     /// call multiple times.
     public func release() {

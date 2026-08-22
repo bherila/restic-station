@@ -141,8 +141,13 @@ struct Tick: AsyncParsableCommand {
             if !backupDue, checkEnabled {
                 let checkDue = ScheduleMath.checkIsDue(lastCheckStart: scheduleState?.lastCheckStart, now: now)
                 if checkDue {
-                    let status = await context.engine.runCheck(set, trigger: .scheduled)
-                    print("set \"\(set.name)\": check \(status.rawValue)")
+                    let outcome = await context.engine.runCheck(set, trigger: .scheduled)
+                    print("set \"\(set.name)\": check \(describe(outcome))")
+                    if case .infrastructureFailure = outcome {
+                        infrastructureFailures.append(
+                            "set \"\(set.name)\": check \(describe(outcome))"
+                        )
+                    }
                 }
             }
         }
@@ -308,6 +313,21 @@ struct Tick: AsyncParsableCommand {
         switch outcome {
         case .completed(let status, _, let children):
             return "\(status.rawValue) (\(children.count) run\(children.count == 1 ? "" : "s"))"
+        case .skipped:
+            return "skipped — another operation for this set is already running"
+        case .retryable(let reason):
+            return "retryable: \(reason)"
+        case .misconfigured(let reason):
+            return "misconfigured: \(reason)"
+        case .infrastructureFailure(let reason):
+            return "cannot run here: \(reason)"
+        }
+    }
+
+    private func describe(_ outcome: CheckRunOutcome) -> String {
+        switch outcome {
+        case .completed(let status):
+            return status.rawValue
         case .skipped:
             return "skipped — another operation for this set is already running"
         case .retryable(let reason):
