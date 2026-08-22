@@ -119,7 +119,7 @@ public struct PreviewTokenStore: Sendable {
         destinations: [PreviewTokenDestination],
         config: AppConfig,
         patterns: [String],
-        executableIdentity: String?,
+        executableIdentity: String,
         lifetime: TimeInterval = defaultLifetime
     ) throws -> PreviewToken {
         try withStoreLock {
@@ -276,12 +276,22 @@ public struct PreviewTokenStore: Sendable {
     /// preview and apply invalidates a reclaim confirmation but did not
     /// invalidate a purge one — even though purge is the operation that
     /// rewrites snapshot history.
+    ///
+    /// `executableIdentity` is **nonoptional**, and that is the point rather
+    /// than tidiness. It used to accept `nil` and fold it to the literal
+    /// `"none"`, so a token minted while restic was missing bound no
+    /// executable at all — and an apply that also saw no restic recomputed
+    /// the same `"none"` fingerprint and matched. Both halves agreeing on
+    /// "no binary" authorized a `rewrite --forget` by whatever binary turned
+    /// up in between. Making the parameter nonoptional means an unbound
+    /// destructive capability cannot be expressed, instead of every caller
+    /// having to remember a guard (#109 exact-head review).
     public static func purgeFingerprint(
         _ config: AppConfig,
-        executableIdentity: String?
+        executableIdentity: String
     ) throws -> String {
         let base = try configFingerprint(config)
-        return SHA256Digest.hex(Data("\(base):\(executableIdentity ?? "none")".utf8))
+        return SHA256Digest.hex(Data("\(base):\(executableIdentity)".utf8))
     }
 
     private struct Index: Codable, Sendable {

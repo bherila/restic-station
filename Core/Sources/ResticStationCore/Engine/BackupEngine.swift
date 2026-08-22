@@ -1002,13 +1002,20 @@ public final class BackupEngine: Sendable {
             )
         }
         guard tokenDestinations.contains(where: { !$0.snapshotIDs.isEmpty }) else { return nil }
+        // Thrown, not `return nil`. `nil` from this method means "there is
+        // nothing destructive to do", and a restic binary that cannot be
+        // identified is emphatically not that — returning nil would report
+        // an empty plan for a set that has one.
+        guard let executable = restic.maintenanceExecutable() else {
+            throw PurgeApplyError.resticUnavailable
+        }
         return try previewTokens.issue(
             machineId: machineId,
             setId: set.id,
             destinations: tokenDestinations,
             config: config,
             patterns: set.purgeExcludes,
-            executableIdentity: restic.maintenanceExecutable()?.identity
+            executableIdentity: executable.identity
         )
     }
 
@@ -1067,8 +1074,11 @@ public final class BackupEngine: Sendable {
         let requestedIds = Set(destinations.map(\.id))
         let tokenIds = Set(preview.destinations.map(\.destinationId))
         // Resolved once and carried all the way to the launch, so the value
-        // that is validated is the value that runs.
-        let executable = restic.maintenanceExecutable()
+        // that is validated is the value that runs — and *required*, because
+        // a nil on both sides used to compare equal while binding nothing.
+        guard let executable = restic.maintenanceExecutable() else {
+            throw PurgeApplyError.resticUnavailable
+        }
         let fingerprint: String
         do {
             // Recomputed here, from the executable this process would
@@ -1076,7 +1086,7 @@ public final class BackupEngine: Sendable {
             // must not authorize a rewrite by this one.
             fingerprint = try PreviewTokenStore.purgeFingerprint(
                 config,
-                executableIdentity: executable?.identity
+                executableIdentity: executable.identity
             )
         } catch {
             throw PurgeApplyError.unavailable
@@ -1262,6 +1272,9 @@ public final class BackupEngine: Sendable {
     ) async throws -> PurgeRunResult {
         guard await secretsAvailable(for: [destination]) else { throw PurgeApplyError.unavailable }
         let plan = try await currentPurgePlan(set: set, destination: destination, patterns: patterns)
+        guard let executable = restic.maintenanceExecutable() else {
+            throw PurgeApplyError.resticUnavailable
+        }
         let token: PreviewToken
         do {
             token = try previewTokens.issue(
@@ -1270,8 +1283,10 @@ public final class BackupEngine: Sendable {
                 destinations: [PreviewTokenDestination(destinationId: destination.id, snapshotIDs: plan.matched.map(\.id))],
                 config: config,
                 patterns: patterns,
-                executableIdentity: restic.maintenanceExecutable()?.identity
+                executableIdentity: executable.identity
             )
+        } catch let error as PurgeApplyError {
+            throw error
         } catch {
             throw PurgeApplyError.unavailable
         }

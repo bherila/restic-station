@@ -413,6 +413,18 @@ extension CLIFailure {
             )
         case .busy:
             return CLIFailure.setBusy(setId: setId)
+        case .resticUnavailable:
+            // Named specifically rather than folded into the cause-neutral
+            // `.unavailable` advice: unlike secret storage or a failed
+            // listing, this one has a single, stateable remedy, and it is
+            // the refusal that stops an unbound destructive capability from
+            // being minted at all.
+            return CLIFailure(
+                code: .resticNotFound,
+                message: "The restic executable could not be identified, so the purge was refused. "
+                    + "Restore the configured restic binary and run purge preview again.",
+                details: CLIErrorDetails(setId: setId)
+            )
         case .destinationOffline(let destinationId):
             return CLIFailure(
                 code: .repositoryOffline,
