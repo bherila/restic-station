@@ -405,6 +405,22 @@ extension CLIFailure {
                 message: "The purge preview has expired. Run purge preview again.",
                 details: CLIErrorDetails(setId: setId)
             )
+        case .token(.storeUnusable(let detail)):
+            // Not the catch-all below. `.storeUnusable` exists precisely to
+            // separate "the confirmation store is broken" from "your preview
+            // is stale", and routing it here told the operator to run purge
+            // preview again — advice no retry can satisfy, which defeated
+            // the whole point of the distinction. Same non-retryable
+            // data-directory error `MaintenancePrune.issueBinding` uses.
+            // Found by review on #117.
+            return CLIFailure(
+                code: .internalError,
+                message: CLIFailure.bounded(
+                    "The confirmation store could not be used: \(detail). "
+                        + "Check the permissions on the Restic Station data directory."
+                ),
+                details: CLIErrorDetails(setId: setId)
+            )
         case .token, .tokenDoesNotMatchCurrentPlan:
             return CLIFailure(
                 code: .operationNotAllowed,

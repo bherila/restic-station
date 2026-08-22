@@ -75,6 +75,15 @@ public enum SetRunOutcome: Equatable, Sendable {
     case skipped
     case retryable(reason: String)
     case misconfigured(reason: String)
+    /// The operation could not start because the *machine* is broken — the
+    /// set lock is unopenable, wrong-owner, or its directory uncreatable.
+    ///
+    /// Deliberately not `.misconfigured`, which describes a configuration the
+    /// operator can fix by editing it, and emphatically not `.retryable`,
+    /// which the helper renders as a benign deferral. A scheduled tick must
+    /// exit non-zero on this so launchd/systemd sees a failing unit rather
+    /// than a clean pass (#110).
+    case infrastructureFailure(reason: String)
 }
 
 /// The standalone-prune result keeps non-destructive refusals distinct from
@@ -260,7 +269,7 @@ public final class BackupEngine: Sendable {
             recordLockFailure(
                 kind: .backup, setId: set.id, destId: primary.id, trigger: trigger, failure: failure
             )
-            return .misconfigured(reason: "backup-set lock unusable — \(failure)")
+            return .infrastructureFailure(reason: "backup-set lock unusable — \(failure)")
         }
         defer { lock.release() }
         // Declared after the lock defer, so it unwinds *first*: the live

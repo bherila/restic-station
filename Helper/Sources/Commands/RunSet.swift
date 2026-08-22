@@ -133,6 +133,8 @@ struct RunSet: AsyncParsableCommand {
             print("backup deferred (\(reason)) — will retry next tick")
         case .misconfigured(let reason):
             HelperExit.fail("backup set is misconfigured: \(reason)")
+        case .infrastructureFailure(let reason):
+            HelperExit.fail("this machine cannot run the backup: \(reason)")
         }
     }
 

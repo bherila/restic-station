@@ -788,7 +788,10 @@ struct BackupEngineTests {
         // which `HealthDerivation` does not count, so the machine went on
         // reporting healthy while every scheduled backup silently did
         // nothing, forever.
-        guard case .misconfigured(let reason) = outcome else {
+        // `.infrastructureFailure`, distinct from `.misconfigured`: the
+        // machine is broken, not the configuration, and only this case makes
+        // the scheduled tick exit non-zero.
+        guard case .infrastructureFailure(let reason) = outcome else {
             Issue.record("a broken lock must not be reported as ordinary contention: \(outcome)")
             return
         }

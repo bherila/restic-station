@@ -234,6 +234,49 @@ let canInjectPermissionFaults = getuid() != 0
         #expect(failure.operation == "create data directories")
     }
 
+    /// #117 review: a single hostile `set-<id>.lock` blocks that one set
+    /// forever while `locks/` itself is fine, so probing only the tick lock
+    /// left the live alarm green.
+    @Test("LockingHealth catches a hostile per-set lock, not just the tick lock")
+    func lockingHealthProbesExistingSetLocks() throws {
+        let root = makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = AppPaths(root: root)
+        try paths.ensureDirectories()
+        #expect(LockingHealth.probe(paths: paths) == nil, "precondition: healthy to begin with")
+
+        // A directory where one set's lock file belongs. `locks/` and
+        // `tick.lock` are untouched and perfectly usable.
+        let setId = UUID()
+        try FileManager.default.createDirectory(
+            at: paths.setLockFile(setId: setId), withIntermediateDirectories: true
+        )
+
+        let failure = try #require(
+            LockingHealth.probe(paths: paths),
+            "a per-set lock that cannot be opened must not read as a healthy machine"
+        )
+        #expect(String(describing: failure).contains(setId.uuidString))
+    }
+
+    /// The probe must not manufacture the very files it reports on: a
+    /// read-only status query that created a lock file per configured set
+    /// would be a write, and on a fresh install would report every set.
+    @Test("probing existing set locks creates nothing")
+    func probeDoesNotCreateSetLocks() throws {
+        let root = makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = AppPaths(root: root)
+        try paths.ensureDirectories()
+
+        let absent = paths.setLockFile(setId: UUID())
+        #expect(FileLock(path: absent).probe(createIfMissing: false) == nil)
+        #expect(
+            !FileManager.default.fileExists(atPath: absent.path),
+            "a non-creating probe must leave the filesystem as it found it"
+        )
+    }
+
     @Test("LockingHealth is quiet on a healthy data directory")
     func lockingHealthIsQuietWhenHealthy() throws {
         let root = makeDirectory()

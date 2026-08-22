@@ -109,6 +109,9 @@ struct Tick: AsyncParsableCommand {
         // ── Step 4/5: sequential due sets (config order). ────────────────
         let now = Date()
         let calendar = Calendar.current
+        /// Sets whose lock could not be *used* this tick. Non-empty means the
+        /// tick exits non-zero, however much other work succeeded.
+        var infrastructureFailures: [String] = []
 
         for set in config.sets {
             let scheduleState = context.stateStore.readScheduleState()?.sets[set.id]
@@ -122,6 +125,14 @@ struct Tick: AsyncParsableCommand {
             if backupDue {
                 let outcome = await context.engine.runSet(set, trigger: .scheduled)
                 print("set \"\(set.name)\": \(describe(outcome))")
+                // A set that cannot take its own lock is a broken machine,
+                // not a skipped cycle. Recorded here and reported at the end
+                // rather than thrown immediately: the remaining sets are
+                // still worth attempting, and the reprobe below still has
+                // value — but this tick must not exit 0 (#110).
+                if case .infrastructureFailure = outcome {
+                    infrastructureFailures.append("set \"\(set.name)\": \(describe(outcome))")
+                }
             }
 
             // "Backup wins": skip this set's check when its backup was due
@@ -168,7 +179,19 @@ struct Tick: AsyncParsableCommand {
             }
         }
 
-        // ── Step 7: tick.lock released by the `defer` above; exit 0. ────
+        // ── Step 7: tick.lock released by the `defer` above. ─────────────
+        //
+        // Exit 0 only if every due set could actually be attempted. A tick
+        // that printed "backup-set lock unusable" and then exited 0 is the
+        // exact shape of the silent stoppage this whole change is about: the
+        // set never runs again, and launchd/systemd keeps seeing success.
+        guard infrastructureFailures.isEmpty else {
+            HelperExit.fail(
+                "tick: this machine could not run "
+                    + "\(infrastructureFailures.count) scheduled operation(s):\n  "
+                    + infrastructureFailures.joined(separator: "\n  ")
+            )
+        }
     }
 
     /// Rewrites dead runs as `failed` and clears the progress files they
@@ -291,6 +314,8 @@ struct Tick: AsyncParsableCommand {
             return "retryable: \(reason)"
         case .misconfigured(let reason):
             return "misconfigured: \(reason)"
+        case .infrastructureFailure(let reason):
+            return "cannot run here: \(reason)"
         }
     }
 }

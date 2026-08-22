@@ -999,6 +999,29 @@ grep -q "NOTHING CAN RUN ON THIS MACHINE" "$OUT_FILE" \
     || fail "human status did not state the locking failure plainly: $(cat "$OUT_FILE")"
 ok "human status states it plainly, above the scheduler line"
 
+# #117 review: a hostile *per-set* lock, with `locks/` and `tick.lock` both
+# perfectly usable. The set can never run again, so neither the tick nor
+# status may report success — previously the tick printed the failure and
+# exited 0, and the live probe only ever looked at `tick.lock`.
+BROKEN_SET_LOCK="$WORK/broken-set-lock"
+mkdir -p "$BROKEN_SET_LOCK"
+cp -R "$HEALTHY/." "$BROKEN_SET_LOCK/" 2>/dev/null || true
+SET_UUID="$(RESTIC_STATION_DATA_DIR="$BROKEN_SET_LOCK" "$HELPER" sets list --json 2>/dev/null \
+    | jq -r '.data[0].id' 2>/dev/null || true)"
+if [[ -n "$SET_UUID" && "$SET_UUID" != "null" ]]; then
+    mkdir -p "$BROKEN_SET_LOCK/locks/set-$SET_UUID.lock"
+    RESTIC_STATION_DATA_DIR="$BROKEN_SET_LOCK" run_helper_split status --json
+    [[ "$RC" -ne 0 ]] \
+        || fail "status --json exited 0 with an unusable per-set lock"
+    [[ "$(jq -r '.data.locking.usable' "$OUT_FILE")" == "false" ]] \
+        || fail "status --json missed a hostile per-set lock: $(jq -c '.data.locking' "$OUT_FILE")"
+    grep -q "$SET_UUID" <<<"$(jq -r '.data.locking.problem' "$OUT_FILE")" \
+        || fail "status --json did not name the offending set lock"
+    ok "a hostile per-set lock is reported even when locks/ and tick.lock are fine"
+else
+    echo "  (skipped per-set lock assertion: could not resolve a set id from the fixture)"
+fi
+
 # The control: the same commands on a healthy fixture must not trip any of
 # the above. A check that fires everywhere is not a check.
 RESTIC_STATION_DATA_DIR="$HEALTHY" run_helper_split status --json

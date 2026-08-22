@@ -11,11 +11,16 @@ import Foundation
 public enum LockingHealth {
     /// `nil` when the data directory and its lock files are usable.
     ///
-    /// Checks `tick.lock` only. Per-set lock files are created on demand, so
-    /// probing them would mean creating a file for every configured set as a
-    /// side effect of a read-only status query; the faults worth catching
-    /// here — an uncreatable, unwritable or hostile `locks/` — are directory
-    /// scoped and show up on the tick lock just as well.
+    /// Checks `tick.lock`, which covers the directory-scoped faults — an
+    /// uncreatable, unwritable or hostile `locks/` — **and every per-set lock
+    /// file that already exists**. A single hostile `set-<id>.lock` (a
+    /// directory, a symlink, another user's file) blocks that one set
+    /// forever while `locks/` itself is perfectly fine, so probing only the
+    /// tick lock left that alarm green; found by review on #117.
+    ///
+    /// Existing files only. Per-set locks are created on demand, and a
+    /// read-only status query must not bring one into being for every
+    /// configured set as a side effect.
     public static func probe(paths: AppPaths) -> LockFailure? {
         do {
             try paths.ensureDirectories()
@@ -27,6 +32,25 @@ public enum LockingHealth {
                 underlying: "\(error)"
             )
         }
-        return FileLock(path: paths.tickLockFile).probe()
+        if let failure = FileLock(path: paths.tickLockFile).probe() {
+            return failure
+        }
+        return probeExistingSetLocks(paths: paths)
+    }
+
+    /// The first unusable `locks/set-*.lock` already on disk, if any.
+    private static func probeExistingSetLocks(paths: AppPaths) -> LockFailure? {
+        guard let entries = try? FileManager.default.contentsOfDirectory(
+            atPath: paths.locksDir.path
+        ) else {
+            return nil
+        }
+        for name in entries.sorted() where name.hasPrefix("set-") && name.hasSuffix(".lock") {
+            let url = paths.locksDir.appendingPathComponent(name, isDirectory: false)
+            if let failure = FileLock(path: url).probe(createIfMissing: false) {
+                return failure
+            }
+        }
+        return nil
     }
 }

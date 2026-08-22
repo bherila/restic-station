@@ -166,11 +166,25 @@ public final class FileLock: @unchecked Sendable {
     /// validating exercises everything that actually breaks — a missing or
     /// unwritable directory, a wrong owner, a symlink at the path — and
     /// contends with nothing.
-    public func probe() -> LockFailure? {
-        let flags = O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC
+    /// - Parameter createIfMissing: when `false`, a lock file that does not
+    ///   exist yet is *not* created and reports no fault. Per-set lock files
+    ///   are made on demand, so a read-only status query must not bring one
+    ///   into being for every configured set as a side effect — but a
+    ///   hostile file that already exists is still worth catching.
+    public func probe(createIfMissing: Bool = true) -> LockFailure? {
+        var flags = O_RDWR | O_NOFOLLOW | O_CLOEXEC
+        if createIfMissing {
+            flags |= O_CREAT
+        } else if !FileManager.default.fileExists(atPath: path.path) {
+            return nil
+        }
         let opened = path.path.withCString { open($0, flags, 0o600) }
         guard opened >= 0 else {
-            return LockFailure(path: path.path, operation: "open", errnoValue: errno)
+            let code = errno
+            // Raced with a deletion between the existence check and the
+            // open. Nothing is there, so there is nothing wrong.
+            if code == ENOENT, !createIfMissing { return nil }
+            return LockFailure(path: path.path, operation: "open", errnoValue: code)
         }
         defer { close(opened) }
         return Self.verify(fd: opened, path: path.path)
