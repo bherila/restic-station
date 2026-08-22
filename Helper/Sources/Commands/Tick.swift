@@ -9,18 +9,42 @@ struct Tick: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "tick",
         abstract: "Run one scheduling pass (invoked by launchd every 2 minutes). "
-            + "Exit 0 always, except a hard config-load error (exit 1)."
+            + "Exit 0 always, except a hard config-load error, or a data directory or "
+            + "tick lock that cannot be used at all (exit 1)."
     )
 
     func run() async throws {
         let paths = AppPaths.default()
-        try? paths.ensureDirectories()
+        // Not `try?`. A data directory that cannot be created means this
+        // tick can do nothing at all, and discarding the error handed that
+        // to the lock below to express — which it did, as `false`, i.e. as
+        // contention (#110).
+        do {
+            try paths.ensureDirectories()
+        } catch {
+            HelperExit.fail("tick: could not create the data directories under \(paths.root.path): \(error)")
+        }
 
         // ── Step 1: tick.lock — busy means a previous tick is still
         // evaluating/running; exit 0 silently. ───────────────────────────
         let lock = FileLock(path: paths.tickLockFile)
-        guard lock.tryAcquire() else {
+        switch lock.acquire() {
+        case .acquired:
+            break
+        case .busy:
+            // The overwhelmingly common case, and not a fault: `tick` holds
+            // this lock for the whole of any backup it starts, so on a host
+            // with a backup running longer than the two-minute interval
+            // *every* intervening tick lands here. Exit 0 — the issue text
+            // proposed exit 2 for a contended lock, which would report the
+            // agent as failing for the entire duration of every long backup.
             return
+        case .failed(let failure):
+            // The case this branch exists for: unopenable, wrong owner, or a
+            // symlink at the lock path. Nothing this tick could do would
+            // work, and reporting success would leave launchd/systemd — and
+            // `status` — believing the schedule is being kept.
+            HelperExit.fail("tick: could not acquire the tick lock: \(failure)")
         }
         defer { lock.release() }
 
@@ -224,7 +248,22 @@ struct Tick: AsyncParsableCommand {
     private func clearAbandonedProgress(runStore: RunStore, stateStore: StateStore, paths: AppPaths) {
         for setId in stateStore.currentRunSetIDs() {
             let lock = FileLock(path: paths.setLockFile(setId: setId))
-            guard lock.tryAcquire() else { continue }
+            switch lock.acquire() {
+            case .acquired:
+                break
+            case .busy:
+                // Someone is running this set; the progress file is theirs.
+                continue
+            case .failed(let failure):
+                // Reported but not fatal. Sweeping abandoned progress is
+                // best-effort housekeeping, and this tick may still have
+                // real backups to attempt — each of which now reports the
+                // same fault itself, as a failed run, when it hits it.
+                StandardStream.writeToStandardError(
+                    Data("tick: could not acquire the lock for set \(setId): \(failure)\n".utf8)
+                )
+                continue
+            }
             defer { lock.release() }
 
             // Re-read inside the lock: whatever was there before we held it

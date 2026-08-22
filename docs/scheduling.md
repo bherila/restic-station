@@ -344,7 +344,18 @@ Two levels, both `flock(2)` `LOCK_EX | LOCK_NB` on files under `locks/` (advisor
 | `tick.lock` | the whole tick | prevent overlapping scheduled evaluations when a backup outlives StartInterval |
 | `set-<setId>.lock` | any run touching that set (scheduled or manual, incl. restore & prune) | one operation per set at a time |
 
-`FileLock` API: `init(path:)`, `tryAcquire() -> Bool`, `release()`, RAII deinit-release. A manual `run-set` finding the set lock busy exits code 2 and writes a `.skipped` index record; the app surfaces "already running".
+`FileLock` API: `init(path:)`, `acquire() -> LockAcquireResult`, `probe() -> LockFailure?`, `release()`, RAII deinit-release. Lock files are opened `O_NOFOLLOW | O_CLOEXEC` at `0600`, and an `fstat` on the descriptor requires a regular file owned by the current uid.
+
+**`busy` and `failed` are different answers, and callers must treat them differently** (#110). `acquire()` returns `busy` only for `EWOULDBLOCK`/`EAGAIN` — a peer genuinely holding the lock. Everything else — an uncreatable `locks/`, `EACCES`, a symlink at the path, a lock file belonging to another user — is `failed`, and:
+
+- `tick` exits **non-zero** rather than returning quietly, so launchd/systemd sees a failing unit instead of a clean pass;
+- `BackupEngine` records a **`.failed`** index entry, not the benign `.skipped` one, so `HealthDerivation` counts it and the menu bar and `status` both show a warning;
+- the polling lock users (`schedule-state`, `runs/index.jsonl`, the secret store) throw **immediately** instead of spending their whole timeout and then blaming contention;
+- `status --json` probes independently and live (`LockingHealth`), because the fault usually prevents writing the very record that would report it.
+
+These were one `false` until #110, which is how an unusable data directory became a silent, permanent, exit-0 stoppage of every scheduled backup.
+
+A contended `tick.lock` is **not** a failure and still exits 0: `tick` holds it for the whole of any backup it starts, so on a host with a backup longer than `StartInterval` every intervening tick finds it busy. A manual `run-set` finding the set lock busy exits code 2 and writes a `.skipped` index record; the app surfaces "already running".
 
 restic's own repo lock is the last line of defense (exit 11 → auto-`unlock` of stale locks + one retry, see restic-cli.md); ours prevent the normal cases.
 

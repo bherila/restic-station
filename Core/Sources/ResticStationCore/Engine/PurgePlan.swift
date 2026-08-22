@@ -113,6 +113,11 @@ public enum PurgeApplyError: Error, Equatable, Sendable {
     case token(PreviewTokenError)
     case tokenDoesNotMatchCurrentPlan
     case busy
+    /// The set lock could not be *used* — not held by someone else, but
+    /// unopenable, wrong owner, or on an uncreatable directory. Kept apart
+    /// from ``busy`` because a caller may sensibly retry contention and must
+    /// never quietly retry a broken lock directory (#110).
+    case lockUnusable(String)
     case destinationOffline(destinationId: UUID)
     case unavailable
     /// No restic executable could be identified, so no destructive purge

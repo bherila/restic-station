@@ -425,6 +425,18 @@ extension CLIFailure {
                     + "Restore the configured restic binary and run purge preview again.",
                 details: CLIErrorDetails(setId: setId)
             )
+        case .lockUnusable(let detail):
+            // Deliberately not `set_busy`. An agent — and the GUI — treat
+            // `set_busy` as "wait and try again", and the lock directory
+            // being unopenable is not something waiting fixes (#110).
+            return CLIFailure(
+                code: .internalError,
+                message: CLIFailure.bounded(
+                    "The backup-set lock could not be used: \(detail). "
+                        + "Check the permissions on the Restic Station data directory."
+                ),
+                details: CLIErrorDetails(setId: setId)
+            )
         case .destinationOffline(let destinationId):
             return CLIFailure(
                 code: .repositoryOffline,

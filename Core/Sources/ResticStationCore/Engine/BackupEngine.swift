@@ -249,10 +249,18 @@ public final class BackupEngine: Sendable {
         }
 
         // ── Step 2: per-set lock ────────────────────────────────────────
-        let lock = makeSetLock(setId: set.id)
-        guard lock.tryAcquire() else {
+        let (lock, acquisition) = acquireSetLock(setId: set.id)
+        switch acquisition {
+        case .acquired:
+            break
+        case .busy:
             recordSkipped(kind: .backup, setId: set.id, destId: primary.id, trigger: trigger)
             return .skipped
+        case .failed(let failure):
+            recordLockFailure(
+                kind: .backup, setId: set.id, destId: primary.id, trigger: trigger, failure: failure
+            )
+            return .misconfigured(reason: "backup-set lock unusable — \(failure)")
         }
         defer { lock.release() }
         // Declared after the lock defer, so it unwinds *first*: the live
@@ -471,10 +479,18 @@ public final class BackupEngine: Sendable {
         }
         guard await secretsAvailable(for: [primary]) else { return .skipped }
 
-        let lock = makeSetLock(setId: set.id)
-        guard lock.tryAcquire() else {
+        let (lock, acquisition) = acquireSetLock(setId: set.id)
+        switch acquisition {
+        case .acquired:
+            break
+        case .busy:
             recordSkipped(kind: .check, setId: set.id, destId: primary.id, trigger: trigger)
             return .skipped
+        case .failed(let failure):
+            recordLockFailure(
+                kind: .check, setId: set.id, destId: primary.id, trigger: trigger, failure: failure
+            )
+            return .failed
         }
         defer { lock.release() }
         // Declared after the lock defer, so it unwinds *first*: the live
@@ -584,10 +600,18 @@ public final class BackupEngine: Sendable {
         }
         guard await secretsAvailable(for: [primary]) else { return .skipped }
 
-        let lock = makeSetLock(setId: set.id)
-        guard lock.tryAcquire() else {
+        let (lock, acquisition) = acquireSetLock(setId: set.id)
+        switch acquisition {
+        case .acquired:
+            break
+        case .busy:
             recordSkipped(kind: .prune, setId: set.id, destId: primary.id, trigger: .manual)
             return .skipped
+        case .failed(let failure):
+            recordLockFailure(
+                kind: .prune, setId: set.id, destId: primary.id, trigger: .manual, failure: failure
+            )
+            return .failed
         }
         defer { lock.release() }
         // Declared after the lock defer, so it unwinds *first*: the live
@@ -666,8 +690,11 @@ public final class BackupEngine: Sendable {
         let executablePath = authorization?.resticExecutablePath ?? resticExecutablePath
         let executableIdentity = authorization?.resticExecutableIdentity ?? resticExecutableIdentity
 
-        let lock = makeSetLock(setId: set.id)
-        guard lock.tryAcquire() else {
+        let (lock, acquisition) = acquireSetLock(setId: set.id)
+        switch acquisition {
+        case .acquired:
+            break
+        case .busy:
             // A preview is an unrecorded read-only query, even when it is
             // refused because another set operation holds the lock. Recording
             // that refusal as a prune would replace the last real cleanup in
@@ -676,6 +703,18 @@ public final class BackupEngine: Sendable {
                 recordSkipped(kind: .prune, setId: set.id, destId: destination.id, trigger: .manual)
             }
             return .skipped(.busy)
+        case .failed(let failure):
+            // A dry run stays unrecorded for the reason above, but the
+            // refusal itself is a fault rather than contention, so it is
+            // reported as one either way.
+            if !dryRun {
+                recordLockFailure(
+                    kind: .prune, setId: set.id, destId: destination.id, trigger: .manual, failure: failure
+                )
+            } else {
+                logWarning("BackupEngine: cannot acquire the set lock: \(failure)")
+            }
+            return .failed(.didNotRun)
         }
         defer { lock.release() }
         defer { try? stateStore.clearCurrentRun(setId: set.id) }
@@ -887,9 +926,19 @@ public final class BackupEngine: Sendable {
             )
         }
 
-        let lock = makeSetLock(setId: set.id)
-        guard lock.tryAcquire() else {
+        let (lock, acquisition) = acquireSetLock(setId: set.id)
+        switch acquisition {
+        case .acquired:
+            break
+        case .busy:
             return PurgePlanResult(plan: emptyPlan, status: .busy, message: "another operation is running")
+        case .failed(let failure):
+            logWarning("BackupEngine: cannot acquire the set lock: \(failure)")
+            return PurgePlanResult(
+                plan: emptyPlan,
+                status: .failed,
+                message: "backup-set lock unusable — \(failure)"
+            )
         }
         defer { lock.release() }
 
@@ -1040,8 +1089,18 @@ public final class BackupEngine: Sendable {
         destinations: [Destination],
         token: String
     ) async throws -> PurgeRunResult {
-        let lock = makeSetLock(setId: set.id)
-        guard lock.tryAcquire() else { throw PurgeApplyError.busy }
+        let (lock, acquisition) = acquireSetLock(setId: set.id)
+        switch acquisition {
+        case .acquired:
+            break
+        case .busy:
+            throw PurgeApplyError.busy
+        case .failed(let failure):
+            // Not `.busy`: the caller retries a busy purge, and retrying a
+            // broken lock directory forever is the silent-stop failure this
+            // whole change is about.
+            throw PurgeApplyError.lockUnusable(String(describing: failure))
+        }
         defer { lock.release() }
         defer { try? stateStore.clearCurrentRun(setId: set.id) }
         return try await runPurgeLocked(
@@ -1313,10 +1372,18 @@ public final class BackupEngine: Sendable {
         }
         guard await secretsAvailable(for: [destination]) else { return .skipped }
 
-        let lock = makeSetLock(setId: set.id)
-        guard lock.tryAcquire() else {
+        let (lock, acquisition) = acquireSetLock(setId: set.id)
+        switch acquisition {
+        case .acquired:
+            break
+        case .busy:
             recordSkipped(kind: .restore, setId: set.id, destId: destination.id, trigger: .manual)
             return .skipped
+        case .failed(let failure):
+            recordLockFailure(
+                kind: .restore, setId: set.id, destId: destination.id, trigger: .manual, failure: failure
+            )
+            return .failed
         }
         defer { lock.release() }
         // Declared after the lock defer, so it unwinds *first*: the live
@@ -1365,10 +1432,18 @@ public final class BackupEngine: Sendable {
         // and `RESTIC_FROM_PASSWORD_COMMAND`).
         guard await secretsAvailable(for: [dest, primary]) else { return .skipped }
 
-        let lock = makeSetLock(setId: set.id)
-        guard lock.tryAcquire() else {
+        let (lock, acquisition) = acquireSetLock(setId: set.id)
+        switch acquisition {
+        case .acquired:
+            break
+        case .busy:
             recordSkipped(kind: .`init`, setId: set.id, destId: dest.id, trigger: .manual)
             return .skipped
+        case .failed(let failure):
+            recordLockFailure(
+                kind: .`init`, setId: set.id, destId: dest.id, trigger: .manual, failure: failure
+            )
+            return .failed
         }
         defer { lock.release() }
         // Declared after the lock defer, so it unwinds *first*: the live
@@ -1473,9 +1548,14 @@ public final class BackupEngine: Sendable {
     /// is retryable, and only `.expired` may say *why* — `.unknown` and
     /// `.alreadyUsed` stay deliberately opaque so a caller cannot probe the
     /// token store for which of the two it hit.
+    ///
+    /// `.storeUnusable` maps to the same non-committal refusal as
+    /// `.unavailable` rather than leaking the filesystem detail into a
+    /// destructive-path message; the detail is logged and reported by
+    /// `status` instead (#110).
     private static func preflightFailure(for error: PreviewTokenError) -> PreflightFailure {
         switch error {
-        case .unavailable: return .previewUnavailable
+        case .unavailable, .storeUnusable: return .previewUnavailable
         case .expired: return .previewExpired
         case .unknown, .alreadyUsed: return .previewChanged
         }
@@ -1812,18 +1892,62 @@ public final class BackupEngine: Sendable {
 
     // MARK: - State helpers
 
-    /// `locks/set-<setId>.lock`. The lock directory is created first:
-    /// `FileLock.tryAcquire()` reports `false` both for "held by someone
-    /// else" and for "could not open the file", so on a fresh data directory
-    /// a missing `locks/` would masquerade as a busy lock and every run
-    /// would be skipped forever.
-    private func makeSetLock(setId: UUID) -> FileLock {
+    /// `locks/set-<setId>.lock`, plus the answer to whether we hold it.
+    ///
+    /// Directory creation is part of acquisition, not a best-effort
+    /// preamble to it. It used to be logged and stepped over, which left the
+    /// caller to interpret the `false` that followed — and every caller read
+    /// that `false` as contention, so an uncreatable `locks/` skipped every
+    /// run of every set forever while each process still exited 0. A
+    /// directory that cannot be created is now a ``LockAcquireResult/failed``
+    /// like any other, carrying the reason (#110).
+    private func acquireSetLock(setId: UUID) -> (lock: FileLock, result: LockAcquireResult) {
+        let lock = FileLock(path: paths.setLockFile(setId: setId))
         do {
             try paths.ensureDirectories()
         } catch {
-            logWarning("BackupEngine: could not create the data directories: \(error)")
+            return (lock, .failed(LockFailure(
+                path: paths.locksDir.path,
+                operation: "create data directories",
+                errnoValue: 0,
+                underlying: "\(error)"
+            )))
         }
-        return FileLock(path: paths.setLockFile(setId: setId))
+        return (lock, lock.acquire())
+    }
+
+    /// Writes one `.failed` index record for an operation that could not
+    /// even start because its lock was unusable.
+    ///
+    /// Deliberately `.failed`, not `.skipped`. `.skipped` is the benign
+    /// "someone else is running" record, and `HealthDerivation` does not
+    /// count it — recording an environment fault that way is how a machine
+    /// that cannot back up at all goes on reporting healthy. `.failed` sets
+    /// `SetHealth.lastRunFailed`, which is what turns the menu bar yellow
+    /// and makes `status --json` exit 1.
+    ///
+    /// Best effort by necessity: the fault that broke the lock is quite
+    /// likely to break this write too, which is why it is not the only
+    /// mechanism — `status` probes the lock directory live, and `tick` exits
+    /// non-zero (#110).
+    private func recordLockFailure(
+        kind: RunKind,
+        setId: UUID,
+        destId: UUID,
+        trigger: RunTrigger,
+        failure: LockFailure
+    ) {
+        logWarning("BackupEngine: cannot acquire the set lock: \(failure)")
+        do {
+            let run = try runStore.begin(kind: kind, setId: setId, destId: destId, trigger: trigger)
+            try runStore.finish(
+                run,
+                status: .failed,
+                errorSummary: "could not acquire the backup-set lock — \(failure)"
+            )
+        } catch {
+            logWarning("BackupEngine: could not record the lock failure: \(error)")
+        }
     }
 
     private func progressReporter(setId: UUID, run: ActiveRun, phase: String) -> ProgressReporter {

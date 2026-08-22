@@ -172,6 +172,17 @@ struct MaintenancePrune: AsyncParsableCommand, JSONRenderable {
                 message: "The reclaim confirmation is temporarily unavailable. Run the dry run again.",
                 details: CLIErrorDetails(setId: setId, destinationId: destinationId)
             )
+        } catch PreviewTokenError.storeUnusable(let detail) {
+            // Not `set_busy`: "run the dry run again" is the wrong advice
+            // for a token store that no retry will fix (#110).
+            throw CLIFailure(
+                code: .internalError,
+                message: CLIFailure.bounded(
+                    "The confirmation store could not be used: \(detail). "
+                        + "Check the permissions on the Restic Station data directory."
+                ),
+                details: CLIErrorDetails(setId: setId, destinationId: destinationId)
+            )
         }
     }
 

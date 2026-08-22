@@ -8,6 +8,60 @@ import Glibc
 import Musl
 #endif
 
+/// Why a lock could not be taken, when the reason was *not* contention.
+///
+/// Carries enough to name the fault in a health record or an operator-facing
+/// message: which file, which syscall, and the `errno` it set. `errnoValue`
+/// is `0` for a policy refusal (wrong file type, wrong owner), where no
+/// syscall failed and the refusal is ours.
+public struct LockFailure: Error, Equatable, Sendable, CustomStringConvertible {
+    public let path: String
+    /// The failing syscall or check: `"open"`, `"flock"`, `"fstat"`,
+    /// `"ownership"`, `"file type"`.
+    public let operation: String
+    public let errnoValue: Int32
+    /// Set when the fault came from a Swift error rather than a syscall —
+    /// directory creation, which must succeed before a lock file can even be
+    /// opened, and which fails as an `NSError` with no useful `errno`.
+    public let underlying: String?
+
+    public init(path: String, operation: String, errnoValue: Int32, underlying: String? = nil) {
+        self.path = path
+        self.operation = operation
+        self.errnoValue = errnoValue
+        self.underlying = underlying
+    }
+
+    public var description: String {
+        if let underlying {
+            return "\(path): \(operation) failed: \(underlying)"
+        }
+        guard errnoValue != 0 else {
+            return "\(path): refused by \(operation) check"
+        }
+        return "\(path): \(operation) failed: \(String(cString: strerror(errnoValue))) (errno \(errnoValue))"
+    }
+}
+
+/// The three genuinely different answers to "did I get the lock?".
+///
+/// The distinction this type exists to force is between ``busy`` and
+/// ``failed``. They used to be one `false`, which meant an unwritable or
+/// damaged state directory was indistinguishable from a peer legitimately
+/// holding the lock — so the scheduler treated "this machine cannot back up
+/// at all" as "someone else is already backing up", and skipped silently and
+/// forever while every process still exited 0. See issue #110.
+///
+/// Only `EWOULDBLOCK`/`EAGAIN` from `flock(2)` is contention. Everything
+/// else is a fault that must reach a human.
+public enum LockAcquireResult: Equatable, Sendable {
+    case acquired
+    /// Another open file description holds the lock. Normal, expected, and
+    /// the only case a caller may treat as "try again later".
+    case busy
+    case failed(LockFailure)
+}
+
 /// Advisory `flock(2)` wrapper per `docs/scheduling.md` §Locking.
 ///
 /// Two levels of lock in this app (`locks/tick.lock`,
@@ -32,17 +86,94 @@ public final class FileLock: @unchecked Sendable {
     }
 
     /// Opens (creating if necessary) and attempts a non-blocking exclusive
-    /// lock. Returns `false` if another open file description already
-    /// holds the lock, or if the file could not be opened. Safe to call
-    /// repeatedly (e.g. to poll).
-    @discardableResult
-    public func tryAcquire() -> Bool {
+    /// lock. Safe to call repeatedly (e.g. to poll).
+    ///
+    /// The open is deliberately hostile to anything that is not the plain
+    /// owner-only regular file we expect:
+    ///
+    /// - `O_NOFOLLOW` so a symlink planted at the lock path cannot redirect
+    ///   the descriptor somewhere else. A symlink fails with `ELOOP`, which
+    ///   is a ``LockAcquireResult/failed`` — not silently followed, and not
+    ///   mistaken for contention.
+    /// - `O_CLOEXEC` so the descriptor does not leak into restic. A leaked
+    ///   descriptor keeps the `flock()` alive in the child, so a restic
+    ///   process outliving its parent would hold the set lock with nothing
+    ///   able to release it.
+    /// - `0600` on creation, then an `fstat` on the descriptor (not the
+    ///   path — no second lookup to race) requiring a regular file owned by
+    ///   this uid. A lock file another user can open is a lock another user
+    ///   can hold, which wedges the scheduler for as long as they care to.
+    public func acquire() -> LockAcquireResult {
         if fd < 0 {
-            let opened = path.path.withCString { open($0, O_CREAT | O_RDWR, 0o644) }
-            guard opened >= 0 else { return false }
+            let flags = O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC
+            let opened = path.path.withCString { open($0, flags, 0o600) }
+            guard opened >= 0 else {
+                return .failed(LockFailure(path: path.path, operation: "open", errnoValue: errno))
+            }
+
+            if let failure = Self.verify(fd: opened, path: path.path) {
+                close(opened)
+                return .failed(failure)
+            }
             fd = opened
         }
-        return flock(fd, LOCK_EX | LOCK_NB) == 0
+
+        guard flock(fd, LOCK_EX | LOCK_NB) == 0 else {
+            let code = errno
+            // The one contended answer. `EWOULDBLOCK` and `EAGAIN` are the
+            // same value on both platforms we build for, but both spellings
+            // are matched so this does not depend on that staying true.
+            if code == EWOULDBLOCK || code == EAGAIN {
+                return .busy
+            }
+            return .failed(LockFailure(path: path.path, operation: "flock", errnoValue: code))
+        }
+        return .acquired
+    }
+
+    /// Post-open checks on the descriptor we actually hold.
+    ///
+    /// Returns `nil` when the file is acceptable. A pre-existing lock file
+    /// from an older release was created `0644`; that is ours and harmless,
+    /// so it is tightened in place via `fchmod` rather than refused — the
+    /// descriptor is already open, so there is no path to re-resolve and no
+    /// window for a swap.
+    private static func verify(fd: Int32, path: String) -> LockFailure? {
+        var info = stat()
+        guard fstat(fd, &info) == 0 else {
+            return LockFailure(path: path, operation: "fstat", errnoValue: errno)
+        }
+        guard info.st_mode & S_IFMT == S_IFREG else {
+            return LockFailure(path: path, operation: "file type", errnoValue: 0)
+        }
+        guard info.st_uid == getuid() else {
+            return LockFailure(path: path, operation: "ownership", errnoValue: 0)
+        }
+        if info.st_mode & (S_IRWXG | S_IRWXO) != 0 {
+            _ = fchmod(fd, 0o600)
+        }
+        return nil
+    }
+
+    /// Whether this lock file could be opened and is one of ours — without
+    /// attempting to take it. Returns `nil` when it is usable.
+    ///
+    /// Deliberately no `flock()`. A reader that wants to know "is the lock
+    /// machinery working?" must not answer it by *taking* the lock: holding
+    /// `tick.lock` even briefly makes a tick starting in that instant see
+    /// contention and skip its cycle, so a monitoring command run in a loop
+    /// could suppress the very schedule it is checking. Opening and
+    /// validating exercises everything that actually breaks — a missing or
+    /// unwritable directory, a wrong owner, a symlink at the path — and
+    /// contends with nothing.
+    public func probe() -> LockFailure? {
+        let flags = O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC
+        let opened = path.path.withCString { open($0, flags, 0o600) }
+        guard opened >= 0 else {
+            return LockFailure(path: path.path, operation: "open", errnoValue: errno)
+        }
+        defer { close(opened) }
+        return Self.verify(fd: opened, path: path.path)
     }
 
     /// Releases the lock (if held) and closes the file descriptor. Safe to
