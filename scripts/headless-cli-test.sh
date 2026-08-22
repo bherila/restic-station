@@ -1009,6 +1009,14 @@ cp -R "$HEALTHY/." "$BROKEN_SET_LOCK/" 2>/dev/null || true
 SET_UUID="$(RESTIC_STATION_DATA_DIR="$BROKEN_SET_LOCK" "$HELPER" sets list --json 2>/dev/null \
     | jq -r '.data[0].id' 2>/dev/null || true)"
 if [[ -n "$SET_UUID" && "$SET_UUID" != "null" ]]; then
+    # Pin an executable path for this fixture. The set lock must reject the
+    # check before that path can ever launch, but `tick` resolves its
+    # configured binary before constructing the engine. `/usr/bin/restic`
+    # exists on the local macOS runner and not in the Linux CI container,
+    # which previously made this assertion test discovery instead of locks.
+    jq --arg restic_path "$HELPER" '.resticPath = $restic_path' \
+        "$BROKEN_SET_LOCK/machine.json" > "$BROKEN_SET_LOCK/machine.json.tmp"
+    mv "$BROKEN_SET_LOCK/machine.json.tmp" "$BROKEN_SET_LOCK/machine.json"
     mkdir -p "$BROKEN_SET_LOCK/locks/set-$SET_UUID.lock"
     RESTIC_STATION_DATA_DIR="$BROKEN_SET_LOCK" run_helper_split status --json
     [[ "$RC" -ne 0 ]] \
