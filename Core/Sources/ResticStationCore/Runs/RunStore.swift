@@ -509,7 +509,7 @@ public struct RunStore: Sendable {
     private func appendIndexEntry(_ entry: RunIndexEntry) throws {
         try paths.ensureDirectories()
 
-        let lock = FileLock(path: indexLockFile)
+        let lock = FileLock(path: indexLockFile, trustedRoot: paths.root)
         let deadline = now().addingTimeInterval(Self.indexLockTimeout)
         // Contention is waited out; a lock that cannot be opened is not
         // (#110) — see the same reasoning in `StateStore`.

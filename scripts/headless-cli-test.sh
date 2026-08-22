@@ -1025,7 +1025,19 @@ if [[ -n "$SET_UUID" && "$SET_UUID" != "null" ]]; then
         || fail "status --json missed a hostile per-set lock: $(jq -c '.data.locking' "$OUT_FILE")"
     grep -q "$SET_UUID" <<<"$(jq -r '.data.locking.problem' "$OUT_FILE")" \
         || fail "status --json did not name the offending set lock"
+    [[ "$(jq -r '.data.locking.scope' "$OUT_FILE")" == "set" ]] \
+        || fail "status --json did not scope the lock fault to one set: $(jq -c '.data.locking' "$OUT_FILE")"
+    LOWER_SET_UUID="$(printf '%s' "$SET_UUID" | tr '[:upper:]' '[:lower:]')"
+    [[ "$(jq -r '.data.locking.setId' "$OUT_FILE" | tr '[:upper:]' '[:lower:]')" == "$LOWER_SET_UUID" ]] \
+        || fail "status --json did not identify the affected set: $(jq -c '.data.locking' "$OUT_FILE")"
     ok "a hostile per-set lock is reported even when locks/ and tick.lock are fine"
+
+    RESTIC_STATION_DATA_DIR="$BROKEN_SET_LOCK" run_helper status
+    grep -q "ONE BACKUP SET CANNOT RUN" "$OUT_FILE" \
+        || fail "human status did not classify the per-set lock as a partial outage: $(cat "$OUT_FILE")"
+    ! grep -q "NOTHING CAN RUN ON THIS MACHINE" "$OUT_FILE" \
+        || fail "human status incorrectly classified one broken set as a machine-wide outage"
+    ok "human status scopes a hostile set lock without claiming the whole machine is stopped"
 
     # Make only the check due: a fresh backup timestamp suppresses the
     # backup, while a nil check timestamp fires immediately. This pins the

@@ -310,8 +310,14 @@ public struct PreviewTokenStore: Sendable {
     /// behavior single-use even across helper processes.
     private func withStoreLock<T>(_ body: () throws -> T) throws -> T {
         do {
-            try paths.ensureDirectories()
-            let lock = FileLock(path: paths.previewTokensLockFile)
+            do {
+                try paths.ensureDirectories()
+            } catch {
+                throw PreviewTokenError.storeUnusable(
+                    "could not create the data directories under \(paths.root.path): \(error)"
+                )
+            }
+            let lock = FileLock(path: paths.previewTokensLockFile, trustedRoot: paths.root)
             // Owner-only is now enforced by `FileLock` itself, on the open
             // descriptor rather than by a `chmod` on the path after the fact
             // — the same check, without the window between them, and it

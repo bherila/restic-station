@@ -541,16 +541,23 @@ struct FileSecretStoreTests {
         defer { try? FileManager.default.removeItem(at: root) }
 
         let ids = (0..<12).map { _ in UUID() }
+        let errors = WarningRecorder()
         await withTaskGroup(of: Void.self) { group in
             for (index, id) in ids.enumerated() {
                 group.addTask {
                     // Each writer is its own read-modify-write of the whole
                     // file; without the lock the last one in would clobber the
                     // others.
-                    try? await store.setPassword("pw-\(index)", destId: id)
+                    do {
+                        try await store.setPassword("pw-\(index)", destId: id)
+                    } catch {
+                        errors.record(String(describing: error))
+                    }
                 }
             }
         }
+
+        #expect(errors.messages.isEmpty, "writers failed: \(errors.messages)")
 
         let document = try store.load()
         #expect(document.secrets.count == ids.count)

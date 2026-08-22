@@ -229,6 +229,13 @@ public struct AppPaths: Equatable, Sendable {
         locksDir.appendingPathComponent("tick.lock", isDirectory: false)
     }
 
+    /// Dedicated stable inode used only to verify that the backing
+    /// filesystem implements `flock(2)`. It never serializes production
+    /// work, so a status probe cannot make a tick skip.
+    public var healthLockFile: URL {
+        locksDir.appendingPathComponent("health.lock", isDirectory: false)
+    }
+
     /// Serializes Linux file-secret read-modify-write operations.
     public var secretsLockFile: URL {
         locksDir.appendingPathComponent("secrets.lock", isDirectory: false)

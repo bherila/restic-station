@@ -2,6 +2,23 @@ import Foundation
 import Testing
 @testable import ResticStationCore
 
+private final class StateStoreErrorRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var messages: [String] = []
+
+    func record(_ error: Error) {
+        lock.lock()
+        messages.append(String(describing: error))
+        lock.unlock()
+    }
+
+    var recorded: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return messages
+    }
+}
+
 @Suite("StateStore: typed read/write for the four state/ files")
 struct StateStoreTests {
     private func makeStore() -> (store: StateStore, root: URL) {
@@ -487,16 +504,23 @@ struct StateStoreTests {
         // machinery, including `Process`, and this suite spawns subprocesses
         // concurrently. Owning the threads keeps the pressure local to this
         // test.
+        let errors = StateStoreErrorRecorder()
         let threads = setIds.enumerated().map { index, setId in
             Thread {
-                try? store.updateScheduleState(setId: setId) { entry in
-                    usleep(20_000)
-                    entry.checkSliceCursor = index
+                do {
+                    try store.updateScheduleState(setId: setId) { entry in
+                        usleep(20_000)
+                        entry.checkSliceCursor = index
+                    }
+                } catch {
+                    errors.record(error)
                 }
             }
         }
         threads.forEach { $0.start() }
         while threads.contains(where: { !$0.isFinished }) { usleep(2_000) }
+
+        #expect(errors.recorded.isEmpty, "writers failed: \(errors.recorded)")
 
         let state = try #require(store.readScheduleState())
         for (index, setId) in setIds.enumerated() {

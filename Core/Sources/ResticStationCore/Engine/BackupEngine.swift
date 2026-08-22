@@ -1968,7 +1968,7 @@ public final class BackupEngine: Sendable {
     /// directory that cannot be created is now a ``LockAcquireResult/failed``
     /// like any other, carrying the reason (#110).
     private func acquireSetLock(setId: UUID) -> (lock: FileLock, result: LockAcquireResult) {
-        let lock = FileLock(path: paths.setLockFile(setId: setId))
+        let lock = FileLock(path: paths.setLockFile(setId: setId), trustedRoot: paths.root)
         do {
             try paths.ensureDirectories()
         } catch {

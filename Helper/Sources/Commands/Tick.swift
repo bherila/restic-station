@@ -27,7 +27,7 @@ struct Tick: AsyncParsableCommand {
 
         // ── Step 1: tick.lock — busy means a previous tick is still
         // evaluating/running; exit 0 silently. ───────────────────────────
-        let lock = FileLock(path: paths.tickLockFile)
+        let lock = FileLock(path: paths.tickLockFile, trustedRoot: paths.root)
         switch lock.acquire() {
         case .acquired:
             break
@@ -275,7 +275,7 @@ struct Tick: AsyncParsableCommand {
     /// theirs, leave it alone.
     private func clearAbandonedProgress(runStore: RunStore, stateStore: StateStore, paths: AppPaths) {
         for setId in stateStore.currentRunSetIDs() {
-            let lock = FileLock(path: paths.setLockFile(setId: setId))
+            let lock = FileLock(path: paths.setLockFile(setId: setId), trustedRoot: paths.root)
             switch lock.acquire() {
             case .acquired:
                 break

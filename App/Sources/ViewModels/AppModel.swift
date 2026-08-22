@@ -408,13 +408,11 @@ final class AppModel: ObservableObject {
             // Core so the Linux build is held to it too (T25).
             fullDiskAccessDenied: HealthDerivation.fullDiskAccessDenied(from: stateWatcher.fdaCheck),
             backgroundAgentEnabled: launchd.isEnabled,
-            // Probed here too, not just by `status --json`. The menu bar
-            // glyph is the only signal most users ever look at, so leaving
-            // it green on a machine whose lock directory is unusable — one
-            // that cannot start a backup at all — is precisely the false
-            // assurance #110 is about. A handful of syscalls, far cheaper
-            // than the run-index reads this same recompute already does.
-            lockingBroken: LockingHealth.probe(paths: paths) != nil,
+            // Probed by `StateWatcher`, not just by `status --json`, and
+            // refreshed by a dedicated `locks/` watch. A lock failure can
+            // prevent the state/run writes that drive every other refresh,
+            // so the menu bar must not depend on those writes to turn red.
+            lockingBroken: stateWatcher.lockingFailure != nil,
             runLiveness: runLiveness
         )
     }

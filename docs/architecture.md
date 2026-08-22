@@ -41,7 +41,7 @@ Secrets: macOS login Keychain (service "restic-station")
 
 - The helper is short-lived per invocation, except while a backup/copy/check runs (the process lives until the work finishes — this may exceed the 120 s `StartInterval`; overlapping ticks are prevented by locks, see `scheduling.md`).
 - Long restic operations stream NDJSON progress; the helper writes throttled progress snapshots to `state/` (≤ 1 write per 1–2 s) and appends every line to the run log.
-- The app is purely reactive: it reads `state/` and `runs/`, watching for changes via a `DispatchSource` directory watcher plus a best-effort `DistributedNotificationCenter` nudge posted by the helper after each state write. Notifications are lossy by design; the directory watcher is the source of truth.
+- The app is purely reactive: it reads `state/` and `runs/` and performs the shared live lock-health probe, watching `state/`, `runs/`, and `locks/` for changes via `DispatchSource` directory watchers plus a best-effort `DistributedNotificationCenter` nudge posted by the helper after each state write. Notifications are lossy by design; the directory watchers are the source of truth.
 
 ## Dependency injection rule (testability)
 
@@ -159,7 +159,8 @@ State — not config — is the right XDG base dir for `root`: `config.json` is 
 | `state/current-run-<setId>.json` | live progress plus an independent 30-second awake-time heartbeat (deleted on completion) |
 | `state/repo-status-<destId>.json` | reachability + last-synced info per destination |
 | `state/fda-check.json` | result of the helper's Full Disk Access probe |
-| `locks/tick.lock`, `locks/set-<setId>.lock` | flock files (see `scheduling.md`) |
+| `locks/tick.lock`, `locks/set-<setId>.lock` | operation-exclusion flock files (see `scheduling.md`) |
+| `locks/health.lock` | stable inode used only by the live `flock(2)` health probe |
 | `mounts/<destId>/` | `restic mount` mountpoint (see `restic-cli.md` §mount) |
 
 restic's cache is redirected via `RESTIC_CACHE_DIR` to the location in the table above. It is deliberately independent of `root` — it is a regenerable cache, not app state.

@@ -7,8 +7,8 @@ import ResticStationCore
 import Darwin
 #endif
 
-/// Reactive bridge from the on-disk `state/` + `runs/` directories to
-/// SwiftUI, per `docs/architecture.md` §Process model: **the directory
+/// Reactive bridge from the on-disk `state/`, `runs/`, and `locks/`
+/// directories to SwiftUI, per `docs/architecture.md` §Process model: **the directory
 /// watcher is the source of truth**; the `DistributedNotificationCenter`
 /// nudge posted by `StateStore` after every write (see
 /// `Core/Sources/ResticStationCore/Engine/StateStore.swift`) is a latency
@@ -42,6 +42,10 @@ public final class StateWatcher: ObservableObject {
     @Published public private(set) var fdaCheck: FdaCheckResult?
     /// `RunStore.recentRuns(limit: 200)`, newest first.
     @Published public private(set) var recentRuns: [RunIndexEntry] = []
+    /// Live lock-health result, refreshed for state/run writes and every
+    /// change under `locks/`. A lock failure can prevent all other writes,
+    /// so the lock directory needs its own event source.
+    @Published public private(set) var lockingFailure: LockingHealthFailure?
 
     private let paths: AppPaths
     private let runStore: RunStore
@@ -57,8 +61,10 @@ public final class StateWatcher: ObservableObject {
 
     private var stateDirSource: DispatchSourceFileSystemObject?
     private var runsDirSource: DispatchSourceFileSystemObject?
-    /// Watches `paths.root` purely so that a delete+recreate of `state/` or
-    /// `runs/` (which this watcher cannot keep an open fd across) has a
+    private var locksDirSource: DispatchSourceFileSystemObject?
+    /// Watches `paths.root` purely so that a delete+recreate of `state/`,
+    /// `runs/`, or `locks/` (which this watcher cannot keep an open fd across)
+    /// has a
     /// second, still-open fd from which to notice the recreation and retry
     /// reopening — see `attemptReopen(_:)`. This is what lets the watcher
     /// survive the directory being deleted and recreated without polling.
@@ -77,11 +83,13 @@ public final class StateWatcher: ObservableObject {
     private enum WatchedDirectory: CaseIterable, Hashable {
         case state
         case runs
+        case locks
 
         func url(paths: AppPaths) -> URL {
             switch self {
             case .state: return paths.stateDir
             case .runs: return paths.runsDir
+            case .locks: return paths.locksDir
             }
         }
     }
@@ -103,6 +111,7 @@ public final class StateWatcher: ObservableObject {
         debounceTask?.cancel()
         stateDirSource?.cancel()
         runsDirSource?.cancel()
+        locksDirSource?.cancel()
         rootDirSource?.cancel()
         if let distributedNotificationObserver {
             DistributedNotificationCenter.default().removeObserver(distributedNotificationObserver)
@@ -160,6 +169,8 @@ public final class StateWatcher: ObservableObject {
         stateDirSource = nil
         runsDirSource?.cancel()
         runsDirSource = nil
+        locksDirSource?.cancel()
+        locksDirSource = nil
         rootDirSource?.cancel()
         rootDirSource = nil
         pendingReopen.removeAll()
@@ -175,6 +186,7 @@ public final class StateWatcher: ObservableObject {
     /// `start()`, e.g. to pre-populate a preview) — every read tolerates a
     /// missing file or directory.
     public func reloadNow() {
+        lockingFailure = LockingHealth.probe(paths: paths)
         scheduleState = stateStore.readScheduleState()
         fdaCheck = stateStore.readFdaCheck()
 
@@ -293,7 +305,7 @@ public final class StateWatcher: ObservableObject {
         return source
     }
 
-    /// A watched subdirectory (`state/` or `runs/`) was deleted out from
+    /// A watched subdirectory (`state/`, `runs/`, or `locks/`) was deleted out from
     /// under us: the now-stale fd/source is torn down and an immediate
     /// reopen is attempted (covers the common `rm -rf && mkdir` race where
     /// recreation has already happened by the time this handler runs). If
@@ -312,6 +324,9 @@ public final class StateWatcher: ObservableObject {
         case .runs:
             runsDirSource?.cancel()
             runsDirSource = nil
+        case .locks:
+            locksDirSource?.cancel()
+            locksDirSource = nil
         }
     }
 
@@ -331,6 +346,8 @@ public final class StateWatcher: ObservableObject {
             stateDirSource = source
         case .runs:
             runsDirSource = source
+        case .locks:
+            locksDirSource = source
         }
     }
 }

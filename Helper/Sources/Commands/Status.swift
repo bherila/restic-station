@@ -482,24 +482,39 @@ struct StatusReport: Encodable {
     ///
     /// Whether this machine's locking machinery is usable at all.
     ///
-    /// `usable: false` is the "nothing will ever run here" finding: no set
-    /// can take its lock, so no backup, check, prune or restore can start,
-    /// and `tick` exits non-zero rather than reporting a clean pass (#110).
+    /// `usable: false` means at least one lock path is broken. `scope`
+    /// distinguishes a machine-wide shared-lock outage from one damaged
+    /// per-set lock; `tick` continues the other sets in the latter case.
     /// Probed live — see ``LockingHealth``.
     struct LockingStatus: Encodable {
         let usable: Bool
         let dataDirectory: String
         /// The specific fault, `null` when usable.
         let problem: String?
+        /// `"machine"`, `"set"`, or `null` when healthy.
+        let scope: String?
+        /// The affected set for a partial outage; otherwise `null`.
+        let setId: UUID?
 
-        init(paths: AppPaths, failure: LockFailure?) {
+        init(paths: AppPaths, failure: LockingHealthFailure?) {
             self.usable = failure == nil
             self.dataDirectory = paths.root.path
             self.problem = failure.map { String(describing: $0) }
+            switch failure?.scope {
+            case .machine:
+                scope = "machine"
+                setId = nil
+            case .set(let id):
+                scope = "set"
+                setId = id
+            case nil:
+                scope = nil
+                setId = nil
+            }
         }
 
         private enum CodingKeys: String, CodingKey {
-            case usable, dataDirectory, problem
+            case usable, dataDirectory, problem, scope, setId
         }
 
         // Explicit `null` for `problem`, per the encoding convention.
@@ -508,6 +523,8 @@ struct StatusReport: Encodable {
             try container.encode(usable, forKey: .usable)
             try container.encode(dataDirectory, forKey: .dataDirectory)
             try container.encode(problem, forKey: .problem)
+            try container.encode(scope, forKey: .scope)
+            try container.encode(setId, forKey: .setId)
         }
     }
 
@@ -671,7 +688,11 @@ struct StatusReport: Encodable {
         // Ahead of the scheduler line: if this is broken, the scheduler
         // firing perfectly on time changes nothing.
         if !locking.usable {
-            lines.append("locking: NOTHING CAN RUN ON THIS MACHINE")
+            if locking.scope == "set", let setId = locking.setId {
+                lines.append("locking: ONE BACKUP SET CANNOT RUN (\(setId.uuidString.lowercased()))")
+            } else {
+                lines.append("locking: NOTHING CAN RUN ON THIS MACHINE")
+            }
             lines.append("  - \(locking.problem ?? "the data directory is unusable")")
             lines.append("  detail: check ownership and permissions on \(locking.dataDirectory)")
         }

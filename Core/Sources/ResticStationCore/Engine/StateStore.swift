@@ -341,7 +341,7 @@ public struct StateStore: Sendable {
         mutate: (inout SetScheduleState) -> Void
     ) throws -> ScheduleState {
         try paths.ensureDirectories()
-        let lock = FileLock(path: paths.scheduleStateLockFile)
+        let lock = FileLock(path: paths.scheduleStateLockFile, trustedRoot: paths.root)
         let deadline = Date().addingTimeInterval(Self.stateLockTimeout)
         // Only contention is worth waiting out. Polling a lock that failed
         // to *open* just burns the whole timeout and then reports a timeout,

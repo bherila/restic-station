@@ -1,5 +1,28 @@
 import Foundation
 
+public enum LockingHealthScope: Equatable, Sendable {
+    case machine
+    case set(UUID)
+}
+
+/// A live locking fault together with the amount of work it blocks.
+/// Per-set lock damage is a partial outage; shared locks and directory
+/// faults prevent safe operation machine-wide.
+public struct LockingHealthFailure: Error, Equatable, Sendable, CustomStringConvertible {
+    public let scope: LockingHealthScope
+    public let failure: LockFailure
+
+    public init(scope: LockingHealthScope, failure: LockFailure) {
+        self.scope = scope
+        self.failure = failure
+    }
+
+    public var path: String { failure.path }
+    public var operation: String { failure.operation }
+    public var errnoValue: Int32 { failure.errnoValue }
+    public var description: String { failure.description }
+}
+
 /// A live check that this machine's locking machinery still works.
 ///
 /// The durable half of issue #110 — a `tick` that exits non-zero, a run
@@ -19,22 +42,32 @@ public enum LockingHealth {
     ///
     /// Per-set locks are created on demand, so a read-only status query must
     /// not bring one into being for every configured set as a side effect.
-    public static func probe(paths: AppPaths) -> LockFailure? {
+    public static func probe(paths: AppPaths) -> LockingHealthFailure? {
         do {
             try paths.ensureDirectories()
         } catch {
-            return LockFailure(
-                path: paths.root.path,
-                operation: "create data directories",
-                errnoValue: 0,
-                underlying: "\(error)"
+            return LockingHealthFailure(
+                scope: .machine,
+                failure: LockFailure(
+                    path: paths.root.path,
+                    operation: "create data directories",
+                    errnoValue: 0,
+                    underlying: "\(error)"
+                )
             )
         }
-        if let failure = FileLock(path: paths.tickLockFile).probe() {
-            return failure
+        if let failure = FileLock(
+            path: paths.tickLockFile, trustedRoot: paths.root
+        ).probe(createIfMissing: false) {
+            return machine(failure)
         }
-        if let failure = FileLock.probeCreation(in: paths.locksDir) {
-            return failure
+        if let failure = FileLock(
+            path: paths.healthLockFile, trustedRoot: paths.root
+        ).probeLocking() {
+            return machine(failure)
+        }
+        if let failure = FileLock.probeCreation(in: paths.locksDir, trustedRoot: paths.root) {
+            return machine(failure)
         }
         if let failure = probeExistingSetLocks(paths: paths) {
             return failure
@@ -49,37 +82,49 @@ public enum LockingHealth {
             paths.previewTokensLockFile,
             paths.runsIndexLockFile,
         ] {
-            if let failure = FileLock(path: lockFile).probe(createIfMissing: false) {
-                return failure
+            if let failure = FileLock(
+                path: lockFile, trustedRoot: paths.root
+            ).probe(createIfMissing: false) {
+                return machine(failure)
             }
         }
         for directory in [paths.stateDir, paths.runsDir] {
-            if let failure = FileLock.probeCreation(in: directory) {
-                return failure
+            if let failure = FileLock.probeCreation(in: directory, trustedRoot: paths.root) {
+                return machine(failure)
             }
         }
         return nil
     }
 
     /// The first unusable `locks/set-*.lock` already on disk, if any.
-    private static func probeExistingSetLocks(paths: AppPaths) -> LockFailure? {
+    private static func probeExistingSetLocks(paths: AppPaths) -> LockingHealthFailure? {
         let entries: [String]
         do {
             entries = try FileManager.default.contentsOfDirectory(atPath: paths.locksDir.path)
         } catch {
-            return LockFailure(
+            return machine(LockFailure(
                 path: paths.locksDir.path,
                 operation: "enumerate lock directory",
                 errnoValue: 0,
                 underlying: "\(error)"
-            )
+            ))
         }
         for name in entries.sorted() where name.hasPrefix("set-") && name.hasSuffix(".lock") {
             let url = paths.locksDir.appendingPathComponent(name, isDirectory: false)
-            if let failure = FileLock(path: url).probe(createIfMissing: false) {
-                return failure
+            if let failure = FileLock(
+                path: url, trustedRoot: paths.root
+            ).probe(createIfMissing: false) {
+                let idStart = name.index(name.startIndex, offsetBy: "set-".count)
+                let idEnd = name.index(name.endIndex, offsetBy: -".lock".count)
+                let scope = UUID(uuidString: String(name[idStart..<idEnd])).map(LockingHealthScope.set)
+                    ?? .machine
+                return LockingHealthFailure(scope: scope, failure: failure)
             }
         }
         return nil
+    }
+
+    private static func machine(_ failure: LockFailure) -> LockingHealthFailure {
+        LockingHealthFailure(scope: .machine, failure: failure)
     }
 }

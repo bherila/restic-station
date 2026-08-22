@@ -138,7 +138,7 @@ struct StatusReportTests {
             fullDiskAccessDenied: false,
             locking: StatusReport.LockingStatus(
                 paths: AppPaths(root: URL(fileURLWithPath: "/data")),
-                failure: failure
+                failure: LockingHealthFailure(scope: .machine, failure: failure)
             ),
             scheduler: nil,
             sets: [makeSetStatus(needsAttention: false, isRunning: false)],
@@ -166,19 +166,56 @@ struct StatusReportTests {
         let healthyText = String(decoding: try ConfigStore.makeEncoder().encode(healthy), as: UTF8.self)
         #expect(healthyText.contains("\"usable\" : true"))
         #expect(healthyText.contains("\"problem\" : null"))
+        #expect(healthyText.contains("\"scope\" : null"))
+        #expect(healthyText.contains("\"setId\" : null"))
 
         let broken = StatusReport(
             machineId: "studio-mac", generatedAt: Date(timeIntervalSince1970: 0), health: "warning",
             fullDiskAccessDenied: false,
             locking: StatusReport.LockingStatus(
                 paths: AppPaths(root: URL(fileURLWithPath: "/data")),
-                failure: LockFailure(path: "/data/locks/tick.lock", operation: "open", errnoValue: EACCES)
+                failure: LockingHealthFailure(
+                    scope: .machine,
+                    failure: LockFailure(
+                        path: "/data/locks/tick.lock", operation: "open", errnoValue: EACCES
+                    )
+                )
             ),
             scheduler: nil, sets: [], unattributedRuns: [], excludedHere: []
         )
         let brokenText = String(decoding: try ConfigStore.makeEncoder().encode(broken), as: UTF8.self)
         #expect(brokenText.contains("\"usable\" : false"))
         #expect(brokenText.contains("tick.lock"))
+        #expect(brokenText.contains("\"scope\" : \"machine\""))
+    }
+
+    @Test("a broken set lock is rendered as a partial outage")
+    func brokenSetLockDoesNotClaimTheWholeMachineIsStopped() {
+        let setId = UUID()
+        let report = StatusReport(
+            machineId: "studio-mac", generatedAt: Date(), health: "warning",
+            fullDiskAccessDenied: false,
+            locking: StatusReport.LockingStatus(
+                paths: AppPaths(root: URL(fileURLWithPath: "/data")),
+                failure: LockingHealthFailure(
+                    scope: .set(setId),
+                    failure: LockFailure(
+                        path: "/data/locks/set-\(setId.uuidString).lock",
+                        operation: "open",
+                        errnoValue: EACCES
+                    )
+                )
+            ),
+            scheduler: nil,
+            sets: [makeSetStatus(needsAttention: true, isRunning: false)],
+            unattributedRuns: [],
+            excludedHere: []
+        )
+
+        let text = report.humanLines().joined(separator: "\n")
+        #expect(text.contains("ONE BACKUP SET CANNOT RUN"))
+        #expect(text.contains(setId.uuidString.lowercased()))
+        #expect(!text.contains("NOTHING CAN RUN ON THIS MACHINE"))
     }
 
     @Test("a healthy report names no attention-needed flags")

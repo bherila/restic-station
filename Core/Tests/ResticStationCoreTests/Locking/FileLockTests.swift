@@ -214,6 +214,32 @@ let canInjectPermissionFaults = geteuid() != 0
         #expect(mode.int16Value & 0o077 == 0)
     }
 
+    @Test("a group-writable lock directory is refused before opening the lock")
+    func groupWritableLockDirectoryIsRefused() throws {
+        let root = makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = AppPaths(root: root)
+        try paths.ensureDirectories()
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o770], ofItemAtPath: paths.locksDir.path
+        )
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o700], ofItemAtPath: paths.locksDir.path
+            )
+        }
+
+        guard case .failed(let failure) = FileLock(
+            path: paths.tickLockFile, trustedRoot: root
+        ).acquire() else {
+            Issue.record("another uid must not be able to replace a flocked lock inode")
+            return
+        }
+        #expect(failure.operation == "lock directory permissions")
+        #expect(failure.path == paths.locksDir.path)
+        #expect(!FileManager.default.fileExists(atPath: paths.tickLockFile.path))
+    }
+
     @Test("probe reports the same faults without taking the lock")
     func probeDoesNotContend() throws {
         let directory = makeDirectory()
@@ -274,6 +300,26 @@ let canInjectPermissionFaults = geteuid() != 0
             "a per-set lock that cannot be opened must not read as a healthy machine"
         )
         #expect(String(describing: failure).contains(setId.uuidString))
+        #expect(failure.scope == .set(setId))
+    }
+
+    @Test("LockingHealth exercises flock on its dedicated stable inode")
+    func lockingHealthExercisesFlock() throws {
+        let root = makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = AppPaths(root: root)
+        try paths.ensureDirectories()
+
+        #expect(!FileManager.default.fileExists(atPath: paths.healthLockFile.path))
+        #expect(LockingHealth.probe(paths: paths) == nil)
+        #expect(FileManager.default.fileExists(atPath: paths.healthLockFile.path))
+
+        // Contention on the health inode is healthy: another probe holding
+        // it proves that `flock` works and must not create a false outage.
+        let holder = FileLock(path: paths.healthLockFile, trustedRoot: root)
+        #expect(holder.acquire() == .acquired)
+        defer { holder.release() }
+        #expect(LockingHealth.probe(paths: paths) == nil)
     }
 
     @Test(
@@ -285,6 +331,11 @@ let canInjectPermissionFaults = geteuid() != 0
         defer { try? FileManager.default.removeItem(at: root) }
         let paths = AppPaths(root: root)
         try paths.ensureDirectories()
+
+        // Create the stable health inode before removing directory write
+        // permission. The live flock exercise can then succeed, leaving the
+        // independent creation-capability check as the fault under test.
+        #expect(LockingHealth.probe(paths: paths) == nil)
 
         // Opening this existing file still succeeds after locks/ becomes
         // read-only. The missing set lock is the operation that would fail.
@@ -372,7 +423,13 @@ let canInjectPermissionFaults = geteuid() != 0
             LockingHealth.probe(paths: paths),
             "failure to inspect per-set locks must not report healthy"
         )
-        #expect(failure.operation == "enumerate lock directory")
+        // Descriptor-relative validation may fail while opening the
+        // unreadable directory, before Foundation attempts enumeration.
+        // Either result is a fail-closed inspection outcome.
+        #expect(
+            failure.operation == "open lock directory"
+                || failure.operation == "enumerate lock directory"
+        )
         #expect(failure.path == paths.locksDir.path)
     }
 

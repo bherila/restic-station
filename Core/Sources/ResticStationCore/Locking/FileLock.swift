@@ -16,8 +16,8 @@ import Musl
 /// syscall failed and the refusal is ours.
 public struct LockFailure: Error, Equatable, Sendable, CustomStringConvertible {
     public let path: String
-    /// The failing syscall or check: `"open"`, `"flock"`, `"fstat"`,
-    /// `"fchmod"`, `"ownership"`, `"permissions"`, `"file type"`.
+    /// The failing syscall or policy check, such as `"open"`, `"flock"`,
+    /// `"fchmod"`, `"ownership"`, or `"lock directory permissions"`.
     public let operation: String
     public let errnoValue: Int32
     /// Set when the fault came from a Swift error rather than a syscall —
@@ -64,9 +64,9 @@ public enum LockAcquireResult: Equatable, Sendable {
 
 /// Advisory `flock(2)` wrapper per `docs/scheduling.md` §Locking.
 ///
-/// Two levels of lock in this app (`locks/tick.lock`,
-/// `locks/set-<setId>.lock`) both use this type: `LOCK_EX | LOCK_NB` on a
-/// file under `locks/`. The lock is released automatically by the kernel on
+/// Operation and companion locks in `locks/`, `state/`, and `runs/` use this
+/// type: `LOCK_EX | LOCK_NB` on an owner-controlled regular file. The lock is
+/// released automatically by the kernel on
 /// process death (no stale-lock cleanup needed) — the lock *file* persists
 /// forever and its mere existence means nothing; only a live, held
 /// `flock()` means anything.
@@ -79,10 +79,16 @@ public enum LockAcquireResult: Equatable, Sendable {
 /// two-instance contention test valid.
 public final class FileLock: @unchecked Sendable {
     public let path: URL
+    private let trustedRoot: URL?
     private var fd: Int32 = -1
 
-    public init(path: URL) {
+    /// - Parameter trustedRoot: The owner-controlled data-directory boundary
+    ///   containing the lock's direct parent (`locks/`, `state/`, or
+    ///   `runs/`). Production callers provide it so both directories are
+    ///   opened and verified before `openat(2)` resolves the lock filename.
+    public init(path: URL, trustedRoot: URL? = nil) {
         self.path = path
+        self.trustedRoot = trustedRoot
     }
 
     /// Opens (creating if necessary) and attempts a non-blocking exclusive
@@ -106,9 +112,12 @@ public final class FileLock: @unchecked Sendable {
     public func acquire() -> LockAcquireResult {
         if fd < 0 {
             let flags = O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC
-            let opened = path.path.withCString { open($0, flags, 0o600) }
-            guard opened >= 0 else {
-                return .failed(LockFailure(path: path.path, operation: "open", errnoValue: errno))
+            let opened: Int32
+            switch Self.openLock(path: path, trustedRoot: trustedRoot, flags: flags) {
+            case .success(let descriptor):
+                opened = descriptor
+            case .failure(let failure):
+                return .failed(failure)
             }
 
             if let failure = Self.verify(fd: opened, path: path.path) {
@@ -165,6 +174,155 @@ public final class FileLock: @unchecked Sendable {
         return nil
     }
 
+    /// Opens the lock through a verified parent-directory descriptor. This
+    /// prevents a group/world-writable parent from unlinking the flocked
+    /// inode and substituting a second inode at the same pathname.
+    private static func openLock(
+        path: URL,
+        trustedRoot: URL?,
+        flags: Int32
+    ) -> Result<Int32, LockFailure> {
+        let parent = path.deletingLastPathComponent()
+        let parentFD: Int32
+        switch openDirectory(parent, trustedRoot: trustedRoot) {
+        case .success(let descriptor):
+            parentFD = descriptor
+        case .failure(let failure):
+            return .failure(failure)
+        }
+        defer { close(parentFD) }
+
+        let (opened, openError) = path.lastPathComponent.withCString { name -> (Int32, Int32) in
+            // On Darwin/APFS, simultaneous first-time `openat(O_CREAT)`
+            // calls for the same basename can transiently return ENOENT even
+            // though the already-open parent descriptor is valid and there
+            // are no intermediate path components. Retry only that otherwise
+            // impossible creating case; a deleted parent keeps returning
+            // ENOENT and still fails closed a few milliseconds later.
+            for attempt in 0..<5 {
+                let descriptor = openat(parentFD, name, flags, 0o600)
+                if descriptor >= 0 { return (descriptor, 0) }
+                let code = errno
+                if code != ENOENT || flags & O_CREAT == 0 || attempt == 4 {
+                    return (descriptor, code)
+                }
+                usleep(1_000)
+            }
+            return (-1, ENOENT) // The loop always returns; keeps Swift exhaustive.
+        }
+        guard opened >= 0 else {
+            return .failure(LockFailure(path: path.path, operation: "open", errnoValue: openError))
+        }
+        return .success(opened)
+    }
+
+    /// Opens `directory` without following symlinks and verifies its owner
+    /// and replacement safety. The immediate lock parent rejects every
+    /// group/world write bit. The trusted root additionally accepts normal
+    /// sticky-directory protection and write-without-search modes; its
+    /// owner-owned child is still not replaceable by another uid. When a
+    /// trusted root is supplied, that child is resolved with `openat` through
+    /// the already-verified root descriptor.
+    private static func openDirectory(
+        _ directory: URL,
+        trustedRoot: URL?
+    ) -> Result<Int32, LockFailure> {
+        let flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+        let directoryPath = directory.standardizedFileURL.path
+
+        guard let trustedRoot else {
+            let (opened, openError) = directoryPath.withCString { name -> (Int32, Int32) in
+                let descriptor = open(name, flags)
+                return (descriptor, descriptor < 0 ? errno : 0)
+            }
+            guard opened >= 0 else {
+                return .failure(LockFailure(
+                    path: directoryPath, operation: "open lock directory", errnoValue: openError
+                ))
+            }
+            if let failure = verifyDirectory(fd: opened, path: directoryPath, isTrustedRoot: false) {
+                close(opened)
+                return .failure(failure)
+            }
+            return .success(opened)
+        }
+
+        let rootPath = trustedRoot.standardizedFileURL.path
+        let (rootFD, rootOpenError) = rootPath.withCString { name -> (Int32, Int32) in
+            let descriptor = open(name, flags)
+            return (descriptor, descriptor < 0 ? errno : 0)
+        }
+        guard rootFD >= 0 else {
+            return .failure(LockFailure(
+                path: rootPath, operation: "open lock root", errnoValue: rootOpenError
+            ))
+        }
+        defer { close(rootFD) }
+        if let failure = verifyDirectory(fd: rootFD, path: rootPath, isTrustedRoot: true) {
+            return .failure(failure)
+        }
+        if directoryPath == rootPath {
+            let duplicate = dup(rootFD)
+            guard duplicate >= 0 else {
+                return .failure(LockFailure(path: rootPath, operation: "dup lock root", errnoValue: errno))
+            }
+            return .success(duplicate)
+        }
+
+        guard directory.deletingLastPathComponent().standardizedFileURL.path == rootPath else {
+            return .failure(LockFailure(
+                path: directoryPath, operation: "trusted directory boundary", errnoValue: 0
+            ))
+        }
+        let (opened, openError) = directory.lastPathComponent.withCString { name -> (Int32, Int32) in
+            let descriptor = openat(rootFD, name, flags)
+            return (descriptor, descriptor < 0 ? errno : 0)
+        }
+        guard opened >= 0 else {
+            return .failure(LockFailure(
+                path: directoryPath, operation: "open lock directory", errnoValue: openError
+            ))
+        }
+        if let failure = verifyDirectory(fd: opened, path: directoryPath, isTrustedRoot: false) {
+            close(opened)
+            return .failure(failure)
+        }
+        return .success(opened)
+    }
+
+    private static func verifyDirectory(
+        fd: Int32,
+        path: String,
+        isTrustedRoot: Bool
+    ) -> LockFailure? {
+        var info = stat()
+        guard fstat(fd, &info) == 0 else {
+            return LockFailure(path: path, operation: "fstat lock directory", errnoValue: errno)
+        }
+        guard info.st_mode & S_IFMT == S_IFDIR else {
+            return LockFailure(path: path, operation: "lock directory type", errnoValue: 0)
+        }
+        guard info.st_uid == geteuid() else {
+            return LockFailure(path: path, operation: "lock directory ownership", errnoValue: 0)
+        }
+        let writableByOthers = info.st_mode & (S_IWGRP | S_IWOTH) != 0
+        let searchableWriter = (info.st_mode & (S_IWGRP | S_IXGRP)) == (S_IWGRP | S_IXGRP)
+            || (info.st_mode & (S_IWOTH | S_IXOTH)) == (S_IWOTH | S_IXOTH)
+        let sticky = info.st_mode & S_ISVTX != 0
+        // The immediate lock parent is stricter: another uid must not be
+        // able to create even an absent lock entry or replace a live one.
+        // At the owner-controlled root boundary, ordinary sticky-directory
+        // semantics protect our owner-owned child directory; write without
+        // search permission cannot modify entries either.
+        let unsafePermissions = isTrustedRoot
+            ? (searchableWriter && !sticky)
+            : writableByOthers
+        guard !unsafePermissions else {
+            return LockFailure(path: path, operation: "lock directory permissions", errnoValue: 0)
+        }
+        return nil
+    }
+
     /// Whether this lock file could be opened and is one of ours — without
     /// attempting to take it. Returns `nil` when it is usable.
     ///
@@ -185,27 +343,36 @@ public final class FileLock: @unchecked Sendable {
         var flags = O_RDWR | O_NOFOLLOW | O_CLOEXEC
         if createIfMissing {
             flags |= O_CREAT
-        } else {
-            // `fileExists` follows symlinks, so a dangling symlink looks
-            // absent and would bypass the `O_NOFOLLOW` refusal below.
-            var info = stat()
-            let result = path.path.withCString { lstat($0, &info) }
-            if result != 0 {
-                let code = errno
-                if code == ENOENT { return nil }
-                return LockFailure(path: path.path, operation: "lstat", errnoValue: code)
-            }
         }
-        let opened = path.path.withCString { open($0, flags, 0o600) }
-        guard opened >= 0 else {
-            let code = errno
-            // Raced with a deletion between the existence check and the
-            // open. Nothing is there, so there is nothing wrong.
-            if code == ENOENT, !createIfMissing { return nil }
-            return LockFailure(path: path.path, operation: "open", errnoValue: code)
+        let opened: Int32
+        switch Self.openLock(path: path, trustedRoot: trustedRoot, flags: flags) {
+        case .success(let descriptor):
+            opened = descriptor
+        case .failure(let failure):
+            // The descriptor-relative `openat` found nothing. A non-creating
+            // probe treats absence as healthy, while `O_NOFOLLOW` still
+            // refuses both live and dangling symlinks with `ELOOP`.
+            if failure.errnoValue == ENOENT, !createIfMissing { return nil }
+            return failure
         }
         defer { close(opened) }
         return Self.verify(fd: opened, path: path.path)
+    }
+
+    /// Exercises the actual `flock(2)` capability on a dedicated health
+    /// inode. Contention itself proves the filesystem supports locking, so a
+    /// concurrent health probe is healthy; only a real acquisition failure
+    /// is returned.
+    public func probeLocking() -> LockFailure? {
+        switch acquire() {
+        case .acquired:
+            release()
+            return nil
+        case .busy:
+            return nil
+        case .failed(let failure):
+            return failure
+        }
     }
 
     /// Verifies that the effective process identity may create a new lock
@@ -218,9 +385,18 @@ public final class FileLock: @unchecked Sendable {
     /// performs `open(O_CREAT)` while remaining non-mutating. This matters
     /// for `state/` and `runs/`, whose filesystem watchers recompute health:
     /// creating a probe there would trigger its own next health check.
-    public static func probeCreation(in directory: URL) -> LockFailure? {
-        let permitted = directory.path.withCString {
-            faccessat(AT_FDCWD, $0, W_OK | X_OK, AT_EACCESS)
+    public static func probeCreation(in directory: URL, trustedRoot: URL? = nil) -> LockFailure? {
+        let directoryFD: Int32
+        switch openDirectory(directory, trustedRoot: trustedRoot) {
+        case .success(let descriptor):
+            directoryFD = descriptor
+        case .failure(let failure):
+            return failure
+        }
+        defer { close(directoryFD) }
+
+        let permitted = ".".withCString {
+            faccessat(directoryFD, $0, W_OK | X_OK, AT_EACCESS)
         }
         guard permitted == 0 else {
             return LockFailure(path: directory.path, operation: "create lock", errnoValue: errno)

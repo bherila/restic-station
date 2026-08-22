@@ -391,7 +391,7 @@ public struct FileSecretStore: SecretStore {
         // is ever called from another write path. Keep this pre-lock check to
         // create the lock directory, but report a degraded mode only once.
         try prepareDirectories(reportWarnings: false)
-        let lock = FileLock(path: lockFileURL)
+        let lock = FileLock(path: lockFileURL, trustedRoot: paths.root)
         let deadline = Date().addingTimeInterval(Self.lockTimeout)
         while true {
             switch lock.acquire() {
