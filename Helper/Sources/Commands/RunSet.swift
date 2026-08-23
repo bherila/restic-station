@@ -193,8 +193,11 @@ struct RunSet: AsyncParsableCommand {
             } else {
                 print("\(kind.rawValue) deferred — will retry next tick")
             }
-        case .infrastructureFailure(let reason):
-            HelperExit.fail("this machine cannot run \(kind.rawValue): \(reason)")
+        case .infrastructureFailure(let reason, let operationMayHaveRun):
+            HelperExit.fail(operationMayHaveRun
+                ? "\(kind.rawValue) may have run, but its result could not be recorded or trusted: "
+                    + "\(reason). Inspect the repositories before retrying."
+                : "this machine cannot run \(kind.rawValue): \(reason)")
         }
     }
 

@@ -109,7 +109,9 @@ public enum ManualRunOutcome: Equatable, Sendable {
     /// were temporarily unavailable before a run could begin.
     case skipped
     /// The set lock, run store, or terminal persistence was unusable.
-    case infrastructureFailure(reason: String)
+    /// `operationMayHaveRun` prevents a caller from encouraging a blind
+    /// retry after restic completed but its terminal state was not durable.
+    case infrastructureFailure(reason: String, operationMayHaveRun: Bool)
 }
 
 /// The standalone-prune result keeps non-destructive refusals distinct from
@@ -720,7 +722,7 @@ public final class BackupEngine: Sendable {
             recordLockFailure(
                 kind: .prune, setId: set.id, destId: primary.id, trigger: .manual, failure: failure
             )
-            return .infrastructureFailure(reason: failure.description)
+            return .infrastructureFailure(reason: failure.description, operationMayHaveRun: false)
         }
         defer { lock.release() }
         // Declared after the lock defer, so it unwinds *first*: the live
@@ -736,10 +738,13 @@ public final class BackupEngine: Sendable {
             groupId: nil,
             expectedExecutableIdentity: expectedExecutableIdentity
         ) else {
-            return .infrastructureFailure(reason: "could not create the primary prune run record")
+            return .infrastructureFailure(
+                reason: "could not create the primary prune run record",
+                operationMayHaveRun: false
+            )
         }
         if let reason = primaryPrune.infrastructureFailureReason {
-            return .infrastructureFailure(reason: reason)
+            return .infrastructureFailure(reason: reason, operationMayHaveRun: true)
         }
         var statuses = [primaryPrune.child.status]
         let groupId = primaryPrune.child.runId
@@ -770,12 +775,13 @@ public final class BackupEngine: Sendable {
                 expectedExecutableIdentity: expectedExecutableIdentity
             ) {
                 if let reason = prune.infrastructureFailureReason {
-                    return .infrastructureFailure(reason: reason)
+                    return .infrastructureFailure(reason: reason, operationMayHaveRun: true)
                 }
                 statuses.append(prune.child.status)
             } else {
                 return .infrastructureFailure(
-                    reason: "could not create the prune run record for \"\(secondary.label)\""
+                    reason: "could not create the prune run record for \"\(secondary.label)\"",
+                    operationMayHaveRun: false
                 )
             }
         }
@@ -1519,7 +1525,7 @@ public final class BackupEngine: Sendable {
             recordLockFailure(
                 kind: .restore, setId: set.id, destId: destination.id, trigger: .manual, failure: failure
             )
-            return .infrastructureFailure(reason: failure.description)
+            return .infrastructureFailure(reason: failure.description, operationMayHaveRun: false)
         }
         defer { lock.release() }
         // Declared after the lock defer, so it unwinds *first*: the live
@@ -1547,10 +1553,13 @@ public final class BackupEngine: Sendable {
             downgradeSuccessToWarning: { outcome in Self.containsErrorMessage(outcome.messages) }
         )
         guard let restore else {
-            return .infrastructureFailure(reason: "could not create the restore run record")
+            return .infrastructureFailure(
+                reason: "could not create the restore run record",
+                operationMayHaveRun: false
+            )
         }
         if let reason = restore.infrastructureFailureReason {
-            return .infrastructureFailure(reason: reason)
+            return .infrastructureFailure(reason: reason, operationMayHaveRun: true)
         }
         return .completed(restore.child.status)
     }
@@ -1585,7 +1594,7 @@ public final class BackupEngine: Sendable {
             recordLockFailure(
                 kind: .`init`, setId: set.id, destId: dest.id, trigger: .manual, failure: failure
             )
-            return .infrastructureFailure(reason: failure.description)
+            return .infrastructureFailure(reason: failure.description, operationMayHaveRun: false)
         }
         defer { lock.release() }
         // Declared after the lock defer, so it unwinds *first*: the live
@@ -1605,7 +1614,10 @@ public final class BackupEngine: Sendable {
             streamProgress: false
         )
         guard let initRun else {
-            return .infrastructureFailure(reason: "could not create the init-secondary run record")
+            return .infrastructureFailure(
+                reason: "could not create the init-secondary run record",
+                operationMayHaveRun: false
+            )
         }
         if initRun.child.status == .success {
             updateRepoStatus(destId: dest.id) { status in
@@ -1615,7 +1627,7 @@ public final class BackupEngine: Sendable {
             }
         }
         if let reason = initRun.infrastructureFailureReason {
-            return .infrastructureFailure(reason: reason)
+            return .infrastructureFailure(reason: reason, operationMayHaveRun: true)
         }
         return .completed(initRun.child.status)
     }

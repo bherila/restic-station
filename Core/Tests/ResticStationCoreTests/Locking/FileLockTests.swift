@@ -424,6 +424,34 @@ let canInjectPermissionFaults = geteuid() != 0
         tick.release()
     }
 
+    @Test("health capability failures remain production outages")
+    func lockingHealthClassifiesHealthArtifactFailuresByMeaning() {
+        let healthPath = "/data/locks/health.lock"
+        let scratchPath = "/data/locks/.health"
+
+        #expect(LockingHealth.classifyHealthArtifactFailure(LockFailure(
+            path: healthPath,
+            operation: "flock",
+            errnoValue: ENOTSUP
+        )).scope == .machine)
+        #expect(LockingHealth.classifyHealthArtifactFailure(LockFailure(
+            path: scratchPath,
+            operation: "create lock probe",
+            errnoValue: ENOSPC
+        )).scope == .machine)
+
+        #expect(LockingHealth.classifyHealthArtifactFailure(LockFailure(
+            path: healthPath,
+            operation: "file type",
+            errnoValue: 0
+        )).scope == .diagnostic)
+        #expect(LockingHealth.classifyHealthArtifactFailure(LockFailure(
+            path: scratchPath,
+            operation: "remove lock probe",
+            errnoValue: EACCES
+        )).scope == .diagnostic)
+    }
+
     @Test("a production lock outage outranks simultaneous diagnostic damage")
     func lockingHealthPrefersProductionFailureOverDiagnosticDamage() throws {
         let root = makeDirectory()

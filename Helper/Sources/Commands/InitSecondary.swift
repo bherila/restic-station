@@ -45,8 +45,11 @@ struct InitSecondary: AsyncParsableCommand {
             }
         case .skipped:
             HelperExit.fail("init-secondary was skipped (set busy or keychain unavailable) — try again")
-        case .infrastructureFailure(let reason):
-            HelperExit.fail("this machine cannot run init-secondary: \(reason)")
+        case .infrastructureFailure(let reason, let operationMayHaveRun):
+            HelperExit.fail(operationMayHaveRun
+                ? "init-secondary may have run, but its result could not be recorded or trusted: \(reason). "
+                    + "Inspect the repository before retrying."
+                : "this machine cannot run init-secondary: \(reason)")
         }
     }
 }

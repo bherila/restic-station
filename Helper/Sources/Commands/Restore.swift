@@ -75,8 +75,11 @@ struct Restore: AsyncParsableCommand {
             }
         case .skipped:
             HelperExit.fail("restore was skipped (set busy or keychain unavailable) — try again", code: 2)
-        case .infrastructureFailure(let reason):
-            HelperExit.fail("this machine cannot run the restore: \(reason)")
+        case .infrastructureFailure(let reason, let operationMayHaveRun):
+            HelperExit.fail(operationMayHaveRun
+                ? "restore may have run, but its result could not be recorded or trusted: \(reason). "
+                    + "Inspect the target before retrying."
+                : "this machine cannot run the restore: \(reason)")
         }
     }
 }

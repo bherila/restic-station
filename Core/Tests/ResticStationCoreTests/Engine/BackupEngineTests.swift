@@ -1461,11 +1461,12 @@ struct BackupEngineTests {
 
         let status = await env.engine.runPrune(env.set)
 
-        guard case .infrastructureFailure(let reason) = status else {
+        guard case .infrastructureFailure(let reason, let operationMayHaveRun) = status else {
             Issue.record("a terminal index failure must remain infrastructure failure: \(status)")
             return
         }
         #expect(reason.contains("run history unusable"))
+        #expect(operationMayHaveRun)
         #expect(env.indexEntries.isEmpty)
     }
 
@@ -1481,11 +1482,12 @@ struct BackupEngineTests {
 
         let outcome = await env.engine.runPrune(env.set)
 
-        guard case .infrastructureFailure(let reason) = outcome else {
+        guard case .infrastructureFailure(let reason, let operationMayHaveRun) = outcome else {
             Issue.record("an unusable prune lock must be infrastructure failure: \(outcome)")
             return
         }
         #expect(reason.contains("lock"))
+        #expect(!operationMayHaveRun)
         #expect(env.resticArgvs.isEmpty)
         #expect(env.entries(kind: .prune).first?.status == .failed)
     }
@@ -2878,11 +2880,12 @@ struct BackupEngineTests {
             targetPath: "/tmp/target"
         ))
 
-        guard case .infrastructureFailure(let reason) = outcome else {
+        guard case .infrastructureFailure(let reason, let operationMayHaveRun) = outcome else {
             Issue.record("an unusable restore lock must be infrastructure failure: \(outcome)")
             return
         }
         #expect(reason.contains("lock"))
+        #expect(!operationMayHaveRun)
         #expect(env.resticArgvs.isEmpty)
         #expect(env.entries(kind: .restore).first?.status == .failed)
     }
@@ -2973,11 +2976,12 @@ struct BackupEngineTests {
 
         let outcome = await env.engine.initSecondary(env.set, dest: env.secondaries[0])
 
-        guard case .infrastructureFailure(let reason) = outcome else {
+        guard case .infrastructureFailure(let reason, let operationMayHaveRun) = outcome else {
             Issue.record("an unusable init lock must be infrastructure failure: \(outcome)")
             return
         }
         #expect(reason.contains("lock"))
+        #expect(!operationMayHaveRun)
         #expect(env.resticArgvs.isEmpty)
         #expect(env.entries(kind: .`init`).first?.status == .failed)
     }

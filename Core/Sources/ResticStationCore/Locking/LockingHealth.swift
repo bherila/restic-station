@@ -83,7 +83,9 @@ public enum LockingHealth {
                 // A fault in the health-only inode is inconclusive. A fault
                 // in its verified production parent remains machine-wide.
                 if failure.path == healthLock.path {
-                    diagnosticFailure = diagnosticFailure ?? diagnostic(failure)
+                    let classified = classifyHealthArtifactFailure(failure)
+                    if classified.scope == .machine { return classified }
+                    diagnosticFailure = diagnosticFailure ?? classified
                 } else {
                     return machine(failure)
                 }
@@ -108,7 +110,9 @@ public enum LockingHealth {
                 return machine(failure)
             }
             if let failure = FileLock.probeActualCreation(in: scratchDirectory) {
-                diagnosticFailure = diagnosticFailure ?? diagnostic(failure)
+                let classified = classifyHealthArtifactFailure(failure)
+                if classified.scope == .machine { return classified }
+                diagnosticFailure = diagnosticFailure ?? classified
             }
         }
         // These companion locks protect shared local state outside
@@ -174,5 +178,18 @@ public enum LockingHealth {
 
     private static func diagnostic(_ failure: LockFailure) -> LockingHealthFailure {
         LockingHealthFailure(scope: .diagnostic, failure: failure)
+    }
+
+    /// Health-path damage is inconclusive, but failures of the capabilities
+    /// those artifacts exist to exercise are production outages. Internal so
+    /// tests can pin this distinction without requiring a full disk or a
+    /// filesystem that rejects flock.
+    static func classifyHealthArtifactFailure(_ failure: LockFailure) -> LockingHealthFailure {
+        switch failure.operation {
+        case "flock", "create lock probe":
+            return machine(failure)
+        default:
+            return diagnostic(failure)
+        }
     }
 }
