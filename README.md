@@ -148,7 +148,7 @@ A mirror only advances when a `restic copy` from the primary succeeds. If the mi
 **What happens when my external drive is unplugged?**
 Nothing bad. Backups to the primary continue; the offline mirror is skipped (no error spam), tracked for staleness, and fully caught up next time it's connected. Retention is never applied to a mirror that isn't caught up.
 
-**Note for this build:** applying retention *manually* is currently unavailable while exact-plan authorization is completed (issues #111 and #82). Scheduled retention is unaffected and still runs after each successful backup and copy, so repositories do not grow without bound — cleanup is deferred to the schedule rather than removed. Previewing cleanup is read-only and still available.
+**Note for this build:** applying retention *manually* is currently unavailable while exact-plan authorization is completed (issues #111 and #82). Retention still runs after each successful backup and copy — whether the backup was scheduled or started by hand — so repositories do not grow without bound; cleanup is deferred to the next backup run rather than removed. Previewing cleanup is read-only and still available.
 
 **Do backups run when the app is closed / the Mac was asleep?**
 Yes. A `launchd` agent runs the helper every 2 minutes independent of the app; schedules missed during sleep run within ~2 minutes of wake (anacron-style).

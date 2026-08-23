@@ -58,8 +58,9 @@ struct RetentionSection: View {
     /// asserting the opposite.
     private static let agentDisabledExplanation =
         "Applying retention manually is unavailable in this build, and the background agent "
-        + "is not running, so no scheduled run will clean up either. Enable the background "
-        + "agent in Settings ▸ Permissions & background."
+        + "is not running, so cleanup will not happen on a schedule. Back Up Now still "
+        + "applies the retention policy after it backs up. To resume scheduled cleanup, "
+        + "enable the background agent in Settings ▸ Permissions & background."
 
     /// What to say about retention when manual apply is contained: the
     /// promise of scheduled cleanup only holds if a tick will happen.
@@ -75,9 +76,9 @@ struct RetentionSection: View {
 
     private var applyRetentionHelp: String {
         // Machine scope first. Containment's explanation promises that
-        // scheduled retention will do the work instead, and for a set this
-        // machine does not run, no tick here ever will — so the more
-        // fundamental fact has to win.
+        // backup runs will do the work instead, and for a set this machine
+        // does not run, none here ever will — so the more fundamental fact
+        // has to win.
         if !runsOnThisMachine {
             return "This backup set does not run on this machine, so retention cannot be applied here."
         }
@@ -87,8 +88,8 @@ struct RetentionSection: View {
             // Promising otherwise sends the operator to Backup Sets expecting
             // this control to light up.
             return "This backup set has no retention policy, so nothing is ever removed — "
-                + "scheduled runs included. Add one in Backup Sets ▸ Retention for "
-                + "scheduled runs to start cleaning up."
+                + "backup runs included. Add one in Backup Sets ▸ Retention and every "
+                + "backup run — scheduled or Back Up Now — will start cleaning up."
         }
         if !canApplyRetention { return containmentExplanation }
         return "Runs the retention policy. It permanently deletes snapshots the policy no longer keeps."

@@ -30,9 +30,11 @@
 /// Timing, not capability. A mirror that is behind was already refused by
 /// the manual path's own freshness guard, so nothing that used to work
 /// stops working. A mirror that is caught up has its retention applied
-/// after its next successful scheduled copy, and the primary's is applied
-/// at the end of every scheduled run. Repositories do not grow without
-/// bound; cleanup is deferred to the schedule.
+/// after the next successful backup run's copy to it, and the primary's is
+/// applied at the end of every backup run — scheduled tick and hand-started
+/// Back Up Now alike, since `runSet` applies retention regardless of
+/// trigger. Repositories do not grow without bound; cleanup is deferred to
+/// the next backup run rather than removed.
 ///
 /// ## Deliberately not configurable
 ///
@@ -53,16 +55,21 @@ public enum ManualRetentionApplyAvailability {
     /// Operator-facing explanation. Shared by the CLI refusal, the app's
     /// disabled affordance, and `docs/ui-spec.md`, so the three cannot
     /// drift into saying different things about the same posture.
-    /// Deliberately says what a scheduled run *does*, not that one is
-    /// imminent. Whether a tick will actually happen depends on the
-    /// background agent being registered and on the set running on this
-    /// machine — neither of which this string can know, and both of which
-    /// it would be lying about if it promised a schedule outright.
+    /// Deliberately says what a backup run *does*, not that one is
+    /// imminent. Whether a run will actually happen depends on the
+    /// background agent, the operator, and machine scope — none of which
+    /// this string can know. "Scheduled, or started by hand" is the whole
+    /// truth: `runSet` applies retention regardless of trigger, so a
+    /// hand-started backup cleans up exactly as a scheduled one does.
+    ///
+    /// UI-agnostic on purpose — this is also the helper's stderr message,
+    /// so it must not name app buttons. The app's copy names **Back Up
+    /// Now**; `docs/cli-json.md` names `--kind backup`.
     public static let reason = """
         Applying retention manually is unavailable in this build while exact-plan \
-        authorization is completed. Retention is applied by scheduled runs instead: \
-        each successful scheduled run cleans the primary, and cleans any mirror whose \
-        copy in that run succeeded. This delays cleanup; it does not remove it. \
-        Previewing cleanup is read-only and remains available.
+        authorization is completed. Retention is still applied by every backup run, \
+        scheduled or started by hand: each successful run cleans the primary, and any \
+        mirror whose copy in that run succeeded. This delays cleanup; it does not \
+        remove it. Previewing cleanup is read-only and remains available.
         """
 }
