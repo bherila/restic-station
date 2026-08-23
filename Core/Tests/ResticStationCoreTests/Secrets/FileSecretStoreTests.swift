@@ -355,6 +355,61 @@ struct FileSecretStoreTests {
         #expect(try await store.password(destId: Self.destId) == "hunter2")
     }
 
+    @Test("a temp-file chmod failure cannot report a successful secret write")
+    func tempFileChmodFailureIsFatalAndCleanedUp() async throws {
+        let (_, root) = Self.makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = FileSecretStore(
+            paths: AppPaths(root: root),
+            helperPath: "/opt/restic-station/restic-station-helper",
+            directoryModeSetter: { path, mode in
+                _ = path.withCString { chmod($0, mode) }
+            },
+            warningHandler: { _ in },
+            fileModeSetter: { _, _ in EPERM }
+        )
+
+        do {
+            try await store.setPassword("hunter2", destId: Self.destId)
+            Issue.record("expected an unenforceable temp-file mode to fail")
+        } catch let error as SecretStoreError {
+            guard case .backendFailed(let message) = error else {
+                Issue.record("expected .backendFailed, got \(error)")
+                return
+            }
+            #expect(message.contains(store.tempFileURL.path))
+            #expect(message.contains("mode 0600"))
+            #expect(!message.contains("hunter2"))
+        }
+        #expect(!FileManager.default.fileExists(atPath: store.tempFileURL.path))
+        #expect(!FileManager.default.fileExists(atPath: store.fileURL.path))
+    }
+
+    @Test("an unusable secrets mutation lock stays typed and non-retryable")
+    func unusableMutationLockIsTyped() async throws {
+        let (store, root) = Self.makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = AppPaths(root: root)
+        try paths.ensureDirectories()
+        try FileManager.default.createDirectory(
+            at: store.lockFileURL,
+            withIntermediateDirectories: true
+        )
+
+        do {
+            try await store.setPassword("hunter2", destId: Self.destId)
+            Issue.record("expected the hostile secrets lock to be refused")
+        } catch let error as SecretStoreError {
+            guard case .lockUnusable(let failure) = error else {
+                Issue.record("expected .lockUnusable, got \(error)")
+                return
+            }
+            #expect(failure.path == store.lockFileURL.path)
+            #expect(!CLIFailure.classify(error).retryable)
+            #expect(CLIFailure.classify(error).code == .internalError)
+        }
+    }
+
     @Test("an unremovable temp entry reports its owner and an actionable recovery")
     func diagnosesSquattedTempEntry() async throws {
         let (store, root) = Self.makeStore()
@@ -541,16 +596,23 @@ struct FileSecretStoreTests {
         defer { try? FileManager.default.removeItem(at: root) }
 
         let ids = (0..<12).map { _ in UUID() }
+        let errors = WarningRecorder()
         await withTaskGroup(of: Void.self) { group in
             for (index, id) in ids.enumerated() {
                 group.addTask {
                     // Each writer is its own read-modify-write of the whole
                     // file; without the lock the last one in would clobber the
                     // others.
-                    try? await store.setPassword("pw-\(index)", destId: id)
+                    do {
+                        try await store.setPassword("pw-\(index)", destId: id)
+                    } catch {
+                        errors.record(String(describing: error))
+                    }
                 }
             }
         }
+
+        #expect(errors.messages.isEmpty, "writers failed: \(errors.messages)")
 
         let document = try store.load()
         #expect(document.secrets.count == ids.count)

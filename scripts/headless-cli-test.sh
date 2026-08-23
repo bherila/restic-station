@@ -957,6 +957,185 @@ RESTIC_STATION_DATA_DIR="$HEALTHY" "$HELPER" secret rm --dest "$PRIMARY_ID" >>"$
 ok "payloads carry what they claim, secret list --json stays presence-only and agrees with human mode"
 
 # ─────────────────────────────────────────────────────────────────────────
+# 10. #110: a machine that cannot take its own locks must not look idle.
+#
+#     The unit tests prove `FileLock` tells contention apart from breakage
+#     and that the engine records the fault. Only a real process can show
+#     the end of that chain: `tick` exiting non-zero so launchd/systemd sees
+#     a failing unit, and `status --json` refusing to report a healthy,
+#     idle machine. That is the pair the issue's acceptance criteria name.
+#
+#     The fault is a *directory* where `locks/tick.lock` belongs. Root
+#     ignores file modes — and the `linux` CI job runs as root — so a
+#     chmod-based denial would pass there for the wrong reason. A directory
+#     cannot be opened as a regular file by anyone, root included. Same
+#     reasoning as the run-index step in ci.yml.
+# ─────────────────────────────────────────────────────────────────────────
+log "10. broken locking is never reported as a healthy, idle machine"
+
+# A fresh install under either a permissive or maximally restrictive service
+# umask must not manufacture a lock tree that it then rejects or cannot reopen.
+# Run the real helper in a subshell because umask is process-global. Pre-create
+# output files so umask 0777 cannot make the test harness's captures unreadable.
+for TEST_UMASK in 0000 0777; do
+    UMASK_DATA="$WORK/umask-$TEST_UMASK-data"
+    UMASK_OUT="$WORK/umask-$TEST_UMASK-status.json"
+    UMASK_ERR="$WORK/umask-$TEST_UMASK-status.err"
+    : >"$UMASK_OUT"
+    : >"$UMASK_ERR"
+    # Prime only the machine identity outside the test umask, then remove the
+    # generated internal directories. MachineStore's independent permission
+    # contract is outside this locking regression; both restrictive-umask
+    # attempts below must create and then reopen the lock tree themselves.
+    set +e
+    RESTIC_STATION_DATA_DIR="$UMASK_DATA" \
+        "$HELPER" status --json >"$UMASK_OUT" 2>"$UMASK_ERR"
+    set -e
+    rm -r "$UMASK_DATA/runs" "$UMASK_DATA/state" "$UMASK_DATA/locks"
+    for UMASK_ATTEMPT in 1 2; do
+        set +e
+        (
+            umask "$TEST_UMASK"
+            RESTIC_STATION_DATA_DIR="$UMASK_DATA" \
+                "$HELPER" status --json >"$UMASK_OUT" 2>"$UMASK_ERR"
+        )
+        UMASK_RC=$?
+        set -e
+        cat "$UMASK_OUT" "$UMASK_ERR" >>"$COMBINED_LOG"
+        jq -e '.data.locking.usable == true' "$UMASK_OUT" >/dev/null \
+            || fail "umask-$TEST_UMASK status attempt $UMASK_ATTEMPT rejected its lock tree: $(cat "$UMASK_OUT")"
+        # Scheduler health can independently make status exit 1; only a
+        # parser/setup failure may use another code here.
+        [[ "$UMASK_RC" -eq 0 || "$UMASK_RC" -eq 1 ]] \
+            || fail "umask-$TEST_UMASK status attempt $UMASK_ATTEMPT exited $UMASK_RC"
+    done
+    for directory in \
+        "$UMASK_DATA" \
+        "$UMASK_DATA/runs" \
+        "$UMASK_DATA/state" \
+        "$UMASK_DATA/locks"; do
+        if [[ "$(uname -s)" == "Darwin" ]]; then
+            DIRECTORY_MODE="$(stat -f '%Lp' "$directory")"
+        else
+            DIRECTORY_MODE="$(stat -c '%a' "$directory")"
+        fi
+        [[ "$DIRECTORY_MODE" == "700" ]] \
+            || fail "$directory was mode $DIRECTORY_MODE after setup under umask $TEST_UMASK, expected 700"
+    done
+    for lock_file in \
+        "$UMASK_DATA/locks/health.lock" \
+        "$UMASK_DATA/state/health.lock" \
+        "$UMASK_DATA/runs/health.lock"; do
+        if [[ "$(uname -s)" == "Darwin" ]]; then
+            LOCK_MODE="$(stat -f '%Lp' "$lock_file")"
+        else
+            LOCK_MODE="$(stat -c '%a' "$lock_file")"
+        fi
+        [[ "$LOCK_MODE" == "600" ]] \
+            || fail "$lock_file was mode $LOCK_MODE after setup under umask $TEST_UMASK, expected 600"
+    done
+done
+ok "fresh lock trees stay reusable at 0700/0600 under umasks 0000 and 0777"
+
+BROKEN_LOCKS="$WORK/broken-locks"
+mkdir -p "$BROKEN_LOCKS/locks/tick.lock"
+
+RESTIC_STATION_DATA_DIR="$BROKEN_LOCKS" run_helper tick
+[[ "$RC" -ne 0 ]] \
+    || fail "tick exited 0 on a tick lock it could not use — the silent-stoppage bug (#110)"
+grep -q "could not acquire the tick lock" "$OUT_FILE" \
+    || fail "tick did not say which lock it could not use: $(cat "$OUT_FILE")"
+ok "tick exits non-zero and names the lock, instead of exiting 0 like a busy tick"
+
+RESTIC_STATION_DATA_DIR="$BROKEN_LOCKS" run_helper_split status --json
+[[ "$RC" -ne 0 ]] \
+    || fail "status --json exited 0 on a machine that cannot take a lock"
+[[ "$(jq -r '.data.locking.usable' "$OUT_FILE")" == "false" ]] \
+    || fail "status --json did not report locking as unusable: $(jq -c '.data.locking' "$OUT_FILE")"
+[[ "$(jq -r '.data.health' "$OUT_FILE")" == "warning" ]] \
+    || fail "status --json reported health $(jq -r '.data.health' "$OUT_FILE"), expected warning"
+jq -e '.data.locking | has("problem") and .problem != null' "$OUT_FILE" >/dev/null \
+    || fail "status --json did not name the specific fault"
+ok "status --json reports locking.usable false, health warning, and exits non-zero"
+
+RESTIC_STATION_DATA_DIR="$BROKEN_LOCKS" run_helper status
+grep -q "NOTHING CAN RUN ON THIS MACHINE" "$OUT_FILE" \
+    || fail "human status did not state the locking failure plainly: $(cat "$OUT_FILE")"
+ok "human status states it plainly, above the scheduler line"
+
+# #117 review: a hostile *per-set* lock, with `locks/` and `tick.lock` both
+# perfectly usable. The set can never run again, so neither the tick nor
+# status may report success — previously the tick printed the failure and
+# exited 0, and the live probe only ever looked at `tick.lock`.
+BROKEN_SET_LOCK="$WORK/broken-set-lock"
+mkdir -p "$BROKEN_SET_LOCK"
+cp -R "$HEALTHY/." "$BROKEN_SET_LOCK/" 2>/dev/null || true
+SET_UUID="$(RESTIC_STATION_DATA_DIR="$BROKEN_SET_LOCK" "$HELPER" sets list --json 2>/dev/null \
+    | jq -r '.data[0].id' 2>/dev/null || true)"
+if [[ -n "$SET_UUID" && "$SET_UUID" != "null" ]]; then
+    # Pin an executable path for this fixture. The set lock must reject the
+    # check before that path can ever launch, but `tick` resolves its
+    # configured binary before constructing the engine. `/usr/bin/restic`
+    # exists on the local macOS runner and not in the Linux CI container,
+    # which previously made this assertion test discovery instead of locks.
+    jq --arg restic_path "$HELPER" '.resticPath = $restic_path' \
+        "$BROKEN_SET_LOCK/machine.json" > "$BROKEN_SET_LOCK/machine.json.tmp"
+    mv "$BROKEN_SET_LOCK/machine.json.tmp" "$BROKEN_SET_LOCK/machine.json"
+    mkdir -p "$BROKEN_SET_LOCK/locks/set-$SET_UUID.lock"
+    RESTIC_STATION_DATA_DIR="$BROKEN_SET_LOCK" run_helper_split status --json
+    [[ "$RC" -ne 0 ]] \
+        || fail "status --json exited 0 with an unusable per-set lock"
+    [[ "$(jq -r '.data.locking.usable' "$OUT_FILE")" == "false" ]] \
+        || fail "status --json missed a hostile per-set lock: $(jq -c '.data.locking' "$OUT_FILE")"
+    grep -q "$SET_UUID" <<<"$(jq -r '.data.locking.problem' "$OUT_FILE")" \
+        || fail "status --json did not name the offending set lock"
+    [[ "$(jq -r '.data.locking.scope' "$OUT_FILE")" == "set" ]] \
+        || fail "status --json did not scope the lock fault to one set: $(jq -c '.data.locking' "$OUT_FILE")"
+    LOWER_SET_UUID="$(printf '%s' "$SET_UUID" | tr '[:upper:]' '[:lower:]')"
+    [[ "$(jq -r '.data.locking.setId' "$OUT_FILE" | tr '[:upper:]' '[:lower:]')" == "$LOWER_SET_UUID" ]] \
+        || fail "status --json did not identify the affected set: $(jq -c '.data.locking' "$OUT_FILE")"
+    ok "a hostile per-set lock is reported even when locks/ and tick.lock are fine"
+
+    RESTIC_STATION_DATA_DIR="$BROKEN_SET_LOCK" run_helper status
+    grep -q "ONE OR MORE BACKUP SETS CANNOT RUN" "$OUT_FILE" \
+        || fail "human status did not classify the per-set lock as a partial outage: $(cat "$OUT_FILE")"
+    ! grep -q "NOTHING CAN RUN ON THIS MACHINE" "$OUT_FILE" \
+        || fail "human status incorrectly classified one broken set as a machine-wide outage"
+    ok "human status scopes a hostile set lock without claiming the whole machine is stopped"
+
+    # Make only the check due: a fresh backup timestamp suppresses the
+    # backup, while a nil check timestamp fires immediately. This pins the
+    # separate check outcome path that used to print `failed` and exit 0.
+    jq '.sets[0].checkPolicy = {"enabled": true, "readDataSubsetSlices": 20}' \
+        "$BROKEN_SET_LOCK/config.json" > "$BROKEN_SET_LOCK/config.json.tmp"
+    mv "$BROKEN_SET_LOCK/config.json.tmp" "$BROKEN_SET_LOCK/config.json"
+    cat > "$BROKEN_SET_LOCK/state/schedule-state.json" <<EOF
+{"sets":{"$SET_UUID":{"lastBackupStart":"$NOW_ISO","lastCheckStart":null,"checkSliceCursor":null,"checkCount":null,"appliedPurgeExcludes":{}}}}
+EOF
+    printf '%s\n' "$SECRET_PASSWORD" \
+        | RESTIC_STATION_DATA_DIR="$BROKEN_SET_LOCK" "$HELPER" secret set --dest "$PRIMARY_ID" \
+            >>"$COMBINED_LOG" 2>&1 \
+        || fail "could not seed the due-check fixture's password"
+    RESTIC_STATION_DATA_DIR="$BROKEN_SET_LOCK" run_helper tick
+    [[ "$RC" -ne 0 ]] \
+        || fail "tick exited 0 when a due check could not use its set lock: $(cat "$OUT_FILE")"
+    grep -q 'check cannot run here' "$OUT_FILE" \
+        || fail "tick did not classify the due check as infrastructure failure: $(cat "$OUT_FILE")"
+    ok "a due check with an unusable set lock makes tick exit non-zero"
+else
+    echo "  (skipped per-set lock assertion: could not resolve a set id from the fixture)"
+fi
+
+# The control: the same commands on a healthy fixture must not trip any of
+# the above. A check that fires everywhere is not a check.
+RESTIC_STATION_DATA_DIR="$HEALTHY" run_helper_split status --json
+[[ "$(jq -r '.data.locking.usable' "$OUT_FILE")" == "true" ]] \
+    || fail "a healthy fixture was reported as having unusable locking"
+[[ "$(jq -r '.data.locking.problem' "$OUT_FILE")" == "null" ]] \
+    || fail "a healthy fixture reported a locking problem"
+ok "a healthy data directory still reports usable locking and no problem"
+
+# ─────────────────────────────────────────────────────────────────────────
 # 6. THE secret-leak check: every byte this script's helper invocations
 #    produced, grepped for the fixture secret value.
 # ─────────────────────────────────────────────────────────────────────────

@@ -140,7 +140,7 @@ struct PurgePreview: AsyncParsableCommand, JSONRenderable {
         HelperExit.code(0)
     }
 
-    private static func validate(
+    static func validate(
         result: PurgePlanResult,
         setId: UUID,
         destination: Destination
@@ -154,6 +154,16 @@ struct PurgePreview: AsyncParsableCommand, JSONRenderable {
             throw CLIFailure(
                 code: .repositoryOffline,
                 message: CLIFailure.bounded("Destination \(destination.label) is offline: \(result.message ?? "try again later")"),
+                details: CLIErrorDetails(setId: setId, destinationId: destination.id)
+            )
+        case .infrastructureFailure:
+            throw CLIFailure(
+                code: .internalError,
+                message: CLIFailure.bounded(
+                    "The purge preview could not use local process-control state: "
+                        + "\(result.message ?? "unknown infrastructure failure"). "
+                        + "Check the permissions on the Restic Station data directory."
+                ),
                 details: CLIErrorDetails(setId: setId, destinationId: destination.id)
             )
         case .failed:
@@ -191,7 +201,7 @@ struct PurgePreview: AsyncParsableCommand, JSONRenderable {
             if let previewToken = report.previewToken, !report.changed.isEmpty {
                 print("  apply with: purge apply --set \(report.setId.uuidString) --preview-token=\(previewToken)")
             }
-        case .busy, .offline, .failed:
+        case .busy, .offline, .infrastructureFailure, .failed:
             // These states are rejected before a report is printed.
             break
         }

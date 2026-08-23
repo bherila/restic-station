@@ -9,18 +9,42 @@ struct Tick: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "tick",
         abstract: "Run one scheduling pass (invoked by launchd every 2 minutes). "
-            + "Exit 0 always, except a hard config-load error (exit 1)."
+            + "Exit 0 always, except a hard config-load error, or a data directory or "
+            + "tick lock that cannot be used at all (exit 1)."
     )
 
     func run() async throws {
         let paths = AppPaths.default()
-        try? paths.ensureDirectories()
+        // Not `try?`. A data directory that cannot be created means this
+        // tick can do nothing at all, and discarding the error handed that
+        // to the lock below to express — which it did, as `false`, i.e. as
+        // contention (#110).
+        do {
+            try paths.ensureDirectories()
+        } catch {
+            HelperExit.fail("tick: could not create the data directories under \(paths.root.path): \(error)")
+        }
 
         // ── Step 1: tick.lock — busy means a previous tick is still
         // evaluating/running; exit 0 silently. ───────────────────────────
-        let lock = FileLock(path: paths.tickLockFile)
-        guard lock.tryAcquire() else {
+        let lock = FileLock(path: paths.tickLockFile, trustedRoot: paths.root)
+        switch lock.acquire() {
+        case .acquired:
+            break
+        case .busy:
+            // The overwhelmingly common case, and not a fault: `tick` holds
+            // this lock for the whole of any backup it starts, so on a host
+            // with a backup running longer than the two-minute interval
+            // *every* intervening tick lands here. Exit 0 — the issue text
+            // proposed exit 2 for a contended lock, which would report the
+            // agent as failing for the entire duration of every long backup.
             return
+        case .failed(let failure):
+            // The case this branch exists for: unopenable, wrong owner, or a
+            // symlink at the lock path. Nothing this tick could do would
+            // work, and reporting success would leave launchd/systemd — and
+            // `status` — believing the schedule is being kept.
+            HelperExit.fail("tick: could not acquire the tick lock: \(failure)")
         }
         defer { lock.release() }
 
@@ -85,6 +109,9 @@ struct Tick: AsyncParsableCommand {
         // ── Step 4/5: sequential due sets (config order). ────────────────
         let now = Date()
         let calendar = Calendar.current
+        /// Sets whose lock could not be *used* this tick. Non-empty means the
+        /// tick exits non-zero, however much other work succeeded.
+        var infrastructureFailures: [String] = []
 
         for set in config.sets {
             let scheduleState = context.stateStore.readScheduleState()?.sets[set.id]
@@ -98,6 +125,14 @@ struct Tick: AsyncParsableCommand {
             if backupDue {
                 let outcome = await context.engine.runSet(set, trigger: .scheduled)
                 print("set \"\(set.name)\": \(describe(outcome))")
+                // A set that cannot take its own lock is a broken machine,
+                // not a skipped cycle. Recorded here and reported at the end
+                // rather than thrown immediately: the remaining sets are
+                // still worth attempting, and the reprobe below still has
+                // value — but this tick must not exit 0 (#110).
+                if case .infrastructureFailure = outcome {
+                    infrastructureFailures.append("set \"\(set.name)\": \(describe(outcome))")
+                }
             }
 
             // "Backup wins": skip this set's check when its backup was due
@@ -106,8 +141,13 @@ struct Tick: AsyncParsableCommand {
             if !backupDue, checkEnabled {
                 let checkDue = ScheduleMath.checkIsDue(lastCheckStart: scheduleState?.lastCheckStart, now: now)
                 if checkDue {
-                    let status = await context.engine.runCheck(set, trigger: .scheduled)
-                    print("set \"\(set.name)\": check \(status.rawValue)")
+                    let outcome = await context.engine.runCheck(set, trigger: .scheduled)
+                    print("set \"\(set.name)\": check \(describe(outcome))")
+                    if case .infrastructureFailure = outcome {
+                        infrastructureFailures.append(
+                            "set \"\(set.name)\": check \(describe(outcome))"
+                        )
+                    }
                 }
             }
         }
@@ -144,7 +184,19 @@ struct Tick: AsyncParsableCommand {
             }
         }
 
-        // ── Step 7: tick.lock released by the `defer` above; exit 0. ────
+        // ── Step 7: tick.lock released by the `defer` above. ─────────────
+        //
+        // Exit 0 only if every due set could actually be attempted. A tick
+        // that printed "backup-set lock unusable" and then exited 0 is the
+        // exact shape of the silent stoppage this whole change is about: the
+        // set never runs again, and launchd/systemd keeps seeing success.
+        guard infrastructureFailures.isEmpty else {
+            HelperExit.fail(
+                "tick: this machine could not run "
+                    + "\(infrastructureFailures.count) scheduled operation(s):\n  "
+                    + infrastructureFailures.joined(separator: "\n  ")
+            )
+        }
     }
 
     /// Rewrites dead runs as `failed` and clears the progress files they
@@ -223,8 +275,23 @@ struct Tick: AsyncParsableCommand {
     /// theirs, leave it alone.
     private func clearAbandonedProgress(runStore: RunStore, stateStore: StateStore, paths: AppPaths) {
         for setId in stateStore.currentRunSetIDs() {
-            let lock = FileLock(path: paths.setLockFile(setId: setId))
-            guard lock.tryAcquire() else { continue }
+            let lock = FileLock(path: paths.setLockFile(setId: setId), trustedRoot: paths.root)
+            switch lock.acquire() {
+            case .acquired:
+                break
+            case .busy:
+                // Someone is running this set; the progress file is theirs.
+                continue
+            case .failed(let failure):
+                // Reported but not fatal. Sweeping abandoned progress is
+                // best-effort housekeeping, and this tick may still have
+                // real backups to attempt — each of which now reports the
+                // same fault itself, as a failed run, when it hits it.
+                StandardStream.writeToStandardError(
+                    Data("tick: could not acquire the lock for set \(setId): \(failure)\n".utf8)
+                )
+                continue
+            }
             defer { lock.release() }
 
             // Re-read inside the lock: whatever was there before we held it
@@ -252,6 +319,23 @@ struct Tick: AsyncParsableCommand {
             return "retryable: \(reason)"
         case .misconfigured(let reason):
             return "misconfigured: \(reason)"
+        case .infrastructureFailure(let reason):
+            return "cannot run here: \(reason)"
+        }
+    }
+
+    private func describe(_ outcome: CheckRunOutcome) -> String {
+        switch outcome {
+        case .completed(let status):
+            return status.rawValue
+        case .skipped:
+            return "skipped — another operation for this set is already running"
+        case .retryable(let reason):
+            return "retryable: \(reason)"
+        case .misconfigured(let reason):
+            return "misconfigured: \(reason)"
+        case .infrastructureFailure(let reason):
+            return "cannot run here: \(reason)"
         }
     }
 }

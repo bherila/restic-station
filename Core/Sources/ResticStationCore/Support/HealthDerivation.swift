@@ -372,8 +372,18 @@ public enum HealthDerivation {
         runsInFlight: [CurrentRunState],
         fullDiskAccessDenied: Bool,
         backgroundAgentEnabled: Bool?,
+        lockingBroken: Bool = false,
         runLiveness: (CurrentRunState) -> CurrentRunLiveness = { _ in .live }
     ) -> AppHealth {
+        // Ahead of the `.running` precedence, unlike every other warning
+        // condition. `.running` is derived from a current-run file, and a
+        // machine whose lock directory is broken is exactly the machine most
+        // likely to have a stale one — so letting "running" win here would
+        // paint wreckage as work in progress on the one host that cannot do
+        // any (#110).
+        if lockingBroken {
+            return .warning
+        }
         let liveRuns = runsInFlight.filter { runLiveness($0) == .live }
         if !liveRuns.isEmpty || setHealths.contains(where: \.isRunning) {
             return .running
@@ -383,6 +393,7 @@ public enum HealthDerivation {
             runsInFlight: runsInFlight,
             fullDiskAccessDenied: fullDiskAccessDenied,
             backgroundAgentEnabled: backgroundAgentEnabled,
+            lockingBroken: lockingBroken,
             runLiveness: runLiveness
         ) {
             return .warning
@@ -404,11 +415,16 @@ public enum HealthDerivation {
     /// inputs, same rules, different question. Keeping them as two functions
     /// over one shared predicate is what stops them drifting: there is no
     /// second copy of "what counts as a problem".
+    /// - Parameter lockingBroken: this machine's lock directory or lock
+    ///   files are unusable, so nothing can be scheduled at all. Passed as a
+    ///   live probe rather than read from recorded state, because the fault
+    ///   it describes is usually the reason nothing could be recorded (#110).
     public static func hasWarningConditions(
         setHealths: [SetHealth],
         runsInFlight: [CurrentRunState],
         fullDiskAccessDenied: Bool,
         backgroundAgentEnabled: Bool?,
+        lockingBroken: Bool = false,
         runLiveness: (CurrentRunState) -> CurrentRunLiveness = { _ in .live }
     ) -> Bool {
         // An unhealthy run for a set that is no longer configured has no
@@ -420,5 +436,6 @@ public enum HealthDerivation {
             || unhealthyRuns > 0
             || fullDiskAccessDenied
             || backgroundAgentEnabled == false
+            || lockingBroken
     }
 }

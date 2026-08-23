@@ -501,7 +501,7 @@ Never a secret: `nonSecretEnv` is exactly `Destination.nonSecretEnv` (never the 
 
 ### `status --json`
 
-Reads only existing state (`state/schedule-state.json`, `state/current-run-*.json`, `state/repo-status-*.json`, `runs/index.jsonl`) — no restic invocation. `health` reuses `HealthDerivation.appHealth` verbatim (`Core/Sources/ResticStationCore/Support/HealthDerivation.swift`), so the CLI and the app's menu bar can never disagree about what counts as a warning.
+Reads recorded state (`state/schedule-state.json`, `state/current-run-*.json`, `state/repo-status-*.json`, `runs/index.jsonl`) and performs the same live locking probe as the app — no restic invocation. The lock probe may create dedicated owner-only `health.lock` inodes in `locks/`, `state/`, and `runs/` so it exercises `flock(2)` on each possibly distinct filesystem, and creates then removes a uniquely named scratch inode inside health-only `.health/` directories on all three filesystems to catch quota or full-filesystem failures; it never creates operation locks. Normal operation setup does not create or depend on any health scratch directory. It inspects set locks only for sets in this machine's resolved configuration, so persistent orphaned names do not create false outages. `health` reuses `HealthDerivation.appHealth` verbatim (`Core/Sources/ResticStationCore/Support/HealthDerivation.swift`), so the CLI and the app's menu bar can never disagree about what counts as a warning.
 
 It also inspects the platform scheduler: the same `SystemdTimerManager` used by `timer status` on Linux, and `launchctl print gui/$UID/net.herila.ResticStation.helper` on macOS. See `scheduling.md` §`status` and the scheduler. Only a definite `false` contributes a warning; a failed probe reports `healthy: null`.
 
@@ -510,6 +510,7 @@ Three things `status` will **not** do quietly, all of which used to make it repo
 - An **unreadable `runs/index.jsonl`** (wrong owner, wrong mode, I/O error) exits non-zero naming the file, instead of reading as "no runs recorded" — which derives to idle, which exits 0. A corrupt or truncated *line* stays survivable: `RunStore.recentRuns` skips it with a warning, as documented above.
 - An **abandoned `current-run-*.json`** (see §state/current-run) reports `warning` with `abandonedRun` populated and `isRunning: false`, instead of `running`.
 - A **stalled run** whose process still exists but has stopped heartbeating reports `warning` with `stalledRun` and `stalledRunLog` populated. It is never offered as safe-to-delete wreckage.
+- **Locking that does not work** — `locks/` uncreatable, uninspectable, or unsafe; unsupported `flock(2)`; inability to allocate a fresh lock inode; a production lock file owned by another user; a symlink where one should be — reports `locking.usable: false` and exits non-zero. `locking.scope` is `"set"` with the first detected affected `setId` for damaged set locks, `"administrative"` when only the mutation-only `secrets.lock` is damaged, and otherwise `"machine"` for a shared operation lock, directory, or filesystem-capability failure. Intrinsic damage confined to a dedicated `health.lock` or `.health/` scratch artifact instead reports `locking.usable: null`, `locking.scope: "diagnostic"`, and exits non-zero: monitoring is inconclusive, but production locks were not proven unusable. A failed `flock(2)` check or fresh-inode allocation remains machine-scoped even when its path is health-only, because production acquisition relies on the same capability. Human output preserves those distinctions and says either secret changes or one or more sets may be affected rather than understating a simultaneous broader outage. This is probed *live* rather than read from recorded state: the fault it describes is usually the reason nothing could be recorded. Machine-wide faults outrank `running`, because a stale `current-run-*.json` is exactly what such a machine tends to be left holding. See `scheduling.md` §Locking.
 - A set whose **first backup was never attempted** reports `firstBackupOverdue: true` after the larger of one schedule period and 24 hours from the later `config.json`/`machine.json` mtime. Missing mtimes disable this condition; a live run, any run history, or `lastBackupStart` proves setup progressed and disables it.
 
 ```json
@@ -518,6 +519,7 @@ Three things `status` will **not** do quietly, all of which used to make it repo
   "generatedAt": "2026-07-26T20:57:30.000Z",
   "health": "warning",
   "fullDiskAccessDenied": false,
+  "locking": {"usable": true, "dataDirectory": "/Users/me/Library/Application Support/ResticStation", "problem": null, "scope": null, "setId": null},
   "scheduler": {"kind": "launchd-agent", "healthy": true, "problems": [], "summaries": []},
   "sets": [
     {

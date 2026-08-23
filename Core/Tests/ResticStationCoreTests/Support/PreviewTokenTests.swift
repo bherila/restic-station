@@ -146,6 +146,33 @@ struct PreviewTokenStoreTests {
         #expect(throws: PreviewTokenError.expired) { try store.token(expiring.value) }
     }
 
+    @Test("directory setup failures use the purge token-store error taxonomy")
+    func directorySetupFailureIsStoreUnusable() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-preview-token-broken-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        FileManager.default.createFile(
+            atPath: root.appendingPathComponent("state").path,
+            contents: Data()
+        )
+        let store = PreviewTokenStore(paths: AppPaths(root: root))
+
+        do {
+            _ = try store.issueMaintenancePrune(
+                machineId: "example-machine",
+                setId: UUID(),
+                destinationId: UUID(),
+                effectiveDestinationFingerprint: "binding"
+            )
+            Issue.record("an unusable data layout must not be reported as transient contention")
+        } catch PreviewTokenError.storeUnusable(let message) {
+            #expect(message.contains("could not create the data directories"))
+        } catch {
+            Issue.record("unexpected error taxonomy: \(error)")
+        }
+    }
+
     /// The app previews Apply Retention and the helper executes it in two
     /// different processes; they must derive byte-identical fingerprints from
     /// the same state, and must diverge whenever anything the helper resolves

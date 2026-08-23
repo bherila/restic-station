@@ -69,6 +69,10 @@ public struct PurgePlanResult: Equatable, Sendable {
         case ready
         case busy
         case offline
+        /// Local process-control state failed before any restic preview
+        /// command ran. Distinct from `failed`, which means the repository
+        /// query itself could not complete.
+        case infrastructureFailure
         case failed
     }
 
@@ -106,13 +110,22 @@ public struct PurgeRunResult: Equatable, Sendable {
     }
 }
 
-/// Failures that prevent a token-gated purge before `rewrite --forget` can
-/// run.  Messages and CLI classification intentionally never carry a token,
-/// path, or repository URL.
+/// Failures while preparing or recording a token-gated purge. Messages and
+/// CLI classification intentionally never carry token material.
 public enum PurgeApplyError: Error, Equatable, Sendable {
     case token(PreviewTokenError)
     case tokenDoesNotMatchCurrentPlan
     case busy
+    /// The set lock could not be *used* — not held by someone else, but
+    /// unopenable, wrong owner, or on an uncreatable directory. Kept apart
+    /// from ``busy`` because a caller may sensibly retry contention and must
+    /// never quietly retry a broken lock directory (#110).
+    case lockUnusable(String)
+    /// Local durable state failed outside set-lock acquisition. The flag is
+    /// required because a rewrite or an earlier destination may already have
+    /// changed repository data before terminal history or watermark storage
+    /// failed; callers must not encourage a blind retry in that case.
+    case infrastructureFailure(reason: String, operationMayHaveRun: Bool)
     case destinationOffline(destinationId: UUID)
     case unavailable
     /// No restic executable could be identified, so no destructive purge

@@ -90,7 +90,13 @@ public struct PreviewToken: Codable, Equatable, Sendable {
 /// None carries the token value: an error can safely reach a bounded CLI
 /// message without leaking a live capability.
 public enum PreviewTokenError: Error, Equatable, Sendable {
+    /// The store could not be reached right now — including its lock being
+    /// held by another process, which is transient and worth retrying.
     case unavailable
+    /// The store itself is unusable: its lock file is unopenable, owned by
+    /// another user, or its directory cannot be created. Kept apart from
+    /// ``unavailable`` because retrying never clears it (#110).
+    case storeUnusable(String)
     case unknown
     case expired
     case alreadyUsed
@@ -304,13 +310,27 @@ public struct PreviewTokenStore: Sendable {
     /// behavior single-use even across helper processes.
     private func withStoreLock<T>(_ body: () throws -> T) throws -> T {
         do {
-            try paths.ensureDirectories()
-            let lock = FileLock(path: paths.previewTokensLockFile)
-            guard lock.tryAcquire() else { throw PreviewTokenError.unavailable }
-            // Owner-only: a lock file another user can open is a lock another
-            // user can hold, which would wedge every destructive confirmation
-            // on the machine. Fail-closed, but total.
-            _ = chmod(paths.previewTokensLockFile.path, 0o600)
+            do {
+                try paths.ensureDirectories()
+            } catch {
+                throw PreviewTokenError.storeUnusable(
+                    "could not create the data directories under \(paths.root.path): \(error)"
+                )
+            }
+            let lock = FileLock(path: paths.previewTokensLockFile, trustedRoot: paths.root)
+            // Owner-only is now enforced by `FileLock` itself, on the open
+            // descriptor rather than by a `chmod` on the path after the fact
+            // — the same check, without the window between them, and it
+            // refuses a lock file belonging to another user instead of
+            // trying to take it over.
+            switch lock.acquire() {
+            case .acquired:
+                break
+            case .busy:
+                throw PreviewTokenError.unavailable
+            case .failed(let failure):
+                throw PreviewTokenError.storeUnusable(String(describing: failure))
+            }
             defer { lock.release() }
             return try body()
         } catch let error as PreviewTokenError {

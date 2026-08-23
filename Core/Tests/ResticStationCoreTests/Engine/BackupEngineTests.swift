@@ -2,6 +2,14 @@ import Foundation
 import Testing
 @testable import ResticStationCore
 
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#endif
+
 // MARK: - Test doubles
 
 /// Injectable clock. `now` is deliberately a stored closure so the same
@@ -541,6 +549,159 @@ struct BackupEngineTests {
         #expect(env.stateStore.readCurrentRun(setId: Self.setId) == nil, "current-run cleared on the failure path too")
     }
 
+    @Test("a terminal run that cannot enter the index is infrastructure failure")
+    func runIndexFailureCannotReportScheduledSuccess() async throws {
+        let paths = Box<AppPaths?>(nil)
+        let env = Self.makeEnv(
+            script: [],
+            retention: nil,
+            reachableSecondaries: [],
+            onSpawn: { argv in
+                guard argv.contains("backup"), let paths = paths.value else { return }
+                try? FileManager.default.removeItem(at: paths.runsIndexLockFile)
+                try? FileManager.default.createDirectory(
+                    at: paths.runsIndexLockFile,
+                    withIntermediateDirectories: true
+                )
+            }
+        )
+        paths.value = env.paths
+        defer { env.cleanUp() }
+        env.fake.script = Self.resticCall(
+            Self.backupArgv(env.primary.repoURL),
+            dest: Self.primaryId,
+            stdoutLines: Self.backupStream()
+        )
+
+        let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
+
+        guard case .infrastructureFailure(let reason) = outcome else {
+            Issue.record("a missing terminal index entry must fail the scheduled operation: \(outcome)")
+            return
+        }
+        #expect(reason.contains("run history unusable"))
+        #expect(env.indexEntries.isEmpty)
+    }
+
+    @Test("a terminal-index failure does not strand otherwise safe mirror and retention work")
+    func runIndexFailureContinuesIndependentPhases() async throws {
+        let paths = Box<AppPaths?>(nil)
+        let env = Self.makeEnv(
+            script: [],
+            reachableSecondaries: [true],
+            onSpawn: { argv in
+                guard argv.contains("backup"), let paths = paths.value else { return }
+                try? FileManager.default.removeItem(at: paths.runsIndexLockFile)
+                try? FileManager.default.createDirectory(
+                    at: paths.runsIndexLockFile,
+                    withIntermediateDirectories: true
+                )
+            }
+        )
+        paths.value = env.paths
+        defer { env.cleanUp() }
+        let secondary = env.secondaries[0]
+        env.fake.script =
+            Self.resticCall(
+                Self.backupArgv(env.primary.repoURL),
+                dest: Self.primaryId,
+                stdoutLines: Self.backupStream()
+            )
+            + Self.resticCall(
+                Self.copyArgv(to: secondary.repoURL, from: env.primary.repoURL),
+                dest: secondary.id,
+                from: env.primary.id
+            )
+            + Self.resticCall(Self.forgetArgv(secondary.repoURL), dest: secondary.id)
+            + Self.resticCall(Self.forgetArgv(env.primary.repoURL), dest: env.primary.id)
+
+        let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
+
+        guard case .infrastructureFailure(let reason) = outcome else {
+            Issue.record("the index fault must remain the set outcome: \(outcome)")
+            return
+        }
+        #expect(reason.contains("run history unusable"))
+        let expectedArgvs: [[String]] = [
+            [Self.resticPath] + Self.backupArgv(env.primary.repoURL),
+            [Self.resticPath] + Self.copyArgv(to: secondary.repoURL, from: env.primary.repoURL),
+            [Self.resticPath] + Self.forgetArgv(secondary.repoURL),
+            [Self.resticPath] + Self.forgetArgv(env.primary.repoURL),
+        ]
+        #expect(env.resticArgvs == expectedArgvs)
+        #expect(env.indexEntries.isEmpty)
+    }
+
+    @Test("a later primary-purge failure cannot mask the backup index failure")
+    func primaryPurgeFailurePreservesEarlierIndexFailure() async throws {
+        let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]
+        let hostnames = [Self.setId: Set(["example-mac.local"])]
+        let paths = Box<AppPaths?>(nil)
+        let env = Self.makeEnv(
+            script: [],
+            retention: nil,
+            purgeExcludes: ["build/**"],
+            reachableSecondaries: [],
+            onSpawn: { argv in
+                guard let paths = paths.value else { return }
+                if argv.contains("backup") {
+                    try? FileManager.default.removeItem(at: paths.runsIndexLockFile)
+                    try? FileManager.default.createDirectory(
+                        at: paths.runsIndexLockFile,
+                        withIntermediateDirectories: true
+                    )
+                } else if argv.contains("snapshots") {
+                    // Isolate the backup's terminal-index failure: repair the
+                    // index before the purge run so its ordinary restic
+                    // failure cannot inherit the same infrastructure fault.
+                    try? FileManager.default.removeItem(at: paths.runsIndexLockFile)
+                }
+            },
+            purgeSourcePaths: sourcePaths,
+            purgeHostnames: hostnames
+        )
+        paths.value = env.paths
+        defer { env.cleanUp() }
+        let snapshotsJSON = try FixtureLoader.string("snapshots.json")
+        let snapshots = try parseSnapshots(Data(snapshotsJSON.utf8))
+        env.fake.script =
+            Self.resticCall(
+                Self.backupArgv(env.primary.repoURL, excludes: env.set.purgeExcludes),
+                dest: Self.primaryId,
+                stdoutLines: Self.backupStream()
+            )
+            + Self.resticCall(
+                ["-r", env.primary.repoURL, "snapshots", "--json"],
+                dest: Self.primaryId,
+                stdoutLines: [snapshotsJSON]
+            )
+            + Self.resticCall(
+                ["-r", env.primary.repoURL, "snapshots", "--json"],
+                dest: Self.primaryId,
+                stdoutLines: [snapshotsJSON]
+            )
+            + Self.resticCall(
+                Self.rewriteArgv(
+                    env.primary.repoURL,
+                    snapshotIDs: snapshots.map(\.id),
+                    patterns: env.set.purgeExcludes
+                ),
+                dest: Self.primaryId,
+                stderr: "rewrite failed",
+                exitCode: 1
+            )
+
+        let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
+
+        guard case .infrastructureFailure(let reason) = outcome else {
+            Issue.record("the earlier index failure must remain authoritative: \(outcome)")
+            return
+        }
+        #expect(reason.contains("run history unusable"))
+        #expect(env.entries(kind: .backup).isEmpty)
+        #expect(env.entries(kind: .purge).first?.status == .failed)
+    }
+
     // MARK: - Row 6 / Row 12 — copy failure isolates that mirror
 
     @Test("rows 6+12: a failed copy is recorded, its mirror is never forgotten, the other mirror proceeds")
@@ -737,7 +898,7 @@ struct BackupEngineTests {
         // A separate FileLock (separate open file description) genuinely
         // contends, even in-process — see FileLock's documentation.
         let holder = FileLock(path: env.paths.setLockFile(setId: Self.setId))
-        #expect(holder.tryAcquire())
+        #expect(holder.acquire() == .acquired)
         defer { holder.release() }
 
         let outcome = await env.engine.runSet(env.set, trigger: .manual)
@@ -752,6 +913,201 @@ struct BackupEngineTests {
         #expect(
             env.stateStore.readScheduleState()?.sets[Self.setId]?.lastBackupStart == nil,
             "step 3 happens after the lock is taken — a busy lock must not consume the schedule slot"
+        )
+    }
+
+    // MARK: - Row 10b — set lock unusable (#110)
+
+    @Test("row 10b: an unusable set lock is a .failed record, not a .skipped one")
+    func rowTenLockUnusable() async throws {
+        let env = Self.makeEnv(script: [])
+        defer { env.cleanUp() }
+        try env.paths.ensureDirectories()
+
+        // A directory where the set's lock *file* belongs. Chosen over
+        // `chmod`-ing `locks/` so the fault is injectable as root too — the
+        // Linux CI container runs as root, where mode bits are advisory and
+        // a permissions-based injection would have to be skipped. Only the
+        // lock path is touched, so the run store can still record what
+        // happened; that is the whole point of the assertion below.
+        try FileManager.default.createDirectory(
+            at: env.paths.setLockFile(setId: Self.setId),
+            withIntermediateDirectories: true
+        )
+
+        let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
+
+        // Before #110 this was `.skipped` with a `.skipped` index record —
+        // which `HealthDerivation` does not count, so the machine went on
+        // reporting healthy while every scheduled backup silently did
+        // nothing, forever.
+        // `.infrastructureFailure`, distinct from `.misconfigured`: the
+        // machine is broken, not the configuration, and only this case makes
+        // the scheduled tick exit non-zero.
+        guard case .infrastructureFailure(let reason) = outcome else {
+            Issue.record("a broken lock must not be reported as ordinary contention: \(outcome)")
+            return
+        }
+        #expect(reason.contains("lock"))
+        #expect(env.resticArgvs.isEmpty, "nothing may be spawned without the lock")
+
+        let entries = env.indexEntries
+        #expect(entries.count == 1)
+        #expect(entries[0].kind == .backup)
+        #expect(entries[0].status == .failed, "a .skipped record here is invisible to health derivation")
+        #expect(entries[0].errorSummary?.contains("lock") == true)
+        #expect(
+            env.stateStore.readScheduleState()?.sets[Self.setId]?.lastBackupStart == nil,
+            "a run that never started must not consume the schedule slot"
+        )
+    }
+
+    @Test("an unusable schedule-state lock stops a backup before restic launches")
+    func scheduleStateLockUnusableStopsBackup() async throws {
+        let env = Self.makeEnv(script: [])
+        defer { env.cleanUp() }
+        try env.paths.ensureDirectories()
+        try FileManager.default.createDirectory(
+            at: env.paths.scheduleStateLockFile,
+            withIntermediateDirectories: true
+        )
+
+        let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
+
+        guard case .infrastructureFailure(let reason) = outcome else {
+            Issue.record("a backup without durable scheduling state must not run: \(outcome)")
+            return
+        }
+        #expect(reason.contains("schedule state"))
+        #expect(env.resticArgvs.isEmpty)
+        #expect(env.entries(kind: .backup).first?.status == .failed)
+    }
+
+    @Test("an unusable runs directory is infrastructure failure before backup launch")
+    func backupBeginFailureIsInfrastructureFailure() async throws {
+        let env = Self.makeEnv(script: [], reachableSecondaries: [])
+        defer { env.cleanUp() }
+        try env.paths.ensureDirectories()
+        let runId = RunStore.formatRunId(kind: .backup, setId: Self.setId, date: Self.t0)
+        try FileManager.default.createSymbolicLink(
+            at: env.paths.runDir(runId: runId),
+            withDestinationURL: env.root.appendingPathComponent("missing-run-target")
+        )
+
+        let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
+
+        guard case .infrastructureFailure(let reason) = outcome else {
+            Issue.record("a run-record creation failure must fail the scheduled operation: \(outcome)")
+            return
+        }
+        #expect(reason.contains("run history unusable"))
+        #expect(env.resticArgvs.isEmpty)
+    }
+
+    @Test("an unusable runs directory is infrastructure failure before check launch")
+    func checkBeginFailureIsInfrastructureFailure() async throws {
+        let env = Self.makeEnv(script: [], reachableSecondaries: [])
+        defer { env.cleanUp() }
+        try env.paths.ensureDirectories()
+        let runId = RunStore.formatRunId(kind: .check, setId: Self.setId, date: Self.t0)
+        try FileManager.default.createSymbolicLink(
+            at: env.paths.runDir(runId: runId),
+            withDestinationURL: env.root.appendingPathComponent("missing-run-target")
+        )
+
+        let outcome = await env.engine.runCheck(env.set, trigger: .scheduled)
+
+        guard case .infrastructureFailure(let reason) = outcome else {
+            Issue.record("a run-record creation failure must fail the scheduled check: \(outcome)")
+            return
+        }
+        #expect(reason.contains("run history unusable"))
+        #expect(env.resticArgvs.isEmpty)
+    }
+
+    @Test("a copy record creation failure fails the set instead of silently skipping the mirror")
+    func copyBeginFailureIsInfrastructureFailure() async throws {
+        let env = Self.makeEnv(
+            script: [],
+            retention: nil,
+            reachableSecondaries: [true]
+        )
+        defer { env.cleanUp() }
+        try env.paths.ensureDirectories()
+        let runId = RunStore.formatRunId(kind: .copy, setId: Self.setId, date: Self.t0)
+        try FileManager.default.createSymbolicLink(
+            at: env.paths.runDir(runId: runId),
+            withDestinationURL: env.root.appendingPathComponent("missing-run-target")
+        )
+        env.fake.script = Self.resticCall(Self.backupArgv(env.primary.repoURL), dest: Self.primaryId)
+
+        let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
+
+        guard case .infrastructureFailure(let reason) = outcome else {
+            Issue.record("a missing copy record must fail the set: \(outcome)")
+            return
+        }
+        #expect(reason.contains("run history unusable"))
+        #expect(env.resticArgvs == [[Self.resticPath] + Self.backupArgv(env.primary.repoURL)])
+    }
+
+    @Test("a retention record creation failure fails the set instead of omitting retention")
+    func retentionBeginFailureIsInfrastructureFailure() async throws {
+        let env = Self.makeEnv(script: [], reachableSecondaries: [])
+        defer { env.cleanUp() }
+        try env.paths.ensureDirectories()
+        let runId = RunStore.formatRunId(kind: .prune, setId: Self.setId, date: Self.t0)
+        try FileManager.default.createSymbolicLink(
+            at: env.paths.runDir(runId: runId),
+            withDestinationURL: env.root.appendingPathComponent("missing-run-target")
+        )
+        env.fake.script = Self.resticCall(Self.backupArgv(env.primary.repoURL), dest: Self.primaryId)
+
+        let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
+
+        guard case .infrastructureFailure(let reason) = outcome else {
+            Issue.record("a missing retention record must fail the set: \(outcome)")
+            return
+        }
+        #expect(reason.contains("run history unusable"))
+        #expect(env.resticArgvs == [[Self.resticPath] + Self.backupArgv(env.primary.repoURL)])
+    }
+
+    /// The health consequence of the record above, asserted end to end
+    /// rather than assumed: a `.failed` last run is what makes
+    /// `hasWarningConditions` true, and therefore what makes `status --json`
+    /// exit 1 instead of reporting an idle, healthy machine.
+    @Test("row 10b: the recorded failure actually reaches health derivation")
+    func rowTenLockUnusableIsUnhealthy() async throws {
+        let env = Self.makeEnv(script: [])
+        defer { env.cleanUp() }
+        try env.paths.ensureDirectories()
+        try FileManager.default.createDirectory(
+            at: env.paths.setLockFile(setId: Self.setId),
+            withIntermediateDirectories: true
+        )
+
+        _ = await env.engine.runSet(env.set, trigger: .scheduled)
+
+        let health = HealthDerivation.setHealth(
+            set: env.set,
+            recentRuns: env.indexEntries.reversed(),
+            currentRun: nil,
+            repoStatuses: [:],
+            setScheduleState: env.stateStore.readScheduleState()?.sets[Self.setId],
+            now: Self.t0,
+            calendar: Calendar(identifier: .gregorian)
+        )
+        #expect(health.lastRunFailed)
+        #expect(health.needsAttention)
+        #expect(
+            HealthDerivation.hasWarningConditions(
+                setHealths: [health],
+                runsInFlight: [],
+                fullDiskAccessDenied: false,
+                backgroundAgentEnabled: true
+            ),
+            "status --json must exit 1 on a machine that cannot take its own locks"
         )
     }
 
@@ -1110,9 +1466,9 @@ struct BackupEngineTests {
         )
         env.fake.script = script
 
-        let status = await env.engine.runCheck(env.set)
+        let outcome = await env.engine.runCheck(env.set)
 
-        #expect(status == .success)
+        #expect(outcome == .completed(.success))
         #expect(env.resticArgvs == [
             [Self.resticPath, "-r", env.primary.repoURL, "check", "--read-data-subset=8/20"],
         ])
@@ -1148,9 +1504,9 @@ struct BackupEngineTests {
         )
         env.fake.script = script
 
-        let status = await env.engine.runCheck(env.set)
+        let outcome = await env.engine.runCheck(env.set)
 
-        #expect(status == .failed)
+        #expect(outcome == .completed(.failed))
         let state = try #require(env.stateStore.readScheduleState()?.sets[Self.setId])
         #expect(state.checkSliceCursor == 7, "the same slice must be re-verified next time")
         #expect(state.checkCount == 1)
@@ -1185,9 +1541,9 @@ struct BackupEngineTests {
         )
         env.fake.script = script
 
-        let status = await env.engine.runCheck(env.set)
+        let outcome = await env.engine.runCheck(env.set)
 
-        #expect(status == .success)
+        #expect(outcome == .completed(.success))
         #expect(env.resticArgvs == [
             [Self.resticPath, "-r", env.primary.repoURL, "check", "--read-data-subset=4/20"],
             [Self.resticPath, "-r", reachable.repoURL, "check"],
@@ -1199,20 +1555,103 @@ struct BackupEngineTests {
         #expect(env.stateStore.readScheduleState()?.sets[Self.setId]?.checkCount == 4)
     }
 
+    @Test("runCheck: primary index failure preserves successful bookkeeping and secondary checks")
+    func checkPrimaryIndexFailureContinuesSuccessfulBookkeeping() async throws {
+        let paths = Box<AppPaths?>(nil)
+        let env = Self.makeEnv(
+            script: [],
+            checkPolicy: CheckPolicy(enabled: true, readDataSubsetSlices: 20),
+            reachableSecondaries: [true],
+            onSpawn: { argv in
+                guard let paths = paths.value, argv.contains("check") else { return }
+                if argv.contains("--read-data-subset=4/20") {
+                    try? FileManager.default.removeItem(at: paths.runsIndexLockFile)
+                    try? FileManager.default.createDirectory(
+                        at: paths.runsIndexLockFile,
+                        withIntermediateDirectories: true
+                    )
+                } else {
+                    // Isolate the primary terminal-index failure. Repair the
+                    // index before the independently safe secondary check.
+                    try? FileManager.default.removeItem(at: paths.runsIndexLockFile)
+                }
+            }
+        )
+        paths.value = env.paths
+        defer { env.cleanUp() }
+        let reachable = env.secondaries[0]
+        try env.stateStore.updateScheduleState(setId: Self.setId) { state in
+            state.checkSliceCursor = 3
+            state.checkCount = 3
+        }
+
+        env.fake.script =
+            Self.resticCall(
+                ["-r", env.primary.repoURL, "check", "--read-data-subset=4/20"],
+                dest: Self.primaryId,
+                stdoutLines: ["no errors were found"]
+            )
+            + Self.resticCall(
+                ["-r", reachable.repoURL, "check"],
+                dest: Self.secondaryAId,
+                stdoutLines: ["no errors were found"]
+            )
+
+        let outcome = await env.engine.runCheck(env.set)
+
+        guard case .infrastructureFailure(let reason) = outcome else {
+            Issue.record("the primary terminal-index fault must remain the outcome: \(outcome)")
+            return
+        }
+        #expect(reason.contains("run history unusable"))
+        #expect(env.resticArgvs == [
+            [Self.resticPath, "-r", env.primary.repoURL, "check", "--read-data-subset=4/20"],
+            [Self.resticPath, "-r", reachable.repoURL, "check"],
+        ])
+        let state = try #require(env.stateStore.readScheduleState()?.sets[Self.setId])
+        #expect(state.checkSliceCursor == 4)
+        #expect(state.checkCount == 4)
+        let checks = env.entries(kind: .check)
+        #expect(checks.count == 1)
+        #expect(checks.first?.destId == Self.secondaryAId)
+    }
+
     @Test("runCheck: set lock busy → .skipped record, no restic")
     func checkLockBusy() async throws {
         let env = Self.makeEnv(script: [], reachableSecondaries: [])
         defer { env.cleanUp() }
         try env.paths.ensureDirectories()
         let holder = FileLock(path: env.paths.setLockFile(setId: Self.setId))
-        #expect(holder.tryAcquire())
+        #expect(holder.acquire() == .acquired)
         defer { holder.release() }
 
-        let status = await env.engine.runCheck(env.set)
+        let outcome = await env.engine.runCheck(env.set)
 
-        #expect(status == .skipped)
+        #expect(outcome == .skipped)
         #expect(env.resticArgvs.isEmpty)
         #expect(env.entries(kind: .check).first?.status == .skipped)
+        #expect(env.stateStore.readScheduleState()?.sets[Self.setId]?.lastCheckStart == nil)
+    }
+
+    @Test("runCheck: an unusable set lock is infrastructure failure, not a failed check")
+    func checkLockUnusable() async throws {
+        let env = Self.makeEnv(script: [], reachableSecondaries: [])
+        defer { env.cleanUp() }
+        try env.paths.ensureDirectories()
+        try FileManager.default.createDirectory(
+            at: env.paths.setLockFile(setId: Self.setId),
+            withIntermediateDirectories: true
+        )
+
+        let outcome = await env.engine.runCheck(env.set, trigger: .scheduled)
+
+        guard case .infrastructureFailure(let reason) = outcome else {
+            Issue.record("an unusable check lock must be a tick-failing infrastructure error: \(outcome)")
+            return
+        }
+        #expect(reason.contains("lock"))
+        #expect(env.resticArgvs.isEmpty)
+        #expect(env.entries(kind: .check).first?.status == .failed)
         #expect(env.stateStore.readScheduleState()?.sets[Self.setId]?.lastCheckStart == nil)
     }
 
@@ -1238,7 +1677,7 @@ struct BackupEngineTests {
 
         let status = await env.engine.runPrune(env.set)
 
-        #expect(status == .success)
+        #expect(status == .completed(.success))
         #expect(env.stateStore.readCurrentRun(setId: Self.setId) == nil, "live progress is cleared afterwards")
         // SAFETY: the mirror that is behind the primary is never forgotten.
         #expect(env.resticArgvs == [
@@ -1267,8 +1706,60 @@ struct BackupEngineTests {
 
         let status = await env.engine.runPrune(env.set)
 
-        #expect(status == .success)
+        #expect(status == .completed(.success))
         #expect(env.resticArgvs == [[Self.resticPath] + Self.forgetArgv(env.primary.repoURL)])
+    }
+
+    @Test("runPrune: a terminal run-index failure cannot report success")
+    func pruneIndexFailureCannotReportSuccess() async throws {
+        let paths = Box<AppPaths?>(nil)
+        let env = Self.makeEnv(
+            script: [],
+            reachableSecondaries: [],
+            onSpawn: { argv in
+                guard argv.contains("forget"), let paths = paths.value else { return }
+                try? FileManager.default.removeItem(at: paths.runsIndexLockFile)
+                try? FileManager.default.createDirectory(
+                    at: paths.runsIndexLockFile,
+                    withIntermediateDirectories: true
+                )
+            }
+        )
+        paths.value = env.paths
+        defer { env.cleanUp() }
+        env.fake.script = Self.resticCall(Self.forgetArgv(env.primary.repoURL), dest: Self.primaryId)
+
+        let status = await env.engine.runPrune(env.set)
+
+        guard case .infrastructureFailure(let reason, let operationMayHaveRun) = status else {
+            Issue.record("a terminal index failure must remain infrastructure failure: \(status)")
+            return
+        }
+        #expect(reason.contains("run history unusable"))
+        #expect(operationMayHaveRun)
+        #expect(env.indexEntries.isEmpty)
+    }
+
+    @Test("runPrune: an unusable set lock is a typed infrastructure failure")
+    func pruneLockUnusable() async throws {
+        let env = Self.makeEnv(script: [], reachableSecondaries: [])
+        defer { env.cleanUp() }
+        try env.paths.ensureDirectories()
+        try FileManager.default.createDirectory(
+            at: env.paths.setLockFile(setId: Self.setId),
+            withIntermediateDirectories: true
+        )
+
+        let outcome = await env.engine.runPrune(env.set)
+
+        guard case .infrastructureFailure(let reason, let operationMayHaveRun) = outcome else {
+            Issue.record("an unusable prune lock must be infrastructure failure: \(outcome)")
+            return
+        }
+        #expect(reason.contains("lock"))
+        #expect(!operationMayHaveRun)
+        #expect(env.resticArgvs.isEmpty)
+        #expect(env.entries(kind: .prune).first?.status == .failed)
     }
 
     @Test(
@@ -1297,6 +1788,121 @@ struct BackupEngineTests {
         #expect(status == .completed(.success))
         #expect(env.resticArgvs == [[Self.resticPath, "-r", env.primary.repoURL, "prune"]])
         #expect(env.entries(kind: .prune).count == 1)
+    }
+
+    @Test("standalone prune: a terminal run-index failure cannot report success")
+    func standalonePruneIndexFailureCannotReportSuccess() async throws {
+        let paths = Box<AppPaths?>(nil)
+        let env = Self.makeEnv(
+            script: [],
+            retention: nil,
+            onSpawn: { argv in
+                guard argv.contains("prune"), let paths = paths.value else { return }
+                try? FileManager.default.removeItem(at: paths.runsIndexLockFile)
+                try? FileManager.default.createDirectory(
+                    at: paths.runsIndexLockFile,
+                    withIntermediateDirectories: true
+                )
+            }
+        )
+        paths.value = env.paths
+        defer { env.cleanUp() }
+        env.fake.script = Self.resticCall(["-r", env.primary.repoURL, "prune"], dest: Self.primaryId)
+
+        let result = await env.engine.runPruneRepository(set: env.set, destination: env.primary)
+
+        guard case .failed(.infrastructure(let reason)) = result else {
+            Issue.record("a missing terminal index entry must fail standalone prune: \(result)")
+            return
+        }
+        #expect(reason.contains("run history unusable"))
+        #expect(env.indexEntries.isEmpty)
+    }
+
+    @Test("standalone prune: launch and terminal-index failures stay outcome-neutral")
+    func standalonePruneLaunchAndIndexFailuresStayOutcomeNeutral() async throws {
+        let paths = Box<AppPaths?>(nil)
+        let env = Self.makeEnv(
+            script: [],
+            retention: nil,
+            onSpawn: { argv in
+                guard argv.contains("prune"), let paths = paths.value else { return }
+                try? FileManager.default.removeItem(at: paths.runsIndexLockFile)
+                try? FileManager.default.createDirectory(
+                    at: paths.runsIndexLockFile,
+                    withIntermediateDirectories: true
+                )
+            }
+        )
+        paths.value = env.paths
+        defer { env.cleanUp() }
+        env.fake.script = [
+            .init(
+                argvPrefix: [Self.resticPath, "-r", env.primary.repoURL, "prune"],
+                failure: .launchFailed("restic disappeared")
+            ),
+        ]
+
+        let result = await env.engine.runPruneRepository(set: env.set, destination: env.primary)
+
+        guard case .failed(.infrastructure(let reason)) = result else {
+            Issue.record("combined launch/index failure must stay infrastructure failure: \(result)")
+            return
+        }
+        #expect(reason.contains("run history unusable"))
+        #expect(env.indexEntries.isEmpty)
+    }
+
+    @Test("standalone remote prune: a terminal run-index failure cannot report success")
+    func standaloneRemotePruneIndexFailureCannotReportSuccess() async throws {
+        let paths = Box<AppPaths?>(nil)
+        let env = Self.makeEnv(
+            script: [],
+            retention: nil,
+            onSpawn: { argv in
+                guard argv.contains(where: { $0.contains("prune") }),
+                      let paths = paths.value else { return }
+                try? FileManager.default.removeItem(at: paths.runsIndexLockFile)
+                try? FileManager.default.createDirectory(
+                    at: paths.runsIndexLockFile,
+                    withIntermediateDirectories: true
+                )
+            }
+        )
+        paths.value = env.paths
+        defer { env.cleanUp() }
+        var destination = env.primary
+        destination.repoURL = "sftp:backup@example:/srv/repo with space"
+        destination.remoteMaintenance = RemoteMaintenance(enabled: true, remoteResticPath: "/opt/restic")
+        var set = env.set
+        set.destinations[0] = destination
+        env.fake.script = [
+            .init(
+                argvPrefix: RemoteResticCommand.version(
+                    sshTarget: "backup@example",
+                    resticPath: "/opt/restic"
+                ).argv,
+                stdoutLines: ["{\"version\":\"0.18.1\"}"]
+            ),
+            .init(
+                argvPrefix: RemoteResticCommand(
+                    sshTarget: "backup@example",
+                    resticPath: "/opt/restic",
+                    repoPath: "/srv/repo with space",
+                    dryRun: false,
+                    password: "repo-password"
+                ).argv
+            ),
+        ]
+
+        let result = await env.engine.runPruneRepository(set: set, destination: destination)
+
+        guard case .failed(.infrastructure(let reason)) = result else {
+            Issue.record("a missing terminal index entry must fail remote prune: \(result)")
+            return
+        }
+        #expect(reason.contains("run history unusable"))
+        #expect(env.indexEntries.isEmpty)
     }
 
     @Test("standalone prune: SFTP remote maintenance verifies SSH then never falls back locally")
@@ -1428,7 +2034,7 @@ struct BackupEngineTests {
         ]
         try env.paths.ensureDirectories()
         let heldTokenStoreLock = FileLock(path: env.paths.previewTokensLockFile)
-        #expect(heldTokenStoreLock.tryAcquire())
+        #expect(heldTokenStoreLock.acquire() == .acquired)
 
         let status = await env.engine.runPruneRepository(
             set: set,
@@ -1556,7 +2162,7 @@ struct BackupEngineTests {
         defer { env.cleanUp() }
         try env.paths.ensureDirectories()
         let heldLock = FileLock(path: env.paths.setLockFile(setId: env.set.id))
-        #expect(heldLock.tryAcquire())
+        #expect(heldLock.acquire() == .acquired)
         defer { heldLock.release() }
 
         let result = await env.engine.runPruneRepository(
@@ -1568,6 +2174,60 @@ struct BackupEngineTests {
         #expect(result == .skipped(.busy))
         #expect(env.fake.invocations.isEmpty)
         #expect(env.entries(kind: .prune).isEmpty)
+    }
+
+    @Test(
+        "standalone prune: an unusable set lock stays an infrastructure failure",
+        arguments: [false, true]
+    )
+    func standalonePruneUnusableSetLockIsInfrastructure(dryRun: Bool) async throws {
+        let env = Self.makeEnv(script: [], retention: nil)
+        defer { env.cleanUp() }
+        try env.paths.ensureDirectories()
+        try FileManager.default.createDirectory(
+            at: env.paths.setLockFile(setId: env.set.id),
+            withIntermediateDirectories: true
+        )
+
+        let result = await env.engine.runPruneRepository(
+            set: env.set,
+            destination: env.primary,
+            dryRun: dryRun
+        )
+
+        guard case .failed(.infrastructure(let reason)) = result else {
+            Issue.record("an unusable set lock must remain infrastructure failure: \(result)")
+            return
+        }
+        #expect(reason.contains("backup-set lock unusable"))
+        #expect(env.fake.invocations.isEmpty)
+        if dryRun {
+            #expect(env.entries(kind: .prune).isEmpty)
+        }
+    }
+
+    @Test("standalone prune reports run-record creation as infrastructure failure")
+    func standalonePruneBeginFailureIsInfrastructure() async throws {
+        let env = Self.makeEnv(script: [], retention: nil)
+        defer { env.cleanUp() }
+        try env.paths.ensureDirectories()
+        let runId = RunStore.formatRunId(kind: .prune, setId: Self.setId, date: Self.t0)
+        try FileManager.default.createSymbolicLink(
+            at: env.paths.runDir(runId: runId),
+            withDestinationURL: env.root.appendingPathComponent("missing-run-target")
+        )
+
+        let result = await env.engine.runPruneRepository(
+            set: env.set,
+            destination: env.primary
+        )
+
+        guard case .failed(.infrastructure(let reason)) = result else {
+            Issue.record("a missing prune record must be infrastructure failure: \(result)")
+            return
+        }
+        #expect(reason.contains("run history unusable"))
+        #expect(env.resticArgvs.isEmpty)
     }
 
     @Test("standalone prune: a busy confirmation does not consume its preview token")
@@ -1588,7 +2248,7 @@ struct BackupEngineTests {
         )
         try env.paths.ensureDirectories()
         let heldLock = FileLock(path: env.paths.setLockFile(setId: env.set.id))
-        #expect(heldLock.tryAcquire())
+        #expect(heldLock.acquire() == .acquired)
 
         let busy = await env.engine.runPruneRepository(
             set: env.set,
@@ -1640,7 +2300,7 @@ struct BackupEngineTests {
         )
         try env.paths.ensureDirectories()
         let heldTokenStoreLock = FileLock(path: env.paths.previewTokensLockFile)
-        #expect(heldTokenStoreLock.tryAcquire())
+        #expect(heldTokenStoreLock.acquire() == .acquired)
 
         let result = await env.engine.runPruneRepository(
             set: env.set,
@@ -1657,6 +2317,42 @@ struct BackupEngineTests {
         #expect(try PreviewTokenStore(paths: env.paths).token(token).value == token)
         #expect(env.fake.invocations.isEmpty)
         #expect(env.entries(kind: .prune).isEmpty)
+    }
+
+    @Test("standalone prune: an unusable confirmation store is not temporary contention")
+    func standalonePruneUnusableConfirmationStoreIsInfrastructureFailure() async throws {
+        let env = Self.makeEnv(script: [], retention: nil)
+        defer { env.cleanUp() }
+        let fingerprint = env.primary.pruneConfirmationFingerprint(secretEnv: [:])
+        let token = try PreviewTokenStore(paths: env.paths).issueMaintenancePrune(
+            machineId: env.machineId,
+            setId: env.set.id,
+            destinationId: env.primary.id,
+            effectiveDestinationFingerprint: fingerprint
+        )
+        try FileManager.default.removeItem(at: env.paths.previewTokensLockFile)
+        try FileManager.default.createDirectory(
+            at: env.paths.previewTokensLockFile,
+            withIntermediateDirectories: true
+        )
+
+        let result = await env.engine.runPruneRepository(
+            set: env.set,
+            destination: env.primary,
+            authorization: MaintenancePruneAuthorization(
+                token: token,
+                machineId: env.machineId,
+                effectiveDestinationFingerprint: fingerprint
+            )
+        )
+
+        guard case .failed(.infrastructure(let reason)) = result else {
+            Issue.record("a broken confirmation store must be infrastructure failure: \(result)")
+            return
+        }
+        #expect(reason.contains("preview-token store unusable"))
+        #expect(env.fake.invocations.isEmpty)
+        #expect(env.entries(kind: .prune).first?.status == .failed)
     }
 
     @Test("standalone prune: a launch-time secret failure retains its preview token")
@@ -2057,6 +2753,124 @@ struct BackupEngineTests {
         #expect(env.resticArgvs.count == 2, "a replay must not spawn restic")
     }
 
+    @Test("runPurge: an initial run-history failure is outcome-neutral infrastructure failure")
+    func purgeRunCreationFailureIsOutcomeNeutral() async throws {
+        let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]
+        let hostnames = [Self.setId: Set(["example-mac.local"])]
+        let env = Self.makeEnv(
+            script: [], retention: nil, purgeExcludes: ["build/**"], reachableSecondaries: [],
+            purgeSourcePaths: sourcePaths, purgeHostnames: hostnames
+        )
+        defer { env.cleanUp() }
+
+        let snapshotsJSON = try FixtureLoader.string("snapshots.json")
+        let snapshots = try parseSnapshots(Data(snapshotsJSON.utf8))
+        let plan = PurgePlan(
+            destinationId: env.primary.id,
+            snapshots: snapshots,
+            sourcePaths: sourcePaths[Self.setId]!,
+            hostnames: hostnames[Self.setId]!,
+            patterns: env.set.purgeExcludes
+        )
+        let token = try #require(try env.engine.issuePurgeToken(
+            set: env.set, destinations: [env.primary], plans: [plan]
+        ))
+        try env.paths.ensureDirectories()
+        let runId = RunStore.formatRunId(kind: .purge, setId: Self.setId, date: Self.t0)
+        try FileManager.default.createSymbolicLink(
+            at: env.paths.runDir(runId: runId),
+            withDestinationURL: env.root.appendingPathComponent("missing-run-target")
+        )
+        env.fake.script = Self.resticCall(
+            ["-r", env.primary.repoURL, "snapshots", "--json"],
+            dest: Self.primaryId,
+            stdoutLines: [snapshotsJSON]
+        )
+
+        do {
+            _ = try await env.engine.runPurge(
+                set: env.set, destinations: [env.primary], token: token.value
+            )
+            Issue.record("an unusable initial run store must fail the purge")
+        } catch let error as PurgeApplyError {
+            guard case .infrastructureFailure(let reason, let operationMayHaveRun) = error else {
+                Issue.record("expected infrastructure failure, got \(error)")
+                return
+            }
+            #expect(reason.contains("run history unusable"))
+            #expect(!operationMayHaveRun)
+        }
+        #expect(!env.resticArgvs.contains { $0.contains("rewrite") })
+    }
+
+    @Test("runPurge: terminal run-history failure reports that destructive work may have run")
+    func purgeTerminalRunHistoryFailureRequiresInspection() async throws {
+        let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]
+        let hostnames = [Self.setId: Set(["example-mac.local"])]
+        let paths = Box<AppPaths?>(nil)
+        let env = Self.makeEnv(
+            script: [], retention: nil, purgeExcludes: ["build/**"], reachableSecondaries: [],
+            onSpawn: { argv in
+                guard argv.contains("rewrite"),
+                      !argv.contains("--dry-run"),
+                      let paths = paths.value else { return }
+                try? FileManager.default.removeItem(at: paths.runsIndexLockFile)
+                try? FileManager.default.createDirectory(
+                    at: paths.runsIndexLockFile,
+                    withIntermediateDirectories: true
+                )
+            },
+            purgeSourcePaths: sourcePaths,
+            purgeHostnames: hostnames
+        )
+        paths.value = env.paths
+        defer { env.cleanUp() }
+
+        let snapshotsJSON = try FixtureLoader.string("snapshots.json")
+        let snapshots = try parseSnapshots(Data(snapshotsJSON.utf8))
+        let plan = PurgePlan(
+            destinationId: env.primary.id,
+            snapshots: snapshots,
+            sourcePaths: sourcePaths[Self.setId]!,
+            hostnames: hostnames[Self.setId]!,
+            patterns: env.set.purgeExcludes
+        )
+        let token = try #require(try env.engine.issuePurgeToken(
+            set: env.set, destinations: [env.primary], plans: [plan]
+        ))
+        let rewrite = try FixtureLoader.string("rewrite-forget.txt")
+            .replacingOccurrences(of: "09b3295c", with: snapshots[0].shortId)
+            .replacingOccurrences(of: "b2435423", with: snapshots[1].shortId)
+        env.fake.script = Self.resticCall(
+            ["-r", env.primary.repoURL, "snapshots", "--json"],
+            dest: Self.primaryId,
+            stdoutLines: [snapshotsJSON]
+        ) + Self.resticCall(
+            Self.rewriteArgv(
+                env.primary.repoURL,
+                snapshotIDs: snapshots.map(\.id),
+                patterns: env.set.purgeExcludes
+            ),
+            dest: Self.primaryId,
+            stdoutLines: rewrite.split(separator: "\n").map(String.init)
+        )
+
+        do {
+            _ = try await env.engine.runPurge(
+                set: env.set, destinations: [env.primary], token: token.value
+            )
+            Issue.record("a missing terminal run record must fail the purge")
+        } catch let error as PurgeApplyError {
+            guard case .infrastructureFailure(let reason, let operationMayHaveRun) = error else {
+                Issue.record("expected infrastructure failure, got \(error)")
+                return
+            }
+            #expect(reason.contains("run history unusable"))
+            #expect(operationMayHaveRun)
+        }
+        #expect(env.resticArgvs.contains { $0.contains("rewrite") && $0.contains("--forget") })
+    }
+
     @Test("runPurge: absent, expired, and changed snapshot-list tokens fail closed")
     func purgeApplyRefusesInvalidTokens() async throws {
         let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]
@@ -2161,6 +2975,153 @@ struct BackupEngineTests {
         #expect(applied?[secondary.id] == env.set.purgeExcludes)
     }
 
+    @Test("automatic purge: unusable preview-token storage is an infrastructure failure")
+    func automaticPurgeTokenStoreFailureIsInfrastructureFailure() async throws {
+        let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]
+        let hostnames = [Self.setId: Set(["example-mac.local"])]
+        let env = Self.makeEnv(
+            script: [], retention: nil, purgeExcludes: ["build/**"], reachableSecondaries: [],
+            purgeSourcePaths: sourcePaths, purgeHostnames: hostnames
+        )
+        defer { env.cleanUp() }
+        let snapshotsJSON = try FixtureLoader.string("snapshots.json")
+        try env.paths.ensureDirectories()
+        try FileManager.default.createDirectory(
+            at: env.paths.previewTokensLockFile,
+            withIntermediateDirectories: true
+        )
+        env.fake.script = Self.resticCall(
+            Self.backupArgv(env.primary.repoURL, excludes: env.set.purgeExcludes),
+            dest: Self.primaryId,
+            stdoutLines: Self.backupStream()
+        ) + Self.resticCall(
+            ["-r", env.primary.repoURL, "snapshots", "--json"],
+            dest: Self.primaryId,
+            stdoutLines: [snapshotsJSON]
+        )
+
+        let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
+
+        guard case .infrastructureFailure(let reason) = outcome else {
+            Issue.record("an unusable token store must fail the scheduled tick: \(outcome)")
+            return
+        }
+        #expect(reason.contains("preview-token store unusable"))
+        #expect(env.resticArgvs.count == 2)
+    }
+
+    @Test("a secondary purge infrastructure failure does not skip later independent work")
+    func secondaryPurgeInfrastructureFailureContinuesOtherDestinations() async throws {
+        let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]
+        let hostnames = [Self.setId: Set(["example-mac.local"])]
+        let env = Self.makeEnv(
+            script: [], purgeExcludes: ["build/**"], reachableSecondaries: [true, true],
+            purgeSourcePaths: sourcePaths, purgeHostnames: hostnames
+        )
+        defer { env.cleanUp() }
+        let failing = env.secondaries[0]
+        let healthy = env.secondaries[1]
+        try env.stateStore.updateScheduleState(setId: Self.setId) { state in
+            state.appliedPurgeExcludes[env.primary.id] = env.set.purgeExcludes
+            state.appliedPurgeExcludes[healthy.id] = env.set.purgeExcludes
+        }
+        try FileManager.default.createDirectory(
+            at: env.paths.previewTokensLockFile,
+            withIntermediateDirectories: true
+        )
+        let snapshotsJSON = try FixtureLoader.string("snapshots.json")
+        env.fake.script = Self.resticCall(
+            Self.backupArgv(env.primary.repoURL, excludes: env.set.purgeExcludes),
+            dest: Self.primaryId,
+            stdoutLines: Self.backupStream()
+        ) + Self.resticCall(
+            ["-r", failing.repoURL, "snapshots", "--json"],
+            dest: failing.id,
+            stdoutLines: [snapshotsJSON]
+        ) + Self.resticCall(
+            Self.copyArgv(to: healthy.repoURL, from: env.primary.repoURL),
+            dest: healthy.id,
+            from: env.primary.id
+        ) + Self.resticCall(
+            Self.forgetArgv(healthy.repoURL), dest: healthy.id
+        ) + Self.resticCall(
+            Self.forgetArgv(env.primary.repoURL), dest: env.primary.id
+        )
+
+        let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
+
+        guard case .infrastructureFailure(let reason) = outcome else {
+            Issue.record("the aggregate outcome must retain the infrastructure failure: \(outcome)")
+            return
+        }
+        #expect(reason.contains("preview-token store unusable"))
+        #expect(env.resticArgvs.contains([Self.resticPath] + Self.copyArgv(
+            to: healthy.repoURL, from: env.primary.repoURL
+        )))
+        #expect(env.resticArgvs.contains([Self.resticPath] + Self.forgetArgv(healthy.repoURL)))
+        #expect(env.resticArgvs.contains([Self.resticPath] + Self.forgetArgv(env.primary.repoURL)))
+        #expect(!env.resticArgvs.contains { $0.contains("copy") && $0.contains(failing.repoURL) })
+    }
+
+    @Test("automatic purge: a successful rewrite without a durable watermark is infrastructure failure")
+    func automaticPurgeWatermarkFailureIsInfrastructureFailure() async throws {
+        let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]
+        let hostnames = [Self.setId: Set(["example-mac.local"])]
+        let paths = Box<AppPaths?>(nil)
+        let env = Self.makeEnv(
+            script: [], retention: nil, purgeExcludes: ["build/**"], reachableSecondaries: [],
+            onSpawn: { argv in
+                guard argv.contains("rewrite"),
+                      !argv.contains("--dry-run"),
+                      let paths = paths.value else { return }
+                try? FileManager.default.removeItem(at: paths.scheduleStateLockFile)
+                try? FileManager.default.createDirectory(
+                    at: paths.scheduleStateLockFile,
+                    withIntermediateDirectories: true
+                )
+            },
+            purgeSourcePaths: sourcePaths,
+            purgeHostnames: hostnames
+        )
+        paths.value = env.paths
+        defer { env.cleanUp() }
+        let snapshotsJSON = try FixtureLoader.string("snapshots.json")
+        let snapshots = try parseSnapshots(Data(snapshotsJSON.utf8))
+        let rewrite = try FixtureLoader.string("rewrite-forget.txt")
+            .replacingOccurrences(of: "09b3295c", with: snapshots[0].shortId)
+            .replacingOccurrences(of: "b2435423", with: snapshots[1].shortId)
+        env.fake.script = Self.resticCall(
+            Self.backupArgv(env.primary.repoURL, excludes: env.set.purgeExcludes),
+            dest: Self.primaryId,
+            stdoutLines: Self.backupStream()
+        ) + Self.resticCall(
+            ["-r", env.primary.repoURL, "snapshots", "--json"],
+            dest: Self.primaryId,
+            stdoutLines: [snapshotsJSON]
+        ) + Self.resticCall(
+            ["-r", env.primary.repoURL, "snapshots", "--json"],
+            dest: Self.primaryId,
+            stdoutLines: [snapshotsJSON]
+        ) + Self.resticCall(
+            Self.rewriteArgv(
+                env.primary.repoURL,
+                snapshotIDs: snapshots.map(\.id),
+                patterns: env.set.purgeExcludes
+            ),
+            dest: Self.primaryId,
+            stdoutLines: rewrite.split(separator: "\n").map(String.init)
+        )
+
+        let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
+
+        guard case .infrastructureFailure(let reason) = outcome else {
+            Issue.record("a lost purge watermark must fail the scheduled tick: \(outcome)")
+            return
+        }
+        #expect(reason.contains("purge watermark"))
+        #expect(env.entries(kind: .purge).first?.status == .success)
+    }
+
     @Test("row purge 2: a stale secondary whose purge fails is never copied or marked applied")
     func failedSecondaryPurgeSkipsCopy() async throws {
         let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]
@@ -2255,6 +3216,28 @@ struct BackupEngineTests {
         #expect(env.fake.invocations.isEmpty)
     }
 
+    @Test("previewPurge preserves an unusable set lock as infrastructure failure")
+    func purgePreviewPreservesLockFailureType() async throws {
+        let env = Self.makeEnv(
+            script: [],
+            retention: nil,
+            purgeExcludes: ["build/**"],
+            reachableSecondaries: []
+        )
+        defer { env.cleanUp() }
+        try env.paths.ensureDirectories()
+        try FileManager.default.createDirectory(
+            at: env.paths.setLockFile(setId: env.set.id),
+            withIntermediateDirectories: true
+        )
+
+        let result = await env.engine.previewPurge(set: env.set, destination: env.primary)
+
+        #expect(result.status == .infrastructureFailure)
+        #expect(result.message?.contains("backup-set lock unusable") == true)
+        #expect(env.fake.invocations.isEmpty, "restic must not run after local lock refusal")
+    }
+
     // MARK: - runRestore
 
     @Test("runRestore: exact argv, .restore record, set lock taken")
@@ -2283,7 +3266,7 @@ struct BackupEngineTests {
             overwriteMode: .ifNewer
         ))
 
-        #expect(status == .success)
+        #expect(status == .completed(.success))
         #expect(env.resticArgvs == [[
             Self.resticPath, "-r", env.primary.repoURL, "restore", "--json", "abc123:/proj/src",
             "--target", target, "--include", "*.txt", "--overwrite", "if-newer",
@@ -2301,7 +3284,7 @@ struct BackupEngineTests {
         defer { env.cleanUp() }
         try env.paths.ensureDirectories()
         let holder = FileLock(path: env.paths.setLockFile(setId: Self.setId))
-        #expect(holder.tryAcquire())
+        #expect(holder.acquire() == .acquired)
         defer { holder.release() }
 
         let status = await env.engine.runRestore(request: RestoreRequest(
@@ -2313,6 +3296,32 @@ struct BackupEngineTests {
         #expect(status == .skipped)
         #expect(env.resticArgvs.isEmpty)
         #expect(env.entries(kind: .restore).first?.status == .skipped)
+    }
+
+    @Test("runRestore: an unusable set lock is a typed infrastructure failure")
+    func restoreLockUnusable() async throws {
+        let env = Self.makeEnv(script: [], reachableSecondaries: [])
+        defer { env.cleanUp() }
+        try env.paths.ensureDirectories()
+        try FileManager.default.createDirectory(
+            at: env.paths.setLockFile(setId: Self.setId),
+            withIntermediateDirectories: true
+        )
+
+        let outcome = await env.engine.runRestore(request: RestoreRequest(
+            destId: Self.primaryId,
+            snapshotID: "abc123",
+            targetPath: "/tmp/target"
+        ))
+
+        guard case .infrastructureFailure(let reason, let operationMayHaveRun) = outcome else {
+            Issue.record("an unusable restore lock must be infrastructure failure: \(outcome)")
+            return
+        }
+        #expect(reason.contains("lock"))
+        #expect(!operationMayHaveRun)
+        #expect(env.resticArgvs.isEmpty)
+        #expect(env.entries(kind: .restore).first?.status == .failed)
     }
 
     @Test("runRestore: per-item error messages downgrade an exit-0 restore to .warning")
@@ -2338,7 +3347,7 @@ struct BackupEngineTests {
             targetPath: "/tmp/target"
         ))
 
-        #expect(status == .warning)
+        #expect(status == .completed(.warning))
         #expect(env.entries(kind: .restore).first?.status == .warning)
     }
 
@@ -2364,7 +3373,7 @@ struct BackupEngineTests {
 
         let status = await env.engine.initSecondary(env.set, dest: secondary)
 
-        #expect(status == .success)
+        #expect(status == .completed(.success))
         #expect(env.resticArgvs == [[
             Self.resticPath, "-r", secondary.repoURL, "init", "--json",
             "--from-repo", env.primary.repoURL, "--copy-chunker-params",
@@ -2385,8 +3394,30 @@ struct BackupEngineTests {
 
         let status = await env.engine.initSecondary(env.set, dest: env.primary)
 
-        #expect(status == .failed)
+        #expect(status == .completed(.failed))
         #expect(env.fake.invocations.isEmpty)
+    }
+
+    @Test("initSecondary: an unusable set lock is a typed infrastructure failure")
+    func initSecondaryLockUnusable() async throws {
+        let env = Self.makeEnv(script: [], reachableSecondaries: [true])
+        defer { env.cleanUp() }
+        try env.paths.ensureDirectories()
+        try FileManager.default.createDirectory(
+            at: env.paths.setLockFile(setId: Self.setId),
+            withIntermediateDirectories: true
+        )
+
+        let outcome = await env.engine.initSecondary(env.set, dest: env.secondaries[0])
+
+        guard case .infrastructureFailure(let reason, let operationMayHaveRun) = outcome else {
+            Issue.record("an unusable init lock must be infrastructure failure: \(outcome)")
+            return
+        }
+        #expect(reason.contains("lock"))
+        #expect(!operationMayHaveRun)
+        #expect(env.resticArgvs.isEmpty)
+        #expect(env.entries(kind: .`init`).first?.status == .failed)
     }
 
     // MARK: - Misconfiguration

@@ -151,6 +151,23 @@ public struct AppPaths: Equatable, Sendable {
         runsDir.appendingPathComponent("index.jsonl", isDirectory: false)
     }
 
+    /// Serializes appends to ``runsIndexFile`` across helper processes.
+    public var runsIndexLockFile: URL {
+        runsDir.appendingPathComponent("index.jsonl.lock", isDirectory: false)
+    }
+
+    /// Dedicated stable inode for testing `flock(2)` on the filesystem that
+    /// stores the run index. It never serializes production work.
+    public var runsHealthLockFile: URL {
+        runsDir.appendingPathComponent("health.lock", isDirectory: false)
+    }
+
+    /// Health-only scratch below `runs/`. Activity inside it does not reach
+    /// the app's non-recursive watcher for the run-index directory.
+    public var runsHealthProbeDir: URL {
+        runsDir.appendingPathComponent(".health", isDirectory: true)
+    }
+
     public func runDir(runId: String) -> URL {
         runsDir.appendingPathComponent(runId, isDirectory: true)
     }
@@ -213,15 +230,47 @@ public struct AppPaths: Equatable, Sendable {
         stateDir.appendingPathComponent("schedule-state.lock", isDirectory: false)
     }
 
+    /// Dedicated stable inode for testing `flock(2)` on the filesystem that
+    /// stores schedule state and preview capabilities.
+    public var stateHealthLockFile: URL {
+        stateDir.appendingPathComponent("health.lock", isDirectory: false)
+    }
+
+    /// Health-only scratch below `state/`. Activity inside it does not reach
+    /// the app's non-recursive watcher for live state.
+    public var stateHealthProbeDir: URL {
+        stateDir.appendingPathComponent(".health", isDirectory: true)
+    }
+
     // MARK: - locks/
 
     public var locksDir: URL {
         root.appendingPathComponent("locks", isDirectory: true)
     }
 
+    /// Owner-only scratch directory used to prove that the lock filesystem
+    /// can create and remove a new inode. `StateWatcher` watches `locks/`
+    /// non-recursively, so activity inside this directory cannot trigger the
+    /// health check that caused it.
+    public var lockHealthProbeDir: URL {
+        locksDir.appendingPathComponent(".health", isDirectory: true)
+    }
+
     /// `locks/tick.lock` — flock file (see `docs/scheduling.md`).
     public var tickLockFile: URL {
         locksDir.appendingPathComponent("tick.lock", isDirectory: false)
+    }
+
+    /// Dedicated stable inode used only to verify that the backing
+    /// filesystem implements `flock(2)`. It never serializes production
+    /// work, so a status probe cannot make a tick skip.
+    public var healthLockFile: URL {
+        locksDir.appendingPathComponent("health.lock", isDirectory: false)
+    }
+
+    /// Serializes Linux file-secret read-modify-write operations.
+    public var secretsLockFile: URL {
+        locksDir.appendingPathComponent("secrets.lock", isDirectory: false)
     }
 
     /// `locks/set-<setId>.lock` — flock file (see `docs/scheduling.md`).
@@ -267,34 +316,52 @@ public struct AppPaths: Equatable, Sendable {
 
     // MARK: - Directory creation
 
-    /// Creates `root`, `runs/`, `state/`, and `locks/` if missing. A fresh
-    /// `root` is owner-only because it may later contain secrets. Missing
-    /// ancestors are created separately with the process-default mode so the
-    /// `0700` attribute is not imposed on shared XDG directories such as
+    /// Creates `root`, `runs/`, `state/`, and `locks/` if missing. The root
+    /// and all internal lock-owning directories are owner-only regardless of
+    /// umask. Missing ancestors are created separately with the process-default
+    /// mode so `0700` is not imposed on shared XDG directories such as
     /// `~/.local` and `~/.local/state`. Idempotent.
     public func ensureDirectories() throws {
         let fileManager = FileManager.default
         let parent = root.deletingLastPathComponent()
         if parent.path != root.path {
             try fileManager.createDirectory(at: parent, withIntermediateDirectories: true)
+            if let failure = FileLock.validateTrustedRootParent(for: root) {
+                throw failure
+            }
         }
         try fileManager.createDirectory(
             at: root,
             withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o700]
         )
-        for directory in [runsDir, stateDir, locksDir] {
-            try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
-        }
-        // `state/` holds `preview-tokens.json` — live capabilities for
-        // destructive operations — so it is owner-only regardless of umask,
-        // and re-asserted rather than set once at creation.
+        // All three directories own flock inodes, so another uid must never
+        // be able to create or replace entries in them. `state/` additionally
+        // holds `preview-tokens.json`, which contains live destructive
+        // capabilities. Create each child through verified parent descriptors
+        // and pin a newly created inode to 0700 after umask. Existing unsafe
+        // runs/ or locks/ directories remain untouched so FileLock and live
+        // health fail closed rather than silently repairing operator state.
         //
         // `root` is deliberately NOT re-tightened here. An operator's chosen
         // data directory mode is theirs (`scripts/secret-cli-test.sh` pins a
         // pre-existing 755 dir staying 755), and the protection that matters
         // is per-file: the token index is 0600 and refuses to load if it is
         // not. This narrows the exposure without overriding that choice.
-        _ = chmod(stateDir.path, 0o700)
+        for (directory, tightenExisting) in [
+            (runsDir, false),
+            (stateDir, true),
+            (locksDir, false),
+        ] {
+            if let failure = FileLock.ensureDirectory(
+                directory,
+                parent: root,
+                trustedRoot: root,
+                mode: 0o700,
+                tightenExisting: tightenExisting
+            ) {
+                throw failure
+            }
+        }
     }
 }

@@ -172,6 +172,17 @@ struct MaintenancePrune: AsyncParsableCommand, JSONRenderable {
                 message: "The reclaim confirmation is temporarily unavailable. Run the dry run again.",
                 details: CLIErrorDetails(setId: setId, destinationId: destinationId)
             )
+        } catch PreviewTokenError.storeUnusable(let detail) {
+            // Not `set_busy`: "run the dry run again" is the wrong advice
+            // for a token store that no retry will fix (#110).
+            throw CLIFailure(
+                code: .internalError,
+                message: CLIFailure.bounded(
+                    "The confirmation store could not be used: \(detail). "
+                        + "Check the permissions on the Restic Station data directory."
+                ),
+                details: CLIErrorDetails(setId: setId, destinationId: destinationId)
+            )
         }
     }
 
@@ -260,6 +271,27 @@ struct MaintenancePrune: AsyncParsableCommand, JSONRenderable {
                     diagnosticReference: diagnosticReference
                 )
             )
+        case .failed(.infrastructure(let reason)):
+            throw Self.infrastructureFailure(
+                reason: reason,
+                setId: setId,
+                destinationId: destination.id
+            )
         }
+    }
+
+    /// Infrastructure spans lock acquisition, preview-token storage, and
+    /// terminal history. Keep the presentation accurate for every source
+    /// instead of claiming all of them are history-write failures.
+    static func infrastructureFailure(
+        reason: String,
+        setId: UUID,
+        destinationId: UUID
+    ) -> CLIFailure {
+        CLIFailure(
+            code: .internalError,
+            message: "Prune could not complete safely: \(reason). Check the Restic Station data directory and run a new reclaim preview.",
+            details: CLIErrorDetails(setId: setId, destinationId: destinationId)
+        )
     }
 }

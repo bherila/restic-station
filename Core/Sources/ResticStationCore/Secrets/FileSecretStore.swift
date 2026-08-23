@@ -33,15 +33,17 @@ import Musl
 /// mode, unprotected group/world write-and-search access is refused, while
 /// group/world read or search access warns about metadata exposure and
 /// continues. A sticky directory owned by this user (or root) protects its
-/// entries from other writers and is therefore not refused. The secret file
-/// is never create-then-`chmod`, which would leave a window in which it is
-/// world-readable. Every read re-verifies the file mode and refuses to read a
-/// group- or world-accessible file or one owned outside the helper/root trust
-/// boundary (see ``load()``).
+/// entries from other writers and is therefore not refused. The secret temp
+/// file is created no wider than `0600`, then descriptor-`fchmod`ed and
+/// re-`fstat`ed to require exact `0600`; there is no wider-permission window.
+/// Every read re-verifies the file mode and refuses to read a group- or
+/// world-accessible file or one owned outside the helper/root trust boundary
+/// (see ``load()``).
 ///
 /// **Atomicity.** Writes go to a fixed-name temp file in the same directory,
-/// created `O_EXCL` at `0600`, `fsync`ed, then `rename(2)`d over the real
-/// file — the same pattern as `ConfigStore.save(_:)`. A crash can therefore
+/// created `O_EXCL` no wider than `0600`, pinned and verified at exact `0600`,
+/// `fsync`ed, then `rename(2)`d over the real file — the same pattern as
+/// `ConfigStore.save(_:)`. A crash can therefore
 /// never truncate `secrets.json`; the worst case is a leftover temp file,
 /// which the next write unlinks or reports with ownership-aware recovery
 /// guidance if another user has squatted the fixed path.
@@ -69,6 +71,7 @@ public struct FileSecretStore: SecretStore {
     private let directoryModeSetter: @Sendable (String, mode_t) -> Void
     private let warningHandler: @Sendable (String) -> Void
     private let effectiveUserID: @Sendable () -> uid_t
+    private let fileModeSetter: @Sendable (Int32, mode_t) -> Int32
 
     /// - Parameters:
     ///   - paths: supplies `root` (the secrets file's directory) and
@@ -103,13 +106,17 @@ public struct FileSecretStore: SecretStore {
         helperPath: String,
         directoryModeSetter: @escaping @Sendable (String, mode_t) -> Void,
         warningHandler: @escaping @Sendable (String) -> Void,
-        effectiveUserID: @escaping @Sendable () -> uid_t = { geteuid() }
+        effectiveUserID: @escaping @Sendable () -> uid_t = { geteuid() },
+        fileModeSetter: @escaping @Sendable (Int32, mode_t) -> Int32 = { fd, mode in
+            fchmod(fd, mode) == 0 ? 0 : errno
+        }
     ) {
         self.paths = paths
         self.helperPath = helperPath
         self.directoryModeSetter = directoryModeSetter
         self.warningHandler = warningHandler
         self.effectiveUserID = effectiveUserID
+        self.fileModeSetter = fileModeSetter
     }
 
     // MARK: - Paths
@@ -126,10 +133,9 @@ public struct FileSecretStore: SecretStore {
         paths.root.appendingPathComponent("secrets.json.tmp", isDirectory: false)
     }
 
-    /// `locks/secrets.lock`. Composed here rather than in `AppPaths` only
-    /// because `AppPaths` is owned elsewhere right now; it belongs there.
+    /// `locks/secrets.lock`.
     var lockFileURL: URL {
-        paths.locksDir.appendingPathComponent("secrets.lock", isDirectory: false)
+        paths.secretsLockFile
     }
 
     // MARK: - Repo password
@@ -392,17 +398,30 @@ public struct FileSecretStore: SecretStore {
         // is ever called from another write path. Keep this pre-lock check to
         // create the lock directory, but report a degraded mode only once.
         try prepareDirectories(reportWarnings: false)
-        let lock = FileLock(path: lockFileURL)
+        let lock = FileLock(path: lockFileURL, trustedRoot: paths.root)
         let deadline = Date().addingTimeInterval(Self.lockTimeout)
-        while !lock.tryAcquire() {
-            guard Date() < deadline else {
-                throw SecretStoreError.backendFailed(
-                    "timed out after \(Int(Self.lockTimeout))s waiting for the secrets lock at "
-                        + "\(lockFileURL.path). Another Restic Station process may be stuck; "
-                        + "check for running restic-station-helper processes."
-                )
+        while true {
+            switch lock.acquire() {
+            case .acquired:
+                break
+            case .busy:
+                guard Date() < deadline else {
+                    throw SecretStoreError.backendFailed(
+                        "timed out after \(Int(Self.lockTimeout))s waiting for the secrets lock at "
+                            + "\(lockFileURL.path). Another Restic Station process may be stuck; "
+                            + "check for running restic-station-helper processes."
+                    )
+                }
+                try await Task.sleep(nanoseconds: Self.lockPollNanoseconds)
+                continue
+            case .failed(let failure):
+                // Reported as itself rather than waited out and then blamed
+                // on a stuck peer: the advice above ("check for running
+                // helper processes") is actively misleading when the lock
+                // file is simply unopenable or owned by another user (#110).
+                throw SecretStoreError.lockUnusable(failure)
             }
-            try await Task.sleep(nanoseconds: Self.lockPollNanoseconds)
+            break
         }
         defer { lock.release() }
         try body()
@@ -454,13 +473,29 @@ public struct FileSecretStore: SecretStore {
                 "could not create \(tempPath): \(Self.describe(errno: code))"
             )
         }
-        // Not "create-then-chmod": the file was *created* at 0600 and a umask
-        // can only clear bits, never set them, so the file has never been
-        // wider than 0600 for an instant. This pins the mode to exactly 0600
-        // whatever the process umask happened to strip.
-        _ = fchmod(fd, 0o600)
-
         do {
+            // Not "create-then-chmod": the file was *created* no wider than
+            // 0600 because umask can only clear bits. Pin and verify the exact
+            // reusable mode on this descriptor before any secret bytes are
+            // written or the entry can be renamed into place.
+            let chmodError = fileModeSetter(fd, 0o600)
+            guard chmodError == 0 else {
+                throw SecretStoreError.backendFailed(
+                    "could not set mode 0600 on \(tempPath): \(Self.describe(errno: chmodError))"
+                )
+            }
+            var tightened = stat()
+            guard fstat(fd, &tightened) == 0 else {
+                throw SecretStoreError.backendFailed(
+                    "could not verify mode 0600 on \(tempPath): \(Self.describe(errno: errno))"
+                )
+            }
+            guard tightened.st_mode & 0o777 == 0o600 else {
+                throw SecretStoreError.backendFailed(
+                    "could not enforce mode 0600 on \(tempPath): filesystem reported mode "
+                        + "\(Self.octal(UInt32(tightened.st_mode) & 0o777))"
+                )
+            }
             try Self.writeAll(fd: fd, data: data)
             guard fsync(fd) == 0 else {
                 throw SecretStoreError.backendFailed(
@@ -533,8 +568,18 @@ public struct FileSecretStore: SecretStore {
     func prepareDirectories(reportWarnings: Bool = true) throws {
         try createDirectory(at: paths.root, mode: 0o700, reportWarnings: reportWarnings)
         try validateImmediateParent()
-        // Lock files hold nothing; the default mode is fine.
-        try FileManager.default.createDirectory(at: paths.locksDir, withIntermediateDirectories: true)
+        // A permissive umask must not create a mutation-lock parent that the
+        // lock verifier immediately refuses. Use the same descriptor-relative
+        // creation and tightening path as AppPaths setup.
+        if let failure = FileLock.ensureDirectory(
+            paths.locksDir,
+            parent: paths.root,
+            trustedRoot: paths.root,
+            mode: 0o700,
+            tightenExisting: false
+        ) {
+            throw SecretStoreError.lockUnusable(failure)
+        }
     }
 
     private func createDirectory(at url: URL, mode: mode_t, reportWarnings: Bool) throws {

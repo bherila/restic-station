@@ -218,6 +218,8 @@ struct AppPathsEnvTests {
         #expect(paths.machineFile.path == "\(rootPath)/machine.json")
         #expect(paths.runsDir.path == "\(rootPath)/runs")
         #expect(paths.runsIndexFile.path == "\(rootPath)/runs/index.jsonl")
+        #expect(paths.runsHealthLockFile.path == "\(rootPath)/runs/health.lock")
+        #expect(paths.runsHealthProbeDir.path == "\(rootPath)/runs/.health")
         #expect(paths.runDir(runId: "r1").path == "\(rootPath)/runs/r1")
         #expect(paths.runMetadataFile(runId: "r1").path == "\(rootPath)/runs/r1/metadata.json")
         #expect(paths.runLogFile(runId: "r1").path == "\(rootPath)/runs/r1/log.txt")
@@ -226,7 +228,10 @@ struct AppPathsEnvTests {
         #expect(paths.currentRunFile(setId: setId).path == "\(rootPath)/state/current-run-\(setId.uuidString).json")
         #expect(paths.repoStatusFile(destId: destId).path == "\(rootPath)/state/repo-status-\(destId.uuidString).json")
         #expect(paths.fdaCheckFile.path == "\(rootPath)/state/fda-check.json")
+        #expect(paths.stateHealthLockFile.path == "\(rootPath)/state/health.lock")
+        #expect(paths.stateHealthProbeDir.path == "\(rootPath)/state/.health")
         #expect(paths.locksDir.path == "\(rootPath)/locks")
+        #expect(paths.lockHealthProbeDir.path == "\(rootPath)/locks/.health")
         #expect(paths.tickLockFile.path == "\(rootPath)/locks/tick.lock")
         #expect(paths.setLockFile(setId: setId).path == "\(rootPath)/locks/set-\(setId.uuidString).lock")
         #expect(paths.mountsDir(destId: destId).path == "\(rootPath)/mounts/\(destId.uuidString)")
@@ -277,6 +282,8 @@ struct AppPathsEnvTests {
                 paths.machineFile.path,
                 paths.runsDir.path,
                 paths.runsIndexFile.path,
+                paths.runsHealthLockFile.path,
+                paths.runsHealthProbeDir.path,
                 paths.runDir(runId: "r1").path,
                 paths.runMetadataFile(runId: "r1").path,
                 paths.runLogFile(runId: "r1").path,
@@ -285,7 +292,10 @@ struct AppPathsEnvTests {
                 paths.currentRunFile(setId: setId).path,
                 paths.repoStatusFile(destId: destId).path,
                 paths.fdaCheckFile.path,
+                paths.stateHealthLockFile.path,
+                paths.stateHealthProbeDir.path,
                 paths.locksDir.path,
+                paths.lockHealthProbeDir.path,
                 paths.tickLockFile.path,
                 paths.setLockFile(setId: setId).path,
                 paths.mountsDir(destId: destId).path,
@@ -302,6 +312,8 @@ struct AppPathsEnvTests {
             "machine.json",
             "runs",
             "runs/index.jsonl",
+            "runs/health.lock",
+            "runs/.health",
             "runs/r1",
             "runs/r1/metadata.json",
             "runs/r1/log.txt",
@@ -310,7 +322,10 @@ struct AppPathsEnvTests {
             "state/current-run-\(setId.uuidString).json",
             "state/repo-status-\(destId.uuidString).json",
             "state/fda-check.json",
+            "state/health.lock",
+            "state/.health",
             "locks",
+            "locks/.health",
             "locks/tick.lock",
             "locks/set-\(setId.uuidString).lock",
             "mounts/\(destId.uuidString)",
@@ -323,13 +338,24 @@ struct AppPathsEnvTests {
 
         try paths.ensureDirectories()
 
-        for directory in [paths.root, paths.runsDir, paths.stateDir, paths.locksDir] {
+        for directory in [
+            paths.root, paths.runsDir, paths.stateDir, paths.locksDir,
+        ] {
             let values = try directory.resourceValues(forKeys: [.isDirectoryKey])
             #expect(values.isDirectory == true)
         }
-        var info = stat()
-        try #require(root.path.withCString { stat($0, &info) } == 0)
-        #expect(UInt32(info.st_mode) & 0o777 == 0o700)
+        for scratchDirectory in [
+            paths.lockHealthProbeDir,
+            paths.stateHealthProbeDir,
+            paths.runsHealthProbeDir,
+        ] {
+            #expect(!FileManager.default.fileExists(atPath: scratchDirectory.path))
+        }
+        for directory in [paths.root, paths.runsDir, paths.stateDir, paths.locksDir] {
+            var info = stat()
+            try #require(directory.path.withCString { stat($0, &info) } == 0)
+            #expect(UInt32(info.st_mode) & 0o777 == 0o700)
+        }
     }
 
     @Test func ensureDirectoriesIsIdempotent() throws {
@@ -341,6 +367,66 @@ struct AppPathsEnvTests {
 
         let values = try paths.stateDir.resourceValues(forKeys: [.isDirectoryKey])
         #expect(values.isDirectory == true)
+    }
+
+    @Test("operation directory setup does not depend on the health scratch path")
+    func ensureDirectoriesIgnoresBrokenHealthScratch() throws {
+        for scratchPath in [
+            { (paths: AppPaths) in paths.lockHealthProbeDir },
+            { (paths: AppPaths) in paths.stateHealthProbeDir },
+            { (paths: AppPaths) in paths.runsHealthProbeDir },
+        ] {
+            let (paths, root) = makeTempPaths()
+            defer { try? FileManager.default.removeItem(at: root) }
+            try paths.ensureDirectories()
+            let scratchDirectory = scratchPath(paths)
+            FileManager.default.createFile(atPath: scratchDirectory.path, contents: Data())
+
+            try paths.ensureDirectories()
+            let failure = try #require(LockingHealth.probe(paths: paths, configuredSetIds: []))
+            #expect(failure.path == scratchDirectory.path)
+            #expect(failure.scope == .diagnostic)
+        }
+    }
+
+    @Test("live health never tightens its scratch directory through an unsafe parent")
+    func lockingHealthRefusesUnsafeHealthParentBeforeTightening() throws {
+        let (paths, root) = makeTempPaths()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try paths.ensureDirectories()
+        try FileManager.default.createDirectory(at: paths.lockHealthProbeDir, withIntermediateDirectories: false)
+        try #require(paths.lockHealthProbeDir.path.withCString { chmod($0, 0o755) } == 0)
+        try #require(paths.locksDir.path.withCString { chmod($0, 0o777) } == 0)
+
+        let failure = try #require(LockingHealth.probe(paths: paths, configuredSetIds: []))
+        #expect(failure.path == paths.locksDir.path)
+        #expect(failure.operation == "lock directory permissions")
+
+        var info = stat()
+        try #require(paths.lockHealthProbeDir.path.withCString { lstat($0, &info) } == 0)
+        #expect(info.st_mode & 0o777 == 0o755)
+    }
+
+    @Test func ensureDirectoriesDoesNotTouchMetadataWhenModesAreAlreadyCorrect() throws {
+        let (paths, root) = makeTempPaths()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        try paths.ensureDirectories()
+        var before = stat()
+        try #require(paths.stateDir.path.withCString { lstat($0, &before) } == 0)
+        usleep(10_000)
+
+        try paths.ensureDirectories()
+        var after = stat()
+        try #require(paths.stateDir.path.withCString { lstat($0, &after) } == 0)
+
+        #if canImport(Darwin)
+        #expect(before.st_ctimespec.tv_sec == after.st_ctimespec.tv_sec)
+        #expect(before.st_ctimespec.tv_nsec == after.st_ctimespec.tv_nsec)
+        #else
+        #expect(before.st_ctim.tv_sec == after.st_ctim.tv_sec)
+        #expect(before.st_ctim.tv_nsec == after.st_ctim.tv_nsec)
+        #endif
     }
 
     @Test func ensureDirectoriesDoesNotApplyRootModeToMissingAncestors() throws {

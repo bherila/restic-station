@@ -188,6 +188,7 @@ final class AppModel: ObservableObject {
         self.config = loadedConfig
         self.resolvedConfig = loadedConfig.resolved(for: loadedMachine).config
         self.addressableConfig = loadedConfig.addressable(for: loadedMachine)
+        stateWatcher.updateConfiguredSetIds(Set(resolvedConfig.sets.map(\.id)))
 
         observeCollaborators()
 
@@ -260,6 +261,7 @@ final class AppModel: ObservableObject {
         config = newConfig
         resolvedConfig = newConfig.resolved(for: machine).config
         addressableConfig = newConfig.addressable(for: machine)
+        stateWatcher.updateConfiguredSetIds(Set(resolvedConfig.sets.map(\.id)))
         lastConfigError = nil
         recomputeDerivedState()
 
@@ -319,6 +321,7 @@ final class AppModel: ObservableObject {
         machine = updated
         resolvedConfig = config.resolved(for: updated).config
         addressableConfig = config.addressable(for: updated)
+        stateWatcher.updateConfiguredSetIds(Set(resolvedConfig.sets.map(\.id)))
         lastConfigError = nil
         recomputeDerivedState()
 
@@ -408,6 +411,11 @@ final class AppModel: ObservableObject {
             // Core so the Linux build is held to it too (T25).
             fullDiskAccessDenied: HealthDerivation.fullDiskAccessDenied(from: stateWatcher.fdaCheck),
             backgroundAgentEnabled: launchd.isEnabled,
+            // Probed by `StateWatcher`, not just by `status --json`, and
+            // refreshed by a dedicated `locks/` watch. A lock failure can
+            // prevent the state/run writes that drive every other refresh,
+            // so the menu bar must not depend on those writes to turn red.
+            lockingBroken: stateWatcher.lockingFailure != nil,
             runLiveness: runLiveness
         )
     }

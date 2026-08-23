@@ -58,18 +58,28 @@ struct Restore: AsyncParsableCommand {
             includes: include,
             overwriteMode: overwrite
         )
-        let status = await context.engine.runRestore(request: request)
-        switch status {
-        case .success:
-            print("restore completed")
-        case .warning:
-            print("restore completed with warnings — some items could not be restored, see the run log")
-        case .failed:
-            HelperExit.fail("restore failed — see the run log")
+        let outcome = await context.engine.runRestore(request: request)
+        switch outcome {
+        case .completed(let status):
+            switch status {
+            case .success:
+                print("restore completed")
+            case .warning:
+                print("restore completed with warnings — some items could not be restored, see the run log")
+            case .failed:
+                HelperExit.fail("restore failed — see the run log")
+            case .skipped:
+                HelperExit.fail("restore was skipped — try again", code: 2)
+            case .running:
+                print("restore \(status.rawValue)")
+            }
         case .skipped:
             HelperExit.fail("restore was skipped (set busy or keychain unavailable) — try again", code: 2)
-        case .running:
-            print("restore \(status.rawValue)")
+        case .infrastructureFailure(let reason, let operationMayHaveRun):
+            HelperExit.fail(operationMayHaveRun
+                ? "restore may have run, but its result could not be recorded or trusted: \(reason). "
+                    + "Inspect the target before retrying."
+                : "this machine cannot run the restore: \(reason)")
         }
     }
 }

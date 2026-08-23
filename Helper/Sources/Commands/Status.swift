@@ -134,6 +134,24 @@ struct Status: AsyncParsableCommand, JSONRenderable {
         // unconditionally, which reads as "the scheduler is fine" and hid a
         // host whose timer or LaunchAgent had stopped firing.
         let scheduler = await Self.scheduler(paths: paths)
+        let secretBackend: SecretBackend
+        do {
+            secretBackend = try SecretBackend.resolve()
+        } catch {
+            throw CLIFailure(
+                code: .configInvalid,
+                message: "secret storage is misconfigured: \(error)"
+            )
+        }
+        // Live, not recorded. A host whose `locks/` cannot be created or
+        // whose lock files are not ours has stopped backing up, and is also
+        // unable to write the run record or health state that would say so —
+        // so the only reliable place to notice is here, at read time (#110).
+        let lockingFailure = LockingHealth.probe(
+            paths: paths,
+            configuredSetIds: Set(scheduled.config.sets.map(\.id)),
+            secretBackend: secretBackend
+        )
         let health = HealthDerivation.appHealth(
             setHealths: setHealths,
             // Every current-run file, including one for a set no longer in
@@ -142,6 +160,7 @@ struct Status: AsyncParsableCommand, JSONRenderable {
             runsInFlight: Array(currentRuns.values),
             fullDiskAccessDenied: fdaDenied,
             backgroundAgentEnabled: scheduler.flatMap(\.healthy),
+            lockingBroken: lockingFailure != nil,
             runLiveness: runLiveness
         )
 
@@ -213,6 +232,7 @@ struct Status: AsyncParsableCommand, JSONRenderable {
             generatedAt: now,
             health: health.rawValue,
             fullDiskAccessDenied: fdaDenied,
+            locking: StatusReport.LockingStatus(paths: paths, failure: lockingFailure),
             scheduler: scheduler,
             sets: sets,
             unattributedRuns: unattributedRuns,
@@ -238,6 +258,7 @@ struct Status: AsyncParsableCommand, JSONRenderable {
             runsInFlight: Array(currentRuns.values),
             fullDiskAccessDenied: fdaDenied,
             backgroundAgentEnabled: scheduler.flatMap(\.healthy),
+            lockingBroken: lockingFailure != nil,
             runLiveness: runLiveness
         )
         HelperExit.code(needsAttention ? 1 : 0)
@@ -472,6 +493,69 @@ struct StatusReport: Encodable {
 
     /// Whether anything is going to fire the tick on this host.
     ///
+    /// Whether this machine's locking machinery is usable at all.
+    ///
+    /// `usable: false` means a production lock path is broken; `null` means
+    /// the health-only probe is damaged and production usability is unknown.
+    /// `scope` distinguishes a machine-wide shared-lock outage, one damaged
+    /// per-set lock, an administrative-only lock outage, and an inconclusive
+    /// diagnostic probe. Probed live — see ``LockingHealth``.
+    struct LockingStatus: Encodable {
+        let usable: Bool?
+        let dataDirectory: String
+        /// The specific fault, `null` when usable.
+        let problem: String?
+        /// `"machine"`, `"set"`, `"administrative"`, `"diagnostic"`, or
+        /// `null` when healthy.
+        let scope: String?
+        /// The affected set for a partial outage; otherwise `null`.
+        let setId: UUID?
+
+        init(paths: AppPaths, failure: LockingHealthFailure?) {
+            switch failure?.scope {
+            case .machine, .set, .administrative:
+                usable = false
+            case .diagnostic:
+                usable = nil
+            case nil:
+                usable = true
+            }
+            self.dataDirectory = paths.root.path
+            self.problem = failure.map { String(describing: $0) }
+            switch failure?.scope {
+            case .machine:
+                scope = "machine"
+                setId = nil
+            case .set(let id):
+                scope = "set"
+                setId = id
+            case .administrative:
+                scope = "administrative"
+                setId = nil
+            case .diagnostic:
+                scope = "diagnostic"
+                setId = nil
+            case nil:
+                scope = nil
+                setId = nil
+            }
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case usable, dataDirectory, problem, scope, setId
+        }
+
+        // Explicit `null` for optionals, including an inconclusive `usable`.
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(usable, forKey: .usable)
+            try container.encode(dataDirectory, forKey: .dataDirectory)
+            try container.encode(problem, forKey: .problem)
+            try container.encode(scope, forKey: .scope)
+            try container.encode(setId, forKey: .setId)
+        }
+    }
+
     /// `healthy: null` means the platform's scheduler probe could not give a
     /// definite answer: no systemd on Linux, or `launchctl print` itself
     /// failed on macOS. That is distinct from a definite `false`.
@@ -595,13 +679,14 @@ struct StatusReport: Encodable {
     /// the same string the app's menu bar state maps to an SF Symbol from.
     let health: String
     let fullDiskAccessDenied: Bool
+    let locking: LockingStatus
     let scheduler: SchedulerStatus?
     let sets: [SetStatus]
     let unattributedRuns: [UnattributedRun]
     let excludedHere: [Exclusion]
 
     private enum CodingKeys: String, CodingKey {
-        case machineId, generatedAt, health, fullDiskAccessDenied, scheduler, sets
+        case machineId, generatedAt, health, fullDiskAccessDenied, locking, scheduler, sets
         case unattributedRuns, excludedHere
     }
 
@@ -615,6 +700,7 @@ struct StatusReport: Encodable {
         try container.encode(generatedAt, forKey: .generatedAt)
         try container.encode(health, forKey: .health)
         try container.encode(fullDiskAccessDenied, forKey: .fullDiskAccessDenied)
+        try container.encode(locking, forKey: .locking)
         try container.encode(scheduler, forKey: .scheduler)
         try container.encode(sets, forKey: .sets)
         try container.encode(unattributedRuns, forKey: .unattributedRuns)
@@ -627,6 +713,29 @@ struct StatusReport: Encodable {
         var lines: [String] = []
         lines.append("machine \"\(machineId)\" — \(health)"
             + (fullDiskAccessDenied ? " (Full Disk Access denied)" : ""))
+        // Ahead of the scheduler line: if this is broken, the scheduler
+        // firing perfectly on time changes nothing.
+        if locking.usable == false {
+            if locking.scope == "set", let setId = locking.setId {
+                lines.append(
+                    "locking: ONE OR MORE BACKUP SETS CANNOT RUN "
+                        + "(first detected: \(setId.uuidString.lowercased()))"
+                )
+            } else if locking.scope == "administrative" {
+                lines.append("locking: SECRET CHANGES CANNOT RUN ON THIS MACHINE")
+            } else {
+                lines.append("locking: NOTHING CAN RUN ON THIS MACHINE")
+            }
+            lines.append("  - \(locking.problem ?? "the data directory is unusable")")
+            lines.append("  detail: check ownership and permissions on \(locking.dataDirectory)")
+        } else if locking.usable == nil {
+            lines.append("locking: LIVE LOCKING CHECK IS INCONCLUSIVE")
+            lines.append("  - diagnostic probe could not run: \(locking.problem ?? "unknown problem")")
+            lines.append(
+                "  detail: repair the health-only probe under \(locking.dataDirectory); "
+                    + "production locks were not proven unusable"
+            )
+        }
         if let scheduler {
             // `if let` rather than `switch` over the `Bool?`. Swift 6.3
             // accepts `case true / case false / case nil` as exhaustive;

@@ -4,6 +4,14 @@ import Testing
 import ResticStationCore
 @testable import restic_station_helper
 
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#endif
+
 /// Unit coverage for `StatusReport`'s pure pieces — `RunSummary`/
 /// `CurrentRunSummary`'s derivation from Core types, `Exclusion`'s mapping
 /// from `ResolvedOmission`, and `humanLines()` rendering. The end-to-end
@@ -114,10 +122,167 @@ struct StatusReportTests {
         )
     }
 
+    /// Every report needs one; only the #110 tests below vary it.
+    static let healthyLocking = StatusReport.LockingStatus(
+        paths: AppPaths(root: URL(fileURLWithPath: "/tmp/restic-station-status-test")),
+        failure: nil
+    )
+
+    // MARK: - #110: locking is reported before anything else
+
+    @Test("an unusable data directory is stated plainly, above the scheduler")
+    func brokenLockingIsRenderedFirst() {
+        let failure = LockFailure(path: "/data/locks/tick.lock", operation: "open", errnoValue: EACCES)
+        let report = StatusReport(
+            machineId: "studio-mac", generatedAt: Date(), health: "warning",
+            fullDiskAccessDenied: false,
+            locking: StatusReport.LockingStatus(
+                paths: AppPaths(root: URL(fileURLWithPath: "/data")),
+                failure: LockingHealthFailure(scope: .machine, failure: failure)
+            ),
+            scheduler: nil,
+            sets: [makeSetStatus(needsAttention: false, isRunning: false)],
+            unattributedRuns: [], excludedHere: []
+        )
+        let lines = report.humanLines()
+        let text = lines.joined(separator: "\n")
+        #expect(text.contains("NOTHING CAN RUN ON THIS MACHINE"))
+        #expect(text.contains("tick.lock"))
+        #expect(text.contains("/data"))
+        // Before the per-set detail: a machine that cannot take a lock has
+        // nothing useful to say about individual sets.
+        let lockingLine = lines.firstIndex { $0.contains("NOTHING CAN RUN") }
+        let setLine = lines.firstIndex { $0.contains("set \"Projects\"") }
+        #expect(lockingLine != nil && setLine != nil && lockingLine! < setLine!)
+    }
+
+    @Test("--json carries the locking verdict, with an explicit null when healthy")
+    func jsonCarriesLockingVerdict() throws {
+        let healthy = StatusReport(
+            machineId: "studio-mac", generatedAt: Date(timeIntervalSince1970: 0), health: "idle",
+            fullDiskAccessDenied: false, locking: Self.healthyLocking, scheduler: nil,
+            sets: [], unattributedRuns: [], excludedHere: []
+        )
+        let healthyText = String(decoding: try ConfigStore.makeEncoder().encode(healthy), as: UTF8.self)
+        #expect(healthyText.contains("\"usable\" : true"))
+        #expect(healthyText.contains("\"problem\" : null"))
+        #expect(healthyText.contains("\"scope\" : null"))
+        #expect(healthyText.contains("\"setId\" : null"))
+
+        let broken = StatusReport(
+            machineId: "studio-mac", generatedAt: Date(timeIntervalSince1970: 0), health: "warning",
+            fullDiskAccessDenied: false,
+            locking: StatusReport.LockingStatus(
+                paths: AppPaths(root: URL(fileURLWithPath: "/data")),
+                failure: LockingHealthFailure(
+                    scope: .machine,
+                    failure: LockFailure(
+                        path: "/data/locks/tick.lock", operation: "open", errnoValue: EACCES
+                    )
+                )
+            ),
+            scheduler: nil, sets: [], unattributedRuns: [], excludedHere: []
+        )
+        let brokenText = String(decoding: try ConfigStore.makeEncoder().encode(broken), as: UTF8.self)
+        #expect(brokenText.contains("\"usable\" : false"))
+        #expect(brokenText.contains("tick.lock"))
+        #expect(brokenText.contains("\"scope\" : \"machine\""))
+    }
+
+    @Test("a broken set lock is rendered as a partial outage")
+    func brokenSetLockDoesNotClaimTheWholeMachineIsStopped() {
+        let setId = UUID()
+        let report = StatusReport(
+            machineId: "studio-mac", generatedAt: Date(), health: "warning",
+            fullDiskAccessDenied: false,
+            locking: StatusReport.LockingStatus(
+                paths: AppPaths(root: URL(fileURLWithPath: "/data")),
+                failure: LockingHealthFailure(
+                    scope: .set(setId),
+                    failure: LockFailure(
+                        path: "/data/locks/set-\(setId.uuidString).lock",
+                        operation: "open",
+                        errnoValue: EACCES
+                    )
+                )
+            ),
+            scheduler: nil,
+            sets: [makeSetStatus(needsAttention: true, isRunning: false)],
+            unattributedRuns: [],
+            excludedHere: []
+        )
+
+        let text = report.humanLines().joined(separator: "\n")
+        #expect(text.contains("ONE OR MORE BACKUP SETS CANNOT RUN"))
+        #expect(text.contains("first detected"))
+        #expect(text.contains(setId.uuidString.lowercased()))
+        #expect(!text.contains("NOTHING CAN RUN ON THIS MACHINE"))
+    }
+
+    @Test("a broken secrets mutation lock is administrative, not machine-wide")
+    func brokenSecretsLockDoesNotClaimOperationsAreStopped() throws {
+        let report = StatusReport(
+            machineId: "studio-mac", generatedAt: Date(), health: "warning",
+            fullDiskAccessDenied: false,
+            locking: StatusReport.LockingStatus(
+                paths: AppPaths(root: URL(fileURLWithPath: "/data")),
+                failure: LockingHealthFailure(
+                    scope: .administrative,
+                    failure: LockFailure(
+                        path: "/data/locks/secrets.lock", operation: "file type", errnoValue: 0
+                    )
+                )
+            ),
+            scheduler: nil,
+            sets: [makeSetStatus(needsAttention: false, isRunning: false)],
+            unattributedRuns: [], excludedHere: []
+        )
+
+        let text = report.humanLines().joined(separator: "\n")
+        #expect(text.contains("SECRET CHANGES CANNOT RUN ON THIS MACHINE"))
+        #expect(!text.contains("NOTHING CAN RUN ON THIS MACHINE"))
+        #expect(!text.contains("ONE OR MORE BACKUP SETS CANNOT RUN"))
+
+        let json = String(decoding: try ConfigStore.makeEncoder().encode(report), as: UTF8.self)
+        #expect(json.contains("\"usable\" : false"))
+        #expect(json.contains("\"scope\" : \"administrative\""))
+    }
+
+    @Test("a damaged health-only probe is inconclusive, not a production outage")
+    func brokenDiagnosticProbeDoesNotClaimProductionIsStopped() throws {
+        let report = StatusReport(
+            machineId: "studio-mac", generatedAt: Date(), health: "warning",
+            fullDiskAccessDenied: false,
+            locking: StatusReport.LockingStatus(
+                paths: AppPaths(root: URL(fileURLWithPath: "/data")),
+                failure: LockingHealthFailure(
+                    scope: .diagnostic,
+                    failure: LockFailure(
+                        path: "/data/locks/health.lock", operation: "open", errnoValue: EISDIR
+                    )
+                )
+            ),
+            scheduler: nil,
+            sets: [makeSetStatus(needsAttention: false, isRunning: false)],
+            unattributedRuns: [],
+            excludedHere: []
+        )
+
+        let text = report.humanLines().joined(separator: "\n")
+        #expect(text.contains("LIVE LOCKING CHECK IS INCONCLUSIVE"))
+        #expect(text.contains("production locks were not proven unusable"))
+        #expect(!text.contains("NOTHING CAN RUN ON THIS MACHINE"))
+        #expect(!text.contains("ONE OR MORE BACKUP SETS CANNOT RUN"))
+
+        let json = String(decoding: try ConfigStore.makeEncoder().encode(report), as: UTF8.self)
+        #expect(json.contains("\"usable\" : null"))
+        #expect(json.contains("\"scope\" : \"diagnostic\""))
+    }
+
     @Test("a healthy report names no attention-needed flags")
     func healthyReportHasNoFlags() {
         let report = StatusReport(
-            machineId: "studio-mac", generatedAt: Date(), health: "idle", fullDiskAccessDenied: false, scheduler: nil,
+            machineId: "studio-mac", generatedAt: Date(), health: "idle", fullDiskAccessDenied: false, locking: Self.healthyLocking, scheduler: nil,
             sets: [makeSetStatus(needsAttention: false, isRunning: false)], unattributedRuns: [], excludedHere: []
         )
         let lines = report.humanLines().joined(separator: "\n")
@@ -127,7 +292,7 @@ struct StatusReportTests {
     @Test("a warning report flags the set, and shows the destination's unreachable+stale state")
     func warningReportFlagsTheSet() {
         let report = StatusReport(
-            machineId: "studio-mac", generatedAt: Date(), health: "warning", fullDiskAccessDenied: false, scheduler: nil,
+            machineId: "studio-mac", generatedAt: Date(), health: "warning", fullDiskAccessDenied: false, locking: Self.healthyLocking, scheduler: nil,
             sets: [makeSetStatus(needsAttention: true, isRunning: false)], unattributedRuns: [], excludedHere: []
         )
         let lines = report.humanLines().joined(separator: "\n")
@@ -141,7 +306,7 @@ struct StatusReportTests {
     func overdueFirstBackupIsExplicit() {
         let report = StatusReport(
             machineId: "studio-mac", generatedAt: Date(), health: "warning",
-            fullDiskAccessDenied: false, scheduler: nil,
+            fullDiskAccessDenied: false, locking: Self.healthyLocking, scheduler: nil,
             sets: [makeSetStatus(needsAttention: true, isRunning: false, firstBackupOverdue: true)],
             unattributedRuns: [], excludedHere: []
         )
@@ -154,7 +319,7 @@ struct StatusReportTests {
     func excludedHereSection() {
         let omission = ResolvedOmission(subject: .backupSet, id: setId, name: "Photos", reason: .disabledForMachine)
         let report = StatusReport(
-            machineId: "mirror-box", generatedAt: Date(), health: "idle", fullDiskAccessDenied: false, scheduler: nil,
+            machineId: "mirror-box", generatedAt: Date(), health: "idle", fullDiskAccessDenied: false, locking: Self.healthyLocking, scheduler: nil,
             sets: [], unattributedRuns: [], excludedHere: [StatusReport.Exclusion(omission: omission)]
         )
         let lines = report.humanLines().joined(separator: "\n")
@@ -168,7 +333,7 @@ struct StatusReportTests {
     func jsonEncodesExplicitNulls() throws {
         let report = StatusReport(
             machineId: "studio-mac", generatedAt: Date(timeIntervalSince1970: 0), health: "idle",
-            fullDiskAccessDenied: false, scheduler: nil, sets: [makeSetStatus(needsAttention: false, isRunning: false)],
+            fullDiskAccessDenied: false, locking: Self.healthyLocking, scheduler: nil, sets: [makeSetStatus(needsAttention: false, isRunning: false)],
             unattributedRuns: [], excludedHere: []
         )
         let data = try ConfigStore.makeEncoder().encode(report)
@@ -195,7 +360,7 @@ struct StatusReportTests {
         )
         let report = StatusReport(
             machineId: "studio-mac", generatedAt: Date(), health: "warning",
-            fullDiskAccessDenied: false, scheduler: nil,
+            fullDiskAccessDenied: false, locking: Self.healthyLocking, scheduler: nil,
             sets: [makeSetStatus(
                 needsAttention: true,
                 isRunning: false,
@@ -221,7 +386,7 @@ struct StatusReportTests {
         let path = "/tmp/status state;safe/current-run.json"
         let report = StatusReport(
             machineId: "studio-mac", generatedAt: Date(), health: "warning",
-            fullDiskAccessDenied: false, scheduler: nil, sets: [],
+            fullDiskAccessDenied: false, locking: Self.healthyLocking, scheduler: nil, sets: [],
             unattributedRuns: [
                 StatusReport.UnattributedRun(
                     setId: setId, liveness: .abandoned,

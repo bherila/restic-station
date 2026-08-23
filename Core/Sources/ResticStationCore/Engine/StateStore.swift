@@ -262,6 +262,10 @@ public struct FdaCheckResult: Codable, Equatable, Sendable {
 
 public enum StateStoreError: Error, Equatable, Sendable, CustomStringConvertible {
     case renameFailed(errno: Int32, from: String, to: String)
+    /// The schedule-state lock could not be used at all — distinct from
+    /// ``scheduleStateLockTimeout``, which means a peer genuinely held it
+    /// for the whole window (#110).
+    case lockUnusable(LockFailure)
     /// `schedule-state.json`'s companion lock could not be acquired within
     /// the bounded retry window.
     case scheduleStateLockTimeout(path: String)
@@ -272,6 +276,8 @@ public enum StateStoreError: Error, Equatable, Sendable, CustomStringConvertible
             return "rename(\(from), \(to)) failed: errno \(errno)"
         case .scheduleStateLockTimeout(let path):
             return "timed out waiting for schedule state lock \(path)"
+        case .lockUnusable(let failure):
+            return "schedule-state lock unusable: \(failure)"
         }
     }
 }
@@ -335,13 +341,27 @@ public struct StateStore: Sendable {
         mutate: (inout SetScheduleState) -> Void
     ) throws -> ScheduleState {
         try paths.ensureDirectories()
-        let lock = FileLock(path: paths.scheduleStateLockFile)
+        let lock = FileLock(path: paths.scheduleStateLockFile, trustedRoot: paths.root)
         let deadline = Date().addingTimeInterval(Self.stateLockTimeout)
-        while !lock.tryAcquire() {
-            if Date() > deadline {
-                throw StateStoreError.scheduleStateLockTimeout(path: paths.scheduleStateLockFile.path)
+        // Only contention is worth waiting out. Polling a lock that failed
+        // to *open* just burns the whole timeout and then reports a timeout,
+        // which names contention as the cause of a permissions or filesystem
+        // fault and sends the reader looking for a process that does not
+        // exist (#110).
+        while true {
+            switch lock.acquire() {
+            case .acquired:
+                break
+            case .busy:
+                if Date() > deadline {
+                    throw StateStoreError.scheduleStateLockTimeout(path: paths.scheduleStateLockFile.path)
+                }
+                usleep(Self.stateLockPollInterval)
+                continue
+            case .failed(let failure):
+                throw StateStoreError.lockUnusable(failure)
             }
-            usleep(Self.stateLockPollInterval)
+            break
         }
         defer { lock.release() }
 

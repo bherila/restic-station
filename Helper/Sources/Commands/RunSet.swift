@@ -61,9 +61,8 @@ struct RunSet: AsyncParsableCommand {
             let outcome = await context.engine.runSet(backupSet, trigger: .manual)
             handle(outcome)
         case .check:
-            let before = Date()
-            let status = await context.engine.runCheck(backupSet, trigger: .manual)
-            handle(status, kind: .check, setId: backupSet.id, since: before, context: context)
+            let outcome = await context.engine.runCheck(backupSet, trigger: .manual)
+            handle(outcome)
         case .prune:
             // Checked against the set the engine is about to receive, after
             // the context has resolved it — not against a separately re-read
@@ -104,11 +103,11 @@ struct RunSet: AsyncParsableCommand {
                 pinnedExecutable = executable.identity
             }
             let before = Date()
-            let status = await context.engine.runPrune(
+            let outcome = await context.engine.runPrune(
                 backupSet,
                 expectedExecutableIdentity: pinnedExecutable
             )
-            handle(status, kind: .prune, setId: backupSet.id, since: before, context: context)
+            handle(outcome, kind: .prune, setId: backupSet.id, since: before, context: context)
         }
     }
 
@@ -133,37 +132,72 @@ struct RunSet: AsyncParsableCommand {
             print("backup deferred (\(reason)) — will retry next tick")
         case .misconfigured(let reason):
             HelperExit.fail("backup set is misconfigured: \(reason)")
+        case .infrastructureFailure(let reason):
+            HelperExit.fail("this machine cannot run the backup: \(reason)")
         }
     }
 
-    // MARK: - RunStatus (check / prune)
+    // MARK: - CheckRunOutcome
 
-    /// `runCheck`/`runPrune` return a bare `RunStatus`, whose `.skipped`
-    /// case is overloaded (lock busy *or* an unavailable keychain,
-    /// unlike `SetRunOutcome`'s two distinct cases). Disambiguated here by
+    private func handle(_ outcome: CheckRunOutcome) {
+        switch outcome {
+        case .completed(let status):
+            switch status {
+            case .success, .warning, .running:
+                print("check \(status.rawValue)")
+            case .failed:
+                HelperExit.fail("check failed — see the run log")
+            case .skipped:
+                print("check deferred — will retry next tick")
+            }
+        case .skipped:
+            HelperExit.fail("another operation for this backup set is already running", code: 2)
+        case .retryable(let reason):
+            print("check deferred (\(reason)) — will retry next tick")
+        case .misconfigured(let reason):
+            HelperExit.fail("backup set is misconfigured: \(reason)")
+        case .infrastructureFailure(let reason):
+            HelperExit.fail("this machine cannot run the check: \(reason)")
+        }
+    }
+
+    // MARK: - ManualRunOutcome (prune)
+
+    /// `ManualRunOutcome.skipped` covers a busy lock or unavailable keychain.
+    /// Disambiguated here by
     /// checking whether a `.skipped` run record was *just* written with the
     /// lock-busy message (`BackupEngine.recordSkipped`) — no run record at
     /// all means the keychain-retryable path.
     private func handle(
-        _ status: RunStatus,
+        _ outcome: ManualRunOutcome,
         kind: RunKind,
         setId: UUID,
         since: Date,
         context: HelperContext
     ) {
-        switch status {
-        case .success, .warning:
-            print("\(kind.rawValue) \(status.rawValue)")
-        case .failed:
-            HelperExit.fail("\(kind.rawValue) failed — see the run log")
+        switch outcome {
+        case .completed(let status):
+            switch status {
+            case .success, .warning:
+                print("\(kind.rawValue) \(status.rawValue)")
+            case .failed:
+                HelperExit.fail("\(kind.rawValue) failed — see the run log")
+            case .skipped:
+                print("\(kind.rawValue) deferred — will retry next tick")
+            case .running:
+                print("\(kind.rawValue) \(status.rawValue)")
+            }
         case .skipped:
             if isLockBusy(kind: kind, setId: setId, since: since, context: context) {
                 HelperExit.fail("another operation for this backup set is already running", code: 2)
             } else {
                 print("\(kind.rawValue) deferred — will retry next tick")
             }
-        case .running:
-            print("\(kind.rawValue) \(status.rawValue)")
+        case .infrastructureFailure(let reason, let operationMayHaveRun):
+            HelperExit.fail(operationMayHaveRun
+                ? "\(kind.rawValue) may have run, but its result could not be recorded or trusted: "
+                    + "\(reason). Inspect the repositories before retrying."
+                : "this machine cannot run \(kind.rawValue): \(reason)")
         }
     }
 
