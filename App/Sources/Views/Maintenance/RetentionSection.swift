@@ -52,6 +52,23 @@ struct RetentionSection: View {
         model.launchd.isEnabled
     }
 
+    /// Said once, used by both the caption and the button's help. They sit
+    /// on the same screen, so a reader can see both at once — the first
+    /// version of this fixed the caption alone and left the tooltip
+    /// asserting the opposite.
+    private static let agentDisabledExplanation =
+        "Applying retention manually is unavailable in this build, and the background agent "
+        + "is not running, so no scheduled run will clean up either. Enable the background "
+        + "agent in Settings ▸ Permissions & background."
+
+    /// What to say about retention when manual apply is contained: the
+    /// promise of scheduled cleanup only holds if a tick will happen.
+    private var containmentExplanation: String {
+        backgroundAgentRunsTicks
+            ? ManualRetentionApplyAvailability.reason
+            : Self.agentDisabledExplanation
+    }
+
     private var canApplyRetention: Bool {
         ManualRetentionApplyAvailability.isEnabled
     }
@@ -73,7 +90,7 @@ struct RetentionSection: View {
                 + "scheduled runs included. Add one in Backup Sets ▸ Retention for "
                 + "scheduled runs to start cleaning up."
         }
-        if !canApplyRetention { return ManualRetentionApplyAvailability.reason }
+        if !canApplyRetention { return containmentExplanation }
         return "Runs the retention policy. It permanently deletes snapshots the policy no longer keeps."
     }
 
@@ -200,15 +217,10 @@ struct RetentionSection: View {
             // it must not assert a schedule that Settings ▸ Permissions is
             // simultaneously reporting as off.
             if !canApplyRetention, hasPolicy, runsOnThisMachine, !backgroundAgentRunsTicks {
-                Label(
-                    "Applying retention manually is unavailable in this build, and the background "
-                        + "agent is not running, so no scheduled run will clean up either. Enable "
-                        + "the background agent in Settings ▸ Permissions & background.",
-                    systemImage: "exclamationmark.triangle"
-                )
-                .font(.caption)
-                .foregroundStyle(.orange)
-                .fixedSize(horizontal: false, vertical: true)
+                Label(Self.agentDisabledExplanation, systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
             } else if !canApplyRetention, hasPolicy, runsOnThisMachine {
                 // Visible, not just a tooltip on a disabled button: the
                 // operator needs to know retention is still happening on
@@ -216,7 +228,7 @@ struct RetentionSection: View {
                 Label(
                     ManualRetentionApplyAvailability.reason,
                     systemImage: "clock.badge.checkmark"
-                )
+                )  // agent-enabled branch: the schedule promise holds here
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
