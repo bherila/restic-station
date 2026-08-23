@@ -53,11 +53,16 @@ public enum ManualRetentionApplyAvailability {
     /// Operator-facing explanation. Shared by the CLI refusal, the app's
     /// disabled affordance, and `docs/ui-spec.md`, so the three cannot
     /// drift into saying different things about the same posture.
+    /// Deliberately says what a scheduled run *does*, not that one is
+    /// imminent. Whether a tick will actually happen depends on the
+    /// background agent being registered and on the set running on this
+    /// machine — neither of which this string can know, and both of which
+    /// it would be lying about if it promised a schedule outright.
     public static let reason = """
         Applying retention manually is unavailable in this build while exact-plan \
-        authorization is completed. Scheduled retention still runs: a caught-up mirror \
-        is cleaned after its next successful scheduled copy, and the primary is cleaned \
-        at the end of each scheduled run. This delays cleanup; it does not remove it. \
+        authorization is completed. Retention is applied by scheduled runs instead: \
+        each successful scheduled run cleans the primary, and cleans any mirror whose \
+        copy in that run succeeded. This delays cleanup; it does not remove it. \
         Previewing cleanup is read-only and remains available.
         """
 }

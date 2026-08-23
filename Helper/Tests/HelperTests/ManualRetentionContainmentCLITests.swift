@@ -102,6 +102,11 @@ struct TestEnvironmentLockTests {
         // would race whichever test currently owns the variable — the exact
         // failure this file exists to prevent.
         try await TestEnvironmentLock.withExclusiveAccess {
+            // Capture and put back whatever the process started with: this
+            // test asserts the unset case, and leaking that unset would hand
+            // every later test the platform default instead of its fixture.
+            let original = ProcessInfo.processInfo.environment[key]
+            defer { if let original { setenv(key, original, 1) } }
             unsetenv(key)
             try await TestEnvironmentLock.unsafeWithDataDirectory("/tmp/env-lock-restore") {
                 #expect(ProcessInfo.processInfo.environment[key] == "/tmp/env-lock-restore")

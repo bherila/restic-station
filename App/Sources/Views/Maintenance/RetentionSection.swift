@@ -55,6 +55,10 @@ struct RetentionSection: View {
         if !runsOnThisMachine {
             return "This backup set does not run on this machine, so retention cannot be applied here."
         }
+        if !hasPolicy {
+            return "This backup set has no retention policy, so nothing is ever removed — "
+                + "scheduled runs included. Add one in Backup Sets to enable cleanup."
+        }
         if !canApplyRetention { return ManualRetentionApplyAvailability.reason }
         return "Runs the retention policy. It permanently deletes snapshots the policy no longer keeps."
     }
