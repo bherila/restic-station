@@ -50,7 +50,7 @@ private let representative: [CLIErrorCode: CLIFailure] = [
     ),
     .resticFailed: .classify(exitClass: .fatal(stderrSummary: "repository is damaged")),
     .operationTimedOut: .classify(ResticRunnerError.timedOut),
-    .previewExpired: .classifyPurgeApply(PurgeApplyError.token(.expired), setId: setId),
+    .previewExpired: .classifyPurgeOperation(PurgeApplyError.token(.expired), setId: setId),
     .internalError: .classify(ConfigStoreError.renameFailed(errno: 13, from: "a", to: "b")),
     // `repositoryOffline` is a `Reachability` result rather than an Error,
     // so this representative remains direct. `operationNotAllowed` is also
@@ -149,12 +149,12 @@ struct CLIErrorContractTests {
 
     @Test("purge token refusals use safe, actionable envelope codes")
     func purgeTokenClassification() {
-        let expired = CLIFailure.classifyPurgeApply(PurgeApplyError.token(.expired), setId: setId)
+        let expired = CLIFailure.classifyPurgeOperation(PurgeApplyError.token(.expired), setId: setId)
         #expect(expired.code == .previewExpired)
         #expect(expired.details.setId == setId)
         #expect(!expired.retryable)
 
-        let stale = CLIFailure.classifyPurgeApply(PurgeApplyError.tokenDoesNotMatchCurrentPlan, setId: setId)
+        let stale = CLIFailure.classifyPurgeOperation(PurgeApplyError.tokenDoesNotMatchCurrentPlan, setId: setId)
         #expect(stale.code == .operationNotAllowed)
         #expect(stale.details.setId == setId)
         #expect(!stale.message.contains("token"), "capabilities never appear in an envelope")

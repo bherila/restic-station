@@ -37,12 +37,17 @@ public struct Reachability: Sendable {
 
     public func probe(
         _ dest: Destination,
-        destinationSecretEnv: [String: String]? = nil
+        destinationSecretEnv: [String: String]? = nil,
+        expectedExecutableIdentity: String? = nil
     ) async -> RepoProbeResult {
         if dest.kind == .localPath {
             return Self.probeLocal(dest)
         }
-        return await probeRemote(dest, destinationSecretEnv: destinationSecretEnv)
+        return await probeRemote(
+            dest,
+            destinationSecretEnv: destinationSecretEnv,
+            expectedExecutableIdentity: expectedExecutableIdentity
+        )
     }
 
     // MARK: - Local
@@ -76,14 +81,16 @@ public struct Reachability: Sendable {
 
     private func probeRemote(
         _ dest: Destination,
-        destinationSecretEnv: [String: String]?
+        destinationSecretEnv: [String: String]?,
+        expectedExecutableIdentity: String?
     ) async -> RepoProbeResult {
         do {
             let outcome = try await restic.run(
                 .catConfig(repo: dest.repoURL),
                 for: ResticInvocation(
                     destination: dest,
-                    destinationSecretEnv: destinationSecretEnv
+                    destinationSecretEnv: destinationSecretEnv,
+                    expectedExecutableIdentity: expectedExecutableIdentity
                 ),
                 timeout: Self.probeTimeout
             )

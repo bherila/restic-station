@@ -124,13 +124,34 @@ struct BackupEngineTests {
         let runStore: RunStore
         let stateStore: StateStore
         let engine: BackupEngine
+        let restic: ResticRunner
+        /// The path this env actually configured, which is **not** always
+        /// ``BackupEngineTests/resticPath``: the executable-swap tests point
+        /// the engine at a binary they may modify. ``resticArgvs`` filtered
+        /// on the static fixture path, so in exactly those tests it matched
+        /// nothing and every "no rewrite was ever spawned" assertion built
+        /// on it was vacuously true (#118).
+        let resticPath: String
         let machineId: String
         let set: BackupSet
         let primary: Destination
         let secondaries: [Destination]
 
+        /// The executable a purge preview would resolve and bind. Tests that
+        /// mint a token by hand must pass this rather than letting the issuer
+        /// resolve its own, which is the coupling #118 removed.
+        ///
+        /// A throwing function rather than an optional unwrapped at the call
+        /// site: these calls sit inside `#require`, and `#require` cannot be
+        /// nested inside itself.
+        func requireResticExecutable() throws -> ResticRunner.MaintenanceExecutable {
+            struct NoResticExecutable: Error {}
+            guard let executable = restic.maintenanceExecutable() else { throw NoResticExecutable() }
+            return executable
+        }
+
         var resticArgvs: [[String]] {
-            fake.invocations.map(\.argv).filter { $0.first == BackupEngineTests.resticPath }
+            fake.invocations.map(\.argv).filter { $0.first == resticPath }
         }
 
         var indexEntries: [RunIndexEntry] {
@@ -172,6 +193,8 @@ struct BackupEngineTests {
         purgeSourcePaths: [UUID: Set<String>] = [:],
         purgeHostnames: [UUID: Set<String>] = [:],
         machineId: String = "example-machine",
+        primaryRepoURL: String? = nil,
+        onSecretPasswordRead: (@Sendable (UUID) -> Void)? = nil,
         /// Overridable so a test can point the engine at a binary it is
         /// allowed to modify, and assert what happens when restic is
         /// replaced mid-operation.
@@ -193,7 +216,7 @@ struct BackupEngineTests {
         let primary = Destination(
             id: primaryId,
             label: "Primary",
-            repoURL: repo("primary", exists: primaryReachable),
+            repoURL: primaryRepoURL ?? repo("primary", exists: primaryReachable),
             isPrimary: true
         )
         let secondaryIds = [secondaryAId, secondaryBId]
@@ -225,7 +248,11 @@ struct BackupEngineTests {
         let processRunner: ProcessRunning = onSpawn.map {
             ObservingProcessRunner(inner: fake, onSpawn: $0)
         } ?? fake
-        let secrets = FakeSecretStore(defaultPassword: "repo-password", backend: secretBackend)
+        let secrets = FakeSecretStore(
+            defaultPassword: "repo-password",
+            backend: secretBackend,
+            onPasswordRead: onSecretPasswordRead
+        )
         for id in secretsUnavailableFor {
             secrets.failPassword(for: id)
         }
@@ -260,6 +287,8 @@ struct BackupEngineTests {
             runStore: runStore,
             stateStore: stateStore,
             engine: engine,
+            restic: restic,
+            resticPath: resticPath,
             machineId: machineId,
             set: set,
             primary: primary,
@@ -2508,7 +2537,8 @@ struct BackupEngineTests {
             patterns: env.set.purgeExcludes
         )
         let token = try #require(try env.engine.issuePurgeToken(
-            set: env.set, destinations: [env.primary], plans: [plan]
+            set: env.set, destinations: [env.primary], plans: [plan],
+            executable: try env.requireResticExecutable()
         ))
 
         // Built against the injected path, not the shared `resticPath` helper.
@@ -2553,22 +2583,45 @@ struct BackupEngineTests {
         )
         defer { env.cleanUp() }
 
-        let snapshots = try parseSnapshots(Data(try FixtureLoader.string("snapshots.json").utf8))
-        let plan = PurgePlan(
-            destinationId: env.primary.id, snapshots: snapshots,
-            sourcePaths: sourcePaths[Self.setId]!, hostnames: hostnames[Self.setId]!,
-            patterns: env.set.purgeExcludes
-        )
-
-        // The preview queries have completed; restic disappears before the
-        // capability is minted. That is the window the finding describes.
+        // #118 moved this refusal earlier: the session resolves the binary
+        // before its first query, so a vanished restic is caught before any
+        // transcript exists to be reviewed, rather than after the previews
+        // had already run.
         try FileManager.default.removeItem(at: fakeRestic)
 
-        #expect(throws: PurgeApplyError.resticUnavailable) {
-            _ = try env.engine.issuePurgeToken(
-                set: env.set, destinations: [env.primary], plans: [plan]
+        await #expect(throws: PurgeApplyError.resticUnavailable) {
+            _ = try await env.engine.previewPurgeSession(
+                set: env.set, destinations: [env.primary]
             )
         }
+        #expect(env.fake.invocations.isEmpty, "no query may run for a binary that cannot be identified")
+    }
+
+    @Test("an empty purge policy needs no restic executable")
+    func purgePreviewSessionEmptyWithoutAnExecutable() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-empty-purge-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fakeRestic = root.appendingPathComponent("restic", isDirectory: false)
+        try Data("temporary restic".utf8).write(to: fakeRestic)
+        let env = Self.makeEnv(
+            script: [], retention: nil, purgeExcludes: [], reachableSecondaries: [],
+            resticPath: fakeRestic.path
+        )
+        defer { env.cleanUp() }
+        try FileManager.default.removeItem(at: fakeRestic)
+
+        let session = try await env.engine.previewPurgeSession(
+            set: env.set,
+            destinations: [env.primary]
+        )
+
+        #expect(session.token == nil)
+        #expect(session.previews.count == 1)
+        #expect(session.previews[0].result.status == .empty)
+        #expect(session.previews[0].result.message == "nothing to purge: purgeExcludes is empty")
+        #expect(env.fake.invocations.isEmpty)
     }
 
     /// The other half: even a token minted while restic existed must not be
@@ -2600,7 +2653,8 @@ struct BackupEngineTests {
             patterns: env.set.purgeExcludes
         )
         let token = try #require(try env.engine.issuePurgeToken(
-            set: env.set, destinations: [env.primary], plans: [plan]
+            set: env.set, destinations: [env.primary], plans: [plan],
+            executable: try env.requireResticExecutable()
         ))
 
         try FileManager.default.removeItem(at: fakeRestic)
@@ -2672,7 +2726,8 @@ struct BackupEngineTests {
             patterns: env.set.purgeExcludes
         )
         let token = try #require(try env.engine.issuePurgeToken(
-            set: env.set, destinations: [env.primary], plans: [plan]
+            set: env.set, destinations: [env.primary], plans: [plan],
+            executable: try env.requireResticExecutable()
         ))
 
         env.fake.script = [
@@ -2693,6 +2748,371 @@ struct BackupEngineTests {
         )
     }
 
+    // MARK: - #118: one binary for the whole purge, preview included
+
+    @Test("a remote preview pins its reachability probe before credentials reach restic")
+    func purgePreviewPinsRemoteReachabilityProbe() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-preview-remote-swap-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fakeRestic = root.appendingPathComponent("restic", isDirectory: false)
+        try Data("original restic".utf8).write(to: fakeRestic)
+        let remoteRepo = "s3:https://example.invalid/preview"
+        let swapPath = fakeRestic.path
+        let env = Self.makeEnv(
+            script: [
+                .init(argvPrefix: [fakeRestic.path, "-r", remoteRepo, "cat", "config"]),
+            ],
+            retention: nil,
+            purgeExcludes: ["build/**"],
+            reachableSecondaries: [],
+            primaryRepoURL: remoteRepo,
+            onSecretPasswordRead: { _ in
+                try? Data("replacement restic".utf8).write(to: URL(fileURLWithPath: swapPath))
+            },
+            resticPath: fakeRestic.path
+        )
+        defer { env.cleanUp() }
+
+        let session = try await env.engine.previewPurgeSession(
+            set: env.set,
+            destinations: [env.primary]
+        )
+
+        #expect(session.token == nil)
+        #expect(session.previews.count == 1)
+        #expect(session.previews[0].result.status == .offline)
+        #expect(
+            env.fake.invocations.isEmpty,
+            "the replacement must not receive `cat config` or the destination credential environment"
+        )
+    }
+
+    @Test("apply pins remote reachability before revalidating a purge token")
+    func purgeApplyPinsRemoteReachabilityProbe() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-apply-remote-swap-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fakeRestic = root.appendingPathComponent("restic", isDirectory: false)
+        try Data("original restic".utf8).write(to: fakeRestic)
+        let remoteRepo = "s3:https://example.invalid/apply"
+        let swapPath = fakeRestic.path
+        let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]
+        let hostnames = [Self.setId: Set(["example-mac.local"])]
+        let env = Self.makeEnv(
+            script: [
+                .init(argvPrefix: [fakeRestic.path, "-r", remoteRepo, "cat", "config"]),
+            ],
+            retention: nil,
+            purgeExcludes: ["build/**"],
+            reachableSecondaries: [],
+            purgeSourcePaths: sourcePaths,
+            purgeHostnames: hostnames,
+            primaryRepoURL: remoteRepo,
+            onSecretPasswordRead: { _ in
+                try? Data("replacement restic".utf8).write(to: URL(fileURLWithPath: swapPath))
+            },
+            resticPath: fakeRestic.path
+        )
+        defer { env.cleanUp() }
+        let snapshots = try parseSnapshots(Data(try FixtureLoader.string("snapshots.json").utf8))
+        let plan = PurgePlan(
+            destinationId: env.primary.id,
+            snapshots: snapshots,
+            sourcePaths: sourcePaths[Self.setId]!,
+            hostnames: hostnames[Self.setId]!,
+            patterns: env.set.purgeExcludes
+        )
+        let token = try #require(try env.engine.issuePurgeToken(
+            set: env.set,
+            destinations: [env.primary],
+            plans: [plan],
+            executable: try env.requireResticExecutable()
+        ))
+
+        await #expect(throws: PurgeApplyError.destinationOffline(destinationId: Self.primaryId)) {
+            _ = try await env.engine.runPurge(
+                set: env.set,
+                destinations: [env.primary],
+                token: token.value
+            )
+        }
+        #expect(
+            env.fake.invocations.isEmpty,
+            "the replacement must not receive remote credentials through the reachability probe"
+        )
+        #expect(throws: Never.self) { _ = try env.engine.purgeTokenDestinationIDs(token.value) }
+    }
+
+    /// #109 pinned the destructive launch and the token, but not the queries
+    /// that produced the transcript the operator reads. Both preview
+    /// commands went out as a bare `ResticInvocation(destination:)`, so a
+    /// binary replaced *between* `snapshots` and `rewrite --dry-run` wrote
+    /// half the preview and was never noticed.
+    @Test("a preview whose binary changes mid-pass produces no transcript and no token")
+    func purgePreviewRefusesASwapBetweenItsOwnQueries() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-preview-swap-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fakeRestic = root.appendingPathComponent("restic", isDirectory: false)
+        try Data("original restic".utf8).write(to: fakeRestic)
+
+        let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]
+        let hostnames = [Self.setId: Set(["example-mac.local"])]
+        let swapPath = fakeRestic.path
+        let env = Self.makeEnv(
+            script: [], retention: nil, purgeExcludes: ["build/**"], reachableSecondaries: [],
+            onSpawn: { argv in
+                guard argv.contains("snapshots") else { return }
+                try? Data("a replacement restic that is quite different".utf8).write(
+                    to: URL(fileURLWithPath: swapPath)
+                )
+            },
+            purgeSourcePaths: sourcePaths, purgeHostnames: hostnames,
+            resticPath: fakeRestic.path
+        )
+        defer { env.cleanUp() }
+
+        let snapshotsJSON = try FixtureLoader.string("snapshots.json")
+        env.fake.script = [
+            .init(
+                argvPrefix: [fakeRestic.path, "-r", env.primary.repoURL, "snapshots", "--json"],
+                stdoutLines: [snapshotsJSON]
+            ),
+        ]
+
+        let session = try await env.engine.previewPurgeSession(
+            set: env.set, destinations: [env.primary]
+        )
+
+        #expect(session.token == nil, "a half-written preview must earn no capability")
+        #expect(session.previews.count == 1)
+        #expect(session.previews[0].result.status == .failed)
+        #expect(
+            !env.resticArgvs.contains { $0.contains("rewrite") },
+            "the dry-run must not be answered by a binary that did not run `snapshots`"
+        )
+    }
+
+    /// The load-bearing case. `issuePurgeToken` used to run after *every*
+    /// destination's preview, so the window between the first destination's
+    /// transcript and the single shared token spanned all the later
+    /// destinations' network round trips — and the token bound only whichever
+    /// binary happened to exist at the end. One session, one executable,
+    /// resolved before the first query, closes it.
+    @Test("a binary swapped between two destinations' previews yields no shared token")
+    func purgePreviewRefusesASwapBetweenDestinations() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-preview-multi-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fakeRestic = root.appendingPathComponent("restic", isDirectory: false)
+        try Data("original restic".utf8).write(to: fakeRestic)
+
+        let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]
+        let hostnames = [Self.setId: Set(["example-mac.local"])]
+        let swapPath = fakeRestic.path
+        let env = Self.makeEnv(
+            script: [], retention: nil, purgeExcludes: ["build/**"], reachableSecondaries: [true],
+            onSpawn: { argv in
+                // After the first destination's dry-run has been answered,
+                // which is exactly where the old ordering left the door open.
+                guard argv.contains("rewrite") else { return }
+                try? Data("a replacement restic that is quite different".utf8).write(
+                    to: URL(fileURLWithPath: swapPath)
+                )
+            },
+            purgeSourcePaths: sourcePaths, purgeHostnames: hostnames,
+            resticPath: fakeRestic.path
+        )
+        defer { env.cleanUp() }
+
+        let secondary = try #require(env.secondaries.first)
+        let snapshotsJSON = try FixtureLoader.string("snapshots.json")
+        let snapshots = try parseSnapshots(Data(snapshotsJSON.utf8))
+        let snapshotIDs = snapshots.map(\.id)
+        let dryRun = try FixtureLoader.string("rewrite-dry-run.txt")
+            .replacingOccurrences(of: "09b3295c", with: snapshots[0].shortId)
+            .replacingOccurrences(of: "b2435423", with: snapshots[1].shortId)
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map(String.init)
+        // Both destinations are scripted all the way through, so an unpinned
+        // pass would succeed completely and mint the shared token. The
+        // refusal below therefore comes from the pin and not from the script
+        // running out — which is what the first draft of this test actually
+        // proved.
+        env.fake.script = [env.primary, secondary].flatMap { destination in
+            [
+                FakeProcessRunner.Expectation(
+                    argvPrefix: [fakeRestic.path, "-r", destination.repoURL, "snapshots", "--json"],
+                    stdoutLines: [snapshotsJSON]
+                ),
+                FakeProcessRunner.Expectation(
+                    argvPrefix: [fakeRestic.path, "-r", destination.repoURL, "rewrite", "--dry-run",
+                                 "--exclude", "build/**"] + snapshotIDs,
+                    stdoutLines: dryRun
+                ),
+            ]
+        }
+
+        let session = try await env.engine.previewPurgeSession(
+            set: env.set, destinations: [env.primary, secondary]
+        )
+
+        #expect(session.previews.count == 2, "the pass stops at the destination that failed, not before it")
+        #expect(session.previews[0].result.status == .ready)
+        #expect(session.previews[1].result.status == .failed)
+        #expect(
+            session.token == nil,
+            "one token covering both destinations must not survive a binary change between them"
+        )
+        #expect(
+            !env.resticArgvs.contains { $0.contains(secondary.repoURL) && $0.contains("rewrite") },
+            "the second destination's dry-run must never reach the replacement"
+        )
+    }
+
+    /// The apply-time half. `runPurgeLocked` captured the executable before
+    /// `currentPurgePlan`, but the plan's own `snapshots` query was
+    /// unpinned — so the program answering "is this token still valid?" was
+    /// not guaranteed to be the program that would act on the answer. The
+    /// launch check already failed closed on the rewrite; this stops the
+    /// *validation* from being answered by a substitute, and so stops the
+    /// single-use token from being spent on it.
+    @Test("apply's token-revalidation query is pinned, so the token survives a mid-apply swap")
+    func purgeApplyRefusesASwapDuringRevalidation() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-apply-swap-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fakeRestic = root.appendingPathComponent("restic", isDirectory: false)
+        try Data("original restic".utf8).write(to: fakeRestic)
+
+        let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]
+        let hostnames = [Self.setId: Set(["example-mac.local"])]
+        let swapPath = fakeRestic.path
+        let env = Self.makeEnv(
+            script: [], retention: nil, purgeExcludes: ["build/**"], reachableSecondaries: [true],
+            onSpawn: { argv in
+                guard argv.contains("snapshots") else { return }
+                try? Data("a replacement restic that is quite different".utf8).write(
+                    to: URL(fileURLWithPath: swapPath)
+                )
+            },
+            purgeSourcePaths: sourcePaths, purgeHostnames: hostnames,
+            resticPath: fakeRestic.path
+        )
+        defer { env.cleanUp() }
+
+        let secondary = try #require(env.secondaries.first)
+        let snapshotsJSON = try FixtureLoader.string("snapshots.json")
+        let snapshots = try parseSnapshots(Data(snapshotsJSON.utf8))
+        let plans = [env.primary, secondary].map { destination in
+            PurgePlan(
+                destinationId: destination.id, snapshots: snapshots,
+                sourcePaths: sourcePaths[Self.setId]!, hostnames: hostnames[Self.setId]!,
+                patterns: env.set.purgeExcludes
+            )
+        }
+        let token = try #require(try env.engine.issuePurgeToken(
+            set: env.set, destinations: [env.primary, secondary], plans: plans,
+            executable: try env.requireResticExecutable()
+        ))
+
+        // The first destination's revalidation query swaps the binary as it
+        // runs; the second destination's query is the one that must refuse.
+        env.fake.script = [env.primary, secondary].map { destination in
+            .init(
+                argvPrefix: [fakeRestic.path, "-r", destination.repoURL, "snapshots", "--json"],
+                stdoutLines: [snapshotsJSON]
+            )
+        }
+
+        await #expect(throws: PurgeApplyError.unavailable) {
+            _ = try await env.engine.runPurge(
+                set: env.set, destinations: [env.primary, secondary], token: token.value
+            )
+        }
+        #expect(
+            !env.resticArgvs.contains { $0.contains("rewrite") },
+            "nothing destructive may follow a revalidation the pinned binary did not answer"
+        )
+        // Single-use, and not used: the refusal happened before `consume`,
+        // so the operator can retry once the binary is restored instead of
+        // being told their preview is stale.
+        #expect(throws: Never.self) { _ = try env.engine.purgeTokenDestinationIDs(token.value) }
+    }
+
+    /// The classification half of #118, and a second instance of the same
+    /// defect the review found: `issuePurgeToken` let a bare
+    /// `PreviewTokenError` escape, where `runPurgeLocked` wraps its own.
+    /// `classifyPurgeOperation` knows nothing about the bare error, so an
+    /// unusable confirmation store lost the specific advice #117 added — on
+    /// the one path that *writes* the store, and so is likeliest to hit it.
+    ///
+    /// The fault is a directory where the token lock file belongs: root
+    /// ignores file modes and the `linux` CI job runs as root, so a
+    /// chmod-based denial would pass there for the wrong reason.
+    @Test("a preview whose token store is unusable says so, instead of failing generically")
+    func purgePreviewReportsAnUnusableTokenStore() async throws {
+        let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]
+        let hostnames = [Self.setId: Set(["example-mac.local"])]
+        let env = Self.makeEnv(
+            script: [], retention: nil, purgeExcludes: ["build/**"], reachableSecondaries: [],
+            purgeSourcePaths: sourcePaths, purgeHostnames: hostnames
+        )
+        defer { env.cleanUp() }
+
+        try env.paths.ensureDirectories()
+        try FileManager.default.createDirectory(
+            at: env.paths.previewTokensLockFile, withIntermediateDirectories: true
+        )
+
+        let snapshotsJSON = try FixtureLoader.string("snapshots.json")
+        let snapshots = try parseSnapshots(Data(snapshotsJSON.utf8))
+        let snapshotIDs = snapshots.map(\.id)
+        let dryRun = try FixtureLoader.string("rewrite-dry-run.txt")
+            .replacingOccurrences(of: "09b3295c", with: snapshots[0].shortId)
+            .replacingOccurrences(of: "b2435423", with: snapshots[1].shortId)
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map(String.init)
+        env.fake.script = Self.resticCall(
+            ["-r", env.primary.repoURL, "snapshots", "--json"],
+            dest: Self.primaryId, stdoutLines: [snapshotsJSON]
+        ) + Self.resticCall(
+            ["-r", env.primary.repoURL, "rewrite", "--dry-run", "--exclude", "build/**"] + snapshotIDs,
+            dest: Self.primaryId, stdoutLines: dryRun
+        )
+
+        var thrown: (any Error)?
+        do {
+            _ = try await env.engine.previewPurgeSession(set: env.set, destinations: [env.primary])
+        } catch {
+            thrown = error
+        }
+        let error = try #require(thrown)
+        guard case .token(.storeUnusable) = try #require(error as? PurgeApplyError) else {
+            Issue.record("expected a wrapped storeUnusable, got \(error)")
+            return
+        }
+
+        // The wrap is only worth anything if it changes what the operator is
+        // told, so assert the rendered envelope and not just the case.
+        let failure = CLIFailure.classifyPurgeOperation(error, setId: Self.setId)
+        #expect(failure.code == .internalError)
+        #expect(
+            failure.message.contains("confirmation store"),
+            "the operator must be told which store is broken, not given a generic fault: \(failure.message)"
+        )
+        #expect(
+            failure.message.contains("data directory"),
+            "the advice #117 added must survive the preview path too: \(failure.message)"
+        )
+    }
+
     @Test("runPurge: a valid token revalidates ids, records rewrite mapping, and is single-use")
     func purgeApplyUsesTokenAndRecordsMapping() async throws {
         let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]
@@ -2710,7 +3130,8 @@ struct BackupEngineTests {
             sourcePaths: sourcePaths[Self.setId]!, hostnames: hostnames[Self.setId]!, patterns: env.set.purgeExcludes
         )
         let token = try #require(try env.engine.issuePurgeToken(
-            set: env.set, destinations: [env.primary], plans: [plan]
+            set: env.set, destinations: [env.primary], plans: [plan],
+            executable: try env.requireResticExecutable()
         ))
         // A repository can hold snapshots from another backup set. Fresh
         // validation sees this one, but attribution declines it and its id
@@ -2773,7 +3194,8 @@ struct BackupEngineTests {
             patterns: env.set.purgeExcludes
         )
         let token = try #require(try env.engine.issuePurgeToken(
-            set: env.set, destinations: [env.primary], plans: [plan]
+            set: env.set, destinations: [env.primary], plans: [plan],
+            executable: try env.requireResticExecutable()
         ))
         try env.paths.ensureDirectories()
         let runId = RunStore.formatRunId(kind: .purge, setId: Self.setId, date: Self.t0)
@@ -2836,7 +3258,8 @@ struct BackupEngineTests {
             patterns: env.set.purgeExcludes
         )
         let token = try #require(try env.engine.issuePurgeToken(
-            set: env.set, destinations: [env.primary], plans: [plan]
+            set: env.set, destinations: [env.primary], plans: [plan],
+            executable: try env.requireResticExecutable()
         ))
         let rewrite = try FixtureLoader.string("rewrite-forget.txt")
             .replacingOccurrences(of: "09b3295c", with: snapshots[0].shortId)
@@ -2895,7 +3318,8 @@ struct BackupEngineTests {
         }
 
         let expired = try #require(try env.engine.issuePurgeToken(
-            set: env.set, destinations: [env.primary], plans: [plan]
+            set: env.set, destinations: [env.primary], plans: [plan],
+            executable: try env.requireResticExecutable()
         ))
         env.clock.advance(PreviewTokenStore.defaultLifetime + 1)
         do {
@@ -2906,7 +3330,8 @@ struct BackupEngineTests {
         }
 
         let changed = try #require(try env.engine.issuePurgeToken(
-            set: env.set, destinations: [env.primary], plans: [plan]
+            set: env.set, destinations: [env.primary], plans: [plan],
+            executable: try env.requireResticExecutable()
         ))
         var snapshotObjects = try #require(JSONSerialization.jsonObject(with: Data(snapshotsJSON.utf8)) as? [[String: Any]])
         snapshotObjects.removeLast()
@@ -3191,7 +3616,11 @@ struct BackupEngineTests {
             stdoutLines: dryRun
         )
 
-        let result = await env.engine.previewPurge(set: env.set, destination: env.primary)
+        let result = await env.engine.previewPurge(
+            set: env.set,
+            destination: env.primary,
+            executable: try env.requireResticExecutable()
+        )
 
         #expect(result.status == .ready)
         #expect(result.plan.matched.map(\.id) == snapshotIDs)
@@ -3209,7 +3638,11 @@ struct BackupEngineTests {
         let env = Self.makeEnv(script: [], retention: nil, purgeExcludes: [], reachableSecondaries: [])
         defer { env.cleanUp() }
 
-        let result = await env.engine.previewPurge(set: env.set, destination: env.primary)
+        let result = await env.engine.previewPurge(
+            set: env.set,
+            destination: env.primary,
+            executable: try env.requireResticExecutable()
+        )
 
         #expect(result.status == .empty)
         #expect(result.plan.matched.isEmpty)
@@ -3231,10 +3664,16 @@ struct BackupEngineTests {
             withIntermediateDirectories: true
         )
 
-        let result = await env.engine.previewPurge(set: env.set, destination: env.primary)
+        let session = try await env.engine.previewPurgeSession(
+            set: env.set,
+            destinations: [env.primary]
+        )
+        let result = try #require(session.previews.first?.result)
 
         #expect(result.status == .infrastructureFailure)
         #expect(result.message?.contains("backup-set lock unusable") == true)
+        #expect(session.previews.count == 1)
+        #expect(session.token == nil, "an incomplete preview must never earn a purge capability")
         #expect(env.fake.invocations.isEmpty, "restic must not run after local lock refusal")
     }
 
