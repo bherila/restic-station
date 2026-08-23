@@ -243,6 +243,72 @@ let canInjectPermissionFaults = geteuid() != 0
         #expect(!FileManager.default.fileExists(atPath: paths.tickLockFile.path))
     }
 
+    @Test("a replaceable data-root entry cannot split the lock namespace")
+    func replaceableDataRootIsRefusedBeforeRecreation() throws {
+        let parent = makeDirectory()
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o700], ofItemAtPath: parent.path
+            )
+            try? FileManager.default.removeItem(at: parent)
+        }
+        let root = parent.appendingPathComponent("data", isDirectory: true)
+        let displacedRoot = parent.appendingPathComponent("data-held-by-first", isDirectory: true)
+        let paths = AppPaths(root: root)
+        try paths.ensureDirectories()
+
+        let holder = FileLock(path: paths.tickLockFile, trustedRoot: root)
+        #expect(holder.acquire() == .acquired)
+        defer { holder.release() }
+
+        // Model a different local uid gaining ordinary directory replacement
+        // access: the first helper keeps the old-tree flock, while the data
+        // root's pathname is moved out from beneath it.
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o777], ofItemAtPath: parent.path
+        )
+        try FileManager.default.moveItem(at: root, to: displacedRoot)
+
+        do {
+            try paths.ensureDirectories()
+            Issue.record("setup must not recreate a second lock tree under a replaceable root entry")
+        } catch let failure as LockFailure {
+            #expect(failure.operation == "lock root parent permissions")
+            #expect(failure.path == parent.path)
+        }
+        #expect(
+            !FileManager.default.fileExists(atPath: root.path),
+            "parent validation must happen before the missing root is recreated"
+        )
+
+        guard case .failed(let failure) = FileLock(
+            path: paths.tickLockFile, trustedRoot: root
+        ).acquire() else {
+            Issue.record("a second helper must fail rather than acquire a distinct lock inode")
+            return
+        }
+        #expect(failure.operation == "lock root parent permissions")
+        #expect(failure.path == parent.path)
+    }
+
+    @Test("a sticky trusted parent preserves owner-protected root entries")
+    func stickyDataRootParentIsAccepted() throws {
+        let parent = makeDirectory()
+        defer {
+            _ = parent.path.withCString { chmod($0, 0o700) }
+            try? FileManager.default.removeItem(at: parent)
+        }
+        try #require(parent.path.withCString { chmod($0, 0o1777) } == 0)
+
+        let root = parent.appendingPathComponent("data", isDirectory: true)
+        let paths = AppPaths(root: root)
+        try paths.ensureDirectories()
+
+        let lock = FileLock(path: paths.tickLockFile, trustedRoot: root)
+        #expect(lock.acquire() == .acquired)
+        lock.release()
+    }
+
     @Test("probe reports the same faults without taking the lock")
     func probeDoesNotContend() throws {
         let directory = makeDirectory()

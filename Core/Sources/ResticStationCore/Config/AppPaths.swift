@@ -326,6 +326,9 @@ public struct AppPaths: Equatable, Sendable {
         let parent = root.deletingLastPathComponent()
         if parent.path != root.path {
             try fileManager.createDirectory(at: parent, withIntermediateDirectories: true)
+            if let failure = FileLock.validateTrustedRootParent(for: root) {
+                throw failure
+            }
         }
         try fileManager.createDirectory(
             at: root,

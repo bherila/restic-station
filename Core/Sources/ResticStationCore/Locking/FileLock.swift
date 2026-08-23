@@ -221,8 +221,9 @@ public final class FileLock: @unchecked Sendable {
     /// group/world write bit. The trusted root additionally accepts normal
     /// sticky-directory protection and write-without-search modes; its
     /// owner-owned child is still not replaceable by another uid. When a
-    /// trusted root is supplied, that child is resolved with `openat` through
-    /// the already-verified root descriptor.
+    /// trusted root is supplied, the root is itself resolved with `openat`
+    /// through its verified immediate parent, and the child is then resolved
+    /// through the already-verified root descriptor.
     private static func openDirectory(
         _ directory: URL,
         trustedRoot: URL?
@@ -248,26 +249,17 @@ public final class FileLock: @unchecked Sendable {
         }
 
         let rootPath = trustedRoot.standardizedFileURL.path
-        let (rootFD, rootOpenError) = rootPath.withCString { name -> (Int32, Int32) in
-            let descriptor = open(name, flags)
-            return (descriptor, descriptor < 0 ? errno : 0)
-        }
-        guard rootFD >= 0 else {
-            return .failure(LockFailure(
-                path: rootPath, operation: "open lock root", errnoValue: rootOpenError
-            ))
-        }
-        defer { close(rootFD) }
-        if let failure = verifyDirectory(fd: rootFD, path: rootPath, isTrustedRoot: true) {
+        let rootFD: Int32
+        switch openTrustedRoot(trustedRoot, flags: flags) {
+        case .success(let descriptor):
+            rootFD = descriptor
+        case .failure(let failure):
             return .failure(failure)
         }
         if directoryPath == rootPath {
-            let duplicate = dup(rootFD)
-            guard duplicate >= 0 else {
-                return .failure(LockFailure(path: rootPath, operation: "dup lock root", errnoValue: errno))
-            }
-            return .success(duplicate)
+            return .success(rootFD)
         }
+        defer { close(rootFD) }
 
         guard directory.deletingLastPathComponent().standardizedFileURL.path == rootPath else {
             return .failure(LockFailure(
@@ -288,6 +280,127 @@ public final class FileLock: @unchecked Sendable {
             return .failure(failure)
         }
         return .success(opened)
+    }
+
+    /// Opens the trusted root through its immediate parent descriptor. The
+    /// parent is the deliberate outer boundary: its own ancestors and ACLs
+    /// remain deployment concerns, but another local uid must not be able to
+    /// rename this root entry and make a later helper lock a different tree.
+    private static func openTrustedRoot(
+        _ trustedRoot: URL,
+        flags: Int32
+    ) -> Result<Int32, LockFailure> {
+        let root = trustedRoot.standardizedFileURL
+        let rootPath = root.path
+        let parent = root.deletingLastPathComponent().standardizedFileURL
+
+        // The filesystem root has no replaceable parent entry.
+        if parent.path == rootPath {
+            let (opened, openError) = rootPath.withCString { name -> (Int32, Int32) in
+                let descriptor = open(name, flags)
+                return (descriptor, descriptor < 0 ? errno : 0)
+            }
+            guard opened >= 0 else {
+                return .failure(LockFailure(
+                    path: rootPath, operation: "open lock root", errnoValue: openError
+                ))
+            }
+            if let failure = verifyDirectory(fd: opened, path: rootPath, isTrustedRoot: true) {
+                close(opened)
+                return .failure(failure)
+            }
+            return .success(opened)
+        }
+
+        let parentFD: Int32
+        switch openTrustedRootParent(for: root, flags: flags) {
+        case .success(let descriptor):
+            parentFD = descriptor
+        case .failure(let failure):
+            return .failure(failure)
+        }
+        defer { close(parentFD) }
+
+        let (opened, openError) = root.lastPathComponent.withCString { name -> (Int32, Int32) in
+            let descriptor = openat(parentFD, name, flags)
+            return (descriptor, descriptor < 0 ? errno : 0)
+        }
+        guard opened >= 0 else {
+            return .failure(LockFailure(
+                path: rootPath, operation: "open lock root", errnoValue: openError
+            ))
+        }
+        if let failure = verifyDirectory(fd: opened, path: rootPath, isTrustedRoot: true) {
+            close(opened)
+            return .failure(failure)
+        }
+        return .success(opened)
+    }
+
+    /// Refuses a replaceable data-root entry before setup creates or opens
+    /// it. This is internal so `AppPaths.ensureDirectories()` can apply the
+    /// same boundary before recreating a missing root after a rename.
+    static func validateTrustedRootParent(for trustedRoot: URL) -> LockFailure? {
+        let flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+        switch openTrustedRootParent(for: trustedRoot.standardizedFileURL, flags: flags) {
+        case .success(let descriptor):
+            close(descriptor)
+            return nil
+        case .failure(let failure):
+            return failure
+        }
+    }
+
+    private static func openTrustedRootParent(
+        for trustedRoot: URL,
+        flags: Int32
+    ) -> Result<Int32, LockFailure> {
+        let rootPath = trustedRoot.path
+        let parent = trustedRoot.deletingLastPathComponent().standardizedFileURL
+        let parentPath = parent.path
+        guard parentPath != rootPath else {
+            return .failure(LockFailure(
+                path: parentPath, operation: "lock root parent boundary", errnoValue: 0
+            ))
+        }
+
+        let (parentFD, openError) = parentPath.withCString { name -> (Int32, Int32) in
+            let descriptor = open(name, flags)
+            return (descriptor, descriptor < 0 ? errno : 0)
+        }
+        guard parentFD >= 0 else {
+            return .failure(LockFailure(
+                path: parentPath, operation: "open lock root parent", errnoValue: openError
+            ))
+        }
+        if let failure = verifyTrustedRootParent(fd: parentFD, path: parentPath) {
+            close(parentFD)
+            return .failure(failure)
+        }
+        return .success(parentFD)
+    }
+
+    private static func verifyTrustedRootParent(fd: Int32, path: String) -> LockFailure? {
+        var info = stat()
+        guard fstat(fd, &info) == 0 else {
+            return LockFailure(path: path, operation: "fstat lock root parent", errnoValue: errno)
+        }
+        guard info.st_mode & S_IFMT == S_IFDIR else {
+            return LockFailure(path: path, operation: "lock root parent type", errnoValue: 0)
+        }
+
+        let effectiveUID = geteuid()
+        guard info.st_uid == effectiveUID || info.st_uid == 0 else {
+            return LockFailure(path: path, operation: "lock root parent ownership", errnoValue: 0)
+        }
+
+        let groupCanReplace = info.st_mode & (S_IWGRP | S_IXGRP) == (S_IWGRP | S_IXGRP)
+        let otherCanReplace = info.st_mode & (S_IWOTH | S_IXOTH) == (S_IWOTH | S_IXOTH)
+        let sticky = info.st_mode & S_ISVTX != 0
+        guard !(groupCanReplace || otherCanReplace) || sticky else {
+            return LockFailure(path: path, operation: "lock root parent permissions", errnoValue: 0)
+        }
+        return nil
     }
 
     private static func verifyDirectory(
