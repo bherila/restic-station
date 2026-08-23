@@ -443,7 +443,8 @@ public final class FileLock: @unchecked Sendable {
         _ directory: URL,
         parent: URL,
         trustedRoot: URL,
-        mode: mode_t
+        mode: mode_t,
+        tightenExisting: Bool = true
     ) -> LockFailure? {
         let directoryPath = directory.standardizedFileURL.path
         guard directory.deletingLastPathComponent().standardizedFileURL.path
@@ -465,6 +466,7 @@ public final class FileLock: @unchecked Sendable {
         defer { close(parentFD) }
 
         let flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+        var createdDirectory = false
         let (directoryFD, openError, creationFailed) = directory.lastPathComponent.withCString {
             name -> (Int32, Int32, Bool) in
             var descriptor = openat(parentFD, name, flags)
@@ -475,6 +477,7 @@ public final class FileLock: @unchecked Sendable {
                 guard created == 0 || createError == EEXIST else {
                     return (descriptor, createError, true)
                 }
+                createdDirectory = created == 0
                 descriptor = openat(parentFD, name, flags)
                 code = descriptor < 0 ? errno : 0
             }
@@ -500,7 +503,7 @@ public final class FileLock: @unchecked Sendable {
             return LockFailure(path: directoryPath, operation: "protected directory ownership", errnoValue: 0)
         }
 
-        if info.st_mode & 0o777 != mode {
+        if info.st_mode & 0o777 != mode, createdDirectory || tightenExisting {
             guard fchmod(directoryFD, mode) == 0 else {
                 return LockFailure(path: directoryPath, operation: "fchmod protected directory", errnoValue: errno)
             }

@@ -973,6 +973,42 @@ ok "payloads carry what they claim, secret list --json stays presence-only and a
 # ─────────────────────────────────────────────────────────────────────────
 log "10. broken locking is never reported as a healthy, idle machine"
 
+# A fresh install under a permissive service umask must not manufacture
+# group/world-writable lock parents and then reject its own tree. Run the
+# real helper in a subshell because umask is process-global.
+PERMISSIVE_UMASK_DATA="$WORK/permissive-umask-data"
+PERMISSIVE_UMASK_OUT="$WORK/permissive-umask-status.json"
+PERMISSIVE_UMASK_ERR="$WORK/permissive-umask-status.err"
+set +e
+(
+    umask 0000
+    RESTIC_STATION_DATA_DIR="$PERMISSIVE_UMASK_DATA" \
+        "$HELPER" status --json >"$PERMISSIVE_UMASK_OUT" 2>"$PERMISSIVE_UMASK_ERR"
+)
+PERMISSIVE_UMASK_RC=$?
+set -e
+cat "$PERMISSIVE_UMASK_OUT" "$PERMISSIVE_UMASK_ERR" >>"$COMBINED_LOG"
+jq -e '.data.locking.usable == true' "$PERMISSIVE_UMASK_OUT" >/dev/null \
+    || fail "a fresh permissive-umask install rejected its own lock tree: $(cat "$PERMISSIVE_UMASK_OUT")"
+for directory in \
+    "$PERMISSIVE_UMASK_DATA" \
+    "$PERMISSIVE_UMASK_DATA/runs" \
+    "$PERMISSIVE_UMASK_DATA/state" \
+    "$PERMISSIVE_UMASK_DATA/locks"; do
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        DIRECTORY_MODE="$(stat -f '%Lp' "$directory")"
+    else
+        DIRECTORY_MODE="$(stat -c '%a' "$directory")"
+    fi
+    [[ "$DIRECTORY_MODE" == "700" ]] \
+        || fail "$directory was mode $DIRECTORY_MODE after setup under umask 0000, expected 700"
+done
+# Scheduler health can independently make status exit 1; only a parser/setup
+# failure may use another code here.
+[[ "$PERMISSIVE_UMASK_RC" -eq 0 || "$PERMISSIVE_UMASK_RC" -eq 1 ]] \
+    || fail "permissive-umask status exited $PERMISSIVE_UMASK_RC"
+ok "fresh lock-owning directories stay 0700 and usable under umask 0000"
+
 BROKEN_LOCKS="$WORK/broken-locks"
 mkdir -p "$BROKEN_LOCKS/locks/tick.lock"
 

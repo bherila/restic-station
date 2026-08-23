@@ -545,8 +545,18 @@ public struct FileSecretStore: SecretStore {
     func prepareDirectories(reportWarnings: Bool = true) throws {
         try createDirectory(at: paths.root, mode: 0o700, reportWarnings: reportWarnings)
         try validateImmediateParent()
-        // Lock files hold nothing; the default mode is fine.
-        try FileManager.default.createDirectory(at: paths.locksDir, withIntermediateDirectories: true)
+        // A permissive umask must not create a mutation-lock parent that the
+        // lock verifier immediately refuses. Use the same descriptor-relative
+        // creation and tightening path as AppPaths setup.
+        if let failure = FileLock.ensureDirectory(
+            paths.locksDir,
+            parent: paths.root,
+            trustedRoot: paths.root,
+            mode: 0o700,
+            tightenExisting: false
+        ) {
+            throw SecretStoreError.lockUnusable(failure)
+        }
     }
 
     private func createDirectory(at url: URL, mode: mode_t, reportWarnings: Bool) throws {

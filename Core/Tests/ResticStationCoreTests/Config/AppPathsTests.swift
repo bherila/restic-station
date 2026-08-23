@@ -351,9 +351,11 @@ struct AppPathsEnvTests {
         ] {
             #expect(!FileManager.default.fileExists(atPath: scratchDirectory.path))
         }
-        var info = stat()
-        try #require(root.path.withCString { stat($0, &info) } == 0)
-        #expect(UInt32(info.st_mode) & 0o777 == 0o700)
+        for directory in [paths.root, paths.runsDir, paths.stateDir, paths.locksDir] {
+            var info = stat()
+            try #require(directory.path.withCString { stat($0, &info) } == 0)
+            #expect(UInt32(info.st_mode) & 0o777 == 0o700)
+        }
     }
 
     @Test func ensureDirectoriesIsIdempotent() throws {

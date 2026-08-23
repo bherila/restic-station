@@ -337,7 +337,7 @@ never used to trigger a rewrite.
 
 ## Locking
 
-The operation-exclusion locks use `flock(2)` `LOCK_EX | LOCK_NB` on files under `locks/` (advisory; auto-released by the kernel on process death — no stale-lock cleanup needed; the files themselves persist, their existence means nothing). Companion locks use the same primitive to serialize shared local files:
+The operation-exclusion locks use `flock(2)` `LOCK_EX | LOCK_NB` on files under `locks/` (advisory; auto-released by the kernel on process death — no stale-lock cleanup needed; the files themselves persist, their existence means nothing). `AppPaths` creates every fresh internal lock-owning directory (`locks/`, `state/`, and `runs/`) through verified descriptors and pins it to `0700` after umask, so setup cannot create a tree the lock verifier then refuses. Existing unsafe `locks/` or `runs/` modes are not silently repaired: live health still reports them; `state/` retains its stricter capability-store re-tightening rule. Companion locks use the same primitive to serialize shared local files:
 
 | Lock | Held by | Purpose |
 |---|---|---|

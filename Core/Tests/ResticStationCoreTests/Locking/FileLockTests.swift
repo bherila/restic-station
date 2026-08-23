@@ -689,11 +689,12 @@ let canInjectPermissionFaults = geteuid() != 0
             LockingHealth.probe(paths: paths, configuredSetIds: []),
             "failure to inspect per-set locks must not report healthy"
         )
-        // Descriptor-relative validation may fail while opening the
+        // Descriptor-relative setup or validation may fail while opening the
         // unreadable directory, before Foundation attempts enumeration.
-        // Either result is a fail-closed inspection outcome.
+        // Every result is a fail-closed inspection outcome.
         #expect(
-            failure.operation == "open lock directory"
+            failure.operation == "open protected directory"
+                || failure.operation == "open lock directory"
                 || failure.operation == "enumerate lock directory"
         )
         #expect(failure.path == paths.locksDir.path)
