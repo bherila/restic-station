@@ -100,6 +100,18 @@ public enum CheckRunOutcome: Equatable, Sendable {
     case infrastructureFailure(reason: String)
 }
 
+/// The result of a directly requested set operation. Manual callers need to
+/// distinguish a command that ran and failed from local process-control or
+/// durable-state infrastructure that prevented a trustworthy run.
+public enum ManualRunOutcome: Equatable, Sendable {
+    case completed(RunStatus)
+    /// Expected deferral: another operation owns the set lock, or secrets
+    /// were temporarily unavailable before a run could begin.
+    case skipped
+    /// The set lock, run store, or terminal persistence was unusable.
+    case infrastructureFailure(reason: String)
+}
+
 /// The standalone-prune result keeps non-destructive refusals distinct from
 /// restic failures so the helper can preserve the published JSON taxonomy.
 public enum PruneRepositoryResult: Equatable, Sendable {
@@ -683,10 +695,10 @@ public final class BackupEngine: Sendable {
     public func runPrune(
         _ set: BackupSet,
         expectedExecutableIdentity: String? = nil
-    ) async -> RunStatus {
+    ) async -> ManualRunOutcome {
         guard let primary = set.destinations.first(where: { $0.isPrimary }) else {
             logWarning("BackupEngine: backup set \"\(set.name)\" has no primary destination — cannot prune")
-            return .failed
+            return .completed(.failed)
         }
         guard let retention = set.retention, !retention.isEmpty else {
             // First half of the double guard: no policy, no forget, ever.
@@ -708,7 +720,7 @@ public final class BackupEngine: Sendable {
             recordLockFailure(
                 kind: .prune, setId: set.id, destId: primary.id, trigger: .manual, failure: failure
             )
-            return .failed
+            return .infrastructureFailure(reason: failure.description)
         }
         defer { lock.release() }
         // Declared after the lock defer, so it unwinds *first*: the live
@@ -724,10 +736,10 @@ public final class BackupEngine: Sendable {
             groupId: nil,
             expectedExecutableIdentity: expectedExecutableIdentity
         ) else {
-            return .skipped
+            return .infrastructureFailure(reason: "could not create the primary prune run record")
         }
-        guard primaryPrune.infrastructureFailureReason == nil else {
-            return .failed
+        if let reason = primaryPrune.infrastructureFailureReason {
+            return .infrastructureFailure(reason: reason)
         }
         var statuses = [primaryPrune.child.status]
         let groupId = primaryPrune.child.runId
@@ -757,14 +769,18 @@ public final class BackupEngine: Sendable {
                 groupId: groupId,
                 expectedExecutableIdentity: expectedExecutableIdentity
             ) {
-                guard prune.infrastructureFailureReason == nil else {
-                    return .failed
+                if let reason = prune.infrastructureFailureReason {
+                    return .infrastructureFailure(reason: reason)
                 }
                 statuses.append(prune.child.status)
+            } else {
+                return .infrastructureFailure(
+                    reason: "could not create the prune run record for \"\(secondary.label)\""
+                )
             }
         }
 
-        return Self.worstStatus(statuses)
+        return .completed(Self.worstStatus(statuses))
     }
 
     /// Reclaims unreferenced repository data without changing snapshot
@@ -1485,10 +1501,10 @@ public final class BackupEngine: Sendable {
     ///
     /// Per-file `error` messages in the NDJSON stream downgrade an exit-0
     /// restore to `.warning` (`docs/restic-cli.md` §restore).
-    public func runRestore(request: RestoreRequest) async -> RunStatus {
+    public func runRestore(request: RestoreRequest) async -> ManualRunOutcome {
         guard let (set, destination) = locate(destId: request.destId) else {
             logWarning("BackupEngine: no configured destination with id \(request.destId) — cannot restore")
-            return .failed
+            return .completed(.failed)
         }
         guard await secretsAvailable(for: [destination]) else { return .skipped }
 
@@ -1503,7 +1519,7 @@ public final class BackupEngine: Sendable {
             recordLockFailure(
                 kind: .restore, setId: set.id, destId: destination.id, trigger: .manual, failure: failure
             )
-            return .failed
+            return .infrastructureFailure(reason: failure.description)
         }
         defer { lock.release() }
         // Declared after the lock defer, so it unwinds *first*: the live
@@ -1530,8 +1546,13 @@ public final class BackupEngine: Sendable {
             streamProgress: false,
             downgradeSuccessToWarning: { outcome in Self.containsErrorMessage(outcome.messages) }
         )
-        guard let restore else { return .skipped }
-        return restore.infrastructureFailureReason == nil ? restore.child.status : .failed
+        guard let restore else {
+            return .infrastructureFailure(reason: "could not create the restore run record")
+        }
+        if let reason = restore.infrastructureFailureReason {
+            return .infrastructureFailure(reason: reason)
+        }
+        return .completed(restore.child.status)
     }
 
     // MARK: - initSecondary
@@ -1540,14 +1561,14 @@ public final class BackupEngine: Sendable {
     /// --copy-chunker-params` — the chunker flag is non-negotiable
     /// (`docs/restic-cli.md` §init secondary): without it deduplication
     /// between primary and mirror is destroyed.
-    public func initSecondary(_ set: BackupSet, dest: Destination) async -> RunStatus {
+    public func initSecondary(_ set: BackupSet, dest: Destination) async -> ManualRunOutcome {
         guard let primary = set.destinations.first(where: { $0.isPrimary }) else {
             logWarning("BackupEngine: backup set \"\(set.name)\" has no primary destination")
-            return .failed
+            return .completed(.failed)
         }
         guard !dest.isPrimary else {
             logWarning("BackupEngine: initSecondary refuses to run against the primary destination")
-            return .failed
+            return .completed(.failed)
         }
         // Both repositories' passwords are needed (`RESTIC_PASSWORD_COMMAND`
         // and `RESTIC_FROM_PASSWORD_COMMAND`).
@@ -1564,7 +1585,7 @@ public final class BackupEngine: Sendable {
             recordLockFailure(
                 kind: .`init`, setId: set.id, destId: dest.id, trigger: .manual, failure: failure
             )
-            return .failed
+            return .infrastructureFailure(reason: failure.description)
         }
         defer { lock.release() }
         // Declared after the lock defer, so it unwinds *first*: the live
@@ -1583,7 +1604,9 @@ public final class BackupEngine: Sendable {
             invocation: ResticInvocation(destination: dest, fromDestination: primary),
             streamProgress: false
         )
-        guard let initRun else { return .skipped }
+        guard let initRun else {
+            return .infrastructureFailure(reason: "could not create the init-secondary run record")
+        }
         if initRun.child.status == .success {
             updateRepoStatus(destId: dest.id) { status in
                 status.reachable = true
@@ -1591,7 +1614,10 @@ public final class BackupEngine: Sendable {
                 status.lastError = nil
             }
         }
-        return initRun.infrastructureFailureReason == nil ? initRun.child.status : .failed
+        if let reason = initRun.infrastructureFailureReason {
+            return .infrastructureFailure(reason: reason)
+        }
+        return .completed(initRun.child.status)
     }
 
     // MARK: - forget (the only destructive command)

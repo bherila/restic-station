@@ -15,9 +15,9 @@ public final class BackupEngine {
                 now: @Sendable () -> Date = Date.init)          // injectable clock
     public func runSet(_ set: BackupSet, trigger: RunTrigger) async -> SetRunOutcome
     public func runCheck(_ set: BackupSet) async -> RunStatus    // scheduled slice check on primary
-    public func runPrune(_ set: BackupSet) async -> RunStatus    // manual "apply retention now" (primary + synced secondaries)
-    public func runRestore(request: RestoreRequest) async -> RunStatus
-    public func initSecondary(_ set: BackupSet, dest: Destination) async -> RunStatus
+    public func runPrune(_ set: BackupSet) async -> ManualRunOutcome    // manual "apply retention now" (primary + synced secondaries)
+    public func runRestore(request: RestoreRequest) async -> ManualRunOutcome
+    public func initSecondary(_ set: BackupSet, dest: Destination) async -> ManualRunOutcome
 }
 ```
 

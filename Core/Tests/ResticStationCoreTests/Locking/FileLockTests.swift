@@ -401,6 +401,50 @@ let canInjectPermissionFaults = geteuid() != 0
         #expect(LockingHealth.probe(paths: paths, configuredSetIds: []) == nil)
     }
 
+    @Test("damage to a health-only lock makes the probe inconclusive, not production-unusable")
+    func lockingHealthSeparatesDiagnosticInodeDamage() throws {
+        let root = makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = AppPaths(root: root)
+        try paths.ensureDirectories()
+
+        try FileManager.default.createDirectory(
+            at: paths.healthLockFile,
+            withIntermediateDirectories: true
+        )
+
+        let failure = try #require(LockingHealth.probe(paths: paths, configuredSetIds: []))
+        #expect(failure.scope == .diagnostic)
+        #expect(failure.path == paths.healthLockFile.path)
+
+        // The actual operation lock remains usable; the diagnostic artifact
+        // alone is not evidence for a machine-wide production outage.
+        let tick = FileLock(path: paths.tickLockFile, trustedRoot: root)
+        #expect(tick.acquire() == .acquired)
+        tick.release()
+    }
+
+    @Test("a production lock outage outranks simultaneous diagnostic damage")
+    func lockingHealthPrefersProductionFailureOverDiagnosticDamage() throws {
+        let root = makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = AppPaths(root: root)
+        try paths.ensureDirectories()
+
+        try FileManager.default.createDirectory(
+            at: paths.healthLockFile,
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            at: paths.scheduleStateLockFile,
+            withIntermediateDirectories: true
+        )
+
+        let failure = try #require(LockingHealth.probe(paths: paths, configuredSetIds: []))
+        #expect(failure.scope == .machine)
+        #expect(failure.path == paths.scheduleStateLockFile.path)
+    }
+
     @Test("LockingHealth freshly allocates on state and runs after their health inodes exist")
     func lockingHealthRepeatedlyProbesAllocationOnEveryFilesystem() throws {
         for scratchPath in [

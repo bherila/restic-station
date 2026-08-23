@@ -3,11 +3,15 @@ import Foundation
 public enum LockingHealthScope: Equatable, Sendable {
     case machine
     case set(UUID)
+    /// A health-only lock or scratch artifact is damaged. The live probe is
+    /// inconclusive; this alone does not prove production locks are unusable.
+    case diagnostic
 }
 
 /// A live locking fault together with the amount of work it blocks.
 /// Per-set lock damage is a partial outage; shared locks and directory
-/// faults prevent safe operation machine-wide.
+/// faults prevent safe operation machine-wide. Health-only artifact damage
+/// is diagnostic failure, not evidence of a production outage.
 public struct LockingHealthFailure: Error, Equatable, Sendable, CustomStringConvertible {
     public let scope: LockingHealthScope
     public let failure: LockFailure
@@ -67,7 +71,8 @@ public enum LockingHealth {
         // the persistent flock inode, effective access, and a fresh inode
         // allocation. The nested scratch directories keep create/remove
         // activity below the app's non-recursive parent watchers.
-        for (healthLock, directory, scratchDirectory) in [
+        var diagnosticFailure: LockingHealthFailure?
+        healthFilesystems: for (healthLock, directory, scratchDirectory) in [
             (paths.healthLockFile, paths.locksDir, paths.lockHealthProbeDir),
             (paths.stateHealthLockFile, paths.stateDir, paths.stateHealthProbeDir),
             (paths.runsHealthLockFile, paths.runsDir, paths.runsHealthProbeDir),
@@ -75,7 +80,13 @@ public enum LockingHealth {
             if let failure = FileLock(
                 path: healthLock, trustedRoot: paths.root
             ).probeLocking() {
-                return machine(failure)
+                // A fault in the health-only inode is inconclusive. A fault
+                // in its verified production parent remains machine-wide.
+                if failure.path == healthLock.path {
+                    diagnosticFailure = diagnosticFailure ?? diagnostic(failure)
+                } else {
+                    return machine(failure)
+                }
             }
             if let failure = FileLock.probeCreation(in: directory, trustedRoot: paths.root) {
                 return machine(failure)
@@ -88,10 +99,16 @@ public enum LockingHealth {
                 trustedRoot: paths.root,
                 mode: 0o700
             ) {
+                // The scratch node itself is health-only. Failure while
+                // validating its production parent still blocks real locks.
+                if failure.path == scratchDirectory.path {
+                    diagnosticFailure = diagnosticFailure ?? diagnostic(failure)
+                    continue healthFilesystems
+                }
                 return machine(failure)
             }
             if let failure = FileLock.probeActualCreation(in: scratchDirectory) {
-                return machine(failure)
+                diagnosticFailure = diagnosticFailure ?? diagnostic(failure)
             }
         }
         // These companion locks protect shared local state outside
@@ -111,7 +128,13 @@ public enum LockingHealth {
                 return machine(failure)
             }
         }
-        return probeConfiguredSetLocks(paths: paths, configuredSetIds: configuredSetIds)
+        if let productionFailure = probeConfiguredSetLocks(
+            paths: paths,
+            configuredSetIds: configuredSetIds
+        ) {
+            return productionFailure
+        }
+        return diagnosticFailure
     }
 
     /// The first unusable configured set lock already on disk, if any. The
@@ -147,5 +170,9 @@ public enum LockingHealth {
 
     private static func machine(_ failure: LockFailure) -> LockingHealthFailure {
         LockingHealthFailure(scope: .machine, failure: failure)
+    }
+
+    private static func diagnostic(_ failure: LockFailure) -> LockingHealthFailure {
+        LockingHealthFailure(scope: .diagnostic, failure: failure)
     }
 }

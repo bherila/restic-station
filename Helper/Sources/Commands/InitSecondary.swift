@@ -28,18 +28,25 @@ struct InitSecondary: AsyncParsableCommand {
             HelperExit.fail("destination \(dest) does not belong to backup set \(set)")
         }
 
-        let status = await context.engine.initSecondary(backupSet, dest: destination)
-        switch status {
-        case .success:
-            print("secondary \"\(destination.label)\" initialized")
-        case .warning:
-            print("secondary \"\(destination.label)\" initialized with warnings — see the run log")
-        case .failed:
-            HelperExit.fail("init-secondary failed — see the run log")
+        let outcome = await context.engine.initSecondary(backupSet, dest: destination)
+        switch outcome {
+        case .completed(let status):
+            switch status {
+            case .success:
+                print("secondary \"\(destination.label)\" initialized")
+            case .warning:
+                print("secondary \"\(destination.label)\" initialized with warnings — see the run log")
+            case .failed:
+                HelperExit.fail("init-secondary failed — see the run log")
+            case .skipped:
+                HelperExit.fail("init-secondary was skipped — try again")
+            case .running:
+                print("init-secondary \(status.rawValue)")
+            }
         case .skipped:
             HelperExit.fail("init-secondary was skipped (set busy or keychain unavailable) — try again")
-        case .running:
-            print("init-secondary \(status.rawValue)")
+        case .infrastructureFailure(let reason):
+            HelperExit.fail("this machine cannot run init-secondary: \(reason)")
         }
     }
 }

@@ -383,6 +383,7 @@ struct AppPathsEnvTests {
             try paths.ensureDirectories()
             let failure = try #require(LockingHealth.probe(paths: paths, configuredSetIds: []))
             #expect(failure.path == scratchDirectory.path)
+            #expect(failure.scope == .diagnostic)
         }
     }
 

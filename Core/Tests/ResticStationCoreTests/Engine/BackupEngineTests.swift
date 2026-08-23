@@ -1407,7 +1407,7 @@ struct BackupEngineTests {
 
         let status = await env.engine.runPrune(env.set)
 
-        #expect(status == .success)
+        #expect(status == .completed(.success))
         #expect(env.stateStore.readCurrentRun(setId: Self.setId) == nil, "live progress is cleared afterwards")
         // SAFETY: the mirror that is behind the primary is never forgotten.
         #expect(env.resticArgvs == [
@@ -1436,7 +1436,7 @@ struct BackupEngineTests {
 
         let status = await env.engine.runPrune(env.set)
 
-        #expect(status == .success)
+        #expect(status == .completed(.success))
         #expect(env.resticArgvs == [[Self.resticPath] + Self.forgetArgv(env.primary.repoURL)])
     }
 
@@ -1461,8 +1461,33 @@ struct BackupEngineTests {
 
         let status = await env.engine.runPrune(env.set)
 
-        #expect(status == .failed)
+        guard case .infrastructureFailure(let reason) = status else {
+            Issue.record("a terminal index failure must remain infrastructure failure: \(status)")
+            return
+        }
+        #expect(reason.contains("run history unusable"))
         #expect(env.indexEntries.isEmpty)
+    }
+
+    @Test("runPrune: an unusable set lock is a typed infrastructure failure")
+    func pruneLockUnusable() async throws {
+        let env = Self.makeEnv(script: [], reachableSecondaries: [])
+        defer { env.cleanUp() }
+        try env.paths.ensureDirectories()
+        try FileManager.default.createDirectory(
+            at: env.paths.setLockFile(setId: Self.setId),
+            withIntermediateDirectories: true
+        )
+
+        let outcome = await env.engine.runPrune(env.set)
+
+        guard case .infrastructureFailure(let reason) = outcome else {
+            Issue.record("an unusable prune lock must be infrastructure failure: \(outcome)")
+            return
+        }
+        #expect(reason.contains("lock"))
+        #expect(env.resticArgvs.isEmpty)
+        #expect(env.entries(kind: .prune).first?.status == .failed)
     }
 
     @Test(
@@ -2805,7 +2830,7 @@ struct BackupEngineTests {
             overwriteMode: .ifNewer
         ))
 
-        #expect(status == .success)
+        #expect(status == .completed(.success))
         #expect(env.resticArgvs == [[
             Self.resticPath, "-r", env.primary.repoURL, "restore", "--json", "abc123:/proj/src",
             "--target", target, "--include", "*.txt", "--overwrite", "if-newer",
@@ -2837,6 +2862,31 @@ struct BackupEngineTests {
         #expect(env.entries(kind: .restore).first?.status == .skipped)
     }
 
+    @Test("runRestore: an unusable set lock is a typed infrastructure failure")
+    func restoreLockUnusable() async throws {
+        let env = Self.makeEnv(script: [], reachableSecondaries: [])
+        defer { env.cleanUp() }
+        try env.paths.ensureDirectories()
+        try FileManager.default.createDirectory(
+            at: env.paths.setLockFile(setId: Self.setId),
+            withIntermediateDirectories: true
+        )
+
+        let outcome = await env.engine.runRestore(request: RestoreRequest(
+            destId: Self.primaryId,
+            snapshotID: "abc123",
+            targetPath: "/tmp/target"
+        ))
+
+        guard case .infrastructureFailure(let reason) = outcome else {
+            Issue.record("an unusable restore lock must be infrastructure failure: \(outcome)")
+            return
+        }
+        #expect(reason.contains("lock"))
+        #expect(env.resticArgvs.isEmpty)
+        #expect(env.entries(kind: .restore).first?.status == .failed)
+    }
+
     @Test("runRestore: per-item error messages downgrade an exit-0 restore to .warning")
     func restoreWithItemErrorsIsWarning() async throws {
         let env = Self.makeEnv(script: [], reachableSecondaries: [])
@@ -2860,7 +2910,7 @@ struct BackupEngineTests {
             targetPath: "/tmp/target"
         ))
 
-        #expect(status == .warning)
+        #expect(status == .completed(.warning))
         #expect(env.entries(kind: .restore).first?.status == .warning)
     }
 
@@ -2886,7 +2936,7 @@ struct BackupEngineTests {
 
         let status = await env.engine.initSecondary(env.set, dest: secondary)
 
-        #expect(status == .success)
+        #expect(status == .completed(.success))
         #expect(env.resticArgvs == [[
             Self.resticPath, "-r", secondary.repoURL, "init", "--json",
             "--from-repo", env.primary.repoURL, "--copy-chunker-params",
@@ -2907,8 +2957,29 @@ struct BackupEngineTests {
 
         let status = await env.engine.initSecondary(env.set, dest: env.primary)
 
-        #expect(status == .failed)
+        #expect(status == .completed(.failed))
         #expect(env.fake.invocations.isEmpty)
+    }
+
+    @Test("initSecondary: an unusable set lock is a typed infrastructure failure")
+    func initSecondaryLockUnusable() async throws {
+        let env = Self.makeEnv(script: [], reachableSecondaries: [true])
+        defer { env.cleanUp() }
+        try env.paths.ensureDirectories()
+        try FileManager.default.createDirectory(
+            at: env.paths.setLockFile(setId: Self.setId),
+            withIntermediateDirectories: true
+        )
+
+        let outcome = await env.engine.initSecondary(env.set, dest: env.secondaries[0])
+
+        guard case .infrastructureFailure(let reason) = outcome else {
+            Issue.record("an unusable init lock must be infrastructure failure: \(outcome)")
+            return
+        }
+        #expect(reason.contains("lock"))
+        #expect(env.resticArgvs.isEmpty)
+        #expect(env.entries(kind: .`init`).first?.status == .failed)
     }
 
     // MARK: - Misconfiguration

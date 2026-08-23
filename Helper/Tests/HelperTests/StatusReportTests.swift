@@ -219,6 +219,37 @@ struct StatusReportTests {
         #expect(!text.contains("NOTHING CAN RUN ON THIS MACHINE"))
     }
 
+    @Test("a damaged health-only probe is inconclusive, not a production outage")
+    func brokenDiagnosticProbeDoesNotClaimProductionIsStopped() throws {
+        let report = StatusReport(
+            machineId: "studio-mac", generatedAt: Date(), health: "warning",
+            fullDiskAccessDenied: false,
+            locking: StatusReport.LockingStatus(
+                paths: AppPaths(root: URL(fileURLWithPath: "/data")),
+                failure: LockingHealthFailure(
+                    scope: .diagnostic,
+                    failure: LockFailure(
+                        path: "/data/locks/health.lock", operation: "open", errnoValue: EISDIR
+                    )
+                )
+            ),
+            scheduler: nil,
+            sets: [makeSetStatus(needsAttention: false, isRunning: false)],
+            unattributedRuns: [],
+            excludedHere: []
+        )
+
+        let text = report.humanLines().joined(separator: "\n")
+        #expect(text.contains("LIVE LOCKING CHECK IS INCONCLUSIVE"))
+        #expect(text.contains("production locks were not proven unusable"))
+        #expect(!text.contains("NOTHING CAN RUN ON THIS MACHINE"))
+        #expect(!text.contains("ONE OR MORE BACKUP SETS CANNOT RUN"))
+
+        let json = String(decoding: try ConfigStore.makeEncoder().encode(report), as: UTF8.self)
+        #expect(json.contains("\"usable\" : null"))
+        #expect(json.contains("\"scope\" : \"diagnostic\""))
+    }
+
     @Test("a healthy report names no attention-needed flags")
     func healthyReportHasNoFlags() {
         let report = StatusReport(

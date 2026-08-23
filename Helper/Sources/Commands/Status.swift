@@ -485,22 +485,30 @@ struct StatusReport: Encodable {
     ///
     /// Whether this machine's locking machinery is usable at all.
     ///
-    /// `usable: false` means at least one lock path is broken. `scope`
-    /// distinguishes a machine-wide shared-lock outage from one damaged
-    /// per-set lock; `tick` continues the other sets in the latter case.
-    /// Probed live — see ``LockingHealth``.
+    /// `usable: false` means a production lock path is broken; `null` means
+    /// the health-only probe is damaged and production usability is unknown.
+    /// `scope` distinguishes a machine-wide shared-lock outage, one damaged
+    /// per-set lock, and an inconclusive diagnostic probe. Probed live — see
+    /// ``LockingHealth``.
     struct LockingStatus: Encodable {
-        let usable: Bool
+        let usable: Bool?
         let dataDirectory: String
         /// The specific fault, `null` when usable.
         let problem: String?
-        /// `"machine"`, `"set"`, or `null` when healthy.
+        /// `"machine"`, `"set"`, `"diagnostic"`, or `null` when healthy.
         let scope: String?
         /// The affected set for a partial outage; otherwise `null`.
         let setId: UUID?
 
         init(paths: AppPaths, failure: LockingHealthFailure?) {
-            self.usable = failure == nil
+            switch failure?.scope {
+            case .machine, .set:
+                usable = false
+            case .diagnostic:
+                usable = nil
+            case nil:
+                usable = true
+            }
             self.dataDirectory = paths.root.path
             self.problem = failure.map { String(describing: $0) }
             switch failure?.scope {
@@ -510,6 +518,9 @@ struct StatusReport: Encodable {
             case .set(let id):
                 scope = "set"
                 setId = id
+            case .diagnostic:
+                scope = "diagnostic"
+                setId = nil
             case nil:
                 scope = nil
                 setId = nil
@@ -520,7 +531,7 @@ struct StatusReport: Encodable {
             case usable, dataDirectory, problem, scope, setId
         }
 
-        // Explicit `null` for `problem`, per the encoding convention.
+        // Explicit `null` for optionals, including an inconclusive `usable`.
         func encode(to encoder: Encoder) throws {
             var container = encoder.container(keyedBy: CodingKeys.self)
             try container.encode(usable, forKey: .usable)
@@ -690,7 +701,7 @@ struct StatusReport: Encodable {
             + (fullDiskAccessDenied ? " (Full Disk Access denied)" : ""))
         // Ahead of the scheduler line: if this is broken, the scheduler
         // firing perfectly on time changes nothing.
-        if !locking.usable {
+        if locking.usable == false {
             if locking.scope == "set", let setId = locking.setId {
                 lines.append(
                     "locking: ONE OR MORE BACKUP SETS CANNOT RUN "
@@ -701,6 +712,13 @@ struct StatusReport: Encodable {
             }
             lines.append("  - \(locking.problem ?? "the data directory is unusable")")
             lines.append("  detail: check ownership and permissions on \(locking.dataDirectory)")
+        } else if locking.usable == nil {
+            lines.append("locking: LIVE LOCKING CHECK IS INCONCLUSIVE")
+            lines.append("  - diagnostic probe could not run: \(locking.problem ?? "unknown problem")")
+            lines.append(
+                "  detail: repair the health-only probe under \(locking.dataDirectory); "
+                    + "production locks were not proven unusable"
+            )
         }
         if let scheduler {
             // `if let` rather than `switch` over the `Bool?`. Swift 6.3
