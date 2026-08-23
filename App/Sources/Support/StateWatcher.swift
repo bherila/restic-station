@@ -478,16 +478,28 @@ public final class StateWatcher: ObservableObject {
             return
         }
 
-        let urls = [
-            paths.tickLockFile,
-            paths.healthLockFile,
-            paths.secretsLockFile,
-            paths.scheduleStateLockFile,
-            paths.stateHealthLockFile,
-            paths.previewTokensLockFile,
-            paths.runsIndexLockFile,
-            paths.runsHealthLockFile,
-        ] + configuredSetIds.map { paths.setLockFile(setId: $0) }
+        var urls: [URL] = []
+        if locksDirSource != nil {
+            urls += [
+                paths.tickLockFile,
+                paths.healthLockFile,
+                paths.secretsLockFile,
+            ]
+            urls += configuredSetIds.map { paths.setLockFile(setId: $0) }
+        }
+        if stateDirSource != nil {
+            urls += [
+                paths.scheduleStateLockFile,
+                paths.stateHealthLockFile,
+                paths.previewTokensLockFile,
+            ]
+        }
+        if runsDirSource != nil {
+            urls += [
+                paths.runsIndexLockFile,
+                paths.runsHealthLockFile,
+            ]
+        }
         let desired = Dictionary(uniqueKeysWithValues: urls.map {
             ($0.standardizedFileURL.path, $0.standardizedFileURL)
         })
