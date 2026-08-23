@@ -1522,6 +1522,40 @@ struct BackupEngineTests {
         #expect(env.indexEntries.isEmpty)
     }
 
+    @Test("standalone prune: launch and terminal-index failures stay outcome-neutral")
+    func standalonePruneLaunchAndIndexFailuresStayOutcomeNeutral() async throws {
+        let paths = Box<AppPaths?>(nil)
+        let env = Self.makeEnv(
+            script: [],
+            retention: nil,
+            onSpawn: { argv in
+                guard argv.contains("prune"), let paths = paths.value else { return }
+                try? FileManager.default.removeItem(at: paths.runsIndexLockFile)
+                try? FileManager.default.createDirectory(
+                    at: paths.runsIndexLockFile,
+                    withIntermediateDirectories: true
+                )
+            }
+        )
+        paths.value = env.paths
+        defer { env.cleanUp() }
+        env.fake.script = [
+            .init(
+                argvPrefix: [Self.resticPath, "-r", env.primary.repoURL, "prune"],
+                failure: .launchFailed("restic disappeared")
+            ),
+        ]
+
+        let result = await env.engine.runPruneRepository(set: env.set, destination: env.primary)
+
+        guard case .failed(.infrastructure(let reason)) = result else {
+            Issue.record("combined launch/index failure must stay infrastructure failure: \(result)")
+            return
+        }
+        #expect(reason.contains("run history unusable"))
+        #expect(env.indexEntries.isEmpty)
+    }
+
     @Test("standalone remote prune: a terminal run-index failure cannot report success")
     func standaloneRemotePruneIndexFailureCannotReportSuccess() async throws {
         let paths = Box<AppPaths?>(nil)
