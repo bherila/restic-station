@@ -13,8 +13,8 @@ The Maintenance screen per `docs/ui-spec.md` §Maintenance: sizes, retention pre
 - Footer: "Repository reports locked? Remove stale locks" → helper unlock (add `unlock` plumbing: reuse `run-set --kind` — no; add a tiny helper subcommand `unlock --set --dest` in this task, mirroring T10 patterns, engine method `runUnlock` calling `.unlock` command with a run record kind reuse `prune`? No — use RunKind extension: record as kind `check` is wrong too. Simplest correct: no run record for unlock; direct ResticRunner call from helper, log to stdout only. Document this exception in the subcommand's abstract.)
 
 ## Acceptance criteria
-- [ ] Against a fixture repo with 3 snapshots and keep-last 1: Preview shows 1 keep / 2 remove; Apply → snapshot count drops to 1 (verified via UI refresh AND `restic snapshots`).
-- [ ] Confirmation numbers always come from a fresh dry-run, never from the stale preview.
+- [ ] Against a fixture repo with 3 snapshots and keep-last 1: Preview shows 1 keep / 2 remove. **Apply is contained** — the control is disabled, the section states the posture, and the helper refuses; assert the refusal instead of a snapshot drop. Retention through a scheduled `tick` is asserted by `scripts/integration-test.sh` §retention.
+- [ ] *Deferred until re-enablement (#111/#82):* Apply → snapshot count drops to 1 (verified via UI refresh AND `restic snapshots`); confirmation numbers always come from a fresh dry-run, never from the stale preview.
 - [ ] Size cards distinguish "on disk" vs "protected data" with the ui-spec labels.
 - [ ] Check now produces a check run record; slice indicator advances on scheduled-style slice checks.
 - [ ] Stale destination (hand-edit repo-status lastSyncedAt back 30 days) highlights correctly.
