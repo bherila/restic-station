@@ -50,6 +50,7 @@ public final class StateWatcher: ObservableObject {
     private let paths: AppPaths
     private let runStore: RunStore
     private let stateStore: StateStore
+    private let secretBackend: SecretBackend
     private var configuredSetIds: Set<UUID>
 
     /// Every filesystem/notification event lands on this serial queue so
@@ -73,6 +74,10 @@ public final class StateWatcher: ObservableObject {
     /// changes only the parent's vnode — none of the sources below the root
     /// receive that event.
     private var rootParentDirSource: DispatchSourceFileSystemObject?
+    /// Watches the parent of `rootParentDirSource` so replacement of the
+    /// immediate root parent can be discovered after its descriptor becomes
+    /// attached to the retired inode.
+    private var rootGrandparentDirSource: DispatchSourceFileSystemObject?
     /// Watches `paths.root` purely so that a delete+recreate of `state/`,
     /// `runs/`, or `locks/` (which this watcher cannot keep an open fd across)
     /// has a
@@ -92,6 +97,7 @@ public final class StateWatcher: ObservableObject {
     private var isRunning = false
 
     private enum WatchTarget {
+        case rootGrandparent
         case rootParent
         case root
         case directory(WatchedDirectory)
@@ -118,11 +124,13 @@ public final class StateWatcher: ObservableObject {
         paths: AppPaths,
         runStore: RunStore,
         stateStore: StateStore,
+        secretBackend: SecretBackend = .configured,
         configuredSetIds: Set<UUID> = []
     ) {
         self.paths = paths
         self.runStore = runStore
         self.stateStore = stateStore
+        self.secretBackend = secretBackend
         self.configuredSetIds = configuredSetIds
     }
 
@@ -144,6 +152,7 @@ public final class StateWatcher: ObservableObject {
         lockFileSources.values.forEach { $0.cancel() }
         rootDirSource?.cancel()
         rootParentDirSource?.cancel()
+        rootGrandparentDirSource?.cancel()
         if let distributedNotificationObserver {
             DistributedNotificationCenter.default().removeObserver(distributedNotificationObserver)
         }
@@ -168,7 +177,14 @@ public final class StateWatcher: ObservableObject {
 
         let rootParent = paths.root.deletingLastPathComponent().standardizedFileURL
         if rootParent.path != paths.root.standardizedFileURL.path {
-            rootParentDirSource = makeSource(watching: rootParent, target: .rootParent)
+            let rootGrandparent = rootParent.deletingLastPathComponent().standardizedFileURL
+            if rootGrandparent.path != rootParent.path {
+                rootGrandparentDirSource = makeSource(
+                    watching: rootGrandparent,
+                    target: .rootGrandparent
+                )
+            }
+            attemptReopenRootParent()
         }
         attemptReopenRoot()
         attemptPendingReopens()
@@ -210,6 +226,8 @@ public final class StateWatcher: ObservableObject {
         rootDirSource = nil
         rootParentDirSource?.cancel()
         rootParentDirSource = nil
+        rootGrandparentDirSource?.cancel()
+        rootGrandparentDirSource = nil
         pendingReopen.removeAll()
 
         if let distributedNotificationObserver {
@@ -223,7 +241,11 @@ public final class StateWatcher: ObservableObject {
     /// `start()`, e.g. to pre-populate a preview) — every read tolerates a
     /// missing file or directory.
     public func reloadNow() {
-        lockingFailure = LockingHealth.probe(paths: paths, configuredSetIds: configuredSetIds)
+        lockingFailure = LockingHealth.probe(
+            paths: paths,
+            configuredSetIds: configuredSetIds,
+            secretBackend: secretBackend
+        )
         if isRunning { refreshLockFileSources() }
         scheduleState = stateStore.readScheduleState()
         fdaCheck = stateStore.readFdaCheck()
@@ -336,13 +358,26 @@ public final class StateWatcher: ObservableObject {
                     } else {
                         self.attemptPendingReopens()
                     }
+                case .rootGrandparent:
+                    // The grandparent remains attached when the immediate
+                    // parent is replaced, so it drives retries against the
+                    // configured parent pathname.
+                    if self.rootParentDirSource == nil {
+                        self.attemptReopenRootParent()
+                        self.attemptReopenRoot()
+                        self.attemptPendingReopens()
+                    } else {
+                        shouldReload = false
+                    }
                 case .rootParent:
                     // A parent event may be a permission change that affects
                     // lock health, or the recreation of a replaced root. An
                     // ordinary `.write` while the root is still watched is
                     // just sibling churn (especially under /tmp) and must not
                     // turn the watcher into a polling loop.
-                    if self.rootDirSource == nil {
+                    if needsReopen {
+                        self.handleRootParentInvalidated()
+                    } else if self.rootDirSource == nil {
                         self.attemptReopenRoot()
                     } else {
                         shouldReload = source.data.contains(.attrib)
@@ -368,20 +403,34 @@ public final class StateWatcher: ObservableObject {
     /// the retired tree. Tear the whole hierarchy down and resolve it again
     /// from the root's still-watched parent.
     private func handleRootInvalidated() {
-        rootDirSource?.cancel()
-        rootDirSource = nil
-        for directory in WatchedDirectory.allCases {
-            invalidateSource(for: directory)
-            pendingReopen.insert(directory)
-        }
-        lockFileSources.values.forEach { $0.cancel() }
-        lockFileSources.removeAll()
+        invalidateRootHierarchy()
         attemptReopenRoot()
         attemptPendingReopens()
     }
 
+    private func handleRootParentInvalidated() {
+        rootParentDirSource?.cancel()
+        rootParentDirSource = nil
+        invalidateRootHierarchy()
+        attemptReopenRootParent()
+        attemptReopenRoot()
+        attemptPendingReopens()
+    }
+
+    private func attemptReopenRootParent() {
+        guard rootParentDirSource == nil else { return }
+        let rootParent = paths.root.deletingLastPathComponent().standardizedFileURL
+        guard rootParent.path != paths.root.standardizedFileURL.path else { return }
+        rootParentDirSource = makeSource(watching: rootParent, target: .rootParent)
+    }
+
     private func attemptReopenRoot() {
         guard rootDirSource == nil else { return }
+
+        let rootParent = paths.root.deletingLastPathComponent().standardizedFileURL
+        if rootParent.path != paths.root.standardizedFileURL.path {
+            guard rootParentDirSource != nil else { return }
+        }
 
         // Child paths must never be resolved while the configured root is
         // unavailable (most importantly, while it is a symlink rejected by
@@ -393,6 +442,13 @@ public final class StateWatcher: ObservableObject {
         pendingReopen.formUnion(WatchedDirectory.allCases)
 
         rootDirSource = makeSource(watching: paths.root, target: .root)
+    }
+
+    private func invalidateRootHierarchy() {
+        rootDirSource?.cancel()
+        rootDirSource = nil
+        invalidateDescendantSources()
+        pendingReopen.formUnion(WatchedDirectory.allCases)
     }
 
     private func attemptPendingReopens() {
@@ -483,8 +539,8 @@ public final class StateWatcher: ObservableObject {
             urls += [
                 paths.tickLockFile,
                 paths.healthLockFile,
-                paths.secretsLockFile,
             ]
+            if secretBackend == .file { urls.append(paths.secretsLockFile) }
             urls += configuredSetIds.map { paths.setLockFile(setId: $0) }
         }
         if stateDirSource != nil {

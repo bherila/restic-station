@@ -7,6 +7,49 @@ import Testing
 @Suite("StateWatcher lock health", .serialized)
 @MainActor
 struct StateWatcherTests {
+    @Test("replacing the data-root parent rebinds the entire watch hierarchy")
+    func rootParentReplacementRebindsHierarchy() async throws {
+        let container = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-root-parent-replacement-\(UUID().uuidString)", isDirectory: true)
+        let parent = container.appendingPathComponent("parent", isDirectory: true)
+        let retiredParent = container.appendingPathComponent("parent-retired", isDirectory: true)
+        let root = parent.appendingPathComponent("data", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: container) }
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: parent.path)
+
+        let paths = AppPaths(root: root)
+        try paths.ensureDirectories()
+        let initialTick = FileLock(path: paths.tickLockFile, trustedRoot: root)
+        #expect(initialTick.acquire() == .acquired)
+        initialTick.release()
+
+        let watcher = StateWatcher(
+            paths: paths,
+            runStore: RunStore(paths: paths),
+            stateStore: StateStore(paths: paths)
+        )
+        watcher.start()
+        defer { watcher.stop() }
+        #expect(watcher.lockingFailure == nil)
+
+        try FileManager.default.moveItem(at: parent, to: retiredParent)
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: false)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: parent.path)
+        try paths.ensureDirectories()
+        let replacementTick = FileLock(path: paths.tickLockFile, trustedRoot: root)
+        #expect(replacementTick.acquire() == .acquired)
+        replacementTick.release()
+        try await Task.sleep(nanoseconds: 750_000_000)
+
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: paths.tickLockFile.path)
+        for _ in 0..<40 {
+            if watcher.lockingFailure?.path == paths.tickLockFile.path { break }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        #expect(watcher.lockingFailure?.path == paths.tickLockFile.path)
+    }
+
     @Test("repairing a symlinked locks directory rebinds direct lock watches")
     func symlinkedLocksRepairRebindsDirectWatches() async throws {
         let parent = FileManager.default.temporaryDirectory

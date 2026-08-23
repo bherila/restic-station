@@ -50,7 +50,11 @@ public enum LockingHealth {
     ///
     /// Per-set locks are created on demand, so a read-only status query must
     /// not bring one into being for every configured set as a side effect.
-    public static func probe(paths: AppPaths, configuredSetIds: Set<UUID>) -> LockingHealthFailure? {
+    public static func probe(
+        paths: AppPaths,
+        configuredSetIds: Set<UUID>,
+        secretBackend: SecretBackend = .file
+    ) -> LockingHealthFailure? {
         do {
             try paths.ensureDirectories()
         } catch let failure as LockFailure {
@@ -126,10 +130,15 @@ public enum LockingHealth {
         // The secrets lock serializes mutation only. Reads use the atomic
         // secrets file directly, so damage here is an administrative outage,
         // not evidence that configured backup operations cannot run.
-        let administrativeFailure = FileLock(
-            path: paths.secretsLockFile, trustedRoot: paths.root
-        ).probe(createIfMissing: false).map {
-            LockingHealthFailure(scope: .administrative, failure: $0)
+        let administrativeFailure: LockingHealthFailure?
+        if secretBackend == .file {
+            administrativeFailure = FileLock(
+                path: paths.secretsLockFile, trustedRoot: paths.root
+            ).probe(createIfMissing: false).map {
+                LockingHealthFailure(scope: .administrative, failure: $0)
+            }
+        } else {
+            administrativeFailure = nil
         }
 
         // These companion locks protect shared local state outside

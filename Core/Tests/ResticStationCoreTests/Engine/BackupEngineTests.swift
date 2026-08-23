@@ -1555,6 +1555,67 @@ struct BackupEngineTests {
         #expect(env.stateStore.readScheduleState()?.sets[Self.setId]?.checkCount == 4)
     }
 
+    @Test("runCheck: primary index failure preserves successful bookkeeping and secondary checks")
+    func checkPrimaryIndexFailureContinuesSuccessfulBookkeeping() async throws {
+        let paths = Box<AppPaths?>(nil)
+        let env = Self.makeEnv(
+            script: [],
+            checkPolicy: CheckPolicy(enabled: true, readDataSubsetSlices: 20),
+            reachableSecondaries: [true],
+            onSpawn: { argv in
+                guard let paths = paths.value, argv.contains("check") else { return }
+                if argv.contains("--read-data-subset=4/20") {
+                    try? FileManager.default.removeItem(at: paths.runsIndexLockFile)
+                    try? FileManager.default.createDirectory(
+                        at: paths.runsIndexLockFile,
+                        withIntermediateDirectories: true
+                    )
+                } else {
+                    // Isolate the primary terminal-index failure. Repair the
+                    // index before the independently safe secondary check.
+                    try? FileManager.default.removeItem(at: paths.runsIndexLockFile)
+                }
+            }
+        )
+        paths.value = env.paths
+        defer { env.cleanUp() }
+        let reachable = env.secondaries[0]
+        try env.stateStore.updateScheduleState(setId: Self.setId) { state in
+            state.checkSliceCursor = 3
+            state.checkCount = 3
+        }
+
+        env.fake.script =
+            Self.resticCall(
+                ["-r", env.primary.repoURL, "check", "--read-data-subset=4/20"],
+                dest: Self.primaryId,
+                stdoutLines: ["no errors were found"]
+            )
+            + Self.resticCall(
+                ["-r", reachable.repoURL, "check"],
+                dest: Self.secondaryAId,
+                stdoutLines: ["no errors were found"]
+            )
+
+        let outcome = await env.engine.runCheck(env.set)
+
+        guard case .infrastructureFailure(let reason) = outcome else {
+            Issue.record("the primary terminal-index fault must remain the outcome: \(outcome)")
+            return
+        }
+        #expect(reason.contains("run history unusable"))
+        #expect(env.resticArgvs == [
+            [Self.resticPath, "-r", env.primary.repoURL, "check", "--read-data-subset=4/20"],
+            [Self.resticPath, "-r", reachable.repoURL, "check"],
+        ])
+        let state = try #require(env.stateStore.readScheduleState()?.sets[Self.setId])
+        #expect(state.checkSliceCursor == 4)
+        #expect(state.checkCount == 4)
+        let checks = env.entries(kind: .check)
+        #expect(checks.count == 1)
+        #expect(checks.first?.destId == Self.secondaryAId)
+    }
+
     @Test("runCheck: set lock busy → .skipped record, no restic")
     func checkLockBusy() async throws {
         let env = Self.makeEnv(script: [], reachableSecondaries: [])

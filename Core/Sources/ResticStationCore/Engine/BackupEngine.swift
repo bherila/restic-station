@@ -653,11 +653,11 @@ public final class BackupEngine: Sendable {
         case .infrastructureFailure(let reason):
             return .infrastructureFailure(reason: reason)
         }
-        if let reason = primaryCheck.infrastructureFailureReason {
-            return .infrastructureFailure(reason: reason)
-        }
         var statuses = [primaryCheck.child.status]
         var infrastructureFailures: [String] = []
+        if let reason = primaryCheck.infrastructureFailureReason {
+            infrastructureFailures.append("primary \"\(primary.label)\": \(reason)")
+        }
 
         if primaryCheck.child.status == .success {
             // SAFETY: cursor advances only on success.

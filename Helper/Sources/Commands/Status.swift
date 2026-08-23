@@ -134,13 +134,23 @@ struct Status: AsyncParsableCommand, JSONRenderable {
         // unconditionally, which reads as "the scheduler is fine" and hid a
         // host whose timer or LaunchAgent had stopped firing.
         let scheduler = await Self.scheduler(paths: paths)
+        let secretBackend: SecretBackend
+        do {
+            secretBackend = try SecretBackend.resolve()
+        } catch {
+            throw CLIFailure(
+                code: .configInvalid,
+                message: "secret storage is misconfigured: \(error)"
+            )
+        }
         // Live, not recorded. A host whose `locks/` cannot be created or
         // whose lock files are not ours has stopped backing up, and is also
         // unable to write the run record or health state that would say so —
         // so the only reliable place to notice is here, at read time (#110).
         let lockingFailure = LockingHealth.probe(
             paths: paths,
-            configuredSetIds: Set(scheduled.config.sets.map(\.id))
+            configuredSetIds: Set(scheduled.config.sets.map(\.id)),
+            secretBackend: secretBackend
         )
         let health = HealthDerivation.appHealth(
             setHealths: setHealths,

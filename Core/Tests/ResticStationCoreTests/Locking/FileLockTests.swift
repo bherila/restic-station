@@ -664,6 +664,33 @@ let canInjectPermissionFaults = geteuid() != 0
         }
     }
 
+    @Test("LockingHealth ignores the unused file-secret lock for keychain storage")
+    func lockingHealthScopesSecretLockToActiveBackend() throws {
+        let root = makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = AppPaths(root: root)
+        try paths.ensureDirectories()
+        try FileManager.default.createDirectory(
+            at: paths.secretsLockFile,
+            withIntermediateDirectories: true
+        )
+
+        #expect(
+            LockingHealth.probe(
+                paths: paths,
+                configuredSetIds: [],
+                secretBackend: .keychain
+            ) == nil
+        )
+        let fileFailure = try #require(LockingHealth.probe(
+            paths: paths,
+            configuredSetIds: [],
+            secretBackend: .file
+        ))
+        #expect(fileFailure.scope == .administrative)
+        #expect(fileFailure.path == paths.secretsLockFile.path)
+    }
+
     @Test("a successful directory-creation probe does not mutate the directory")
     func creationProbeDoesNotMutateDirectory() throws {
         let directory = makeDirectory()
