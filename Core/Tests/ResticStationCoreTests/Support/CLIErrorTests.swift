@@ -158,6 +158,31 @@ struct CLIErrorContractTests {
         #expect(stale.code == .operationNotAllowed)
         #expect(stale.details.setId == setId)
         #expect(!stale.message.contains("token"), "capabilities never appear in an envelope")
+
+        let didNotRun = CLIFailure.classifyPurgeApply(
+            PurgeApplyError.infrastructureFailure(
+                reason: "run history unusable",
+                operationMayHaveRun: false
+            ),
+            setId: setId
+        )
+        #expect(didNotRun.code == .internalError)
+        #expect(!didNotRun.retryable)
+        #expect(didNotRun.message.contains("did not run destructive work"))
+        #expect(!didNotRun.message.contains("backup-set lock"))
+
+        let mayHaveRun = CLIFailure.classifyPurgeApply(
+            PurgeApplyError.infrastructureFailure(
+                reason: "run history unusable",
+                operationMayHaveRun: true
+            ),
+            setId: setId
+        )
+        #expect(mayHaveRun.code == .internalError)
+        #expect(!mayHaveRun.retryable)
+        #expect(mayHaveRun.message.contains("may have changed repository data"))
+        #expect(mayHaveRun.message.contains("Inspect the repositories before retrying"))
+        #expect(!mayHaveRun.message.contains("backup-set lock"))
     }
 }
 

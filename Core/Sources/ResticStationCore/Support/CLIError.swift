@@ -453,6 +453,17 @@ extension CLIFailure {
                 ),
                 details: CLIErrorDetails(setId: setId)
             )
+        case .infrastructureFailure(let reason, let operationMayHaveRun):
+            let message = operationMayHaveRun
+                ? "The purge may have changed repository data, but its result could not be recorded or trusted: "
+                    + "\(reason). Inspect the repositories before retrying."
+                : "The purge did not run destructive work because its local state could not be recorded: \(reason). "
+                    + "Check the permissions on the Restic Station data directory."
+            return CLIFailure(
+                code: .internalError,
+                message: CLIFailure.bounded(message),
+                details: CLIErrorDetails(setId: setId)
+            )
         case .destinationOffline(let destinationId):
             return CLIFailure(
                 code: .repositoryOffline,

@@ -2573,6 +2573,124 @@ struct BackupEngineTests {
         #expect(env.resticArgvs.count == 2, "a replay must not spawn restic")
     }
 
+    @Test("runPurge: an initial run-history failure is outcome-neutral infrastructure failure")
+    func purgeRunCreationFailureIsOutcomeNeutral() async throws {
+        let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]
+        let hostnames = [Self.setId: Set(["example-mac.local"])]
+        let env = Self.makeEnv(
+            script: [], retention: nil, purgeExcludes: ["build/**"], reachableSecondaries: [],
+            purgeSourcePaths: sourcePaths, purgeHostnames: hostnames
+        )
+        defer { env.cleanUp() }
+
+        let snapshotsJSON = try FixtureLoader.string("snapshots.json")
+        let snapshots = try parseSnapshots(Data(snapshotsJSON.utf8))
+        let plan = PurgePlan(
+            destinationId: env.primary.id,
+            snapshots: snapshots,
+            sourcePaths: sourcePaths[Self.setId]!,
+            hostnames: hostnames[Self.setId]!,
+            patterns: env.set.purgeExcludes
+        )
+        let token = try #require(try env.engine.issuePurgeToken(
+            set: env.set, destinations: [env.primary], plans: [plan]
+        ))
+        try env.paths.ensureDirectories()
+        let runId = RunStore.formatRunId(kind: .purge, setId: Self.setId, date: Self.t0)
+        try FileManager.default.createSymbolicLink(
+            at: env.paths.runDir(runId: runId),
+            withDestinationURL: env.root.appendingPathComponent("missing-run-target")
+        )
+        env.fake.script = Self.resticCall(
+            ["-r", env.primary.repoURL, "snapshots", "--json"],
+            dest: Self.primaryId,
+            stdoutLines: [snapshotsJSON]
+        )
+
+        do {
+            _ = try await env.engine.runPurge(
+                set: env.set, destinations: [env.primary], token: token.value
+            )
+            Issue.record("an unusable initial run store must fail the purge")
+        } catch let error as PurgeApplyError {
+            guard case .infrastructureFailure(let reason, let operationMayHaveRun) = error else {
+                Issue.record("expected infrastructure failure, got \(error)")
+                return
+            }
+            #expect(reason.contains("run history unusable"))
+            #expect(!operationMayHaveRun)
+        }
+        #expect(!env.resticArgvs.contains { $0.contains("rewrite") })
+    }
+
+    @Test("runPurge: terminal run-history failure reports that destructive work may have run")
+    func purgeTerminalRunHistoryFailureRequiresInspection() async throws {
+        let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]
+        let hostnames = [Self.setId: Set(["example-mac.local"])]
+        let paths = Box<AppPaths?>(nil)
+        let env = Self.makeEnv(
+            script: [], retention: nil, purgeExcludes: ["build/**"], reachableSecondaries: [],
+            onSpawn: { argv in
+                guard argv.contains("rewrite"),
+                      !argv.contains("--dry-run"),
+                      let paths = paths.value else { return }
+                try? FileManager.default.removeItem(at: paths.runsIndexLockFile)
+                try? FileManager.default.createDirectory(
+                    at: paths.runsIndexLockFile,
+                    withIntermediateDirectories: true
+                )
+            },
+            purgeSourcePaths: sourcePaths,
+            purgeHostnames: hostnames
+        )
+        paths.value = env.paths
+        defer { env.cleanUp() }
+
+        let snapshotsJSON = try FixtureLoader.string("snapshots.json")
+        let snapshots = try parseSnapshots(Data(snapshotsJSON.utf8))
+        let plan = PurgePlan(
+            destinationId: env.primary.id,
+            snapshots: snapshots,
+            sourcePaths: sourcePaths[Self.setId]!,
+            hostnames: hostnames[Self.setId]!,
+            patterns: env.set.purgeExcludes
+        )
+        let token = try #require(try env.engine.issuePurgeToken(
+            set: env.set, destinations: [env.primary], plans: [plan]
+        ))
+        let rewrite = try FixtureLoader.string("rewrite-forget.txt")
+            .replacingOccurrences(of: "09b3295c", with: snapshots[0].shortId)
+            .replacingOccurrences(of: "b2435423", with: snapshots[1].shortId)
+        env.fake.script = Self.resticCall(
+            ["-r", env.primary.repoURL, "snapshots", "--json"],
+            dest: Self.primaryId,
+            stdoutLines: [snapshotsJSON]
+        ) + Self.resticCall(
+            Self.rewriteArgv(
+                env.primary.repoURL,
+                snapshotIDs: snapshots.map(\.id),
+                patterns: env.set.purgeExcludes
+            ),
+            dest: Self.primaryId,
+            stdoutLines: rewrite.split(separator: "\n").map(String.init)
+        )
+
+        do {
+            _ = try await env.engine.runPurge(
+                set: env.set, destinations: [env.primary], token: token.value
+            )
+            Issue.record("a missing terminal run record must fail the purge")
+        } catch let error as PurgeApplyError {
+            guard case .infrastructureFailure(let reason, let operationMayHaveRun) = error else {
+                Issue.record("expected infrastructure failure, got \(error)")
+                return
+            }
+            #expect(reason.contains("run history unusable"))
+            #expect(operationMayHaveRun)
+        }
+        #expect(env.resticArgvs.contains { $0.contains("rewrite") && $0.contains("--forget") })
+    }
+
     @Test("runPurge: absent, expired, and changed snapshot-list tokens fail closed")
     func purgeApplyRefusesInvalidTokens() async throws {
         let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]

@@ -1385,7 +1385,10 @@ public final class BackupEngine: Sendable {
                 // ever run and no error shown. Leave it pending and say so.
                 if plan.unattributed.isEmpty {
                     try markPurgePatternsApplied(
-                        setId: set.id, destinationId: destination.id, patterns: preview.patterns
+                        setId: set.id,
+                        destinationId: destination.id,
+                        patterns: preview.patterns,
+                        operationMayHaveRun: !children.isEmpty
                     )
                 } else {
                     logWarning(
@@ -1410,16 +1413,25 @@ public final class BackupEngine: Sendable {
             case .completed(let child):
                 purge = child
             case .infrastructureFailure(let reason):
-                throw PurgeApplyError.lockUnusable(reason)
+                throw PurgeApplyError.infrastructureFailure(
+                    reason: reason,
+                    operationMayHaveRun: !children.isEmpty
+                )
             }
             children.append(purge.child)
             if let reason = purge.infrastructureFailureReason {
-                throw PurgeApplyError.lockUnusable(reason)
+                throw PurgeApplyError.infrastructureFailure(
+                    reason: reason,
+                    operationMayHaveRun: true
+                )
             }
             if resolvedGroupId == nil { resolvedGroupId = purge.child.runId }
             if purge.child.status == .success {
                 try markPurgePatternsApplied(
-                    setId: set.id, destinationId: destination.id, patterns: preview.patterns
+                    setId: set.id,
+                    destinationId: destination.id,
+                    patterns: preview.patterns,
+                    operationMayHaveRun: true
                 )
             }
         }
@@ -2260,7 +2272,8 @@ public final class BackupEngine: Sendable {
     private func markPurgePatternsApplied(
         setId: UUID,
         destinationId: UUID,
-        patterns: [String]
+        patterns: [String],
+        operationMayHaveRun: Bool
     ) throws {
         do {
             try updateScheduleState(setId: setId) { state in
@@ -2271,7 +2284,10 @@ public final class BackupEngine: Sendable {
                 state.appliedPurgeExcludes[destinationId] = applied
             }
         } catch {
-            throw PurgeApplyError.lockUnusable("could not persist the purge watermark — \(error)")
+            throw PurgeApplyError.infrastructureFailure(
+                reason: "could not persist the purge watermark — \(error)",
+                operationMayHaveRun: operationMayHaveRun
+            )
         }
     }
 
@@ -2280,6 +2296,8 @@ public final class BackupEngine: Sendable {
         switch error {
         case .lockUnusable(let detail):
             return detail
+        case .infrastructureFailure(let reason, _):
+            return reason
         case .token(.storeUnusable(let detail)):
             return "preview-token store unusable — \(detail)"
         default:
