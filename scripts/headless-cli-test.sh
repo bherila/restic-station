@@ -983,17 +983,32 @@ for TEST_UMASK in 0000 0777; do
     UMASK_ERR="$WORK/umask-$TEST_UMASK-status.err"
     : >"$UMASK_OUT"
     : >"$UMASK_ERR"
+    # Prime only the machine identity outside the test umask, then remove the
+    # generated internal directories. MachineStore's independent permission
+    # contract is outside this locking regression; both restrictive-umask
+    # attempts below must create and then reopen the lock tree themselves.
     set +e
-    (
-        umask "$TEST_UMASK"
-        RESTIC_STATION_DATA_DIR="$UMASK_DATA" \
-            "$HELPER" status --json >"$UMASK_OUT" 2>"$UMASK_ERR"
-    )
-    UMASK_RC=$?
+    RESTIC_STATION_DATA_DIR="$UMASK_DATA" \
+        "$HELPER" status --json >"$UMASK_OUT" 2>"$UMASK_ERR"
     set -e
-    cat "$UMASK_OUT" "$UMASK_ERR" >>"$COMBINED_LOG"
-    jq -e '.data.locking.usable == true' "$UMASK_OUT" >/dev/null \
-        || fail "a fresh umask-$TEST_UMASK install rejected its own lock tree: $(cat "$UMASK_OUT")"
+    rm -r "$UMASK_DATA/runs" "$UMASK_DATA/state" "$UMASK_DATA/locks"
+    for UMASK_ATTEMPT in 1 2; do
+        set +e
+        (
+            umask "$TEST_UMASK"
+            RESTIC_STATION_DATA_DIR="$UMASK_DATA" \
+                "$HELPER" status --json >"$UMASK_OUT" 2>"$UMASK_ERR"
+        )
+        UMASK_RC=$?
+        set -e
+        cat "$UMASK_OUT" "$UMASK_ERR" >>"$COMBINED_LOG"
+        jq -e '.data.locking.usable == true' "$UMASK_OUT" >/dev/null \
+            || fail "umask-$TEST_UMASK status attempt $UMASK_ATTEMPT rejected its lock tree: $(cat "$UMASK_OUT")"
+        # Scheduler health can independently make status exit 1; only a
+        # parser/setup failure may use another code here.
+        [[ "$UMASK_RC" -eq 0 || "$UMASK_RC" -eq 1 ]] \
+            || fail "umask-$TEST_UMASK status attempt $UMASK_ATTEMPT exited $UMASK_RC"
+    done
     for directory in \
         "$UMASK_DATA" \
         "$UMASK_DATA/runs" \
@@ -1007,12 +1022,20 @@ for TEST_UMASK in 0000 0777; do
         [[ "$DIRECTORY_MODE" == "700" ]] \
             || fail "$directory was mode $DIRECTORY_MODE after setup under umask $TEST_UMASK, expected 700"
     done
-    # Scheduler health can independently make status exit 1; only a
-    # parser/setup failure may use another code here.
-    [[ "$UMASK_RC" -eq 0 || "$UMASK_RC" -eq 1 ]] \
-        || fail "umask-$TEST_UMASK status exited $UMASK_RC"
+    for lock_file in \
+        "$UMASK_DATA/locks/health.lock" \
+        "$UMASK_DATA/state/health.lock" \
+        "$UMASK_DATA/runs/health.lock"; do
+        if [[ "$(uname -s)" == "Darwin" ]]; then
+            LOCK_MODE="$(stat -f '%Lp' "$lock_file")"
+        else
+            LOCK_MODE="$(stat -c '%a' "$lock_file")"
+        fi
+        [[ "$LOCK_MODE" == "600" ]] \
+            || fail "$lock_file was mode $LOCK_MODE after setup under umask $TEST_UMASK, expected 600"
+    done
 done
-ok "fresh lock-owning directories stay 0700 and usable under umasks 0000 and 0777"
+ok "fresh lock trees stay reusable at 0700/0600 under umasks 0000 and 0777"
 
 BROKEN_LOCKS="$WORK/broken-locks"
 mkdir -p "$BROKEN_LOCKS/locks/tick.lock"

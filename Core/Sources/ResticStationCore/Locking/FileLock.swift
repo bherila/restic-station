@@ -143,10 +143,10 @@ public final class FileLock: @unchecked Sendable {
     /// Post-open checks on the descriptor we actually hold.
     ///
     /// Returns `nil` when the file is acceptable. A pre-existing lock file
-    /// from an older release was created `0644`; that is ours and harmless,
-    /// so it is tightened in place via `fchmod` rather than refused — the
-    /// descriptor is already open, so there is no path to re-resolve and no
-    /// window for a swap.
+    /// from an older release may be `0644`, while a restrictive umask can
+    /// strip the owner bits from a newly created inode. Either non-exact mode
+    /// is repaired to `0600` through the descriptor rather than accepted —
+    /// there is no path to re-resolve and no window for a swap.
     private static func verify(fd: Int32, path: String) -> LockFailure? {
         var info = stat()
         guard fstat(fd, &info) == 0 else {
@@ -158,7 +158,7 @@ public final class FileLock: @unchecked Sendable {
         guard info.st_uid == geteuid() else {
             return LockFailure(path: path, operation: "ownership", errnoValue: 0)
         }
-        if info.st_mode & (S_IRWXG | S_IRWXO) != 0 {
+        if info.st_mode & 0o777 != 0o600 {
             guard fchmod(fd, 0o600) == 0 else {
                 return LockFailure(path: path, operation: "fchmod", errnoValue: errno)
             }
@@ -167,7 +167,7 @@ public final class FileLock: @unchecked Sendable {
             guard fstat(fd, &tightened) == 0 else {
                 return LockFailure(path: path, operation: "fstat after fchmod", errnoValue: errno)
             }
-            guard tightened.st_mode & (S_IRWXG | S_IRWXO) == 0 else {
+            guard tightened.st_mode & 0o777 == 0o600 else {
                 return LockFailure(path: path, operation: "permissions", errnoValue: 0)
             }
         }

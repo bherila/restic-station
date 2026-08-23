@@ -120,7 +120,10 @@ mode_of() {
 
 # ─────────────────────────────────────────────────────────────────────────
 log "1. secret set reads the password from a pipe (never argv)"
-printf '%s' "$PASSWORD" | "$HELPER" secret set --dest "$DEST_ID"
+# A maximally restrictive service umask must still produce a reusable 0600
+# file and mutation lock. The later set and print-password invocations are
+# separate processes and therefore prove these artifacts can be reopened.
+printf '%s' "$PASSWORD" | (umask 0777; "$HELPER" secret set --dest "$DEST_ID")
 [[ -f "$SECRETS_FILE" ]] || fail "no $SECRETS_FILE was created"
 ok "secret set stored a password"
 
@@ -128,9 +131,11 @@ ok "secret set stored a password"
 log "2. file is 0600, directory is 0700"
 FILE_MODE="$(mode_of "$SECRETS_FILE")"
 DIR_MODE="$(mode_of "$DATA_DIR")"
+LOCK_MODE="$(mode_of "$DATA_DIR/locks/secrets.lock")"
 [[ "$FILE_MODE" == "600" ]] || fail "expected secrets.json mode 600, got $FILE_MODE"
 [[ "$DIR_MODE" == "700" ]] || fail "expected data dir mode 700, got $DIR_MODE"
-ok "secrets.json=$FILE_MODE data dir=$DIR_MODE"
+[[ "$LOCK_MODE" == "600" ]] || fail "expected secrets.lock mode 600, got $LOCK_MODE"
+ok "secrets.json=$FILE_MODE secrets.lock=$LOCK_MODE data dir=$DIR_MODE"
 
 grep -q "\"$DEST_ID_LOWER\"" "$SECRETS_FILE" \
     || fail "secrets.json is not keyed on the lowercased destination uuid"

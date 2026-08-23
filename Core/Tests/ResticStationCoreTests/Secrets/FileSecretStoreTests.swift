@@ -355,6 +355,36 @@ struct FileSecretStoreTests {
         #expect(try await store.password(destId: Self.destId) == "hunter2")
     }
 
+    @Test("a temp-file chmod failure cannot report a successful secret write")
+    func tempFileChmodFailureIsFatalAndCleanedUp() async throws {
+        let (_, root) = Self.makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = FileSecretStore(
+            paths: AppPaths(root: root),
+            helperPath: "/opt/restic-station/restic-station-helper",
+            directoryModeSetter: { path, mode in
+                _ = path.withCString { chmod($0, mode) }
+            },
+            warningHandler: { _ in },
+            fileModeSetter: { _, _ in EPERM }
+        )
+
+        do {
+            try await store.setPassword("hunter2", destId: Self.destId)
+            Issue.record("expected an unenforceable temp-file mode to fail")
+        } catch let error as SecretStoreError {
+            guard case .backendFailed(let message) = error else {
+                Issue.record("expected .backendFailed, got \(error)")
+                return
+            }
+            #expect(message.contains(store.tempFileURL.path))
+            #expect(message.contains("mode 0600"))
+            #expect(!message.contains("hunter2"))
+        }
+        #expect(!FileManager.default.fileExists(atPath: store.tempFileURL.path))
+        #expect(!FileManager.default.fileExists(atPath: store.fileURL.path))
+    }
+
     @Test("an unusable secrets mutation lock stays typed and non-retryable")
     func unusableMutationLockIsTyped() async throws {
         let (store, root) = Self.makeStore()
