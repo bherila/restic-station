@@ -1440,6 +1440,31 @@ struct BackupEngineTests {
         #expect(env.resticArgvs == [[Self.resticPath] + Self.forgetArgv(env.primary.repoURL)])
     }
 
+    @Test("runPrune: a terminal run-index failure cannot report success")
+    func pruneIndexFailureCannotReportSuccess() async throws {
+        let paths = Box<AppPaths?>(nil)
+        let env = Self.makeEnv(
+            script: [],
+            reachableSecondaries: [],
+            onSpawn: { argv in
+                guard argv.contains("forget"), let paths = paths.value else { return }
+                try? FileManager.default.removeItem(at: paths.runsIndexLockFile)
+                try? FileManager.default.createDirectory(
+                    at: paths.runsIndexLockFile,
+                    withIntermediateDirectories: true
+                )
+            }
+        )
+        paths.value = env.paths
+        defer { env.cleanUp() }
+        env.fake.script = Self.resticCall(Self.forgetArgv(env.primary.repoURL), dest: Self.primaryId)
+
+        let status = await env.engine.runPrune(env.set)
+
+        #expect(status == .failed)
+        #expect(env.indexEntries.isEmpty)
+    }
+
     @Test(
         "safety: runPrune with an empty or absent policy spawns nothing at all",
         arguments: [nil, RetentionPolicy()] as [RetentionPolicy?]
@@ -1466,6 +1491,87 @@ struct BackupEngineTests {
         #expect(status == .completed(.success))
         #expect(env.resticArgvs == [[Self.resticPath, "-r", env.primary.repoURL, "prune"]])
         #expect(env.entries(kind: .prune).count == 1)
+    }
+
+    @Test("standalone prune: a terminal run-index failure cannot report success")
+    func standalonePruneIndexFailureCannotReportSuccess() async throws {
+        let paths = Box<AppPaths?>(nil)
+        let env = Self.makeEnv(
+            script: [],
+            retention: nil,
+            onSpawn: { argv in
+                guard argv.contains("prune"), let paths = paths.value else { return }
+                try? FileManager.default.removeItem(at: paths.runsIndexLockFile)
+                try? FileManager.default.createDirectory(
+                    at: paths.runsIndexLockFile,
+                    withIntermediateDirectories: true
+                )
+            }
+        )
+        paths.value = env.paths
+        defer { env.cleanUp() }
+        env.fake.script = Self.resticCall(["-r", env.primary.repoURL, "prune"], dest: Self.primaryId)
+
+        let result = await env.engine.runPruneRepository(set: env.set, destination: env.primary)
+
+        guard case .failed(.infrastructure(let reason)) = result else {
+            Issue.record("a missing terminal index entry must fail standalone prune: \(result)")
+            return
+        }
+        #expect(reason.contains("run history unusable"))
+        #expect(env.indexEntries.isEmpty)
+    }
+
+    @Test("standalone remote prune: a terminal run-index failure cannot report success")
+    func standaloneRemotePruneIndexFailureCannotReportSuccess() async throws {
+        let paths = Box<AppPaths?>(nil)
+        let env = Self.makeEnv(
+            script: [],
+            retention: nil,
+            onSpawn: { argv in
+                guard argv.contains(where: { $0.contains("prune") }),
+                      let paths = paths.value else { return }
+                try? FileManager.default.removeItem(at: paths.runsIndexLockFile)
+                try? FileManager.default.createDirectory(
+                    at: paths.runsIndexLockFile,
+                    withIntermediateDirectories: true
+                )
+            }
+        )
+        paths.value = env.paths
+        defer { env.cleanUp() }
+        var destination = env.primary
+        destination.repoURL = "sftp:backup@example:/srv/repo with space"
+        destination.remoteMaintenance = RemoteMaintenance(enabled: true, remoteResticPath: "/opt/restic")
+        var set = env.set
+        set.destinations[0] = destination
+        env.fake.script = [
+            .init(
+                argvPrefix: RemoteResticCommand.version(
+                    sshTarget: "backup@example",
+                    resticPath: "/opt/restic"
+                ).argv,
+                stdoutLines: ["{\"version\":\"0.18.1\"}"]
+            ),
+            .init(
+                argvPrefix: RemoteResticCommand(
+                    sshTarget: "backup@example",
+                    resticPath: "/opt/restic",
+                    repoPath: "/srv/repo with space",
+                    dryRun: false,
+                    password: "repo-password"
+                ).argv
+            ),
+        ]
+
+        let result = await env.engine.runPruneRepository(set: set, destination: destination)
+
+        guard case .failed(.infrastructure(let reason)) = result else {
+            Issue.record("a missing terminal index entry must fail remote prune: \(result)")
+            return
+        }
+        #expect(reason.contains("run history unusable"))
+        #expect(env.indexEntries.isEmpty)
     }
 
     @Test("standalone prune: SFTP remote maintenance verifies SSH then never falls back locally")

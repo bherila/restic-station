@@ -127,6 +127,9 @@ public enum PruneRepositoryFailure: Equatable, Sendable {
     case offline(String)
     case restic(ResticExitClass)
     case didNotRun
+    /// Restic finished, but the durable run history could not record that
+    /// terminal result. The operation must not be reported as successful.
+    case infrastructure(String)
 }
 
 // MARK: - BackupEngine
@@ -722,6 +725,9 @@ public final class BackupEngine: Sendable {
         ) else {
             return .skipped
         }
+        guard primaryPrune.infrastructureFailureReason == nil else {
+            return .failed
+        }
         var statuses = [primaryPrune.child.status]
         let groupId = primaryPrune.child.runId
 
@@ -750,6 +756,9 @@ public final class BackupEngine: Sendable {
                 groupId: groupId,
                 expectedExecutableIdentity: expectedExecutableIdentity
             ) {
+                guard prune.infrastructureFailureReason == nil else {
+                    return .failed
+                }
                 statuses.append(prune.child.status)
             }
         }
@@ -896,6 +905,9 @@ public final class BackupEngine: Sendable {
                 afterLaunchFailure: restorePreviewToken
             )
             guard let prune else { return .failed(.didNotRun) }
+            if let reason = prune.infrastructureFailureReason {
+                return .failed(.infrastructure(reason))
+            }
             switch prune.preflightFailure {
             case .previewChanged:
                 return .skipped(.previewChanged)
@@ -976,6 +988,9 @@ public final class BackupEngine: Sendable {
             afterLaunchFailure: restorePreviewToken
         )
         guard let prune else { return .failed(.didNotRun) }
+        if let reason = prune.infrastructureFailureReason {
+            return .failed(.infrastructure(reason))
+        }
         switch prune.preflightFailure {
         case .previewChanged:
             return .skipped(.previewChanged)
@@ -1625,7 +1640,7 @@ public final class BackupEngine: Sendable {
         let outcome: ResticOutcome?
         let preflightFailure: PreflightFailure?
         /// The child may have completed and its terminal metadata may exist,
-        /// while the append-only index write failed. Scheduled callers must
+        /// while the append-only index write failed. Every caller must
         /// surface that as machine infrastructure failure, never success.
         let infrastructureFailureReason: String?
     }

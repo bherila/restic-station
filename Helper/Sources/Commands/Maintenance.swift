@@ -271,6 +271,12 @@ struct MaintenancePrune: AsyncParsableCommand, JSONRenderable {
                     diagnosticReference: diagnosticReference
                 )
             )
+        case .failed(.infrastructure(let reason)):
+            throw CLIFailure(
+                code: .internalError,
+                message: "Prune completed, but its run history could not be recorded: \(reason)",
+                details: CLIErrorDetails(setId: setId, destinationId: destination.id)
+            )
         }
     }
 }
