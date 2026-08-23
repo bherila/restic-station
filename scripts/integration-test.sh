@@ -775,7 +775,10 @@ assert_retention() {
     [[ $rc -eq 0 ]] || fail "$step" "tick exited $rc: $out"
 
     local scheduled_backups
-    scheduled_backups="$(idx_select backup success "$SET_ID" "" "" | grep -c '"trigger":"scheduled"' || true)"
+    # Whitespace-tolerant: `jq -c` emits `"trigger":"scheduled"` while the
+    # no-jq `json.dumps` fallback emits `"trigger": "scheduled"`.
+    scheduled_backups="$(idx_select backup success "$SET_ID" "" "" \
+        | grep -cE '"trigger":[[:space:]]*"scheduled"' || true)"
     [[ "$scheduled_backups" -ge 1 ]] \
         || fail "$step" "tick produced no scheduled backup — the set was not due, or the scheduler no longer dispatches: $out"
 
