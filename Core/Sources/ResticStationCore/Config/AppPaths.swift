@@ -156,6 +156,12 @@ public struct AppPaths: Equatable, Sendable {
         runsDir.appendingPathComponent("index.jsonl.lock", isDirectory: false)
     }
 
+    /// Dedicated stable inode for testing `flock(2)` on the filesystem that
+    /// stores the run index. It never serializes production work.
+    public var runsHealthLockFile: URL {
+        runsDir.appendingPathComponent("health.lock", isDirectory: false)
+    }
+
     public func runDir(runId: String) -> URL {
         runsDir.appendingPathComponent(runId, isDirectory: true)
     }
@@ -216,6 +222,12 @@ public struct AppPaths: Equatable, Sendable {
     /// document, so without this one can clobber the other's entry.
     public var scheduleStateLockFile: URL {
         stateDir.appendingPathComponent("schedule-state.lock", isDirectory: false)
+    }
+
+    /// Dedicated stable inode for testing `flock(2)` on the filesystem that
+    /// stores schedule state and preview capabilities.
+    public var stateHealthLockFile: URL {
+        stateDir.appendingPathComponent("health.lock", isDirectory: false)
     }
 
     // MARK: - locks/
@@ -308,7 +320,7 @@ public struct AppPaths: Equatable, Sendable {
             withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o700]
         )
-        for directory in [runsDir, stateDir, locksDir, lockHealthProbeDir] {
+        for directory in [runsDir, stateDir, locksDir] {
             try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
         }
         // `state/` holds `preview-tokens.json` — live capabilities for
@@ -320,18 +332,13 @@ public struct AppPaths: Equatable, Sendable {
         // pre-existing 755 dir staying 755), and the protection that matters
         // is per-file: the token index is 0600 and refuses to load if it is
         // not. This narrows the exposure without overriding that choice.
-        for (directory, parent) in [
-            (stateDir, root),
-            (lockHealthProbeDir, locksDir),
-        ] {
-            if let failure = FileLock.tightenDirectory(
-                directory,
-                parent: parent,
-                trustedRoot: root,
-                mode: 0o700
-            ) {
-                throw failure
-            }
+        if let failure = FileLock.ensureDirectory(
+            stateDir,
+            parent: root,
+            trustedRoot: root,
+            mode: 0o700
+        ) {
+            throw failure
         }
     }
 }

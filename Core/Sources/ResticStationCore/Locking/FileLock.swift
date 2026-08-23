@@ -323,10 +323,10 @@ public final class FileLock: @unchecked Sendable {
         return nil
     }
 
-    /// Tightens an already-created owner directory through verified parent
-    /// descriptors. The child is opened with `O_NOFOLLOW`, so a hostile
-    /// parent cannot turn permission repair into `chmod` of another path.
-    static func tightenDirectory(
+    /// Creates if needed, then tightens an owner directory through verified
+    /// parent descriptors. The child is opened with `O_NOFOLLOW`, so a
+    /// hostile parent cannot redirect creation or permission repair.
+    static func ensureDirectory(
         _ directory: URL,
         parent: URL,
         trustedRoot: URL,
@@ -352,10 +352,19 @@ public final class FileLock: @unchecked Sendable {
         defer { close(parentFD) }
 
         let flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
-        let (directoryFD, openError) = directory.lastPathComponent.withCString {
-            name -> (Int32, Int32) in
-            let descriptor = openat(parentFD, name, flags)
-            return (descriptor, descriptor < 0 ? errno : 0)
+        let (directoryFD, openError) = directory.lastPathComponent.withCString { name -> (Int32, Int32) in
+            var descriptor = openat(parentFD, name, flags)
+            var code = descriptor < 0 ? errno : 0
+            if descriptor < 0, code == ENOENT {
+                let created = mkdirat(parentFD, name, mode)
+                let createError = created != 0 ? errno : 0
+                guard created == 0 || createError == EEXIST else {
+                    return (descriptor, createError)
+                }
+                descriptor = openat(parentFD, name, flags)
+                code = descriptor < 0 ? errno : 0
+            }
+            return (descriptor, code)
         }
         guard directoryFD >= 0 else {
             return LockFailure(

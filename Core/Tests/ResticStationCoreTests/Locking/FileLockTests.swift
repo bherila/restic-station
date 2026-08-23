@@ -370,16 +370,21 @@ let canInjectPermissionFaults = geteuid() != 0
         #expect(failure.path == paths.scheduleStateLockFile.path)
     }
 
-    @Test("LockingHealth exercises flock on its dedicated stable inode")
-    func lockingHealthExercisesFlock() throws {
+    @Test("LockingHealth exercises flock on each lock-owning filesystem")
+    func lockingHealthExercisesFlockOnEveryFilesystem() throws {
         let root = makeDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let paths = AppPaths(root: root)
         try paths.ensureDirectories()
 
-        #expect(!FileManager.default.fileExists(atPath: paths.healthLockFile.path))
+        let healthLocks = [
+            paths.healthLockFile,
+            paths.stateHealthLockFile,
+            paths.runsHealthLockFile,
+        ]
+        #expect(healthLocks.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) })
         #expect(LockingHealth.probe(paths: paths, configuredSetIds: []) == nil)
-        #expect(FileManager.default.fileExists(atPath: paths.healthLockFile.path))
+        #expect(healthLocks.allSatisfy { FileManager.default.fileExists(atPath: $0.path) })
 
         // Contention on the health inode is healthy: another probe holding
         // it proves that `flock` works and must not create a false outage.

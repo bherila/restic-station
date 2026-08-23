@@ -71,6 +71,16 @@ public enum LockingHealth {
         if let failure = FileLock.probeCreation(in: paths.locksDir, trustedRoot: paths.root) {
             return machine(failure)
         }
+        // Diagnostic scratch is health-only. Normal tick/set-lock setup must
+        // not depend on this path being intact.
+        if let failure = FileLock.ensureDirectory(
+            paths.lockHealthProbeDir,
+            parent: paths.locksDir,
+            trustedRoot: paths.root,
+            mode: 0o700
+        ) {
+            return machine(failure)
+        }
         if let failure = FileLock.probeActualCreation(in: paths.lockHealthProbeDir) {
             return machine(failure)
         }
@@ -88,6 +98,15 @@ public enum LockingHealth {
             if let failure = FileLock(
                 path: lockFile, trustedRoot: paths.root
             ).probe(createIfMissing: false) {
+                return machine(failure)
+            }
+        }
+        // `locks/`, `state/`, and `runs/` may be distinct mounts. Exercise
+        // real flock semantics on a non-production inode in every one.
+        for healthLock in [paths.stateHealthLockFile, paths.runsHealthLockFile] {
+            if let failure = FileLock(
+                path: healthLock, trustedRoot: paths.root
+            ).probeLocking() {
                 return machine(failure)
             }
         }

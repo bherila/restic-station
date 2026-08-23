@@ -161,6 +161,7 @@ State — not config — is the right XDG base dir for `root`: `config.json` is 
 | `state/fda-check.json` | result of the helper's Full Disk Access probe |
 | `locks/tick.lock`, `locks/set-<setId>.lock` | operation-exclusion flock files (see `scheduling.md`) |
 | `locks/health.lock` | stable inode used only by the live `flock(2)` health probe |
+| `state/health.lock`, `runs/health.lock` | stable health-only inodes that verify `flock(2)` on separately mounted state/run filesystems |
 | `locks/.health/` | owner-only scratch directory for the live create/remove lock probe |
 | `mounts/<destId>/` | `restic mount` mountpoint (see `restic-cli.md` §mount) |
 
