@@ -309,6 +309,31 @@ let canInjectPermissionFaults = geteuid() != 0
         lock.release()
     }
 
+    @Test(
+        "search-only trusted directories can still host known lock paths",
+        .enabled(if: canInjectPermissionFaults, "root bypasses directory permission checks")
+    )
+    func searchOnlyDirectoriesAreAccepted() throws {
+        let parent = makeDirectory()
+        let root = parent.appendingPathComponent("data", isDirectory: true)
+        defer {
+            for directory in [root.appendingPathComponent("locks", isDirectory: true), root, parent] {
+                try? FileManager.default.setAttributes(
+                    [.posixPermissions: 0o700], ofItemAtPath: directory.path
+                )
+            }
+            try? FileManager.default.removeItem(at: parent)
+        }
+        let paths = AppPaths(root: root)
+        try paths.ensureDirectories()
+        try FileManager.default.setAttributes([.posixPermissions: 0o300], ofItemAtPath: root.path)
+        try FileManager.default.setAttributes([.posixPermissions: 0o300], ofItemAtPath: paths.locksDir.path)
+
+        let lock = FileLock(path: paths.tickLockFile, trustedRoot: root)
+        #expect(lock.acquire() == .acquired)
+        lock.release()
+    }
+
     @Test("probe reports the same faults without taking the lock")
     func probeDoesNotContend() throws {
         let directory = makeDirectory()

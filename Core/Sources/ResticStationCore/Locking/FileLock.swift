@@ -82,6 +82,20 @@ public final class FileLock: @unchecked Sendable {
     private let trustedRoot: URL?
     private var fd: Int32 = -1
 
+    /// Directory descriptors are traversal capabilities, not directory
+    /// streams. Requiring read access here rejects valid search-only
+    /// directories even though every child is addressed by name with
+    /// `openat(2)`. Linux's `O_PATH` and Darwin's `O_SEARCH` express that
+    /// narrower contract while still supporting `fstat` and descriptor-
+    /// relative operations.
+    private static var directoryOpenFlags: Int32 {
+        #if os(Linux)
+        O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+        #else
+        O_SEARCH | O_NOFOLLOW | O_CLOEXEC
+        #endif
+    }
+
     /// - Parameter trustedRoot: The owner-controlled data-directory boundary
     ///   containing the lock's direct parent (`locks/`, `state/`, or
     ///   `runs/`). Production callers provide it so both directories are
@@ -228,7 +242,7 @@ public final class FileLock: @unchecked Sendable {
         _ directory: URL,
         trustedRoot: URL?
     ) -> Result<Int32, LockFailure> {
-        let flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+        let flags = directoryOpenFlags
         let directoryPath = directory.standardizedFileURL.path
 
         guard let trustedRoot else {
@@ -341,7 +355,7 @@ public final class FileLock: @unchecked Sendable {
     /// it. This is internal so `AppPaths.ensureDirectories()` can apply the
     /// same boundary before recreating a missing root after a rename.
     static func validateTrustedRootParent(for trustedRoot: URL) -> LockFailure? {
-        let flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+        let flags = directoryOpenFlags
         switch openTrustedRootParent(for: trustedRoot.standardizedFileURL, flags: flags) {
         case .success(let descriptor):
             close(descriptor)
@@ -465,7 +479,7 @@ public final class FileLock: @unchecked Sendable {
         }
         defer { close(parentFD) }
 
-        let flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+        let flags = directoryOpenFlags
         var createdDirectory = false
         let (directoryFD, openError, failureOperation) = directory.lastPathComponent.withCString {
             name -> (Int32, Int32, String?) in
@@ -513,7 +527,10 @@ public final class FileLock: @unchecked Sendable {
         }
 
         if info.st_mode & 0o777 != mode, createdDirectory || tightenExisting {
-            guard fchmod(directoryFD, mode) == 0 else {
+            let chmodResult = directory.lastPathComponent.withCString {
+                fchmodat(parentFD, $0, mode, 0)
+            }
+            guard chmodResult == 0 else {
                 return LockFailure(path: directoryPath, operation: "fchmod protected directory", errnoValue: errno)
             }
             guard fstat(directoryFD, &info) == 0 else {

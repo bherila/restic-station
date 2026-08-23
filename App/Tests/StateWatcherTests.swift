@@ -7,6 +7,81 @@ import Testing
 @Suite("StateWatcher lock health", .serialized)
 @MainActor
 struct StateWatcherTests {
+    @Test("data-root parent permission changes refresh lock health")
+    func rootParentMetadataRefreshesHealth() async throws {
+        let parent = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-root-parent-watcher-\(UUID().uuidString)", isDirectory: true)
+        let root = parent.appendingPathComponent("data", isDirectory: true)
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: parent.path)
+            try? FileManager.default.removeItem(at: parent)
+        }
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: false)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: parent.path)
+        let paths = AppPaths(root: root)
+        try paths.ensureDirectories()
+        let watcher = StateWatcher(
+            paths: paths,
+            runStore: RunStore(paths: paths),
+            stateStore: StateStore(paths: paths)
+        )
+        watcher.start()
+        defer { watcher.stop() }
+        #expect(watcher.lockingFailure == nil)
+
+        try FileManager.default.setAttributes([.posixPermissions: 0o770], ofItemAtPath: parent.path)
+        for _ in 0..<40 {
+            if watcher.lockingFailure?.path == parent.path { break }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        #expect(watcher.lockingFailure?.path == parent.path)
+
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: parent.path)
+        for _ in 0..<40 {
+            if watcher.lockingFailure == nil { break }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        #expect(watcher.lockingFailure == nil)
+    }
+
+    @Test("replacing the data root rebinds every child watch")
+    func rootReplacementRebindsChildWatches() async throws {
+        let parent = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-root-replacement-watcher-\(UUID().uuidString)", isDirectory: true)
+        let root = parent.appendingPathComponent("data", isDirectory: true)
+        let retiredRoot = parent.appendingPathComponent("data-retired", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: parent) }
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: false)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: parent.path)
+        let paths = AppPaths(root: root)
+        try paths.ensureDirectories()
+        let initialLock = FileLock(path: paths.tickLockFile, trustedRoot: root)
+        #expect(initialLock.acquire() == .acquired)
+        initialLock.release()
+
+        let watcher = StateWatcher(
+            paths: paths,
+            runStore: RunStore(paths: paths),
+            stateStore: StateStore(paths: paths)
+        )
+        watcher.start()
+        defer { watcher.stop() }
+
+        try FileManager.default.moveItem(at: root, to: retiredRoot)
+        try paths.ensureDirectories()
+        let replacementLock = FileLock(path: paths.tickLockFile, trustedRoot: root)
+        #expect(replacementLock.acquire() == .acquired)
+        replacementLock.release()
+        try await Task.sleep(nanoseconds: 750_000_000)
+
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: paths.tickLockFile.path)
+        for _ in 0..<40 {
+            if watcher.lockingFailure?.path == paths.tickLockFile.path { break }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        #expect(watcher.lockingFailure?.path == paths.tickLockFile.path)
+    }
+
     @Test("lock permission changes and directory renames refresh lock health")
     func lockMetadataAndRenameRefreshHealth() async throws {
         let root = FileManager.default.temporaryDirectory

@@ -68,6 +68,11 @@ public final class StateWatcher: ObservableObject {
     /// health is reported, while the directory sources discover creation and
     /// replacement and cause this set to be reconciled.
     private var lockFileSources: [String: DispatchSourceFileSystemObject] = [:]
+    /// Watches the immediate parent of `paths.root`. Replacement safety is
+    /// an invariant of the lock namespace, and a chmod on this directory
+    /// changes only the parent's vnode — none of the sources below the root
+    /// receive that event.
+    private var rootParentDirSource: DispatchSourceFileSystemObject?
     /// Watches `paths.root` purely so that a delete+recreate of `state/`,
     /// `runs/`, or `locks/` (which this watcher cannot keep an open fd across)
     /// has a
@@ -85,6 +90,12 @@ public final class StateWatcher: ObservableObject {
     private var distributedNotificationObserver: NSObjectProtocol?
     private var debounceTask: Task<Void, Never>?
     private var isRunning = false
+
+    private enum WatchTarget {
+        case rootParent
+        case root
+        case directory(WatchedDirectory)
+    }
 
     private enum WatchedDirectory: CaseIterable, Hashable {
         case state
@@ -132,6 +143,7 @@ public final class StateWatcher: ObservableObject {
         locksDirSource?.cancel()
         lockFileSources.values.forEach { $0.cancel() }
         rootDirSource?.cancel()
+        rootParentDirSource?.cancel()
         if let distributedNotificationObserver {
             DistributedNotificationCenter.default().removeObserver(distributedNotificationObserver)
         }
@@ -154,7 +166,11 @@ public final class StateWatcher: ObservableObject {
         // notifications; reads remain tolerant either way.
         try? paths.ensureDirectories()
 
-        rootDirSource = makeSource(watching: paths.root, reportDeleteAsDirectory: nil)
+        let rootParent = paths.root.deletingLastPathComponent().standardizedFileURL
+        if rootParent.path != paths.root.standardizedFileURL.path {
+            rootParentDirSource = makeSource(watching: rootParent, target: .rootParent)
+        }
+        attemptReopenRoot()
         for directory in WatchedDirectory.allCases {
             attemptReopen(directory)
         }
@@ -194,6 +210,8 @@ public final class StateWatcher: ObservableObject {
         lockFileSources.removeAll()
         rootDirSource?.cancel()
         rootDirSource = nil
+        rootParentDirSource?.cancel()
+        rootParentDirSource = nil
         pendingReopen.removeAll()
 
         if let distributedNotificationObserver {
@@ -283,16 +301,9 @@ public final class StateWatcher: ObservableObject {
     /// (most commonly: the directory doesn't exist yet) — callers track
     /// that as "pending" and retry later rather than treating it as fatal.
     ///
-    /// - Parameter reportDeleteAsDirectory: when non-nil, a `.delete` or
-    ///   `.rename` event is treated as "this watched *sub*directory is no
-    ///   longer reachable at its configured path" and
-    ///   routed to `handleDirectoryInvalidated(_:)` for that
-    ///   `WatchedDirectory`. `nil` for the root watcher, which exists only
-    ///   to notice churn in `paths.root`'s children and drive reopen
-    ///   retries — root itself is not expected to disappear.
     private func makeSource(
         watching url: URL,
-        reportDeleteAsDirectory directory: WatchedDirectory?
+        target: WatchTarget
     ) -> DispatchSourceFileSystemObject? {
         let fd = open(url.path, O_EVTONLY)
         guard fd >= 0 else { return nil }
@@ -309,17 +320,36 @@ public final class StateWatcher: ObservableObject {
             // (`.main`), so this is a synchronous, same-thread hop into
             // actor-isolated state — no `Task` needed.
             MainActor.assumeIsolated {
-                if let directory, needsReopen {
-                    self.handleDirectoryInvalidated(directory)
-                } else if directory == nil {
-                    // Root watcher: opportunistically retry any directory
-                    // that's been waiting to be reopened since a prior
-                    // delete, then treat this like any other nudge.
-                    for pending in self.pendingReopen {
-                        self.attemptReopen(pending)
+                var shouldReload = true
+                switch target {
+                case .directory(let directory):
+                    if needsReopen {
+                        self.handleDirectoryInvalidated(directory)
                     }
+                case .root:
+                    if needsReopen {
+                        self.handleRootInvalidated()
+                    } else {
+                        self.attemptPendingReopens()
+                    }
+                case .rootParent:
+                    // A parent event may be a permission change that affects
+                    // lock health, or the recreation of a replaced root. An
+                    // ordinary `.write` while the root is still watched is
+                    // just sibling churn (especially under /tmp) and must not
+                    // turn the watcher into a polling loop.
+                    if self.rootDirSource == nil {
+                        self.attemptReopenRoot()
+                    } else {
+                        shouldReload = source.data.contains(.attrib)
+                            || source.data.contains(.delete)
+                            || source.data.contains(.rename)
+                    }
+                    self.attemptPendingReopens()
                 }
-                self.scheduleDebouncedReload()
+                if shouldReload {
+                    self.scheduleDebouncedReload()
+                }
             }
         }
         source.setCancelHandler {
@@ -327,6 +357,34 @@ public final class StateWatcher: ObservableObject {
         }
         source.resume()
         return source
+    }
+
+    /// The root watcher is attached to an inode, not a pathname. If that
+    /// inode is renamed or deleted, every child source remains attached to
+    /// the retired tree. Tear the whole hierarchy down and resolve it again
+    /// from the root's still-watched parent.
+    private func handleRootInvalidated() {
+        rootDirSource?.cancel()
+        rootDirSource = nil
+        for directory in WatchedDirectory.allCases {
+            invalidateSource(for: directory)
+            pendingReopen.insert(directory)
+        }
+        lockFileSources.values.forEach { $0.cancel() }
+        lockFileSources.removeAll()
+        attemptReopenRoot()
+        attemptPendingReopens()
+    }
+
+    private func attemptReopenRoot() {
+        guard rootDirSource == nil else { return }
+        rootDirSource = makeSource(watching: paths.root, target: .root)
+    }
+
+    private func attemptPendingReopens() {
+        for pending in Array(pendingReopen) {
+            attemptReopen(pending)
+        }
     }
 
     /// A watched subdirectory (`state/`, `runs/`, or `locks/`) was deleted or
@@ -366,7 +424,7 @@ public final class StateWatcher: ObservableObject {
     /// next event retries. Safe to call redundantly (e.g. once from
     /// `start()` and again from a root-watcher event).
     private func attemptReopen(_ directory: WatchedDirectory) {
-        guard let source = makeSource(watching: directory.url(paths: paths), reportDeleteAsDirectory: directory) else {
+        guard let source = makeSource(watching: directory.url(paths: paths), target: .directory(directory)) else {
             pendingReopen.insert(directory)
             return
         }

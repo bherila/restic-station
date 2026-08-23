@@ -370,11 +370,14 @@ public final class BackupEngine: Sendable {
         children.append(backup.child)
         let groupId = backup.child.runId
         if let reason = backup.infrastructureFailureReason {
-            return .infrastructureFailure(reason: reason)
+            infrastructureFailures.append("primary \"\(primary.label)\": \(reason)")
         }
 
         guard backup.child.status != .failed else {
             // Terminal: no copies, no retention (T09 step 5, scenario 5).
+            if !infrastructureFailures.isEmpty {
+                return .infrastructureFailure(reason: infrastructureFailures.joined(separator: "; "))
+            }
             return .completed(status: .failed, groupId: groupId, children: children)
         }
 
@@ -491,7 +494,6 @@ public final class BackupEngine: Sendable {
             children.append(copy.child)
             if let reason = copy.infrastructureFailureReason {
                 infrastructureFailures.append("secondary \"\(secondary.label)\": \(reason)")
-                continue
             }
 
             // SAFETY: retention on a mirror runs *only* when this run's copy

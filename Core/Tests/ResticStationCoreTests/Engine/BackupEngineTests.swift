@@ -583,6 +583,54 @@ struct BackupEngineTests {
         #expect(env.indexEntries.isEmpty)
     }
 
+    @Test("a terminal-index failure does not strand otherwise safe mirror and retention work")
+    func runIndexFailureContinuesIndependentPhases() async throws {
+        let paths = Box<AppPaths?>(nil)
+        let env = Self.makeEnv(
+            script: [],
+            reachableSecondaries: [true],
+            onSpawn: { argv in
+                guard argv.contains("backup"), let paths = paths.value else { return }
+                try? FileManager.default.removeItem(at: paths.runsIndexLockFile)
+                try? FileManager.default.createDirectory(
+                    at: paths.runsIndexLockFile,
+                    withIntermediateDirectories: true
+                )
+            }
+        )
+        paths.value = env.paths
+        defer { env.cleanUp() }
+        let secondary = env.secondaries[0]
+        env.fake.script =
+            Self.resticCall(
+                Self.backupArgv(env.primary.repoURL),
+                dest: Self.primaryId,
+                stdoutLines: Self.backupStream()
+            )
+            + Self.resticCall(
+                Self.copyArgv(to: secondary.repoURL, from: env.primary.repoURL),
+                dest: secondary.id,
+                from: env.primary.id
+            )
+            + Self.resticCall(Self.forgetArgv(secondary.repoURL), dest: secondary.id)
+            + Self.resticCall(Self.forgetArgv(env.primary.repoURL), dest: env.primary.id)
+
+        let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
+
+        guard case .infrastructureFailure(let reason) = outcome else {
+            Issue.record("the index fault must remain the set outcome: \(outcome)")
+            return
+        }
+        #expect(reason.contains("run history unusable"))
+        #expect(env.resticArgvs == [
+            [Self.resticPath] + Self.backupArgv(env.primary.repoURL),
+            [Self.resticPath] + Self.copyArgv(to: secondary.repoURL, from: env.primary.repoURL),
+            [Self.resticPath] + Self.forgetArgv(secondary.repoURL),
+            [Self.resticPath] + Self.forgetArgv(env.primary.repoURL),
+        ])
+        #expect(env.indexEntries.isEmpty)
+    }
+
     // MARK: - Row 6 / Row 12 — copy failure isolates that mirror
 
     @Test("rows 6+12: a failed copy is recorded, its mirror is never forgotten, the other mirror proceeds")
