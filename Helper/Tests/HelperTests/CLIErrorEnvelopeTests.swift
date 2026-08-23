@@ -284,27 +284,29 @@ struct CommandFailureClassificationTests {
             .write(to: directory.appendingPathComponent("config.json"))
 
         // `AppPaths.default()` reads this, which is how the command under
-        // test is pointed at the fixture without a seam of its own.
-        setenv("RESTIC_STATION_DATA_DIR", directory.path, 1)
-        defer { unsetenv("RESTIC_STATION_DATA_DIR") }
-
-        // `secret list` is in this list because it reaches its config
-        // through `SecretContext.make()`, not `HelperContext.make()` —
-        // entering a password has to work before restic is configured — so
-        // it had a second setup path with its own `HelperExit.fail` and kept
-        // answering a broken config with an empty stdout.
-        for argv in [["sets", "list"], ["status"], ["config", "show"], ["secret", "list"]] {
-            var command = try #require(HelperMain.parseAsRoot(argv) as? any AsyncParsableCommand)
-            do {
-                try await command.run()
-                Issue.record("\(argv.joined(separator: " ")) did not fail on an unloadable config")
-            } catch let failure as CLIFailure {
-                #expect(failure.code == .configInvalid)
-                #expect(failure.exitCode == .error)
-                // The message names the file and stays bounded — the
-                // pre-#81 version printed a whole DecodingError description.
-                #expect(failure.message.hasPrefix("could not load configuration:"))
-                #expect(failure.message.count <= CLIFailure.messageCharacterLimit)
+        // test is pointed at the fixture without a seam of its own. Through
+        // ``TestEnvironmentLock`` because the variable is process-global and
+        // other suites set it too — parallel tests would otherwise read each
+        // other's fixture directory.
+        try await TestEnvironmentLock.shared.withDataDirectory(directory.path) {
+            // `secret list` is in this list because it reaches its config
+            // through `SecretContext.make()`, not `HelperContext.make()` —
+            // entering a password has to work before restic is configured — so
+            // it had a second setup path with its own `HelperExit.fail` and kept
+            // answering a broken config with an empty stdout.
+            for argv in [["sets", "list"], ["status"], ["config", "show"], ["secret", "list"]] {
+                var command = try #require(HelperMain.parseAsRoot(argv) as? any AsyncParsableCommand)
+                do {
+                    try await command.run()
+                    Issue.record("\(argv.joined(separator: " ")) did not fail on an unloadable config")
+                } catch let failure as CLIFailure {
+                    #expect(failure.code == .configInvalid)
+                    #expect(failure.exitCode == .error)
+                    // The message names the file and stays bounded — the
+                    // pre-#81 version printed a whole DecodingError description.
+                    #expect(failure.message.hasPrefix("could not load configuration:"))
+                    #expect(failure.message.count <= CLIFailure.messageCharacterLimit)
+                }
             }
         }
     }

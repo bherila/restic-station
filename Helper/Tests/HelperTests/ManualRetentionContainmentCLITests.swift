@@ -20,45 +20,44 @@ import Testing
 /// this test — which a code-only assertion could not detect, since the
 /// context construction would otherwise have *succeeded* here.
 ///
-/// Serialized because it mutates process environment.
-@Suite("manual retention containment (CLI)", .serialized)
+/// Environment mutation goes through ``TestEnvironmentLock``: a `.serialized`
+/// trait would only order tests inside this suite, and `CLIErrorEnvelopeTests`
+/// mutates the same variable from another one.
+@Suite("manual retention containment (CLI)")
 struct ManualRetentionContainmentCLITests {
 
     @Test("run-set --kind prune refuses before any context is built")
     func pruneRefusesBeforeContextConstruction() async throws {
-        let key = "RESTIC_STATION_DATA_DIR"
-        let previous = ProcessInfo.processInfo.environment[key]
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("rs-containment-\(UUID().uuidString)", isDirectory: true)
-        setenv(key, root.path, 1)
-        defer {
-            if let previous { setenv(key, previous, 1) } else { unsetenv(key) }
-            try? FileManager.default.removeItem(at: root)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        try await TestEnvironmentLock.shared.withDataDirectory(root.path) {
+            #expect(
+                !FileManager.default.fileExists(atPath: root.path),
+                "precondition: the data directory does not exist yet"
+            )
+
+            var command = try RunSet.parse([
+                "--set", "00000000-0000-0000-0000-000000000001", "--kind", "prune",
+            ])
+
+            do {
+                try await command.run()
+                Issue.record("expected a refusal")
+            } catch let failure as CLIFailure {
+                #expect(failure.code == .operationNotAllowed)
+                #expect(failure.message == ManualRetentionApplyAvailability.reason)
+            }
+
+            #expect(
+                !FileManager.default.fileExists(atPath: root.path),
+                """
+                the refusal created the data directory, so it ran after \
+                HelperContext.make(). The gate must be the first statement in \
+                RunSet.run(), before any context is built.
+                """
+            )
         }
-        #expect(
-            !FileManager.default.fileExists(atPath: root.path),
-            "precondition: the data directory does not exist yet"
-        )
-
-        var command = try RunSet.parse([
-            "--set", "00000000-0000-0000-0000-000000000001", "--kind", "prune",
-        ])
-
-        do {
-            try await command.run()
-            Issue.record("expected a refusal")
-        } catch let failure as CLIFailure {
-            #expect(failure.code == .operationNotAllowed)
-            #expect(failure.message == ManualRetentionApplyAvailability.reason)
-        }
-
-        #expect(
-            !FileManager.default.fileExists(atPath: root.path),
-            """
-            the refusal created the data directory, so it ran after \
-            HelperContext.make(). The gate must be the first statement in \
-            RunSet.run(), before any context is built.
-            """
-        )
     }
 }

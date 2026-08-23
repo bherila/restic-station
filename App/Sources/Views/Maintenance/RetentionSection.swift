@@ -170,7 +170,7 @@ struct RetentionSection: View {
 
                 Spacer(minLength: 0)
             }
-            if !canApplyRetention {
+            if !canApplyRetention, hasPolicy {
                 // Visible, not just a tooltip on a disabled button: the
                 // operator needs to know retention is still happening on
                 // schedule, or they will reasonably assume it stopped.

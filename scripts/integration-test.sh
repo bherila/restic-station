@@ -694,7 +694,13 @@ assert_migration() {
 }
 
 assert_retention() {
-    local step="retention (keep-last 2 via run-set --kind prune)"
+    # Manual retention apply is contained (Option A, issues #111/#82): the
+    # helper refuses `run-set --kind prune` outright. Retention itself is not
+    # gone, so this step proves both halves — the refusal costs nothing, and
+    # the scheduled path still applies the policy to the primary and to a
+    # caught-up mirror. Dropping the second half would let containment turn
+    # into "no retention at all" without any test noticing.
+    local step="retention (contained manual apply; scheduled path still prunes)"
     log "$step"
 
     local prune_primary_before prune_secondary_before
@@ -702,14 +708,43 @@ assert_retention() {
     prune_secondary_before="$(idx_count prune success "$SET_ID" "$SECONDARY_DEST_ID" "")"
     [[ "$prune_primary_before" -eq 0 ]] || fail "$step" "unexpected prune records before this step (retention was null throughout runs 1-4)"
 
+    local pcount_before scount_before
+    pcount_before="$(primary_snapshot_count)"
+    scount_before="$(secondary_snapshot_count_at "$SECONDARY_REPO")"
+
     write_config '{"keepLast": 2, "keepHourly": null, "keepDaily": null, "keepWeekly": null, "keepMonthly": null, "keepYearly": null}'
 
+    # ── half 1: manual apply refuses, and changes nothing ────────────────
     local out rc
     set +e
     out="$("$HELPER" run-set --set "$SET_ID" --kind prune 2>&1)"
     rc=$?
     set -e
-    [[ $rc -eq 0 ]] || fail "$step" "run-set --kind prune exited $rc: $out"
+    [[ $rc -ne 0 ]] || fail "$step" "run-set --kind prune succeeded; manual retention apply must be refused"
+    grep -qi "unavailable in this build" <<<"$out" \
+        || fail "$step" "prune refusal did not explain the posture: $out"
+
+    local prune_primary_refused prune_secondary_refused
+    prune_primary_refused="$(idx_count prune success "$SET_ID" "$PRIMARY_DEST_ID" "")"
+    prune_secondary_refused="$(idx_count prune success "$SET_ID" "$SECONDARY_DEST_ID" "")"
+    [[ "$prune_primary_refused" -eq "$prune_primary_before" ]] \
+        || fail "$step" "the refusal manufactured a prune record for the primary"
+    [[ "$prune_secondary_refused" -eq "$prune_secondary_before" ]] \
+        || fail "$step" "the refusal manufactured a prune record for the secondary"
+    [[ "$(primary_snapshot_count)" -eq "$pcount_before" ]] \
+        || fail "$step" "the refusal removed primary snapshots"
+    [[ "$(secondary_snapshot_count_at "$SECONDARY_REPO")" -eq "$scount_before" ]] \
+        || fail "$step" "the refusal removed secondary snapshots"
+
+    # ── half 2: the scheduled path still applies the same policy ─────────
+    # `runSet` backs up, copies, then forgets — mirrors after their own
+    # successful copy, primary last. That is the path that survives
+    # containment, so it is the one that has to keep working.
+    set +e
+    out="$("$HELPER" run-set --set "$SET_ID" --kind backup 2>&1)"
+    rc=$?
+    set -e
+    [[ $rc -eq 0 ]] || fail "$step" "run-set --kind backup exited $rc: $out"
 
     local pcount scount
     pcount="$(primary_snapshot_count)"
@@ -722,12 +757,13 @@ assert_retention() {
     prune_secondary_after="$(idx_count prune success "$SET_ID" "$SECONDARY_DEST_ID" "")"
     [[ "$prune_primary_after" -eq $((prune_primary_before + 1)) ]] \
         || fail "$step" "expected exactly one new successful prune record for the primary, before=$prune_primary_before after=$prune_primary_after"
-    # The mirror just synced in run4 (lastSyncedAt >= primary's), so runPrune's
-    # freshness guard (docs/tasks/T19) must let it qualify too.
+    # The mirror's copy in this very run succeeded, which is the scheduled
+    # path's own gate for pruning a secondary — a live proof, not the stored
+    # timestamp the contained manual path relied on.
     [[ "$prune_secondary_after" -eq $((prune_secondary_before + 1)) ]] \
         || fail "$step" "expected the freshly-synced secondary to also be pruned, before=$prune_secondary_before after=$prune_secondary_after"
 
-    log "$step OK (primary=$pcount, secondary=$scount snapshots)"
+    log "$step OK (manual apply refused; scheduled path pruned primary=$pcount, secondary=$scount snapshots)"
 }
 
 assert_tick_noop() {
