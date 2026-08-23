@@ -18,9 +18,13 @@ actor TestEnvironmentLock {
     /// Runs `body` with `RESTIC_STATION_DATA_DIR` set to `path`, restoring
     /// whatever was there before — including "unset", which is not the same
     /// as empty.
-    func withDataDirectory<T>(
+    /// `T: Sendable` and `@Sendable` on `body` are load-bearing, not
+    /// decoration: Swift 6.1 (the toolchain the Linux CI container pins)
+    /// rejects returning a non-`Sendable` `T` across the actor boundary,
+    /// while 6.3 accepts it. Written to the stricter rule so both agree.
+    func withDataDirectory<T: Sendable>(
         _ path: String,
-        _ body: () async throws -> T
+        _ body: @Sendable () async throws -> T
     ) async rethrows -> T {
         let key = "RESTIC_STATION_DATA_DIR"
         let previous = ProcessInfo.processInfo.environment[key]

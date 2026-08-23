@@ -38,7 +38,7 @@ struct ManualRetentionContainmentCLITests {
                 "precondition: the data directory does not exist yet"
             )
 
-            var command = try RunSet.parse([
+            let command = try RunSet.parse([
                 "--set", "00000000-0000-0000-0000-000000000001", "--kind", "prune",
             ])
 
