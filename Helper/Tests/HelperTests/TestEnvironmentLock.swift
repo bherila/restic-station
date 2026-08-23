@@ -61,24 +61,40 @@ enum TestEnvironmentLock {
         _ path: String,
         _ body: @Sendable () async throws -> T
     ) async throws -> T {
-        let key = "RESTIC_STATION_DATA_DIR"
-        await gate.acquire()
-        let previous = ProcessInfo.processInfo.environment[key]
-        setenv(key, path, 1)
-
-        func restore() {
-            if let previous { setenv(key, previous, 1) } else { unsetenv(key) }
+        try await withExclusiveAccess {
+            try await unsafeWithDataDirectory(path, body)
         }
+    }
 
+    /// Holds the gate for the duration of `body` without touching the
+    /// environment itself. For a caller that needs to set, clear, *and*
+    /// assert the variable in one uninterrupted window — which the ordinary
+    /// entry point cannot express, since it owns the set and the restore.
+    static func withExclusiveAccess<T: Sendable>(
+        _ body: @Sendable () async throws -> T
+    ) async throws -> T {
+        await gate.acquire()
         do {
             let result = try await body()
-            restore()
             await gate.release()
             return result
         } catch {
-            restore()
             await gate.release()
             throw error
         }
+    }
+
+    /// Set-and-restore with **no** synchronization. Only valid inside
+    /// ``withExclusiveAccess(_:)``; calling it anywhere else reintroduces
+    /// the cross-suite race this file exists to close.
+    static func unsafeWithDataDirectory<T: Sendable>(
+        _ path: String,
+        _ body: @Sendable () async throws -> T
+    ) async throws -> T {
+        let key = "RESTIC_STATION_DATA_DIR"
+        let previous = ProcessInfo.processInfo.environment[key]
+        setenv(key, path, 1)
+        defer { if let previous { setenv(key, previous, 1) } else { unsetenv(key) } }
+        return try await body()
     }
 }

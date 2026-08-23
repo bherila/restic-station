@@ -97,13 +97,19 @@ struct TestEnvironmentLockTests {
     @Test("the previous value is restored, including when it was unset")
     func restoresPreviousValue() async throws {
         let key = "RESTIC_STATION_DATA_DIR"
-        unsetenv(key)
-        try await TestEnvironmentLock.withDataDirectory("/tmp/env-lock-restore") {
-            #expect(ProcessInfo.processInfo.environment[key] == "/tmp/env-lock-restore")
+        // The clearing, the nested set, and the post-assertion all have to
+        // sit inside one gate acquisition: doing the `unsetenv` outside it
+        // would race whichever test currently owns the variable — the exact
+        // failure this file exists to prevent.
+        try await TestEnvironmentLock.withExclusiveAccess {
+            unsetenv(key)
+            try await TestEnvironmentLock.unsafeWithDataDirectory("/tmp/env-lock-restore") {
+                #expect(ProcessInfo.processInfo.environment[key] == "/tmp/env-lock-restore")
+            }
+            #expect(
+                ProcessInfo.processInfo.environment[key] == nil,
+                "an unset variable must come back unset, not empty"
+            )
         }
-        #expect(
-            ProcessInfo.processInfo.environment[key] == nil,
-            "an unset variable must come back unset, not empty"
-        )
     }
 }
