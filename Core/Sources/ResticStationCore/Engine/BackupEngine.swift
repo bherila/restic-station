@@ -92,11 +92,13 @@ public enum CheckRunOutcome: Equatable, Sendable {
     case completed(RunStatus)
     /// A peer holds the set lock. Expected and retryable.
     case skipped
-    /// No run record was created, so a later tick can retry cleanly.
+    /// Secrets were unavailable before locking or durable state mutation, so
+    /// a later tick can retry cleanly.
     case retryable(reason: String)
     case misconfigured(reason: String)
-    /// The set or schedule-state lock is unusable. Scheduled callers must
-    /// exit non-zero rather than flattening this to an ordinary failed check.
+    /// The set lock, schedule state, or run history is unusable. Scheduled
+    /// callers must exit non-zero rather than flattening this to an ordinary
+    /// failed check.
     case infrastructureFailure(reason: String)
 }
 
@@ -328,7 +330,7 @@ public final class BackupEngine: Sendable {
         var infrastructureFailures: [String] = []
 
         // ── Steps 4 + 5: probe primary, then back it up ─────────────────
-        let backup = await performChild(
+        let backupResult = await performChild(
             kind: .backup,
             setId: set.id,
             destination: primary,
@@ -358,10 +360,12 @@ public final class BackupEngine: Sendable {
             }
         )
 
-        guard let backup else {
-            // `RunStore.begin` failed (disk full, unwritable data dir): no
-            // record exists, so this is retryable rather than a failed run.
-            return .retryable(reason: "the run record could not be created")
+        let backup: ChildRun
+        switch backupResult {
+        case .completed(let child):
+            backup = child
+        case .infrastructureFailure(let reason):
+            return .infrastructureFailure(reason: reason)
         }
         children.append(backup.child)
         let groupId = backup.child.runId
@@ -464,7 +468,7 @@ public final class BackupEngine: Sendable {
                 }
             }
 
-            let copy = await performChild(
+            let copyResult = await performChild(
                 kind: .copy,
                 setId: set.id,
                 destination: secondary,
@@ -476,7 +480,14 @@ public final class BackupEngine: Sendable {
                 invocation: ResticInvocation(destination: secondary, fromDestination: primary),
                 streamProgress: false
             )
-            guard let copy else { continue }
+            let copy: ChildRun
+            switch copyResult {
+            case .completed(let child):
+                copy = child
+            case .infrastructureFailure(let reason):
+                infrastructureFailures.append("secondary \"\(secondary.label)\": \(reason)")
+                continue
+            }
             children.append(copy.child)
             if let reason = copy.infrastructureFailureReason {
                 infrastructureFailures.append("secondary \"\(secondary.label)\": \(reason)")
@@ -495,32 +506,42 @@ public final class BackupEngine: Sendable {
             }
             markSynced(secondary)
 
-            if let prune = await forgetChild(
+            switch await forgetChild(
                 destination: secondary,
                 policy: set.retention,
                 setId: set.id,
                 trigger: trigger,
                 groupId: groupId
             ) {
+            case .completed(let prune):
                 children.append(prune.child)
                 if let reason = prune.infrastructureFailureReason {
                     infrastructureFailures.append("secondary \"\(secondary.label)\": \(reason)")
                 }
+            case .infrastructureFailure(let reason):
+                infrastructureFailures.append("secondary \"\(secondary.label)\": \(reason)")
+            case .notRequired:
+                break
             }
         }
 
         // ── Step 8: retention on the primary ────────────────────────────
-        if let prune = await forgetChild(
+        switch await forgetChild(
             destination: primary,
             policy: set.retention,
             setId: set.id,
             trigger: trigger,
             groupId: groupId
         ) {
+        case .completed(let prune):
             children.append(prune.child)
             if let reason = prune.infrastructureFailureReason {
                 infrastructureFailures.append("primary \"\(primary.label)\": \(reason)")
             }
+        case .infrastructureFailure(let reason):
+            infrastructureFailures.append("primary \"\(primary.label)\": \(reason)")
+        case .notRequired:
+            break
         }
 
         // ── Step 9: current-run cleared and lock released by the defers ─
@@ -602,7 +623,7 @@ public final class BackupEngine: Sendable {
         )
         let checkCount = (previousState?.checkCount ?? 0) + 1
 
-        let primaryCheck = await performChild(
+        let primaryCheckResult = await performChild(
             kind: .check,
             setId: set.id,
             destination: primary,
@@ -613,8 +634,12 @@ public final class BackupEngine: Sendable {
             invocation: ResticInvocation(destination: primary),
             streamProgress: false
         )
-        guard let primaryCheck else {
-            return .retryable(reason: "the run record could not be created")
+        let primaryCheck: ChildRun
+        switch primaryCheckResult {
+        case .completed(let child):
+            primaryCheck = child
+        case .infrastructureFailure(let reason):
+            return .infrastructureFailure(reason: reason)
         }
         if let reason = primaryCheck.infrastructureFailureReason {
             return .infrastructureFailure(reason: reason)
@@ -640,7 +665,7 @@ public final class BackupEngine: Sendable {
                     let probe = await reachability.probe(secondary)
                     record(probe: probe, for: secondary)
                     guard probe == .reachable else { continue }
-                    let secondaryCheck = await performChild(
+                    let secondaryCheckResult = await performChild(
                         kind: .check,
                         setId: set.id,
                         destination: secondary,
@@ -652,13 +677,18 @@ public final class BackupEngine: Sendable {
                         invocation: ResticInvocation(destination: secondary),
                         streamProgress: false
                     )
-                    if let secondaryCheck {
+                    switch secondaryCheckResult {
+                    case .completed(let secondaryCheck):
                         statuses.append(secondaryCheck.child.status)
                         if let reason = secondaryCheck.infrastructureFailureReason {
                             infrastructureFailures.append(
                                 "secondary \"\(secondary.label)\": \(reason)"
                             )
                         }
+                    case .infrastructureFailure(let reason):
+                        infrastructureFailures.append(
+                            "secondary \"\(secondary.label)\": \(reason)"
+                        )
                     }
                 }
             }
@@ -730,18 +760,26 @@ public final class BackupEngine: Sendable {
         // exit path (T09 step 8 — "clear current-run, release lock").
         defer { try? stateStore.clearCurrentRun(setId: set.id) }
 
-        guard let primaryPrune = await forgetChild(
+        let primaryPruneResult = await forgetChild(
             destination: primary,
             policy: retention,
             setId: set.id,
             trigger: .manual,
             groupId: nil,
             expectedExecutableIdentity: expectedExecutableIdentity
-        ) else {
+        )
+        let primaryPrune: ChildRun
+        switch primaryPruneResult {
+        case .completed(let child):
+            primaryPrune = child
+        case .infrastructureFailure(let reason):
             return .infrastructureFailure(
-                reason: "could not create the primary prune run record",
+                reason: reason,
                 operationMayHaveRun: false
             )
+        case .notRequired:
+            // The public guard above already requires a non-empty policy.
+            return .skipped
         }
         if let reason = primaryPrune.infrastructureFailureReason {
             return .infrastructureFailure(reason: reason, operationMayHaveRun: true)
@@ -766,7 +804,7 @@ public final class BackupEngine: Sendable {
                 )
                 continue
             }
-            if let prune = await forgetChild(
+            switch await forgetChild(
                 destination: secondary,
                 policy: retention,
                 setId: set.id,
@@ -774,17 +812,21 @@ public final class BackupEngine: Sendable {
                 groupId: groupId,
                 expectedExecutableIdentity: expectedExecutableIdentity
             ) {
+            case .completed(let prune):
                 if let reason = prune.infrastructureFailureReason {
                     return .infrastructureFailure(reason: reason, operationMayHaveRun: true)
                 }
                 statuses.append(prune.child.status)
-            } else {
+            case .infrastructureFailure(let reason):
                 return .infrastructureFailure(
-                    reason: "could not create the prune run record for \"\(secondary.label)\"",
+                    reason: reason,
                     // The primary prune, and possibly earlier mirrors, have
                     // already executed by the time this later record fails.
                     operationMayHaveRun: true
                 )
+            case .notRequired:
+                // The public guard above already requires a non-empty policy.
+                continue
             }
         }
 
@@ -920,7 +962,7 @@ public final class BackupEngine: Sendable {
                 }
             }
 
-            let prune = await performChild(
+            let pruneResult = await performChild(
                 kind: .prune, setId: set.id, destination: destination, trigger: .manual, groupId: nil,
                 phase: "remote pruning", command: .prune(repo: destination.repoURL),
                 invocation: ResticInvocation(destination: destination), streamProgress: false,
@@ -929,7 +971,13 @@ public final class BackupEngine: Sendable {
                 beforeLaunch: consumePreviewToken,
                 afterLaunchFailure: restorePreviewToken
             )
-            guard let prune else { return .failed(.didNotRun) }
+            let prune: ChildRun
+            switch pruneResult {
+            case .completed(let child):
+                prune = child
+            case .infrastructureFailure(let reason):
+                return .failed(.infrastructure(reason))
+            }
             if let reason = prune.infrastructureFailureReason {
                 return .failed(.infrastructure(reason))
             }
@@ -995,7 +1043,7 @@ public final class BackupEngine: Sendable {
             }
         }
 
-        let prune = await performChild(
+        let pruneResult = await performChild(
             kind: .prune,
             setId: set.id,
             destination: destination,
@@ -1014,7 +1062,13 @@ public final class BackupEngine: Sendable {
             beforeLaunch: consumePreviewToken,
             afterLaunchFailure: restorePreviewToken
         )
-        guard let prune else { return .failed(.didNotRun) }
+        let prune: ChildRun
+        switch pruneResult {
+        case .completed(let child):
+            prune = child
+        case .infrastructureFailure(let reason):
+            return .failed(.infrastructure(reason))
+        }
         if let reason = prune.infrastructureFailureReason {
             return .failed(.infrastructure(reason))
         }
@@ -1342,7 +1396,7 @@ public final class BackupEngine: Sendable {
                 }
                 continue
             }
-            guard let purge = await purgeChild(
+            let purgeResult = await purgeChild(
                 destination: destination,
                 snapshotIDs: plan.matched.map(\.id),
                 patterns: preview.patterns,
@@ -1350,8 +1404,13 @@ public final class BackupEngine: Sendable {
                 trigger: trigger,
                 groupId: resolvedGroupId,
                 executable: executable
-            ) else {
-                return PurgeRunResult(status: .failed, children: children)
+            )
+            let purge: ChildRun
+            switch purgeResult {
+            case .completed(let child):
+                purge = child
+            case .infrastructureFailure(let reason):
+                throw PurgeApplyError.lockUnusable(reason)
             }
             children.append(purge.child)
             if let reason = purge.infrastructureFailureReason {
@@ -1412,7 +1471,7 @@ public final class BackupEngine: Sendable {
         trigger: RunTrigger,
         groupId: String?,
         executable: ResticRunner.MaintenanceExecutable
-    ) async -> ChildRun? {
+    ) async -> RecordedChildResult {
         let fullIDByShortID = Dictionary(
             snapshotIDs.map { (String($0.prefix(8)), $0) },
             uniquingKeysWith: { first, _ in first }
@@ -1535,7 +1594,7 @@ public final class BackupEngine: Sendable {
         // exit path (T09 step 8 — "clear current-run, release lock").
         defer { try? stateStore.clearCurrentRun(setId: set.id) }
 
-        let restore = await performChild(
+        let restoreResult = await performChild(
             kind: .restore,
             setId: set.id,
             destination: destination,
@@ -1554,9 +1613,13 @@ public final class BackupEngine: Sendable {
             streamProgress: false,
             downgradeSuccessToWarning: { outcome in Self.containsErrorMessage(outcome.messages) }
         )
-        guard let restore else {
+        let restore: ChildRun
+        switch restoreResult {
+        case .completed(let child):
+            restore = child
+        case .infrastructureFailure(let reason):
             return .infrastructureFailure(
-                reason: "could not create the restore run record",
+                reason: reason,
                 operationMayHaveRun: false
             )
         }
@@ -1604,7 +1667,7 @@ public final class BackupEngine: Sendable {
         // exit path (T09 step 8 — "clear current-run, release lock").
         defer { try? stateStore.clearCurrentRun(setId: set.id) }
 
-        let initRun = await performChild(
+        let initResult = await performChild(
             kind: .`init`,
             setId: set.id,
             destination: dest,
@@ -1615,9 +1678,13 @@ public final class BackupEngine: Sendable {
             invocation: ResticInvocation(destination: dest, fromDestination: primary),
             streamProgress: false
         )
-        guard let initRun else {
+        let initRun: ChildRun
+        switch initResult {
+        case .completed(let child):
+            initRun = child
+        case .infrastructureFailure(let reason):
             return .infrastructureFailure(
-                reason: "could not create the init-secondary run record",
+                reason: reason,
                 operationMayHaveRun: false
             )
         }
@@ -1656,11 +1723,11 @@ public final class BackupEngine: Sendable {
         /// window spans every earlier destination in a multi-destination
         /// prune — never receives `forget --prune`.
         expectedExecutableIdentity: String? = nil
-    ) async -> ChildRun? {
+    ) async -> RetentionChildResult {
         guard let policy, !policy.isEmpty else {
-            return nil
+            return .notRequired
         }
-        return await performChild(
+        switch await performChild(
             kind: .prune,
             setId: setId,
             destination: destination,
@@ -1673,7 +1740,12 @@ public final class BackupEngine: Sendable {
                 expectedExecutableIdentity: expectedExecutableIdentity
             ),
             streamProgress: false
-        )
+        ) {
+        case .completed(let child):
+            return .completed(child)
+        case .infrastructureFailure(let reason):
+            return .infrastructureFailure(reason)
+        }
     }
 
     // MARK: - Child runs
@@ -1688,6 +1760,21 @@ public final class BackupEngine: Sendable {
         /// while the append-only index write failed. Every caller must
         /// surface that as machine infrastructure failure, never success.
         let infrastructureFailureReason: String?
+    }
+
+    /// A command either obtained a durable run record before launch or was
+    /// stopped by run-history infrastructure. Keeping that failure typed
+    /// prevents callers from treating an unwritable `runs/` directory as an
+    /// ordinary skip or as an intentionally absent retention operation.
+    private enum RecordedChildResult {
+        case completed(ChildRun)
+        case infrastructureFailure(String)
+    }
+
+    private enum RetentionChildResult {
+        case notRequired
+        case completed(ChildRun)
+        case infrastructureFailure(String)
     }
 
     private enum PreflightFailure: Sendable {
@@ -1732,8 +1819,8 @@ public final class BackupEngine: Sendable {
     /// log → optional pre-flight → execute (with the exit-11 unlock/retry
     /// protocol) → `finish` + index append.
     ///
-    /// Returns `nil` only when the run record could not be created at all,
-    /// in which case nothing was spawned.
+    /// Returns a typed infrastructure failure when the run record could not
+    /// be created at all; in that case nothing was spawned.
     ///
     /// - Parameters:
     ///   - preflightPhase: written to `current-run` before `preflight` runs.
@@ -1759,7 +1846,7 @@ public final class BackupEngine: Sendable {
         afterLaunchFailure: (@Sendable () -> Void)? = nil,
         downgradeSuccessToWarning: (@Sendable (ResticOutcome) -> Bool)? = nil,
         purgeSnapshotRewrites: (@Sendable (ResticOutcome) -> [String: String]?)? = nil
-    ) async -> ChildRun? {
+    ) async -> RecordedChildResult {
         var run: ActiveRun
         do {
             run = try runStore.begin(
@@ -1770,8 +1857,9 @@ public final class BackupEngine: Sendable {
                 groupId: groupId
             )
         } catch {
-            logWarning("BackupEngine: could not create a \(kind.rawValue) run record: \(error)")
-            return nil
+            let reason = "run history unusable — could not create a \(kind.rawValue) run record: \(error)"
+            logWarning("BackupEngine: \(reason)")
+            return .infrastructureFailure(reason)
         }
         // Reproduces the exact spawned command line: `ResticRunner` prepends
         // the binary path from the same config value. Secrets never appear
@@ -1792,23 +1880,23 @@ public final class BackupEngine: Sendable {
             if case .previewUnavailable = failure {
                 do {
                     try runStore.discardUnstarted(run)
-                    return ChildRun(
+                    return .completed(ChildRun(
                         child: SetRunChild(runId: run.runId, kind: kind, destId: destination.id, status: .skipped),
                         outcome: nil,
                         preflightFailure: failure,
                         infrastructureFailureReason: nil
-                    )
+                    ))
                 } catch {
                     logWarning("BackupEngine: could not discard unavailable preflight run \(run.runId): \(error)")
                 }
             }
             let infrastructureFailure = finish(run, status: .failed, errorSummary: failure.message)
-            return ChildRun(
+            return .completed(ChildRun(
                 child: SetRunChild(runId: run.runId, kind: kind, destId: destination.id, status: .failed),
                 outcome: nil,
                 preflightFailure: failure,
                 infrastructureFailureReason: infrastructureFailure
-            )
+            ))
         }
 
         if preflightPhase != nil {
@@ -1832,12 +1920,12 @@ public final class BackupEngine: Sendable {
             if case .previewUnavailable = launchPreflightFailure {
                 do {
                     try runStore.discardUnstarted(run)
-                    return ChildRun(
+                    return .completed(ChildRun(
                         child: SetRunChild(runId: run.runId, kind: kind, destId: destination.id, status: .skipped),
                         outcome: nil,
                         preflightFailure: launchPreflightFailure,
                         infrastructureFailureReason: nil
-                    )
+                    ))
                 } catch {
                     logWarning("BackupEngine: could not discard unavailable launch preflight run \(run.runId): \(error)")
                 }
@@ -1847,12 +1935,12 @@ public final class BackupEngine: Sendable {
                 status: .failed,
                 errorSummary: launchPreflightFailure.message
             )
-            return ChildRun(
+            return .completed(ChildRun(
                 child: SetRunChild(runId: run.runId, kind: kind, destId: destination.id, status: .failed),
                 outcome: nil,
                 preflightFailure: launchPreflightFailure,
                 infrastructureFailureReason: infrastructureFailure
-            )
+            ))
         }
 
         let status: RunStatus
@@ -1898,12 +1986,12 @@ public final class BackupEngine: Sendable {
             resticExitCode: exitCode,
             purgeSnapshotRewrites: rewrites
         )
-        return ChildRun(
+        return .completed(ChildRun(
             child: SetRunChild(runId: run.runId, kind: kind, destId: destination.id, status: status),
             outcome: result.outcome,
             preflightFailure: nil,
             infrastructureFailureReason: infrastructureFailure
-        )
+        ))
     }
 
     /// The outcome of spawning (or failing to spawn) one restic child.

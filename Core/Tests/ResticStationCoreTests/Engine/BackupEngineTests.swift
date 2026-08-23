@@ -864,6 +864,96 @@ struct BackupEngineTests {
         #expect(env.entries(kind: .backup).first?.status == .failed)
     }
 
+    @Test("an unusable runs directory is infrastructure failure before backup launch")
+    func backupBeginFailureIsInfrastructureFailure() async throws {
+        let env = Self.makeEnv(script: [], reachableSecondaries: [])
+        defer { env.cleanUp() }
+        try env.paths.ensureDirectories()
+        let runId = RunStore.formatRunId(kind: .backup, setId: Self.setId, date: Self.t0)
+        try FileManager.default.createSymbolicLink(
+            at: env.paths.runDir(runId: runId),
+            withDestinationURL: env.root.appendingPathComponent("missing-run-target")
+        )
+
+        let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
+
+        guard case .infrastructureFailure(let reason) = outcome else {
+            Issue.record("a run-record creation failure must fail the scheduled operation: \(outcome)")
+            return
+        }
+        #expect(reason.contains("run history unusable"))
+        #expect(env.resticArgvs.isEmpty)
+    }
+
+    @Test("an unusable runs directory is infrastructure failure before check launch")
+    func checkBeginFailureIsInfrastructureFailure() async throws {
+        let env = Self.makeEnv(script: [], reachableSecondaries: [])
+        defer { env.cleanUp() }
+        try env.paths.ensureDirectories()
+        let runId = RunStore.formatRunId(kind: .check, setId: Self.setId, date: Self.t0)
+        try FileManager.default.createSymbolicLink(
+            at: env.paths.runDir(runId: runId),
+            withDestinationURL: env.root.appendingPathComponent("missing-run-target")
+        )
+
+        let outcome = await env.engine.runCheck(env.set, trigger: .scheduled)
+
+        guard case .infrastructureFailure(let reason) = outcome else {
+            Issue.record("a run-record creation failure must fail the scheduled check: \(outcome)")
+            return
+        }
+        #expect(reason.contains("run history unusable"))
+        #expect(env.resticArgvs.isEmpty)
+    }
+
+    @Test("a copy record creation failure fails the set instead of silently skipping the mirror")
+    func copyBeginFailureIsInfrastructureFailure() async throws {
+        let env = Self.makeEnv(
+            script: [],
+            retention: nil,
+            reachableSecondaries: [true]
+        )
+        defer { env.cleanUp() }
+        try env.paths.ensureDirectories()
+        let runId = RunStore.formatRunId(kind: .copy, setId: Self.setId, date: Self.t0)
+        try FileManager.default.createSymbolicLink(
+            at: env.paths.runDir(runId: runId),
+            withDestinationURL: env.root.appendingPathComponent("missing-run-target")
+        )
+        env.fake.script = Self.resticCall(Self.backupArgv(env.primary.repoURL), dest: Self.primaryId)
+
+        let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
+
+        guard case .infrastructureFailure(let reason) = outcome else {
+            Issue.record("a missing copy record must fail the set: \(outcome)")
+            return
+        }
+        #expect(reason.contains("run history unusable"))
+        #expect(env.resticArgvs == [[Self.resticPath] + Self.backupArgv(env.primary.repoURL)])
+    }
+
+    @Test("a retention record creation failure fails the set instead of omitting retention")
+    func retentionBeginFailureIsInfrastructureFailure() async throws {
+        let env = Self.makeEnv(script: [], reachableSecondaries: [])
+        defer { env.cleanUp() }
+        try env.paths.ensureDirectories()
+        let runId = RunStore.formatRunId(kind: .prune, setId: Self.setId, date: Self.t0)
+        try FileManager.default.createSymbolicLink(
+            at: env.paths.runDir(runId: runId),
+            withDestinationURL: env.root.appendingPathComponent("missing-run-target")
+        )
+        env.fake.script = Self.resticCall(Self.backupArgv(env.primary.repoURL), dest: Self.primaryId)
+
+        let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
+
+        guard case .infrastructureFailure(let reason) = outcome else {
+            Issue.record("a missing retention record must fail the set: \(outcome)")
+            return
+        }
+        #expect(reason.contains("run history unusable"))
+        #expect(env.resticArgvs == [[Self.resticPath] + Self.backupArgv(env.primary.repoURL)])
+    }
+
     /// The health consequence of the record above, asserted end to end
     /// rather than assumed: a `.failed` last run is what makes
     /// `hasWarningConditions` true, and therefore what makes `status --json`
@@ -1934,6 +2024,30 @@ struct BackupEngineTests {
         if dryRun {
             #expect(env.entries(kind: .prune).isEmpty)
         }
+    }
+
+    @Test("standalone prune reports run-record creation as infrastructure failure")
+    func standalonePruneBeginFailureIsInfrastructure() async throws {
+        let env = Self.makeEnv(script: [], retention: nil)
+        defer { env.cleanUp() }
+        try env.paths.ensureDirectories()
+        let runId = RunStore.formatRunId(kind: .prune, setId: Self.setId, date: Self.t0)
+        try FileManager.default.createSymbolicLink(
+            at: env.paths.runDir(runId: runId),
+            withDestinationURL: env.root.appendingPathComponent("missing-run-target")
+        )
+
+        let result = await env.engine.runPruneRepository(
+            set: env.set,
+            destination: env.primary
+        )
+
+        guard case .failed(.infrastructure(let reason)) = result else {
+            Issue.record("a missing prune record must be infrastructure failure: \(result)")
+            return
+        }
+        #expect(reason.contains("run history unusable"))
+        #expect(env.resticArgvs.isEmpty)
     }
 
     @Test("standalone prune: a busy confirmation does not consume its preview token")
