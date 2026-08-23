@@ -219,6 +219,35 @@ struct StatusReportTests {
         #expect(!text.contains("NOTHING CAN RUN ON THIS MACHINE"))
     }
 
+    @Test("a broken secrets mutation lock is administrative, not machine-wide")
+    func brokenSecretsLockDoesNotClaimOperationsAreStopped() throws {
+        let report = StatusReport(
+            machineId: "studio-mac", generatedAt: Date(), health: "warning",
+            fullDiskAccessDenied: false,
+            locking: StatusReport.LockingStatus(
+                paths: AppPaths(root: URL(fileURLWithPath: "/data")),
+                failure: LockingHealthFailure(
+                    scope: .administrative,
+                    failure: LockFailure(
+                        path: "/data/locks/secrets.lock", operation: "file type", errnoValue: 0
+                    )
+                )
+            ),
+            scheduler: nil,
+            sets: [makeSetStatus(needsAttention: false, isRunning: false)],
+            unattributedRuns: [], excludedHere: []
+        )
+
+        let text = report.humanLines().joined(separator: "\n")
+        #expect(text.contains("SECRET CHANGES CANNOT RUN ON THIS MACHINE"))
+        #expect(!text.contains("NOTHING CAN RUN ON THIS MACHINE"))
+        #expect(!text.contains("ONE OR MORE BACKUP SETS CANNOT RUN"))
+
+        let json = String(decoding: try ConfigStore.makeEncoder().encode(report), as: UTF8.self)
+        #expect(json.contains("\"usable\" : false"))
+        #expect(json.contains("\"scope\" : \"administrative\""))
+    }
+
     @Test("a damaged health-only probe is inconclusive, not a production outage")
     func brokenDiagnosticProbeDoesNotClaimProductionIsStopped() throws {
         let report = StatusReport(

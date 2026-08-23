@@ -635,6 +635,7 @@ let canInjectPermissionFaults = geteuid() != 0
                 "a hostile \(name) lock must not leave locking health green"
             )
             #expect(failure.path == hostile.path)
+            #expect(failure.scope == (name == "secrets" ? .administrative : .machine))
         }
     }
 

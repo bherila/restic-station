@@ -770,6 +770,14 @@ extension CLIFailure {
         switch error {
         case .itemNotFound:
             return CLIFailure(code: .secretNotConfigured, message: error.description)
+        case .lockUnusable:
+            return CLIFailure(
+                code: .internalError,
+                message: bounded(
+                    "The secrets mutation lock could not be used: \(error.description). "
+                        + "Check the permissions on the Restic Station data directory."
+                )
+            )
         case .backendFailed:
             return CLIFailure(code: .secretUnavailable, message: error.description)
         }

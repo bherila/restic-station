@@ -355,6 +355,31 @@ struct FileSecretStoreTests {
         #expect(try await store.password(destId: Self.destId) == "hunter2")
     }
 
+    @Test("an unusable secrets mutation lock stays typed and non-retryable")
+    func unusableMutationLockIsTyped() async throws {
+        let (store, root) = Self.makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = AppPaths(root: root)
+        try paths.ensureDirectories()
+        try FileManager.default.createDirectory(
+            at: store.lockFileURL,
+            withIntermediateDirectories: true
+        )
+
+        do {
+            try await store.setPassword("hunter2", destId: Self.destId)
+            Issue.record("expected the hostile secrets lock to be refused")
+        } catch let error as SecretStoreError {
+            guard case .lockUnusable(let failure) = error else {
+                Issue.record("expected .lockUnusable, got \(error)")
+                return
+            }
+            #expect(failure.path == store.lockFileURL.path)
+            #expect(!CLIFailure.classify(error).retryable)
+            #expect(CLIFailure.classify(error).code == .internalError)
+        }
+    }
+
     @Test("an unremovable temp entry reports its owner and an actionable recovery")
     func diagnosesSquattedTempEntry() async throws {
         let (store, root) = Self.makeStore()

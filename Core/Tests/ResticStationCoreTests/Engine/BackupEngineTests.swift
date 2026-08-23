@@ -3036,6 +3036,28 @@ struct BackupEngineTests {
         #expect(env.fake.invocations.isEmpty)
     }
 
+    @Test("previewPurge preserves an unusable set lock as infrastructure failure")
+    func purgePreviewPreservesLockFailureType() async throws {
+        let env = Self.makeEnv(
+            script: [],
+            retention: nil,
+            purgeExcludes: ["build/**"],
+            reachableSecondaries: []
+        )
+        defer { env.cleanUp() }
+        try env.paths.ensureDirectories()
+        try FileManager.default.createDirectory(
+            at: env.paths.setLockFile(setId: env.set.id),
+            withIntermediateDirectories: true
+        )
+
+        let result = await env.engine.previewPurge(set: env.set, destination: env.primary)
+
+        #expect(result.status == .infrastructureFailure)
+        #expect(result.message?.contains("backup-set lock unusable") == true)
+        #expect(env.fake.invocations.isEmpty, "restic must not run after local lock refusal")
+    }
+
     // MARK: - runRestore
 
     @Test("runRestore: exact argv, .restore record, set lock taken")

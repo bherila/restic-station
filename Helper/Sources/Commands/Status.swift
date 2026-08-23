@@ -488,21 +488,22 @@ struct StatusReport: Encodable {
     /// `usable: false` means a production lock path is broken; `null` means
     /// the health-only probe is damaged and production usability is unknown.
     /// `scope` distinguishes a machine-wide shared-lock outage, one damaged
-    /// per-set lock, and an inconclusive diagnostic probe. Probed live — see
-    /// ``LockingHealth``.
+    /// per-set lock, an administrative-only lock outage, and an inconclusive
+    /// diagnostic probe. Probed live — see ``LockingHealth``.
     struct LockingStatus: Encodable {
         let usable: Bool?
         let dataDirectory: String
         /// The specific fault, `null` when usable.
         let problem: String?
-        /// `"machine"`, `"set"`, `"diagnostic"`, or `null` when healthy.
+        /// `"machine"`, `"set"`, `"administrative"`, `"diagnostic"`, or
+        /// `null` when healthy.
         let scope: String?
         /// The affected set for a partial outage; otherwise `null`.
         let setId: UUID?
 
         init(paths: AppPaths, failure: LockingHealthFailure?) {
             switch failure?.scope {
-            case .machine, .set:
+            case .machine, .set, .administrative:
                 usable = false
             case .diagnostic:
                 usable = nil
@@ -518,6 +519,9 @@ struct StatusReport: Encodable {
             case .set(let id):
                 scope = "set"
                 setId = id
+            case .administrative:
+                scope = "administrative"
+                setId = nil
             case .diagnostic:
                 scope = "diagnostic"
                 setId = nil
@@ -707,6 +711,8 @@ struct StatusReport: Encodable {
                     "locking: ONE OR MORE BACKUP SETS CANNOT RUN "
                         + "(first detected: \(setId.uuidString.lowercased()))"
                 )
+            } else if locking.scope == "administrative" {
+                lines.append("locking: SECRET CHANGES CANNOT RUN ON THIS MACHINE")
             } else {
                 lines.append("locking: NOTHING CAN RUN ON THIS MACHINE")
             }

@@ -160,7 +160,7 @@ Root being outside the secrecy boundary does **not** mean a root-run helper acce
 
 ### Concurrency
 
-A tick and an interactive `secret set` can run at the same time. Every read-modify-write takes `locks/secrets.lock` (the existing `FileLock`, `flock(2)`, released by the kernel on process death) with a 10 s timeout, so a concurrent `secret set` cannot lose the other writer's entry. Reads take **no** lock: `rename(2)` is atomic, so a reader always sees one complete generation of the file.
+A tick and an interactive `secret set` can run at the same time. Every read-modify-write takes `locks/secrets.lock` (the existing `FileLock`, `flock(2)`, released by the kernel on process death) with a 10 s timeout, so a concurrent `secret set` cannot lose the other writer's entry. A structurally unusable mutation lock is a typed, non-retryable infrastructure failure rather than temporary secret unavailability. Reads take **no** lock: `rename(2)` is atomic, so a reader always sees one complete generation of the file.
 
 ### How the password reaches restic
 

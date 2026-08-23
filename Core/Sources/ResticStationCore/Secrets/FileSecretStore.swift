@@ -412,7 +412,7 @@ public struct FileSecretStore: SecretStore {
                 // on a stuck peer: the advice above ("check for running
                 // helper processes") is actively misleading when the lock
                 // file is simply unopenable or owned by another user (#110).
-                throw SecretStoreError.backendFailed("secrets lock unusable: \(failure)")
+                throw SecretStoreError.lockUnusable(failure)
             }
             break
         }

@@ -69,6 +69,10 @@ public struct PurgePlanResult: Equatable, Sendable {
         case ready
         case busy
         case offline
+        /// Local process-control state failed before any restic preview
+        /// command ran. Distinct from `failed`, which means the repository
+        /// query itself could not complete.
+        case infrastructureFailure
         case failed
     }
 

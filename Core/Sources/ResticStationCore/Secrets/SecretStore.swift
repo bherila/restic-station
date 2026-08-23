@@ -5,15 +5,20 @@ import Foundation
 /// Typed errors surfaced by every ``SecretStore`` backend.
 ///
 /// **Invariant: no case ever carries secret material.** ``itemNotFound`` is
-/// data-free by construction, and ``backendFailed(_:)`` may only be
-/// constructed from a backend's own diagnostic text (a `security` stderr
-/// line, a file path, an errno string) — never from a password, a secret-env
-/// value, or a decoded blob. These strings reach run logs and the UI.
+/// data-free by construction, ``lockUnusable(_:)`` carries only path/errno
+/// diagnostics, and ``backendFailed(_:)`` may only be constructed from a
+/// backend's own diagnostic text (a `security` stderr line, a file path, an
+/// errno string) — never from a password, a secret-env value, or a decoded
+/// blob. These strings reach run logs and the UI.
 public enum SecretStoreError: Error, Sendable, Equatable, CustomStringConvertible {
     /// No stored item for this destination. On the keychain backend this is
     /// `security`'s documented exit code 44; on the file backend it is a
     /// missing key (or a missing `secrets.json`).
     case itemNotFound
+    /// The file backend's mutation lock is structurally unusable. Kept out
+    /// of `backendFailed` because retrying the identical write cannot repair
+    /// a symlink, wrong owner, unsafe parent, or wrong file type.
+    case lockUnusable(LockFailure)
     /// Any other backend failure, with the backend's own diagnostic text.
     case backendFailed(String)
 
@@ -21,6 +26,8 @@ public enum SecretStoreError: Error, Sendable, Equatable, CustomStringConvertibl
         switch self {
         case .itemNotFound:
             return "no stored secret for this destination"
+        case .lockUnusable(let failure):
+            return "secrets lock unusable: \(failure)"
         case .backendFailed(let detail):
             return detail
         }

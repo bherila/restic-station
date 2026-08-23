@@ -110,7 +110,7 @@ never match on it. `details` is omitted entirely when empty.
 | `repository_offline` | **yes** | **3** | The destination did not answer — an unplugged drive, a sleeping NAS. Expected, not a fault. |
 | `repository_locked` | **yes** | 1 | restic exit 11: another restic process holds the repository lock. |
 | `repository_not_initialized` | no | 1 | restic exit 10: nothing is initialized at that location. |
-| `secret_unavailable` | **yes** | 1 | The secret backend answered badly and may answer well later — a locked login keychain, a transient I/O error. **Also currently reported for the file backend's permanent refusals** (a group-accessible or symlinked `secrets.json`, an untrusted owner, malformed contents), which retrying cannot fix — see #96. |
+| `secret_unavailable` | **yes** | 1 | The secret backend answered badly and may answer well later — a locked login keychain, a transient I/O error. **Also currently reported for the file backend's permanent `secrets.json` refusals** (a group-accessible or symlinked file, an untrusted owner, malformed contents), which retrying cannot fix — see #96. A structurally unusable `secrets.lock` is instead non-retryable `internal_error`. |
 | `secret_not_configured` | no | 1 | The backend answered "no such item": no password is stored for this destination. Run `secret set`. Also what `ResticRunner`'s pre-flight reports, so the distinction survives to the commands that actually run restic. |
 | `secret_rejected` | no | 1 | restic exit 12: the secret was read fine and restic refused it. |
 | `restic_not_found` | no | 1 | No restic binary anywhere that was searched. |
@@ -119,7 +119,7 @@ never match on it. `details` is omitted entirely when empty.
 | `operation_timed_out` | **yes** | 1 | The operation exceeded the caller's timeout and was stopped; restic never reported. A stalled network or a spinning-up remote clears on its own. |
 | `preview_expired` | no | 1 | A destructive preview token has expired. Run a fresh preview; the old token can never be applied. |
 | `operation_not_allowed` | no | 1 | Refused by a safety invariant — `forget` with an empty retention policy, `prune` on a mirror behind its primary (`architecture.md` §Invariants). |
-| `internal_error` | no | 1 | An unexpected failure. Bounded; never a serialized object description. |
+| `internal_error` | no | 1 | An unexpected or structurally unrecoverable local failure, including an unusable process-control lock. Bounded; never a serialized object description. |
 
 ### `retryable`
 

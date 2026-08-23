@@ -63,6 +63,11 @@ public final class StateWatcher: ObservableObject {
     private var stateDirSource: DispatchSourceFileSystemObject?
     private var runsDirSource: DispatchSourceFileSystemObject?
     private var locksDirSource: DispatchSourceFileSystemObject?
+    /// Metadata changes on a child do not emit `.attrib` on its parent
+    /// directory vnode. Keep direct sources for every existing lock whose
+    /// health is reported, while the directory sources discover creation and
+    /// replacement and cause this set to be reconciled.
+    private var lockFileSources: [String: DispatchSourceFileSystemObject] = [:]
     /// Watches `paths.root` purely so that a delete+recreate of `state/`,
     /// `runs/`, or `locks/` (which this watcher cannot keep an open fd across)
     /// has a
@@ -125,6 +130,7 @@ public final class StateWatcher: ObservableObject {
         stateDirSource?.cancel()
         runsDirSource?.cancel()
         locksDirSource?.cancel()
+        lockFileSources.values.forEach { $0.cancel() }
         rootDirSource?.cancel()
         if let distributedNotificationObserver {
             DistributedNotificationCenter.default().removeObserver(distributedNotificationObserver)
@@ -184,6 +190,8 @@ public final class StateWatcher: ObservableObject {
         runsDirSource = nil
         locksDirSource?.cancel()
         locksDirSource = nil
+        lockFileSources.values.forEach { $0.cancel() }
+        lockFileSources.removeAll()
         rootDirSource?.cancel()
         rootDirSource = nil
         pendingReopen.removeAll()
@@ -200,6 +208,7 @@ public final class StateWatcher: ObservableObject {
     /// missing file or directory.
     public func reloadNow() {
         lockingFailure = LockingHealth.probe(paths: paths, configuredSetIds: configuredSetIds)
+        if isRunning { refreshLockFileSources() }
         scheduleState = stateStore.readScheduleState()
         fdaCheck = stateStore.readFdaCheck()
 
@@ -364,5 +373,62 @@ public final class StateWatcher: ObservableObject {
         case .locks:
             locksDirSource = source
         }
+    }
+
+    /// Reconciles direct vnode watches for every lock path the live health
+    /// probe inspects. Absent companion and set locks stay absent: `open`
+    /// never creates them, and their parent directory source installs the
+    /// child watch after a later creation. Stable health locks are created by
+    /// the probe and therefore become watchable during the same reload.
+    private func refreshLockFileSources() {
+        let urls = [
+            paths.tickLockFile,
+            paths.healthLockFile,
+            paths.secretsLockFile,
+            paths.scheduleStateLockFile,
+            paths.stateHealthLockFile,
+            paths.previewTokensLockFile,
+            paths.runsIndexLockFile,
+            paths.runsHealthLockFile,
+        ] + configuredSetIds.map { paths.setLockFile(setId: $0) }
+        let desired = Dictionary(uniqueKeysWithValues: urls.map {
+            ($0.standardizedFileURL.path, $0.standardizedFileURL)
+        })
+
+        for key in Array(lockFileSources.keys) where desired[key] == nil {
+            lockFileSources.removeValue(forKey: key)?.cancel()
+        }
+        for (key, url) in desired where lockFileSources[key] == nil {
+            if let source = makeLockFileSource(watching: url, key: key) {
+                lockFileSources[key] = source
+            }
+        }
+    }
+
+    private func makeLockFileSource(
+        watching url: URL,
+        key: String
+    ) -> DispatchSourceFileSystemObject? {
+        let fd = open(url.path, O_EVTONLY | O_NOFOLLOW | O_CLOEXEC)
+        guard fd >= 0 else { return nil }
+
+        let source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fd,
+            eventMask: [.attrib, .delete, .rename],
+            queue: watchQueue
+        )
+        source.setEventHandler { [weak self] in
+            guard let self else { return }
+            let invalidated = source.data.contains(.delete) || source.data.contains(.rename)
+            MainActor.assumeIsolated {
+                if invalidated {
+                    self.lockFileSources.removeValue(forKey: key)?.cancel()
+                }
+                self.scheduleDebouncedReload()
+            }
+        }
+        source.setCancelHandler { close(fd) }
+        source.resume()
+        return source
     }
 }

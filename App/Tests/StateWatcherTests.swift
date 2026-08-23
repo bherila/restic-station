@@ -14,6 +14,9 @@ struct StateWatcherTests {
         defer { try? FileManager.default.removeItem(at: root) }
         let paths = AppPaths(root: root)
         try paths.ensureDirectories()
+        let tickLock = FileLock(path: paths.tickLockFile, trustedRoot: root)
+        #expect(tickLock.acquire() == .acquired)
+        tickLock.release()
         let watcher = StateWatcher(
             paths: paths,
             runStore: RunStore(paths: paths),
@@ -21,6 +24,26 @@ struct StateWatcherTests {
         )
         watcher.start()
         defer { watcher.stop() }
+        #expect(watcher.lockingFailure == nil)
+
+        // Child metadata does not mutate the parent directory vnode. The
+        // direct lock-file source must still refresh live health.
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o000], ofItemAtPath: paths.tickLockFile.path
+        )
+        for _ in 0..<40 {
+            if watcher.lockingFailure?.path == paths.tickLockFile.path { break }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        #expect(watcher.lockingFailure?.path == paths.tickLockFile.path)
+
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600], ofItemAtPath: paths.tickLockFile.path
+        )
+        for _ in 0..<40 {
+            if watcher.lockingFailure == nil { break }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
         #expect(watcher.lockingFailure == nil)
 
         // A metadata-only permission change must make the app unhealthy even

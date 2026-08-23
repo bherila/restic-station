@@ -204,6 +204,38 @@ struct ResticUnavailableWiringTests {
 @Suite("failures classified by the commands themselves")
 struct CommandFailureClassificationTests {
 
+    @Test("purge preview preserves local lock failure as non-retryable infrastructure")
+    func purgePreviewInfrastructureFailure() {
+        let setId = UUID()
+        let destination = Destination(
+            id: UUID(), label: "Primary", repoURL: "/repo", isPrimary: true
+        )
+        let result = PurgePlanResult(
+            plan: PurgePlan(
+                destinationId: destination.id,
+                snapshots: [],
+                sourcePaths: [],
+                hostnames: [],
+                patterns: ["build/**"]
+            ),
+            status: .infrastructureFailure,
+            message: "backup-set lock unusable — refused by ownership check"
+        )
+
+        do {
+            try PurgePreview.validate(result: result, setId: setId, destination: destination)
+            Issue.record("expected infrastructure failure")
+        } catch let failure as CLIFailure {
+            #expect(failure.code == .internalError)
+            #expect(!failure.retryable)
+            #expect(failure.message.contains("backup-set lock unusable"))
+            #expect(failure.details.setId == setId)
+            #expect(failure.details.destinationId == destination.id)
+        } catch {
+            Issue.record("unexpected error: \(error)")
+        }
+    }
+
     @Test(
         "maintenance infrastructure failures do not claim that history alone failed",
         arguments: [

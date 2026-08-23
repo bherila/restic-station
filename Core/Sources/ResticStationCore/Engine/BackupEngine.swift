@@ -1127,7 +1127,7 @@ public final class BackupEngine: Sendable {
             logWarning("BackupEngine: cannot acquire the set lock: \(failure)")
             return PurgePlanResult(
                 plan: emptyPlan,
-                status: .failed,
+                status: .infrastructureFailure,
                 message: "backup-set lock unusable — \(failure)"
             )
         }

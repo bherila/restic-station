@@ -3,15 +3,19 @@ import Foundation
 public enum LockingHealthScope: Equatable, Sendable {
     case machine
     case set(UUID)
+    /// A lock used only for administrative mutation is broken. Existing
+    /// backup, check, restore, and maintenance reads remain usable.
+    case administrative
     /// A health-only lock or scratch artifact is damaged. The live probe is
     /// inconclusive; this alone does not prove production locks are unusable.
     case diagnostic
 }
 
 /// A live locking fault together with the amount of work it blocks.
-/// Per-set lock damage is a partial outage; shared locks and directory
-/// faults prevent safe operation machine-wide. Health-only artifact damage
-/// is diagnostic failure, not evidence of a production outage.
+/// Per-set and administrative lock damage are partial outages; shared
+/// operation locks and directory faults prevent safe operation machine-wide.
+/// Health-only artifact damage is diagnostic failure, not evidence of a
+/// production outage.
 public struct LockingHealthFailure: Error, Equatable, Sendable, CustomStringConvertible {
     public let scope: LockingHealthScope
     public let failure: LockFailure
@@ -119,13 +123,21 @@ public enum LockingHealth {
                 diagnosticFailure = diagnosticFailure ?? classified
             }
         }
+        // The secrets lock serializes mutation only. Reads use the atomic
+        // secrets file directly, so damage here is an administrative outage,
+        // not evidence that configured backup operations cannot run.
+        let administrativeFailure = FileLock(
+            path: paths.secretsLockFile, trustedRoot: paths.root
+        ).probe(createIfMissing: false).map {
+            LockingHealthFailure(scope: .administrative, failure: $0)
+        }
+
         // These companion locks protect shared local state outside
         // `locks/`. Probe known files without creating them, then separately
         // prove their parent directories can create a future lock. Shared
         // machine-wide faults must be selected before a narrower per-set
         // fault so status never understates the outage.
         for lockFile in [
-            paths.secretsLockFile,
             paths.scheduleStateLockFile,
             paths.previewTokensLockFile,
             paths.runsIndexLockFile,
@@ -142,7 +154,7 @@ public enum LockingHealth {
         ) {
             return productionFailure
         }
-        return diagnosticFailure
+        return administrativeFailure ?? diagnosticFailure
     }
 
     /// The first unusable configured set lock already on disk, if any. The

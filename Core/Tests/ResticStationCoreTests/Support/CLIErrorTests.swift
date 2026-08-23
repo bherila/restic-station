@@ -433,6 +433,13 @@ struct CLIErrorMappingTests {
             CLIFailure.classify(SecretStoreError.backendFailed("security: exit 51")).code
                 == .secretUnavailable
         )
+        let lockFailure = CLIFailure.classify(SecretStoreError.lockUnusable(LockFailure(
+            path: "/data/locks/secrets.lock",
+            operation: "file type",
+            errnoValue: 0
+        )))
+        #expect(lockFailure.code == .internalError)
+        #expect(!lockFailure.retryable)
     }
 
     @Test("an unrecognised error is internal_error, never guessed at from its text")
