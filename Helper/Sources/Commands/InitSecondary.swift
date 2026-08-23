@@ -50,6 +50,11 @@ struct InitSecondary: AsyncParsableCommand {
                 ? "init-secondary may have run, but its result could not be recorded or trusted: \(reason). "
                     + "Inspect the repository before retrying."
                 : "this machine cannot run init-secondary: \(reason)")
+        case .operationNotAllowed(let reason):
+            // Not reachable today: only manual retention apply is
+            // contained. Exhaustive so that containing another
+            // operation later cannot silently fall through here.
+            HelperExit.fail(reason)
         }
     }
 }

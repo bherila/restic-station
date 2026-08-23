@@ -1704,7 +1704,7 @@ struct BackupEngineTests {
         script += Self.resticCall(Self.forgetArgv(fresh.repoURL), dest: Self.secondaryBId)
         env.fake.script = script
 
-        let status = await env.engine.runPrune(env.set)
+        let status = await env.engine.runPruneUnchecked(env.set)
 
         #expect(status == .completed(.success))
         #expect(env.stateStore.readCurrentRun(setId: Self.setId) == nil, "live progress is cleared afterwards")
@@ -1733,7 +1733,7 @@ struct BackupEngineTests {
         script += Self.resticCall(Self.forgetArgv(env.primary.repoURL), dest: Self.primaryId)
         env.fake.script = script
 
-        let status = await env.engine.runPrune(env.set)
+        let status = await env.engine.runPruneUnchecked(env.set)
 
         #expect(status == .completed(.success))
         #expect(env.resticArgvs == [[Self.resticPath] + Self.forgetArgv(env.primary.repoURL)])
@@ -1758,7 +1758,7 @@ struct BackupEngineTests {
         defer { env.cleanUp() }
         env.fake.script = Self.resticCall(Self.forgetArgv(env.primary.repoURL), dest: Self.primaryId)
 
-        let status = await env.engine.runPrune(env.set)
+        let status = await env.engine.runPruneUnchecked(env.set)
 
         guard case .infrastructureFailure(let reason, let operationMayHaveRun) = status else {
             Issue.record("a terminal index failure must remain infrastructure failure: \(status)")
@@ -1779,7 +1779,7 @@ struct BackupEngineTests {
             withIntermediateDirectories: true
         )
 
-        let outcome = await env.engine.runPrune(env.set)
+        let outcome = await env.engine.runPruneUnchecked(env.set)
 
         guard case .infrastructureFailure(let reason, let operationMayHaveRun) = outcome else {
             Issue.record("an unusable prune lock must be infrastructure failure: \(outcome)")
@@ -1799,7 +1799,7 @@ struct BackupEngineTests {
         let env = Self.makeEnv(script: [], retention: retention)
         defer { env.cleanUp() }
 
-        let status = await env.engine.runPrune(env.set)
+        let status = await env.engine.runPruneUnchecked(env.set)
 
         #expect(status == .skipped)
         #expect(env.fake.invocations.isEmpty, "nothing spawned — the guard is the first thing checked")

@@ -114,6 +114,12 @@ public enum ManualRunOutcome: Equatable, Sendable {
     /// `operationMayHaveRun` prevents a caller from encouraging a blind
     /// retry after restic completed but its terminal state was not durable.
     case infrastructureFailure(reason: String, operationMayHaveRun: Bool)
+    /// The operation is not available in this build. Distinct from
+    /// ``skipped`` (a retryable deferral) and ``infrastructureFailure``
+    /// (this machine is broken): nothing is wrong, nothing will change on a
+    /// retry, and no state was touched. See
+    /// ``ManualRetentionApplyAvailability``.
+    case operationNotAllowed(reason: String)
 }
 
 /// The standalone-prune result keeps non-destructive refusals distinct from
@@ -736,7 +742,34 @@ public final class BackupEngine: Sendable {
     /// `nil` means the caller made no such promise, which is the scheduled
     /// path. A *bound* caller must pass a real identity and refuse if it
     /// cannot read one; see `RunSet`.
+    /// Refuses before touching anything: no secret read, no set lock, no
+    /// executable resolution, no run record, no subprocess. See
+    /// ``ManualRetentionApplyAvailability`` for why, and for what still
+    /// applies retention while this is closed.
+    ///
+    /// The helper refuses earlier still — before it even builds a context —
+    /// so this is defense in depth for a direct Core caller, not the only
+    /// gate.
     public func runPrune(
+        _ set: BackupSet,
+        expectedExecutableIdentity: String? = nil
+    ) async -> ManualRunOutcome {
+        guard ManualRetentionApplyAvailability.isEnabled else {
+            return .operationNotAllowed(reason: ManualRetentionApplyAvailability.reason)
+        }
+        return await runPruneUnchecked(
+            set,
+            expectedExecutableIdentity: expectedExecutableIdentity
+        )
+    }
+
+    /// The manual-retention mechanics, minus the containment gate.
+    ///
+    /// `internal` on purpose: reachable from the tests that cover mirror
+    /// freshness, executable pinning and run recording, and from nothing
+    /// that ships. Do not add a public caller — the gate above is the only
+    /// supported entry point.
+    func runPruneUnchecked(
         _ set: BackupSet,
         expectedExecutableIdentity: String? = nil
     ) async -> ManualRunOutcome {

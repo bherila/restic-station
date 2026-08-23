@@ -39,6 +39,22 @@ struct RetentionSection: View {
         maintenance.isBusy(.prune(setId: backupSet.id))
     }
 
+    /// Manual retention apply is contained — see
+    /// ``ManualRetentionApplyAvailability``. The helper and Core both refuse
+    /// independently, so this only spares the operator a dialog that would
+    /// end in a refusal; it is not what enforces the posture.
+    private var canApplyRetention: Bool {
+        ManualRetentionApplyAvailability.isEnabled
+    }
+
+    private var applyRetentionHelp: String {
+        if !canApplyRetention { return ManualRetentionApplyAvailability.reason }
+        if !runsOnThisMachine {
+            return "This backup set does not run on this machine, so retention cannot be applied here."
+        }
+        return "Runs the retention policy. It permanently deletes snapshots the policy no longer keeps."
+    }
+
     private var hasICloudRepository: Bool {
         backupSet.destinations.contains(where: MaintenanceModel.isICloudRepository)
     }
@@ -127,11 +143,9 @@ struct RetentionSection: View {
                         Label("Apply retention now", systemImage: "trash")
                     }
                 }
-                .disabled(!hasPolicy || !runsOnThisMachine || isPruning
+                .disabled(!hasPolicy || !runsOnThisMachine || !canApplyRetention || isPruning
                     || maintenance.isPreparingPrune || isPreviewing)
-                .help(runsOnThisMachine
-                    ? "Runs the retention policy. It permanently deletes snapshots the policy no longer keeps."
-                    : "This backup set does not run on this machine, so retention cannot be applied here.")
+                .help(applyRetentionHelp)
 
                 Menu {
                     ForEach(backupSet.destinations) { destination in
@@ -155,6 +169,18 @@ struct RetentionSection: View {
                 .help("Checks and prunes the selected repository. It frees unreferenced pack data without changing retention.")
 
                 Spacer(minLength: 0)
+            }
+            if !canApplyRetention {
+                // Visible, not just a tooltip on a disabled button: the
+                // operator needs to know retention is still happening on
+                // schedule, or they will reasonably assume it stopped.
+                Label(
+                    ManualRetentionApplyAvailability.reason,
+                    systemImage: "clock.badge.checkmark"
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
             }
             if hasICloudRepository {
                 Label(
