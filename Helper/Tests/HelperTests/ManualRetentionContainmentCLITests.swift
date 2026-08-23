@@ -32,7 +32,7 @@ struct ManualRetentionContainmentCLITests {
             .appendingPathComponent("rs-containment-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
 
-        try await TestEnvironmentLock.shared.withDataDirectory(root.path) {
+        try await TestEnvironmentLock.withDataDirectory(root.path) {
             #expect(
                 !FileManager.default.fileExists(atPath: root.path),
                 "precondition: the data directory does not exist yet"
@@ -59,5 +59,51 @@ struct ManualRetentionContainmentCLITests {
                 """
             )
         }
+    }
+}
+
+/// ``TestEnvironmentLock`` itself. The mechanism is only worth having if it
+/// holds across `await`, which is precisely where an `actor` method does
+/// not: actors are reentrant at their suspension points, so an earlier
+/// version of this type let a second caller overwrite the variable
+/// mid-flight and then restore a stale value.
+@Suite("TestEnvironmentLock")
+struct TestEnvironmentLockTests {
+
+    @Test("concurrent callers each observe their own value across a suspension")
+    func serializesAcrossSuspension() async throws {
+        let key = "RESTIC_STATION_DATA_DIR"
+
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for index in 0..<8 {
+                group.addTask {
+                    let mine = "/tmp/env-lock-probe-\(index)"
+                    try await TestEnvironmentLock.withDataDirectory(mine) {
+                        // Suspend inside the critical section: an actor
+                        // would admit another caller right here.
+                        for _ in 0..<4 { await Task.yield() }
+                        let seen = ProcessInfo.processInfo.environment[key]
+                        #expect(
+                            seen == mine,
+                            "another caller entered the critical section: expected \(mine), saw \(seen ?? "unset")"
+                        )
+                    }
+                }
+            }
+            try await group.waitForAll()
+        }
+    }
+
+    @Test("the previous value is restored, including when it was unset")
+    func restoresPreviousValue() async throws {
+        let key = "RESTIC_STATION_DATA_DIR"
+        unsetenv(key)
+        try await TestEnvironmentLock.withDataDirectory("/tmp/env-lock-restore") {
+            #expect(ProcessInfo.processInfo.environment[key] == "/tmp/env-lock-restore")
+        }
+        #expect(
+            ProcessInfo.processInfo.environment[key] == nil,
+            "an unset variable must come back unset, not empty"
+        )
     }
 }

@@ -288,7 +288,7 @@ struct CommandFailureClassificationTests {
         // ``TestEnvironmentLock`` because the variable is process-global and
         // other suites set it too — parallel tests would otherwise read each
         // other's fixture directory.
-        try await TestEnvironmentLock.shared.withDataDirectory(directory.path) {
+        try await TestEnvironmentLock.withDataDirectory(directory.path) {
             // `secret list` is in this list because it reaches its config
             // through `SecretContext.make()`, not `HelperContext.make()` —
             // entering a password has to work before restic is configured — so
