@@ -337,6 +337,12 @@ public final class StateWatcher: ObservableObject {
     /// retried the next time `rootDirSource` fires (see `makeSource`).
     private func handleDirectoryInvalidated(_ directory: WatchedDirectory) {
         invalidateSource(for: directory)
+        // A child descriptor survives its parent being renamed, but then it
+        // refers to the retired tree. Drop every direct lock source so the
+        // next reload resolves all lock paths through the replacement
+        // directories instead of treating stale path keys as still watched.
+        lockFileSources.values.forEach { $0.cancel() }
+        lockFileSources.removeAll()
         attemptReopen(directory)
     }
 

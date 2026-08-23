@@ -75,7 +75,31 @@ struct StateWatcherTests {
             withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o700]
         )
-        try await Task.sleep(nanoseconds: 500_000_000)
+        let replacementTickLock = FileLock(path: paths.tickLockFile, trustedRoot: root)
+        #expect(replacementTickLock.acquire() == .acquired)
+        replacementTickLock.release()
+        // Let the replacement directory event reconcile direct sources. The
+        // pathname is unchanged, so a source retained from the old tree
+        // would otherwise make this metadata event invisible.
+        try await Task.sleep(nanoseconds: 750_000_000)
+
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o000], ofItemAtPath: paths.tickLockFile.path
+        )
+        for _ in 0..<40 {
+            if watcher.lockingFailure?.path == paths.tickLockFile.path { break }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        #expect(watcher.lockingFailure?.path == paths.tickLockFile.path)
+
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600], ofItemAtPath: paths.tickLockFile.path
+        )
+        for _ in 0..<40 {
+            if watcher.lockingFailure == nil { break }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        #expect(watcher.lockingFailure == nil)
 
         let setId = UUID()
         watcher.updateConfiguredSetIds([setId])
