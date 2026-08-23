@@ -323,6 +323,78 @@ public final class FileLock: @unchecked Sendable {
         return nil
     }
 
+    /// Tightens an already-created owner directory through verified parent
+    /// descriptors. The child is opened with `O_NOFOLLOW`, so a hostile
+    /// parent cannot turn permission repair into `chmod` of another path.
+    static func tightenDirectory(
+        _ directory: URL,
+        parent: URL,
+        trustedRoot: URL,
+        mode: mode_t
+    ) -> LockFailure? {
+        let directoryPath = directory.standardizedFileURL.path
+        guard directory.deletingLastPathComponent().standardizedFileURL.path
+                == parent.standardizedFileURL.path else {
+            return LockFailure(
+                path: directoryPath,
+                operation: "trusted directory boundary",
+                errnoValue: 0
+            )
+        }
+
+        let parentFD: Int32
+        switch openDirectory(parent, trustedRoot: trustedRoot) {
+        case .success(let descriptor):
+            parentFD = descriptor
+        case .failure(let failure):
+            return failure
+        }
+        defer { close(parentFD) }
+
+        let flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+        let (directoryFD, openError) = directory.lastPathComponent.withCString {
+            name -> (Int32, Int32) in
+            let descriptor = openat(parentFD, name, flags)
+            return (descriptor, descriptor < 0 ? errno : 0)
+        }
+        guard directoryFD >= 0 else {
+            return LockFailure(
+                path: directoryPath,
+                operation: "open protected directory",
+                errnoValue: openError
+            )
+        }
+        defer { close(directoryFD) }
+
+        var info = stat()
+        guard fstat(directoryFD, &info) == 0 else {
+            return LockFailure(path: directoryPath, operation: "fstat protected directory", errnoValue: errno)
+        }
+        guard info.st_mode & S_IFMT == S_IFDIR else {
+            return LockFailure(path: directoryPath, operation: "protected directory type", errnoValue: 0)
+        }
+        guard info.st_uid == geteuid() else {
+            return LockFailure(path: directoryPath, operation: "protected directory ownership", errnoValue: 0)
+        }
+
+        if info.st_mode & 0o777 != mode {
+            guard fchmod(directoryFD, mode) == 0 else {
+                return LockFailure(path: directoryPath, operation: "fchmod protected directory", errnoValue: errno)
+            }
+            guard fstat(directoryFD, &info) == 0 else {
+                return LockFailure(
+                    path: directoryPath,
+                    operation: "fstat after protected directory fchmod",
+                    errnoValue: errno
+                )
+            }
+            guard info.st_mode & 0o777 == mode else {
+                return LockFailure(path: directoryPath, operation: "protected directory permissions", errnoValue: 0)
+            }
+        }
+        return nil
+    }
+
     /// Whether this lock file could be opened and is one of ours — without
     /// attempting to take it. Returns `nil` when it is usable.
     ///

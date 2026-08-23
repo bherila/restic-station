@@ -45,6 +45,8 @@ public enum LockingHealth {
     public static func probe(paths: AppPaths, configuredSetIds: Set<UUID>) -> LockingHealthFailure? {
         do {
             try paths.ensureDirectories()
+        } catch let failure as LockFailure {
+            return machine(failure)
         } catch {
             return LockingHealthFailure(
                 scope: .machine,
@@ -97,7 +99,9 @@ public enum LockingHealth {
         return probeConfiguredSetLocks(paths: paths, configuredSetIds: configuredSetIds)
     }
 
-    /// The first unusable configured set lock already on disk, if any.
+    /// The first unusable configured set lock already on disk, if any. The
+    /// status renderer labels it as the first detected set rather than
+    /// claiming it is the only affected set.
     /// Orphaned and malformed persistent lock names are harmless: `flock`
     /// state lives on descriptors, not filenames, and no configured work
     /// will ever open them.

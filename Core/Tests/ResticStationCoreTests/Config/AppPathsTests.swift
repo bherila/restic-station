@@ -348,6 +348,23 @@ struct AppPathsEnvTests {
         #expect(values.isDirectory == true)
     }
 
+    @Test("ensureDirectories never tightens the health directory through an unsafe parent path")
+    func ensureDirectoriesRefusesUnsafeHealthParentBeforeTightening() throws {
+        let (paths, root) = makeTempPaths()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try paths.ensureDirectories()
+        try #require(paths.lockHealthProbeDir.path.withCString { chmod($0, 0o755) } == 0)
+        try #require(paths.locksDir.path.withCString { chmod($0, 0o777) } == 0)
+
+        #expect(throws: (any Error).self) {
+            try paths.ensureDirectories()
+        }
+
+        var info = stat()
+        try #require(paths.lockHealthProbeDir.path.withCString { lstat($0, &info) } == 0)
+        #expect(info.st_mode & 0o777 == 0o755)
+    }
+
     @Test func ensureDirectoriesDoesNotTouchMetadataWhenModesAreAlreadyCorrect() throws {
         let (paths, root) = makeTempPaths()
         defer { try? FileManager.default.removeItem(at: root) }

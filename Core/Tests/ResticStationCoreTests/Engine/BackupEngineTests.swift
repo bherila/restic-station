@@ -1879,6 +1879,36 @@ struct BackupEngineTests {
         #expect(env.entries(kind: .prune).isEmpty)
     }
 
+    @Test(
+        "standalone prune: an unusable set lock stays an infrastructure failure",
+        arguments: [false, true]
+    )
+    func standalonePruneUnusableSetLockIsInfrastructure(dryRun: Bool) async throws {
+        let env = Self.makeEnv(script: [], retention: nil)
+        defer { env.cleanUp() }
+        try env.paths.ensureDirectories()
+        try FileManager.default.createDirectory(
+            at: env.paths.setLockFile(setId: env.set.id),
+            withIntermediateDirectories: true
+        )
+
+        let result = await env.engine.runPruneRepository(
+            set: env.set,
+            destination: env.primary,
+            dryRun: dryRun
+        )
+
+        guard case .failed(.infrastructure(let reason)) = result else {
+            Issue.record("an unusable set lock must remain infrastructure failure: \(result)")
+            return
+        }
+        #expect(reason.contains("backup-set lock unusable"))
+        #expect(env.fake.invocations.isEmpty)
+        if dryRun {
+            #expect(env.entries(kind: .prune).isEmpty)
+        }
+    }
+
     @Test("standalone prune: a busy confirmation does not consume its preview token")
     func standalonePruneBusyConfirmationRetainsItsPreviewToken() async throws {
         let env = Self.makeEnv(script: [], retention: nil)
@@ -1966,6 +1996,42 @@ struct BackupEngineTests {
         #expect(try PreviewTokenStore(paths: env.paths).token(token).value == token)
         #expect(env.fake.invocations.isEmpty)
         #expect(env.entries(kind: .prune).isEmpty)
+    }
+
+    @Test("standalone prune: an unusable confirmation store is not temporary contention")
+    func standalonePruneUnusableConfirmationStoreIsInfrastructureFailure() async throws {
+        let env = Self.makeEnv(script: [], retention: nil)
+        defer { env.cleanUp() }
+        let fingerprint = env.primary.pruneConfirmationFingerprint(secretEnv: [:])
+        let token = try PreviewTokenStore(paths: env.paths).issueMaintenancePrune(
+            machineId: env.machineId,
+            setId: env.set.id,
+            destinationId: env.primary.id,
+            effectiveDestinationFingerprint: fingerprint
+        )
+        try FileManager.default.removeItem(at: env.paths.previewTokensLockFile)
+        try FileManager.default.createDirectory(
+            at: env.paths.previewTokensLockFile,
+            withIntermediateDirectories: true
+        )
+
+        let result = await env.engine.runPruneRepository(
+            set: env.set,
+            destination: env.primary,
+            authorization: MaintenancePruneAuthorization(
+                token: token,
+                machineId: env.machineId,
+                effectiveDestinationFingerprint: fingerprint
+            )
+        )
+
+        guard case .failed(.infrastructure(let reason)) = result else {
+            Issue.record("a broken confirmation store must be infrastructure failure: \(result)")
+            return
+        }
+        #expect(reason.contains("preview-token store unusable"))
+        #expect(env.fake.invocations.isEmpty)
+        #expect(env.entries(kind: .prune).first?.status == .failed)
     }
 
     @Test("standalone prune: a launch-time secret failure retains its preview token")

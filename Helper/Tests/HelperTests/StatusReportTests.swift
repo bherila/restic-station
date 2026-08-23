@@ -213,7 +213,8 @@ struct StatusReportTests {
         )
 
         let text = report.humanLines().joined(separator: "\n")
-        #expect(text.contains("ONE BACKUP SET CANNOT RUN"))
+        #expect(text.contains("ONE OR MORE BACKUP SETS CANNOT RUN"))
+        #expect(text.contains("first detected"))
         #expect(text.contains(setId.uuidString.lowercased()))
         #expect(!text.contains("NOTHING CAN RUN ON THIS MACHINE"))
     }

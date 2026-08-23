@@ -692,7 +692,10 @@ struct StatusReport: Encodable {
         // firing perfectly on time changes nothing.
         if !locking.usable {
             if locking.scope == "set", let setId = locking.setId {
-                lines.append("locking: ONE BACKUP SET CANNOT RUN (\(setId.uuidString.lowercased()))")
+                lines.append(
+                    "locking: ONE OR MORE BACKUP SETS CANNOT RUN "
+                        + "(first detected: \(setId.uuidString.lowercased()))"
+                )
             } else {
                 lines.append("locking: NOTHING CAN RUN ON THIS MACHINE")
             }

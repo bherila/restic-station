@@ -320,19 +320,17 @@ public struct AppPaths: Equatable, Sendable {
         // pre-existing 755 dir staying 755), and the protection that matters
         // is per-file: the token index is 0600 and refuses to load if it is
         // not. This narrows the exposure without overriding that choice.
-        for directory in [stateDir, lockHealthProbeDir] {
-            var info = stat()
-            let statResult = directory.path.withCString { lstat($0, &info) }
-            guard statResult == 0 else {
-                throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
-            }
-            guard info.st_mode & S_IFMT == S_IFDIR else {
-                throw NSError(domain: NSPOSIXErrorDomain, code: Int(ENOTDIR))
-            }
-            if info.st_mode & 0o777 != 0o700 {
-                guard chmod(directory.path, 0o700) == 0 else {
-                    throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
-                }
+        for (directory, parent) in [
+            (stateDir, root),
+            (lockHealthProbeDir, locksDir),
+        ] {
+            if let failure = FileLock.tightenDirectory(
+                directory,
+                parent: parent,
+                trustedRoot: root,
+                mode: 0o700
+            ) {
+                throw failure
             }
         }
     }

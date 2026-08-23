@@ -816,7 +816,7 @@ public final class BackupEngine: Sendable {
             } else {
                 logWarning("BackupEngine: cannot acquire the set lock: \(failure)")
             }
-            return .failed(.didNotRun)
+            return .failed(.infrastructure("backup-set lock unusable — \(failure)"))
         }
         defer { lock.release() }
         defer { try? stateStore.clearCurrentRun(setId: set.id) }
@@ -915,6 +915,8 @@ public final class BackupEngine: Sendable {
                 return .skipped(.previewExpired)
             case .previewUnavailable:
                 return .skipped(.previewUnavailable)
+            case .storeUnusable(let detail):
+                return .failed(.infrastructure("preview-token store unusable — \(detail)"))
             case .reason, .none:
                 break
             }
@@ -998,6 +1000,8 @@ public final class BackupEngine: Sendable {
             return .skipped(.previewExpired)
         case .previewUnavailable:
             return .skipped(.previewUnavailable)
+        case .storeUnusable(let detail):
+            return .failed(.infrastructure("preview-token store unusable — \(detail)"))
         case .reason, .none:
             break
         }
@@ -1650,6 +1654,7 @@ public final class BackupEngine: Sendable {
         case previewChanged
         case previewExpired
         case previewUnavailable
+        case storeUnusable(String)
 
         var message: String {
             switch self {
@@ -1660,6 +1665,8 @@ public final class BackupEngine: Sendable {
                 return "The reclaim preview has expired. Run a new dry run before pruning."
             case .previewUnavailable:
                 return "The reclaim confirmation is temporarily unavailable. Try confirming again."
+            case .storeUnusable(let detail):
+                return "The reclaim confirmation store is unusable: \(detail)"
             }
         }
     }
@@ -1669,13 +1676,12 @@ public final class BackupEngine: Sendable {
     /// `.alreadyUsed` stay deliberately opaque so a caller cannot probe the
     /// token store for which of the two it hit.
     ///
-    /// `.storeUnusable` maps to the same non-committal refusal as
-    /// `.unavailable` rather than leaking the filesystem detail into a
-    /// destructive-path message; the detail is logged and reported by
-    /// `status` instead (#110).
+    /// `.storeUnusable` stays distinct from transient contention so the
+    /// caller can report the permanent data-directory fault as non-retryable.
     private static func preflightFailure(for error: PreviewTokenError) -> PreflightFailure {
         switch error {
-        case .unavailable, .storeUnusable: return .previewUnavailable
+        case .unavailable: return .previewUnavailable
+        case .storeUnusable(let detail): return .storeUnusable(detail)
         case .expired: return .previewExpired
         case .unknown, .alreadyUsed: return .previewChanged
         }

@@ -145,7 +145,7 @@ Every field is an id, a small integer, or a closed enum value:
 
 | Key | Type | Set when |
 |---|---|---|
-| `setId` | UUID string | The failure is about one backup set. |
+| `setId` | UUID string | The first detected affected backup set; additional set locks may also be unusable. |
 | `destinationId` | UUID string | The failure is about one destination. |
 | `runId` | string | The failure is about one run record. |
 | `machineId` | string | A per-machine resolution decided the outcome. |

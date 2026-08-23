@@ -1033,7 +1033,7 @@ if [[ -n "$SET_UUID" && "$SET_UUID" != "null" ]]; then
     ok "a hostile per-set lock is reported even when locks/ and tick.lock are fine"
 
     RESTIC_STATION_DATA_DIR="$BROKEN_SET_LOCK" run_helper status
-    grep -q "ONE BACKUP SET CANNOT RUN" "$OUT_FILE" \
+    grep -q "ONE OR MORE BACKUP SETS CANNOT RUN" "$OUT_FILE" \
         || fail "human status did not classify the per-set lock as a partial outage: $(cat "$OUT_FILE")"
     ! grep -q "NOTHING CAN RUN ON THIS MACHINE" "$OUT_FILE" \
         || fail "human status incorrectly classified one broken set as a machine-wide outage"

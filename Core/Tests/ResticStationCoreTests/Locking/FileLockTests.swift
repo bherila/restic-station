@@ -309,6 +309,27 @@ let canInjectPermissionFaults = geteuid() != 0
         #expect(failure.scope == .set(setId))
     }
 
+    @Test("LockingHealth labels a multi-set outage by its first detected set")
+    func lockingHealthDoesNotClaimOnlyOneSetIsBroken() throws {
+        let root = makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = AppPaths(root: root)
+        try paths.ensureDirectories()
+        let setIds = [UUID(), UUID()]
+        for setId in setIds {
+            try FileManager.default.createDirectory(
+                at: paths.setLockFile(setId: setId),
+                withIntermediateDirectories: true
+            )
+        }
+
+        let failure = try #require(
+            LockingHealth.probe(paths: paths, configuredSetIds: Set(setIds))
+        )
+        let first = setIds.sorted { $0.uuidString < $1.uuidString }[0]
+        #expect(failure.scope == .set(first))
+    }
+
     @Test("LockingHealth ignores orphaned and malformed persistent set locks")
     func lockingHealthIgnoresUnconfiguredSetLocks() throws {
         let root = makeDirectory()
