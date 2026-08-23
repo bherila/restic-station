@@ -698,17 +698,26 @@ assert_migration() {
 # than a manual `run-set`, which dispatches with a different trigger.
 wind_schedule_back() {
     local set_id="$1" file="$DATA_DIR/state/schedule-state.json"
-    [[ -f "$file" ]] || return 0
-    python3 - "$file" "$set_id" <<'WIND'
+    # Fails loudly on every path. A missing file, a missing set entry, or a
+    # renamed field must not quietly wind nothing back and report success —
+    # the caller then runs `tick`, sees no scheduled backup, and blames the
+    # scheduler for what is really a broken fixture.
+    [[ -f "$file" ]] || fail "wind_schedule_back" "no schedule-state.json at $file"
+    python3 - "$file" "$set_id" <<'WIND' || return 1
 import json, sys
 path, set_id = sys.argv[1], sys.argv[2]
 with open(path) as handle:
     state = json.load(handle)
-stamp = "2020-01-01T00:00:00Z"
-entry = state.setdefault("sets", {}).setdefault(set_id, {})
-for key in ("lastBackupStart", "lastBackupEnd"):
-    if key in entry:
-        entry[key] = stamp
+sets = state.get("sets") or {}
+if set_id not in sets:
+    sys.exit(f"schedule-state.json has no entry for set {set_id}: {sorted(sets)}")
+entry = sets[set_id]
+# `lastBackupStart` is the only backup timestamp SetScheduleState encodes.
+# Asserted rather than assumed: if it is renamed, this must fail here and
+# not silently leave the set not-due.
+if "lastBackupStart" not in entry:
+    sys.exit(f"no lastBackupStart in schedule-state entry: {sorted(entry)}")
+entry["lastBackupStart"] = "2020-01-01T00:00:00Z"
 with open(path, "w") as handle:
     json.dump(state, handle)
 WIND
@@ -766,6 +775,9 @@ assert_retention() {
     # whether the scheduler still reaches retention at all.
     #
     # Wind the set's last backup back so it is due.
+    local scheduled_before
+    scheduled_before="$(idx_select backup success "$SET_ID" "" "" \
+        | grep -cE '"trigger":[[:space:]]*"scheduled"' || true)"
     wind_schedule_back "$SET_ID"
 
     set +e
@@ -774,13 +786,16 @@ assert_retention() {
     set -e
     [[ $rc -eq 0 ]] || fail "$step" "tick exited $rc: $out"
 
-    local scheduled_backups
+    local scheduled_after
     # Whitespace-tolerant: `jq -c` emits `"trigger":"scheduled"` while the
     # no-jq `json.dumps` fallback emits `"trigger": "scheduled"`.
-    scheduled_backups="$(idx_select backup success "$SET_ID" "" "" \
+    scheduled_after="$(idx_select backup success "$SET_ID" "" "" \
         | grep -cE '"trigger":[[:space:]]*"scheduled"' || true)"
-    [[ "$scheduled_backups" -ge 1 ]] \
-        || fail "$step" "tick produced no scheduled backup — the set was not due, or the scheduler no longer dispatches: $out"
+    # A delta, not a total: an earlier step already runs a `tick` against this
+    # same set and discards the result, so a lifetime count >= 1 could be
+    # satisfied by that one and assert nothing about *this* dispatch.
+    [[ "$scheduled_after" -eq $((scheduled_before + 1)) ]] \
+        || fail "$step" "this tick produced no new scheduled backup (before=$scheduled_before after=$scheduled_after) — the set was not due, or the scheduler no longer dispatches: $out"
 
     local pcount scount
     pcount="$(primary_snapshot_count)"

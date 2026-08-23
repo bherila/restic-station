@@ -12,11 +12,13 @@ import SwiftUI
 /// - The preview is an app-direct `forget --json --dry-run`
 ///   (`docs/architecture.md`'s read-only exception). It writes nothing and
 ///   produces no run record.
-/// - Apply runs a **fresh** dry-run of its own, quotes those counts in the
-///   confirmation, and then hands the real work to the helper
-///   (`run-set --kind prune`). The numbers the user agrees to are therefore
-///   never the ones from a preview taken minutes ago against a repository
-///   that has since gained snapshots.
+/// - Apply is **contained in this build** and the control is disabled; the
+///   helper refuses `run-set --kind prune` outright (#111/#82). See
+///   ``ManualRetentionApplyAvailability``. When it is re-enabled it runs a
+///   **fresh** dry-run of its own, quotes those counts in the confirmation,
+///   and then hands the real work to the helper — so the numbers the user
+///   agrees to are never the ones from a preview taken minutes ago against
+///   a repository that has since gained snapshots.
 struct RetentionSection: View {
     @EnvironmentObject private var model: AppModel
     let backupSet: BackupSet
@@ -43,6 +45,13 @@ struct RetentionSection: View {
     /// ``ManualRetentionApplyAvailability``. The helper and Core both refuse
     /// independently, so this only spares the operator a dialog that would
     /// end in a refusal; it is not what enforces the posture.
+    /// Whether a tick will actually happen on this Mac. `LaunchdManager`
+    /// already publishes this; the containment copy is the one place that
+    /// promises a schedule, so it is the one place that has to check.
+    private var backgroundAgentRunsTicks: Bool {
+        model.launchd.isEnabled
+    }
+
     private var canApplyRetention: Bool {
         ManualRetentionApplyAvailability.isEnabled
     }
@@ -56,8 +65,13 @@ struct RetentionSection: View {
             return "This backup set does not run on this machine, so retention cannot be applied here."
         }
         if !hasPolicy {
+            // Deliberately does not say "to enable cleanup": adding a policy
+            // leaves this button disabled, because manual apply is contained.
+            // Promising otherwise sends the operator to Backup Sets expecting
+            // this control to light up.
             return "This backup set has no retention policy, so nothing is ever removed — "
-                + "scheduled runs included. Add one in Backup Sets to enable cleanup."
+                + "scheduled runs included. Add one in Backup Sets ▸ Retention for "
+                + "scheduled runs to start cleaning up."
         }
         if !canApplyRetention { return ManualRetentionApplyAvailability.reason }
         return "Runs the retention policy. It permanently deletes snapshots the policy no longer keeps."
@@ -179,9 +193,23 @@ struct RetentionSection: View {
                 Spacer(minLength: 0)
             }
             // Only claim scheduled cleanup where a scheduled run will
-            // actually do it: this machine must run the set, and there must
-            // be a policy for `forgetChild` to apply.
-            if !canApplyRetention, hasPolicy, runsOnThisMachine {
+            // actually do it: this machine must run the set, there must be a
+            // policy for `forgetChild` to apply, and the background agent
+            // must actually be running ticks. With manual apply disabled,
+            // this is the one screen an operator reads about retention — so
+            // it must not assert a schedule that Settings ▸ Permissions is
+            // simultaneously reporting as off.
+            if !canApplyRetention, hasPolicy, runsOnThisMachine, !backgroundAgentRunsTicks {
+                Label(
+                    "Applying retention manually is unavailable in this build, and the background "
+                        + "agent is not running, so no scheduled run will clean up either. Enable "
+                        + "the background agent in Settings ▸ Permissions & background.",
+                    systemImage: "exclamationmark.triangle"
+                )
+                .font(.caption)
+                .foregroundStyle(.orange)
+                .fixedSize(horizontal: false, vertical: true)
+            } else if !canApplyRetention, hasPolicy, runsOnThisMachine {
                 // Visible, not just a tooltip on a disabled button: the
                 // operator needs to know retention is still happening on
                 // schedule, or they will reasonably assume it stopped.
