@@ -467,26 +467,35 @@ public final class FileLock: @unchecked Sendable {
 
         let flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
         var createdDirectory = false
-        let (directoryFD, openError, creationFailed) = directory.lastPathComponent.withCString {
-            name -> (Int32, Int32, Bool) in
+        let (directoryFD, openError, failureOperation) = directory.lastPathComponent.withCString {
+            name -> (Int32, Int32, String?) in
             var descriptor = openat(parentFD, name, flags)
             var code = descriptor < 0 ? errno : 0
             if descriptor < 0, code == ENOENT {
                 let created = mkdirat(parentFD, name, mode)
                 let createError = created != 0 ? errno : 0
                 guard created == 0 || createError == EEXIST else {
-                    return (descriptor, createError, true)
+                    return (descriptor, createError, "create protected directory")
                 }
-                createdDirectory = created == 0
+                if created == 0 {
+                    createdDirectory = true
+                    // mkdirat applies umask, so a restrictive service umask
+                    // can produce mode 0000 and make the new directory
+                    // impossible to reopen. Pin the entry through the already
+                    // verified parent before the first open.
+                    guard fchmodat(parentFD, name, mode, 0) == 0 else {
+                        return (-1, errno, "fchmod created protected directory")
+                    }
+                }
                 descriptor = openat(parentFD, name, flags)
                 code = descriptor < 0 ? errno : 0
             }
-            return (descriptor, code, false)
+            return (descriptor, code, nil)
         }
         guard directoryFD >= 0 else {
             return LockFailure(
                 path: directoryPath,
-                operation: creationFailed ? "create protected directory" : "open protected directory",
+                operation: failureOperation ?? "open protected directory",
                 errnoValue: openError
             )
         }
