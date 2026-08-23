@@ -622,13 +622,84 @@ struct BackupEngineTests {
             return
         }
         #expect(reason.contains("run history unusable"))
-        #expect(env.resticArgvs == [
+        let expectedArgvs: [[String]] = [
             [Self.resticPath] + Self.backupArgv(env.primary.repoURL),
             [Self.resticPath] + Self.copyArgv(to: secondary.repoURL, from: env.primary.repoURL),
             [Self.resticPath] + Self.forgetArgv(secondary.repoURL),
             [Self.resticPath] + Self.forgetArgv(env.primary.repoURL),
-        ])
+        ]
+        #expect(env.resticArgvs == expectedArgvs)
         #expect(env.indexEntries.isEmpty)
+    }
+
+    @Test("a later primary-purge failure cannot mask the backup index failure")
+    func primaryPurgeFailurePreservesEarlierIndexFailure() async throws {
+        let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]
+        let hostnames = [Self.setId: Set(["example-mac.local"])]
+        let paths = Box<AppPaths?>(nil)
+        let env = Self.makeEnv(
+            script: [],
+            retention: nil,
+            purgeExcludes: ["build/**"],
+            reachableSecondaries: [],
+            onSpawn: { argv in
+                guard let paths = paths.value else { return }
+                if argv.contains("backup") {
+                    try? FileManager.default.removeItem(at: paths.runsIndexLockFile)
+                    try? FileManager.default.createDirectory(
+                        at: paths.runsIndexLockFile,
+                        withIntermediateDirectories: true
+                    )
+                } else if argv.contains("snapshots") {
+                    // Isolate the backup's terminal-index failure: repair the
+                    // index before the purge run so its ordinary restic
+                    // failure cannot inherit the same infrastructure fault.
+                    try? FileManager.default.removeItem(at: paths.runsIndexLockFile)
+                }
+            },
+            purgeSourcePaths: sourcePaths,
+            purgeHostnames: hostnames
+        )
+        paths.value = env.paths
+        defer { env.cleanUp() }
+        let snapshotsJSON = try FixtureLoader.string("snapshots.json")
+        let snapshots = try parseSnapshots(Data(snapshotsJSON.utf8))
+        env.fake.script =
+            Self.resticCall(
+                Self.backupArgv(env.primary.repoURL, excludes: env.set.purgeExcludes),
+                dest: Self.primaryId,
+                stdoutLines: Self.backupStream()
+            )
+            + Self.resticCall(
+                ["-r", env.primary.repoURL, "snapshots", "--json"],
+                dest: Self.primaryId,
+                stdoutLines: [snapshotsJSON]
+            )
+            + Self.resticCall(
+                ["-r", env.primary.repoURL, "snapshots", "--json"],
+                dest: Self.primaryId,
+                stdoutLines: [snapshotsJSON]
+            )
+            + Self.resticCall(
+                Self.rewriteArgv(
+                    env.primary.repoURL,
+                    snapshotIDs: snapshots.map(\.id),
+                    patterns: env.set.purgeExcludes
+                ),
+                dest: Self.primaryId,
+                stderr: "rewrite failed",
+                exitCode: 1
+            )
+
+        let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
+
+        guard case .infrastructureFailure(let reason) = outcome else {
+            Issue.record("the earlier index failure must remain authoritative: \(outcome)")
+            return
+        }
+        #expect(reason.contains("run history unusable"))
+        #expect(env.entries(kind: .backup).isEmpty)
+        #expect(env.entries(kind: .purge).first?.status == .failed)
     }
 
     // MARK: - Row 6 / Row 12 — copy failure isolates that mirror

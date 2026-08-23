@@ -7,6 +7,48 @@ import Testing
 @Suite("StateWatcher lock health", .serialized)
 @MainActor
 struct StateWatcherTests {
+    @Test("repairing a symlinked data root rebinds health and child watches")
+    func symlinkedRootRepairRebindsWatches() async throws {
+        let parent = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-root-symlink-watcher-\(UUID().uuidString)", isDirectory: true)
+        let root = parent.appendingPathComponent("data", isDirectory: true)
+        let hostileTarget = parent.appendingPathComponent("hostile-target", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: parent) }
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: false)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: parent.path)
+        try AppPaths(root: hostileTarget).ensureDirectories()
+        try FileManager.default.createSymbolicLink(at: root, withDestinationURL: hostileTarget)
+
+        let paths = AppPaths(root: root)
+        let watcher = StateWatcher(
+            paths: paths,
+            runStore: RunStore(paths: paths),
+            stateStore: StateStore(paths: paths)
+        )
+        watcher.start()
+        defer { watcher.stop() }
+        #expect(watcher.lockingFailure != nil)
+
+        try FileManager.default.removeItem(at: root)
+        try paths.ensureDirectories()
+        for _ in 0..<40 {
+            if watcher.lockingFailure == nil { break }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        #expect(watcher.lockingFailure == nil)
+
+        let tickLock = FileLock(path: paths.tickLockFile, trustedRoot: root)
+        #expect(tickLock.acquire() == .acquired)
+        tickLock.release()
+        try await Task.sleep(nanoseconds: 500_000_000)
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: paths.tickLockFile.path)
+        for _ in 0..<40 {
+            if watcher.lockingFailure?.path == paths.tickLockFile.path { break }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        #expect(watcher.lockingFailure?.path == paths.tickLockFile.path)
+    }
+
     @Test("data-root parent permission changes refresh lock health")
     func rootParentMetadataRefreshesHealth() async throws {
         let parent = FileManager.default.temporaryDirectory

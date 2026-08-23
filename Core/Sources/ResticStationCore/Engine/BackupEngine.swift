@@ -405,6 +405,11 @@ public final class BackupEngine: Sendable {
                 )
                 children.append(contentsOf: purge.children)
                 guard purge.status == .success else {
+                    if !infrastructureFailures.isEmpty {
+                        return .infrastructureFailure(
+                            reason: infrastructureFailures.joined(separator: "; ")
+                        )
+                    }
                     return .completed(status: .failed, groupId: groupId, children: children)
                 }
             } catch {
@@ -412,7 +417,12 @@ public final class BackupEngine: Sendable {
                     "BackupEngine: could not purge primary \"\(primary.label)\" before mirroring: \(error)"
                 )
                 if let reason = Self.purgeInfrastructureFailureReason(error) {
-                    return .infrastructureFailure(reason: reason)
+                    infrastructureFailures.append("primary \"\(primary.label)\": \(reason)")
+                }
+                if !infrastructureFailures.isEmpty {
+                    return .infrastructureFailure(
+                        reason: infrastructureFailures.joined(separator: "; ")
+                    )
                 }
                 return .completed(status: .failed, groupId: groupId, children: children)
             }

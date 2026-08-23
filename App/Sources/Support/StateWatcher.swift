@@ -171,9 +171,7 @@ public final class StateWatcher: ObservableObject {
             rootParentDirSource = makeSource(watching: rootParent, target: .rootParent)
         }
         attemptReopenRoot()
-        for directory in WatchedDirectory.allCases {
-            attemptReopen(directory)
-        }
+        attemptPendingReopens()
 
         let observer = DistributedNotificationCenter.default().addObserver(
             forName: Self.stateChangedNotificationName,
@@ -295,8 +293,10 @@ public final class StateWatcher: ObservableObject {
 
     // MARK: - Directory watch sources
 
-    /// Opens `url` `O_EVTONLY` and wires up a source for content,
-    /// permission, deletion, and rename changes.
+    /// Opens the configured directory entry itself for event-only access and
+    /// wires up a source for content, permission, deletion, and rename
+    /// changes. Directory-only, no-follow flags keep a watcher from silently
+    /// binding to a replacement file or symlink target.
     /// `DispatchSourceFileSystemObject`. Returns `nil` if `open(2)` fails
     /// (most commonly: the directory doesn't exist yet) — callers track
     /// that as "pending" and retry later rather than treating it as fatal.
@@ -305,7 +305,11 @@ public final class StateWatcher: ObservableObject {
         watching url: URL,
         target: WatchTarget
     ) -> DispatchSourceFileSystemObject? {
-        let fd = open(url.path, O_EVTONLY)
+        // A watcher must describe the configured directory entry itself,
+        // never a symlink target. Otherwise health can correctly reject a
+        // hostile root while this source remains attached to the hostile
+        // target and misses the later repair at the configured pathname.
+        let fd = open(url.path, O_EVTONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
         guard fd >= 0 else { return nil }
 
         let source = DispatchSource.makeFileSystemObjectSource(
@@ -378,13 +382,32 @@ public final class StateWatcher: ObservableObject {
 
     private func attemptReopenRoot() {
         guard rootDirSource == nil else { return }
+
+        // Child paths must never be resolved while the configured root is
+        // unavailable (most importantly, while it is a symlink rejected by
+        // `O_NOFOLLOW`). Otherwise `root/state`, `root/runs`, and
+        // `root/locks` can still follow that intermediate symlink and leave
+        // their sources attached to the hostile tree after the root is
+        // repaired in place.
+        invalidateDescendantSources()
+        pendingReopen.formUnion(WatchedDirectory.allCases)
+
         rootDirSource = makeSource(watching: paths.root, target: .root)
     }
 
     private func attemptPendingReopens() {
+        guard rootDirSource != nil else { return }
         for pending in Array(pendingReopen) {
             attemptReopen(pending)
         }
+    }
+
+    private func invalidateDescendantSources() {
+        for directory in WatchedDirectory.allCases {
+            invalidateSource(for: directory)
+        }
+        lockFileSources.values.forEach { $0.cancel() }
+        lockFileSources.removeAll()
     }
 
     /// A watched subdirectory (`state/`, `runs/`, or `locks/`) was deleted or
@@ -424,6 +447,10 @@ public final class StateWatcher: ObservableObject {
     /// next event retries. Safe to call redundantly (e.g. once from
     /// `start()` and again from a root-watcher event).
     private func attemptReopen(_ directory: WatchedDirectory) {
+        guard rootDirSource != nil else {
+            pendingReopen.insert(directory)
+            return
+        }
         guard let source = makeSource(watching: directory.url(paths: paths), target: .directory(directory)) else {
             pendingReopen.insert(directory)
             return
@@ -445,6 +472,12 @@ public final class StateWatcher: ObservableObject {
     /// child watch after a later creation. Stable health locks are created by
     /// the probe and therefore become watchable during the same reload.
     private func refreshLockFileSources() {
+        guard rootDirSource != nil else {
+            lockFileSources.values.forEach { $0.cancel() }
+            lockFileSources.removeAll()
+            return
+        }
+
         let urls = [
             paths.tickLockFile,
             paths.healthLockFile,
