@@ -274,7 +274,7 @@ let canInjectPermissionFaults = geteuid() != 0
 
         let paths = AppPaths(root: blocker)
         let failure = try #require(
-            LockingHealth.probe(paths: paths),
+            LockingHealth.probe(paths: paths, configuredSetIds: []),
             "an uncreatable data directory must be reported, not stepped over"
         )
         #expect(failure.operation == "create data directories")
@@ -289,7 +289,10 @@ let canInjectPermissionFaults = geteuid() != 0
         defer { try? FileManager.default.removeItem(at: root) }
         let paths = AppPaths(root: root)
         try paths.ensureDirectories()
-        #expect(LockingHealth.probe(paths: paths) == nil, "precondition: healthy to begin with")
+        #expect(
+            LockingHealth.probe(paths: paths, configuredSetIds: []) == nil,
+            "precondition: healthy to begin with"
+        )
 
         // A directory where one set's lock file belongs. `locks/` and
         // `tick.lock` are untouched and perfectly usable.
@@ -299,11 +302,29 @@ let canInjectPermissionFaults = geteuid() != 0
         )
 
         let failure = try #require(
-            LockingHealth.probe(paths: paths),
+            LockingHealth.probe(paths: paths, configuredSetIds: [setId]),
             "a per-set lock that cannot be opened must not read as a healthy machine"
         )
         #expect(String(describing: failure).contains(setId.uuidString))
         #expect(failure.scope == .set(setId))
+    }
+
+    @Test("LockingHealth ignores orphaned and malformed persistent set locks")
+    func lockingHealthIgnoresUnconfiguredSetLocks() throws {
+        let root = makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = AppPaths(root: root)
+        try paths.ensureDirectories()
+
+        let orphaned = UUID()
+        for path in [
+            paths.setLockFile(setId: orphaned),
+            paths.locksDir.appendingPathComponent("set-not-a-uuid.lock", isDirectory: false),
+        ] {
+            try FileManager.default.createDirectory(at: path, withIntermediateDirectories: true)
+        }
+
+        #expect(LockingHealth.probe(paths: paths, configuredSetIds: []) == nil)
     }
 
     @Test("LockingHealth prefers a simultaneous machine-wide fault over a set fault")
@@ -321,7 +342,9 @@ let canInjectPermissionFaults = geteuid() != 0
             at: paths.scheduleStateLockFile, withIntermediateDirectories: true
         )
 
-        let failure = try #require(LockingHealth.probe(paths: paths))
+        let failure = try #require(
+            LockingHealth.probe(paths: paths, configuredSetIds: [setId])
+        )
         #expect(failure.scope == .machine)
         #expect(failure.path == paths.scheduleStateLockFile.path)
     }
@@ -334,7 +357,7 @@ let canInjectPermissionFaults = geteuid() != 0
         try paths.ensureDirectories()
 
         #expect(!FileManager.default.fileExists(atPath: paths.healthLockFile.path))
-        #expect(LockingHealth.probe(paths: paths) == nil)
+        #expect(LockingHealth.probe(paths: paths, configuredSetIds: []) == nil)
         #expect(FileManager.default.fileExists(atPath: paths.healthLockFile.path))
 
         // Contention on the health inode is healthy: another probe holding
@@ -342,7 +365,7 @@ let canInjectPermissionFaults = geteuid() != 0
         let holder = FileLock(path: paths.healthLockFile, trustedRoot: root)
         #expect(holder.acquire() == .acquired)
         defer { holder.release() }
-        #expect(LockingHealth.probe(paths: paths) == nil)
+        #expect(LockingHealth.probe(paths: paths, configuredSetIds: []) == nil)
     }
 
     @Test(
@@ -358,7 +381,7 @@ let canInjectPermissionFaults = geteuid() != 0
         // Create the stable health inode before removing directory write
         // permission. The live flock exercise can then succeed, leaving the
         // independent creation-capability check as the fault under test.
-        #expect(LockingHealth.probe(paths: paths) == nil)
+        #expect(LockingHealth.probe(paths: paths, configuredSetIds: []) == nil)
 
         // Opening this existing file still succeeds after locks/ becomes
         // read-only. The missing set lock is the operation that would fail.
@@ -373,7 +396,7 @@ let canInjectPermissionFaults = geteuid() != 0
         }
 
         let failure = try #require(
-            LockingHealth.probe(paths: paths),
+            LockingHealth.probe(paths: paths, configuredSetIds: []),
             "an existing tick.lock must not mask inability to create the next set lock"
         )
         #expect(failure.operation == "create lock")
@@ -398,7 +421,7 @@ let canInjectPermissionFaults = geteuid() != 0
             try FileManager.default.createDirectory(at: hostile, withIntermediateDirectories: true)
 
             let failure = try #require(
-                LockingHealth.probe(paths: paths),
+                LockingHealth.probe(paths: paths, configuredSetIds: []),
                 "a hostile \(name) lock must not leave locking health green"
             )
             #expect(failure.path == hostile.path)
@@ -418,6 +441,15 @@ let canInjectPermissionFaults = geteuid() != 0
         let after = try FileManager.default.attributesOfItem(atPath: directory.path)[.modificationDate] as? Date
         #expect(entries == ["sentinel"])
         #expect(after == before)
+    }
+
+    @Test("the actual creation probe allocates and removes a fresh inode")
+    func actualCreationProbeLeavesNoResidue() throws {
+        let directory = makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        #expect(FileLock.probeActualCreation(in: directory) == nil)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: directory.path).isEmpty)
     }
 
     @Test(
@@ -443,7 +475,7 @@ let canInjectPermissionFaults = geteuid() != 0
         }
 
         let failure = try #require(
-            LockingHealth.probe(paths: paths),
+            LockingHealth.probe(paths: paths, configuredSetIds: []),
             "failure to inspect per-set locks must not report healthy"
         )
         // Descriptor-relative validation may fail while opening the
@@ -478,6 +510,6 @@ let canInjectPermissionFaults = geteuid() != 0
     func lockingHealthIsQuietWhenHealthy() throws {
         let root = makeDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
-        #expect(LockingHealth.probe(paths: AppPaths(root: root)) == nil)
+        #expect(LockingHealth.probe(paths: AppPaths(root: root), configuredSetIds: []) == nil)
     }
 }

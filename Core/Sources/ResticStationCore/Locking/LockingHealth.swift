@@ -35,14 +35,14 @@ public enum LockingHealth {
     /// `nil` when the data directory and its lock files are usable.
     ///
     /// Checks the existing tick, per-set and shared-state lock files, plus
-    /// live creation capability in each parent directory. A single hostile
-    /// `set-<id>.lock` (a directory, a symlink, another user's file) blocks
+    /// live creation capability in each parent directory. A hostile lock for
+    /// a configured set (a directory, a symlink, another user's file) blocks
     /// that one set forever while `locks/` itself is perfectly fine, and an
     /// existing `tick.lock` alone does not prove another lock can be created.
     ///
     /// Per-set locks are created on demand, so a read-only status query must
     /// not bring one into being for every configured set as a side effect.
-    public static func probe(paths: AppPaths) -> LockingHealthFailure? {
+    public static func probe(paths: AppPaths, configuredSetIds: Set<UUID>) -> LockingHealthFailure? {
         do {
             try paths.ensureDirectories()
         } catch {
@@ -69,6 +69,9 @@ public enum LockingHealth {
         if let failure = FileLock.probeCreation(in: paths.locksDir, trustedRoot: paths.root) {
             return machine(failure)
         }
+        if let failure = FileLock.probeActualCreation(in: paths.lockHealthProbeDir) {
+            return machine(failure)
+        }
         // These companion locks protect shared local state outside
         // `locks/`. Probe known files without creating them, then separately
         // prove their parent directories can create a future lock. Shared
@@ -91,14 +94,19 @@ public enum LockingHealth {
                 return machine(failure)
             }
         }
-        return probeExistingSetLocks(paths: paths)
+        return probeConfiguredSetLocks(paths: paths, configuredSetIds: configuredSetIds)
     }
 
-    /// The first unusable `locks/set-*.lock` already on disk, if any.
-    private static func probeExistingSetLocks(paths: AppPaths) -> LockingHealthFailure? {
-        let entries: [String]
+    /// The first unusable configured set lock already on disk, if any.
+    /// Orphaned and malformed persistent lock names are harmless: `flock`
+    /// state lives on descriptors, not filenames, and no configured work
+    /// will ever open them.
+    private static func probeConfiguredSetLocks(
+        paths: AppPaths,
+        configuredSetIds: Set<UUID>
+    ) -> LockingHealthFailure? {
         do {
-            entries = try FileManager.default.contentsOfDirectory(atPath: paths.locksDir.path)
+            _ = try FileManager.default.contentsOfDirectory(atPath: paths.locksDir.path)
         } catch {
             return machine(LockFailure(
                 path: paths.locksDir.path,
@@ -107,16 +115,12 @@ public enum LockingHealth {
                 underlying: "\(error)"
             ))
         }
-        for name in entries.sorted() where name.hasPrefix("set-") && name.hasSuffix(".lock") {
-            let url = paths.locksDir.appendingPathComponent(name, isDirectory: false)
+        for setId in configuredSetIds.sorted(by: { $0.uuidString < $1.uuidString }) {
+            let url = paths.setLockFile(setId: setId)
             if let failure = FileLock(
                 path: url, trustedRoot: paths.root
             ).probe(createIfMissing: false) {
-                let idStart = name.index(name.startIndex, offsetBy: "set-".count)
-                let idEnd = name.index(name.endIndex, offsetBy: -".lock".count)
-                let scope = UUID(uuidString: String(name[idStart..<idEnd])).map(LockingHealthScope.set)
-                    ?? .machine
-                return LockingHealthFailure(scope: scope, failure: failure)
+                return LockingHealthFailure(scope: .set(setId), failure: failure)
             }
         }
         return nil

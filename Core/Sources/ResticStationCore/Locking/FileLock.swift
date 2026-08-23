@@ -404,6 +404,45 @@ public final class FileLock: @unchecked Sendable {
         return nil
     }
 
+    /// Creates and removes a uniquely named owner-only file in a dedicated
+    /// probe directory. Unlike an access-mode check, this exercises inode
+    /// allocation and therefore catches quota exhaustion and a full
+    /// filesystem before a production lock needs to be created.
+    public static func probeActualCreation(in directory: URL) -> LockFailure? {
+        let directoryFD: Int32
+        switch openDirectory(directory, trustedRoot: nil) {
+        case .success(let descriptor):
+            directoryFD = descriptor
+        case .failure(let failure):
+            return failure
+        }
+        defer { close(directoryFD) }
+
+        let name = "probe-\(UUID().uuidString)"
+        let (created, createError) = name.withCString { namePointer -> (Int32, Int32) in
+            let descriptor = openat(
+                directoryFD,
+                namePointer,
+                O_CREAT | O_EXCL | O_RDWR | O_NOFOLLOW | O_CLOEXEC,
+                0o600
+            )
+            return (descriptor, descriptor < 0 ? errno : 0)
+        }
+        guard created >= 0 else {
+            return LockFailure(path: directory.path, operation: "create lock probe", errnoValue: createError)
+        }
+        close(created)
+
+        let (removed, removeError) = name.withCString { namePointer -> (Int32, Int32) in
+            let result = unlinkat(directoryFD, namePointer, 0)
+            return (result, result != 0 ? errno : 0)
+        }
+        guard removed == 0 else {
+            return LockFailure(path: directory.path, operation: "remove lock probe", errnoValue: removeError)
+        }
+        return nil
+    }
+
     /// Releases the lock (if held) and closes the file descriptor. Safe to
     /// call multiple times.
     public func release() {

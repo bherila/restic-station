@@ -138,7 +138,10 @@ struct Status: AsyncParsableCommand, JSONRenderable {
         // whose lock files are not ours has stopped backing up, and is also
         // unable to write the run record or health state that would say so —
         // so the only reliable place to notice is here, at read time (#110).
-        let lockingFailure = LockingHealth.probe(paths: paths)
+        let lockingFailure = LockingHealth.probe(
+            paths: paths,
+            configuredSetIds: Set(scheduled.config.sets.map(\.id))
+        )
         let health = HealthDerivation.appHealth(
             setHealths: setHealths,
             // Every current-run file, including one for a set no longer in

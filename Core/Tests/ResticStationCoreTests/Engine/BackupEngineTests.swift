@@ -549,6 +549,40 @@ struct BackupEngineTests {
         #expect(env.stateStore.readCurrentRun(setId: Self.setId) == nil, "current-run cleared on the failure path too")
     }
 
+    @Test("a terminal run that cannot enter the index is infrastructure failure")
+    func runIndexFailureCannotReportScheduledSuccess() async throws {
+        let paths = Box<AppPaths?>(nil)
+        let env = Self.makeEnv(
+            script: [],
+            retention: nil,
+            reachableSecondaries: [],
+            onSpawn: { argv in
+                guard argv.contains("backup"), let paths = paths.value else { return }
+                try? FileManager.default.removeItem(at: paths.runsIndexLockFile)
+                try? FileManager.default.createDirectory(
+                    at: paths.runsIndexLockFile,
+                    withIntermediateDirectories: true
+                )
+            }
+        )
+        paths.value = env.paths
+        defer { env.cleanUp() }
+        env.fake.script = Self.resticCall(
+            Self.backupArgv(env.primary.repoURL),
+            dest: Self.primaryId,
+            stdoutLines: Self.backupStream()
+        )
+
+        let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
+
+        guard case .infrastructureFailure(let reason) = outcome else {
+            Issue.record("a missing terminal index entry must fail the scheduled operation: \(outcome)")
+            return
+        }
+        #expect(reason.contains("run history unusable"))
+        #expect(env.indexEntries.isEmpty)
+    }
+
     // MARK: - Row 6 / Row 12 — copy failure isolates that mirror
 
     @Test("rows 6+12: a failed copy is recorded, its mirror is never forgotten, the other mirror proceeds")
@@ -2329,6 +2363,59 @@ struct BackupEngineTests {
         }
         #expect(reason.contains("preview-token store unusable"))
         #expect(env.resticArgvs.count == 2)
+    }
+
+    @Test("a secondary purge infrastructure failure does not skip later independent work")
+    func secondaryPurgeInfrastructureFailureContinuesOtherDestinations() async throws {
+        let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]
+        let hostnames = [Self.setId: Set(["example-mac.local"])]
+        let env = Self.makeEnv(
+            script: [], purgeExcludes: ["build/**"], reachableSecondaries: [true, true],
+            purgeSourcePaths: sourcePaths, purgeHostnames: hostnames
+        )
+        defer { env.cleanUp() }
+        let failing = env.secondaries[0]
+        let healthy = env.secondaries[1]
+        try env.stateStore.updateScheduleState(setId: Self.setId) { state in
+            state.appliedPurgeExcludes[env.primary.id] = env.set.purgeExcludes
+            state.appliedPurgeExcludes[healthy.id] = env.set.purgeExcludes
+        }
+        try FileManager.default.createDirectory(
+            at: env.paths.previewTokensLockFile,
+            withIntermediateDirectories: true
+        )
+        let snapshotsJSON = try FixtureLoader.string("snapshots.json")
+        env.fake.script = Self.resticCall(
+            Self.backupArgv(env.primary.repoURL, excludes: env.set.purgeExcludes),
+            dest: Self.primaryId,
+            stdoutLines: Self.backupStream()
+        ) + Self.resticCall(
+            ["-r", failing.repoURL, "snapshots", "--json"],
+            dest: failing.id,
+            stdoutLines: [snapshotsJSON]
+        ) + Self.resticCall(
+            Self.copyArgv(to: healthy.repoURL, from: env.primary.repoURL),
+            dest: healthy.id,
+            from: env.primary.id
+        ) + Self.resticCall(
+            Self.forgetArgv(healthy.repoURL), dest: healthy.id
+        ) + Self.resticCall(
+            Self.forgetArgv(env.primary.repoURL), dest: env.primary.id
+        )
+
+        let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
+
+        guard case .infrastructureFailure(let reason) = outcome else {
+            Issue.record("the aggregate outcome must retain the infrastructure failure: \(outcome)")
+            return
+        }
+        #expect(reason.contains("preview-token store unusable"))
+        #expect(env.resticArgvs.contains([Self.resticPath] + Self.copyArgv(
+            to: healthy.repoURL, from: env.primary.repoURL
+        )))
+        #expect(env.resticArgvs.contains([Self.resticPath] + Self.forgetArgv(healthy.repoURL)))
+        #expect(env.resticArgvs.contains([Self.resticPath] + Self.forgetArgv(env.primary.repoURL)))
+        #expect(!env.resticArgvs.contains { $0.contains("copy") && $0.contains(failing.repoURL) })
     }
 
     @Test("automatic purge: a successful rewrite without a durable watermark is infrastructure failure")

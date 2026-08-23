@@ -307,6 +307,7 @@ public final class BackupEngine: Sendable {
         }
 
         var children: [SetRunChild] = []
+        var infrastructureFailures: [String] = []
 
         // ── Steps 4 + 5: probe primary, then back it up ─────────────────
         let backup = await performChild(
@@ -346,6 +347,9 @@ public final class BackupEngine: Sendable {
         }
         children.append(backup.child)
         let groupId = backup.child.runId
+        if let reason = backup.infrastructureFailureReason {
+            return .infrastructureFailure(reason: reason)
+        }
 
         guard backup.child.status != .failed else {
             // Terminal: no copies, no retention (T09 step 5, scenario 5).
@@ -434,7 +438,9 @@ public final class BackupEngine: Sendable {
                         "BackupEngine: could not purge secondary \"\(secondary.label)\" before copy: \(error)"
                     )
                     if let reason = Self.purgeInfrastructureFailureReason(error) {
-                        return .infrastructureFailure(reason: reason)
+                        infrastructureFailures.append(
+                            "secondary \"\(secondary.label)\": \(reason)"
+                        )
                     }
                     continue
                 }
@@ -454,6 +460,10 @@ public final class BackupEngine: Sendable {
             )
             guard let copy else { continue }
             children.append(copy.child)
+            if let reason = copy.infrastructureFailureReason {
+                infrastructureFailures.append("secondary \"\(secondary.label)\": \(reason)")
+                continue
+            }
 
             // SAFETY: retention on a mirror runs *only* when this run's copy
             // succeeded. A stale mirror plus an aggressive policy is a data
@@ -475,6 +485,9 @@ public final class BackupEngine: Sendable {
                 groupId: groupId
             ) {
                 children.append(prune.child)
+                if let reason = prune.infrastructureFailureReason {
+                    infrastructureFailures.append("secondary \"\(secondary.label)\": \(reason)")
+                }
             }
         }
 
@@ -487,9 +500,15 @@ public final class BackupEngine: Sendable {
             groupId: groupId
         ) {
             children.append(prune.child)
+            if let reason = prune.infrastructureFailureReason {
+                infrastructureFailures.append("primary \"\(primary.label)\": \(reason)")
+            }
         }
 
         // ── Step 9: current-run cleared and lock released by the defers ─
+        if !infrastructureFailures.isEmpty {
+            return .infrastructureFailure(reason: infrastructureFailures.joined(separator: "; "))
+        }
         return .completed(
             status: Self.worstStatus(children.map(\.status)),
             groupId: groupId,
@@ -579,7 +598,11 @@ public final class BackupEngine: Sendable {
         guard let primaryCheck else {
             return .retryable(reason: "the run record could not be created")
         }
+        if let reason = primaryCheck.infrastructureFailureReason {
+            return .infrastructureFailure(reason: reason)
+        }
         var statuses = [primaryCheck.child.status]
+        var infrastructureFailures: [String] = []
 
         if primaryCheck.child.status == .success {
             // SAFETY: cursor advances only on success.
@@ -613,11 +636,19 @@ public final class BackupEngine: Sendable {
                     )
                     if let secondaryCheck {
                         statuses.append(secondaryCheck.child.status)
+                        if let reason = secondaryCheck.infrastructureFailureReason {
+                            infrastructureFailures.append(
+                                "secondary \"\(secondary.label)\": \(reason)"
+                            )
+                        }
                     }
                 }
             }
         }
 
+        if !infrastructureFailures.isEmpty {
+            return .infrastructureFailure(reason: infrastructureFailures.joined(separator: "; "))
+        }
         return .completed(Self.worstStatus(statuses))
     }
 
@@ -1279,6 +1310,9 @@ public final class BackupEngine: Sendable {
                 return PurgeRunResult(status: .failed, children: children)
             }
             children.append(purge.child)
+            if let reason = purge.infrastructureFailureReason {
+                throw PurgeApplyError.lockUnusable(reason)
+            }
             if resolvedGroupId == nil { resolvedGroupId = purge.child.runId }
             if purge.child.status == .success {
                 try markPurgePatternsApplied(
@@ -1476,7 +1510,8 @@ public final class BackupEngine: Sendable {
             streamProgress: false,
             downgradeSuccessToWarning: { outcome in Self.containsErrorMessage(outcome.messages) }
         )
-        return restore?.child.status ?? .skipped
+        guard let restore else { return .skipped }
+        return restore.infrastructureFailureReason == nil ? restore.child.status : .failed
     }
 
     // MARK: - initSecondary
@@ -1536,7 +1571,7 @@ public final class BackupEngine: Sendable {
                 status.lastError = nil
             }
         }
-        return initRun.child.status
+        return initRun.infrastructureFailureReason == nil ? initRun.child.status : .failed
     }
 
     // MARK: - forget (the only destructive command)
@@ -1589,6 +1624,10 @@ public final class BackupEngine: Sendable {
         let child: SetRunChild
         let outcome: ResticOutcome?
         let preflightFailure: PreflightFailure?
+        /// The child may have completed and its terminal metadata may exist,
+        /// while the append-only index write failed. Scheduled callers must
+        /// surface that as machine infrastructure failure, never success.
+        let infrastructureFailureReason: String?
     }
 
     private enum PreflightFailure: Sendable {
@@ -1694,17 +1733,19 @@ public final class BackupEngine: Sendable {
                     return ChildRun(
                         child: SetRunChild(runId: run.runId, kind: kind, destId: destination.id, status: .skipped),
                         outcome: nil,
-                        preflightFailure: failure
+                        preflightFailure: failure,
+                        infrastructureFailureReason: nil
                     )
                 } catch {
                     logWarning("BackupEngine: could not discard unavailable preflight run \(run.runId): \(error)")
                 }
             }
-            finish(run, status: .failed, errorSummary: failure.message)
+            let infrastructureFailure = finish(run, status: .failed, errorSummary: failure.message)
             return ChildRun(
                 child: SetRunChild(runId: run.runId, kind: kind, destId: destination.id, status: .failed),
                 outcome: nil,
-                preflightFailure: failure
+                preflightFailure: failure,
+                infrastructureFailureReason: infrastructureFailure
             )
         }
 
@@ -1732,17 +1773,23 @@ public final class BackupEngine: Sendable {
                     return ChildRun(
                         child: SetRunChild(runId: run.runId, kind: kind, destId: destination.id, status: .skipped),
                         outcome: nil,
-                        preflightFailure: launchPreflightFailure
+                        preflightFailure: launchPreflightFailure,
+                        infrastructureFailureReason: nil
                     )
                 } catch {
                     logWarning("BackupEngine: could not discard unavailable launch preflight run \(run.runId): \(error)")
                 }
             }
-            finish(run, status: .failed, errorSummary: launchPreflightFailure.message)
+            let infrastructureFailure = finish(
+                run,
+                status: .failed,
+                errorSummary: launchPreflightFailure.message
+            )
             return ChildRun(
                 child: SetRunChild(runId: run.runId, kind: kind, destId: destination.id, status: .failed),
                 outcome: nil,
-                preflightFailure: launchPreflightFailure
+                preflightFailure: launchPreflightFailure,
+                infrastructureFailureReason: infrastructureFailure
             )
         }
 
@@ -1781,7 +1828,7 @@ public final class BackupEngine: Sendable {
         } else {
             rewrites = nil
         }
-        finish(
+        let infrastructureFailure = finish(
             run,
             status: status,
             stats: stats,
@@ -1792,7 +1839,8 @@ public final class BackupEngine: Sendable {
         return ChildRun(
             child: SetRunChild(runId: run.runId, kind: kind, destId: destination.id, status: status),
             outcome: result.outcome,
-            preflightFailure: nil
+            preflightFailure: nil,
+            infrastructureFailureReason: infrastructureFailure
         )
     }
 
@@ -1926,7 +1974,7 @@ public final class BackupEngine: Sendable {
         errorSummary: String? = nil,
         resticExitCode: Int32? = nil,
         purgeSnapshotRewrites: [String: String]? = nil
-    ) {
+    ) -> String? {
         do {
             try runStore.finish(
                 run,
@@ -1936,8 +1984,11 @@ public final class BackupEngine: Sendable {
                 resticExitCode: resticExitCode,
                 purgeSnapshotRewrites: purgeSnapshotRewrites
             )
+            return nil
         } catch {
-            logWarning("BackupEngine: could not finish run \(run.runId): \(error)")
+            let reason = "run history unusable — could not index run \(run.runId): \(error)"
+            logWarning("BackupEngine: \(reason)")
+            return reason
         }
     }
 

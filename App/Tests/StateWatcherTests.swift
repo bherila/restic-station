@@ -1,4 +1,5 @@
 import Foundation
+import Combine
 import ResticStationCore
 import Testing
 @testable import Restic_Station
@@ -54,6 +55,7 @@ struct StateWatcherTests {
         try await Task.sleep(nanoseconds: 500_000_000)
 
         let setId = UUID()
+        watcher.updateConfiguredSetIds([setId])
         try FileManager.default.createDirectory(
             at: paths.setLockFile(setId: setId),
             withIntermediateDirectories: true
@@ -65,5 +67,29 @@ struct StateWatcherTests {
         }
         #expect(watcher.lockingFailure?.scope == .set(setId))
         #expect(watcher.lockingFailure?.path.contains(setId.uuidString) == true)
+    }
+
+    @Test("a settled lock-health reload does not trigger another reload")
+    func lockHealthDoesNotTriggerItself() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-lock-watcher-idle-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = AppPaths(root: root)
+        let watcher = StateWatcher(
+            paths: paths,
+            runStore: RunStore(paths: paths),
+            stateStore: StateStore(paths: paths)
+        )
+        var changes = 0
+        let subscription = watcher.objectWillChange.sink { changes += 1 }
+        defer { subscription.cancel() }
+
+        watcher.start()
+        defer { watcher.stop() }
+        try await Task.sleep(nanoseconds: 750_000_000)
+        changes = 0
+        try await Task.sleep(nanoseconds: 750_000_000)
+
+        #expect(changes == 0)
     }
 }

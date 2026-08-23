@@ -227,6 +227,7 @@ struct AppPathsEnvTests {
         #expect(paths.repoStatusFile(destId: destId).path == "\(rootPath)/state/repo-status-\(destId.uuidString).json")
         #expect(paths.fdaCheckFile.path == "\(rootPath)/state/fda-check.json")
         #expect(paths.locksDir.path == "\(rootPath)/locks")
+        #expect(paths.lockHealthProbeDir.path == "\(rootPath)/locks/.health")
         #expect(paths.tickLockFile.path == "\(rootPath)/locks/tick.lock")
         #expect(paths.setLockFile(setId: setId).path == "\(rootPath)/locks/set-\(setId.uuidString).lock")
         #expect(paths.mountsDir(destId: destId).path == "\(rootPath)/mounts/\(destId.uuidString)")
@@ -286,6 +287,7 @@ struct AppPathsEnvTests {
                 paths.repoStatusFile(destId: destId).path,
                 paths.fdaCheckFile.path,
                 paths.locksDir.path,
+                paths.lockHealthProbeDir.path,
                 paths.tickLockFile.path,
                 paths.setLockFile(setId: setId).path,
                 paths.mountsDir(destId: destId).path,
@@ -311,6 +313,7 @@ struct AppPathsEnvTests {
             "state/repo-status-\(destId.uuidString).json",
             "state/fda-check.json",
             "locks",
+            "locks/.health",
             "locks/tick.lock",
             "locks/set-\(setId.uuidString).lock",
             "mounts/\(destId.uuidString)",
@@ -323,7 +326,9 @@ struct AppPathsEnvTests {
 
         try paths.ensureDirectories()
 
-        for directory in [paths.root, paths.runsDir, paths.stateDir, paths.locksDir] {
+        for directory in [
+            paths.root, paths.runsDir, paths.stateDir, paths.locksDir, paths.lockHealthProbeDir,
+        ] {
             let values = try directory.resourceValues(forKeys: [.isDirectoryKey])
             #expect(values.isDirectory == true)
         }
@@ -341,6 +346,28 @@ struct AppPathsEnvTests {
 
         let values = try paths.stateDir.resourceValues(forKeys: [.isDirectoryKey])
         #expect(values.isDirectory == true)
+    }
+
+    @Test func ensureDirectoriesDoesNotTouchMetadataWhenModesAreAlreadyCorrect() throws {
+        let (paths, root) = makeTempPaths()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        try paths.ensureDirectories()
+        var before = stat()
+        try #require(paths.stateDir.path.withCString { lstat($0, &before) } == 0)
+        usleep(10_000)
+
+        try paths.ensureDirectories()
+        var after = stat()
+        try #require(paths.stateDir.path.withCString { lstat($0, &after) } == 0)
+
+        #if canImport(Darwin)
+        #expect(before.st_ctimespec.tv_sec == after.st_ctimespec.tv_sec)
+        #expect(before.st_ctimespec.tv_nsec == after.st_ctimespec.tv_nsec)
+        #else
+        #expect(before.st_ctim.tv_sec == after.st_ctim.tv_sec)
+        #expect(before.st_ctim.tv_nsec == after.st_ctim.tv_nsec)
+        #endif
     }
 
     @Test func ensureDirectoriesDoesNotApplyRootModeToMissingAncestors() throws {

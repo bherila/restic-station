@@ -50,6 +50,7 @@ public final class StateWatcher: ObservableObject {
     private let paths: AppPaths
     private let runStore: RunStore
     private let stateStore: StateStore
+    private var configuredSetIds: Set<UUID>
 
     /// Every filesystem/notification event lands on this serial queue so
     /// source creation/teardown and event handling never race each other.
@@ -97,10 +98,22 @@ public final class StateWatcher: ObservableObject {
     private static let stateChangedNotificationName = Notification.Name("net.herila.ResticStation.stateChanged")
     private static let debounceNanoseconds: UInt64 = 250_000_000 // 250 ms, per T12 spec.
 
-    public init(paths: AppPaths, runStore: RunStore, stateStore: StateStore) {
+    public init(
+        paths: AppPaths,
+        runStore: RunStore,
+        stateStore: StateStore,
+        configuredSetIds: Set<UUID> = []
+    ) {
         self.paths = paths
         self.runStore = runStore
         self.stateStore = stateStore
+        self.configuredSetIds = configuredSetIds
+    }
+
+    public func updateConfiguredSetIds(_ ids: Set<UUID>) {
+        guard configuredSetIds != ids else { return }
+        configuredSetIds = ids
+        if isRunning { reloadNow() }
     }
 
     deinit {
@@ -186,7 +199,7 @@ public final class StateWatcher: ObservableObject {
     /// `start()`, e.g. to pre-populate a preview) — every read tolerates a
     /// missing file or directory.
     public func reloadNow() {
-        lockingFailure = LockingHealth.probe(paths: paths)
+        lockingFailure = LockingHealth.probe(paths: paths, configuredSetIds: configuredSetIds)
         scheduleState = stateStore.readScheduleState()
         fdaCheck = stateStore.readFdaCheck()
 
