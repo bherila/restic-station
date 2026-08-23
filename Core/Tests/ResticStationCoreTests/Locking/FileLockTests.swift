@@ -382,9 +382,16 @@ let canInjectPermissionFaults = geteuid() != 0
             paths.stateHealthLockFile,
             paths.runsHealthLockFile,
         ]
+        let scratchDirectories = [
+            paths.lockHealthProbeDir,
+            paths.stateHealthProbeDir,
+            paths.runsHealthProbeDir,
+        ]
         #expect(healthLocks.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) })
+        #expect(scratchDirectories.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) })
         #expect(LockingHealth.probe(paths: paths, configuredSetIds: []) == nil)
         #expect(healthLocks.allSatisfy { FileManager.default.fileExists(atPath: $0.path) })
+        #expect(scratchDirectories.allSatisfy { FileManager.default.fileExists(atPath: $0.path) })
 
         // Contention on the health inode is healthy: another probe holding
         // it proves that `flock` works and must not create a false outage.
@@ -392,6 +399,40 @@ let canInjectPermissionFaults = geteuid() != 0
         #expect(holder.acquire() == .acquired)
         defer { holder.release() }
         #expect(LockingHealth.probe(paths: paths, configuredSetIds: []) == nil)
+    }
+
+    @Test("LockingHealth freshly allocates on state and runs after their health inodes exist")
+    func lockingHealthRepeatedlyProbesAllocationOnEveryFilesystem() throws {
+        for scratchPath in [
+            { (paths: AppPaths) in paths.stateHealthProbeDir },
+            { (paths: AppPaths) in paths.runsHealthProbeDir },
+        ] {
+            let root = makeDirectory()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let paths = AppPaths(root: root)
+            try paths.ensureDirectories()
+            #expect(LockingHealth.probe(paths: paths, configuredSetIds: []) == nil)
+
+            let scratchDirectory = scratchPath(paths)
+            var before = stat()
+            try #require(scratchDirectory.path.withCString { lstat($0, &before) } == 0)
+            usleep(10_000)
+
+            #expect(LockingHealth.probe(paths: paths, configuredSetIds: []) == nil)
+            var after = stat()
+            try #require(scratchDirectory.path.withCString { lstat($0, &after) } == 0)
+            #if canImport(Darwin)
+            #expect(
+                before.st_mtimespec.tv_sec != after.st_mtimespec.tv_sec
+                    || before.st_mtimespec.tv_nsec != after.st_mtimespec.tv_nsec
+            )
+            #else
+            #expect(
+                before.st_mtim.tv_sec != after.st_mtim.tv_sec
+                    || before.st_mtim.tv_nsec != after.st_mtim.tv_nsec
+            )
+            #endif
+        }
     }
 
     @Test(

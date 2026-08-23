@@ -127,8 +127,9 @@ public enum PruneRepositoryFailure: Equatable, Sendable {
     case offline(String)
     case restic(ResticExitClass)
     case didNotRun
-    /// The durable run history could not record the terminal result. Restic
-    /// may have completed, failed, or never launched; none may report success.
+    /// Local process-control or durable-state infrastructure was unusable.
+    /// Restic may have completed, failed, or never launched; none may report
+    /// success without the required locking and bookkeeping invariants.
     case infrastructure(String)
 }
 

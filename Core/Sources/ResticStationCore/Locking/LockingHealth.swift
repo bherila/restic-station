@@ -63,26 +63,36 @@ public enum LockingHealth {
         ).probe(createIfMissing: false) {
             return machine(failure)
         }
-        if let failure = FileLock(
-            path: paths.healthLockFile, trustedRoot: paths.root
-        ).probeLocking() {
-            return machine(failure)
-        }
-        if let failure = FileLock.probeCreation(in: paths.locksDir, trustedRoot: paths.root) {
-            return machine(failure)
-        }
-        // Diagnostic scratch is health-only. Normal tick/set-lock setup must
-        // not depend on this path being intact.
-        if let failure = FileLock.ensureDirectory(
-            paths.lockHealthProbeDir,
-            parent: paths.locksDir,
-            trustedRoot: paths.root,
-            mode: 0o700
-        ) {
-            return machine(failure)
-        }
-        if let failure = FileLock.probeActualCreation(in: paths.lockHealthProbeDir) {
-            return machine(failure)
+        // These directories may be distinct mounts. On each one, exercise
+        // the persistent flock inode, effective access, and a fresh inode
+        // allocation. The nested scratch directories keep create/remove
+        // activity below the app's non-recursive parent watchers.
+        for (healthLock, directory, scratchDirectory) in [
+            (paths.healthLockFile, paths.locksDir, paths.lockHealthProbeDir),
+            (paths.stateHealthLockFile, paths.stateDir, paths.stateHealthProbeDir),
+            (paths.runsHealthLockFile, paths.runsDir, paths.runsHealthProbeDir),
+        ] {
+            if let failure = FileLock(
+                path: healthLock, trustedRoot: paths.root
+            ).probeLocking() {
+                return machine(failure)
+            }
+            if let failure = FileLock.probeCreation(in: directory, trustedRoot: paths.root) {
+                return machine(failure)
+            }
+            // Diagnostic scratch is health-only. Normal operation setup must
+            // not depend on any of these paths being intact.
+            if let failure = FileLock.ensureDirectory(
+                scratchDirectory,
+                parent: directory,
+                trustedRoot: paths.root,
+                mode: 0o700
+            ) {
+                return machine(failure)
+            }
+            if let failure = FileLock.probeActualCreation(in: scratchDirectory) {
+                return machine(failure)
+            }
         }
         // These companion locks protect shared local state outside
         // `locks/`. Probe known files without creating them, then separately
@@ -98,20 +108,6 @@ public enum LockingHealth {
             if let failure = FileLock(
                 path: lockFile, trustedRoot: paths.root
             ).probe(createIfMissing: false) {
-                return machine(failure)
-            }
-        }
-        // `locks/`, `state/`, and `runs/` may be distinct mounts. Exercise
-        // real flock semantics on a non-production inode in every one.
-        for healthLock in [paths.stateHealthLockFile, paths.runsHealthLockFile] {
-            if let failure = FileLock(
-                path: healthLock, trustedRoot: paths.root
-            ).probeLocking() {
-                return machine(failure)
-            }
-        }
-        for directory in [paths.stateDir, paths.runsDir] {
-            if let failure = FileLock.probeCreation(in: directory, trustedRoot: paths.root) {
                 return machine(failure)
             }
         }

@@ -272,11 +272,26 @@ struct MaintenancePrune: AsyncParsableCommand, JSONRenderable {
                 )
             )
         case .failed(.infrastructure(let reason)):
-            throw CLIFailure(
-                code: .internalError,
-                message: "Prune's terminal result could not be recorded: \(reason)",
-                details: CLIErrorDetails(setId: setId, destinationId: destination.id)
+            throw Self.infrastructureFailure(
+                reason: reason,
+                setId: setId,
+                destinationId: destination.id
             )
         }
+    }
+
+    /// Infrastructure spans lock acquisition, preview-token storage, and
+    /// terminal history. Keep the presentation accurate for every source
+    /// instead of claiming all of them are history-write failures.
+    static func infrastructureFailure(
+        reason: String,
+        setId: UUID,
+        destinationId: UUID
+    ) -> CLIFailure {
+        CLIFailure(
+            code: .internalError,
+            message: "Prune could not complete safely: \(reason). Check the Restic Station data directory and run a new reclaim preview.",
+            details: CLIErrorDetails(setId: setId, destinationId: destinationId)
+        )
     }
 }

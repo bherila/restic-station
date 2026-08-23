@@ -162,6 +162,12 @@ public struct AppPaths: Equatable, Sendable {
         runsDir.appendingPathComponent("health.lock", isDirectory: false)
     }
 
+    /// Health-only scratch below `runs/`. Activity inside it does not reach
+    /// the app's non-recursive watcher for the run-index directory.
+    public var runsHealthProbeDir: URL {
+        runsDir.appendingPathComponent(".health", isDirectory: true)
+    }
+
     public func runDir(runId: String) -> URL {
         runsDir.appendingPathComponent(runId, isDirectory: true)
     }
@@ -228,6 +234,12 @@ public struct AppPaths: Equatable, Sendable {
     /// stores schedule state and preview capabilities.
     public var stateHealthLockFile: URL {
         stateDir.appendingPathComponent("health.lock", isDirectory: false)
+    }
+
+    /// Health-only scratch below `state/`. Activity inside it does not reach
+    /// the app's non-recursive watcher for live state.
+    public var stateHealthProbeDir: URL {
+        stateDir.appendingPathComponent(".health", isDirectory: true)
     }
 
     // MARK: - locks/
