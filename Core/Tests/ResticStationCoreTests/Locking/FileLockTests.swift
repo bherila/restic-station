@@ -439,6 +439,11 @@ let canInjectPermissionFaults = geteuid() != 0
             operation: "create lock probe",
             errnoValue: ENOSPC
         )).scope == .machine)
+        #expect(LockingHealth.classifyHealthArtifactFailure(LockFailure(
+            path: scratchPath,
+            operation: "create protected directory",
+            errnoValue: EDQUOT
+        )).scope == .machine)
 
         #expect(LockingHealth.classifyHealthArtifactFailure(LockFailure(
             path: healthPath,

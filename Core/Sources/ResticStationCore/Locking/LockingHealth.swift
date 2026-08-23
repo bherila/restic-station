@@ -102,9 +102,13 @@ public enum LockingHealth {
                 mode: 0o700
             ) {
                 // The scratch node itself is health-only. Failure while
-                // validating its production parent still blocks real locks.
+                // validating its production parent or creating the missing
+                // scratch directory still proves real lock creation cannot
+                // currently work.
                 if failure.path == scratchDirectory.path {
-                    diagnosticFailure = diagnosticFailure ?? diagnostic(failure)
+                    let classified = classifyHealthArtifactFailure(failure)
+                    if classified.scope == .machine { return classified }
+                    diagnosticFailure = diagnosticFailure ?? classified
                     continue healthFilesystems
                 }
                 return machine(failure)
@@ -186,7 +190,7 @@ public enum LockingHealth {
     /// filesystem that rejects flock.
     static func classifyHealthArtifactFailure(_ failure: LockFailure) -> LockingHealthFailure {
         switch failure.operation {
-        case "flock", "create lock probe":
+        case "flock", "create lock probe", "create protected directory":
             return machine(failure)
         default:
             return diagnostic(failure)

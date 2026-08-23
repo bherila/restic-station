@@ -352,24 +352,25 @@ public final class FileLock: @unchecked Sendable {
         defer { close(parentFD) }
 
         let flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
-        let (directoryFD, openError) = directory.lastPathComponent.withCString { name -> (Int32, Int32) in
+        let (directoryFD, openError, creationFailed) = directory.lastPathComponent.withCString {
+            name -> (Int32, Int32, Bool) in
             var descriptor = openat(parentFD, name, flags)
             var code = descriptor < 0 ? errno : 0
             if descriptor < 0, code == ENOENT {
                 let created = mkdirat(parentFD, name, mode)
                 let createError = created != 0 ? errno : 0
                 guard created == 0 || createError == EEXIST else {
-                    return (descriptor, createError)
+                    return (descriptor, createError, true)
                 }
                 descriptor = openat(parentFD, name, flags)
                 code = descriptor < 0 ? errno : 0
             }
-            return (descriptor, code)
+            return (descriptor, code, false)
         }
         guard directoryFD >= 0 else {
             return LockFailure(
                 path: directoryPath,
-                operation: "open protected directory",
+                operation: creationFailed ? "create protected directory" : "open protected directory",
                 errnoValue: openError
             )
         }

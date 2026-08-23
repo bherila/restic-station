@@ -781,7 +781,9 @@ public final class BackupEngine: Sendable {
             } else {
                 return .infrastructureFailure(
                     reason: "could not create the prune run record for \"\(secondary.label)\"",
-                    operationMayHaveRun: false
+                    // The primary prune, and possibly earlier mirrors, have
+                    // already executed by the time this later record fails.
+                    operationMayHaveRun: true
                 )
             }
         }
