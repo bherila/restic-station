@@ -48,10 +48,14 @@ struct RetentionSection: View {
     }
 
     private var applyRetentionHelp: String {
-        if !canApplyRetention { return ManualRetentionApplyAvailability.reason }
+        // Machine scope first. Containment's explanation promises that
+        // scheduled retention will do the work instead, and for a set this
+        // machine does not run, no tick here ever will — so the more
+        // fundamental fact has to win.
         if !runsOnThisMachine {
             return "This backup set does not run on this machine, so retention cannot be applied here."
         }
+        if !canApplyRetention { return ManualRetentionApplyAvailability.reason }
         return "Runs the retention policy. It permanently deletes snapshots the policy no longer keeps."
     }
 
@@ -170,7 +174,10 @@ struct RetentionSection: View {
 
                 Spacer(minLength: 0)
             }
-            if !canApplyRetention, hasPolicy {
+            // Only claim scheduled cleanup where a scheduled run will
+            // actually do it: this machine must run the set, and there must
+            // be a policy for `forgetChild` to apply.
+            if !canApplyRetention, hasPolicy, runsOnThisMachine {
                 // Visible, not just a tooltip on a disabled button: the
                 // operator needs to know retention is still happening on
                 // schedule, or they will reasonably assume it stopped.
