@@ -90,7 +90,11 @@ public final class FileLock: @unchecked Sendable {
     /// relative operations.
     private static var directoryOpenFlags: Int32 {
         #if os(Linux)
-        O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+        // O_PATH is Linux UAPI value 010000000 on every architecture, but
+        // Swift 6.1's Glibc module does not import the GNU-only macro.
+        // Spell the stable kernel ABI value explicitly so both glibc and
+        // musl builds get the path-only descriptor semantics.
+        Int32(0o10000000) | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
         #else
         O_SEARCH | O_NOFOLLOW | O_CLOEXEC
         #endif
