@@ -19,10 +19,12 @@
 #      in-flight, failed, stale-mirror — asserting the exit code each time.
 #   5. Every `--json` mode emits parseable JSON with nothing else on stdout
 #      (piped through `jq` here, not just eyeballed).
-#   6. No subcommand prints a secret: every stdout/stderr byte this script's
+#   6. Capability selectors carry their value only on stdin: retired argv
+#      forms exit 64 without reflection, and Linux /proc never sees a canary.
+#   7. No subcommand prints a secret: every stdout/stderr byte this script's
 #      subcommands produce is captured to one combined log, and that log is
 #      grepped for the fixture secret value at the very end.
-#   7. Exit-code contract (0 ok / 1 error) spot-checked for the new
+#   8. Exit-code contract (0 ok / 1 error) spot-checked for the new
 #      subcommands on both the happy and unhappy path.
 #   9. Every `--json` command emits one success envelope
 #      ({schemaVersion, ok, data}) on stdout and nothing else (issue #79).
@@ -89,6 +91,21 @@ run_helper_split() {
     set +e
     "$HELPER" "$@" >"$OUT_FILE" 2>"$ERR_FILE"
     RC=$?
+    set -e
+    cat "$OUT_FILE" "$ERR_FILE" >>"$COMBINED_LOG"
+}
+
+# The capability transport test must feed stdin without placing its canary in
+# argv, environment, or the combined diagnostic log. Capture the helper's
+# exit status (not printf's) from the pipeline explicitly.
+run_helper_split_stdin() {
+    local payload="$1"
+    shift
+    OUT_FILE="$WORK/out-$$-$RANDOM"
+    ERR_FILE="$WORK/err-$$-$RANDOM"
+    set +e
+    printf '%s' "$payload" | "$HELPER" "$@" >"$OUT_FILE" 2>"$ERR_FILE"
+    RC=${PIPESTATUS[1]}
     set -e
     cat "$OUT_FILE" "$ERR_FILE" >>"$COMBINED_LOG"
 }
@@ -728,7 +745,6 @@ ok "every --json command reports an unloadable config.json as config_invalid, ex
 # preview or a token-gated apply can touch a repository.
 for CMD in \
     "purge preview --set 6F9619FF-8B86-D011-B42D-00C04FC964FF" \
-    "purge apply --set 6F9619FF-8B86-D011-B42D-00C04FC964FF --preview-token deliberately-invalid" \
     "maintenance prune --set 6F9619FF-8B86-D011-B42D-00C04FC964FF --dry-run"; do
     # shellcheck disable=SC2086
     RESTIC_STATION_DATA_DIR="$ENVELOPE_DATA" run_helper_split $CMD --json
@@ -736,6 +752,12 @@ for CMD in \
     jq -e '.ok == false and .error.code == "config_invalid"' "$OUT_FILE" >/dev/null \
         || fail "\`$CMD --json\` on a broken config did not emit config_invalid"
 done
+CAPABILITY_CANARY='AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
+RESTIC_STATION_DATA_DIR="$ENVELOPE_DATA" run_helper_split_stdin "$CAPABILITY_CANARY" \
+    purge apply --set 6F9619FF-8B86-D011-B42D-00C04FC964FF --preview-token-stdin --json
+expect_rc 1
+jq -e '.ok == false and .error.code == "config_invalid"' "$OUT_FILE" >/dev/null \
+    || fail "purge apply --json on a broken config did not emit config_invalid after bounded stdin parsing"
 ok "purge and maintenance prune --json preserve the setup-failure envelope"
 
 # `config validate --json` has a second setup failure of its own: with no
@@ -1136,10 +1158,104 @@ RESTIC_STATION_DATA_DIR="$HEALTHY" run_helper_split status --json
 ok "a healthy data directory still reports usable locking and no problem"
 
 # ─────────────────────────────────────────────────────────────────────────
-# 6. THE secret-leak check: every byte this script's helper invocations
+# 6. Capability transport: retired argv forms must fail redacted at EX_USAGE,
+#    while selected stdin input stays out of the observable child argv.
+# ─────────────────────────────────────────────────────────────────────────
+log "6. capability transport is redacted and stdin-bound"
+
+assert_legacy_capability_rejected() {
+    local mode="$1"
+    shift
+    run_helper_split "$@"
+    expect_rc 64
+    ! grep -qF -- "$CAPABILITY_CANARY" "$OUT_FILE" "$ERR_FILE" \
+        || fail "legacy capability rejection reflected its supplied value"
+    if [[ "$mode" == json ]]; then
+        jq -e '.ok == false and .error.code == "invalid_arguments"' "$OUT_FILE" >/dev/null \
+            || fail "legacy capability rejection in JSON mode did not emit invalid_arguments"
+    else
+        [[ ! -s "$OUT_FILE" ]] || fail "legacy human rejection wrote to stdout"
+    fi
+}
+
+# Attached and separated forms both hit the early shim, before ArgumentParser
+# can echo the raw option text. Run each in human and JSON modes.
+for mode in human json; do
+    json_args=()
+    [[ "$mode" == json ]] && json_args=(--json)
+    assert_legacy_capability_rejected "$mode" purge apply --set "$SET_ID" "--preview-token=$CAPABILITY_CANARY" "${json_args[@]}"
+    assert_legacy_capability_rejected "$mode" purge apply --set "$SET_ID" --preview-token "$CAPABILITY_CANARY" "${json_args[@]}"
+    assert_legacy_capability_rejected "$mode" maintenance prune --set "$SET_ID" "--expected-destination=$CAPABILITY_CANARY" "${json_args[@]}"
+    assert_legacy_capability_rejected "$mode" maintenance prune --set "$SET_ID" --expected-destination "$CAPABILITY_CANARY" "${json_args[@]}"
+done
+ok "legacy attached and separated capability options exit 64 without reflection"
+
+# Linux grants access to a same-user child command line through /proc. Keep
+# each selected command blocked on a pipe, observe that its selector is there
+# but its capability is not, then release the pipe. macOS deliberately has no
+# equivalent world-readable /proc surface, so this exact regression is Linux
+# only (the Linux CI job runs this script).
+assert_stdin_selector_is_not_argv() {
+    local label="$1"
+    local selector="$2"
+    shift 2
+    local fifo="$WORK/$label.stdin"
+    local observed="$WORK/$label.cmdline"
+    OUT_FILE="$WORK/out-$$-$RANDOM"
+    ERR_FILE="$WORK/err-$$-$RANDOM"
+    mkfifo "$fifo"
+    # Keep one read/write end open so the child starts and remains blocked in
+    # its bounded stdin reader until this test writes the canary.
+    exec 9<>"$fifo"
+    set +e
+    # The background child would otherwise inherit fd 9's write end and
+    # keep its own FIFO open forever after the parent releases the canary.
+    # Close it only in that child; the parent retains it until after /proc
+    # observation and the one payload write.
+    RESTIC_STATION_DATA_DIR="$ENVELOPE_DATA" "$HELPER" "$@" 9>&- <"$fifo" >"$OUT_FILE" 2>"$ERR_FILE" &
+    local pid=$!
+    set -e
+    for _ in $(seq 1 50); do
+        [[ -r "/proc/$pid/cmdline" ]] && break
+        sleep 0.02
+    done
+    [[ -r "/proc/$pid/cmdline" ]] || fail "$label helper was not observable in /proc"
+    tr '\0' ' ' <"/proc/$pid/cmdline" >"$observed"
+    grep -qF -- "$selector" "$observed" || fail "$label argv omitted its stdin selector"
+    ! grep -qF -- "$CAPABILITY_CANARY" "$observed" \
+        || fail "$label exposed its capability in /proc/<pid>/cmdline"
+    printf '%s' "$CAPABILITY_CANARY" >&9
+    exec 9>&-
+    set +e
+    wait "$pid"
+    RC=$?
+    set -e
+    cat "$OUT_FILE" "$ERR_FILE" >>"$COMBINED_LOG"
+    [[ "$RC" -eq 1 ]] || fail "$label should reach the broken-config fixture after stdin parsing, got $RC"
+    ! grep -qF -- "$CAPABILITY_CANARY" "$OUT_FILE" "$ERR_FILE" \
+        || fail "$label reflected its stdin capability in output"
+}
+
+if [[ -d /proc && -r /proc/self/cmdline ]]; then
+    assert_stdin_selector_is_not_argv purge-apply --preview-token-stdin \
+        purge apply --set "$SET_ID" --preview-token-stdin --json
+    assert_stdin_selector_is_not_argv maintenance-prune --expected-destination-stdin \
+        maintenance prune --set "$SET_ID" --expected-destination-stdin --json
+    RESTIC_STATION_DATA_DIR="$ENVELOPE_DATA" run_helper_split status --json
+    ! grep -qF -- "$CAPABILITY_CANARY" "$OUT_FILE" "$ERR_FILE" \
+        || fail "capability reached status output"
+    ! grep -r -qF -- "$CAPABILITY_CANARY" "$ENVELOPE_DATA" 2>/dev/null \
+        || fail "capability reached a run, log, current-run, or other fixture-state artifact"
+    ok "both stdin selectors hide the capability from Linux child argv, output, and fixture-state artifacts"
+else
+    echo "  (skipped /proc capability-argv assertion: no Linux /proc)"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────
+# 7. THE secret-leak check: every byte this script's helper invocations
 #    produced, grepped for the fixture secret value.
 # ─────────────────────────────────────────────────────────────────────────
-log "6. no subcommand printed the fixture secret anywhere in this run's output"
+log "7. no subcommand printed the fixture secret anywhere in this run's output"
 if grep -qF -- "$SECRET_PASSWORD" "$COMBINED_LOG"; then
     fail "the fixture secret value appeared in captured helper output — see $COMBINED_LOG"
 fi

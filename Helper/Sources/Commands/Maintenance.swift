@@ -26,11 +26,12 @@ struct MaintenancePrune: AsyncParsableCommand, JSONRenderable {
     @Option(name: .long, help: "Destination UUID. Defaults to the primary destination.")
     var dest: UUID?
 
-    /// App confirmations carry an opaque, helper-issued preview binding. The
-    /// helper owns the final check, because it reloads config after the app
-    /// may have compared an earlier in-memory snapshot.
-    @Option(name: .long, parsing: .unconditional, help: "Require this helper-issued preview binding before pruning.")
-    var expectedDestination: String?
+    /// Selects the opaque helper-issued preview binding on stdin. The helper
+    /// owns the final check, because it reloads config after the app may have
+    /// compared an earlier in-memory snapshot. The value itself never enters
+    /// argv, where Linux exposes it through `/proc/<pid>/cmdline`.
+    @Flag(name: .long, help: "Read the helper-issued preview binding from standard input before pruning.")
+    var expectedDestinationStdin = false
 
     @Flag(name: .long, help: "Ask restic what prune would reclaim without modifying the repository.")
     var dryRun = false
@@ -55,6 +56,17 @@ struct MaintenancePrune: AsyncParsableCommand, JSONRenderable {
     }
 
     func run() async throws {
+        // A dry run creates a fresh binding; it must never also consume one.
+        // Both checks are deliberately before HelperContext.make(), so a bad
+        // selected capability cannot reach config, secrets, restic discovery,
+        // or the token store.
+        guard !(dryRun && expectedDestinationStdin) else {
+            throw CLIFailure.invalidArguments("--expected-destination-stdin cannot be used with --dry-run")
+        }
+        let expectedDestination = try expectedDestinationStdin
+            ? CapabilityInput.read(prompt: "Reclaim preview token: ")
+            : nil
+
         let context = try await HelperContext.make()
         guard let backupSet = context.addressable.set(id: set) else {
             throw CLIFailure.setNotFound(setId: set)

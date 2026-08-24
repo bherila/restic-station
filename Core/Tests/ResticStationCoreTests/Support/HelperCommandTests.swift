@@ -1,4 +1,5 @@
 import Foundation
+import Foundation
 import Testing
 @testable import ResticStationCore
 
@@ -73,16 +74,21 @@ private let destId = UUID(uuidString: "0B7A50D4-9C3E-4F5B-9A0E-8E1F2C3D4A5B")!
     }
 
     @Test func maintenancePrune() {
-        #expect(
-            HelperCommand.maintenancePrune(
-                setId: setId,
-                destId: destId,
-                expectedDestination: "preview-fingerprint",
-                dryRun: true,
-                json: true
-            ).argv
-                == ["maintenance", "prune", "--set", "6B29FC40-CA47-1067-B31D-00DD010662DA", "--dest", "0B7A50D4-9C3E-4F5B-9A0E-8E1F2C3D4A5B", "--expected-destination=preview-fingerprint", "--dry-run", "--json"]
+        let capability = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        let confirmed = HelperCommand.maintenancePrune(
+            setId: setId,
+            destId: destId,
+            expectedDestination: capability,
+            dryRun: false,
+            json: true
         )
+        #expect(
+            confirmed.argv
+                == ["maintenance", "prune", "--set", "6B29FC40-CA47-1067-B31D-00DD010662DA", "--dest", "0B7A50D4-9C3E-4F5B-9A0E-8E1F2C3D4A5B", "--expected-destination-stdin", "--json"]
+        )
+        #expect(!confirmed.argv.joined(separator: " ").contains(capability))
+        #expect(confirmed.invocation.sensitiveStdin?.data == Data(capability.utf8))
+        #expect(!String(describing: confirmed.invocation).contains(capability))
         #expect(
             HelperCommand.maintenancePrune(setId: setId, destId: nil, expectedDestination: nil, dryRun: false).argv
                 == ["maintenance", "prune", "--set", "6B29FC40-CA47-1067-B31D-00DD010662DA"]

@@ -141,10 +141,16 @@ Standalone repository-wide space reclamation. `--dry-run` reports the work
 without changing the repository. Exit 0 means prune completed; nonzero is a
 restic failure. Purge previews and purge applies never add `prune` implicitly.
 Restic Station exposes it as `maintenance prune --set <uuid> [--dest <uuid>]
-[--expected-destination <preview-token>] [--dry-run] [--json]`; omitting `--dest`
-selects the primary. The app obtains `--expected-destination` from the helper's
-JSON dry-run response, so the helper refuses a configuration or stored-secret
-environment change that would redirect the destructive command.
+[--expected-destination-stdin] [--dry-run] [--json]`; omitting `--dest`
+selects the primary. A confirmed app invocation writes its helper-issued
+binding to stdin and passes only `--expected-destination-stdin`, so the
+capability never appears in argv. The helper refuses a configuration or
+stored-secret environment change that would redirect the destructive command.
+`--dry-run` issues a new binding and cannot be combined with the selector.
+Omitting the selector on a real prune remains the documented unbound
+direct-operator path. The retired value-bearing selector is rejected with
+exit 64; see `cli-json.md` §Confirmation capabilities for the bounded
+43-character input and terminal flow.
 It may run with
 no retention policy, but refuses a mirror that is behind the primary.
 

@@ -114,6 +114,44 @@ struct AppModelMachineOverrideTests {
         #expect(preview.confirmationBinding == nil)
     }
 
+    @Test("confirmed maintenance capability is stdin-only and never inherited through the environment")
+    func confirmedMaintenanceCapabilityUsesRedactedStdin() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-capability-helper-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let helper = root.appendingPathComponent("helper", isDirectory: false)
+        let argvOutput = root.appendingPathComponent("argv", isDirectory: false)
+        let stdinOutput = root.appendingPathComponent("stdin", isDirectory: false)
+        let environmentOutput = root.appendingPathComponent("environment", isDirectory: false)
+        let script = """
+        #!/bin/sh
+        printf '%s\\n' "$@" > "\(argvOutput.path)"
+        cat > "\(stdinOutput.path)"
+        env > "\(environmentOutput.path)"
+        """
+        try script.write(to: helper, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: helper.path)
+
+        let capability = String(repeating: "A", count: 43)
+        let result = await HelperInvoker(helperURL: helper).pruneRepository(
+            setId: UUID(),
+            destId: UUID(),
+            dryRun: false,
+            expectedDestination: capability
+        )
+
+        #expect(result.isSuccess)
+        let argv = try String(contentsOf: argvOutput, encoding: .utf8)
+        let stdin = try String(contentsOf: stdinOutput, encoding: .utf8)
+        let environment = try String(contentsOf: environmentOutput, encoding: .utf8)
+        #expect(argv.contains("--expected-destination-stdin"))
+        #expect(!argv.contains(capability))
+        #expect(stdin == capability)
+        #expect(!environment.contains(capability))
+    }
+
     @Test("known machines and effective-plan preview include exclusions and replacements")
     func effectivePlanPreview() throws {
         let setId = UUID()

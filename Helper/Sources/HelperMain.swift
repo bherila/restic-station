@@ -27,6 +27,18 @@ struct HelperMain: AsyncParsableCommand {
     ///   only in supporting async *shell completions*, and this project
     ///   declares no custom completions at all, so nothing is given up.
     static func main() async {
+        // ArgumentParser may include an unrecognised argument verbatim in
+        // its usage error. Legacy capability flags therefore need their own
+        // early, redacting rejection path: accepting a value-bearing option
+        // for long enough to print an error would recreate the argv leak this
+        // helper is removing. This happens before parsing or context setup.
+        if LegacyCapabilityArguments.containsLegacyValueBearingOption() {
+            HelperOutput.renderFailure(
+                .invalidArguments("capability values must be supplied through the documented standard-input selector"),
+                json: HelperOutput.argvRequestsJSON(),
+                exitCode: 64
+            )
+        }
         var parsed: ParsableCommand?
         do {
             var command = try parseAsRoot()

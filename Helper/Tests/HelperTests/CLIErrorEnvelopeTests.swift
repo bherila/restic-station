@@ -43,7 +43,7 @@ struct JSONModeDetectionTests {
         ["purge", "preview", "--set", "00000000-0000-0000-0000-000000000001", "--json"],
         [
             "purge", "apply", "--set", "00000000-0000-0000-0000-000000000001",
-            "--preview-token", "not-a-real-token", "--json",
+            "--preview-token-stdin", "--json",
         ],
         ["secret", "list", "--json"],
         ["cli", "status", "--json"],
