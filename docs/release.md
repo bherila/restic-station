@@ -5,7 +5,6 @@ Manual process for cutting a Restic Station release. There is no release automat
 ## 0. Pre-flight
 
 - [ ] CI green on `main` — all five jobs (`linux`, `macos`, `release-linux`, `linux-integration`, `linux-runtime-verify`; see `docs/testing.md`'s CI table).
-- [ ] Run the **manual checklists** in [testing.md §Layer 3](testing.md#layer-3--manual-checklists-docstasks-reference-these-run-before-tagging-a-release) with the release build copied to `/Applications`: SMAppService, FDA badges, keychain-under-scheduler, sleep catch-up, restore. These cannot be automated — do not skip them.
 - [ ] No open issues labeled release-blocking.
 
 ## 1. Version bump
@@ -58,7 +57,11 @@ rm ResticStation.zip
 ditto -c -k --keepParent "$APP" "Restic-Station-vX.Y.Z.zip"
 ```
 
-## 5. Tag and publish
+## 5. Release-artifact verification
+
+- [ ] Run **every** manual checklist in [testing.md §Layer 3](testing.md#layer-3--manual-checklists-docstasks-reference-these-run-before-tagging-a-release) with the final signed release artifact (stapled when notarized) copied to `/Applications`, and record the required build SHA/artifact identity with each result. This includes SMAppService, stall detection, FDA, the Keychain evidence matrix, sleep/catch-up, physical-mirror recovery, read-only retention preview, the manual-apply containment refusal, scheduled retention via a due tick, token-confirmed reclaim space, and restores from local, external-volume, and SFTP destinations. These cannot be automated — do not skip them.
+
+## 6. Tag and publish
 
 ```sh
 git tag vX.Y.Z && git push origin main vX.Y.Z
@@ -68,7 +71,7 @@ gh release create vX.Y.Z "Restic-Station-vX.Y.Z.zip" \
 
 Release notes should state the signing posture (notarized / ad-hoc), the minimum macOS (14) and restic (≥ 0.18) versions, and link the FDA setup walkthrough in the README.
 
-## 6. Post-release smoke test
+## 7. Post-release smoke test
 
 On a machine (or account) that has never run the app: download the release zip, unzip, move to `/Applications`, launch — Gatekeeper must open it without warnings (notarized builds). Complete onboarding through the FDA step and confirm one scheduled backup fires.
 

@@ -1,6 +1,6 @@
 # Testing strategy
 
-Three layers: unit tests (portable Core plus macOS app wiring), an integration script (real restic, macOS **and** Linux CI — see §Layer 2), and manual checklists (SMAppService/FDA — cannot be automated).
+Three layers: unit tests (portable Core plus macOS app wiring), an integration script (real restic, macOS **and** Linux CI — see §Layer 2), and manual hardware/OS checklists (see §Layer 3; they cannot be automated).
 
 ## Layer 1 — unit tests (`swift test --package-path Core`; app tests through `xcodebuild test`)
 
@@ -110,12 +110,33 @@ host or suitable self-hosted runner.
 
 ## Layer 3 — manual checklists (docs/tasks reference these; run before tagging a release)
 
+**Evidence rule for every row:** record the build SHA and artifact identity
+(for example, the signed app's version/build and checksum) with the evidence.
+The checklist is a release gate, not a statement that a similarly named build
+was tested earlier.
+
 **SMAppService** (app copied to /Applications): register → status Enabled (or approval flow via System Settings) → `launchctl print gui/$UID/net.herila.ResticStation.helper` shows agent and `restic-station-helper status --json` reports `scheduler.kind == "launchd-agent"`, `healthy == true` → wait ≤2 min → tick ran (state files touched) → quit app → tick still runs → unregister → agent gone and CLI scheduler health becomes `false`/`agentNotLoaded`.
 **Stall detection**: start a backup against disposable data, wait for `heartbeatUptime` to appear in its current-run file, `kill -STOP <metadata pid>`, and confirm the app and `status --json` change from running/live to warning/stalled after five minutes of awake time; `kill -CONT`, then terminate or let the run finish. Confirm sleep time did not consume the threshold.
 **FDA**: revoke in System Settings → both badges show denied → app probe correct; grant to app → app badge granted; Re-check → agent badge granted (if not: fallback path per keychain-and-fda.md verifies).
-**Keychain**: create destination with password → run scheduled backup with app closed → no GUI prompt appears, backup succeeds.
+**Keychain evidence matrix**: record the following fields for every scenario below: the process context (`app`, manual helper, or launchd); the exact OSStatus or typed error (never a prose paraphrase); whether it clears without configuration changes; whether retry after login succeeds; whether the current UI and `status --json` expose it; whether any run record or scheduling state was written; and whether a prompt, delay, or hang occurred.
+
+| Scenario | Required observation |
+|---|---|
+| Launchd with an unlocked keychain | Run a scheduled backup with the app closed. |
+| Pre-login / pre-unlock tick | Let the scheduled tick run before the login keychain is unlocked. |
+| App closed | Compare the scheduler-context result with the app's last known state. |
+| FDA split | Exercise both directions: FDA granted to the app but not the helper, and to the helper but not the app. |
+| Never-configured password | Attempt the scheduled path without a stored destination password. |
+| Revoked or moved keychain item | Remove or make the stored item unavailable after configuration. |
+| Retry after login | Repeat the pre-login/pre-unlock failure after login without changing configuration. |
+
 **Sleep/catch-up**: schedule daily at a time while Mac will be asleep; wake after → backup runs within ~2 min of wake.
-**Restore**: real restore of a folder to a temp target; diff -r matches; original-location restore shows the warning.
+**Physical mirror disconnect/reconnect**: use disposable data and a physical mirror volume; disconnect it before a run, verify the primary can complete without treating the mirror as current, reconnect it, then verify the next eligible backup copies to the mirror before that mirror receives retention.
+**Retention preview (read-only)**: inspect the retention preview for a disposable set and verify that previewing alone neither changes snapshots nor creates a run record.
+**Manual retention-apply containment refusal**: verify the UI shows the exact "unavailable in this build" posture and the helper's successfully parsed `run-set --kind prune` refuses; verify it creates no run record and removes no snapshots. Do not substitute a manual `forget` command for this check.
+**Scheduled retention via a due tick**: seed a disposable, policy-configured set with identifiable snapshots in excess of what that set's configured `--keep-*` policy retains, make it due, and run `tick`; verify the scheduled backup completes, a caught-up mirror is copied before it is pruned, the primary is pruned last, and the policy's surplus snapshot IDs are removed.
+**Reclaim space with token confirmation**: in the app's confirmation flow, preview reclaim space for a disposable destination, then confirm with the currently displayed confirmation binding; verify a stale, altered, or already-consumed binding is refused before `restic prune` runs. This does not change the documented direct human-CLI path, where omitting `--expected-destination` is deliberate.
+**Restore** (Layer-3 destination scope: local, external-volume, and SFTP): restore a known fixture from each of those destinations to fresh targets; compare bytes or cryptographic hashes to the source for each. Also confirm original-location restore shows its warning.
 
 ## CI (`.github/workflows/ci.yml`)
 
