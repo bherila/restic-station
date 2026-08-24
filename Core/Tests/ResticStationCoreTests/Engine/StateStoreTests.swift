@@ -195,18 +195,19 @@ struct StateStoreTests {
         #expect(Date().timeIntervalSince(started) < 2.0, "a broken lock must not be waited out")
     }
 
-    @Test("reads of missing files return nil, never throw")
+    @Test("a missing schedule state is classified separately from other absent state")
     func missingFilesReturnNil() {
         let (store, root) = makeStore()
         defer { try? FileManager.default.removeItem(at: root) }
 
         #expect(store.readScheduleState() == nil)
+        #expect(store.readScheduleStateResult() == .missing)
         #expect(store.readRepoStatus(destId: UUID()) == nil)
         #expect(store.readCurrentRun(setId: UUID()) == nil)
         #expect(store.readFdaCheck() == nil)
     }
 
-    @Test("reads of corrupt files return nil, never throw")
+    @Test("a corrupt schedule state is preserved and mutations refuse it")
     func corruptFilesReturnNil() throws {
         let (store, root) = makeStore()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -221,6 +222,12 @@ struct StateStoreTests {
         try garbage.write(to: store.paths.fdaCheckFile)
 
         #expect(store.readScheduleState() == nil)
+        #expect(store.readScheduleStateResult() == .corrupt)
+        let before = try Data(contentsOf: store.paths.scheduleStateFile)
+        #expect(throws: StateStoreError.self) {
+            try store.updateScheduleState(setId: UUID()) { $0.lastBackupStart = Date() }
+        }
+        #expect(try Data(contentsOf: store.paths.scheduleStateFile) == before)
         #expect(store.readRepoStatus(destId: destId) == nil)
         #expect(store.readCurrentRun(setId: setId) == nil)
         #expect(store.readFdaCheck() == nil)

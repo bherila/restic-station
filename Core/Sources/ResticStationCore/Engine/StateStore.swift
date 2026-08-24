@@ -260,6 +260,20 @@ public struct FdaCheckResult: Codable, Equatable, Sendable {
 
 // MARK: - StateStoreError
 
+/// The outcome of reading the schedule state. Unlike the other regenerable
+/// state files, this document holds destructive purge bookkeeping, so a
+/// corrupt existing file must never be mistaken for an absent one.
+public enum ScheduleStateReadResult: Equatable, Sendable {
+    case missing
+    case valid(ScheduleState)
+    case corrupt
+
+    public var state: ScheduleState? {
+        guard case .valid(let state) = self else { return nil }
+        return state
+    }
+}
+
 public enum StateStoreError: Error, Equatable, Sendable, CustomStringConvertible {
     case renameFailed(errno: Int32, from: String, to: String)
     /// The schedule-state lock could not be used at all — distinct from
@@ -269,6 +283,7 @@ public enum StateStoreError: Error, Equatable, Sendable, CustomStringConvertible
     /// `schedule-state.json`'s companion lock could not be acquired within
     /// the bounded retry window.
     case scheduleStateLockTimeout(path: String)
+    case scheduleStateCorrupt(path: String)
 
     public var description: String {
         switch self {
@@ -278,6 +293,8 @@ public enum StateStoreError: Error, Equatable, Sendable, CustomStringConvertible
             return "timed out waiting for schedule state lock \(path)"
         case .lockUnusable(let failure):
             return "schedule-state lock unusable: \(failure)"
+        case .scheduleStateCorrupt(let path):
+            return "schedule state is corrupt and was left unchanged: \(path)"
         }
     }
 }
@@ -286,10 +303,10 @@ public enum StateStoreError: Error, Equatable, Sendable, CustomStringConvertible
 
 /// Typed read/write access to the four `state/` files described in
 /// `docs/data-model.md`. Writes are atomic (temp file + `rename(2)`, same
-/// convention as `ConfigStore.save(_:)`); reads return `nil` on a missing or
-/// corrupt file rather than throwing — state is a regenerable cache, never a
-/// source of truth callers must trust blindly (`docs/data-model.md`
-/// §Versioning & migration).
+/// convention as `ConfigStore.save(_:)`). Most reads tolerate missing or
+/// corrupt files as regenerable cache. Schedule state is the exception: it
+/// contains purge bookkeeping, so its typed read result distinguishes a
+/// missing file from a corrupt existing one and mutations fail closed.
 ///
 /// After every write (including `clearCurrentRun`, which deletes a file),
 /// posts the best-effort `DistributedNotificationCenter` nudge described in
@@ -304,14 +321,33 @@ public struct StateStore: Sendable {
 
     // MARK: - schedule-state.json
 
+    public func readScheduleStateResult() -> ScheduleStateReadResult {
+        let url = paths.scheduleStateFile
+        do {
+            let data = try Data(contentsOf: url)
+            guard let state = try? Self.makeDecoder().decode(ScheduleState.self, from: data) else {
+                return .corrupt
+            }
+            return .valid(state)
+        } catch {
+            let nsError = error as NSError
+            return nsError.domain == NSCocoaErrorDomain && nsError.code == NSFileNoSuchFileError
+                ? .missing
+                : .corrupt
+        }
+    }
+
+    /// Compatibility view for callers that only need valid schedule data.
+    /// Mutating and health-sensitive callers must use
+    /// ``readScheduleStateResult()`` so they cannot treat corruption as absent.
     public func readScheduleState() -> ScheduleState? {
-        read(ScheduleState.self, from: paths.scheduleStateFile)
+        readScheduleStateResult().state
     }
 
     /// How long to retry for the schedule-state lock before giving up. The
     /// critical section is a decode, one dictionary mutation and an atomic
     /// write, so real contention is measured in milliseconds.
-    private static let stateLockTimeout: TimeInterval = 5
+    private static let stateLockTimeout: Duration = .seconds(5)
     private static let stateLockPollInterval: UInt32 = 20_000  // 20ms
 
     /// Loads the current `ScheduleState` (or an empty one), applies
@@ -342,7 +378,8 @@ public struct StateStore: Sendable {
     ) throws -> ScheduleState {
         try paths.ensureDirectories()
         let lock = FileLock(path: paths.scheduleStateLockFile, trustedRoot: paths.root)
-        let deadline = Date().addingTimeInterval(Self.stateLockTimeout)
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: Self.stateLockTimeout)
         // Only contention is worth waiting out. Polling a lock that failed
         // to *open* just burns the whole timeout and then reports a timeout,
         // which names contention as the cause of a permissions or filesystem
@@ -353,7 +390,7 @@ public struct StateStore: Sendable {
             case .acquired:
                 break
             case .busy:
-                if Date() > deadline {
+                if clock.now > deadline {
                     throw StateStoreError.scheduleStateLockTimeout(path: paths.scheduleStateLockFile.path)
                 }
                 usleep(Self.stateLockPollInterval)
@@ -365,7 +402,15 @@ public struct StateStore: Sendable {
         }
         defer { lock.release() }
 
-        var state = readScheduleState() ?? ScheduleState()
+        var state: ScheduleState
+        switch readScheduleStateResult() {
+        case .missing:
+            state = ScheduleState()
+        case .valid(let loaded):
+            state = loaded
+        case .corrupt:
+            throw StateStoreError.scheduleStateCorrupt(path: paths.scheduleStateFile.path)
+        }
         var entry = state.sets[setId] ?? SetScheduleState()
         mutate(&entry)
         state.sets[setId] = entry
