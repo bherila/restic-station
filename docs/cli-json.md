@@ -235,10 +235,11 @@ emitted by `purge apply` and `maintenance prune` when a confirmation does not
 match the current plan; it is also the classification behind
 `run-set --kind prune`'s unconditional refusal — but `run-set` is
 **human-only** (it has no `--json` mode), so that refusal reaches callers as
-prose on stderr with exit 1, never as a JSON envelope. Automation must treat
-any nonzero exit from `run-set --kind prune` as the containment refusal
-rather than branching on a code it will never see. See the containment note
-below. `preview_expired` is emitted by both when a binding
+prose on stderr with exit 1, never as a JSON envelope. Automation should
+treat **exit 1 from a successfully parsed** `run-set --kind prune`
+invocation as the containment refusal; exit 64 remains ArgumentParser's
+usage error (malformed UUID, unknown option — see the exit-code section
+above) and must not be mistaken for it. See the containment note below. `preview_expired` is emitted by both when a binding
 outlives `PreviewTokenStore.defaultLifetime`.
 
 ## Confirmation bindings are an app gate, not a CLI gate

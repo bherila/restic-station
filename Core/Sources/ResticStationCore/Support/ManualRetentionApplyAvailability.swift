@@ -46,11 +46,13 @@
 /// destination volume being the canonical case, therefore receives no
 /// retention at all, and with this gate closed there is no in-product way
 /// to free that space by dropping snapshots ("Reclaim space" only removes
-/// packs nothing references). Recovery is
-/// `restic forget --keep-last <n> --prune` by hand against the affected
-/// repository — bare `forget` selects nothing without `--keep-*` flags, and
-/// only pruning frees pack space. This is deliberate: a break-glass flag
-/// here would be a bypass of the very containment this type exists to hold.
+/// packs nothing references). Recovery is `restic forget --prune` by hand
+/// against the affected repository, carrying the set's configured `--keep-*`
+/// flags — bare `forget` selects nothing, only pruning frees pack space, and
+/// substituting a different policy (a bare keep-last, say) would delete
+/// snapshots the configured policy meant to retain, so dry-run first. This
+/// is deliberate: a break-glass flag here would be a bypass of the very
+/// containment this type exists to hold.
 ///
 /// ## Deliberately not configurable
 ///
@@ -87,20 +89,29 @@ public enum ManualRetentionApplyAvailability {
     /// into different claims about the same deadlock. The command is spelled
     /// out because a bare `restic forget` selects nothing without `--keep-*`
     /// flags, and only pruning actually frees pack space.
+    /// Names no concrete `--keep-*` values on purpose: substituting a
+    /// keep-last-only policy for a configured hourly/daily/weekly one would
+    /// permanently delete snapshots the operator meant to keep. The
+    /// instruction is to reproduce *their* policy, dry-run first.
     public static let failedBackupRecovery =
         "If backups themselves are failing (for example, a full volume), free space "
-        + "by hand: restic forget --keep-last <n> --prune on that repository."
+        + "by hand: restic forget --prune with the set's configured --keep-* flags, "
+        + "dry-run first."
 
     /// "This delays cleanup; it does not remove it" used to end this
     /// message — deleted because it is false in the one case where the
     /// operator most needs the truth: a set whose backups are failing gets
     /// no retention at all, and the recovery path belongs here, in the
     /// message they are actually reading, not only in the docs.
+    /// "When a set has a retention policy" is load-bearing: the helper
+    /// refuses before loading any configuration, so this string cannot know
+    /// whether the addressed set has a policy — and for one that does not,
+    /// `forgetChild` is `.notRequired` and no backup run cleans anything.
+    /// The claim must be conditional because the gate cannot verify it.
     public static let reason =
         "Applying retention manually is unavailable in this build while exact-plan "
-        + "authorization is completed. Retention is still applied by every backup run, "
-        + "scheduled or started by hand: each successful run cleans the primary, and any "
-        + "mirror whose copy in that run succeeded. "
+        + "authorization is completed. When a set has a retention policy, each "
+        + "successful backup run — scheduled or started by hand — still applies it. "
         + failedBackupRecovery
         + " Previewing cleanup is read-only and remains available."
 }
