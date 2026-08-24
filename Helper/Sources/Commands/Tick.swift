@@ -107,6 +107,17 @@ struct Tick: AsyncParsableCommand {
         }
 
         // ── Step 4/5: sequential due sets (config order). ────────────────
+        let scheduleState: ScheduleState?
+        switch context.stateStore.readScheduleStateResult() {
+        case .missing:
+            scheduleState = nil
+        case .valid(let state):
+            scheduleState = state
+        case .corrupt:
+            throw CLIFailure.stateUnreadable(
+                "could not read schedule state (\(paths.scheduleStateFile.path)); it was left unchanged"
+            )
+        }
         let now = Date()
         let calendar = Calendar.current
         /// Sets whose lock could not be *used* this tick. Non-empty means the
@@ -114,11 +125,11 @@ struct Tick: AsyncParsableCommand {
         var infrastructureFailures: [String] = []
 
         for set in config.sets {
-            let scheduleState = context.stateStore.readScheduleState()?.sets[set.id]
+            let setScheduleState = scheduleState?.sets[set.id]
 
             let backupDue = ScheduleMath.isDue(
                 schedule: set.schedule,
-                lastRunStart: scheduleState?.lastBackupStart,
+                lastRunStart: setScheduleState?.lastBackupStart,
                 now: now,
                 calendar: calendar
             )
@@ -139,7 +150,7 @@ struct Tick: AsyncParsableCommand {
             // in the same tick (the check runs on a later tick instead).
             let checkEnabled = set.checkPolicy?.enabled ?? false
             if !backupDue, checkEnabled {
-                let checkDue = ScheduleMath.checkIsDue(lastCheckStart: scheduleState?.lastCheckStart, now: now)
+                let checkDue = ScheduleMath.checkIsDue(lastCheckStart: setScheduleState?.lastCheckStart, now: now)
                 if checkDue {
                     let outcome = await context.engine.runCheck(set, trigger: .scheduled)
                     print("set \"\(set.name)\": check \(describe(outcome))")

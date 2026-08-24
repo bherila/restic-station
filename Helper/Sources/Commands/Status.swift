@@ -112,7 +112,17 @@ struct Status: AsyncParsableCommand, JSONRenderable {
                 repoStatuses[destination.id] = status
             }
         }
-        let scheduleState = stateStore.readScheduleState()
+        let scheduleState: ScheduleState?
+        switch stateStore.readScheduleStateResult() {
+        case .missing:
+            scheduleState = nil
+        case .valid(let state):
+            scheduleState = state
+        case .corrupt:
+            throw CLIFailure.stateUnreadable(
+                "could not read schedule state (\(paths.scheduleStateFile.path)); it was left unchanged"
+            )
+        }
 
         let setHealths = HealthDerivation.setHealths(
             config: scheduled.config,
