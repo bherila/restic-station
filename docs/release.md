@@ -5,7 +5,7 @@ Manual process for cutting a Restic Station release. There is no release automat
 ## 0. Pre-flight
 
 - [ ] CI green on `main` — all five jobs (`linux`, `macos`, `release-linux`, `linux-integration`, `linux-runtime-verify`; see `docs/testing.md`'s CI table).
-- [ ] Run the **manual checklists** in [testing.md §Layer 3](testing.md#layer-3--manual-checklists-docstasks-reference-these-run-before-tagging-a-release) with the release build copied to `/Applications`: SMAppService, FDA badges, keychain-under-scheduler, sleep catch-up, restore. These cannot be automated — do not skip them.
+- [ ] Run **every** manual checklist in [testing.md §Layer 3](testing.md#layer-3--manual-checklists-docstasks-reference-these-run-before-tagging-a-release) with the release build copied to `/Applications`, and record the required build SHA/artifact identity with each result. This includes SMAppService, stall detection, FDA, the Keychain evidence matrix, sleep/catch-up, physical-mirror recovery, read-only retention preview, the manual-apply containment refusal, scheduled retention via a due tick, token-confirmed reclaim space, and restores from local, external-volume, and SFTP destinations. These cannot be automated — do not skip them.
 - [ ] No open issues labeled release-blocking.
 
 ## 1. Version bump
