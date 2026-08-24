@@ -1179,14 +1179,21 @@ assert_legacy_capability_rejected() {
 }
 
 # Attached and separated forms both hit the early shim, before ArgumentParser
-# can echo the raw option text. Run each in human and JSON modes.
+# can echo the raw option text. Keep the calls explicit instead of expanding
+# an empty array: macOS ships Bash 3, where an empty array trips `set -u` as
+# an unbound variable before the assertion even reaches the helper.
 for mode in human json; do
-    json_args=()
-    [[ "$mode" == json ]] && json_args=(--json)
-    assert_legacy_capability_rejected "$mode" purge apply --set "$SET_ID" "--preview-token=$CAPABILITY_CANARY" "${json_args[@]}"
-    assert_legacy_capability_rejected "$mode" purge apply --set "$SET_ID" --preview-token "$CAPABILITY_CANARY" "${json_args[@]}"
-    assert_legacy_capability_rejected "$mode" maintenance prune --set "$SET_ID" "--expected-destination=$CAPABILITY_CANARY" "${json_args[@]}"
-    assert_legacy_capability_rejected "$mode" maintenance prune --set "$SET_ID" --expected-destination "$CAPABILITY_CANARY" "${json_args[@]}"
+    if [[ "$mode" == json ]]; then
+        assert_legacy_capability_rejected "$mode" purge apply --set "$SET_ID" "--preview-token=$CAPABILITY_CANARY" --json
+        assert_legacy_capability_rejected "$mode" purge apply --set "$SET_ID" --preview-token "$CAPABILITY_CANARY" --json
+        assert_legacy_capability_rejected "$mode" maintenance prune --set "$SET_ID" "--expected-destination=$CAPABILITY_CANARY" --json
+        assert_legacy_capability_rejected "$mode" maintenance prune --set "$SET_ID" --expected-destination "$CAPABILITY_CANARY" --json
+    else
+        assert_legacy_capability_rejected "$mode" purge apply --set "$SET_ID" "--preview-token=$CAPABILITY_CANARY"
+        assert_legacy_capability_rejected "$mode" purge apply --set "$SET_ID" --preview-token "$CAPABILITY_CANARY"
+        assert_legacy_capability_rejected "$mode" maintenance prune --set "$SET_ID" "--expected-destination=$CAPABILITY_CANARY"
+        assert_legacy_capability_rejected "$mode" maintenance prune --set "$SET_ID" --expected-destination "$CAPABILITY_CANARY"
+    fi
 done
 ok "legacy attached and separated capability options exit 64 without reflection"
 
