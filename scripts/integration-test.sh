@@ -84,7 +84,6 @@ LOCK_HOLDER_PID=""
 TEMP_KEYCHAIN=""
 ORIGINAL_DEFAULT_KEYCHAIN=""
 ORIGINAL_KEYCHAINS=()
-HAVE_JQ=0
 
 # =========================================================================
 # Cleanup (trap): workspace + keychain items + temp keychain + stray procs.
@@ -156,53 +155,27 @@ fail() {
 }
 
 # =========================================================================
-# JSON helpers: jq if available, else a python3 fallback for the exact
-# query shapes this script needs (jq preferred; CI installs it via brew).
+# JSON helpers: jq is a required preflight dependency. CI installs it, and a
+# missing local dependency fails before the script creates any test state.
 # =========================================================================
 
 jlen() { # stdin: a JSON array -> its length
-    if [[ $HAVE_JQ -eq 1 ]]; then
-        jq 'length'
-    else
-        python3 -c 'import json, sys; print(len(json.load(sys.stdin)))'
-    fi
+    jq 'length'
 }
 
 json_field() { # json_field <file> <field> -> raw value, "" if missing/null
     local file="$1" field="$2"
     [[ -f "$file" ]] || { echo ""; return 0; }
-    if [[ $HAVE_JQ -eq 1 ]]; then
-        # NOT `.[$f] // empty` — jq's `//` treats JSON `false` (and 0, "") as
-        # falsy too, which would silently swallow `"reachable": false`.
-        jq -r --arg f "$field" 'if .[$f] == null then "" else .[$f] end' "$file"
-    else
-        python3 -c "
-import json, sys
-try:
-    with open('$file') as fh:
-        d = json.load(fh)
-except Exception:
-    d = {}
-v = d.get('$field')
-print('' if v is None else v)
-"
-    fi
+    # NOT `.[$f] // empty` — jq's `//` treats JSON `false` (and 0, "") as
+    # falsy too, which would silently swallow `"reachable": false`.
+    jq -r --arg f "$field" 'if .[$f] == null then "" else .[$f] end' "$file"
 }
 
 field_of() { # field_of <json-line> <field> -> raw value, "" if missing/null
     local line="$1" field="$2"
     [[ -n "$line" ]] || { echo ""; return 0; }
-    if [[ $HAVE_JQ -eq 1 ]]; then
-        # See json_field's comment above re: `//` and JSON `false`.
-        printf '%s' "$line" | jq -r --arg f "$field" 'if .[$f] == null then "" else .[$f] end'
-    else
-        printf '%s' "$line" | python3 -c "
-import json, sys
-d = json.load(sys.stdin)
-v = d.get('$field')
-print('' if v is None else v)
-"
-    fi
+    # See json_field's comment above re: `//` and JSON `false`.
+    printf '%s' "$line" | jq -r --arg f "$field" 'if .[$f] == null then "" else .[$f] end'
 }
 
 # idx_select KIND STATUS SETID DESTID GROUPID
@@ -211,39 +184,13 @@ print('' if v is None else v)
 idx_select() {
     local kind="$1" status="$2" setId="$3" destId="$4" groupId="$5"
     [[ -f "$INDEX_FILE" ]] || return 0
-    if [[ $HAVE_JQ -eq 1 ]]; then
-        jq -c \
-            --arg k "$kind" --arg st "$status" --arg s "$setId" --arg d "$destId" --arg g "$groupId" '
-            select(.kind == $k and .setId == $s)
-            | select($st == "" or .status == $st)
-            | select($d == "" or .destId == $d)
-            | select($g == "" or .groupId == $g)
-        ' "$INDEX_FILE" 2>/dev/null || true
-    else
-        python3 - "$INDEX_FILE" "$kind" "$status" "$setId" "$destId" "$groupId" <<'PY'
-import json, sys
-path, kind, status, setId, destId, groupId = sys.argv[1:7]
-try:
-    with open(path) as f:
-        lines = f.readlines()
-except FileNotFoundError:
-    lines = []
-for line in lines:
-    line = line.strip()
-    if not line:
-        continue
-    rec = json.loads(line)
-    if rec.get("kind") != kind or rec.get("setId") != setId:
-        continue
-    if status and rec.get("status") != status:
-        continue
-    if destId and rec.get("destId") != destId:
-        continue
-    if groupId and rec.get("groupId") != groupId:
-        continue
-    print(json.dumps(rec))
-PY
-    fi
+    jq -c \
+        --arg k "$kind" --arg st "$status" --arg s "$setId" --arg d "$destId" --arg g "$groupId" '
+        select(.kind == $k and .setId == $s)
+        | select($st == "" or .status == $st)
+        | select($d == "" or .destId == $d)
+        | select($g == "" or .groupId == $g)
+    ' "$INDEX_FILE" 2>/dev/null || true
 }
 
 idx_count() { # same args as idx_select -> match count
@@ -267,20 +214,9 @@ preflight_restic() {
 }
 
 preflight_jq() {
-    if command -v jq >/dev/null 2>&1; then
-        HAVE_JQ=1
-        return 0
-    fi
-    if command -v brew >/dev/null 2>&1; then
-        log "jq not found — installing via Homebrew"
-        brew install jq >/dev/null 2>&1 || true
-    fi
-    if command -v jq >/dev/null 2>&1; then
-        HAVE_JQ=1
-    else
-        HAVE_JQ=0
-        echo "jq not available — falling back to python3 for JSON queries."
-    fi
+    command -v jq >/dev/null 2>&1 && return 0
+    echo "FATAL: jq is required for integration-test.sh JSON assertions. Install jq and rerun." >&2
+    exit 1
 }
 
 # =========================================================================
