@@ -15,7 +15,7 @@ public final class BackupEngine {
                 now: @Sendable () -> Date = Date.init)          // injectable clock
     public func runSet(_ set: BackupSet, trigger: RunTrigger) async -> SetRunOutcome
     public func runCheck(_ set: BackupSet) async -> RunStatus    // scheduled slice check on primary
-    public func runPrune(_ set: BackupSet) async -> ManualRunOutcome    // manual "apply retention now" (primary + synced secondaries)
+    public func runPrune(_ set: BackupSet) async -> ManualRunOutcome    // manual "apply retention now" — CONTAINED: always returns .operationNotAllowed (see below)
     public func runRestore(request: RestoreRequest) async -> ManualRunOutcome
     public func initSecondary(_ set: BackupSet, dest: Destination) async -> ManualRunOutcome
 }
@@ -39,7 +39,10 @@ public final class BackupEngine {
 - `checkSliceCursor` advances only on check success.
 
 ### runCheck / runPrune / runRestore / initSecondary
-Per restic-cli.md: check uses slice rotation (T06 `nextCheckSlice`), structure-only on secondaries every 4th check; prune = dry-run first is the UI's job — engine's `runPrune` is the real one; restore builds `RestoreRequest {destId, snapshotID, subpath?, targetPath, includes, overwriteMode}`; all take the set lock and write run records.
+Per restic-cli.md: check uses slice rotation (T06 `nextCheckSlice`), structure-only on secondaries every 4th check; prune = dry-run first is the UI's job — engine's `runPrune` **is currently contained** and refuses (see below); restore builds `RestoreRequest {destId, snapshotID, subpath?, targetPath, includes, overwriteMode}`; all take the set lock and write run records **except the contained `runPrune`, which by design takes no lock and writes no record**.
+
+#### runPrune containment
+`runPrune` refuses unconditionally with `.operationNotAllowed` at its first statement — before secrets, the set lock, executable resolution, or any run record — because its mirror-safety proof is a persisted wall-clock comparison (#111) and no exact keep/remove plan reaches the helper (#82). The requirements above describe the *internal* `runPruneUnchecked`, which the tests drive through `@testable` and which nothing shipping calls. Scheduled retention in `runSet` is unaffected and remains fully specified above. Re-enabling the public entry point is the joint acceptance criterion for #111 and #82; the lock and run-record requirements apply again at that point.
 
 ## Tests
 The 12-row scenario table from `docs/testing.md` §BackupEngine, one parameterized test each, driven by FakeProcessRunner scripts (script BOTH the keychain pre-flight `find-generic-password` replies and the restic replies — order matters and is part of the assertion). Assert: exact sequence of spawned argvs, index records (kind/status/groupId), schedule-state and repo-status mutations, current-run lifecycle (written during, cleared after). Plus: throttling test (status flood → ≤ N state writes), clock injection (fixed `now`).

@@ -586,6 +586,15 @@ final class MaintenanceModel: ObservableObject {
     /// from the same data, so what the user reads in the dialog and what they
     /// see behind it are the same measurement.
     func prepareApplyRetention(for set: BackupSet, in model: AppModel) {
+        // Containment (#111/#82). The button is disabled, but the flow must
+        // refuse on its own: a second entry point (menu command, shortcut,
+        // future retry affordance) or a refactor of the button's six-term
+        // `.disabled` expression must not reach a destructive confirmation
+        // whose apply the helper will refuse anyway.
+        guard ManualRetentionApplyAvailability.isEnabled else {
+            retentionPreview = .failed(ManualRetentionApplyAvailability.reason)
+            return
+        }
         // **Scheduling scope, not addressable.** The Maintenance screen reads
         // the addressable view — correct for sizes, inspection and restore,
         // which must see every repository this machine can reach. But Apply

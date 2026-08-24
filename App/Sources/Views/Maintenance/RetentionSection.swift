@@ -12,11 +12,13 @@ import SwiftUI
 /// - The preview is an app-direct `forget --json --dry-run`
 ///   (`docs/architecture.md`'s read-only exception). It writes nothing and
 ///   produces no run record.
-/// - Apply runs a **fresh** dry-run of its own, quotes those counts in the
-///   confirmation, and then hands the real work to the helper
-///   (`run-set --kind prune`). The numbers the user agrees to are therefore
-///   never the ones from a preview taken minutes ago against a repository
-///   that has since gained snapshots.
+/// - Apply is **contained in this build** and the control is disabled; the
+///   helper refuses `run-set --kind prune` outright (#111/#82). See
+///   ``ManualRetentionApplyAvailability``. When it is re-enabled it runs a
+///   **fresh** dry-run of its own, quotes those counts in the confirmation,
+///   and then hands the real work to the helper — so the numbers the user
+///   agrees to are never the ones from a preview taken minutes ago against
+///   a repository that has since gained snapshots.
 struct RetentionSection: View {
     @EnvironmentObject private var model: AppModel
     let backupSet: BackupSet
@@ -37,6 +39,65 @@ struct RetentionSection: View {
 
     private var isPruning: Bool {
         maintenance.isBusy(.prune(setId: backupSet.id))
+    }
+
+    /// Manual retention apply is contained — see
+    /// ``ManualRetentionApplyAvailability``. The helper and Core both refuse
+    /// independently, so this only spares the operator a dialog that would
+    /// end in a refusal; it is not what enforces the posture.
+    /// Whether a tick will actually happen on this Mac. `LaunchdManager`
+    /// already publishes this; the containment copy is the one place that
+    /// promises a schedule, so it is the one place that has to check.
+    private var backgroundAgentRunsTicks: Bool {
+        model.launchd.isEnabled
+    }
+
+    /// Said once, used by both the caption and the button's help. They sit
+    /// on the same screen, so a reader can see both at once — the first
+    /// version of this fixed the caption alone and left the tooltip
+    /// asserting the opposite.
+    private static let agentDisabledExplanation =
+        "Applying retention manually is unavailable in this build, and the background agent "
+        + "is not running, so cleanup will not happen on a schedule. Back Up Now still "
+        + "applies the retention policy after it backs up. "
+        + ManualRetentionApplyAvailability.failedBackupRecovery
+        + " To resume scheduled cleanup, enable the background agent in "
+        + "Settings ▸ Permissions."
+
+    /// What to say about retention when manual apply is contained: the
+    /// promise of scheduled cleanup only holds if a tick will happen.
+    private var containmentExplanation: String {
+        backgroundAgentRunsTicks
+            ? ManualRetentionApplyAvailability.reason
+            : Self.agentDisabledExplanation
+    }
+
+    private var canApplyRetention: Bool {
+        ManualRetentionApplyAvailability.isEnabled
+    }
+
+    private var applyRetentionHelp: String {
+        // Machine scope first. Containment's explanation promises that
+        // backup runs will do the work instead, and for a set this machine
+        // does not run, none here ever will — so the more fundamental fact
+        // has to win.
+        if !runsOnThisMachine {
+            return "This backup set does not run on this machine, so retention cannot be applied here."
+        }
+        if !hasPolicy {
+            // Deliberately does not say "to enable cleanup": adding a policy
+            // leaves this button disabled, because manual apply is contained.
+            // Promising otherwise sends the operator to Backup Sets expecting
+            // this control to light up.
+            // Unconditionally true: whether runs *happen* depends on the
+            // operator and the agent, but any successful backup run cleans
+            // up. Do not promise scheduling here — the agent may be off.
+            return "This backup set has no retention policy, so nothing is ever removed — "
+                + "backup runs included. Add one in Backup Sets ▸ Retention and each "
+                + "successful backup run will clean up."
+        }
+        if !canApplyRetention { return containmentExplanation }
+        return "Runs the retention policy. It permanently deletes snapshots the policy no longer keeps."
     }
 
     private var hasICloudRepository: Bool {
@@ -118,7 +179,12 @@ struct RetentionSection: View {
                 Button {
                     maintenance.prepareApplyRetention(for: backupSet, in: model)
                 } label: {
-                    if maintenance.isPreparingPrune || isPruning {
+                    // `busyAction == .prune` is shared with Reclaim space, so
+                    // without the containment term this permanently disabled
+                    // button would show "Cleaning up…" while a reclaim runs —
+                    // directly under a caption saying manual apply is
+                    // unavailable.
+                    if canApplyRetention, maintenance.isPreparingPrune || isPruning {
                         HStack(spacing: 6) {
                             ProgressView().controlSize(.small)
                             Text(isPruning ? "Cleaning up…" : "Checking…")
@@ -127,11 +193,9 @@ struct RetentionSection: View {
                         Label("Apply retention now", systemImage: "trash")
                     }
                 }
-                .disabled(!hasPolicy || !runsOnThisMachine || isPruning
+                .disabled(!hasPolicy || !runsOnThisMachine || !canApplyRetention || isPruning
                     || maintenance.isPreparingPrune || isPreviewing)
-                .help(runsOnThisMachine
-                    ? "Runs the retention policy. It permanently deletes snapshots the policy no longer keeps."
-                    : "This backup set does not run on this machine, so retention cannot be applied here.")
+                .help(applyRetentionHelp)
 
                 Menu {
                     ForEach(backupSet.destinations) { destination in
@@ -155,6 +219,30 @@ struct RetentionSection: View {
                 .help("Checks and prunes the selected repository. It frees unreferenced pack data without changing retention.")
 
                 Spacer(minLength: 0)
+            }
+            // Only claim scheduled cleanup where a scheduled run will
+            // actually do it: this machine must run the set, there must be a
+            // policy for `forgetChild` to apply, and the background agent
+            // must actually be running ticks. With manual apply disabled,
+            // this is the one screen an operator reads about retention — so
+            // it must not assert a schedule that Settings ▸ Permissions is
+            // simultaneously reporting as off.
+            if !canApplyRetention, hasPolicy, runsOnThisMachine, !backgroundAgentRunsTicks {
+                Label(Self.agentDisabledExplanation, systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else if !canApplyRetention, hasPolicy, runsOnThisMachine {
+                // Visible, not just a tooltip on a disabled button: the
+                // operator needs to know retention is still happening on
+                // schedule, or they will reasonably assume it stopped.
+                Label(
+                    ManualRetentionApplyAvailability.reason,
+                    systemImage: "clock.badge.checkmark"
+                )  // agent-enabled branch: the schedule promise holds here
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
             }
             if hasICloudRepository {
                 Label(

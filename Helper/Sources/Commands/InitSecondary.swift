@@ -50,6 +50,14 @@ struct InitSecondary: AsyncParsableCommand {
                 ? "init-secondary may have run, but its result could not be recorded or trusted: \(reason). "
                     + "Inspect the repository before retrying."
                 : "this machine cannot run init-secondary: \(reason)")
+        case .operationNotAllowed(let reason):
+            // Not reachable today: only manual retention apply is
+            // contained. Exhaustive so that containing another
+            // operation later cannot silently fall through here. If that
+            // day comes, refuse in `run()` before `HelperContext.make()`
+            // with a structured `CLIFailure`, as `RunSet` does — this arm
+            // is a last-resort sink, not the refusal pattern.
+            HelperExit.fail(reason)
         }
     }
 }

@@ -693,23 +693,114 @@ assert_migration() {
     log "$step OK (machineId=$machine_id)"
 }
 
+# Winds a set's recorded last-backup timestamps back far enough that the next
+# `tick` finds it due. Used to drive the real scheduled entry point rather
+# than a manual `run-set`, which dispatches with a different trigger.
+wind_schedule_back() {
+    local set_id="$1" step="$2" file="$DATA_DIR/state/schedule-state.json"
+    # Fails loudly THROUGH fail() on every path, labelled with the caller's
+    # step. A missing file, a missing set entry, or a renamed field must not
+    # quietly wind nothing back — and must not abort as a bare nonzero under
+    # `set -e` either, which would skip fail()'s index/state dump and let the
+    # EXIT trap delete the evidence before anyone can look at it.
+    [[ -f "$file" ]] || fail "$step" "wind_schedule_back: no schedule-state.json at $file"
+    local wind_out
+    if ! wind_out="$(python3 - "$file" "$set_id" 2>&1 <<'WIND'
+import json, sys
+path, set_id = sys.argv[1], sys.argv[2]
+with open(path) as handle:
+    state = json.load(handle)
+sets = state.get("sets") or {}
+if set_id not in sets:
+    sys.exit(f"schedule-state.json has no entry for set {set_id}: {sorted(sets)}")
+entry = sets[set_id]
+# `lastBackupStart` is the only backup timestamp SetScheduleState encodes.
+# Asserted rather than assumed: if it is renamed, this must fail here and
+# not silently leave the set not-due.
+if "lastBackupStart" not in entry:
+    sys.exit(f"no lastBackupStart in schedule-state entry: {sorted(entry)}")
+entry["lastBackupStart"] = "2020-01-01T00:00:00Z"
+with open(path, "w") as handle:
+    json.dump(state, handle)
+WIND
+    )"; then
+        fail "$step" "wind_schedule_back: ${wind_out:-python3 failed with no output}"
+    fi
+}
+
 assert_retention() {
-    local step="retention (keep-last 2 via run-set --kind prune)"
+    # Manual retention apply is contained (Option A, issues #111/#82): the
+    # helper refuses `run-set --kind prune` outright. Retention itself is not
+    # gone, so this step proves both halves — the refusal costs nothing, and
+    # the scheduled path still applies the policy to the primary and to a
+    # caught-up mirror. Dropping the second half would let containment turn
+    # into "no retention at all" without any test noticing.
+    local step="retention (contained manual apply; scheduled path still prunes)"
     log "$step"
 
     local prune_primary_before prune_secondary_before
     prune_primary_before="$(idx_count prune success "$SET_ID" "$PRIMARY_DEST_ID" "")"
     prune_secondary_before="$(idx_count prune success "$SET_ID" "$SECONDARY_DEST_ID" "")"
+    # Any status, any destination: the contract is "no run record at all", so
+    # filtering to success would let a regression that moved bookkeeping ahead
+    # of the refusal write a failed or skipped record and still pass.
+    local prune_any_before
+    prune_any_before="$(idx_count prune "" "$SET_ID" "" "")"
     [[ "$prune_primary_before" -eq 0 ]] || fail "$step" "unexpected prune records before this step (retention was null throughout runs 1-4)"
+
+    local pcount_before scount_before
+    pcount_before="$(primary_snapshot_count)"
+    scount_before="$(secondary_snapshot_count_at "$SECONDARY_REPO")"
 
     write_config '{"keepLast": 2, "keepHourly": null, "keepDaily": null, "keepWeekly": null, "keepMonthly": null, "keepYearly": null}'
 
+    # ── half 1: manual apply refuses, and changes nothing ────────────────
     local out rc
     set +e
     out="$("$HELPER" run-set --set "$SET_ID" --kind prune 2>&1)"
     rc=$?
     set -e
-    [[ $rc -eq 0 ]] || fail "$step" "run-set --kind prune exited $rc: $out"
+    [[ $rc -ne 0 ]] || fail "$step" "run-set --kind prune succeeded; manual retention apply must be refused"
+    grep -qi "unavailable in this build" <<<"$out" \
+        || fail "$step" "prune refusal did not explain the posture: $out"
+
+    local prune_any_refused
+    prune_any_refused="$(idx_count prune "" "$SET_ID" "" "")"
+    [[ "$prune_any_refused" -eq "$prune_any_before" ]] \
+        || fail "$step" "the refusal manufactured a prune record (any status, any destination): before=$prune_any_before after=$prune_any_refused"
+    [[ "$(primary_snapshot_count)" -eq "$pcount_before" ]] \
+        || fail "$step" "the refusal removed primary snapshots"
+    [[ "$(secondary_snapshot_count_at "$SECONDARY_REPO")" -eq "$scount_before" ]] \
+        || fail "$step" "the refusal removed secondary snapshots"
+
+    # ── half 2: the scheduled path still applies the same policy ─────────
+    # Through `tick`, not `run-set --kind backup`: only `tick` runs the due
+    # check and dispatches with trigger `.scheduled`. Driving `run-set` here
+    # would exercise `runSet` under a *manual* trigger and prove nothing about
+    # whether the scheduler still reaches retention at all.
+    #
+    # Wind the set's last backup back so it is due.
+    local scheduled_before
+    scheduled_before="$(idx_select backup success "$SET_ID" "" "" \
+        | grep -cE '"trigger":[[:space:]]*"scheduled"' || true)"
+    wind_schedule_back "$SET_ID" "$step"
+
+    set +e
+    out="$("$HELPER" tick 2>&1)"
+    rc=$?
+    set -e
+    [[ $rc -eq 0 ]] || fail "$step" "tick exited $rc: $out"
+
+    local scheduled_after
+    # Whitespace-tolerant: `jq -c` emits `"trigger":"scheduled"` while the
+    # no-jq `json.dumps` fallback emits `"trigger": "scheduled"`.
+    scheduled_after="$(idx_select backup success "$SET_ID" "" "" \
+        | grep -cE '"trigger":[[:space:]]*"scheduled"' || true)"
+    # A delta, not a total: an earlier step already runs a `tick` against this
+    # same set and discards the result, so a lifetime count >= 1 could be
+    # satisfied by that one and assert nothing about *this* dispatch.
+    [[ "$scheduled_after" -eq $((scheduled_before + 1)) ]] \
+        || fail "$step" "this tick produced no new scheduled backup (before=$scheduled_before after=$scheduled_after) — the set was not due, or the scheduler no longer dispatches: $out"
 
     local pcount scount
     pcount="$(primary_snapshot_count)"
@@ -722,12 +813,13 @@ assert_retention() {
     prune_secondary_after="$(idx_count prune success "$SET_ID" "$SECONDARY_DEST_ID" "")"
     [[ "$prune_primary_after" -eq $((prune_primary_before + 1)) ]] \
         || fail "$step" "expected exactly one new successful prune record for the primary, before=$prune_primary_before after=$prune_primary_after"
-    # The mirror just synced in run4 (lastSyncedAt >= primary's), so runPrune's
-    # freshness guard (docs/tasks/T19) must let it qualify too.
+    # The mirror's copy in this very run succeeded, which is the scheduled
+    # path's own gate for pruning a secondary — a live proof, not the stored
+    # timestamp the contained manual path relied on.
     [[ "$prune_secondary_after" -eq $((prune_secondary_before + 1)) ]] \
         || fail "$step" "expected the freshly-synced secondary to also be pruned, before=$prune_secondary_before after=$prune_secondary_after"
 
-    log "$step OK (primary=$pcount, secondary=$scount snapshots)"
+    log "$step OK (manual apply refused; scheduled path pruned primary=$pcount, secondary=$scount snapshots)"
 }
 
 assert_tick_noop() {

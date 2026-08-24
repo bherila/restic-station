@@ -41,6 +41,19 @@ struct RunSet: AsyncParsableCommand {
     var expectedConfig: String?
 
     func run() async throws {
+        // Before `HelperContext.make()`, deliberately: containment must cost
+        // no config load, no data-directory creation, no restic discovery or
+        // hashing, no secret read, no lock, no run record, and no subprocess.
+        // Option A disables manual retention apply outright, so there is
+        // nothing about *this* set the refusal needs to resolve first.
+        if kind == .prune, !ManualRetentionApplyAvailability.isEnabled {
+            throw CLIFailure(
+                code: .operationNotAllowed,
+                message: ManualRetentionApplyAvailability.reason,
+                details: CLIErrorDetails(setId: set)
+            )
+        }
+
         let context = try await HelperContext.make()
         // `scheduled`: backup, check and prune are all things this machine
         // *does to* a set, so a set disabled here must not run — unlike the
@@ -64,6 +77,15 @@ struct RunSet: AsyncParsableCommand {
             let outcome = await context.engine.runCheck(backupSet, trigger: .manual)
             handle(outcome)
         case .prune:
+            // UNREACHABLE while `ManualRetentionApplyAvailability.isEnabled`
+            // is `false` — the gate at the top of `run()` refuses first.
+            // Kept intact rather than deleted: this is the authorization
+            // half (--expected-config validation, executable pinning) that
+            // re-enablement (#111/#82) restores, and rewriting it from
+            // scratch then is riskier than carrying it dark now. The
+            // ManualRunOutcome handler and `isLockBusy` below are reachable
+            // only from here and are dark for the same reason.
+            //
             // Checked against the set the engine is about to receive, after
             // the context has resolved it — not against a separately re-read
             // file, which would leave the decoded value and the hashed value
@@ -198,6 +220,12 @@ struct RunSet: AsyncParsableCommand {
                 ? "\(kind.rawValue) may have run, but its result could not be recorded or trusted: "
                     + "\(reason). Inspect the repositories before retrying."
                 : "this machine cannot run \(kind.rawValue): \(reason)")
+        case .operationNotAllowed(let reason):
+            // Unreachable via the CLI — `run()` refuses before building a
+            // context. Kept exhaustive so a future caller that reaches the
+            // engine directly still reports the posture rather than a
+            // misleading retryable failure.
+            HelperExit.fail(reason)
         }
     }
 
