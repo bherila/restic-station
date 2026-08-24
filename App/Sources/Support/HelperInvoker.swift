@@ -158,17 +158,18 @@ public struct HelperInvoker: Sendable {
 
     private func runDetailed(_ command: HelperCommand) async -> HelperInvocation {
         let executable = helperURL
+        let invocation = command.invocation
         return await withCheckedContinuation { (continuation: CheckedContinuation<HelperInvocation, Never>) in
             // The whole spawn + drain + wait happens on a utility queue:
             // `waitUntilExit()` blocks its thread, so it must never run on
             // a Swift-concurrency cooperative thread (or the main one).
             DispatchQueue.global(qos: .utility).async {
-                continuation.resume(returning: Self.runBlocking(executable: executable, command: command))
+                continuation.resume(returning: Self.runBlocking(executable: executable, invocation: invocation))
             }
         }
     }
 
-    private static func runBlocking(executable: URL, command: HelperCommand) -> HelperInvocation {
+    private static func runBlocking(executable: URL, invocation: HelperInvocationSpec) -> HelperInvocation {
         guard FileManager.default.isExecutableFile(atPath: executable.path) else {
             return HelperInvocation(
                 result: .failed(output: "The Restic Station helper is missing from this copy of the app "
@@ -179,7 +180,7 @@ public struct HelperInvoker: Sendable {
 
         let process = Process()
         process.executableURL = executable
-        process.arguments = command.argv
+        process.arguments = invocation.argv
         // Environment is inherited on purpose: it carries the developer's
         // `RESTIC_STATION_DATA_DIR` override (see `AppPaths.default()`) so
         // an app run against a scratch data dir spawns a helper against the
@@ -190,6 +191,27 @@ public struct HelperInvoker: Sendable {
         let stderrPipe = Pipe()
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
+
+        // Never inherit the app's stdin. A confirmation payload is filled
+        // and closed before the helper starts: its fixed 43-byte value cannot
+        // fill the pipe, so there is no post-launch broken-pipe race. For an
+        // invocation without a payload, this is deliberately an already
+        // closed empty pipe. The helper's later remote-restic child receives
+        // a distinct stdin pipe, so the two process boundaries do not share
+        // a stream.
+        let stdinPipe = Pipe()
+        do {
+            if let sensitiveStdin = invocation.sensitiveStdin {
+                try stdinPipe.fileHandleForWriting.write(contentsOf: sensitiveStdin.data)
+            }
+            try stdinPipe.fileHandleForWriting.close()
+        } catch {
+            return HelperInvocation(
+                result: .failed(output: "Could not prepare helper input: \(error.localizedDescription)"),
+                stdout: ""
+            )
+        }
+        process.standardInput = stdinPipe
 
         do {
             try process.run()

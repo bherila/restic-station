@@ -308,17 +308,20 @@ enum SecretInput {
         return value
     }
 
-    private static func withEchoDisabled<T>(_ body: () -> T) -> T {
+    /// Shared terminal mechanics for the bounded destructive-capability
+    /// reader. Passwords intentionally retain their existing unbounded input
+    /// semantics; only a fixed-size capability gets the hard read limit.
+    static func withEchoDisabled<T>(_ body: () throws -> T) rethrows -> T {
         var original = termios()
         guard tcgetattr(STDIN_FILENO, &original) == 0 else {
             // Not a real terminal after all — better to echo than to refuse.
-            return body()
+            return try body()
         }
         var modified = original
         modified.c_lflag &= ~tcflag_t(ECHO)
         _ = tcsetattr(STDIN_FILENO, TCSAFLUSH, &modified)
         defer { _ = tcsetattr(STDIN_FILENO, TCSAFLUSH, &original) }
-        return body()
+        return try body()
     }
 }
 

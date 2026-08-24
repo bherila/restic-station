@@ -124,64 +124,33 @@ import Testing
 
 @Test func maintenancePruneBindsConfirmedDestinationToItsPreview() throws {
     let setId = UUID()
-    let destination = Destination(
-        id: UUID(),
-        label: "Primary",
-        repoURL: "/Volumes/current.restic",
-        isPrimary: true,
-        nonSecretEnv: ["AWS_DEFAULT_REGION": "current"]
-    )
+    let destinationId = UUID()
     let parsed = try #require(HelperMain.parseAsRoot([
         "maintenance", "prune", "--set", setId.uuidString,
-        "--dest", destination.id.uuidString,
-        "--expected-destination", Destination(
-            id: destination.id,
-            label: destination.label,
-            repoURL: destination.repoURL,
-            isPrimary: destination.isPrimary,
-            nonSecretEnv: ["AWS_DEFAULT_REGION": "previewed"]
-        ).pruneConfirmationFingerprint(secretEnv: [:]),
+        "--dest", destinationId.uuidString,
+        "--expected-destination-stdin",
     ]) as? MaintenancePrune)
-    #expect(parsed.expectedDestination != nil)
-
-    #expect(parsed.expectedDestination == Destination(
-        id: destination.id,
-        label: destination.label,
-        repoURL: destination.repoURL,
-        isPrimary: destination.isPrimary,
-        nonSecretEnv: ["AWS_DEFAULT_REGION": "previewed"]
-    ).pruneConfirmationFingerprint(secretEnv: [:]))
+    #expect(parsed.expectedDestinationStdin)
 }
 
-@Test func maintenancePruneAcceptsHyphenPrefixedPreviewBindings() throws {
+@Test func maintenancePruneSelectsItsStdinBindingWithoutAnArgvValue() throws {
     let setId = UUID()
     let destinationId = UUID()
     let parsed = try #require(HelperMain.parseAsRoot([
         "maintenance", "prune", "--set", setId.uuidString,
         "--dest", destinationId.uuidString,
-        "--expected-destination", "-valid-preview-binding",
+        "--expected-destination-stdin",
     ]) as? MaintenancePrune)
-    #expect(parsed.expectedDestination == "-valid-preview-binding")
+    #expect(parsed.expectedDestinationStdin)
 }
 
-/// The token is opaque base64url, so roughly one in 64 begins with `-`.
-/// Without `.unconditional`, ArgumentParser reads it as the next option and
-/// rejects the space-separated form that `purge preview` itself prints —
-/// burning a reviewed, 15-minute token on a usage error the operator had no
-/// way to avoid. Both spellings must parse.
-@Test func purgeApplyAcceptsHyphenPrefixedPreviewTokens() throws {
+@Test func purgeApplySelectsItsStdinTokenWithoutAnArgvValue() throws {
     let setId = UUID()
-    let spaced = try #require(HelperMain.parseAsRoot([
+    let parsed = try #require(HelperMain.parseAsRoot([
         "purge", "apply", "--set", setId.uuidString,
-        "--preview-token", "-Abc123_token",
+        "--preview-token-stdin",
     ]) as? PurgeApply)
-    #expect(spaced.previewToken == "-Abc123_token")
-
-    let attached = try #require(HelperMain.parseAsRoot([
-        "purge", "apply", "--set", setId.uuidString,
-        "--preview-token=-Abc123_token",
-    ]) as? PurgeApply)
-    #expect(attached.previewToken == "-Abc123_token")
+    #expect(parsed.previewTokenStdin)
 }
 
 @Test func maintenancePruneAcceptsItsUnchangedEffectiveDestination() throws {

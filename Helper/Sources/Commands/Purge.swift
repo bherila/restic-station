@@ -149,6 +149,17 @@ struct PurgePreview: AsyncParsableCommand, JSONRenderable {
             for report in reports {
                 Self.printHuman(report)
             }
+            // One preview session has one shared capability. Printing it once
+            // keeps the explicit handoff usable without repeating a live
+            // value for every destination; the command itself is token-free
+            // and the later TTY prompt keeps it out of shell history/argv.
+            for line in Self.humanApplyGuidance(
+                setId: set,
+                previewToken: previewToken,
+                hasChanges: reports.contains(where: { !$0.changed.isEmpty })
+            ) {
+                print(line)
+            }
         }
         HelperExit.code(0)
     }
@@ -188,6 +199,21 @@ struct PurgePreview: AsyncParsableCommand, JSONRenderable {
         }
     }
 
+    /// One preview session has one shared capability, regardless of how many
+    /// destinations changed. Keeping this rendering in one accessor makes it
+    /// impossible for per-destination output to repeat a live value.
+    static func humanApplyGuidance(
+        setId: UUID,
+        previewToken: String?,
+        hasChanges: Bool
+    ) -> [String] {
+        guard let previewToken, hasChanges else { return [] }
+        return [
+            "  preview token: \(previewToken)",
+            "  apply with: purge apply --set \(setId.uuidString) --preview-token-stdin",
+        ]
+    }
+
     private static func printHuman(_ report: Report) {
         switch report.status {
         case .empty:
@@ -208,12 +234,6 @@ struct PurgePreview: AsyncParsableCommand, JSONRenderable {
                 }
             }
             print("  space is not reclaimed until a prune runs")
-            // Attached form, so a copy-paste survives a token that starts
-            // with `-` regardless of how the option is parsed. Suppressed
-            // when nothing would change: there is nothing to apply.
-            if let previewToken = report.previewToken, !report.changed.isEmpty {
-                print("  apply with: purge apply --set \(report.setId.uuidString) --preview-token=\(previewToken)")
-            }
         case .busy, .offline, .infrastructureFailure, .failed:
             // These states are rejected before a report is printed.
             break
@@ -233,13 +253,8 @@ struct PurgeApply: AsyncParsableCommand, JSONRenderable {
     @Option(name: .long, help: "The backup set's UUID.")
     var set: UUID
 
-    /// `.unconditional` because the token is opaque base64url: roughly one
-    /// in 64 begins with `-`, and ArgumentParser would otherwise read it as
-    /// the next option and reject the exact space-separated form that
-    /// `purge preview` prints. The user's 15-minute reviewed token would be
-    /// burned on a usage error they had no way to avoid.
-    @Option(name: .long, parsing: .unconditional, help: "The short-lived token returned by purge preview.")
-    var previewToken: String
+    @Flag(name: .long, help: "Read the short-lived purge-preview token from standard input.")
+    var previewTokenStdin = false
 
     @Flag(name: .long, help: "Emit JSON. Only JSON reaches stdout in this mode.")
     var json = false
@@ -258,6 +273,14 @@ struct PurgeApply: AsyncParsableCommand, JSONRenderable {
     }
 
     func run() async throws {
+        // Token parsing comes before all local setup. In particular a bad
+        // stdin payload must not reach config, repository lookup, the token
+        // store, or executable discovery.
+        guard previewTokenStdin else {
+            throw CLIFailure.invalidArguments("--preview-token-stdin is required")
+        }
+        let previewToken = try CapabilityInput.read(prompt: "Preview token: ")
+
         let context = try await HelperContext.make()
         guard let backupSet = context.addressable.set(id: set) else {
             throw CLIFailure.setNotFound(setId: set)

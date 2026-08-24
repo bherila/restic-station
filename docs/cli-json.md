@@ -242,11 +242,37 @@ usage error (malformed UUID, unknown option — see the exit-code section
 above) and must not be mistaken for it. See the containment note below. `preview_expired` is emitted by both when a binding
 outlives `PreviewTokenStore.defaultLifetime`.
 
-## Confirmation bindings are an app gate, not a CLI gate
+## Confirmation capabilities use bounded stdin, never argv
 
-`purge apply` cannot run without a valid `--preview-token`: `BackupEngine`
-refuses every request not bound to a current preview, and there is no force,
-yes, or environment bypass.
+`purge apply` requires `--preview-token-stdin`; its 32-byte preview
+capability is read from standard input before the helper loads configuration,
+opens the token store, or discovers restic. From a terminal it prompts on
+stderr with echo disabled; from a pipe or file it reads one bounded payload.
+The canonical form is exactly 43 unpadded base64url ASCII characters (32
+decoded bytes), optionally followed by one final LF. Whitespace, padding,
+CR, embedded newlines, noncanonical encodings, and excess input are refused
+without echoing the attempted value. There is no force, yes, or environment
+bypass.
+
+For a human flow, `purge preview` displays its shared token **once** and then
+prints a token-free command:
+
+```console
+$ restic-station purge apply --set <uuid> --preview-token-stdin
+Preview token: # paste the displayed token; terminal echo is disabled
+```
+
+This avoids placing a capability in shell history or argv. A noninteractive
+caller may pipe a protected source into that same command. `purge apply`
+never emits the received capability.
+
+The retired `--preview-token=<value>` / `--preview-token <value>` and
+`--expected-destination=<value>` / `--expected-destination <value>` forms
+are rejection-only compatibility shims: they exit **64** in both human and
+JSON mode before context construction, never redeem or reflect the supplied
+value, and do not appear in `--help`. This cannot erase a capability that an
+old caller already put in its own argv; the guarantee is that new and
+app-originated flows never do so.
 
 `run-set --kind prune` (the app's **Apply retention now**) is **contained in
 this build and always refuses**, with `operation_not_allowed` and exit 1,
@@ -280,14 +306,15 @@ helper-issued token to mint; the shared fingerprint is what both processes
 can compute identically, and the helper refuses if any input moved between
 the preview the operator read and the run they authorised.
 
-`maintenance prune` is deliberately different. `--expected-destination` is
-optional, and omitting it runs a real `restic prune` with no binding check —
-this is the documented behaviour for a direct CLI operator, who is trusted the
-same way they are trusted to run `restic prune` themselves. The app always
-sends the binding. Note what prune does and does not destroy: it removes
-unreferenced pack data only, so snapshots stay restorable; what it
-irrevocably finalises is a purge rewrite that already happened. The set lock
-and the stale-mirror invariant still apply either way.
+`maintenance prune` is deliberately different. `--expected-destination-stdin`
+selects an optional helper-issued binding on stdin; omitting the selector on a
+real prune preserves the existing unbound direct-CLI behaviour. The app
+always sends the binding. A dry run has no selector and issues a fresh binding;
+combining `--dry-run` with the selector is invalid. If selected, the binding
+is consumed and validated before context construction. Note what prune does
+and does not destroy: it removes unreferenced pack data only, so snapshots
+stay restorable; what it irrevocably finalises is a purge rewrite that already
+happened. The set lock and the stale-mirror invariant still apply either way.
 
 ## Migrating from the unwrapped shape
 

@@ -29,7 +29,7 @@ public enum HelperCommand: Equatable, Sendable {
     case prune(setId: UUID, expectedConfig: String? = nil)
     /// `run-set --set <uuid> --kind check`.
     case check(setId: UUID)
-    /// `maintenance prune --set <uuid> [--dest <uuid>] [--expected-destination <preview-token>] [--dry-run]`.
+    /// `maintenance prune --set <uuid> [--dest <uuid>] [--expected-destination-stdin] [--dry-run]`.
     /// This reclaims unused packs without applying a retention policy.
     /// `expectedDestination` is an opaque helper-issued binding for the full
     /// effective destination the preceding preview described; direct CLI
@@ -61,9 +61,12 @@ public enum HelperCommand: Equatable, Sendable {
     /// `version`.
     case version
 
-    /// The helper's argument vector **excluding argv[0]** — exactly what
-    /// goes into `Process.arguments` (the executable itself is
-    /// `HelperInvoker.helperURL`).
+    /// The helper's non-sensitive argument vector **excluding argv[0]**.
+    ///
+    /// Callers that spawn the helper must use ``invocation`` rather than
+    /// treating this as the complete process description: confirmation
+    /// capabilities deliberately travel in its redacted stdin payload, not
+    /// in argv where Linux exposes them through `/proc/<pid>/cmdline`.
     public var argv: [String] {
         switch self {
         case .tick:
@@ -80,9 +83,10 @@ public enum HelperCommand: Equatable, Sendable {
         case .maintenancePrune(let setId, let destId, let expectedDestination, let dryRun, let json):
             var argv = ["maintenance", "prune", "--set", Self.render(setId)]
             if let destId { argv.append(contentsOf: ["--dest", Self.render(destId)]) }
-            // Attach the opaque value so a valid base64url token beginning
-            // with `-` can never be reparsed as another option.
-            if let expectedDestination { argv.append("--expected-destination=\(expectedDestination)") }
+            // The opaque confirmation is deliberately stdin, never argv.
+            // Only this selector is visible to another local user through
+            // `/proc/<pid>/cmdline`; the value is carried by `invocation`.
+            if expectedDestination != nil { argv.append("--expected-destination-stdin") }
             if dryRun { argv.append("--dry-run") }
             if json { argv.append("--json") }
             return argv
@@ -99,6 +103,23 @@ public enum HelperCommand: Equatable, Sendable {
         case .version:
             return ["version"]
         }
+    }
+
+    /// The complete, redaction-preserving process contract for this command.
+    ///
+    /// `argv` alone is intentionally insufficient for a confirmed
+    /// maintenance prune. Keeping the capability beside argv in a typed
+    /// value prevents a future App call site from accidentally rebuilding
+    /// the old token-bearing command line.
+    public var invocation: HelperInvocationSpec {
+        let sensitiveStdin: HelperSensitiveInput?
+        switch self {
+        case .maintenancePrune(_, _, let expectedDestination, _, _):
+            sensitiveStdin = expectedDestination.map(HelperSensitiveInput.init)
+        default:
+            sensitiveStdin = nil
+        }
+        return HelperInvocationSpec(argv: argv, sensitiveStdin: sensitiveStdin)
     }
 
     /// The subcommand name (`argv[0]` of `argv`), i.e. what
@@ -147,6 +168,45 @@ public enum HelperCommand: Equatable, Sendable {
     private static func render(_ id: UUID) -> String {
         id.uuidString
     }
+}
+
+/// A capability payload for an app-to-helper pipe.
+///
+/// Its value is intentionally private and both textual renderings are
+/// redacted. `HelperInvoker` is the only consumer and obtains bytes through
+/// ``data`` immediately before it creates the helper's closed stdin pipe.
+public struct HelperSensitiveInput: Equatable, Sendable, CustomStringConvertible, CustomDebugStringConvertible {
+    private let value: String
+
+    public init(_ value: String) {
+        self.value = value
+    }
+
+    /// Bytes to write to the helper's stdin. This is a transport seam, not a
+    /// diagnostic API; callers must not log or serialize it.
+    public var data: Data { Data(value.utf8) }
+
+    public var description: String { "<redacted sensitive stdin>" }
+    public var debugDescription: String { description }
+}
+
+/// Everything required to spawn the helper without putting a capability in
+/// argv or the environment.
+public struct HelperInvocationSpec: Equatable, Sendable, CustomStringConvertible, CustomDebugStringConvertible {
+    public let argv: [String]
+    public let sensitiveStdin: HelperSensitiveInput?
+
+    public init(argv: [String], sensitiveStdin: HelperSensitiveInput?) {
+        self.argv = argv
+        self.sensitiveStdin = sensitiveStdin
+    }
+
+    public var description: String {
+        let stdinDescription = sensitiveStdin == nil ? "nil" : "<redacted>"
+        return "HelperInvocationSpec(argv: \(argv), sensitiveStdin: \(stdinDescription))"
+    }
+
+    public var debugDescription: String { description }
 }
 
 // MARK: - HelperRestoreArgs
