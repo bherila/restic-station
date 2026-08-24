@@ -79,11 +79,17 @@ public enum ManualRetentionApplyAvailability {
     /// UI-agnostic on purpose — this is also the helper's stderr message,
     /// so it must not name app buttons. The app's copy names **Back Up
     /// Now**; `docs/cli-json.md` names `--kind backup`.
+    /// "This delays cleanup; it does not remove it" used to end this
+    /// message — deleted because it is false in the one case where the
+    /// operator most needs the truth: a set whose backups are failing gets
+    /// no retention at all, and the recovery path belongs here, in the
+    /// message they are actually reading, not only in the docs.
     public static let reason = """
         Applying retention manually is unavailable in this build while exact-plan \
         authorization is completed. Retention is still applied by every backup run, \
         scheduled or started by hand: each successful run cleans the primary, and any \
-        mirror whose copy in that run succeeded. This delays cleanup; it does not \
-        remove it. Previewing cleanup is read-only and remains available.
+        mirror whose copy in that run succeeded. If backups themselves are failing \
+        (for example, a full volume), free space with restic forget by hand. \
+        Previewing cleanup is read-only and remains available.
         """
 }
