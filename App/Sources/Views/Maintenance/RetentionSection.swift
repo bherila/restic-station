@@ -59,8 +59,10 @@ struct RetentionSection: View {
     private static let agentDisabledExplanation =
         "Applying retention manually is unavailable in this build, and the background agent "
         + "is not running, so cleanup will not happen on a schedule. Back Up Now still "
-        + "applies the retention policy after it backs up. To resume scheduled cleanup, "
-        + "enable the background agent in Settings ▸ Permissions."
+        + "applies the retention policy after it backs up. "
+        + ManualRetentionApplyAvailability.failedBackupRecovery
+        + " To resume scheduled cleanup, enable the background agent in "
+        + "Settings ▸ Permissions."
 
     /// What to say about retention when manual apply is contained: the
     /// promise of scheduled cleanup only holds if a tick will happen.

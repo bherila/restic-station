@@ -30,6 +30,13 @@ struct MaintenanceView: View {
         .navigationTitle("Restic Station")
         .navigationSubtitle("Maintenance")
         .onAppear { model.refresh() }
+        // The containment caption promises (or denies) scheduled cleanup
+        // based on launchd status, which System Settings can flip behind our
+        // back while this screen stays mounted — re-read on activation, the
+        // same way PermissionsView does.
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            model.refresh()
+        }
     }
 
     // MARK: - Content
