@@ -330,8 +330,9 @@ public struct StateStore: Sendable {
             }
             return .valid(state)
         } catch {
-            let cocoaError = error as? CocoaError
-            return cocoaError?.code == .fileNoSuchFile
+            let nsError = error as NSError
+            return nsError.domain == NSCocoaErrorDomain
+                && (nsError.code == NSFileNoSuchFileError || nsError.code == NSFileReadNoSuchFileError)
                 ? .missing
                 : .corrupt
         }
