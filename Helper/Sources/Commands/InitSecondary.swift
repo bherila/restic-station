@@ -53,7 +53,10 @@ struct InitSecondary: AsyncParsableCommand {
         case .operationNotAllowed(let reason):
             // Not reachable today: only manual retention apply is
             // contained. Exhaustive so that containing another
-            // operation later cannot silently fall through here.
+            // operation later cannot silently fall through here. If that
+            // day comes, refuse in `run()` before `HelperContext.make()`
+            // with a structured `CLIFailure`, as `RunSet` does — this arm
+            // is a last-resort sink, not the refusal pattern.
             HelperExit.fail(reason)
         }
     }

@@ -60,7 +60,7 @@ struct RetentionSection: View {
         "Applying retention manually is unavailable in this build, and the background agent "
         + "is not running, so cleanup will not happen on a schedule. Back Up Now still "
         + "applies the retention policy after it backs up. To resume scheduled cleanup, "
-        + "enable the background agent in Settings ▸ Permissions & background."
+        + "enable the background agent in Settings ▸ Permissions."
 
     /// What to say about retention when manual apply is contained: the
     /// promise of scheduled cleanup only holds if a tick will happen.
@@ -87,9 +87,12 @@ struct RetentionSection: View {
             // leaves this button disabled, because manual apply is contained.
             // Promising otherwise sends the operator to Backup Sets expecting
             // this control to light up.
+            // Unconditionally true: whether runs *happen* depends on the
+            // operator and the agent, but any successful backup run cleans
+            // up. Do not promise scheduling here — the agent may be off.
             return "This backup set has no retention policy, so nothing is ever removed — "
-                + "backup runs included. Add one in Backup Sets ▸ Retention and every "
-                + "backup run — scheduled or Back Up Now — will start cleaning up."
+                + "backup runs included. Add one in Backup Sets ▸ Retention and each "
+                + "successful backup run will clean up."
         }
         if !canApplyRetention { return containmentExplanation }
         return "Runs the retention policy. It permanently deletes snapshots the policy no longer keeps."
@@ -174,7 +177,12 @@ struct RetentionSection: View {
                 Button {
                     maintenance.prepareApplyRetention(for: backupSet, in: model)
                 } label: {
-                    if maintenance.isPreparingPrune || isPruning {
+                    // `busyAction == .prune` is shared with Reclaim space, so
+                    // without the containment term this permanently disabled
+                    // button would show "Cleaning up…" while a reclaim runs —
+                    // directly under a caption saying manual apply is
+                    // unavailable.
+                    if canApplyRetention, maintenance.isPreparingPrune || isPruning {
                         HStack(spacing: 6) {
                             ProgressView().controlSize(.small)
                             Text(isPruning ? "Cleaning up…" : "Checking…")

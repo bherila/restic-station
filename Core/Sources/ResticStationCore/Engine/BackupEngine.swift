@@ -720,36 +720,16 @@ public final class BackupEngine: Sendable {
 
     // MARK: - runPrune
 
-    /// The manual "apply retention now" action: `forget --prune` on the
-    /// primary and on every secondary that is **not** a stale mirror.
-    ///
-    /// SAFETY: a secondary is pruned only when its `lastSyncedAt` is at least
-    /// as recent as the primary's (the end of the primary's last successful
-    /// backup). A mirror that has not received the newest snapshots must
-    /// never have an aggressive policy applied to it — that is exactly the
-    /// data-loss window invariant 2 describes. When the primary has never
-    /// synced, no secondary is pruned.
-    ///
-    /// A dry run first is the UI's job (`ResticCommand.forget(dryRun:)`);
-    /// this is the real one.
-    /// `expectedExecutableIdentity` binds every `forget --prune` this call
-    /// makes to one restic binary. It is what makes the caller's fingerprint
-    /// check more than advisory: validating the executable and then launching
-    /// unpinned leaves a window — across the lock acquisition and every
-    /// earlier destination — in which a replacement receives the destructive
-    /// command instead.
-    ///
-    /// `nil` means the caller made no such promise, which is the scheduled
-    /// path. A *bound* caller must pass a real identity and refuse if it
-    /// cannot read one; see `RunSet`.
-    /// Refuses before touching anything: no secret read, no set lock, no
-    /// executable resolution, no run record, no subprocess. See
+    /// The manual "apply retention now" action — **contained**: refuses
+    /// before touching anything. No secret read, no set lock, no executable
+    /// resolution, no run record, no subprocess. See
     /// ``ManualRetentionApplyAvailability`` for why, and for what still
     /// applies retention while this is closed.
     ///
     /// The helper refuses earlier still — before it even builds a context —
     /// so this is defense in depth for a direct Core caller, not the only
-    /// gate.
+    /// gate. The destructive contract lives on ``runPruneUnchecked``, the
+    /// function that actually implements it.
     public func runPrune(
         _ set: BackupSet,
         expectedExecutableIdentity: String? = nil
@@ -763,7 +743,29 @@ public final class BackupEngine: Sendable {
         )
     }
 
-    /// The manual-retention mechanics, minus the containment gate.
+    /// The manual-retention mechanics, minus the containment gate:
+    /// `forget --prune` on the primary and on every secondary that is
+    /// **not** a stale mirror.
+    ///
+    /// SAFETY: a secondary is pruned only when its `lastSyncedAt` is at least
+    /// as recent as the primary's (the end of the primary's last successful
+    /// backup). A mirror that has not received the newest snapshots must
+    /// never have an aggressive policy applied to it — that is exactly the
+    /// data-loss window invariant 2 describes. When the primary has never
+    /// synced, no secondary is pruned. Any new caller — including the
+    /// #111/#82 re-enablement — inherits this obligation; skipping the
+    /// freshness loop reintroduces the data-loss window.
+    ///
+    /// A dry run first is the UI's job (`ResticCommand.forget(dryRun:)`);
+    /// this is the real one.
+    /// `expectedExecutableIdentity` binds every `forget --prune` this call
+    /// makes to one restic binary. It is what makes the caller's fingerprint
+    /// check more than advisory: validating the executable and then launching
+    /// unpinned leaves a window — across the lock acquisition and every
+    /// earlier destination — in which a replacement receives the destructive
+    /// command instead. `nil` means the caller made no such promise, which
+    /// is the scheduled path; a *bound* caller must pass a real identity and
+    /// refuse if it cannot read one — see `RunSet`.
     ///
     /// `internal` on purpose: reachable from the tests that cover mirror
     /// freshness, executable pinning and run recording, and from nothing
@@ -1893,7 +1895,8 @@ public final class BackupEngine: Sendable {
     ///
     /// Callers are responsible for the freshness half of the contract: never
     /// call this for a destination whose copy did not succeed in this run
-    /// (`runSet`) or whose mirror is behind the primary (`runPrune`).
+    /// (`runSet`) or whose mirror is behind the primary (`runPruneUnchecked`
+    /// — the public `runPrune` is contained and never reaches here).
     private func forgetChild(
         destination: Destination,
         policy: RetentionPolicy?,

@@ -697,13 +697,15 @@ assert_migration() {
 # `tick` finds it due. Used to drive the real scheduled entry point rather
 # than a manual `run-set`, which dispatches with a different trigger.
 wind_schedule_back() {
-    local set_id="$1" file="$DATA_DIR/state/schedule-state.json"
-    # Fails loudly on every path. A missing file, a missing set entry, or a
-    # renamed field must not quietly wind nothing back and report success —
-    # the caller then runs `tick`, sees no scheduled backup, and blames the
-    # scheduler for what is really a broken fixture.
-    [[ -f "$file" ]] || fail "wind_schedule_back" "no schedule-state.json at $file"
-    python3 - "$file" "$set_id" <<'WIND' || return 1
+    local set_id="$1" step="$2" file="$DATA_DIR/state/schedule-state.json"
+    # Fails loudly THROUGH fail() on every path, labelled with the caller's
+    # step. A missing file, a missing set entry, or a renamed field must not
+    # quietly wind nothing back — and must not abort as a bare nonzero under
+    # `set -e` either, which would skip fail()'s index/state dump and let the
+    # EXIT trap delete the evidence before anyone can look at it.
+    [[ -f "$file" ]] || fail "$step" "wind_schedule_back: no schedule-state.json at $file"
+    local wind_out
+    if ! wind_out="$(python3 - "$file" "$set_id" 2>&1 <<'WIND'
 import json, sys
 path, set_id = sys.argv[1], sys.argv[2]
 with open(path) as handle:
@@ -721,6 +723,9 @@ entry["lastBackupStart"] = "2020-01-01T00:00:00Z"
 with open(path, "w") as handle:
     json.dump(state, handle)
 WIND
+    )"; then
+        fail "$step" "wind_schedule_back: ${wind_out:-python3 failed with no output}"
+    fi
 }
 
 assert_retention() {
@@ -778,7 +783,7 @@ assert_retention() {
     local scheduled_before
     scheduled_before="$(idx_select backup success "$SET_ID" "" "" \
         | grep -cE '"trigger":[[:space:]]*"scheduled"' || true)"
-    wind_schedule_back "$SET_ID"
+    wind_schedule_back "$SET_ID" "$step"
 
     set +e
     out="$("$HELPER" tick 2>&1)"

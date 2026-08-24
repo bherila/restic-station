@@ -77,6 +77,15 @@ struct RunSet: AsyncParsableCommand {
             let outcome = await context.engine.runCheck(backupSet, trigger: .manual)
             handle(outcome)
         case .prune:
+            // UNREACHABLE while `ManualRetentionApplyAvailability.isEnabled`
+            // is `false` — the gate at the top of `run()` refuses first.
+            // Kept intact rather than deleted: this is the authorization
+            // half (--expected-config validation, executable pinning) that
+            // re-enablement (#111/#82) restores, and rewriting it from
+            // scratch then is riskier than carrying it dark now. The
+            // ManualRunOutcome handler and `isLockBusy` below are reachable
+            // only from here and are dark for the same reason.
+            //
             // Checked against the set the engine is about to receive, after
             // the context has resolved it — not against a separately re-read
             // file, which would leave the decoded value and the hashed value

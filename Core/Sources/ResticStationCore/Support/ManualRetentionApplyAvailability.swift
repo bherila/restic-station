@@ -22,8 +22,12 @@
 /// Scheduled retention inside `runSet` has neither defect: it prunes a
 /// mirror only when *this run's* copy to it succeeded — a live proof, not a
 /// stored timestamp — and it orders secondaries before the primary. So
-/// disabling the manual path removes both defects from shipping code rather
-/// than deferring them behind a flag.
+/// disabling the manual path removes both defects from the shipping
+/// *retention* path rather than deferring them behind a flag.
+/// (`runPruneRepository` — reclaim space — keeps the same timestamp
+/// comparison, but there it is defense in depth rather than the load-bearing
+/// proof: reclaim only drops packs unreferenced within that one repository,
+/// so a behind mirror's extra snapshots keep their data. #111 tracks it.)
 ///
 /// ## What this costs
 ///
@@ -35,6 +39,16 @@
 /// Back Up Now alike, since `runSet` applies retention regardless of
 /// trigger. Repositories do not grow without bound; cleanup is deferred to
 /// the next backup run rather than removed.
+///
+/// One genuine capability exception: retention runs only after a
+/// **successful** backup (`runSet` bails — "no copies, no retention" — when
+/// the backup child fails). A set whose backups themselves fail, a full
+/// destination volume being the canonical case, therefore receives no
+/// retention at all, and with this gate closed there is no in-product way
+/// to free that space by dropping snapshots ("Reclaim space" only removes
+/// packs nothing references). Recovery is `restic forget` by hand against
+/// the affected repository. This is deliberate: a break-glass flag here
+/// would be a bypass of the very containment this type exists to hold.
 ///
 /// ## Deliberately not configurable
 ///

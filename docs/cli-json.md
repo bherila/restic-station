@@ -232,8 +232,13 @@ exception: they mutate, and they carry `--json` because the app drives them.
 Every defined code now has a producer. `repository_offline` was wired by #79
 and is also emitted by `purge preview` (exit 3); `operation_not_allowed` is
 emitted by `purge apply` and `maintenance prune` when a confirmation does not
-match the current plan, and by `run-set --kind prune` **unconditionally** —
-see the containment note below. `preview_expired` is emitted by both when a binding
+match the current plan; it is also the classification behind
+`run-set --kind prune`'s unconditional refusal — but `run-set` is
+**human-only** (it has no `--json` mode), so that refusal reaches callers as
+prose on stderr with exit 1, never as a JSON envelope. Automation must treat
+any nonzero exit from `run-set --kind prune` as the containment refusal
+rather than branching on a code it will never see. See the containment note
+below. `preview_expired` is emitted by both when a binding
 outlives `PreviewTokenStore.defaultLifetime`.
 
 ## Confirmation bindings are an app gate, not a CLI gate
@@ -262,12 +267,17 @@ that previously drove `--kind prune` should drive `--kind backup` instead, or
 wait for the schedule. `maintenance prune` — reclaim space, which does not
 change retention — is unaffected.
 
-When it is re-enabled, `--expected-config` resumes its documented role: a
-SHA-256 of `config.json`'s bytes. Retention's preview runs in the app rather
-than through the helper, so there is no helper-issued token to mint; the file
-fingerprint is what both processes can compute identically, and the helper
-refuses if the file moved between the preview the operator read and the run
-they authorised.
+When it is re-enabled, `--expected-config` resumes its role — which since
+#109 is **not** a bare SHA-256 of `config.json`: it is
+`MaintenanceBinding.effectiveSetFingerprint`, binding the machine id, the
+resolved scheduling-view set, the byte fingerprints of both `config.json`
+and `machine.json`, and the restic executable identity. It is computed by
+the app and recomputed helper-side against the exact set handed to the
+engine; an integrator cannot derive it from `config.json` alone. Retention's
+preview runs in the app rather than through the helper, so there is no
+helper-issued token to mint; the shared fingerprint is what both processes
+can compute identically, and the helper refuses if any input moved between
+the preview the operator read and the run they authorised.
 
 `maintenance prune` is deliberately different. `--expected-destination` is
 optional, and omitting it runs a real `restic prune` with no binding check —
