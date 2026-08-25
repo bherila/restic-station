@@ -70,7 +70,11 @@ public enum LockingHealth {
                 )
             )
         }
-        for sharedLock in [paths.tickLockFile, paths.destructiveAuditLockFile] {
+        for sharedLock in [
+            paths.tickLockFile,
+            paths.destructiveAuditLockFile,
+            paths.runPublicationLockFile,
+        ] {
             if let failure = FileLock(
                 path: sharedLock, trustedRoot: paths.root
             ).probe(createIfMissing: false) {

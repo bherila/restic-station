@@ -2153,10 +2153,12 @@ public final class BackupEngine: Sendable {
 
         let result: ExecuteResult
         let auditRun = run
+        let destructiveLaunchState = DestructiveLaunchState()
         let auditBeforeLaunch: (@Sendable () throws -> Void)?
         if kind.isDestructive {
-            auditBeforeLaunch = { [runStore, auditRun] in
+            auditBeforeLaunch = { [runStore, auditRun, destructiveLaunchState] in
                 try runStore.markDestructiveLaunchAuthorized(auditRun)
+                destructiveLaunchState.markAuthorized()
             }
         } else {
             auditBeforeLaunch = nil
@@ -2218,9 +2220,7 @@ public final class BackupEngine: Sendable {
         switch result {
         case .didNotRun(let reason, _, let operationMayHaveRun):
             status = .failed
-            let launchMarkerExists = kind.isDestructive
-                && ((try? runStore.metadata(runId: run.runId).destructiveLaunchAuthorizedAt) != nil)
-            if operationMayHaveRun, launchMarkerExists {
+            if operationMayHaveRun, destructiveLaunchState.wasAuthorized {
                 auditFailureReason = .repositoryOutcomeUnknown
                 errorSummary = "operation_completed_audit_failed — repository outcome unknown: \(reason)"
             } else {
@@ -2259,7 +2259,8 @@ public final class BackupEngine: Sendable {
             errorSummary: errorSummary,
             resticExitCode: exitCode,
             purgeSnapshotRewrites: rewrites,
-            auditFailureReason: auditFailureReason
+            auditFailureReason: auditFailureReason,
+            launchWasAuthorized: destructiveLaunchState.wasAuthorized
         )
         let auditCondition = auditFailureReason.map { reason in
             "operation_completed_audit_failed — destructive run \(run.runId) has unresolved \(reason.rawValue) audit evidence"
@@ -2424,7 +2425,8 @@ public final class BackupEngine: Sendable {
         errorSummary: String? = nil,
         resticExitCode: Int32? = nil,
         purgeSnapshotRewrites: [String: String]? = nil,
-        auditFailureReason: RunAuditFailureReason? = nil
+        auditFailureReason: RunAuditFailureReason? = nil,
+        launchWasAuthorized: Bool = false
     ) -> String? {
         do {
             try runStore.finish(
@@ -2438,9 +2440,7 @@ public final class BackupEngine: Sendable {
             )
             return nil
         } catch {
-            let launchWasAuthorized = run.kind.isDestructive
-                && ((try? runStore.metadata(runId: run.runId).destructiveLaunchAuthorizedAt) != nil)
-            let prefix = launchWasAuthorized
+            let prefix = run.kind.isDestructive && launchWasAuthorized
                 ? "operation_completed_audit_failed — "
                 : "run history unusable — "
             let reason = prefix + "could not commit terminal audit evidence for run \(run.runId): \(error)"
@@ -2777,6 +2777,23 @@ public final class BackupEngine: Sendable {
 
 /// Throttled writer for `state/current-run-<setId>.json`.
 ///
+/// In-memory evidence that the pre-spawn audit commit succeeded. Canonical
+/// metadata remains authoritative after the process exits; this state exists
+/// only so losing that metadata during terminal commit cannot make the same
+/// invocation forget that repository mutation may already have occurred.
+private final class DestructiveLaunchState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var authorized = false
+
+    var wasAuthorized: Bool {
+        lock.withLock { authorized }
+    }
+
+    func markAuthorized() {
+        lock.withLock { authorized = true }
+    }
+}
+
 /// One instance per child run: the throttle window is per phase, so the
 /// first `status` line of every phase lands immediately and the UI never
 /// waits for progress to appear. An independent timer refreshes only the

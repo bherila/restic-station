@@ -84,6 +84,12 @@ public enum RunStoreError: Error, Equatable, Sendable, CustomStringConvertible {
     /// The `index.jsonl` companion lock could not be acquired within the
     /// bounded retry window — see `RunStore.indexLockTimeout`.
     case indexLockTimeout(path: String)
+    /// A run publisher or audit verifier could not enter their short shared
+    /// critical section within the bounded retry window.
+    case publicationLockTimeout(path: String)
+    /// The independently encoded kind in a current-format run directory name
+    /// disagrees with metadata.
+    case runDirectoryKindMismatch(path: String, encodedKind: RunKind)
     /// The `index.jsonl` companion lock could not be used at all — wrong
     /// owner, unopenable, or an uncreatable `runs/` (#110).
     case lockUnusable(LockFailure)
@@ -98,8 +104,12 @@ public enum RunStoreError: Error, Equatable, Sendable, CustomStringConvertible {
             return "refusing to discard non-fresh run metadata at \(path)"
         case .indexLockTimeout(let path):
             return "timed out waiting for index lock \(path)"
+        case .publicationLockTimeout(let path):
+            return "timed out waiting for run-publication lock \(path)"
+        case .runDirectoryKindMismatch(let path, let encodedKind):
+            return "run directory kind does not match metadata kind \(encodedKind.rawValue): \(path)"
         case .lockUnusable(let failure):
-            return "run-index lock unusable: \(failure)"
+            return "run-store lock unusable: \(failure)"
         }
     }
 }
@@ -129,6 +139,7 @@ public struct RunStore: Sendable {
     /// should never last anywhere near this long in practice.
     private static let indexLockTimeout: TimeInterval = 5
     private static let indexLockPollInterval: UInt32 = 5_000 // microseconds
+    private static let publicationLockMaxAttempts = 1_000
 
     public init(paths: AppPaths) {
         self.init(
@@ -169,6 +180,13 @@ public struct RunStore: Sendable {
         groupId: String? = nil
     ) throws -> ActiveRun {
         try paths.ensureDirectories()
+
+        // A verifier must never observe the directory between mkdir and its
+        // first metadata commit. The separate publication lock also lets two
+        // read-only verifiers serialize without pretending one is a running
+        // destructive helper.
+        let publicationLock = try acquireRunPublicationLock()
+        defer { publicationLock.release() }
 
         let start = now()
         let runId = try allocateRunId(kind: kind, setId: setId, start: start)
@@ -283,6 +301,9 @@ public struct RunStore: Sendable {
     /// presenting such contention as a failed maintenance run would replace
     /// the last real cleanup despite modifying no repository data.
     public func discardUnstarted(_ run: ActiveRun) throws {
+        let publicationLock = try acquireRunPublicationLock()
+        defer { publicationLock.release() }
+
         let directory = paths.runDir(runId: run.runId)
         let metadataURL = directory.appendingPathComponent("metadata.json", isDirectory: false)
         let data = try Data(contentsOf: metadataURL)
@@ -461,6 +482,9 @@ public struct RunStore: Sendable {
         let fileManager = FileManager.default
         guard fileManager.fileExists(atPath: paths.runsDir.path) else { return [] }
 
+        let publicationLock = try acquireRunPublicationLock()
+        defer { publicationLock.release() }
+
         let gateProbe: FileLock?
         let destructiveOperationIsActive: Bool
         if callerHoldsDestructiveAuditGate {
@@ -512,6 +536,13 @@ public struct RunStore: Sendable {
             // this scan exists to enforce.
             let data = try Data(contentsOf: metadataURL)
             let discriminator = try decoder.decode(RunAuditDiscriminator.self, from: data)
+            if let directoryKind = Self.runKind(fromRunDirectoryName: directory.lastPathComponent),
+               directoryKind != discriminator.kind {
+                throw RunStoreError.runDirectoryKindMismatch(
+                    path: metadataURL.path,
+                    encodedKind: discriminator.kind
+                )
+            }
             guard discriminator.kind.isDestructive else { continue }
             let metadata = try decoder.decode(RunMetadata.self, from: data)
             guard metadata.destructiveLaunchAuthorizedAt != nil else {
@@ -581,6 +612,38 @@ public struct RunStore: Sendable {
             }
         }
         return results
+    }
+
+    /// The kind is a structural part of every run directory name:
+    /// `<timestamp>-<kind>-<set-prefix>[-collision]`. Audit verification
+    /// cross-checks this independent copy before allowing a valid but
+    /// corrupted metadata discriminator to skip the destructive contract.
+    private static func runKind(fromRunDirectoryName name: String) -> RunKind? {
+        let fields = name.split(separator: "-", omittingEmptySubsequences: false)
+        guard fields.count >= 3 else { return nil }
+        return RunKind(rawValue: String(fields[1]))
+    }
+
+    /// Coordinates the mkdir + initial metadata publication with audit
+    /// scans. The lock is deliberately separate from the destructive gate:
+    /// contention here can only mean another publisher/verifier, never proof
+    /// that a recorded destructive PID owns the operation gate.
+    private func acquireRunPublicationLock() throws -> FileLock {
+        let lock = FileLock(path: paths.runPublicationLockFile, trustedRoot: paths.root)
+        for attempt in 0..<Self.publicationLockMaxAttempts {
+            switch lock.acquire() {
+            case .acquired:
+                return lock
+            case .busy:
+                if attempt + 1 == Self.publicationLockMaxAttempts {
+                    throw RunStoreError.publicationLockTimeout(path: paths.runPublicationLockFile.path)
+                }
+                usleep(Self.indexLockPollInterval)
+            case .failed(let failure):
+                throw RunStoreError.lockUnusable(failure)
+            }
+        }
+        preconditionFailure("publication lock retry loop must return or throw")
     }
 
     // MARK: - runId allocation

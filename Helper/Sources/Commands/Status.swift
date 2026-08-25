@@ -88,8 +88,17 @@ struct Status: AsyncParsableCommand, JSONRenderable {
             )
         }
         let auditFailures: [RunAuditFailure]
+        let auditGateFailure: LockFailure?
         do {
             auditFailures = try runStore.unresolvedAuditFailures()
+            auditGateFailure = nil
+        } catch RunStoreError.lockUnusable(let failure) {
+            // Keep the documented StatusReport shape for a broken audit or
+            // publication lock. The live lock-health result below owns this
+            // diagnosis; a generic CLI error would hide locking.usable,
+            // scope, and the offending path from monitoring.
+            auditFailures = []
+            auditGateFailure = failure
         } catch {
             throw CLIFailure.stateUnreadable(
                 "could not verify destructive run audit evidence (\(paths.runsDir.path)): \(error)"
@@ -169,7 +178,9 @@ struct Status: AsyncParsableCommand, JSONRenderable {
             paths: paths,
             configuredSetIds: Set(scheduled.config.sets.map(\.id)),
             secretBackend: secretBackend
-        )
+        ) ?? auditGateFailure.map {
+            LockingHealthFailure(scope: .machine, failure: $0)
+        }
         let health = HealthDerivation.appHealth(
             setHealths: setHealths,
             // Every current-run file, including one for a set no longer in

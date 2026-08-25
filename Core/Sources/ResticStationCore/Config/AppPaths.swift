@@ -268,6 +268,13 @@ public struct AppPaths: Equatable, Sendable {
         locksDir.appendingPathComponent("destructive-audit.lock", isDirectory: false)
     }
 
+    /// Serializes run-directory publication with destructive audit scans.
+    /// This is distinct from ``destructiveAuditLockFile`` so contention from
+    /// another read-only verifier is never mistaken for a live operation.
+    public var runPublicationLockFile: URL {
+        locksDir.appendingPathComponent("run-publication.lock", isDirectory: false)
+    }
+
     /// Dedicated stable inode used only to verify that the backing
     /// filesystem implements `flock(2)`. It never serializes production
     /// work, so a status probe cannot make a tick skip.

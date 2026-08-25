@@ -1771,6 +1771,41 @@ struct BackupEngineTests {
         #expect(env.indexEntries.isEmpty)
     }
 
+    @Test("runPrune: losing metadata after launch cannot erase known repository uncertainty")
+    func prunePostLaunchMetadataLossStaysAuditFailure() async throws {
+        let paths = Box<AppPaths?>(nil)
+        let env = Self.makeEnv(
+            script: [],
+            reachableSecondaries: [],
+            onSpawn: { argv in
+                guard argv.contains("forget"), let paths = paths.value else { return }
+                let runDirectories = try? FileManager.default.contentsOfDirectory(
+                    at: paths.runsDir,
+                    includingPropertiesForKeys: [.isDirectoryKey]
+                )
+                for directory in runDirectories ?? [] {
+                    try? FileManager.default.removeItem(
+                        at: directory.appendingPathComponent("metadata.json")
+                    )
+                }
+            }
+        )
+        paths.value = env.paths
+        defer { env.cleanUp() }
+        env.fake.script = Self.resticCall(Self.forgetArgv(env.primary.repoURL), dest: Self.primaryId)
+
+        let status = await env.engine.runPruneUnchecked(env.set)
+
+        guard case .infrastructureFailure(let reason, let operationMayHaveRun) = status else {
+            Issue.record("post-launch metadata loss must remain an audit failure: \(status)")
+            return
+        }
+        #expect(operationMayHaveRun)
+        #expect(reason.contains("operation_completed_audit_failed"))
+        #expect(env.resticArgvs.count == 1)
+        #expect(env.indexEntries.isEmpty)
+    }
+
     @Test("runPrune: an unopenable audit log refuses destructive launch")
     func pruneLogOpenFailureRefusesLaunch() async throws {
         let env = Self.makeEnv(

@@ -562,6 +562,7 @@ public final class StateWatcher: ObservableObject {
             urls += [
                 paths.tickLockFile,
                 paths.destructiveAuditLockFile,
+                paths.runPublicationLockFile,
                 paths.healthLockFile,
             ]
             if secretBackend == .file { urls.append(paths.secretsLockFile) }

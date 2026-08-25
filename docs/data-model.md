@@ -327,9 +327,19 @@ launch, and terminal audit commit across every set. The helper acquires it
 before checking for unresolved evidence and holds it until terminal metadata
 and its index projection are committed. This closes the cross-set race in
 which two helpers could both pass verification before either recorded an
-audit failure. A running launch marker is considered live only while this
-kernel-released lock is held and its helper PID exists; PID existence alone
-is never trusted because PIDs are reusable.
+audit failure. A separate `locks/run-publication.lock` serializes audit scans
+with the directory-plus-initial-metadata publication performed by every run,
+so a verifier cannot mistake the writer's own mkdir-to-metadata interval for
+corruption. It also serializes read-only verifiers; contention between two
+scans therefore cannot be mistaken for ownership of the destructive gate. A
+running launch marker is considered live only while the kernel-released
+destructive gate is held and its helper PID exists; PID existence alone is
+never trusted because PIDs are reusable. For run directories using the current
+documented runId format, the operation kind encoded in metadata must match the
+independently encoded kind in the directory name before a non-destructive
+record may be excluded from this audit scan. Older directories without an
+encoded kind remain readable; their fully decoded destructive metadata is
+still subject to the same audit rules.
 
 Repository outcome and audit outcome are independent axes:
 

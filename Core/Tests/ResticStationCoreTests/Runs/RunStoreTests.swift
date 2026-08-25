@@ -318,12 +318,33 @@ private final class TickCounter: @unchecked Sendable {
         let paths = makePaths()
         defer { cleanup(paths) }
         try paths.ensureDirectories()
-        let legacyRun = paths.runsDir.appendingPathComponent("legacy-backup", isDirectory: true)
+        let legacyRun = paths.runsDir.appendingPathComponent(
+            "20260101T000000Z-backup-deadbeef",
+            isDirectory: true
+        )
         try FileManager.default.createDirectory(at: legacyRun, withIntermediateDirectories: true)
         try Data(#"{"kind":"backup","start":"legacy-date-that-current-code-does-not-decode"}"#.utf8)
             .write(to: legacyRun.appendingPathComponent("metadata.json"))
 
         #expect(try RunStore(paths: paths).unresolvedAuditFailures().isEmpty)
+    }
+
+    @Test("metadata kind must match the kind independently encoded in its run directory")
+    func metadataKindMismatchFailsAuditVerification() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+        try paths.ensureDirectories()
+        let corruptedPrune = paths.runsDir.appendingPathComponent(
+            "20260101T000000Z-prune-deadbeef",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: corruptedPrune, withIntermediateDirectories: true)
+        try Data(#"{"kind":"backup"}"#.utf8)
+            .write(to: corruptedPrune.appendingPathComponent("metadata.json"))
+
+        #expect(throws: RunStoreError.self) {
+            try RunStore(paths: paths).unresolvedAuditFailures()
+        }
     }
 
     @Test("the global audit gate, not a reusable PID, proves a destructive run is active")
