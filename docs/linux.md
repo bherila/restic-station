@@ -21,6 +21,13 @@ Linux fixture-import scenario. Nothing below was typed by hand on a Mac and rela
 something could not be run in CI that is stated explicitly rather than shown as if observed (see
 [Scheduling](#scheduling) and [Not executed in CI](#not-executed-in-ci)).
 
+Run-history durability uses the portable POSIX boundary shared with macOS:
+complete `write(2)` loops, `fsync(2)` on metadata and index files, atomic
+descriptor-relative `renameat(2)`, and `fsync(2)` on the containing directory.
+It intentionally uses `fsync`, which is available on both platforms, rather
+than Linux-only `fdatasync` or macOS-only `F_FULLFSYNC`; the latter may offer
+different device-level guarantees but neither is a cross-platform contract.
+
 Two honest caveats about how that output is *presented*, so this claim can be taken literally:
 
 - Transcripts are lightly trimmed for readability — unrelated runner noise (e.g. `Failed to set
