@@ -1556,26 +1556,13 @@ public final class BackupEngine: Sendable {
 
         guard await secretsAvailable(for: destinations) else { throw PurgeApplyError.unavailable }
 
-        var plans: [(destination: Destination, plan: PurgePlan)] = []
-        for destination in destinations.sorted(by: { $0.id.uuidString < $1.id.uuidString }) {
-            let plan = try await currentPurgePlan(
-                set: set,
-                destination: destination,
-                patterns: preview.patterns,
-                executable: executable
-            )
-            guard let tokenDestination = preview.destinations.first(where: { $0.destinationId == destination.id }),
-                  tokenDestination.snapshotIDs.sorted() == plan.matched.map(\.id).sorted() else {
-                throw PurgeApplyError.tokenDoesNotMatchCurrentPlan
-            }
-            plans.append((destination, plan))
-        }
-
-        // Acquire the machine-wide destructive gate before spending the
-        // single-use confirmation token. Holding it across the complete
-        // multi-destination apply also prevents another destructive helper
-        // from entering between children. Contention is retryable and leaves
-        // the operator's already-reviewed token intact.
+        // Acquire the machine-wide destructive gate before the final live
+        // repository observations, not merely before spending the token.
+        // Sets may share a repository; without this boundary another helper
+        // could mutate it after validation but before this apply launches.
+        // Holding it across the complete multi-destination apply also
+        // prevents another destructive helper from entering between children.
+        // Contention is retryable and leaves the reviewed token intact.
         do {
             try paths.ensureDirectories()
         } catch {
@@ -1594,6 +1581,21 @@ public final class BackupEngine: Sendable {
             throw PurgeApplyError.lockUnusable(String(describing: failure))
         }
         defer { destructiveAuditGate.release() }
+
+        var plans: [(destination: Destination, plan: PurgePlan)] = []
+        for destination in destinations.sorted(by: { $0.id.uuidString < $1.id.uuidString }) {
+            let plan = try await currentPurgePlan(
+                set: set,
+                destination: destination,
+                patterns: preview.patterns,
+                executable: executable
+            )
+            guard let tokenDestination = preview.destinations.first(where: { $0.destinationId == destination.id }),
+                  tokenDestination.snapshotIDs.sorted() == plan.matched.map(\.id).sorted() else {
+                throw PurgeApplyError.tokenDoesNotMatchCurrentPlan
+            }
+            plans.append((destination, plan))
+        }
 
         do {
             _ = try previewTokens.consume(token)
@@ -1680,6 +1682,11 @@ public final class BackupEngine: Sendable {
                 // twice is harmless because the second exact-match attempt
                 // fails closed once `usedAt` is already nil.
                 restorePurgeToken()
+                throw PurgeApplyError.infrastructureFailure(
+                    reason: purge.preflightFailure?.message
+                        ?? "the first purge process could not be launched",
+                    operationMayHaveRun: false
+                )
             }
             children.append(purge.child)
             if let reason = purge.infrastructureFailureReason {

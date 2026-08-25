@@ -2720,11 +2720,19 @@ struct BackupEngineTests {
             ),
         ]
 
-        let result = try await env.engine.runPurge(
-            set: env.set, destinations: [env.primary], token: token.value
-        )
-
-        #expect(result.status == .failed)
+        do {
+            _ = try await env.engine.runPurge(
+                set: env.set, destinations: [env.primary], token: token.value
+            )
+            Issue.record("a pre-launch executable swap must abort the purge apply")
+        } catch let error as PurgeApplyError {
+            guard case .infrastructureFailure(_, let operationMayHaveRun) = error else {
+                Issue.record("expected infrastructure failure, got \(error)")
+                return
+            }
+            #expect(!operationMayHaveRun)
+        }
+        #expect(throws: Never.self) { _ = try env.engine.purgeTokenDestinationIDs(token.value) }
         // The decisive assertion: no rewrite argv was ever produced.
         #expect(!env.resticArgvs.contains { $0.contains("rewrite") })
     }
@@ -2908,11 +2916,19 @@ struct BackupEngineTests {
             ),
         ]
 
-        let result = try await env.engine.runPurge(
-            set: env.set, destinations: [env.primary], token: token.value
-        )
-
-        #expect(result.status == .failed)
+        do {
+            _ = try await env.engine.runPurge(
+                set: env.set, destinations: [env.primary], token: token.value
+            )
+            Issue.record("a cache-defeating executable swap must abort the purge apply")
+        } catch let error as PurgeApplyError {
+            guard case .infrastructureFailure(_, let operationMayHaveRun) = error else {
+                Issue.record("expected infrastructure failure, got \(error)")
+                return
+            }
+            #expect(!operationMayHaveRun)
+        }
+        #expect(throws: Never.self) { _ = try env.engine.purgeTokenDestinationIDs(token.value) }
         #expect(
             !env.resticArgvs.contains { $0.contains("rewrite") },
             "a cache-defeating in-place swap must not reach the destructive command"
@@ -3335,10 +3351,20 @@ struct BackupEngineTests {
     func purgeApplyUsesTokenAndRecordsMapping() async throws {
         let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]
         let hostnames = [Self.setId: Set(["example-mac.local"])]
+        let paths = Box<AppPaths?>(nil)
+        let gateWasHeldDuringRevalidation = Box(false)
         let env = Self.makeEnv(
             script: [], retention: nil, purgeExcludes: ["build/**"], reachableSecondaries: [],
+            onSpawn: { argv in
+                guard argv.contains("snapshots"), let paths = paths.value else { return }
+                let probe = FileLock(path: paths.destructiveAuditLockFile, trustedRoot: paths.root)
+                let result = probe.acquire()
+                gateWasHeldDuringRevalidation.value = result == .busy
+                if result == .acquired { probe.release() }
+            },
             purgeSourcePaths: sourcePaths, purgeHostnames: hostnames
         )
+        paths.value = env.paths
         defer { env.cleanUp() }
 
         let snapshotsJSON = try FixtureLoader.string("snapshots.json")
@@ -3370,6 +3396,7 @@ struct BackupEngineTests {
         let result = try await env.engine.runPurge(set: env.set, destinations: [env.primary], token: token.value)
 
         #expect(result.status == .success)
+        #expect(gateWasHeldDuringRevalidation.value)
         #expect(env.resticArgvs == [
             [Self.resticPath, "-r", env.primary.repoURL, "snapshots", "--json"],
             [Self.resticPath] + Self.rewriteArgv(
@@ -3449,37 +3476,43 @@ struct BackupEngineTests {
         }
     }
 
-    @Test("runPurge: a first-child process launch failure restores the purge token")
-    func purgeLaunchFailureRestoresItsPreviewToken() async throws {
+    @Test("runPurge: a first-child launch failure restores the token and aborts later destinations")
+    func purgeLaunchFailureRestoresTokenAndAbortsLaterDestinations() async throws {
         let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]
         let hostnames = [Self.setId: Set(["example-mac.local"])]
         let env = Self.makeEnv(
-            script: [], retention: nil, purgeExcludes: ["build/**"], reachableSecondaries: [],
+            script: [], retention: nil, purgeExcludes: ["build/**"], reachableSecondaries: [true],
             purgeSourcePaths: sourcePaths, purgeHostnames: hostnames
         )
         defer { env.cleanUp() }
 
         let snapshotsJSON = try FixtureLoader.string("snapshots.json")
         let snapshots = try parseSnapshots(Data(snapshotsJSON.utf8))
-        let plan = PurgePlan(
-            destinationId: env.primary.id,
-            snapshots: snapshots,
-            sourcePaths: sourcePaths[Self.setId]!,
-            hostnames: hostnames[Self.setId]!,
-            patterns: env.set.purgeExcludes
-        )
+        let secondary = try #require(env.secondaries.first)
+        let orderedDestinations = [env.primary, secondary].sorted { $0.id.uuidString < $1.id.uuidString }
+        let plans = orderedDestinations.map { destination in
+            PurgePlan(
+                destinationId: destination.id,
+                snapshots: snapshots,
+                sourcePaths: sourcePaths[Self.setId]!,
+                hostnames: hostnames[Self.setId]!,
+                patterns: env.set.purgeExcludes
+            )
+        }
         let token = try #require(try env.engine.issuePurgeToken(
-            set: env.set, destinations: [env.primary], plans: [plan],
+            set: env.set, destinations: orderedDestinations, plans: plans,
             executable: try env.requireResticExecutable()
         ))
-        env.fake.script = Self.resticCall(
-            ["-r", env.primary.repoURL, "snapshots", "--json"],
-            dest: Self.primaryId,
-            stdoutLines: [snapshotsJSON]
-        ) + [
+        env.fake.script = orderedDestinations.flatMap { destination in
+            Self.resticCall(
+                ["-r", destination.repoURL, "snapshots", "--json"],
+                dest: destination.id,
+                stdoutLines: [snapshotsJSON]
+            )
+        } + [
             .init(
                 argvPrefix: [Self.resticPath] + Self.rewriteArgv(
-                    env.primary.repoURL,
+                    orderedDestinations[0].repoURL,
                     snapshotIDs: snapshots.map(\.id),
                     patterns: env.set.purgeExcludes
                 ),
@@ -3487,13 +3520,22 @@ struct BackupEngineTests {
             ),
         ]
 
-        let result = try await env.engine.runPurge(
-            set: env.set, destinations: [env.primary], token: token.value
-        )
+        do {
+            _ = try await env.engine.runPurge(
+                set: env.set, destinations: orderedDestinations, token: token.value
+            )
+            Issue.record("a failed first launch must abort the complete purge apply")
+        } catch let error as PurgeApplyError {
+            guard case .infrastructureFailure(_, let operationMayHaveRun) = error else {
+                Issue.record("expected infrastructure failure, got \(error)")
+                return
+            }
+            #expect(!operationMayHaveRun)
+        }
 
-        #expect(result.status == .failed)
         #expect(throws: Never.self) { _ = try env.engine.purgeTokenDestinationIDs(token.value) }
-        #expect(env.resticArgvs.last?.contains("rewrite") == true)
+        #expect(env.resticArgvs.filter { $0.contains("rewrite") }.count == 1)
+        #expect(env.resticArgvs.last?.contains(orderedDestinations[0].repoURL) == true)
     }
 
     @Test("runPurge: terminal run-history failure reports that destructive work may have run")
