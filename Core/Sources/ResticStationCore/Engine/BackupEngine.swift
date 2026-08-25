@@ -1603,8 +1603,16 @@ public final class BackupEngine: Sendable {
             throw PurgeApplyError.unavailable
         }
 
+        let restorePurgeToken: @Sendable () -> Void = { [previewTokens, preview] in
+            // A failed restore intentionally leaves the token consumed. A
+            // destructive retry is safe only when the store can prove it
+            // restored this exact capability.
+            try? previewTokens.restore(token, matching: preview)
+        }
+
         var children: [SetRunChild] = []
         var resolvedGroupId = groupId
+        var isFirstPurgeChild = true
         for (destination, plan) in plans {
             guard !plan.matched.isEmpty else {
                 // Nothing to rewrite. Advancing the watermark is only correct
@@ -1629,6 +1637,7 @@ public final class BackupEngine: Sendable {
                 }
                 continue
             }
+            let restoreAfterLaunchFailure = isFirstPurgeChild ? restorePurgeToken : nil
             let purgeResult = await purgeChild(
                 destination: destination,
                 snapshotIDs: plan.matched.map(\.id),
@@ -1637,14 +1646,18 @@ public final class BackupEngine: Sendable {
                 trigger: trigger,
                 groupId: resolvedGroupId,
                 executable: executable,
-                callerHoldsDestructiveAuditGate: true
+                callerHoldsDestructiveAuditGate: true,
+                afterLaunchFailure: restoreAfterLaunchFailure
             )
+            let wasFirstPurgeChild = isFirstPurgeChild
+            isFirstPurgeChild = false
             let purge: ChildRun
             switch purgeResult {
             case .completed(let child):
                 purge = child
             case .deferred(let reason):
                 if children.isEmpty {
+                    restorePurgeToken()
                     throw PurgeApplyError.busy
                 }
                 throw PurgeApplyError.infrastructureFailure(
@@ -1652,10 +1665,21 @@ public final class BackupEngine: Sendable {
                     operationMayHaveRun: true
                 )
             case .infrastructureFailure(let reason):
+                if wasFirstPurgeChild { restorePurgeToken() }
                 throw PurgeApplyError.infrastructureFailure(
                     reason: reason,
                     operationMayHaveRun: !children.isEmpty
                 )
+            }
+            if wasFirstPurgeChild,
+               purge.outcome == nil,
+               purge.infrastructureFailureReason == nil {
+                // Secret/executable preflight and Process.run launch
+                // failures are all before a child can mutate the repository.
+                // The latter also invokes `afterLaunchFailure`; restoring
+                // twice is harmless because the second exact-match attempt
+                // fails closed once `usedAt` is already nil.
+                restorePurgeToken()
             }
             children.append(purge.child)
             if let reason = purge.infrastructureFailureReason {
@@ -1738,7 +1762,8 @@ public final class BackupEngine: Sendable {
         trigger: RunTrigger,
         groupId: String?,
         executable: ResticRunner.MaintenanceExecutable,
-        callerHoldsDestructiveAuditGate: Bool = false
+        callerHoldsDestructiveAuditGate: Bool = false,
+        afterLaunchFailure: (@Sendable () -> Void)? = nil
     ) async -> RecordedChildResult {
         let fullIDByShortID = Dictionary(
             snapshotIDs.map { (String($0.prefix(8)), $0) },
@@ -1774,6 +1799,7 @@ public final class BackupEngine: Sendable {
                 expectedExecutableIdentity: executable.identity
             ),
             streamProgress: false,
+            afterLaunchFailure: afterLaunchFailure,
             callerHoldsDestructiveAuditGate: callerHoldsDestructiveAuditGate,
             purgeSnapshotRewrites: { outcome in
                 Dictionary(uniqueKeysWithValues: parseRewrite(outcome.rawOutput).snapshots.compactMap { rewrite in

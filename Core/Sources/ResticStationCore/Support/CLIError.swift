@@ -468,18 +468,21 @@ extension CLIFailure {
         case .infrastructureFailure(let reason, let operationMayHaveRun):
             let unresolvedAuditFailure = reason.hasPrefix(CLIErrorCode.operationCompletedAuditFailed.rawValue)
             let message: String
-            if operationMayHaveRun {
+            if unresolvedAuditFailure, operationMayHaveRun {
                 message = "The purge may have changed repository data, but its result could not be recorded or trusted: "
                     + "\(reason). Inspect the repositories before retrying."
             } else if unresolvedAuditFailure {
                 message = "The purge was blocked by an earlier destructive operation whose audit evidence is incomplete: "
                     + "\(reason). Inspect the repositories and reconcile run history before retrying."
+            } else if operationMayHaveRun {
+                message = "The purge changed repository data and its run audit is complete, but local state could not be updated: "
+                    + "\(reason). Repair the local state before retrying."
             } else {
                 message = "The purge did not run destructive work because its local state could not be recorded: \(reason). "
                     + "Check the permissions on the Restic Station data directory."
             }
             return CLIFailure(
-                code: operationMayHaveRun || unresolvedAuditFailure
+                code: unresolvedAuditFailure
                     ? .operationCompletedAuditFailed
                     : .internalError,
                 message: CLIFailure.bounded(message),

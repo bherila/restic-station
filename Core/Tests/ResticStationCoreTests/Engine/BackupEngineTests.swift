@@ -3441,6 +3441,59 @@ struct BackupEngineTests {
             #expect(!operationMayHaveRun)
         }
         #expect(!env.resticArgvs.contains { $0.contains("rewrite") })
+        #expect(
+            throws: Never.self,
+            "a first-child pre-launch failure must leave the reviewed token retryable"
+        ) {
+            _ = try env.engine.purgeTokenDestinationIDs(token.value)
+        }
+    }
+
+    @Test("runPurge: a first-child process launch failure restores the purge token")
+    func purgeLaunchFailureRestoresItsPreviewToken() async throws {
+        let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]
+        let hostnames = [Self.setId: Set(["example-mac.local"])]
+        let env = Self.makeEnv(
+            script: [], retention: nil, purgeExcludes: ["build/**"], reachableSecondaries: [],
+            purgeSourcePaths: sourcePaths, purgeHostnames: hostnames
+        )
+        defer { env.cleanUp() }
+
+        let snapshotsJSON = try FixtureLoader.string("snapshots.json")
+        let snapshots = try parseSnapshots(Data(snapshotsJSON.utf8))
+        let plan = PurgePlan(
+            destinationId: env.primary.id,
+            snapshots: snapshots,
+            sourcePaths: sourcePaths[Self.setId]!,
+            hostnames: hostnames[Self.setId]!,
+            patterns: env.set.purgeExcludes
+        )
+        let token = try #require(try env.engine.issuePurgeToken(
+            set: env.set, destinations: [env.primary], plans: [plan],
+            executable: try env.requireResticExecutable()
+        ))
+        env.fake.script = Self.resticCall(
+            ["-r", env.primary.repoURL, "snapshots", "--json"],
+            dest: Self.primaryId,
+            stdoutLines: [snapshotsJSON]
+        ) + [
+            .init(
+                argvPrefix: [Self.resticPath] + Self.rewriteArgv(
+                    env.primary.repoURL,
+                    snapshotIDs: snapshots.map(\.id),
+                    patterns: env.set.purgeExcludes
+                ),
+                failure: .launchFailed("restic disappeared")
+            ),
+        ]
+
+        let result = try await env.engine.runPurge(
+            set: env.set, destinations: [env.primary], token: token.value
+        )
+
+        #expect(result.status == .failed)
+        #expect(throws: Never.self) { _ = try env.engine.purgeTokenDestinationIDs(token.value) }
+        #expect(env.resticArgvs.last?.contains("rewrite") == true)
     }
 
     @Test("runPurge: terminal run-history failure reports that destructive work may have run")

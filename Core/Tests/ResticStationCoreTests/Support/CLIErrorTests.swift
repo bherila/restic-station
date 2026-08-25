@@ -52,7 +52,10 @@ private let representative: [CLIErrorCode: CLIFailure] = [
     .operationTimedOut: .classify(ResticRunnerError.timedOut),
     .previewExpired: .classifyPurgeOperation(PurgeApplyError.token(.expired), setId: setId),
     .operationCompletedAuditFailed: .classifyPurgeOperation(
-        PurgeApplyError.infrastructureFailure(reason: "terminal audit persistence failed", operationMayHaveRun: true),
+        PurgeApplyError.infrastructureFailure(
+            reason: "operation_completed_audit_failed — terminal audit persistence failed",
+            operationMayHaveRun: true
+        ),
         setId: setId
     ),
     .internalError: .classify(ConfigStoreError.renameFailed(errno: 13, from: "a", to: "b")),
@@ -176,18 +179,29 @@ struct CLIErrorContractTests {
         #expect(didNotRun.message.contains("did not run destructive work"))
         #expect(!didNotRun.message.contains("backup-set lock"))
 
-        let mayHaveRun = CLIFailure.classifyPurgeApply(
+        let auditedButLocalStateFailed = CLIFailure.classifyPurgeApply(
             PurgeApplyError.infrastructureFailure(
-                reason: "run history unusable",
+                reason: "could not persist the purge watermark",
                 operationMayHaveRun: true
             ),
             setId: setId
         )
-        #expect(mayHaveRun.code == .operationCompletedAuditFailed)
-        #expect(!mayHaveRun.retryable)
-        #expect(mayHaveRun.message.contains("may have changed repository data"))
-        #expect(mayHaveRun.message.contains("Inspect the repositories before retrying"))
-        #expect(!mayHaveRun.message.contains("backup-set lock"))
+        #expect(auditedButLocalStateFailed.code == .internalError)
+        #expect(!auditedButLocalStateFailed.retryable)
+        #expect(auditedButLocalStateFailed.message.contains("run audit is complete"))
+        #expect(auditedButLocalStateFailed.message.contains("Repair the local state before retrying"))
+        #expect(!auditedButLocalStateFailed.message.contains("backup-set lock"))
+
+        let auditCommitFailed = CLIFailure.classifyPurgeApply(
+            PurgeApplyError.infrastructureFailure(
+                reason: "operation_completed_audit_failed — terminal audit persistence failed",
+                operationMayHaveRun: true
+            ),
+            setId: setId
+        )
+        #expect(auditCommitFailed.code == .operationCompletedAuditFailed)
+        #expect(auditCommitFailed.message.contains("may have changed repository data"))
+        #expect(auditCommitFailed.message.contains("Inspect the repositories before retrying"))
 
         let blockedByPriorAuditFailure = CLIFailure.classifyPurgeApply(
             PurgeApplyError.infrastructureFailure(
