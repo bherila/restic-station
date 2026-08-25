@@ -61,6 +61,44 @@ private final class AuditLoaderThreadRecorder: @unchecked Sendable {
     }
 }
 
+private final class ReplacementAuditLoader: @unchecked Sendable {
+    private let lock = NSLock()
+    private var callCount = 0
+    private let secondStarted = DispatchSemaphore(value: 0)
+    private let releaseSecond = DispatchSemaphore(value: 0)
+    private let thirdStarted = DispatchSemaphore(value: 0)
+    private let releaseThird = DispatchSemaphore(value: 0)
+    private let currentResult: AuditHealthRefreshResult
+
+    init(currentResult: AuditHealthRefreshResult) {
+        self.currentResult = currentResult
+    }
+
+    func load() -> AuditHealthRefreshResult {
+        lock.lock()
+        callCount += 1
+        let call = callCount
+        lock.unlock()
+        switch call {
+        case 1:
+            return currentResult
+        case 2:
+            secondStarted.signal()
+            releaseSecond.wait()
+            return .success([])
+        default:
+            thirdStarted.signal()
+            releaseThird.wait()
+            return currentResult
+        }
+    }
+
+    func waitUntilSecondStarted() { secondStarted.wait() }
+    func finishSecond() { releaseSecond.signal() }
+    func waitUntilThirdStarted() { thirdStarted.wait() }
+    func finishThird() { releaseThird.signal() }
+}
+
 @Suite("StateWatcher lock health", .serialized)
 @MainActor
 struct StateWatcherTests {
@@ -470,6 +508,44 @@ struct StateWatcherTests {
         await staleRefresh.value
         #expect(watcher.auditFailures == [failure])
         #expect(!watcher.auditVerificationFailed)
+    }
+
+    @Test("replacing an explicit audit scan invalidates it before the replacement starts")
+    func explicitAuditReplacementInvalidatesSynchronously() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-audit-replacement-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = AppPaths(root: root)
+        let failure = RunAuditFailure(
+            runId: "current-audit-failure",
+            kind: .purge,
+            setId: UUID(),
+            destId: UUID(),
+            start: Date(),
+            reason: .launchedWithoutTerminalMetadata
+        )
+        let loader = ReplacementAuditLoader(currentResult: .success([failure]))
+        let watcher = StateWatcher(
+            paths: paths,
+            runStore: RunStore(paths: paths),
+            stateStore: StateStore(paths: paths),
+            auditHealthLoader: { loader.load() }
+        )
+
+        await watcher.refreshAuditHealthOffMain()
+        #expect(watcher.auditFailures == [failure])
+
+        watcher.reloadNow()
+        await Task.detached { loader.waitUntilSecondStarted() }.value
+        watcher.reloadNow()
+        loader.finishSecond()
+        await Task.detached { loader.waitUntilThirdStarted() }.value
+
+        // The replacement is deliberately still blocked. The canceled scan
+        // has finished, but it must already be unable to publish its stale
+        // healthy result.
+        #expect(watcher.auditFailures == [failure])
+        loader.finishThird()
     }
 
     @Test("explicit reload audit scans never run on the main thread")

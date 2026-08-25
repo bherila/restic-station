@@ -315,6 +315,13 @@ public final class StateWatcher: ObservableObject {
     public func refreshAuditHealthOffMain() async {
         auditRefreshGeneration &+= 1
         let generation = auditRefreshGeneration
+        await refreshAuditHealthOffMain(generation: generation)
+    }
+
+    /// Runs a scan for a generation already reserved synchronously by its
+    /// caller. In particular, an explicit reload must invalidate the task it
+    /// replaces before the replacement Task gets a chance to execute.
+    private func refreshAuditHealthOffMain(generation: UInt64) async {
         let loader = auditHealthLoader
         let result = await Task.detached(priority: .utility) {
             loader()
@@ -334,9 +341,11 @@ public final class StateWatcher: ObservableObject {
 
     private func scheduleExplicitAuditRefresh() {
         explicitAuditRefreshTask?.cancel()
+        auditRefreshGeneration &+= 1
+        let generation = auditRefreshGeneration
         explicitAuditRefreshTask = Task { @MainActor [weak self] in
             guard let self, !Task.isCancelled else { return }
-            await self.refreshAuditHealthOffMain()
+            await self.refreshAuditHealthOffMain(generation: generation)
         }
     }
 
