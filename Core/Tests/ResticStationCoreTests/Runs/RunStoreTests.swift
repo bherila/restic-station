@@ -261,8 +261,10 @@ private final class TickCounter: @unchecked Sendable {
         let paths = makePaths()
         defer { cleanup(paths) }
         let store = RunStore(paths: paths, now: { Date() })
-        let run = try store.begin(kind: .prune, setId: UUID(), destId: UUID(), trigger: .manual)
+        var run = try store.begin(kind: .prune, setId: UUID(), destId: UUID(), trigger: .manual)
+        run.argvRedacted = ["/usr/bin/restic", "forget", "--keep-last", "3"]
         try store.markDestructiveLaunchAuthorized(run)
+        #expect(try store.metadata(runId: run.runId).argvRedacted == run.argvRedacted)
 
         try FileManager.default.createDirectory(
             at: paths.runsIndexLockFile,
@@ -276,6 +278,70 @@ private final class TickCounter: @unchecked Sendable {
         #expect(failure.runId == run.runId)
         #expect(failure.reason == .terminalMetadataMissingIndex)
         #expect(try store.metadata(runId: run.runId).status == .success)
+    }
+
+    @Test("a duplicate or divergent index projection remains an audit failure")
+    func terminalDestructiveMetadataRequiresExactlyOneMatchingIndex() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+        let store = RunStore(paths: paths, now: { Date() })
+        let run = try store.begin(kind: .prune, setId: UUID(), destId: UUID(), trigger: .manual)
+        try store.markDestructiveLaunchAuthorized(run)
+        try store.finish(run, status: .success, resticExitCode: 0)
+        let line = try Data(contentsOf: paths.runsIndexFile)
+        let handle = try FileHandle(forWritingTo: paths.runsIndexFile)
+        defer { try? handle.close() }
+        try handle.seekToEnd()
+        try handle.write(contentsOf: line)
+
+        let failure = try #require(store.unresolvedAuditFailures().first)
+        #expect(failure.runId == run.runId)
+        #expect(failure.reason == .terminalMetadataIndexMismatch)
+    }
+
+    @Test("unreadable canonical run metadata makes audit verification fail closed")
+    func unreadableCanonicalMetadataFailsAuditVerification() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+        try paths.ensureDirectories()
+        let corruptRun = paths.runsDir.appendingPathComponent("corrupt-run", isDirectory: true)
+        try FileManager.default.createDirectory(at: corruptRun, withIntermediateDirectories: true)
+        try Data("{not-json".utf8).write(to: corruptRun.appendingPathComponent("metadata.json"))
+
+        #expect(throws: (any Error).self) {
+            try RunStore(paths: paths).unresolvedAuditFailures()
+        }
+    }
+
+    @Test("malformed fields in a known non-destructive run do not block destructive audit verification")
+    func malformedNonDestructiveMetadataIsOutsideAuditContract() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+        try paths.ensureDirectories()
+        let legacyRun = paths.runsDir.appendingPathComponent("legacy-backup", isDirectory: true)
+        try FileManager.default.createDirectory(at: legacyRun, withIntermediateDirectories: true)
+        try Data(#"{"kind":"backup","start":"legacy-date-that-current-code-does-not-decode"}"#.utf8)
+            .write(to: legacyRun.appendingPathComponent("metadata.json"))
+
+        #expect(try RunStore(paths: paths).unresolvedAuditFailures().isEmpty)
+    }
+
+    @Test("the global audit gate, not a reusable PID, proves a destructive run is active")
+    func destructiveGateDistinguishesActiveRunFromRecycledPID() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+        let store = RunStore(paths: paths, now: { Date() })
+        let run = try store.begin(kind: .prune, setId: UUID(), destId: UUID(), trigger: .manual)
+        try store.markDestructiveLaunchAuthorized(run)
+
+        let gate = FileLock(path: paths.destructiveAuditLockFile, trustedRoot: paths.root)
+        #expect(gate.acquire() == .acquired)
+        #expect(try store.unresolvedAuditFailures().isEmpty)
+        gate.release()
+
+        let failure = try #require(store.unresolvedAuditFailures().first)
+        #expect(failure.runId == run.runId)
+        #expect(failure.reason == .launchedWithoutTerminalMetadata)
     }
 
     @Test("recovery preserves an unknown destructive repository outcome as critical")

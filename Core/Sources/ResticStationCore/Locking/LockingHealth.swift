@@ -70,10 +70,12 @@ public enum LockingHealth {
                 )
             )
         }
-        if let failure = FileLock(
-            path: paths.tickLockFile, trustedRoot: paths.root
-        ).probe(createIfMissing: false) {
-            return machine(failure)
+        for sharedLock in [paths.tickLockFile, paths.destructiveAuditLockFile] {
+            if let failure = FileLock(
+                path: sharedLock, trustedRoot: paths.root
+            ).probe(createIfMissing: false) {
+                return machine(failure)
+            }
         }
         // These directories may be distinct mounts. On each one, exercise
         // the persistent flock inode, effective access, and a fresh inode

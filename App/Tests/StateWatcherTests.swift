@@ -350,4 +350,34 @@ struct StateWatcherTests {
 
         #expect(changes == 0)
     }
+
+    @Test("the liveness refresh notices a destructive helper dying without a file event")
+    func auditRefreshNoticesReleasedDestructiveGate() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-audit-refresh-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = AppPaths(root: root)
+        let runStore = RunStore(paths: paths)
+        let run = try runStore.begin(kind: .prune, setId: UUID(), destId: UUID(), trigger: .manual)
+        try runStore.markDestructiveLaunchAuthorized(run)
+        let gate = FileLock(path: paths.destructiveAuditLockFile, trustedRoot: paths.root)
+        #expect(gate.acquire() == .acquired)
+
+        let watcher = StateWatcher(
+            paths: paths,
+            runStore: runStore,
+            stateStore: StateStore(paths: paths)
+        )
+        watcher.reloadNow()
+        #expect(watcher.auditFailures.isEmpty)
+        #expect(!watcher.auditVerificationFailed)
+
+        // flock release has no vnode write for DispatchSource to observe.
+        gate.release()
+        watcher.refreshAuditHealth()
+
+        #expect(watcher.auditFailures.first?.runId == run.runId)
+        #expect(watcher.auditFailures.first?.reason == .launchedWithoutTerminalMetadata)
+        #expect(!watcher.auditVerificationFailed)
+    }
 }

@@ -36,6 +36,12 @@ public enum RunAuditFailureReason: String, Codable, Equatable, Sendable {
     /// Terminal metadata is canonical and present, but its derived index
     /// projection is absent.
     case terminalMetadataMissingIndex = "terminal_metadata_missing_index"
+    /// The index contains one or more projections for the run, but not
+    /// exactly one byte-semantic projection of the canonical metadata.
+    case terminalMetadataIndexMismatch = "terminal_metadata_index_mismatch"
+    /// The process crossed the launch boundary but returned no trustworthy
+    /// repository outcome (for example cancellation or timeout).
+    case repositoryOutcomeUnknown = "repository_outcome_unknown"
 }
 
 /// An unresolved destructive-operation audit failure. This is deliberately

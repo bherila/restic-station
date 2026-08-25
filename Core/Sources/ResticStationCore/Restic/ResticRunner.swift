@@ -217,7 +217,9 @@ public final class ResticRunner: Sendable {
                 // received argv yet. Restore it on this pre-spawn audit
                 // failure just as on Process.run() launch failure.
                 afterLaunchFailure?()
-                throw error
+                throw ResticRunnerError.launchFailed(
+                    "required destructive audit evidence could not be committed"
+                )
             }
             result = try await runner.run(command.argv, env: nil, stdin: command.password, currentDirectory: nil, onStdoutLine: { line in
                 onRawLine?(line); let message = self.decoder.decodeLine(line); collector.append(message)
@@ -401,7 +403,9 @@ public final class ResticRunner: Sendable {
             try auditBeforeLaunch?()
         } catch {
             afterLaunchFailure?()
-            throw error
+            throw ResticRunnerError.launchFailed(
+                "required destructive audit evidence could not be committed"
+            )
         }
         let argv = [resolvedExecutablePath] + cmd.argv
         let collector = MessageCollector()

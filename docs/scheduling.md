@@ -346,6 +346,7 @@ The operation-exclusion locks use `flock(2)` `LOCK_EX | LOCK_NB` on files under 
 | Lock | Held by | Purpose |
 |---|---|---|
 | `tick.lock` | the whole tick | prevent overlapping scheduled evaluations when a backup outlives StartInterval |
+| `destructive-audit.lock` | destructive audit verification through terminal commit | serialize the fail-closed audit gate across every set; kernel release distinguishes a live helper from a recycled PID |
 | `set-<setId>.lock` | any run touching that set (scheduled or manual, incl. restore & prune) | one operation per set at a time |
 | `health.lock` | a live health probe | exercise the backing filesystem's actual `flock(2)` support without contending with production work |
 | `state/health.lock`, `runs/health.lock` | a live health probe | exercise `flock(2)` on state/run filesystems when they are separate mounts |

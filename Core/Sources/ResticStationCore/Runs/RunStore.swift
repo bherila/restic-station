@@ -27,6 +27,14 @@ public struct ActiveRun: Equatable, Sendable {
     public var argvRedacted: [String]
 }
 
+/// The one field audit verification may inspect without trusting the rest of
+/// a metadata record. Historical non-destructive fixtures and records are not
+/// part of the destructive contract; once their kind is known, malformed
+/// unrelated fields must not prevent status from verifying destructive runs.
+private struct RunAuditDiscriminator: Decodable {
+    let kind: RunKind
+}
+
 /// One run `recoverInterrupted()` rewrote from `.running` to `.failed`.
 ///
 /// Carries the `setId` as well as the `runId` because the caller has a second
@@ -212,7 +220,8 @@ public struct RunStore: Sendable {
         stats: BackupSummary? = nil,
         errorSummary: String? = nil,
         resticExitCode: Int32? = nil,
-        purgeSnapshotRewrites: [String: String]? = nil
+        purgeSnapshotRewrites: [String: String]? = nil,
+        auditFailureReason: RunAuditFailureReason? = nil
     ) throws {
         // The launch marker is committed separately, immediately before
         // process creation. Preserve that canonical evidence in the terminal
@@ -245,7 +254,7 @@ public struct RunStore: Sendable {
             stats: stats,
             purgeSnapshotRewrites: purgeSnapshotRewrites,
             destructiveLaunchAuthorizedAt: destructiveLaunchAuthorizedAt,
-            auditFailureReason: nil
+            auditFailureReason: auditFailureReason
         )
         try writeMetadataAtomic(metadata)
         try appendIndexEntry(metadata.indexEntry)
@@ -265,6 +274,7 @@ public struct RunStore: Sendable {
             throw RunStoreError.discardUnsafe(path: paths.runMetadataFile(runId: run.runId).path)
         }
         existing.destructiveLaunchAuthorizedAt = now()
+        existing.argvRedacted = run.argvRedacted
         try writeMetadataAtomic(existing)
     }
 
@@ -445,10 +455,40 @@ public struct RunStore: Sendable {
     /// Reconstructs unresolved destructive audit failures from the canonical
     /// per-run metadata and the derived index. It never mutates either one;
     /// #120 owns idempotent reconciliation toward metadata.
-    public func unresolvedAuditFailures() throws -> [RunAuditFailure] {
-        let indexedRunIds = Set(try readIndexEntries().map(\.runId))
+    public func unresolvedAuditFailures(
+        callerHoldsDestructiveAuditGate: Bool = false
+    ) throws -> [RunAuditFailure] {
         let fileManager = FileManager.default
         guard fileManager.fileExists(atPath: paths.runsDir.path) else { return [] }
+
+        let gateProbe: FileLock?
+        let destructiveOperationIsActive: Bool
+        if callerHoldsDestructiveAuditGate {
+            // BackupEngine owns the gate before it scans and has not launched
+            // its new operation yet. Any older running marker is therefore
+            // unresolved, even if its PID has since been recycled.
+            gateProbe = nil
+            destructiveOperationIsActive = false
+        } else {
+            let probe = FileLock(path: paths.destructiveAuditLockFile, trustedRoot: paths.root)
+            switch probe.acquire() {
+            case .acquired:
+                // Keep the probe lock through the scan. This makes the
+                // no-active-operation observation atomic with a new helper's
+                // verify-and-launch sequence.
+                gateProbe = probe
+                destructiveOperationIsActive = false
+            case .busy:
+                gateProbe = nil
+                destructiveOperationIsActive = true
+            case .failed(let failure):
+                throw RunStoreError.lockUnusable(failure)
+            }
+        }
+        defer { gateProbe?.release() }
+
+        let indexedEntries = try readIndexEntries()
+        let indexedByRunId = Dictionary(grouping: indexedEntries, by: \.runId)
         let runDirectories = try fileManager.contentsOfDirectory(
             at: paths.runsDir,
             includingPropertiesForKeys: [.isDirectoryKey]
@@ -457,13 +497,24 @@ public struct RunStore: Sendable {
         var failures: [RunAuditFailure] = []
 
         for directory in runDirectories {
-            let values = try? directory.resourceValues(forKeys: [.isDirectoryKey])
-            guard values?.isDirectory == true else { continue }
+            let values = try directory.resourceValues(forKeys: [.isDirectoryKey])
+            guard values.isDirectory == true else { continue }
+            // These are known control paths, not run directories. If the
+            // index lock is a directory because it is damaged, lock health
+            // reports it; do not misdiagnose it as missing run metadata too.
+            if directory.lastPathComponent == paths.runsIndexLockFile.lastPathComponent
+                || directory.lastPathComponent == paths.runsHealthProbeDir.lastPathComponent {
+                continue
+            }
             let metadataURL = directory.appendingPathComponent("metadata.json", isDirectory: false)
-            guard let data = try? Data(contentsOf: metadataURL),
-                  let metadata = try? decoder.decode(RunMetadata.self, from: data),
-                  metadata.kind.isDestructive,
-                  metadata.destructiveLaunchAuthorizedAt != nil else {
+            // Canonical evidence that cannot be read must make verification
+            // fail closed. Silently skipping it could hide the very marker
+            // this scan exists to enforce.
+            let data = try Data(contentsOf: metadataURL)
+            let discriminator = try decoder.decode(RunAuditDiscriminator.self, from: data)
+            guard discriminator.kind.isDestructive else { continue }
+            let metadata = try decoder.decode(RunMetadata.self, from: data)
+            guard metadata.destructiveLaunchAuthorizedAt != nil else {
                 continue
             }
 
@@ -471,13 +522,19 @@ public struct RunStore: Sendable {
             if let recorded = metadata.auditFailureReason {
                 reason = recorded
             } else if metadata.status == .running {
-                reason = Self.isProcessAlive(pid: metadata.pid)
+                reason = destructiveOperationIsActive && Self.isProcessAlive(pid: metadata.pid)
                     ? nil
                     : .launchedWithoutTerminalMetadata
             } else {
-                reason = indexedRunIds.contains(metadata.runId)
-                    ? nil
-                    : .terminalMetadataMissingIndex
+                let projections = indexedByRunId[metadata.runId] ?? []
+                if projections.isEmpty {
+                    reason = .terminalMetadataMissingIndex
+                } else if projections.count == 1,
+                          projections[0] == metadata.indexEntry {
+                    reason = nil
+                } else {
+                    reason = .terminalMetadataIndexMismatch
+                }
             }
             if let reason {
                 failures.append(RunAuditFailure(

@@ -316,10 +316,20 @@ For `prune` (retention or standalone pack reclamation) and `purge`,
 confirmation preflights, persisted `destructiveLaunchAuthorizedAt`, and is
 about to hand the exact argv to the process runner. Before that boundary the
 run is safely unstarted. The run directory and initial metadata must exist,
-and `log.txt` must be open, before the marker may be written. Failure of any
-of those prerequisites refuses process creation. The crash-durability details
+`log.txt` must be open, and the exact redacted argv must be persisted in the
+same metadata rewrite as the marker before the marker may be written. Failure
+of any of those prerequisites refuses process creation. The crash-durability details
 that make these successful writes survive power loss are specified by #120;
 they do not weaken this ordering or the fail-closed launch rule.
+
+One machine-wide `locks/destructive-audit.lock` serializes verification,
+launch, and terminal audit commit across every set. The helper acquires it
+before checking for unresolved evidence and holds it until terminal metadata
+and its index projection are committed. This closes the cross-set race in
+which two helpers could both pass verification before either recorded an
+audit failure. A running launch marker is considered live only while this
+kernel-released lock is held and its helper PID exists; PID existence alone
+is never trusted because PIDs are reusable.
 
 Repository outcome and audit outcome are independent axes:
 
@@ -327,7 +337,7 @@ Repository outcome and audit outcome are independent axes:
 |---|---|---|
 | Not started | terminal failed/skipped evidence may be recorded; retry follows the ordinary typed error | infrastructure failure, but no destructive work may have run |
 | Known success, warning, or failure | terminal metadata plus exactly one matching index projection; normal policy applies | `operation_completed_audit_failed`; nonzero helper exit, critical health, never automatic retry |
-| Unknown after the launch boundary | terminal `auditFailureReason` preserves that uncertainty | `operation_completed_audit_failed`; nonzero helper exit, critical health, never automatic retry |
+| Unknown after the launch boundary | terminal `auditFailureReason: repository_outcome_unknown` preserves that uncertainty | `operation_completed_audit_failed`; nonzero helper exit, critical health, never automatic retry |
 
 `operationMayHaveRun == false` permits a caller to correct the stated local
 prerequisite and submit a fresh request. `operationMayHaveRun == true`
@@ -336,7 +346,9 @@ destructive retry. It must surface `operation_completed_audit_failed`, name
 the diagnostic run id when available, and require repository inspection plus
 run-history reconciliation first. A timeout or lost child after the launch
 boundary is conservative: absence of a reported outcome is not proof that no
-repository mutation occurred.
+repository mutation occurred, so terminal metadata retains
+`repository_outcome_unknown` even when that terminal record and index append
+both succeed.
 
 Reconciliation runs on helper recovery and explicit history repair. It is
 idempotent. It may append one missing index projection for terminal canonical
@@ -349,11 +361,20 @@ critical condition. Only an explicit repair after human inspection may clear
 that uncertainty. Repeated reconciliation must neither append duplicates nor
 alter an already terminal repository outcome.
 
+Verification requires every run directory's canonical `metadata.json` to be
+readable and decodable. It fails closed on missing or corrupt canonical
+evidence instead of skipping the directory. A terminal destructive record is
+complete only when the index contains exactly one projection equal to
+`metadata.indexEntry`; an absent, duplicate, or divergent projection remains
+critical until #120's reconciliation repairs it.
+
 `status --json` exposes unresolved entries in `auditFailures`, each with
 `code: "operation_completed_audit_failed"` and `retryable: false`, and reports
 global `health: "critical"`. New destructive launches are refused while any
 such entry remains unresolved; read-only inspection and non-destructive
-backups remain available.
+backups remain available. The app re-runs this liveness-sensitive audit check
+on its 30-second health cadence because process death releases a flock without
+creating a filesystem event.
 
 ## state/schedule-state.json
 

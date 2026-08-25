@@ -16,11 +16,11 @@ import Darwin
 /// filesystem events, so a dropped/coalesced notification never causes stale
 /// UI, only a slightly later (bounded by the next filesystem event) refresh.
 ///
-/// All actual reads go through `StateStore`/`RunStore`, which are tolerant
-/// of missing/partial/corrupt files by construction (state is a regenerable
-/// cache, never a source of truth the reader must trust blindly — see
-/// `docs/data-model.md` §Versioning). `StateWatcher` itself never parses
-/// file contents; it only reacts to *that something changed* and re-reads
+/// All actual reads go through `StateStore`/`RunStore`. Regenerable state
+/// caches tolerate missing/partial/corrupt files; destructive canonical run
+/// metadata deliberately fails closed because skipping it could authorize a
+/// second destructive launch. `StateWatcher` itself never parses file
+/// contents; it only reacts to *that something changed* and re-reads
 /// everything through those APIs.
 ///
 /// No polling: every refresh is triggered by a `DispatchSource` filesystem
@@ -46,6 +46,10 @@ public final class StateWatcher: ObservableObject {
     /// metadata/index pair. Reconstructed from run history on every reload;
     /// never a second persisted source of truth.
     @Published public private(set) var auditFailures: [RunAuditFailure] = []
+    /// Verification itself failed, so absence of a decoded failure is not
+    /// evidence of safety. The app treats this as critical and the helper
+    /// reports the underlying state-read error.
+    @Published public private(set) var auditVerificationFailed = false
     /// Live lock-health result, refreshed for state/run writes and every
     /// change under `locks/`. A lock failure can prevent all other writes,
     /// so the lock directory needs its own event source.
@@ -259,7 +263,21 @@ public final class StateWatcher: ObservableObject {
         repoStatuses = discovered.repoStatuses
 
         recentRuns = (try? runStore.recentRuns(limit: 200)) ?? []
-        auditFailures = (try? runStore.unresolvedAuditFailures()) ?? []
+        refreshAuditHealth()
+    }
+
+    /// Re-evaluates the liveness-sensitive destructive audit state without
+    /// reloading every cache. A helper dying releases its flock but creates
+    /// no filesystem event, so AppModel calls this from its existing
+    /// 30-second health refresh.
+    public func refreshAuditHealth() {
+        do {
+            auditFailures = try runStore.unresolvedAuditFailures()
+            auditVerificationFailed = false
+        } catch {
+            auditFailures = []
+            auditVerificationFailed = true
+        }
     }
 
     // MARK: - Debounce
@@ -543,6 +561,7 @@ public final class StateWatcher: ObservableObject {
         if locksDirSource != nil {
             urls += [
                 paths.tickLockFile,
+                paths.destructiveAuditLockFile,
                 paths.healthLockFile,
             ]
             if secretBackend == .file { urls.append(paths.secretsLockFile) }

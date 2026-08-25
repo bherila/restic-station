@@ -1796,6 +1796,62 @@ struct BackupEngineTests {
         #expect(try env.runStore.unresolvedAuditFailures().isEmpty)
     }
 
+    @Test("runPrune: a post-launch timeout preserves unknown repository outcome and blocks retry")
+    func prunePostLaunchTimeoutPreservesAuditFailure() async throws {
+        let env = Self.makeEnv(script: [], reachableSecondaries: [])
+        defer { env.cleanUp() }
+        // The repo URL is allocated inside makeEnv, so bind the expectation
+        // after construction while preserving the one scripted timeout.
+        env.fake.script = [.init(
+            argvPrefix: [Self.resticPath] + Self.forgetArgv(env.primary.repoURL),
+            failure: .timeout
+        )]
+
+        let first = await env.engine.runPruneUnchecked(env.set)
+        guard case .infrastructureFailure(let firstReason, let operationMayHaveRun) = first else {
+            Issue.record("a timed-out destructive child must be an audit failure: \(first)")
+            return
+        }
+        #expect(operationMayHaveRun)
+        #expect(firstReason.contains("operation_completed_audit_failed"))
+        #expect(env.resticArgvs.count == 1)
+
+        let run = try #require(env.entries(kind: .prune).first)
+        let metadata = try env.runStore.metadata(runId: run.runId)
+        #expect(metadata.auditFailureReason == .repositoryOutcomeUnknown)
+        #expect(metadata.argvRedacted == [Self.resticPath] + Self.forgetArgv(env.primary.repoURL))
+        #expect(try env.runStore.unresolvedAuditFailures().first?.runId == run.runId)
+
+        let second = await env.engine.runPruneUnchecked(env.set)
+        guard case .infrastructureFailure(let secondReason, let secondMayHaveRun) = second else {
+            Issue.record("the unresolved timeout must block another prune: \(second)")
+            return
+        }
+        #expect(!secondMayHaveRun)
+        #expect(secondReason.contains("operation_completed_audit_failed"))
+        #expect(env.resticArgvs.count == 1, "the second destructive argv must never launch")
+    }
+
+    @Test("runPrune: the machine-wide destructive audit gate serializes different helpers")
+    func pruneRefusesWhileDestructiveAuditGateIsHeld() async throws {
+        let env = Self.makeEnv(script: [], reachableSecondaries: [])
+        defer { env.cleanUp() }
+        try env.paths.ensureDirectories()
+        let gate = FileLock(path: env.paths.destructiveAuditLockFile, trustedRoot: env.paths.root)
+        #expect(gate.acquire() == .acquired)
+        defer { gate.release() }
+
+        let outcome = await env.engine.runPruneUnchecked(env.set)
+
+        guard case .infrastructureFailure(let reason, let operationMayHaveRun) = outcome else {
+            Issue.record("a held destructive audit gate must refuse prune: \(outcome)")
+            return
+        }
+        #expect(!operationMayHaveRun)
+        #expect(reason.contains("destructive audit gate busy"))
+        #expect(env.resticArgvs.isEmpty)
+    }
+
     @Test("runPrune: an unusable set lock is a typed infrastructure failure")
     func pruneLockUnusable() async throws {
         let env = Self.makeEnv(script: [], reachableSecondaries: [])

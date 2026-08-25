@@ -2038,9 +2038,38 @@ public final class BackupEngine: Sendable {
         downgradeSuccessToWarning: (@Sendable (ResticOutcome) -> Bool)? = nil,
         purgeSnapshotRewrites: (@Sendable (ResticOutcome) -> [String: String]?)? = nil
     ) async -> RecordedChildResult {
+        let destructiveAuditGate: FileLock?
         if kind.isDestructive {
             do {
-                if let unresolved = try runStore.unresolvedAuditFailures().first {
+                try paths.ensureDirectories()
+            } catch {
+                let reason = "run history unusable — could not prepare the destructive audit gate: \(error)"
+                logWarning("BackupEngine: \(reason)")
+                return .infrastructureFailure(reason)
+            }
+            let gate = FileLock(path: paths.destructiveAuditLockFile, trustedRoot: paths.root)
+            switch gate.acquire() {
+            case .acquired:
+                destructiveAuditGate = gate
+            case .busy:
+                let reason = "destructive audit gate busy — another destructive operation is running"
+                logWarning("BackupEngine: \(reason)")
+                return .infrastructureFailure(reason)
+            case .failed(let failure):
+                let reason = "run history unusable — destructive audit gate unusable: \(failure)"
+                logWarning("BackupEngine: \(reason)")
+                return .infrastructureFailure(reason)
+            }
+        } else {
+            destructiveAuditGate = nil
+        }
+        defer { destructiveAuditGate?.release() }
+
+        if kind.isDestructive {
+            do {
+                if let unresolved = try runStore.unresolvedAuditFailures(
+                    callerHoldsDestructiveAuditGate: true
+                ).first {
                     let reason = "operation_completed_audit_failed — destructive run "
                         + "\(unresolved.runId) has unresolved \(unresolved.reason.rawValue) audit evidence; "
                         + "inspect and reconcile run history before retrying"
@@ -2153,7 +2182,7 @@ public final class BackupEngine: Sendable {
             )
         }
 
-        if case .didNotRun(_, let launchPreflightFailure?) = result {
+        if case .didNotRun(_, let launchPreflightFailure?, _) = result {
             if case .previewUnavailable = launchPreflightFailure {
                 do {
                     try runStore.discardUnstarted(run)
@@ -2185,10 +2214,18 @@ public final class BackupEngine: Sendable {
         var stats: BackupSummary?
         var exitCode: Int32?
 
+        var auditFailureReason: RunAuditFailureReason? = nil
         switch result {
-        case .didNotRun(let reason, _):
+        case .didNotRun(let reason, _, let operationMayHaveRun):
             status = .failed
-            errorSummary = reason
+            let launchMarkerExists = kind.isDestructive
+                && ((try? runStore.metadata(runId: run.runId).destructiveLaunchAuthorizedAt) != nil)
+            if operationMayHaveRun, launchMarkerExists {
+                auditFailureReason = .repositoryOutcomeUnknown
+                errorSummary = "operation_completed_audit_failed — repository outcome unknown: \(reason)"
+            } else {
+                errorSummary = reason
+            }
         case .ranToCompletion(let outcome):
             exitCode = outcome.exitCode
             stats = Self.summary(in: outcome.messages)
@@ -2221,13 +2258,17 @@ public final class BackupEngine: Sendable {
             stats: stats,
             errorSummary: errorSummary,
             resticExitCode: exitCode,
-            purgeSnapshotRewrites: rewrites
+            purgeSnapshotRewrites: rewrites,
+            auditFailureReason: auditFailureReason
         )
+        let auditCondition = auditFailureReason.map { reason in
+            "operation_completed_audit_failed — destructive run \(run.runId) has unresolved \(reason.rawValue) audit evidence"
+        }
         return .completed(ChildRun(
             child: SetRunChild(runId: run.runId, kind: kind, destId: destination.id, status: status),
             outcome: result.outcome,
             preflightFailure: nil,
-            infrastructureFailureReason: infrastructureFailure
+            infrastructureFailureReason: infrastructureFailure ?? auditCondition
         ))
     }
 
@@ -2236,7 +2277,11 @@ public final class BackupEngine: Sendable {
         case ranToCompletion(ResticOutcome)
         /// restic produced no outcome at all (launch failure, timeout,
         /// secret read failure mid-run, cancellation).
-        case didNotRun(reason: String, preflightFailure: PreflightFailure? = nil)
+        case didNotRun(
+            reason: String,
+            preflightFailure: PreflightFailure? = nil,
+            operationMayHaveRun: Bool = false
+        )
 
         var outcome: ResticOutcome? {
             if case .ranToCompletion(let outcome) = self { return outcome }
@@ -2321,10 +2366,16 @@ public final class BackupEngine: Sendable {
             return .didNotRun(reason: failure.message, preflightFailure: failure)
         } catch let error as ResticRunnerError {
             logWriter?.appendLine("restic did not run: \(error.description)")
-            return .didNotRun(reason: error.userFacingMessage)
+            return .didNotRun(
+                reason: error.userFacingMessage,
+                operationMayHaveRun: error == .timedOut
+            )
         } catch {
             logWriter?.appendLine("restic did not run: \(error)")
-            return .didNotRun(reason: "The operation did not complete. Open the run log for details.")
+            return .didNotRun(
+                reason: "The operation did not complete. Open the run log for details.",
+                operationMayHaveRun: true
+            )
         }
     }
 
@@ -2351,10 +2402,16 @@ public final class BackupEngine: Sendable {
             return .didNotRun(reason: failure.message, preflightFailure: failure)
         } catch let error as ResticRunnerError {
             logWriter?.appendLine("remote maintenance did not run: \(error.description)")
-            return .didNotRun(reason: error.userFacingMessage)
+            return .didNotRun(
+                reason: error.userFacingMessage,
+                operationMayHaveRun: error == .timedOut
+            )
         } catch {
             logWriter?.appendLine("remote maintenance did not run")
-            return .didNotRun(reason: "Remote maintenance could not start. Check SSH and the remote restic installation.")
+            return .didNotRun(
+                reason: "Remote maintenance could not start. Check SSH and the remote restic installation.",
+                operationMayHaveRun: true
+            )
         }
     }
 
@@ -2366,7 +2423,8 @@ public final class BackupEngine: Sendable {
         stats: BackupSummary? = nil,
         errorSummary: String? = nil,
         resticExitCode: Int32? = nil,
-        purgeSnapshotRewrites: [String: String]? = nil
+        purgeSnapshotRewrites: [String: String]? = nil,
+        auditFailureReason: RunAuditFailureReason? = nil
     ) -> String? {
         do {
             try runStore.finish(
@@ -2375,7 +2433,8 @@ public final class BackupEngine: Sendable {
                 stats: stats,
                 errorSummary: errorSummary,
                 resticExitCode: resticExitCode,
-                purgeSnapshotRewrites: purgeSnapshotRewrites
+                purgeSnapshotRewrites: purgeSnapshotRewrites,
+                auditFailureReason: auditFailureReason
             )
             return nil
         } catch {

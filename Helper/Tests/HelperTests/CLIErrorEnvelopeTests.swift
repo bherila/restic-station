@@ -260,6 +260,21 @@ struct CommandFailureClassificationTests {
         #expect(failure.details.destinationId == destinationId)
     }
 
+    @Test("maintenance audit failures never recommend a fresh destructive preview")
+    func maintenanceAuditFailureGuidance() {
+        let failure = MaintenancePrune.infrastructureFailure(
+            reason: "operation_completed_audit_failed — repository outcome unknown",
+            setId: UUID(),
+            destinationId: UUID()
+        )
+
+        #expect(failure.code == .operationCompletedAuditFailed)
+        #expect(!failure.retryable)
+        #expect(failure.message.contains("Inspect the repository"))
+        #expect(failure.message.contains("reconcile run history"))
+        #expect(!failure.message.contains("new reclaim preview"))
+    }
+
     @Test("a non-positive --limit is invalid_arguments, not an internal error")
     func limitValidation() async throws {
         // `runs list` validates `--limit` by hand rather than through
