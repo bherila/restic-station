@@ -1542,6 +1542,30 @@ public final class BackupEngine: Sendable {
             plans.append((destination, plan))
         }
 
+        // Acquire the machine-wide destructive gate before spending the
+        // single-use confirmation token. Holding it across the complete
+        // multi-destination apply also prevents another destructive helper
+        // from entering between children. Contention is retryable and leaves
+        // the operator's already-reviewed token intact.
+        do {
+            try paths.ensureDirectories()
+        } catch {
+            throw PurgeApplyError.lockUnusable(String(describing: error))
+        }
+        let destructiveAuditGate = FileLock(
+            path: paths.destructiveAuditLockFile,
+            trustedRoot: paths.root
+        )
+        switch destructiveAuditGate.acquire() {
+        case .acquired:
+            break
+        case .busy:
+            throw PurgeApplyError.busy
+        case .failed(let failure):
+            throw PurgeApplyError.lockUnusable(String(describing: failure))
+        }
+        defer { destructiveAuditGate.release() }
+
         do {
             _ = try previewTokens.consume(token)
         } catch let error as PreviewTokenError {
@@ -1583,7 +1607,8 @@ public final class BackupEngine: Sendable {
                 setId: set.id,
                 trigger: trigger,
                 groupId: resolvedGroupId,
-                executable: executable
+                executable: executable,
+                callerHoldsDestructiveAuditGate: true
             )
             let purge: ChildRun
             switch purgeResult {
@@ -1683,7 +1708,8 @@ public final class BackupEngine: Sendable {
         setId: UUID,
         trigger: RunTrigger,
         groupId: String?,
-        executable: ResticRunner.MaintenanceExecutable
+        executable: ResticRunner.MaintenanceExecutable,
+        callerHoldsDestructiveAuditGate: Bool = false
     ) async -> RecordedChildResult {
         let fullIDByShortID = Dictionary(
             snapshotIDs.map { (String($0.prefix(8)), $0) },
@@ -1719,6 +1745,7 @@ public final class BackupEngine: Sendable {
                 expectedExecutableIdentity: executable.identity
             ),
             streamProgress: false,
+            callerHoldsDestructiveAuditGate: callerHoldsDestructiveAuditGate,
             purgeSnapshotRewrites: { outcome in
                 Dictionary(uniqueKeysWithValues: parseRewrite(outcome.rawOutput).snapshots.compactMap { rewrite in
                     guard let oldID = fullIDByShortID[rewrite.shortID], let newID = rewrite.newSnapshotShortID else {
@@ -2077,10 +2104,11 @@ public final class BackupEngine: Sendable {
         beforeLaunch: (@Sendable () throws -> Void)? = nil,
         afterLaunchFailure: (@Sendable () -> Void)? = nil,
         downgradeSuccessToWarning: (@Sendable (ResticOutcome) -> Bool)? = nil,
+        callerHoldsDestructiveAuditGate: Bool = false,
         purgeSnapshotRewrites: (@Sendable (ResticOutcome) -> [String: String]?)? = nil
     ) async -> RecordedChildResult {
         let destructiveAuditGate: FileLock?
-        if kind.isDestructive {
+        if kind.isDestructive && !callerHoldsDestructiveAuditGate {
             do {
                 try paths.ensureDirectories()
             } catch {

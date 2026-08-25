@@ -57,6 +57,7 @@ public final class StateWatcher: ObservableObject {
 
     private let paths: AppPaths
     private let runStore: RunStore
+    private let auditHealthLoader: @Sendable () -> AuditHealthRefreshResult
     private let stateStore: StateStore
     private let secretBackend: SecretBackend
     private var configuredSetIds: Set<UUID>
@@ -103,6 +104,10 @@ public final class StateWatcher: ObservableObject {
     private var distributedNotificationObserver: NSObjectProtocol?
     private var debounceTask: Task<Void, Never>?
     private var isRunning = false
+    /// Invalidates an older detached scan whenever any newer synchronous or
+    /// asynchronous refresh begins. Detached filesystem reads can finish out
+    /// of order; only the newest requested observation may publish UI state.
+    private var auditRefreshGeneration: UInt64 = 0
 
     private enum WatchTarget {
         case rootGrandparent
@@ -137,6 +142,31 @@ public final class StateWatcher: ObservableObject {
     ) {
         self.paths = paths
         self.runStore = runStore
+        self.auditHealthLoader = {
+            do {
+                return .success(try runStore.unresolvedAuditFailures())
+            } catch {
+                return .verificationFailed
+            }
+        }
+        self.stateStore = stateStore
+        self.secretBackend = secretBackend
+        self.configuredSetIds = configuredSetIds
+    }
+
+    /// Deterministic audit-loader seam for ordering tests. Production always
+    /// uses the public initializer above and reads through `RunStore`.
+    init(
+        paths: AppPaths,
+        runStore: RunStore,
+        stateStore: StateStore,
+        secretBackend: SecretBackend = .configured,
+        configuredSetIds: Set<UUID> = [],
+        auditHealthLoader: @escaping @Sendable () -> AuditHealthRefreshResult
+    ) {
+        self.paths = paths
+        self.runStore = runStore
+        self.auditHealthLoader = auditHealthLoader
         self.stateStore = stateStore
         self.secretBackend = secretBackend
         self.configuredSetIds = configuredSetIds
@@ -271,10 +301,12 @@ public final class StateWatcher: ObservableObject {
     /// no filesystem event, so AppModel calls this from its existing
     /// 30-second health refresh.
     public func refreshAuditHealth() {
-        do {
-            auditFailures = try runStore.unresolvedAuditFailures()
+        auditRefreshGeneration &+= 1
+        switch auditHealthLoader() {
+        case .success(let failures):
+            auditFailures = failures
             auditVerificationFailed = false
-        } catch {
+        case .verificationFailed:
             auditFailures = []
             auditVerificationFailed = true
         }
@@ -286,14 +318,14 @@ public final class StateWatcher: ObservableObject {
     /// periodic liveness check must not freeze the menu bar for the audit
     /// lock's bounded wait or a large history directory traversal.
     public func refreshAuditHealthOffMain() async {
-        let store = runStore
+        auditRefreshGeneration &+= 1
+        let generation = auditRefreshGeneration
+        let loader = auditHealthLoader
         let result = await Task.detached(priority: .utility) {
-            do {
-                return AuditHealthRefreshResult.success(try store.unresolvedAuditFailures())
-            } catch {
-                return AuditHealthRefreshResult.verificationFailed
-            }
+            loader()
         }.value
+
+        guard generation == auditRefreshGeneration else { return }
 
         switch result {
         case .success(let failures):
@@ -648,7 +680,7 @@ public final class StateWatcher: ObservableObject {
     }
 }
 
-private enum AuditHealthRefreshResult: Sendable {
+enum AuditHealthRefreshResult: Sendable {
     case success([RunAuditFailure])
     case verificationFailed
 }

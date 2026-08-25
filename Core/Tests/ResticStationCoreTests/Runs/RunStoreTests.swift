@@ -428,6 +428,59 @@ private final class TickCounter: @unchecked Sendable {
         #expect(failure.reason == .launchedWithoutTerminalMetadata)
     }
 
+    @Test("current markerless destructive metadata is affirmative pre-launch evidence")
+    func currentMarkerlessDestructiveRunIsSafelyUnstarted() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+        let store = RunStore(paths: paths, now: { Date() })
+        let run = try store.begin(kind: .prune, setId: UUID(), destId: UUID(), trigger: .manual)
+
+        let metadata = try store.metadata(runId: run.runId)
+        #expect(metadata.destructiveAuditContractVersion == RunStore.destructiveAuditContractVersion)
+        #expect(metadata.destructiveLaunchAuthorizedAt == nil)
+        #expect(try store.unresolvedAuditFailures().isEmpty)
+    }
+
+    @Test("markerless pre-contract destructive runs fail closed even while a gate is busy")
+    func legacyMarkerlessDestructiveRunFailsClosed() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+        let store = RunStore(paths: paths, now: { Date() })
+        let run = try store.begin(kind: .prune, setId: UUID(), destId: UUID(), trigger: .manual)
+
+        var legacy = try store.metadata(runId: run.runId)
+        legacy.destructiveAuditContractVersion = nil
+        #expect(legacy.destructiveLaunchAuthorizedAt == nil)
+        try writeRawMetadata(legacy, paths: paths)
+
+        let gate = FileLock(path: paths.destructiveAuditLockFile, trustedRoot: paths.root)
+        #expect(gate.acquire() == .acquired)
+        defer { gate.release() }
+
+        let failure = try #require(store.unresolvedAuditFailures().first)
+        #expect(failure.runId == run.runId)
+        #expect(failure.reason == .launchedWithoutTerminalMetadata)
+    }
+
+    @Test("recovery preserves a dead markerless pre-contract destructive run as critical")
+    func recoverInterruptedLegacyMarkerlessDestructiveRunFailsClosed() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+        let store = RunStore(paths: paths, now: { Date() })
+        let run = try store.begin(kind: .purge, setId: UUID(), destId: UUID(), trigger: .manual)
+
+        var legacy = try store.metadata(runId: run.runId)
+        legacy.destructiveAuditContractVersion = nil
+        legacy.pid = 999_999
+        try writeRawMetadata(legacy, paths: paths)
+
+        _ = try store.recoverInterrupted()
+        let recovered = try store.metadata(runId: run.runId)
+        #expect(recovered.status == .failed)
+        #expect(recovered.auditFailureReason == .launchedWithoutTerminalMetadata)
+        #expect(recovered.errorSummary?.contains("operation_completed_audit_failed") == true)
+    }
+
     @Test("recovery preserves an unknown destructive repository outcome as critical")
     func recoverInterruptedDestructiveRunPreservesAuditFailure() throws {
         let paths = makePaths()

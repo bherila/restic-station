@@ -4,6 +4,39 @@ import ResticStationCore
 import Testing
 @testable import Restic_Station
 
+private final class ScriptedAuditLoader: @unchecked Sendable {
+    private let lock = NSLock()
+    private var callCount = 0
+    private let firstStarted = DispatchSemaphore(value: 0)
+    private let releaseFirst = DispatchSemaphore(value: 0)
+    private let newerResult: AuditHealthRefreshResult
+
+    init(newerResult: AuditHealthRefreshResult) {
+        self.newerResult = newerResult
+    }
+
+    func load() -> AuditHealthRefreshResult {
+        lock.lock()
+        callCount += 1
+        let call = callCount
+        lock.unlock()
+        if call == 1 {
+            firstStarted.signal()
+            releaseFirst.wait()
+            return .success([])
+        }
+        return newerResult
+    }
+
+    func waitUntilFirstStarted() {
+        firstStarted.wait()
+    }
+
+    func finishFirst() {
+        releaseFirst.signal()
+    }
+}
+
 @Suite("StateWatcher lock health", .serialized)
 @MainActor
 struct StateWatcherTests {
@@ -378,6 +411,39 @@ struct StateWatcherTests {
 
         #expect(watcher.auditFailures.first?.runId == run.runId)
         #expect(watcher.auditFailures.first?.reason == .launchedWithoutTerminalMetadata)
+        #expect(!watcher.auditVerificationFailed)
+    }
+
+    @Test("an older detached audit scan cannot replace a newer refresh")
+    func staleDetachedAuditRefreshIsDiscarded() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-audit-generation-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = AppPaths(root: root)
+        let failure = RunAuditFailure(
+            runId: "newer-audit-state",
+            kind: .prune,
+            setId: UUID(),
+            destId: UUID(),
+            start: Date(),
+            reason: .launchedWithoutTerminalMetadata
+        )
+        let loader = ScriptedAuditLoader(newerResult: .success([failure]))
+        let watcher = StateWatcher(
+            paths: paths,
+            runStore: RunStore(paths: paths),
+            stateStore: StateStore(paths: paths),
+            auditHealthLoader: { loader.load() }
+        )
+
+        let staleRefresh = Task { await watcher.refreshAuditHealthOffMain() }
+        await Task.detached { loader.waitUntilFirstStarted() }.value
+        watcher.refreshAuditHealth()
+        #expect(watcher.auditFailures == [failure])
+
+        loader.finishFirst()
+        await staleRefresh.value
+        #expect(watcher.auditFailures == [failure])
         #expect(!watcher.auditVerificationFailed)
     }
 }

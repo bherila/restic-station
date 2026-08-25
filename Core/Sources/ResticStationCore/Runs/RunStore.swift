@@ -146,6 +146,10 @@ public struct RunStore: Sendable {
     private static let indexLockTimeout: TimeInterval = 5
     private static let indexLockPollInterval: UInt32 = 5_000 // microseconds
     private static let publicationLockMaxAttempts = 1_000
+    /// Markerless destructive runs created under this contract are known to
+    /// be pre-launch. Missing or unknown versions predate that guarantee and
+    /// are treated as an unknown repository outcome while still running.
+    public static let destructiveAuditContractVersion = 1
 
     public init(paths: AppPaths) {
         self.init(
@@ -234,7 +238,10 @@ public struct RunStore: Sendable {
             dataAdded: nil,
             errorSummary: nil,
             stats: nil,
-            purgeSnapshotRewrites: nil
+            purgeSnapshotRewrites: nil,
+            destructiveAuditContractVersion: kind.isDestructive
+                ? Self.destructiveAuditContractVersion
+                : nil
         )
         let runDirectory = paths.runDir(runId: runId)
         try FileManager.default.createDirectory(at: runDirectory, withIntermediateDirectories: true)
@@ -291,10 +298,14 @@ public struct RunStore: Sendable {
         // rewrite. Failing to re-read it is itself an audit failure; do not
         // replace the record with one that falsely claims no launch occurred.
         let destructiveLaunchAuthorizedAt: Date?
+        let destructiveAuditContractVersion: Int?
         if run.kind.isDestructive {
-            destructiveLaunchAuthorizedAt = try metadata(runId: run.runId).destructiveLaunchAuthorizedAt
+            let canonical = try metadata(runId: run.runId)
+            destructiveLaunchAuthorizedAt = canonical.destructiveLaunchAuthorizedAt
+            destructiveAuditContractVersion = canonical.destructiveAuditContractVersion
         } else {
             destructiveLaunchAuthorizedAt = nil
+            destructiveAuditContractVersion = nil
         }
         let metadata = RunMetadata(
             runId: run.runId,
@@ -316,6 +327,7 @@ public struct RunStore: Sendable {
             errorSummary: errorSummary,
             stats: stats,
             purgeSnapshotRewrites: purgeSnapshotRewrites,
+            destructiveAuditContractVersion: destructiveAuditContractVersion,
             destructiveLaunchAuthorizedAt: destructiveLaunchAuthorizedAt,
             auditFailureReason: auditFailureReason
         )
@@ -411,7 +423,8 @@ public struct RunStore: Sendable {
             updated.status = .failed
             updated.end = now()
             if updated.kind.isDestructive,
-               updated.destructiveLaunchAuthorizedAt != nil {
+               (updated.destructiveLaunchAuthorizedAt != nil
+                   || updated.destructiveAuditContractVersion != Self.destructiveAuditContractVersion) {
                 updated.auditFailureReason = .launchedWithoutTerminalMetadata
                 updated.errorSummary = "operation_completed_audit_failed — destructive operation may have run; repository outcome was not recorded"
             } else {
@@ -597,13 +610,20 @@ public struct RunStore: Sendable {
             guard discriminator.kind.isDestructive else { continue }
             let metadata = try decoder.decode(RunMetadata.self, from: data)
             canonicalDestructiveRunIds.insert(metadata.runId)
-            guard metadata.destructiveLaunchAuthorizedAt != nil else {
-                continue
-            }
-
             let reason: RunAuditFailureReason?
             if let recorded = metadata.auditFailureReason {
                 reason = recorded
+            } else if metadata.destructiveLaunchAuthorizedAt == nil {
+                // Current records explicitly identify the contract under
+                // which a missing marker means safely unstarted. Historical
+                // running records have no such discriminator: their helper
+                // may have launched before launch markers existed, so their
+                // repository outcome is unknown even when a recycled/live
+                // pid or another helper keeps the machine-wide gate busy.
+                reason = metadata.status == .running
+                    && metadata.destructiveAuditContractVersion != Self.destructiveAuditContractVersion
+                    ? .launchedWithoutTerminalMetadata
+                    : nil
             } else if metadata.status == .running {
                 reason = destructiveOperationIsActive && Self.isProcessAlive(pid: metadata.pid)
                     ? nil

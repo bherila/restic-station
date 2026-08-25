@@ -302,7 +302,7 @@ Secret-env item is optional (absent for local/sftp destinations without credenti
 
 ## runs/<runId>/metadata.json — `RunMetadata`
 
-Superset of the index line, plus: `pid`, `resticExitCode`, `argvRedacted` (argv with env not included), `stats` (full decoded summary message where applicable), `groupId`, `destructiveLaunchAuthorizedAt`, and `auditFailureReason`. A successful `purge` run additionally carries `purgeSnapshotRewrites`, an old full snapshot id → new snapshot id mapping. It is an audit record only: older run records continue to name their historical snapshot ids. Written once at start (`status: "running"`, no `end`) and atomically rewritten on completion.
+Superset of the index line, plus: `pid`, `resticExitCode`, `argvRedacted` (argv with env not included), `stats` (full decoded summary message where applicable), `groupId`, `destructiveAuditContractVersion`, `destructiveLaunchAuthorizedAt`, and `auditFailureReason`. A successful `purge` run additionally carries `purgeSnapshotRewrites`, an old full snapshot id → new snapshot id mapping. It is an audit record only: older run records continue to name their historical snapshot ids. Written once at start (`status: "running"`, no `end`) and atomically rewritten on completion.
 
 ### Normative destructive-operation audit contract
 
@@ -321,6 +321,12 @@ same metadata rewrite as the marker before the marker may be written. Failure
 of any of those prerequisites refuses process creation. The crash-durability details
 that make these successful writes survive power loss are specified by #120;
 they do not weaken this ordering or the fail-closed launch rule.
+
+New destructive records persist `destructiveAuditContractVersion: 1` in their
+initial metadata, making a markerless current-version record affirmative
+evidence that launch has not yet been authorized. A markerless `running`
+record with a missing or unknown contract version predates that guarantee and
+fails closed as an unknown repository outcome until an operator reconciles it.
 
 One machine-wide `locks/destructive-audit.lock` serializes verification,
 launch, and terminal audit commit across every set. The helper acquires it

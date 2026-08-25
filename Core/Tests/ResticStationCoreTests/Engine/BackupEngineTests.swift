@@ -3191,6 +3191,53 @@ struct BackupEngineTests {
         #expect(throws: Never.self) { _ = try env.engine.purgeTokenDestinationIDs(token.value) }
     }
 
+    @Test("a busy destructive audit gate does not spend the purge token")
+    func purgeApplyBusyAuditGatePreservesToken() async throws {
+        let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]
+        let hostnames = [Self.setId: Set(["example-mac.local"])]
+        let env = Self.makeEnv(
+            script: [], retention: nil, purgeExcludes: ["build/**"], reachableSecondaries: [],
+            purgeSourcePaths: sourcePaths, purgeHostnames: hostnames
+        )
+        defer { env.cleanUp() }
+
+        let snapshotsJSON = try FixtureLoader.string("snapshots.json")
+        let snapshots = try parseSnapshots(Data(snapshotsJSON.utf8))
+        let plan = PurgePlan(
+            destinationId: env.primary.id,
+            snapshots: snapshots,
+            sourcePaths: sourcePaths[Self.setId]!,
+            hostnames: hostnames[Self.setId]!,
+            patterns: env.set.purgeExcludes
+        )
+        let token = try #require(try env.engine.issuePurgeToken(
+            set: env.set,
+            destinations: [env.primary],
+            plans: [plan],
+            executable: try env.requireResticExecutable()
+        ))
+        env.fake.script = [
+            .init(
+                argvPrefix: [env.resticPath, "-r", env.primary.repoURL, "snapshots", "--json"],
+                stdoutLines: [snapshotsJSON]
+            ),
+        ]
+
+        let gate = FileLock(path: env.paths.destructiveAuditLockFile, trustedRoot: env.paths.root)
+        #expect(gate.acquire() == .acquired)
+        await #expect(throws: PurgeApplyError.busy) {
+            _ = try await env.engine.runPurge(
+                set: env.set,
+                destinations: [env.primary],
+                token: token.value
+            )
+        }
+        gate.release()
+
+        #expect(throws: Never.self) { _ = try env.engine.purgeTokenDestinationIDs(token.value) }
+        #expect(!env.resticArgvs.contains { $0.contains("rewrite") })
+    }
+
     /// The classification half of #118, and a second instance of the same
     /// defect the review found: `issuePurgeToken` let a bare
     /// `PreviewTokenError` escape, where `runPurgeLocked` wraps its own.
