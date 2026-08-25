@@ -90,6 +90,10 @@ public enum RunStoreError: Error, Equatable, Sendable, CustomStringConvertible {
     /// The independently encoded kind in a current-format run directory name
     /// disagrees with metadata.
     case runDirectoryKindMismatch(path: String, encodedKind: RunKind)
+    /// Destructive metadata is canonical only at `runs/<metadata.runId>`.
+    /// Accepting it under another directory could hide the disappearance of
+    /// the real canonical record from the orphan-index audit.
+    case runDirectoryIDMismatch(path: String, encodedRunId: String)
     /// Initial metadata publication failed after its fresh run directory was
     /// created, and removing that unpublished directory failed too.
     case initialPublicationCleanupFailed(path: String, publicationError: String, cleanupError: String)
@@ -111,6 +115,8 @@ public enum RunStoreError: Error, Equatable, Sendable, CustomStringConvertible {
             return "timed out waiting for run-publication lock \(path)"
         case .runDirectoryKindMismatch(let path, let encodedKind):
             return "run directory kind does not match metadata kind \(encodedKind.rawValue): \(path)"
+        case .runDirectoryIDMismatch(let path, let encodedRunId):
+            return "run directory name does not match metadata run ID \(encodedRunId): \(path)"
         case .initialPublicationCleanupFailed(let path, let publicationError, let cleanupError):
             return "initial run publication failed at \(path): \(publicationError); cleanup also failed: \(cleanupError)"
         case .lockUnusable(let failure):
@@ -641,6 +647,12 @@ public struct RunStore: Sendable {
             }
             guard discriminator.kind.isDestructive else { continue }
             let metadata = try decoder.decode(RunMetadata.self, from: data)
+            guard directory.lastPathComponent == metadata.runId else {
+                throw RunStoreError.runDirectoryIDMismatch(
+                    path: metadataURL.path,
+                    encodedRunId: metadata.runId
+                )
+            }
             canonicalDestructiveRunIds.insert(metadata.runId)
             let reason: RunAuditFailureReason?
             if let recorded = metadata.auditFailureReason {

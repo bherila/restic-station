@@ -418,6 +418,26 @@ private final class TickCounter: @unchecked Sendable {
         }
     }
 
+    @Test("destructive metadata is canonical only in its matching run directory")
+    func metadataRunIDMismatchFailsAuditVerification() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+        let store = RunStore(paths: paths, now: { Date() })
+        let run = try store.begin(kind: .prune, setId: UUID(), destId: UUID(), trigger: .manual)
+        try store.markDestructiveLaunchAuthorized(run)
+        try store.finish(run, status: .success, resticExitCode: 0)
+
+        let misplaced = paths.runsDir.appendingPathComponent(
+            "\(run.runId)-misplaced",
+            isDirectory: true
+        )
+        try FileManager.default.moveItem(at: paths.runDir(runId: run.runId), to: misplaced)
+
+        #expect(throws: RunStoreError.self) {
+            try store.unresolvedAuditFailures()
+        }
+    }
+
     @Test("the global audit gate, not a reusable PID, proves a destructive run is active")
     func destructiveGateDistinguishesActiveRunFromRecycledPID() throws {
         let paths = makePaths()
