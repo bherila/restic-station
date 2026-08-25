@@ -132,6 +132,7 @@ public struct RunStore: Sendable {
     private let now: @Sendable () -> Date
     private let uptime: @Sendable () -> TimeInterval
     private let initialPublicationHook: @Sendable (URL) throws -> Void
+    private let publicationLockMaxAttempts: Int
 
     /// Five minutes is ten missed 30-second heartbeats: long enough to absorb
     /// scheduling pressure, short enough for a monitoring check to catch a
@@ -171,6 +172,7 @@ public struct RunStore: Sendable {
         self.now = now
         self.uptime = uptime
         self.initialPublicationHook = { _ in }
+        self.publicationLockMaxAttempts = Self.publicationLockMaxAttempts
     }
 
     /// Fault-injection seam for the publication rollback regression test.
@@ -180,12 +182,15 @@ public struct RunStore: Sendable {
         paths: AppPaths,
         now: @escaping @Sendable () -> Date,
         uptime: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
-        initialPublicationHook: @escaping @Sendable (URL) throws -> Void
+        initialPublicationHook: @escaping @Sendable (URL) throws -> Void,
+        publicationLockMaxAttempts: Int = 1_000
     ) {
+        precondition(publicationLockMaxAttempts > 0)
         self.paths = paths
         self.now = now
         self.uptime = uptime
         self.initialPublicationHook = initialPublicationHook
+        self.publicationLockMaxAttempts = publicationLockMaxAttempts
     }
 
     // MARK: - begin / finish
@@ -211,7 +216,7 @@ public struct RunStore: Sendable {
         // first metadata commit. The separate publication lock also lets two
         // read-only verifiers serialize without pretending one is a running
         // destructive helper.
-        let publicationLock = try acquireRunPublicationLock()
+        let publicationLock = try acquireRunPublicationLock(waitIndefinitely: true)
         defer { publicationLock.release() }
 
         let start = now()
@@ -290,7 +295,7 @@ public struct RunStore: Sendable {
         // as one verifier-visible transaction. Without this lock a scan can
         // observe new terminal metadata against the old index snapshot and
         // permanently misdiagnose an ordinary in-flight finish.
-        let publicationLock = try acquireRunPublicationLock()
+        let publicationLock = try acquireRunPublicationLock(waitIndefinitely: true)
         defer { publicationLock.release() }
 
         // The launch marker is committed separately, immediately before
@@ -358,7 +363,7 @@ public struct RunStore: Sendable {
     /// presenting such contention as a failed maintenance run would replace
     /// the last real cleanup despite modifying no repository data.
     public func discardUnstarted(_ run: ActiveRun) throws {
-        let publicationLock = try acquireRunPublicationLock()
+        let publicationLock = try acquireRunPublicationLock(waitIndefinitely: true)
         defer { publicationLock.release() }
 
         let directory = paths.runDir(runId: run.runId)
@@ -394,7 +399,7 @@ public struct RunStore: Sendable {
 
         // Recovery performs the same terminal metadata + index publication
         // as finish(), so it must obey the same verifier-visible boundary.
-        let publicationLock = try acquireRunPublicationLock()
+        let publicationLock = try acquireRunPublicationLock(waitIndefinitely: true)
         defer { publicationLock.release() }
 
         let fileManager = FileManager.default
@@ -546,7 +551,10 @@ public struct RunStore: Sendable {
         guard fileManager.fileExists(atPath: paths.runsDir.path) else { return [] }
 
         let publicationLock = try acquireRunPublicationLock()
-        defer { publicationLock.release() }
+        var publicationLockHeld = true
+        defer {
+            if publicationLockHeld { publicationLock.release() }
+        }
 
         let gateProbe: FileLock?
         let destructiveOperationIsActive: Bool
@@ -574,31 +582,49 @@ public struct RunStore: Sendable {
         }
         defer { gateProbe?.release() }
 
-        let indexedEntries = try readIndexEntries()
-        let indexedByRunId = Dictionary(grouping: indexedEntries, by: \.runId)
+        // Snapshot only bytes and structural names while publishers are
+        // excluded. JSON decoding, grouping and comparison happen after the
+        // lock is released so a large history cannot hold terminal writers
+        // behind avoidable CPU work. Publishers themselves wait without a
+        // timeout: after restic may have changed a repository, losing the
+        // terminal audit commit is less safe than waiting for a reader.
+        let indexData: Data?
+        if fileManager.fileExists(atPath: paths.runsIndexFile.path) {
+            indexData = try Data(contentsOf: paths.runsIndexFile)
+        } else {
+            indexData = nil
+        }
         let runDirectories = try fileManager.contentsOfDirectory(
             at: paths.runsDir,
             includingPropertiesForKeys: [.isDirectoryKey]
         )
-        let decoder = ConfigStore.makeDecoder()
-        var failures: [RunAuditFailure] = []
-        var canonicalDestructiveRunIds: Set<String> = []
-
+        var metadataSnapshots: [(directory: URL, data: Data)] = []
         for directory in runDirectories {
             let values = try directory.resourceValues(forKeys: [.isDirectoryKey])
             guard values.isDirectory == true else { continue }
-            // These are known control paths, not run directories. If the
-            // index lock is a directory because it is damaged, lock health
-            // reports it; do not misdiagnose it as missing run metadata too.
             if directory.lastPathComponent == paths.runsIndexLockFile.lastPathComponent
                 || directory.lastPathComponent == paths.runsHealthProbeDir.lastPathComponent {
                 continue
             }
             let metadataURL = directory.appendingPathComponent("metadata.json", isDirectory: false)
+            metadataSnapshots.append((directory, try Data(contentsOf: metadataURL)))
+        }
+        publicationLock.release()
+        publicationLockHeld = false
+
+        let indexedEntries = decodeIndexEntries(indexData)
+        let indexedByRunId = Dictionary(grouping: indexedEntries, by: \.runId)
+        let decoder = ConfigStore.makeDecoder()
+        var failures: [RunAuditFailure] = []
+        var canonicalDestructiveRunIds: Set<String> = []
+
+        for snapshot in metadataSnapshots {
+            let directory = snapshot.directory
+            let metadataURL = directory.appendingPathComponent("metadata.json", isDirectory: false)
             // Canonical evidence that cannot be read must make verification
             // fail closed. Silently skipping it could hide the very marker
             // this scan exists to enforce.
-            let data = try Data(contentsOf: metadataURL)
+            let data = snapshot.data
             let discriminator = try decoder.decode(RunAuditDiscriminator.self, from: data)
             if let directoryKind = Self.runKind(fromRunDirectoryName: directory.lastPathComponent),
                directoryKind != discriminator.kind {
@@ -687,6 +713,12 @@ public struct RunStore: Sendable {
         guard FileManager.default.fileExists(atPath: indexFile.path) else { return [] }
 
         let data = try Data(contentsOf: indexFile)
+        return decodeIndexEntries(data)
+    }
+
+    private func decodeIndexEntries(_ data: Data?) -> [RunIndexEntry] {
+        guard let data else { return [] }
+        let indexFile = paths.runsIndexFile
         guard let text = String(data: data, encoding: .utf8) else {
             warn("RunStore: \(indexFile.path) is not valid UTF-8; treating as empty")
             return []
@@ -721,14 +753,16 @@ public struct RunStore: Sendable {
     /// scans. The lock is deliberately separate from the destructive gate:
     /// contention here can only mean another publisher/verifier, never proof
     /// that a recorded destructive PID owns the operation gate.
-    private func acquireRunPublicationLock() throws -> FileLock {
+    private func acquireRunPublicationLock(waitIndefinitely: Bool = false) throws -> FileLock {
         let lock = FileLock(path: paths.runPublicationLockFile, trustedRoot: paths.root)
-        for attempt in 0..<Self.publicationLockMaxAttempts {
+        var attempt = 0
+        while true {
             switch lock.acquire() {
             case .acquired:
                 return lock
             case .busy:
-                if attempt + 1 == Self.publicationLockMaxAttempts {
+                attempt += 1
+                if !waitIndefinitely && attempt >= publicationLockMaxAttempts {
                     throw RunStoreError.publicationLockTimeout(path: paths.runPublicationLockFile.path)
                 }
                 usleep(Self.indexLockPollInterval)
@@ -736,7 +770,6 @@ public struct RunStore: Sendable {
                 throw RunStoreError.lockUnusable(failure)
             }
         }
-        preconditionFailure("publication lock retry loop must return or throw")
     }
 
     // MARK: - runId allocation

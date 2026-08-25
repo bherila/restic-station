@@ -2169,7 +2169,8 @@ public final class BackupEngine: Sendable {
         // Reproduces the exact spawned command line: `ResticRunner` prepends
         // the binary path from the same config value. Secrets never appear
         // in argv (`ResticCommand`'s invariant 1), so this is safe to persist.
-        run.argvRedacted = remoteCommand?.argv ?? ([config.resticPath].compactMap { $0 } + command.argv)
+        run.argvRedacted = remoteCommand?.passwordStdinArgv
+            ?? ([config.resticPath].compactMap { $0 } + command.argv)
 
         let logWriter: LogWriter?
         do {

@@ -344,7 +344,15 @@ private final class TickCounter: @unchecked Sendable {
     func terminalPublicationWaitsForAuditPublicationLock() async throws {
         let paths = makePaths()
         defer { cleanup(paths) }
-        let store = RunStore(paths: paths, now: { Date() })
+        // One attempt makes a reader time out immediately. Terminal writers
+        // deliberately ignore that bounded reader policy and must wait for
+        // the finite snapshot instead of losing post-operation evidence.
+        let store = RunStore(
+            paths: paths,
+            now: { Date() },
+            initialPublicationHook: { _ in },
+            publicationLockMaxAttempts: 1
+        )
         let run = try store.begin(kind: .prune, setId: UUID(), destId: UUID(), trigger: .manual)
         try store.markDestructiveLaunchAuthorized(run)
         let held = FileLock(path: paths.runPublicationLockFile, trustedRoot: paths.root)

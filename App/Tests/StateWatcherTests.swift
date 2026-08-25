@@ -37,6 +37,30 @@ private final class ScriptedAuditLoader: @unchecked Sendable {
     }
 }
 
+private final class AuditLoaderThreadRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var mainThreadObservations: [Bool] = []
+
+    func load() -> AuditHealthRefreshResult {
+        lock.lock()
+        mainThreadObservations.append(Thread.isMainThread)
+        lock.unlock()
+        return .success([])
+    }
+
+    func reset() {
+        lock.lock()
+        mainThreadObservations = []
+        lock.unlock()
+    }
+
+    var observations: [Bool] {
+        lock.lock()
+        defer { lock.unlock() }
+        return mainThreadObservations
+    }
+}
+
 @Suite("StateWatcher lock health", .serialized)
 @MainActor
 struct StateWatcherTests {
@@ -445,5 +469,38 @@ struct StateWatcherTests {
         await staleRefresh.value
         #expect(watcher.auditFailures == [failure])
         #expect(!watcher.auditVerificationFailed)
+    }
+
+    @Test("filesystem-triggered audit scans never run on the main thread")
+    func filesystemAuditRefreshRunsOffMain() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-audit-event-thread-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = AppPaths(root: root)
+        let stateStore = StateStore(paths: paths)
+        let recorder = AuditLoaderThreadRecorder()
+        let watcher = StateWatcher(
+            paths: paths,
+            runStore: RunStore(paths: paths),
+            stateStore: stateStore,
+            auditHealthLoader: { recorder.load() }
+        )
+        watcher.start()
+        defer { watcher.stop() }
+        recorder.reset()
+
+        try stateStore.writeFdaCheck(FdaCheckResult(
+            checkedAt: Date(),
+            hasFullDiskAccess: true,
+            probedPath: "/tmp",
+            context: "test"
+        ))
+        for _ in 0..<40 {
+            if !recorder.observations.isEmpty { break }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+
+        #expect(!recorder.observations.isEmpty)
+        #expect(recorder.observations.allSatisfy { !$0 })
     }
 }

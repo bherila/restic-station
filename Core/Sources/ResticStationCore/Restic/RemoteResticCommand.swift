@@ -57,10 +57,21 @@ public struct RemoteResticCommand: Equatable, Sendable {
 
     private init(argv: [String], password: Data?) { self.argv = argv; self.password = password }
 
-    public func withPassword(_ password: String) -> RemoteResticCommand {
+    /// Exact passwordless argv handed to ssh when the repository password is
+    /// supplied on stdin. This is also the redacted destructive audit argv;
+    /// constructing it does not require loading the secret.
+    public var passwordStdinArgv: [String] {
+        guard !argv.contains("'/dev/stdin'"),
+              let pruneIndex = argv.lastIndex(of: "'prune'") else { return argv }
         var updated = argv
-        guard let pruneIndex = updated.lastIndex(of: "'prune'") else { return self }
         updated.insert(contentsOf: ["'-p'", "'/dev/stdin'"], at: pruneIndex)
-        return RemoteResticCommand(argv: updated, password: Data((password + "\n").utf8))
+        return updated
+    }
+
+    public func withPassword(_ password: String) -> RemoteResticCommand {
+        RemoteResticCommand(
+            argv: passwordStdinArgv,
+            password: Data((password + "\n").utf8)
+        )
     }
 }

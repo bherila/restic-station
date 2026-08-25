@@ -341,8 +341,12 @@ scans therefore cannot be mistaken for ownership of the destructive gate. A
 terminal metadata rewrite and its index append, including crash recovery,
 hold that same publication lock as one verifier-visible transaction. A scan
 therefore cannot observe the canonical half of an ordinary finish without
-its derived projection. A failed first metadata write removes the unpublished
-run directory before releasing the lock, so it cannot leave permanent
+its derived projection. Audit readers snapshot the index bytes and canonical
+metadata bytes under the lock, then release it before decoding and comparing
+the full history. Publishers wait for that finite snapshot without timing
+out; a read-only health scan must never cause a post-operation terminal audit
+commit to fail. A failed first metadata write removes the unpublished run
+directory before releasing the lock, so it cannot leave permanent
 directory-shaped audit wreckage. A running launch marker is considered live
 only while the kernel-released
 destructive gate is held and its helper PID exists; PID existence alone is

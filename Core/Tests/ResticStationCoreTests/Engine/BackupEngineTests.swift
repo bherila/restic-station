@@ -2080,6 +2080,10 @@ struct BackupEngineTests {
         #expect(env.resticArgvs.isEmpty, "remote maintenance must not fall back to local restic")
         let prune = try #require(env.entries(kind: .prune).first)
         #expect(env.log(runId: prune.runId).contains("repo-password") == false)
+        let metadata = try env.runStore.metadata(runId: prune.runId)
+        #expect(metadata.argvRedacted == env.fake.invocations[1].argv)
+        #expect(metadata.argvRedacted.contains("'-p'"))
+        #expect(metadata.argvRedacted.contains("'/dev/stdin'"))
     }
 
     @Test("standalone prune: unavailable SFTP remote maintenance never starts local restic")

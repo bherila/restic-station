@@ -279,6 +279,14 @@ public final class StateWatcher: ObservableObject {
     /// `start()`, e.g. to pre-populate a preview) — every read tolerates a
     /// missing file or directory.
     public func reloadNow() {
+        reloadCachedStateNow()
+        refreshAuditHealth()
+    }
+
+    /// Reloads event-backed caches that are cheap to read. Audit history is
+    /// deliberately separate because it may contend on a lock and traverse
+    /// every run; filesystem-triggered callers perform that scan detached.
+    private func reloadCachedStateNow() {
         lockingFailure = LockingHealth.probe(
             paths: paths,
             configuredSetIds: configuredSetIds,
@@ -293,7 +301,6 @@ public final class StateWatcher: ObservableObject {
         repoStatuses = discovered.repoStatuses
 
         recentRuns = (try? runStore.recentRuns(limit: 200)) ?? []
-        refreshAuditHealth()
     }
 
     /// Re-evaluates the liveness-sensitive destructive audit state without
@@ -344,7 +351,9 @@ public final class StateWatcher: ObservableObject {
         debounceTask = Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: Self.debounceNanoseconds)
             guard !Task.isCancelled else { return }
-            self?.reloadNow()
+            guard let self else { return }
+            self.reloadCachedStateNow()
+            await self.refreshAuditHealthOffMain()
         }
     }
 
