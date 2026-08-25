@@ -120,6 +120,14 @@ public final class ResticRunner: Sendable {
         self.runner = runner
     }
 
+    /// The exact secret-free argv that ``run(_:for:onLine:onRawLine:timeout:beforeLaunch:auditBeforeLaunch:afterLaunchFailure:)``
+    /// hands to the process runner. Run-history publication uses this same
+    /// resolver so an invocation override cannot make the audit record
+    /// disagree with the child that was actually selected.
+    func redactedArgv(_ command: ResticCommand, for invocation: ResticInvocation) -> [String] {
+        [invocation.resticPathOverride ?? resticPath] + command.argv
+    }
+
     // MARK: - Running
 
     /// Runs `cmd` against `inv`'s destination(s).

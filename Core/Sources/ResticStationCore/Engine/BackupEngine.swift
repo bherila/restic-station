@@ -827,13 +827,41 @@ public final class BackupEngine: Sendable {
         // exit path (T09 step 8 — "clear current-run, release lock").
         defer { try? stateStore.clearCurrentRun(setId: set.id) }
 
+        // One manual retention request is one destructive transaction across
+        // the primary and every eligible mirror. Holding the machine-wide
+        // gate for the full pass prevents another helper from entering after
+        // the primary has already been pruned and turning a partial request
+        // into an apparent success.
+        do {
+            try paths.ensureDirectories()
+        } catch {
+            return .infrastructureFailure(
+                reason: "run history unusable — could not prepare the destructive audit gate: \(error)",
+                operationMayHaveRun: false
+            )
+        }
+        let destructiveAuditGate = FileLock(
+            path: paths.destructiveAuditLockFile,
+            trustedRoot: paths.root
+        )
+        switch destructiveAuditGate.acquire() {
+        case .acquired:
+            break
+        case .busy:
+            return .skipped
+        case .failed(let failure):
+            return .infrastructureFailure(reason: failure.description, operationMayHaveRun: false)
+        }
+        defer { destructiveAuditGate.release() }
+
         let primaryPruneResult = await forgetChild(
             destination: primary,
             policy: retention,
             setId: set.id,
             trigger: .manual,
             groupId: nil,
-            expectedExecutableIdentity: expectedExecutableIdentity
+            expectedExecutableIdentity: expectedExecutableIdentity,
+            callerHoldsDestructiveAuditGate: true
         )
         let primaryPrune: ChildRun
         switch primaryPruneResult {
@@ -879,7 +907,8 @@ public final class BackupEngine: Sendable {
                 setId: set.id,
                 trigger: .manual,
                 groupId: groupId,
-                expectedExecutableIdentity: expectedExecutableIdentity
+                expectedExecutableIdentity: expectedExecutableIdentity,
+                callerHoldsDestructiveAuditGate: true
             ) {
             case .completed(let prune):
                 if let reason = prune.infrastructureFailureReason {
@@ -1975,7 +2004,8 @@ public final class BackupEngine: Sendable {
         /// before spawning, so a binary replaced after authorization — the
         /// window spans every earlier destination in a multi-destination
         /// prune — never receives `forget --prune`.
-        expectedExecutableIdentity: String? = nil
+        expectedExecutableIdentity: String? = nil,
+        callerHoldsDestructiveAuditGate: Bool = false
     ) async -> RetentionChildResult {
         guard let policy, !policy.isEmpty else {
             return .notRequired
@@ -1992,7 +2022,8 @@ public final class BackupEngine: Sendable {
                 destination: destination,
                 expectedExecutableIdentity: expectedExecutableIdentity
             ),
-            streamProgress: false
+            streamProgress: false,
+            callerHoldsDestructiveAuditGate: callerHoldsDestructiveAuditGate
         ) {
         case .completed(let child):
             return .completed(child)
@@ -2166,11 +2197,12 @@ public final class BackupEngine: Sendable {
             logWarning("BackupEngine: \(reason)")
             return .infrastructureFailure(reason)
         }
-        // Reproduces the exact spawned command line: `ResticRunner` prepends
-        // the binary path from the same config value. Secrets never appear
-        // in argv (`ResticCommand`'s invariant 1), so this is safe to persist.
+        // Reproduces the exact spawned command line, including an invocation
+        // override selected by a validated maintenance request. Secrets never
+        // appear in argv (`ResticCommand`'s invariant 1), so this is safe to
+        // persist.
         run.argvRedacted = remoteCommand?.passwordStdinArgv
-            ?? ([config.resticPath].compactMap { $0 } + command.argv)
+            ?? restic.redactedArgv(command, for: invocation)
 
         let logWriter: LogWriter?
         do {

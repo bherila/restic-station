@@ -556,7 +556,7 @@ public struct RunStore: Sendable {
             if publicationLockHeld { publicationLock.release() }
         }
 
-        let gateProbe: FileLock?
+        var gateProbe: FileLock?
         let destructiveOperationIsActive: Bool
         if callerHoldsDestructiveAuditGate {
             // BackupEngine owns the gate before it scans and has not launched
@@ -611,6 +611,12 @@ public struct RunStore: Sendable {
         }
         publicationLock.release()
         publicationLockHeld = false
+        // The liveness observation is now captured in
+        // `destructiveOperationIsActive`; decoding cannot change it. Release
+        // the machine-wide gate before CPU-only history work so a large
+        // health scan cannot spuriously defer a real destructive helper.
+        gateProbe?.release()
+        gateProbe = nil
 
         let indexedEntries = decodeIndexEntries(indexData)
         let indexedByRunId = Dictionary(grouping: indexedEntries, by: \.runId)

@@ -1932,6 +1932,28 @@ struct BackupEngineTests {
         #expect(env.entries(kind: .prune).count == 1)
     }
 
+    @Test("standalone prune records the invocation-selected executable in canonical metadata")
+    func standalonePruneRecordsExecutableOverride() async throws {
+        let env = Self.makeEnv(script: [], retention: nil, reachableSecondaries: [])
+        defer { env.cleanUp() }
+        let selectedRestic = "/opt/validated/restic"
+        env.fake.script = [
+            .init(argvPrefix: [selectedRestic, "-r", env.primary.repoURL, "prune"]),
+        ]
+
+        let status = await env.engine.runPruneRepository(
+            set: env.set,
+            destination: env.primary,
+            resticExecutablePath: selectedRestic
+        )
+
+        #expect(status == .completed(.success))
+        let prune = try #require(env.entries(kind: .prune).first)
+        let metadata = try env.runStore.metadata(runId: prune.runId)
+        #expect(metadata.argvRedacted == env.fake.invocations[0].argv)
+        #expect(metadata.argvRedacted.first == selectedRestic)
+    }
+
     @Test("standalone prune: a terminal run-index failure cannot report success")
     func standalonePruneIndexFailureCannotReportSuccess() async throws {
         let paths = Box<AppPaths?>(nil)
