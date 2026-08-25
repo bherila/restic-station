@@ -13,6 +13,7 @@ This spec fixes **information architecture, controls, states, and copy**. Visual
 ## Menu bar (`MenuBarExtra`, style `.menu`, `isInserted:` bound to `showMenuBarIcon`)
 
 Icon (template, SF Symbols):
+- Critical: `externaldrive.badge.xmark` (an unresolved destructive-operation audit failure; outranks running and warning)
 - Idle/healthy: `externaldrive.badge.checkmark`
 - Running: `externaldrive.badge.timemachine` (any run in flight)
 - Warning: `externaldrive.badge.exclamationmark` (last run of any set failed, OR any destination stale, OR a first backup is overdue, OR FDA/agent problem)

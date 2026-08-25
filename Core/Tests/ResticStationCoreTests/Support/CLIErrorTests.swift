@@ -51,6 +51,10 @@ private let representative: [CLIErrorCode: CLIFailure] = [
     .resticFailed: .classify(exitClass: .fatal(stderrSummary: "repository is damaged")),
     .operationTimedOut: .classify(ResticRunnerError.timedOut),
     .previewExpired: .classifyPurgeOperation(PurgeApplyError.token(.expired), setId: setId),
+    .operationCompletedAuditFailed: .classifyPurgeOperation(
+        PurgeApplyError.infrastructureFailure(reason: "terminal audit persistence failed", operationMayHaveRun: true),
+        setId: setId
+    ),
     .internalError: .classify(ConfigStoreError.renameFailed(errno: 13, from: "a", to: "b")),
     // `repositoryOffline` is a `Reachability` result rather than an Error,
     // so this representative remains direct. `operationNotAllowed` is also
@@ -105,8 +109,9 @@ struct CLIErrorContractTests {
         #expect(CLIErrorCode.operationTimedOut.rawValue == "operation_timed_out")
         #expect(CLIErrorCode.previewExpired.rawValue == "preview_expired")
         #expect(CLIErrorCode.operationNotAllowed.rawValue == "operation_not_allowed")
+        #expect(CLIErrorCode.operationCompletedAuditFailed.rawValue == "operation_completed_audit_failed")
         #expect(CLIErrorCode.internalError.rawValue == "internal_error")
-        #expect(CLIErrorCode.allCases.count == 21)
+        #expect(CLIErrorCode.allCases.count == 22)
     }
 
     @Test("only busy and offline leave exit 1 — the coarse shell contract is unchanged")
@@ -178,11 +183,22 @@ struct CLIErrorContractTests {
             ),
             setId: setId
         )
-        #expect(mayHaveRun.code == .internalError)
+        #expect(mayHaveRun.code == .operationCompletedAuditFailed)
         #expect(!mayHaveRun.retryable)
         #expect(mayHaveRun.message.contains("may have changed repository data"))
         #expect(mayHaveRun.message.contains("Inspect the repositories before retrying"))
         #expect(!mayHaveRun.message.contains("backup-set lock"))
+
+        let blockedByPriorAuditFailure = CLIFailure.classifyPurgeApply(
+            PurgeApplyError.infrastructureFailure(
+                reason: "operation_completed_audit_failed — prior destructive run needs inspection",
+                operationMayHaveRun: false
+            ),
+            setId: setId
+        )
+        #expect(blockedByPriorAuditFailure.code == .operationCompletedAuditFailed)
+        #expect(!blockedByPriorAuditFailure.retryable)
+        #expect(blockedByPriorAuditFailure.message.contains("blocked by an earlier destructive operation"))
     }
 }
 

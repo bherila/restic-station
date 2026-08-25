@@ -220,6 +220,10 @@ exits on `HealthDerivation.hasWarningConditions`, which is the same rules
 without that precedence. Both read one shared predicate, so "what counts as a
 problem" has exactly one definition.
 
+An unresolved destructive audit failure is the exception: `critical`
+outranks `running`, exits 1, and blocks further destructive launches until
+the canonical run evidence is reconciled.
+
 The `null`/`unknown` cases contribute nothing to health, exactly as an absent
 `fda-check.json` does. `status` used to assert `backgroundAgentEnabled: true`
 on every platform, which read as "the scheduler is fine" and meant a Linux

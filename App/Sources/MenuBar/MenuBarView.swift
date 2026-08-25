@@ -143,9 +143,12 @@ enum MenuBarCopy {
 // MARK: - Icon
 
 extension AppHealth {
-    /// The three template SF Symbols from `docs/ui-spec.md` §Menu bar.
+    /// The ordinary three symbols from `docs/ui-spec.md` plus a red-X drive
+    /// for the destructive-audit critical state.
     var menuBarSymbolName: String {
         switch self {
+        case .critical:
+            return "externaldrive.badge.xmark"
         case .idle:
             return "externaldrive.badge.checkmark"
         case .running:

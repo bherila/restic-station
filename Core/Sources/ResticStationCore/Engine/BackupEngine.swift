@@ -225,6 +225,7 @@ public final class BackupEngine: Sendable {
     /// supplies these unions when it constructs the engine.
     private let purgeSourcePaths: [UUID: Set<String>]
     private let purgeHostnames: [UUID: Set<String>]
+    private let logWriterFactory: @Sendable (URL) throws -> LogWriter
 
     public init(
         config: AppConfig,
@@ -239,7 +240,8 @@ public final class BackupEngine: Sendable {
         purgeSourcePaths: [UUID: Set<String>] = [:],
         purgeHostnames: [UUID: Set<String>] = [:],
         machineId: String = MachineIdentity.generate(),
-        previewTokens: PreviewTokenStore? = nil
+        previewTokens: PreviewTokenStore? = nil,
+        logWriterFactory: (@Sendable (URL) throws -> LogWriter)? = nil
     ) {
         self.config = config
         self.paths = paths
@@ -254,6 +256,9 @@ public final class BackupEngine: Sendable {
         self.previewTokens = previewTokens ?? PreviewTokenStore(paths: paths, now: now)
         self.purgeSourcePaths = purgeSourcePaths
         self.purgeHostnames = purgeHostnames
+        self.logWriterFactory = logWriterFactory ?? { url in
+            try LogWriter(url: url, now: now)
+        }
     }
 
     // MARK: - runSet
@@ -2033,6 +2038,22 @@ public final class BackupEngine: Sendable {
         downgradeSuccessToWarning: (@Sendable (ResticOutcome) -> Bool)? = nil,
         purgeSnapshotRewrites: (@Sendable (ResticOutcome) -> [String: String]?)? = nil
     ) async -> RecordedChildResult {
+        if kind.isDestructive {
+            do {
+                if let unresolved = try runStore.unresolvedAuditFailures().first {
+                    let reason = "operation_completed_audit_failed — destructive run "
+                        + "\(unresolved.runId) has unresolved \(unresolved.reason.rawValue) audit evidence; "
+                        + "inspect and reconcile run history before retrying"
+                    logWarning("BackupEngine: \(reason)")
+                    return .infrastructureFailure(reason)
+                }
+            } catch {
+                let reason = "run history unusable — could not verify destructive audit history: \(error)"
+                logWarning("BackupEngine: \(reason)")
+                return .infrastructureFailure(reason)
+            }
+        }
+
         var run: ActiveRun
         do {
             run = try runStore.begin(
@@ -2052,7 +2073,19 @@ public final class BackupEngine: Sendable {
         // in argv (`ResticCommand`'s invariant 1), so this is safe to persist.
         run.argvRedacted = remoteCommand?.argv ?? ([config.resticPath].compactMap { $0 } + command.argv)
 
-        let logWriter = try? LogWriter(url: paths.runLogFile(runId: run.runId), now: now)
+        let logWriter: LogWriter?
+        do {
+            logWriter = try logWriterFactory(paths.runLogFile(runId: run.runId))
+        } catch {
+            if kind.isDestructive {
+                let reason = "run history unusable — could not open the required destructive audit log "
+                    + "for run \(run.runId): \(error)"
+                let finishFailure = finish(run, status: .failed, errorSummary: reason)
+                logWarning("BackupEngine: \(reason)")
+                return .infrastructureFailure(finishFailure ?? reason)
+            }
+            logWriter = nil
+        }
         defer { logWriter?.close() }
         logWriter?.appendLine("$ \(run.argvRedacted.joined(separator: " "))")
 
@@ -2090,16 +2123,34 @@ public final class BackupEngine: Sendable {
         }
 
         let result: ExecuteResult
+        let auditRun = run
+        let auditBeforeLaunch: (@Sendable () throws -> Void)?
+        if kind.isDestructive {
+            auditBeforeLaunch = { [runStore, auditRun] in
+                try runStore.markDestructiveLaunchAuthorized(auditRun)
+            }
+        } else {
+            auditBeforeLaunch = nil
+        }
         if let remoteCommand {
             result = await spawnRemote(
                 remoteCommand,
                 destination: destination,
                 logWriter: logWriter,
                 beforeLaunch: beforeLaunch,
+                auditBeforeLaunch: auditBeforeLaunch,
                 afterLaunchFailure: afterLaunchFailure
             )
         } else {
-            result = await execute(command, invocation: invocation, logWriter: logWriter, reporter: streamProgress ? reporter : nil, beforeLaunch: beforeLaunch, afterLaunchFailure: afterLaunchFailure)
+            result = await execute(
+                command,
+                invocation: invocation,
+                logWriter: logWriter,
+                reporter: streamProgress ? reporter : nil,
+                beforeLaunch: beforeLaunch,
+                auditBeforeLaunch: auditBeforeLaunch,
+                afterLaunchFailure: afterLaunchFailure
+            )
         }
 
         if case .didNotRun(_, let launchPreflightFailure?) = result {
@@ -2204,6 +2255,7 @@ public final class BackupEngine: Sendable {
         logWriter: LogWriter?,
         reporter: ProgressReporter?,
         beforeLaunch: (@Sendable () throws -> Void)? = nil,
+        auditBeforeLaunch: (@Sendable () throws -> Void)? = nil,
         afterLaunchFailure: (@Sendable () -> Void)? = nil
     ) async -> ExecuteResult {
         let first = await spawn(
@@ -2212,6 +2264,7 @@ public final class BackupEngine: Sendable {
             logWriter: logWriter,
             reporter: reporter,
             beforeLaunch: beforeLaunch,
+            auditBeforeLaunch: auditBeforeLaunch,
             afterLaunchFailure: afterLaunchFailure
         )
         guard case .ranToCompletion(let outcome) = first, outcome.status == .repoLocked else {
@@ -2243,6 +2296,7 @@ public final class BackupEngine: Sendable {
         logWriter: LogWriter?,
         reporter: ProgressReporter?,
         beforeLaunch: (@Sendable () throws -> Void)? = nil,
+        auditBeforeLaunch: (@Sendable () throws -> Void)? = nil,
         afterLaunchFailure: (@Sendable () -> Void)? = nil
     ) async -> ExecuteResult {
         do {
@@ -2257,6 +2311,7 @@ public final class BackupEngine: Sendable {
                     logWriter?.appendLine(line)
                 },
                 beforeLaunch: beforeLaunch,
+                auditBeforeLaunch: auditBeforeLaunch,
                 afterLaunchFailure: afterLaunchFailure
             )
             return .ranToCompletion(outcome)
@@ -2278,6 +2333,7 @@ public final class BackupEngine: Sendable {
         destination: Destination,
         logWriter: LogWriter?,
         beforeLaunch: (@Sendable () throws -> Void)? = nil,
+        auditBeforeLaunch: (@Sendable () throws -> Void)? = nil,
         afterLaunchFailure: (@Sendable () -> Void)? = nil
     ) async -> ExecuteResult {
         do {
@@ -2286,6 +2342,7 @@ public final class BackupEngine: Sendable {
                 destination: destination,
                 onRawLine: { logWriter?.appendLine($0) },
                 beforeLaunch: beforeLaunch,
+                auditBeforeLaunch: auditBeforeLaunch,
                 afterLaunchFailure: afterLaunchFailure
             ))
         } catch let error as PreviewTokenError {
@@ -2322,7 +2379,12 @@ public final class BackupEngine: Sendable {
             )
             return nil
         } catch {
-            let reason = "run history unusable — could not index run \(run.runId): \(error)"
+            let launchWasAuthorized = run.kind.isDestructive
+                && ((try? runStore.metadata(runId: run.runId).destructiveLaunchAuthorizedAt) != nil)
+            let prefix = launchWasAuthorized
+                ? "operation_completed_audit_failed — "
+                : "run history unusable — "
+            let reason = prefix + "could not commit terminal audit evidence for run \(run.runId): \(error)"
             logWarning("BackupEngine: \(reason)")
             return reason
         }

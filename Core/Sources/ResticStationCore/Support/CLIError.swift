@@ -130,6 +130,12 @@ public enum CLIErrorCode: String, Sendable, Codable, CaseIterable, Equatable {
     /// behind its primary (`docs/architecture.md` §Invariants).
     case operationNotAllowed = "operation_not_allowed"
 
+    /// A destructive argv crossed its audited launch boundary, but complete
+    /// terminal metadata plus the derived index entry could not be proven.
+    /// The repository outcome may be known or unknown; either way an
+    /// identical destructive retry is forbidden until reconciliation.
+    case operationCompletedAuditFailed = "operation_completed_audit_failed"
+
     // ── Everything else ───────────────────────────────────────────────────
 
     /// An unexpected failure. Its `message` is bounded and never carries a
@@ -161,7 +167,7 @@ extension CLIErrorCode {
              .secretNotConfigured,
              .repositoryNotInitialized, .resticNotFound, .resticUnsupported,
              .resticFailed, .operationTimedOut, .previewExpired, .operationNotAllowed,
-             .internalError:
+             .operationCompletedAuditFailed, .internalError:
             return .error
         }
     }
@@ -184,7 +190,7 @@ extension CLIErrorCode {
              .secretRejected, .secretNotConfigured,
              .repositoryNotInitialized, .resticNotFound,
              .resticUnsupported, .resticFailed, .previewExpired, .operationNotAllowed,
-             .internalError:
+             .operationCompletedAuditFailed, .internalError:
             return false
         case .operationTimedOut:
             return true
@@ -460,13 +466,22 @@ extension CLIFailure {
                 details: CLIErrorDetails(setId: setId)
             )
         case .infrastructureFailure(let reason, let operationMayHaveRun):
-            let message = operationMayHaveRun
-                ? "The purge may have changed repository data, but its result could not be recorded or trusted: "
+            let unresolvedAuditFailure = reason.hasPrefix(CLIErrorCode.operationCompletedAuditFailed.rawValue)
+            let message: String
+            if operationMayHaveRun {
+                message = "The purge may have changed repository data, but its result could not be recorded or trusted: "
                     + "\(reason). Inspect the repositories before retrying."
-                : "The purge did not run destructive work because its local state could not be recorded: \(reason). "
+            } else if unresolvedAuditFailure {
+                message = "The purge was blocked by an earlier destructive operation whose audit evidence is incomplete: "
+                    + "\(reason). Inspect the repositories and reconcile run history before retrying."
+            } else {
+                message = "The purge did not run destructive work because its local state could not be recorded: \(reason). "
                     + "Check the permissions on the Restic Station data directory."
+            }
             return CLIFailure(
-                code: .internalError,
+                code: operationMayHaveRun || unresolvedAuditFailure
+                    ? .operationCompletedAuditFailed
+                    : .internalError,
                 message: CLIFailure.bounded(message),
                 details: CLIErrorDetails(setId: setId)
             )

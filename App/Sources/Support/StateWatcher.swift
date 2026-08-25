@@ -42,6 +42,10 @@ public final class StateWatcher: ObservableObject {
     @Published public private(set) var fdaCheck: FdaCheckResult?
     /// `RunStore.recentRuns(limit: 200)`, newest first.
     @Published public private(set) var recentRuns: [RunIndexEntry] = []
+    /// Destructive runs whose launch marker has no complete terminal
+    /// metadata/index pair. Reconstructed from run history on every reload;
+    /// never a second persisted source of truth.
+    @Published public private(set) var auditFailures: [RunAuditFailure] = []
     /// Live lock-health result, refreshed for state/run writes and every
     /// change under `locks/`. A lock failure can prevent all other writes,
     /// so the lock directory needs its own event source.
@@ -255,6 +259,7 @@ public final class StateWatcher: ObservableObject {
         repoStatuses = discovered.repoStatuses
 
         recentRuns = (try? runStore.recentRuns(limit: 200)) ?? []
+        auditFailures = (try? runStore.unresolvedAuditFailures()) ?? []
     }
 
     // MARK: - Debounce

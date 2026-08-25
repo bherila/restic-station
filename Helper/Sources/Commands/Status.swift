@@ -87,6 +87,14 @@ struct Status: AsyncParsableCommand, JSONRenderable {
                 "could not read the run history (\(paths.runsIndexFile.path)): \(error)"
             )
         }
+        let auditFailures: [RunAuditFailure]
+        do {
+            auditFailures = try runStore.unresolvedAuditFailures()
+        } catch {
+            throw CLIFailure.stateUnreadable(
+                "could not verify destructive run audit evidence (\(paths.runsDir.path)): \(error)"
+            )
+        }
 
         var currentRuns: [UUID: CurrentRunState] = [:]
         for setId in stateStore.currentRunSetIDs() {
@@ -171,6 +179,7 @@ struct Status: AsyncParsableCommand, JSONRenderable {
             fullDiskAccessDenied: fdaDenied,
             backgroundAgentEnabled: scheduler.flatMap(\.healthy),
             lockingBroken: lockingFailure != nil,
+            destructiveAuditFailure: !auditFailures.isEmpty,
             runLiveness: runLiveness
         )
 
@@ -191,7 +200,8 @@ struct Status: AsyncParsableCommand, JSONRenderable {
             return StatusReport.SetStatus(
                 id: setHealth.setId,
                 name: setHealth.name,
-                needsAttention: setHealth.needsAttention,
+                needsAttention: setHealth.needsAttention
+                    || auditFailures.contains(where: { $0.setId == setHealth.setId }),
                 isRunning: setHealth.isRunning,
                 firstBackupOverdue: setHealth.firstBackupOverdue,
                 abandonedRun: StatusReport.CurrentRunSummary(setHealth.abandonedRun),
@@ -237,7 +247,7 @@ struct Status: AsyncParsableCommand, JSONRenderable {
             StatusReport.Exclusion(omission: omission)
         }
 
-        let report = StatusReport(
+        var report = StatusReport(
             machineId: machineId,
             generatedAt: now,
             health: health.rawValue,
@@ -248,6 +258,7 @@ struct Status: AsyncParsableCommand, JSONRenderable {
             unattributedRuns: unattributedRuns,
             excludedHere: excludedHere
         )
+        report.auditFailures = auditFailures.map(StatusReport.AuditFailure.init)
 
         if json {
             CLIJSON.print(report)
@@ -263,7 +274,7 @@ struct Status: AsyncParsableCommand, JSONRenderable {
         // while its timer was disabled and no *next* backup would ever
         // start. `hasWarningConditions` is the same rules without that
         // precedence, which is the right question for an exit code.
-        let needsAttention = HealthDerivation.hasWarningConditions(
+        let needsAttention = !auditFailures.isEmpty || HealthDerivation.hasWarningConditions(
             setHealths: setHealths,
             runsInFlight: Array(currentRuns.values),
             fullDiskAccessDenied: fdaDenied,
@@ -391,6 +402,26 @@ struct Status: AsyncParsableCommand, JSONRenderable {
 // MARK: - StatusReport (the `--json` shape — see docs/data-model.md)
 
 struct StatusReport: Encodable {
+    struct AuditFailure: Encodable {
+        let code = "operation_completed_audit_failed"
+        let runId: String
+        let kind: String
+        let setId: UUID
+        let destinationId: UUID
+        let start: Date
+        let reason: String
+        let retryable = false
+
+        init(_ failure: RunAuditFailure) {
+            runId = failure.runId
+            kind = failure.kind.rawValue
+            setId = failure.setId
+            destinationId = failure.destId
+            start = failure.start
+            reason = failure.reason.rawValue
+        }
+    }
+
     struct RunSummary: Encodable {
         let runId: String
         let status: String
@@ -685,18 +716,19 @@ struct StatusReport: Encodable {
 
     let machineId: String
     let generatedAt: Date
-    /// `"idle"` | `"running"` | `"warning"` — `AppHealth.rawValue` verbatim,
+    /// `"idle"` | `"running"` | `"warning"` | `"critical"` — `AppHealth.rawValue` verbatim,
     /// the same string the app's menu bar state maps to an SF Symbol from.
     let health: String
     let fullDiskAccessDenied: Bool
     let locking: LockingStatus
     let scheduler: SchedulerStatus?
     let sets: [SetStatus]
+    var auditFailures: [AuditFailure] = []
     let unattributedRuns: [UnattributedRun]
     let excludedHere: [Exclusion]
 
     private enum CodingKeys: String, CodingKey {
-        case machineId, generatedAt, health, fullDiskAccessDenied, locking, scheduler, sets
+        case machineId, generatedAt, health, fullDiskAccessDenied, locking, scheduler, sets, auditFailures
         case unattributedRuns, excludedHere
     }
 
@@ -713,6 +745,7 @@ struct StatusReport: Encodable {
         try container.encode(locking, forKey: .locking)
         try container.encode(scheduler, forKey: .scheduler)
         try container.encode(sets, forKey: .sets)
+        try container.encode(auditFailures, forKey: .auditFailures)
         try container.encode(unattributedRuns, forKey: .unattributedRuns)
         try container.encode(excludedHere, forKey: .excludedHere)
     }
@@ -723,6 +756,14 @@ struct StatusReport: Encodable {
         var lines: [String] = []
         lines.append("machine \"\(machineId)\" — \(health)"
             + (fullDiskAccessDenied ? " (Full Disk Access denied)" : ""))
+        for failure in auditFailures {
+            lines.append(
+                "audit: OPERATION COMPLETED BUT AUDIT FAILED — \(failure.kind) run \(failure.runId)"
+            )
+            lines.append(
+                "  - \(failure.reason); inspect repository state and reconcile run history before retrying"
+            )
+        }
         // Ahead of the scheduler line: if this is broken, the scheduler
         // firing perfectly on time changes nothing.
         if locking.usable == false {

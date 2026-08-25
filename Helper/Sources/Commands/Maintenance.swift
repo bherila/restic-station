@@ -301,7 +301,9 @@ struct MaintenancePrune: AsyncParsableCommand, JSONRenderable {
         destinationId: UUID
     ) -> CLIFailure {
         CLIFailure(
-            code: .internalError,
+            code: reason.hasPrefix("operation_completed_audit_failed")
+                ? .operationCompletedAuditFailed
+                : .internalError,
             message: "Prune could not complete safely: \(reason). Check the Restic Station data directory and run a new reclaim preview.",
             details: CLIErrorDetails(setId: setId, destinationId: destinationId)
         )

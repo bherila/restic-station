@@ -214,6 +214,16 @@ public struct RunStore: Sendable {
         resticExitCode: Int32? = nil,
         purgeSnapshotRewrites: [String: String]? = nil
     ) throws {
+        // The launch marker is committed separately, immediately before
+        // process creation. Preserve that canonical evidence in the terminal
+        // rewrite. Failing to re-read it is itself an audit failure; do not
+        // replace the record with one that falsely claims no launch occurred.
+        let destructiveLaunchAuthorizedAt: Date?
+        if run.kind.isDestructive {
+            destructiveLaunchAuthorizedAt = try metadata(runId: run.runId).destructiveLaunchAuthorizedAt
+        } else {
+            destructiveLaunchAuthorizedAt = nil
+        }
         let metadata = RunMetadata(
             runId: run.runId,
             kind: run.kind,
@@ -233,10 +243,29 @@ public struct RunStore: Sendable {
             dataAdded: stats?.dataAdded,
             errorSummary: errorSummary,
             stats: stats,
-            purgeSnapshotRewrites: purgeSnapshotRewrites
+            purgeSnapshotRewrites: purgeSnapshotRewrites,
+            destructiveLaunchAuthorizedAt: destructiveLaunchAuthorizedAt,
+            auditFailureReason: nil
         )
         try writeMetadataAtomic(metadata)
         try appendIndexEntry(metadata.indexEntry)
+    }
+
+    /// Commits the destructive launch boundary immediately before the argv
+    /// is handed to the process runner. The caller must refuse launch if this
+    /// write fails. It is intentionally separate from `begin`: secret,
+    /// executable and confirmation-token preflights can still fail safely
+    /// before this point.
+    public func markDestructiveLaunchAuthorized(_ run: ActiveRun) throws {
+        precondition(run.kind.isDestructive)
+        var existing = try metadata(runId: run.runId)
+        guard existing.status == .running,
+              existing.runId == run.runId,
+              existing.pid == run.pid else {
+            throw RunStoreError.discardUnsafe(path: paths.runMetadataFile(runId: run.runId).path)
+        }
+        existing.destructiveLaunchAuthorizedAt = now()
+        try writeMetadataAtomic(existing)
     }
 
     /// Removes a just-created run before it reaches the index. This is only
@@ -300,7 +329,13 @@ public struct RunStore: Sendable {
             var updated = metadata
             updated.status = .failed
             updated.end = now()
-            updated.errorSummary = "interrupted"
+            if updated.kind.isDestructive,
+               updated.destructiveLaunchAuthorizedAt != nil {
+                updated.auditFailureReason = .launchedWithoutTerminalMetadata
+                updated.errorSummary = "operation_completed_audit_failed — destructive operation may have run; repository outcome was not recorded"
+            } else {
+                updated.errorSummary = "interrupted"
+            }
             try writeMetadataAtomic(updated)
             try appendIndexEntry(updated.indexEntry)
             recovered.append(RecoveredRun(runId: metadata.runId, setId: metadata.setId))
@@ -405,6 +440,60 @@ public struct RunStore: Sendable {
     public func metadata(runId: String) throws -> RunMetadata {
         let data = try Data(contentsOf: paths.runMetadataFile(runId: runId))
         return try ConfigStore.makeDecoder().decode(RunMetadata.self, from: data)
+    }
+
+    /// Reconstructs unresolved destructive audit failures from the canonical
+    /// per-run metadata and the derived index. It never mutates either one;
+    /// #120 owns idempotent reconciliation toward metadata.
+    public func unresolvedAuditFailures() throws -> [RunAuditFailure] {
+        let indexedRunIds = Set(try readIndexEntries().map(\.runId))
+        let fileManager = FileManager.default
+        guard fileManager.fileExists(atPath: paths.runsDir.path) else { return [] }
+        let runDirectories = try fileManager.contentsOfDirectory(
+            at: paths.runsDir,
+            includingPropertiesForKeys: [.isDirectoryKey]
+        )
+        let decoder = ConfigStore.makeDecoder()
+        var failures: [RunAuditFailure] = []
+
+        for directory in runDirectories {
+            let values = try? directory.resourceValues(forKeys: [.isDirectoryKey])
+            guard values?.isDirectory == true else { continue }
+            let metadataURL = directory.appendingPathComponent("metadata.json", isDirectory: false)
+            guard let data = try? Data(contentsOf: metadataURL),
+                  let metadata = try? decoder.decode(RunMetadata.self, from: data),
+                  metadata.kind.isDestructive,
+                  metadata.destructiveLaunchAuthorizedAt != nil else {
+                continue
+            }
+
+            let reason: RunAuditFailureReason?
+            if let recorded = metadata.auditFailureReason {
+                reason = recorded
+            } else if metadata.status == .running {
+                reason = Self.isProcessAlive(pid: metadata.pid)
+                    ? nil
+                    : .launchedWithoutTerminalMetadata
+            } else {
+                reason = indexedRunIds.contains(metadata.runId)
+                    ? nil
+                    : .terminalMetadataMissingIndex
+            }
+            if let reason {
+                failures.append(RunAuditFailure(
+                    runId: metadata.runId,
+                    kind: metadata.kind,
+                    setId: metadata.setId,
+                    destId: metadata.destId,
+                    start: metadata.start,
+                    reason: reason
+                ))
+            }
+        }
+
+        return failures.sorted {
+            $0.start == $1.start ? $0.runId < $1.runId : $0.start < $1.start
+        }
     }
 
     /// `runs/<runId>/log.txt` — see `AppPaths.runLogFile(runId:)`.

@@ -256,6 +256,62 @@ private final class TickCounter: @unchecked Sendable {
         #expect(index.isEmpty)
     }
 
+    @Test("terminal destructive metadata missing from the index is an audit failure")
+    func terminalDestructiveMetadataMissingIndex() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+        let store = RunStore(paths: paths, now: { Date() })
+        let run = try store.begin(kind: .prune, setId: UUID(), destId: UUID(), trigger: .manual)
+        try store.markDestructiveLaunchAuthorized(run)
+
+        try FileManager.default.createDirectory(
+            at: paths.runsIndexLockFile,
+            withIntermediateDirectories: true
+        )
+        #expect(throws: (any Error).self) {
+            try store.finish(run, status: .success, resticExitCode: 0)
+        }
+
+        let failure = try #require(store.unresolvedAuditFailures().first)
+        #expect(failure.runId == run.runId)
+        #expect(failure.reason == .terminalMetadataMissingIndex)
+        #expect(try store.metadata(runId: run.runId).status == .success)
+    }
+
+    @Test("recovery preserves an unknown destructive repository outcome as critical")
+    func recoverInterruptedDestructiveRunPreservesAuditFailure() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+        let store = RunStore(paths: paths, now: { Date() })
+        let run = try store.begin(kind: .purge, setId: UUID(), destId: UUID(), trigger: .manual)
+        try store.markDestructiveLaunchAuthorized(run)
+
+        var stuck = try store.metadata(runId: run.runId)
+        stuck.pid = 999_999
+        try writeRawMetadata(stuck, paths: paths)
+
+        _ = try store.recoverInterrupted()
+        let recovered = try store.metadata(runId: run.runId)
+        #expect(recovered.status == .failed)
+        #expect(recovered.auditFailureReason == .launchedWithoutTerminalMetadata)
+        #expect(recovered.errorSummary?.contains("operation_completed_audit_failed") == true)
+        #expect(try store.recentRuns(limit: 10).count == 1)
+
+        let failures = try store.unresolvedAuditFailures()
+        let failure = try #require(failures.first)
+        #expect(failures.count == 1)
+        #expect(failure.runId == run.runId)
+        #expect(failure.kind == .purge)
+        #expect(failure.setId == run.setId)
+        #expect(failure.destId == run.destId)
+        #expect(abs(failure.start.timeIntervalSince(run.start)) < 0.001)
+        #expect(failure.reason == .launchedWithoutTerminalMetadata)
+
+        _ = try store.recoverInterrupted()
+        #expect(try store.recentRuns(limit: 10).count == 1, "recovery is idempotent")
+        #expect(try store.unresolvedAuditFailures() == failures)
+    }
+
     // MARK: - Current-run liveness
 
     /// A `state/current-run-<setId>.json` for `runId`. Only `runId` matters

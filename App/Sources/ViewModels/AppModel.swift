@@ -416,6 +416,7 @@ final class AppModel: ObservableObject {
             // prevent the state/run writes that drive every other refresh,
             // so the menu bar must not depend on those writes to turn red.
             lockingBroken: stateWatcher.lockingFailure != nil,
+            destructiveAuditFailure: !stateWatcher.auditFailures.isEmpty,
             runLiveness: runLiveness
         )
     }

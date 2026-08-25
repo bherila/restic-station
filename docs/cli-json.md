@@ -119,6 +119,7 @@ never match on it. `details` is omitted entirely when empty.
 | `operation_timed_out` | **yes** | 1 | The operation exceeded the caller's timeout and was stopped; restic never reported. A stalled network or a spinning-up remote clears on its own. |
 | `preview_expired` | no | 1 | A destructive preview token has expired. Run a fresh preview; the old token can never be applied. |
 | `operation_not_allowed` | no | 1 | Refused by a safety invariant — `forget` with an empty retention policy, `prune` on a mirror behind its primary (`architecture.md` §Invariants). |
+| `operation_completed_audit_failed` | no | 1 | A destructive launch crossed its audit boundary, but complete terminal metadata plus its index projection could not be proven. Inspect repository state and reconcile run history; never retry the destructive request automatically. |
 | `internal_error` | no | 1 | An unexpected or structurally unrecoverable local failure, including an unusable process-control lock. Bounded; never a serialized object description. |
 
 ### `retryable`
@@ -215,7 +216,7 @@ Two consequences, both deliberate:
 ## What is *not* an error
 
 **A nonzero exit is not the same as a failure.** `status --json` exits 1 when
-health is `warning` — it is documented as a Nagios/Icinga check. That is a
+health is `warning` or `critical` — it is documented as a Nagios/Icinga check. That is a
 successful report with a nonzero exit and still emits a `StatusReport`, never an
 envelope. Callers should branch on the presence of `error`/`ok`, not on the exit
 code alone.

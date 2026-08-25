@@ -195,6 +195,7 @@ struct BackupEngineTests {
         machineId: String = "example-machine",
         primaryRepoURL: String? = nil,
         onSecretPasswordRead: (@Sendable (UUID) -> Void)? = nil,
+        logWriterFactory: (@Sendable (URL) throws -> LogWriter)? = nil,
         /// Overridable so a test can point the engine at a binary it is
         /// allowed to modify, and assert what happens when restic is
         /// replaced mid-operation.
@@ -276,7 +277,8 @@ struct BackupEngineTests {
             now: clock.now,
             purgeSourcePaths: purgeSourcePaths,
             purgeHostnames: purgeHostnames,
-            machineId: machineId
+            machineId: machineId,
+            logWriterFactory: logWriterFactory
         )
 
         return Env(
@@ -612,8 +614,8 @@ struct BackupEngineTests {
         #expect(env.indexEntries.isEmpty)
     }
 
-    @Test("a terminal-index failure does not strand otherwise safe mirror and retention work")
-    func runIndexFailureContinuesIndependentPhases() async throws {
+    @Test("a destructive terminal-index failure blocks the next destructive phase")
+    func destructiveIndexFailureBlocksNextDestructivePhase() async throws {
         let paths = Box<AppPaths?>(nil)
         let env = Self.makeEnv(
             script: [],
@@ -655,9 +657,9 @@ struct BackupEngineTests {
             [Self.resticPath] + Self.backupArgv(env.primary.repoURL),
             [Self.resticPath] + Self.copyArgv(to: secondary.repoURL, from: env.primary.repoURL),
             [Self.resticPath] + Self.forgetArgv(secondary.repoURL),
-            [Self.resticPath] + Self.forgetArgv(env.primary.repoURL),
         ]
         #expect(env.resticArgvs == expectedArgvs)
+        #expect(reason.contains("operation_completed_audit_failed"))
         #expect(env.indexEntries.isEmpty)
     }
 
@@ -1764,9 +1766,34 @@ struct BackupEngineTests {
             Issue.record("a terminal index failure must remain infrastructure failure: \(status)")
             return
         }
-        #expect(reason.contains("run history unusable"))
+        #expect(reason.contains("operation_completed_audit_failed"))
         #expect(operationMayHaveRun)
         #expect(env.indexEntries.isEmpty)
+    }
+
+    @Test("runPrune: an unopenable audit log refuses destructive launch")
+    func pruneLogOpenFailureRefusesLaunch() async throws {
+        let env = Self.makeEnv(
+            script: [],
+            reachableSecondaries: [],
+            logWriterFactory: { url in
+                throw LogWriterError.openFailed(errno: EACCES, path: url.path)
+            }
+        )
+        defer { env.cleanUp() }
+
+        let outcome = await env.engine.runPruneUnchecked(env.set)
+
+        guard case .infrastructureFailure(let reason, let operationMayHaveRun) = outcome else {
+            Issue.record("an unavailable destructive audit log must fail closed: \(outcome)")
+            return
+        }
+        #expect(reason.contains("required destructive audit log"))
+        #expect(!operationMayHaveRun)
+        #expect(env.resticArgvs.isEmpty, "no destructive argv may reach the process runner")
+        let run = try #require(env.entries(kind: .prune).first)
+        #expect(run.status == .failed)
+        #expect(try env.runStore.unresolvedAuditFailures().isEmpty)
     }
 
     @Test("runPrune: an unusable set lock is a typed infrastructure failure")
@@ -1844,7 +1871,7 @@ struct BackupEngineTests {
             Issue.record("a missing terminal index entry must fail standalone prune: \(result)")
             return
         }
-        #expect(reason.contains("run history unusable"))
+        #expect(reason.contains("operation_completed_audit_failed"))
         #expect(env.indexEntries.isEmpty)
     }
 
@@ -1878,7 +1905,7 @@ struct BackupEngineTests {
             Issue.record("combined launch/index failure must stay infrastructure failure: \(result)")
             return
         }
-        #expect(reason.contains("run history unusable"))
+        #expect(reason.contains("operation_completed_audit_failed"))
         #expect(env.indexEntries.isEmpty)
     }
 
@@ -1930,7 +1957,7 @@ struct BackupEngineTests {
             Issue.record("a missing terminal index entry must fail remote prune: \(result)")
             return
         }
-        #expect(reason.contains("run history unusable"))
+        #expect(reason.contains("operation_completed_audit_failed"))
         #expect(env.indexEntries.isEmpty)
     }
 
@@ -3288,7 +3315,7 @@ struct BackupEngineTests {
                 Issue.record("expected infrastructure failure, got \(error)")
                 return
             }
-            #expect(reason.contains("run history unusable"))
+            #expect(reason.contains("operation_completed_audit_failed"))
             #expect(operationMayHaveRun)
         }
         #expect(env.resticArgvs.contains { $0.contains("rewrite") && $0.contains("--forget") })
