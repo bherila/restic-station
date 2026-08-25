@@ -103,6 +103,7 @@ public final class StateWatcher: ObservableObject {
 
     private var distributedNotificationObserver: NSObjectProtocol?
     private var debounceTask: Task<Void, Never>?
+    private var explicitAuditRefreshTask: Task<Void, Never>?
     private var isRunning = false
     /// Invalidates an older detached scan whenever any newer synchronous or
     /// asynchronous refresh begins. Detached filesystem reads can finish out
@@ -184,6 +185,7 @@ public final class StateWatcher: ObservableObject {
         // reference, but a bare `deinit` must not leak fds/observers if a
         // caller forgets.
         debounceTask?.cancel()
+        explicitAuditRefreshTask?.cancel()
         stateDirSource?.cancel()
         runsDirSource?.cancel()
         locksDirSource?.cancel()
@@ -199,8 +201,9 @@ public final class StateWatcher: ObservableObject {
     // MARK: - Lifecycle
 
     /// Opens the directory watches, registers the distributed-notification
-    /// observer, and performs an initial synchronous `reloadNow()` so
-    /// `@Published` state is populated before the first SwiftUI render.
+    /// observer, and performs an initial `reloadNow()`. Cheap `@Published`
+    /// state is populated synchronously; the potentially contended full
+    /// audit scan is detached from the first SwiftUI render.
     /// Idempotent — a second call while already running is a no-op.
     public func start() {
         guard !isRunning else { return }
@@ -251,6 +254,8 @@ public final class StateWatcher: ObservableObject {
 
         debounceTask?.cancel()
         debounceTask = nil
+        explicitAuditRefreshTask?.cancel()
+        explicitAuditRefreshTask = nil
 
         stateDirSource?.cancel()
         stateDirSource = nil
@@ -274,13 +279,13 @@ public final class StateWatcher: ObservableObject {
         }
     }
 
-    /// Synchronously re-reads every published property through
-    /// `StateStore`/`RunStore`. Safe to call at any time (including before
-    /// `start()`, e.g. to pre-populate a preview) — every read tolerates a
-    /// missing file or directory.
+    /// Re-reads every published property through `StateStore`/`RunStore`.
+    /// Event-backed caches update synchronously; the potentially contended
+    /// full audit scan always runs detached and publishes later through its
+    /// generation guard. Safe to call at any time, including before start.
     public func reloadNow() {
         reloadCachedStateNow()
-        refreshAuditHealth()
+        scheduleExplicitAuditRefresh()
     }
 
     /// Reloads event-backed caches that are cheap to read. Audit history is
@@ -303,27 +308,10 @@ public final class StateWatcher: ObservableObject {
         recentRuns = (try? runStore.recentRuns(limit: 200)) ?? []
     }
 
-    /// Re-evaluates the liveness-sensitive destructive audit state without
-    /// reloading every cache. A helper dying releases its flock but creates
-    /// no filesystem event, so AppModel calls this from its existing
-    /// 30-second health refresh.
-    public func refreshAuditHealth() {
-        auditRefreshGeneration &+= 1
-        switch auditHealthLoader() {
-        case .success(let failures):
-            auditFailures = failures
-            auditVerificationFailed = false
-        case .verificationFailed:
-            auditFailures = []
-            auditVerificationFailed = true
-        }
-    }
-
     /// Performs the potentially contended full run-history scan away from
-    /// the main actor, then publishes only the small result here. The
-    /// synchronous variant remains available for explicit reloads, while the
-    /// periodic liveness check must not freeze the menu bar for the audit
-    /// lock's bounded wait or a large history directory traversal.
+    /// the main actor, then publishes only the small result here. A helper
+    /// dying releases its flock but creates no filesystem event, so AppModel
+    /// also calls this from its existing 30-second health refresh.
     public func refreshAuditHealthOffMain() async {
         auditRefreshGeneration &+= 1
         let generation = auditRefreshGeneration
@@ -341,6 +329,14 @@ public final class StateWatcher: ObservableObject {
         case .verificationFailed:
             auditFailures = []
             auditVerificationFailed = true
+        }
+    }
+
+    private func scheduleExplicitAuditRefresh() {
+        explicitAuditRefreshTask?.cancel()
+        explicitAuditRefreshTask = Task { @MainActor [weak self] in
+            guard let self, !Task.isCancelled else { return }
+            await self.refreshAuditHealthOffMain()
         }
     }
 

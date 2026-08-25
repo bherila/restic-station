@@ -426,6 +426,7 @@ struct StateWatcherTests {
             stateStore: StateStore(paths: paths)
         )
         watcher.reloadNow()
+        await watcher.refreshAuditHealthOffMain()
         #expect(watcher.auditFailures.isEmpty)
         #expect(!watcher.auditVerificationFailed)
 
@@ -462,13 +463,37 @@ struct StateWatcherTests {
 
         let staleRefresh = Task { await watcher.refreshAuditHealthOffMain() }
         await Task.detached { loader.waitUntilFirstStarted() }.value
-        watcher.refreshAuditHealth()
+        await watcher.refreshAuditHealthOffMain()
         #expect(watcher.auditFailures == [failure])
 
         loader.finishFirst()
         await staleRefresh.value
         #expect(watcher.auditFailures == [failure])
         #expect(!watcher.auditVerificationFailed)
+    }
+
+    @Test("explicit reload audit scans never run on the main thread")
+    func explicitAuditRefreshRunsOffMain() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-audit-explicit-thread-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = AppPaths(root: root)
+        let recorder = AuditLoaderThreadRecorder()
+        let watcher = StateWatcher(
+            paths: paths,
+            runStore: RunStore(paths: paths),
+            stateStore: StateStore(paths: paths),
+            auditHealthLoader: { recorder.load() }
+        )
+
+        watcher.reloadNow()
+        for _ in 0..<40 {
+            if !recorder.observations.isEmpty { break }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+
+        #expect(!recorder.observations.isEmpty)
+        #expect(recorder.observations.allSatisfy { !$0 })
     }
 
     @Test("filesystem-triggered audit scans never run on the main thread")
