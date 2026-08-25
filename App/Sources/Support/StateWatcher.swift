@@ -280,6 +280,31 @@ public final class StateWatcher: ObservableObject {
         }
     }
 
+    /// Performs the potentially contended full run-history scan away from
+    /// the main actor, then publishes only the small result here. The
+    /// synchronous variant remains available for explicit reloads, while the
+    /// periodic liveness check must not freeze the menu bar for the audit
+    /// lock's bounded wait or a large history directory traversal.
+    public func refreshAuditHealthOffMain() async {
+        let store = runStore
+        let result = await Task.detached(priority: .utility) {
+            do {
+                return AuditHealthRefreshResult.success(try store.unresolvedAuditFailures())
+            } catch {
+                return AuditHealthRefreshResult.verificationFailed
+            }
+        }.value
+
+        switch result {
+        case .success(let failures):
+            auditFailures = failures
+            auditVerificationFailed = false
+        case .verificationFailed:
+            auditFailures = []
+            auditVerificationFailed = true
+        }
+    }
+
     // MARK: - Debounce
 
     private func scheduleDebouncedReload() {
@@ -621,4 +646,9 @@ public final class StateWatcher: ObservableObject {
         source.resume()
         return source
     }
+}
+
+private enum AuditHealthRefreshResult: Sendable {
+    case success([RunAuditFailure])
+    case verificationFailed
 }

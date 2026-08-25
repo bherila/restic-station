@@ -375,6 +375,8 @@ public final class BackupEngine: Sendable {
         switch backupResult {
         case .completed(let child):
             backup = child
+        case .deferred(let reason):
+            return .infrastructureFailure(reason: reason)
         case .infrastructureFailure(let reason):
             return .infrastructureFailure(reason: reason)
         }
@@ -508,6 +510,9 @@ public final class BackupEngine: Sendable {
             switch copyResult {
             case .completed(let child):
                 copy = child
+            case .deferred(let reason):
+                infrastructureFailures.append("secondary \"\(secondary.label)\": \(reason)")
+                continue
             case .infrastructureFailure(let reason):
                 infrastructureFailures.append("secondary \"\(secondary.label)\": \(reason)")
                 continue
@@ -543,6 +548,8 @@ public final class BackupEngine: Sendable {
                 }
             case .infrastructureFailure(let reason):
                 infrastructureFailures.append("secondary \"\(secondary.label)\": \(reason)")
+            case .deferred:
+                break
             case .notRequired:
                 break
             }
@@ -563,6 +570,8 @@ public final class BackupEngine: Sendable {
             }
         case .infrastructureFailure(let reason):
             infrastructureFailures.append("primary \"\(primary.label)\": \(reason)")
+        case .deferred:
+            break
         case .notRequired:
             break
         }
@@ -661,6 +670,8 @@ public final class BackupEngine: Sendable {
         switch primaryCheckResult {
         case .completed(let child):
             primaryCheck = child
+        case .deferred(let reason):
+            return .infrastructureFailure(reason: reason)
         case .infrastructureFailure(let reason):
             return .infrastructureFailure(reason: reason)
         }
@@ -709,6 +720,10 @@ public final class BackupEngine: Sendable {
                             )
                         }
                     case .infrastructureFailure(let reason):
+                        infrastructureFailures.append(
+                            "secondary \"\(secondary.label)\": \(reason)"
+                        )
+                    case .deferred(let reason):
                         infrastructureFailures.append(
                             "secondary \"\(secondary.label)\": \(reason)"
                         )
@@ -824,6 +839,8 @@ public final class BackupEngine: Sendable {
         switch primaryPruneResult {
         case .completed(let child):
             primaryPrune = child
+        case .deferred:
+            return .skipped
         case .infrastructureFailure(let reason):
             return .infrastructureFailure(
                 reason: reason,
@@ -876,6 +893,8 @@ public final class BackupEngine: Sendable {
                     // already executed by the time this later record fails.
                     operationMayHaveRun: true
                 )
+            case .deferred:
+                return .completed(Self.worstStatus(statuses))
             case .notRequired:
                 // The public guard above already requires a non-empty policy.
                 continue
@@ -1027,6 +1046,8 @@ public final class BackupEngine: Sendable {
             switch pruneResult {
             case .completed(let child):
                 prune = child
+            case .deferred:
+                return .skipped(.busy)
             case .infrastructureFailure(let reason):
                 return .failed(.infrastructure(reason))
             }
@@ -1118,6 +1139,8 @@ public final class BackupEngine: Sendable {
         switch pruneResult {
         case .completed(let child):
             prune = child
+        case .deferred:
+            return .skipped(.busy)
         case .infrastructureFailure(let reason):
             return .failed(.infrastructure(reason))
         }
@@ -1566,6 +1589,14 @@ public final class BackupEngine: Sendable {
             switch purgeResult {
             case .completed(let child):
                 purge = child
+            case .deferred(let reason):
+                if children.isEmpty {
+                    throw PurgeApplyError.busy
+                }
+                throw PurgeApplyError.infrastructureFailure(
+                    reason: reason,
+                    operationMayHaveRun: true
+                )
             case .infrastructureFailure(let reason):
                 throw PurgeApplyError.infrastructureFailure(
                     reason: reason,
@@ -1807,6 +1838,8 @@ public final class BackupEngine: Sendable {
         switch restoreResult {
         case .completed(let child):
             restore = child
+        case .deferred(let reason):
+            return .infrastructureFailure(reason: reason, operationMayHaveRun: false)
         case .infrastructureFailure(let reason):
             return .infrastructureFailure(
                 reason: reason,
@@ -1872,6 +1905,8 @@ public final class BackupEngine: Sendable {
         switch initResult {
         case .completed(let child):
             initRun = child
+        case .deferred(let reason):
+            return .infrastructureFailure(reason: reason, operationMayHaveRun: false)
         case .infrastructureFailure(let reason):
             return .infrastructureFailure(
                 reason: reason,
@@ -1934,6 +1969,8 @@ public final class BackupEngine: Sendable {
         ) {
         case .completed(let child):
             return .completed(child)
+        case .deferred(let reason):
+            return .deferred(reason)
         case .infrastructureFailure(let reason):
             return .infrastructureFailure(reason)
         }
@@ -1959,12 +1996,16 @@ public final class BackupEngine: Sendable {
     /// ordinary skip or as an intentionally absent retention operation.
     private enum RecordedChildResult {
         case completed(ChildRun)
+        /// Expected machine-wide destructive-gate contention. Nothing was
+        /// recorded or launched, so callers may safely defer and retry.
+        case deferred(String)
         case infrastructureFailure(String)
     }
 
     private enum RetentionChildResult {
         case notRequired
         case completed(ChildRun)
+        case deferred(String)
         case infrastructureFailure(String)
     }
 
@@ -2054,7 +2095,7 @@ public final class BackupEngine: Sendable {
             case .busy:
                 let reason = "destructive audit gate busy — another destructive operation is running"
                 logWarning("BackupEngine: \(reason)")
-                return .infrastructureFailure(reason)
+                return .deferred(reason)
             case .failed(let failure):
                 let reason = "run history unusable — destructive audit gate unusable: \(failure)"
                 logWarning("BackupEngine: \(reason)")

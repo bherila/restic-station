@@ -215,7 +215,7 @@ final class AppModel: ObservableObject {
                 try? await Task.sleep(nanoseconds: Self.healthRefreshIntervalNanoseconds)
                 guard !Task.isCancelled else { return }
                 guard let self else { return }
-                self.stateWatcher.refreshAuditHealth()
+                await self.stateWatcher.refreshAuditHealthOffMain()
                 self.recomputeDerivedState()
             }
         }

@@ -30,6 +30,9 @@ public enum RunKind: String, Codable, Equatable, Sendable, CaseIterable {
 /// Why a destructive run is not represented by a complete canonical
 /// metadata record plus its derived index entry.
 public enum RunAuditFailureReason: String, Codable, Equatable, Sendable {
+    /// The derived index claims a destructive run completed, but the
+    /// canonical per-run directory/metadata record is gone entirely.
+    case canonicalMetadataMissing = "canonical_metadata_missing"
     /// The pre-spawn launch marker exists, the owning helper is gone, and no
     /// terminal metadata was committed. The repository outcome is unknown.
     case launchedWithoutTerminalMetadata = "launched_without_terminal_metadata"

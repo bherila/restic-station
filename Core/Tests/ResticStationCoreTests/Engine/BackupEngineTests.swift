@@ -1878,12 +1878,7 @@ struct BackupEngineTests {
 
         let outcome = await env.engine.runPruneUnchecked(env.set)
 
-        guard case .infrastructureFailure(let reason, let operationMayHaveRun) = outcome else {
-            Issue.record("a held destructive audit gate must refuse prune: \(outcome)")
-            return
-        }
-        #expect(!operationMayHaveRun)
-        #expect(reason.contains("destructive audit gate busy"))
+        #expect(outcome == .skipped)
         #expect(env.resticArgvs.isEmpty)
     }
 
@@ -2414,6 +2409,38 @@ struct BackupEngineTests {
             authorization: authorization
         )
         #expect(completed == .completed(.success))
+    }
+
+    @Test("standalone prune: destructive audit contention is retryable and retains its preview token")
+    func standalonePruneAuditGateContentionRetainsPreviewToken() async throws {
+        let env = Self.makeEnv(script: [], retention: nil)
+        defer { env.cleanUp() }
+        let fingerprint = env.primary.pruneConfirmationFingerprint(secretEnv: [:])
+        let token = try PreviewTokenStore(paths: env.paths).issueMaintenancePrune(
+            machineId: env.machineId,
+            setId: env.set.id,
+            destinationId: env.primary.id,
+            effectiveDestinationFingerprint: fingerprint
+        )
+        let authorization = MaintenancePruneAuthorization(
+            token: token,
+            machineId: env.machineId,
+            effectiveDestinationFingerprint: fingerprint
+        )
+        let gate = FileLock(path: env.paths.destructiveAuditLockFile, trustedRoot: env.paths.root)
+        #expect(gate.acquire() == .acquired)
+
+        let result = await env.engine.runPruneRepository(
+            set: env.set,
+            destination: env.primary,
+            authorization: authorization
+        )
+        gate.release()
+
+        #expect(result == .skipped(.busy))
+        #expect(try PreviewTokenStore(paths: env.paths).token(token).value == token)
+        #expect(env.fake.invocations.isEmpty)
+        #expect(env.entries(kind: .prune).isEmpty)
     }
 
     @Test("standalone prune: an invalid confirmation remains previewChanged")

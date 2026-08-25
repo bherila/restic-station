@@ -195,6 +195,28 @@ private final class TickCounter: @unchecked Sendable {
         #expect(Set(index.map(\.groupId)) == [backupRun.runId])
     }
 
+    @Test("a failed initial metadata publication removes its unpublished run directory")
+    func failedInitialPublicationRemovesRunDirectory() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+        let setId = UUID()
+        let start = Date(timeIntervalSince1970: 1_700_000_000)
+        let runId = RunStore.formatRunId(kind: .prune, setId: setId, date: start)
+        let store = RunStore(
+            paths: paths,
+            now: { start },
+            initialPublicationHook: { directory in
+                throw RunStoreError.discardUnsafe(path: directory.path)
+            }
+        )
+
+        #expect(throws: RunStoreError.self) {
+            try store.begin(kind: .prune, setId: setId, destId: UUID(), trigger: .manual)
+        }
+        #expect(!FileManager.default.fileExists(atPath: paths.runDir(runId: runId).path))
+        #expect(try store.unresolvedAuditFailures().isEmpty)
+    }
+
     // MARK: - Crash recovery
 
     @Test func recoverInterruptedRewritesDeadPidRunsAsFailed() throws {
@@ -297,6 +319,47 @@ private final class TickCounter: @unchecked Sendable {
         let failure = try #require(store.unresolvedAuditFailures().first)
         #expect(failure.runId == run.runId)
         #expect(failure.reason == .terminalMetadataIndexMismatch)
+    }
+
+    @Test("a destructive index projection without canonical metadata is an audit failure")
+    func destructiveIndexWithoutCanonicalMetadata() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+        let store = RunStore(paths: paths, now: { Date() })
+        let run = try store.begin(kind: .prune, setId: UUID(), destId: UUID(), trigger: .manual)
+        try store.markDestructiveLaunchAuthorized(run)
+        try store.finish(run, status: .success, resticExitCode: 0)
+
+        try FileManager.default.removeItem(at: paths.runDir(runId: run.runId))
+
+        let failure = try #require(store.unresolvedAuditFailures().first)
+        #expect(failure.runId == run.runId)
+        #expect(failure.kind == .prune)
+        #expect(failure.setId == run.setId)
+        #expect(failure.destId == run.destId)
+        #expect(failure.reason == .canonicalMetadataMissing)
+    }
+
+    @Test("terminal metadata and index publication are atomic to audit verification")
+    func terminalPublicationWaitsForAuditPublicationLock() async throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+        let store = RunStore(paths: paths, now: { Date() })
+        let run = try store.begin(kind: .prune, setId: UUID(), destId: UUID(), trigger: .manual)
+        try store.markDestructiveLaunchAuthorized(run)
+        let held = FileLock(path: paths.runPublicationLockFile, trustedRoot: paths.root)
+        #expect(held.acquire() == .acquired)
+
+        let finishing = Task.detached {
+            try store.finish(run, status: .success, resticExitCode: 0)
+        }
+        try await Task.sleep(nanoseconds: 50_000_000)
+        #expect(try store.metadata(runId: run.runId).status == .running)
+        held.release()
+        try await finishing.value
+
+        #expect(try store.metadata(runId: run.runId).status == .success)
+        #expect(try store.unresolvedAuditFailures().isEmpty)
     }
 
     @Test("unreadable canonical run metadata makes audit verification fail closed")

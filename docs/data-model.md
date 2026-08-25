@@ -332,7 +332,13 @@ with the directory-plus-initial-metadata publication performed by every run,
 so a verifier cannot mistake the writer's own mkdir-to-metadata interval for
 corruption. It also serializes read-only verifiers; contention between two
 scans therefore cannot be mistaken for ownership of the destructive gate. A
-running launch marker is considered live only while the kernel-released
+terminal metadata rewrite and its index append, including crash recovery,
+hold that same publication lock as one verifier-visible transaction. A scan
+therefore cannot observe the canonical half of an ordinary finish without
+its derived projection. A failed first metadata write removes the unpublished
+run directory before releasing the lock, so it cannot leave permanent
+directory-shaped audit wreckage. A running launch marker is considered live
+only while the kernel-released
 destructive gate is held and its helper PID exists; PID existence alone is
 never trusted because PIDs are reusable. For run directories using the current
 documented runId format, the operation kind encoded in metadata must match the
@@ -376,7 +382,10 @@ readable and decodable. It fails closed on missing or corrupt canonical
 evidence instead of skipping the directory. A terminal destructive record is
 complete only when the index contains exactly one projection equal to
 `metadata.indexEntry`; an absent, duplicate, or divergent projection remains
-critical until #120's reconciliation repairs it.
+critical until #120's reconciliation repairs it. Conversely, a destructive
+index projection whose entire canonical run directory is missing reports
+`canonical_metadata_missing`; a directory-driven scan must never silently
+authorize another destructive launch after that loss.
 
 `status --json` exposes unresolved entries in `auditFailures`, each with
 `code: "operation_completed_audit_failed"` and `retryable: false`, and reports

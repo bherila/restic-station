@@ -90,6 +90,9 @@ public enum RunStoreError: Error, Equatable, Sendable, CustomStringConvertible {
     /// The independently encoded kind in a current-format run directory name
     /// disagrees with metadata.
     case runDirectoryKindMismatch(path: String, encodedKind: RunKind)
+    /// Initial metadata publication failed after its fresh run directory was
+    /// created, and removing that unpublished directory failed too.
+    case initialPublicationCleanupFailed(path: String, publicationError: String, cleanupError: String)
     /// The `index.jsonl` companion lock could not be used at all — wrong
     /// owner, unopenable, or an uncreatable `runs/` (#110).
     case lockUnusable(LockFailure)
@@ -108,6 +111,8 @@ public enum RunStoreError: Error, Equatable, Sendable, CustomStringConvertible {
             return "timed out waiting for run-publication lock \(path)"
         case .runDirectoryKindMismatch(let path, let encodedKind):
             return "run directory kind does not match metadata kind \(encodedKind.rawValue): \(path)"
+        case .initialPublicationCleanupFailed(let path, let publicationError, let cleanupError):
+            return "initial run publication failed at \(path): \(publicationError); cleanup also failed: \(cleanupError)"
         case .lockUnusable(let failure):
             return "run-store lock unusable: \(failure)"
         }
@@ -126,6 +131,7 @@ public struct RunStore: Sendable {
     public let paths: AppPaths
     private let now: @Sendable () -> Date
     private let uptime: @Sendable () -> TimeInterval
+    private let initialPublicationHook: @Sendable (URL) throws -> Void
 
     /// Five minutes is ten missed 30-second heartbeats: long enough to absorb
     /// scheduling pressure, short enough for a monitoring check to catch a
@@ -160,6 +166,22 @@ public struct RunStore: Sendable {
         self.paths = paths
         self.now = now
         self.uptime = uptime
+        self.initialPublicationHook = { _ in }
+    }
+
+    /// Fault-injection seam for the publication rollback regression test.
+    /// Kept internal so production callers cannot insert work between the
+    /// directory creation and first canonical metadata commit.
+    init(
+        paths: AppPaths,
+        now: @escaping @Sendable () -> Date,
+        uptime: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+        initialPublicationHook: @escaping @Sendable (URL) throws -> Void
+    ) {
+        self.paths = paths
+        self.now = now
+        self.uptime = uptime
+        self.initialPublicationHook = initialPublicationHook
     }
 
     // MARK: - begin / finish
@@ -214,8 +236,24 @@ public struct RunStore: Sendable {
             stats: nil,
             purgeSnapshotRewrites: nil
         )
-        try FileManager.default.createDirectory(at: paths.runDir(runId: runId), withIntermediateDirectories: true)
-        try writeMetadataAtomic(metadata)
+        let runDirectory = paths.runDir(runId: runId)
+        try FileManager.default.createDirectory(at: runDirectory, withIntermediateDirectories: true)
+        do {
+            try initialPublicationHook(runDirectory)
+            try writeMetadataAtomic(metadata)
+        } catch {
+            let publicationError = String(describing: error)
+            do {
+                try FileManager.default.removeItem(at: runDirectory)
+            } catch let cleanupError {
+                throw RunStoreError.initialPublicationCleanupFailed(
+                    path: runDirectory.path,
+                    publicationError: publicationError,
+                    cleanupError: String(describing: cleanupError)
+                )
+            }
+            throw error
+        }
 
         return ActiveRun(
             runId: runId,
@@ -241,6 +279,13 @@ public struct RunStore: Sendable {
         purgeSnapshotRewrites: [String: String]? = nil,
         auditFailureReason: RunAuditFailureReason? = nil
     ) throws {
+        // Publish the canonical terminal rewrite and its derived index line
+        // as one verifier-visible transaction. Without this lock a scan can
+        // observe new terminal metadata against the old index snapshot and
+        // permanently misdiagnose an ordinary in-flight finish.
+        let publicationLock = try acquireRunPublicationLock()
+        defer { publicationLock.release() }
+
         // The launch marker is committed separately, immediately before
         // process creation. Preserve that canonical evidence in the terminal
         // rewrite. Failing to re-read it is itself an audit failure; do not
@@ -334,6 +379,11 @@ public struct RunStore: Sendable {
     @discardableResult
     public func recoverInterrupted() throws -> [RecoveredRun] {
         try paths.ensureDirectories()
+
+        // Recovery performs the same terminal metadata + index publication
+        // as finish(), so it must obey the same verifier-visible boundary.
+        let publicationLock = try acquireRunPublicationLock()
+        defer { publicationLock.release() }
 
         let fileManager = FileManager.default
         guard let runDirs = try? fileManager.contentsOfDirectory(
@@ -519,6 +569,7 @@ public struct RunStore: Sendable {
         )
         let decoder = ConfigStore.makeDecoder()
         var failures: [RunAuditFailure] = []
+        var canonicalDestructiveRunIds: Set<String> = []
 
         for directory in runDirectories {
             let values = try directory.resourceValues(forKeys: [.isDirectoryKey])
@@ -545,6 +596,7 @@ public struct RunStore: Sendable {
             }
             guard discriminator.kind.isDestructive else { continue }
             let metadata = try decoder.decode(RunMetadata.self, from: data)
+            canonicalDestructiveRunIds.insert(metadata.runId)
             guard metadata.destructiveLaunchAuthorizedAt != nil else {
                 continue
             }
@@ -577,6 +629,27 @@ public struct RunStore: Sendable {
                     reason: reason
                 ))
             }
+        }
+
+        // The index is derived, but a destructive projection with no
+        // canonical record is still evidence of an operation whose durable
+        // audit source disappeared. Directory-driven scans alone would
+        // silently miss exactly that loss.
+        for (runId, projections) in indexedByRunId
+            where projections.contains(where: { $0.kind.isDestructive })
+                && !canonicalDestructiveRunIds.contains(runId) {
+            guard let projection = projections
+                .filter({ $0.kind.isDestructive })
+                .sorted(by: { $0.start < $1.start })
+                .first else { continue }
+            failures.append(RunAuditFailure(
+                runId: runId,
+                kind: projection.kind,
+                setId: projection.setId,
+                destId: projection.destId,
+                start: projection.start,
+                reason: .canonicalMetadataMissing
+            ))
         }
 
         return failures.sorted {
