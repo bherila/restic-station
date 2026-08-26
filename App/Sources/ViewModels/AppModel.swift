@@ -337,6 +337,12 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Makes the global reload affordance visible when an editor's stale
+    /// preflight notices a replacement before the watcher publishes it.
+    func noteConfigChangedOnDisk() {
+        configChangedOnDisk = true
+    }
+
     /// Persists an edit to `machine.json` — the host-local half of the
     /// configuration (`docs/data-model.md` §machine.json). Kept separate
     /// from `saveConfig(_:)` because the two files have different lifetimes:
@@ -514,7 +520,11 @@ final class AppModel: ObservableObject {
             .sink { [weak self] observedFingerprint in
                 MainActor.assumeIsolated {
                     guard let self else { return }
-                    self.configChangedOnDisk = observedFingerprint != self.configFingerprint
+                    // A failed reload must retain the only production reload
+                    // affordance even if fleet sync restores the exact bytes
+                    // already represented by `configFingerprint`.
+                    self.configChangedOnDisk = self.configLoadError != nil
+                        || observedFingerprint != self.configFingerprint
                 }
             }
             .store(in: &cancellables)

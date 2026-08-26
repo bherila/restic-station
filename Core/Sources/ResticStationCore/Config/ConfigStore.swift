@@ -306,10 +306,12 @@ public struct ConfigStore: Sendable {
     }
 
     /// Saves only when `config.json` is still the exact byte revision the
-    /// caller began editing. The comparison and every Restic Station write
-    /// are serialized by `locks/config.lock`; a fleet-sync tool need not
-    /// understand that lock because its replacement changes the fingerprint
-    /// checked immediately before the atomic rename.
+    /// caller began editing. Every Restic Station writer is serialized by
+    /// `locks/config.lock`. On Darwin, where the app runs, the candidate is
+    /// atomically exchanged with `config.json` and the displaced bytes are
+    /// checked, so even a non-cooperating fleet replacement cannot land in
+    /// the old check-to-rename window. Other platforms rely on the shared
+    /// lock used by the helper's supported config writers.
     ///
     /// - Returns: the fingerprint of the bytes installed by this save.
     @discardableResult
@@ -319,16 +321,29 @@ public struct ConfigStore: Sendable {
 
         let data = try Self.makeEncoder().encode(config)
         return try withConfigWriteLock {
-            // Write the complete candidate first. This leaves the comparison
-            // as close as possible to rename and never exposes partial JSON.
             try data.write(to: tempConfigFile)
-            let actualFingerprint = try currentFileFingerprint()
-            guard actualFingerprint == expectedFingerprint else {
+            let installed = try AtomicFile.replaceIfMatches(
+                from: tempConfigFile,
+                to: paths.configFile,
+                expectedFingerprint: expectedFingerprint,
+                candidateFingerprint: SHA256Digest.hex(data)
+            )
+            guard installed else {
                 try? FileManager.default.removeItem(at: tempConfigFile)
                 throw ConfigStoreError.changedOnDisk
             }
-            try AtomicFile.rename(from: tempConfigFile, to: paths.configFile)
             return SHA256Digest.hex(data)
+        }
+    }
+
+    /// Refuses an edit before it performs a related side effect outside
+    /// `config.json` (the destination editor's keychain write). The config
+    /// save still performs the authoritative atomic compare-and-swap.
+    public func assertUnchanged(from expectedFingerprint: String) throws {
+        try withConfigWriteLock {
+            guard try currentFileFingerprint() == expectedFingerprint else {
+                throw ConfigStoreError.changedOnDisk
+            }
         }
     }
 
@@ -432,6 +447,99 @@ enum AtomicFile {
             throw ConfigStoreError.renameFailed(errno: renameErrno, from: fromPath, to: toPath)
         }
     }
+
+    /// Atomically installs `source` only when `destination` is the revision
+    /// the caller edited. Darwin's `RENAME_SWAP` supplies the missing atomic
+    /// boundary: the bytes displaced by the swap are the exact bytes that
+    /// were present when the candidate became visible. A mismatch is swapped
+    /// straight back and reported without accepting the stale edit.
+    static func replaceIfMatches(
+        from source: URL,
+        to destination: URL,
+        expectedFingerprint: String,
+        candidateFingerprint: String
+    ) throws -> Bool {
+        #if canImport(Darwin)
+        if expectedFingerprint == "absent" {
+            let result = renameX(from: source, to: destination, flags: UInt32(RENAME_EXCL))
+            if result == 0 { return true }
+            let failure = errno
+            if failure == EEXIST { return false }
+            throw ConfigStoreError.renameFailed(
+                errno: failure, from: source.path, to: destination.path
+            )
+        }
+
+        let swap = renameX(from: source, to: destination, flags: UInt32(RENAME_SWAP))
+        if swap != 0 {
+            let failure = errno
+            if failure == ENOENT { return false }
+            throw ConfigStoreError.renameFailed(
+                errno: failure, from: source.path, to: destination.path
+            )
+        }
+
+        let displacedFingerprint: String
+        do {
+            displacedFingerprint = SHA256Digest.hex(try Data(contentsOf: source))
+        } catch {
+            _ = renameX(from: source, to: destination, flags: UInt32(RENAME_SWAP))
+            throw error
+        }
+
+        guard displacedFingerprint != expectedFingerprint else {
+            try? FileManager.default.removeItem(at: source)
+            return true
+        }
+
+        let rollback = renameX(from: source, to: destination, flags: UInt32(RENAME_SWAP))
+        guard rollback == 0 else {
+            throw ConfigStoreError.renameFailed(
+                errno: errno, from: source.path, to: destination.path
+            )
+        }
+
+        // Normally the source now holds our candidate. If a non-cooperating
+        // writer replaced the destination during the tiny rollback window,
+        // the source instead holds that newer external revision. Put it back
+        // rather than discarding it; the stale app edit still loses.
+        if let rolledOut = try? Data(contentsOf: source),
+           SHA256Digest.hex(rolledOut) != candidateFingerprint {
+            let restoreExternal = renameX(
+                from: source, to: destination, flags: UInt32(RENAME_SWAP)
+            )
+            guard restoreExternal == 0 else {
+                throw ConfigStoreError.renameFailed(
+                    errno: errno, from: source.path, to: destination.path
+                )
+            }
+        }
+        try? FileManager.default.removeItem(at: source)
+        return false
+        #else
+        // The Linux helper's supported writers all use `config.lock`.
+        // Linux has renameat2(RENAME_EXCHANGE), but Swift's Glibc/Musl
+        // overlays do not expose it consistently across supported builders.
+        let actual = if FileManager.default.fileExists(atPath: destination.path) {
+            SHA256Digest.hex(try Data(contentsOf: destination))
+        } else {
+            "absent"
+        }
+        guard actual == expectedFingerprint else { return false }
+        try rename(from: source, to: destination)
+        return true
+        #endif
+    }
+
+    #if canImport(Darwin)
+    private static func renameX(from source: URL, to destination: URL, flags: UInt32) -> Int32 {
+        source.path.withCString { fromC in
+            destination.path.withCString { toC in
+                Darwin.renamex_np(fromC, toC, flags)
+            }
+        }
+    }
+    #endif
 }
 
 /// Low-level failures from `ConfigStore.save(_:)`'s atomic rename step.

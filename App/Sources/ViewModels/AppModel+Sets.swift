@@ -134,8 +134,23 @@ extension AppModel {
     func storeDestinationSecrets(
         destId: UUID,
         password: String?,
-        secretEnv: [String: String]?
+        secretEnv: [String: String]?,
+        ifConfigUnchangedFrom expectedFingerprint: String
     ) async throws {
+        // Refuse a stale editor before opening or mutating the secret store.
+        // `saveSet` still performs the authoritative atomic CAS after these
+        // writes, covering a replacement that lands later.
+        if let configLoadError {
+            throw AppModelError.configUnreadable(configLoadError)
+        }
+        do {
+            try configStore.assertUnchanged(from: expectedFingerprint)
+        } catch {
+            if case ConfigStoreError.changedOnDisk = error {
+                noteConfigChangedOnDisk()
+            }
+            throw error
+        }
         let store = try makeSecretStore()
         if let password, !password.isEmpty {
             try await store.setPassword(password, destId: destId)

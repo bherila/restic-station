@@ -451,4 +451,39 @@ struct AppModelMachineOverrideTests {
         }
         #expect(try store.load() == fleetReplacement)
     }
+
+    @Test("a failed reload keeps its reload affordance after the old bytes return")
+    func failedConfigReloadCanRecoverWhenTheSameRevisionReturns() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-config-reload-app-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let paths = AppPaths(root: root)
+        let store = ConfigStore(paths: paths)
+        let original = AppConfig(showMenuBarIcon: true)
+        try store.save(original)
+        let originalBytes = try Data(contentsOf: paths.configFile)
+
+        let model = AppModel(paths: paths)
+        model.stateWatcher.start()
+        defer { model.stateWatcher.stop() }
+
+        try Data("not json".utf8).write(to: paths.configFile, options: .atomic)
+        model.reloadConfigFromDisk()
+        #expect(model.configLoadError != nil)
+        #expect(model.configChangedOnDisk)
+
+        try originalBytes.write(to: paths.configFile, options: .atomic)
+        model.stateWatcher.reloadNow()
+        for _ in 0..<20 {
+            if model.configChangedOnDisk { break }
+            try await Task.sleep(nanoseconds: 25_000_000)
+        }
+        #expect(model.configChangedOnDisk)
+
+        model.reloadConfigFromDisk()
+        #expect(model.configLoadError == nil)
+        #expect(!model.configChangedOnDisk)
+        #expect(model.config == original)
+    }
 }

@@ -634,8 +634,13 @@ struct DestinationEditorView: View {
             try await model.storeDestinationSecrets(
                 destId: destination.id,
                 password: password.isEmpty ? nil : password,
-                secretEnv: secretEnvToWrite
+                secretEnv: secretEnvToWrite,
+                ifConfigUnchangedFrom: configFingerprint
             )
+        } catch ConfigStoreError.changedOnDisk {
+            message = .error("Settings changed on disk while this destination was open. "
+                + "Reload Settings, then apply the edit again; no keychain item was changed.")
+            return nil
         } catch {
             message = .error("The keychain items for this destination could not be written "
                 + "(\(error)). Unlock your login keychain, then try again.")

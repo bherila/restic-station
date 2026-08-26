@@ -68,6 +68,39 @@ import Testing
         #expect(installedFingerprint == store.fileFingerprint())
     }
 
+    @Test("compare-and-swap creates config only while the expected state is absent")
+    func compareAndSwapSaveFromAbsentRevision() throws {
+        let (store, root) = makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let emptySnapshot = try store.snapshot()
+        #expect(emptySnapshot.fingerprint == "absent")
+        let config = sampleConfig()
+        let installedFingerprint = try store.save(
+            config,
+            ifUnchangedFrom: emptySnapshot.fingerprint
+        )
+
+        #expect(try store.load() == config)
+        #expect(installedFingerprint == store.fileFingerprint())
+    }
+
+    @Test("compare-and-swap never overwrites a file that appeared after an absent snapshot")
+    func compareAndSwapSaveRefusesAnAbsentRevisionThatAppeared() throws {
+        let (store, root) = makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let emptySnapshot = try store.snapshot()
+        var replacement = sampleConfig()
+        replacement.sets[0].name = "Fleet replacement"
+        try store.save(replacement)
+
+        #expect(throws: ConfigStoreError.changedOnDisk) {
+            try store.save(sampleConfig(), ifUnchangedFrom: emptySnapshot.fingerprint)
+        }
+        #expect(try store.load() == replacement)
+    }
+
     @Test("compare-and-swap save preserves a replacement made after editing began")
     func compareAndSwapSaveRefusesChangedRevision() throws {
         let (store, root) = makeStore()
@@ -87,6 +120,23 @@ import Testing
         }
         #expect(try store.load() == externalReplacement)
         #expect(!FileManager.default.fileExists(atPath: store.tempConfigFile.path))
+    }
+
+    @Test("a stale preflight refuses before a related external side effect")
+    func unchangedAssertionRefusesAStaleRevision() throws {
+        let (store, root) = makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        try store.save(sampleConfig())
+        let editingSnapshot = try store.snapshot()
+        var replacement = editingSnapshot.config
+        replacement.sets[0].name = "Fleet replacement"
+        try store.save(replacement)
+
+        #expect(throws: ConfigStoreError.changedOnDisk) {
+            try store.assertUnchanged(from: editingSnapshot.fingerprint)
+        }
+        #expect(try store.load() == replacement)
     }
 
     @Test("config writers refuse contention without touching the installed file")
