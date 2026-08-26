@@ -220,10 +220,11 @@ public struct RunMetadata: Codable, Equatable, Sendable {
     /// Full decoded summary message where applicable (e.g. a `backup` or
     /// `copy` run). `nil` for kinds with no such summary (e.g. `prune`).
     public var stats: BackupSummary?
-    /// Old full snapshot id → resulting short snapshot id after `restic
-    /// rewrite --forget`. A selected no-op maps to its own unchanged short
-    /// id. Present only for successful/partially successful purge runs;
-    /// historical run records deliberately remain untouched.
+    /// Every launch-time repository snapshot's old full id → resulting short
+    /// id after `restic rewrite --forget`. A selected no-op or unattributed
+    /// snapshot maps to its own unchanged short id. Present only for
+    /// successful/partially successful purge runs; historical run records
+    /// deliberately remain untouched.
     public var purgeSnapshotRewrites: [String: String]?
     /// Exact exclusion patterns bound to a purge launch. A terminal success
     /// is durable evidence that these patterns completed for this run's

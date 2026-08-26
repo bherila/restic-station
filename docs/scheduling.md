@@ -361,14 +361,17 @@ destructive-audit gate and the schedule-state lease, revalidates the token's
 snapshot attribution, reads the live restic repository config id, verifies the
 complete run history, and restores only the exact `purgePatterns` whose
 launch-bound `purgeRepositoryId` matches that live repository **and** whose
-recorded old-to-result snapshot mapping matches the live post-rewrite generation
-(a rewritten old id is absent and its new id is present exactly once; a
-legitimate no-op maps to its own short id and remains present). The repository
-id is queried again inside the runner immediately before the synchronous
+recorded complete-repository old-to-result snapshot mapping matches the live
+post-rewrite generation (the snapshot count is exact; a rewritten old id is
+absent and its new id is present exactly once; a legitimate no-op or
+unattributed snapshot maps to its own short id and remains present). The
+repository id is queried again inside the runner immediately before the synchronous
 executable/token/audit/spawn boundary, and the complete repository snapshot-id
 set is re-listed there and compared with the generation observed during token
-revalidation. A replacement or stale-host backup in the earlier planning
-window refuses launch and restores a first-child token. Watermark recovery
+revalidation. Malformed identity or snapshot JSON retains an explicit
+infrastructure reason instead of being collapsed into secret unavailability. A
+replacement or stale-host backup in the earlier planning window refuses launch
+and restores a first-child token. Watermark recovery
 likewise rechecks that canonical purge metadata still reproduces the exact
 verified index projection, including its purge-evidence digest, at the point
 that evidence is consumed. The full snapshot ids selected for every destination

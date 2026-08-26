@@ -1980,9 +1980,17 @@ public final class BackupEngine: Sendable {
         } catch {
             throw PurgeApplyError.unavailable
         }
-        guard outcome.status == .success,
-              let snapshots = try? parseSnapshots(Data(outcome.rawOutput.utf8)) else {
+        guard outcome.status == .success else {
             throw PurgeApplyError.unavailable
+        }
+        let snapshots: [Snapshot]
+        do {
+            snapshots = try parseSnapshots(Data(outcome.rawOutput.utf8))
+        } catch {
+            throw PurgeApplyError.infrastructureFailure(
+                reason: "repository snapshot evidence is malformed — \(error)",
+                operationMayHaveRun: false
+            )
         }
         return (
             plan: PurgePlan(
@@ -2014,10 +2022,23 @@ public final class BackupEngine: Sendable {
         } catch {
             throw PurgeApplyError.unavailable
         }
-        guard outcome.status == .success,
-              let config = try? parseRepositoryConfig(Data(outcome.rawOutput.utf8)),
-              !config.id.isEmpty else {
+        guard outcome.status == .success else {
             throw PurgeApplyError.unavailable
+        }
+        let config: RepositoryConfig
+        do {
+            config = try parseRepositoryConfig(Data(outcome.rawOutput.utf8))
+        } catch {
+            throw PurgeApplyError.infrastructureFailure(
+                reason: "repository identity evidence is malformed — \(error)",
+                operationMayHaveRun: false
+            )
+        }
+        guard !config.id.isEmpty else {
+            throw PurgeApplyError.infrastructureFailure(
+                reason: "repository identity evidence has an empty id",
+                operationMayHaveRun: false
+            )
         }
         return config.id
     }
@@ -2040,9 +2061,17 @@ public final class BackupEngine: Sendable {
         } catch {
             throw PurgeApplyError.unavailable
         }
-        guard outcome.status == .success,
-              let snapshots = try? parseSnapshots(Data(outcome.rawOutput.utf8)) else {
+        guard outcome.status == .success else {
             throw PurgeApplyError.unavailable
+        }
+        let snapshots: [Snapshot]
+        do {
+            snapshots = try parseSnapshots(Data(outcome.rawOutput.utf8))
+        } catch {
+            throw PurgeApplyError.infrastructureFailure(
+                reason: "repository snapshot evidence is malformed — \(error)",
+                operationMayHaveRun: false
+            )
         }
         return Set(snapshots.map(\.id))
     }
@@ -2118,14 +2147,22 @@ public final class BackupEngine: Sendable {
                         destinationSecretEnv: destinationSecretEnv,
                         executable: executable
                     )
+                } catch let error as PurgeApplyError {
+                    if case .infrastructureFailure = error { throw error }
+                    throw PurgeApplyError.infrastructureFailure(
+                        reason: "the repository could not be revalidated at purge launch — \(error)",
+                        operationMayHaveRun: false
+                    )
                 } catch {
-                    throw ResticRunnerError.launchFailed(
-                        "the repository could not be revalidated at purge launch"
+                    throw PurgeApplyError.infrastructureFailure(
+                        reason: "the repository could not be revalidated at purge launch — \(error)",
+                        operationMayHaveRun: false
                     )
                 }
                 guard launchRepositoryId == repositoryId else {
-                    throw ResticRunnerError.launchFailed(
-                        "the repository changed after purge validation"
+                    throw PurgeApplyError.infrastructureFailure(
+                        reason: "the repository changed after purge validation",
+                        operationMayHaveRun: false
                     )
                 }
                 let launchSnapshotIDs: Set<String>
@@ -2135,14 +2172,22 @@ public final class BackupEngine: Sendable {
                         destinationSecretEnv: destinationSecretEnv,
                         executable: executable
                     )
+                } catch let error as PurgeApplyError {
+                    if case .infrastructureFailure = error { throw error }
+                    throw PurgeApplyError.infrastructureFailure(
+                        reason: "the repository snapshots could not be revalidated at purge launch — \(error)",
+                        operationMayHaveRun: false
+                    )
                 } catch {
-                    throw ResticRunnerError.launchFailed(
-                        "the repository snapshots could not be revalidated at purge launch"
+                    throw PurgeApplyError.infrastructureFailure(
+                        reason: "the repository snapshots could not be revalidated at purge launch — \(error)",
+                        operationMayHaveRun: false
                     )
                 }
                 guard launchSnapshotIDs == repositorySnapshotIDs else {
-                    throw ResticRunnerError.launchFailed(
-                        "the repository snapshots changed after purge validation"
+                    throw PurgeApplyError.infrastructureFailure(
+                        reason: "the repository snapshots changed after purge validation",
+                        operationMayHaveRun: false
                     )
                 }
             },
@@ -2160,11 +2205,12 @@ public final class BackupEngine: Sendable {
                     guard changedRewrites.updateValue(newID, forKey: oldID) == nil else { return nil }
                 }
                 guard changedRewrites.count == modifiedCount else { return nil }
-                // Restic omits per-snapshot output for a selected snapshot
-                // that already satisfies the rewrite. Preserve complete
-                // generation evidence by representing that legitimate no-op
-                // as old full id -> its unchanged short id.
-                return Dictionary(uniqueKeysWithValues: snapshotIDs.map { oldID in
+                // Preserve the complete repository generation, not only the
+                // selected snapshots: a selected no-op and every unattributed
+                // snapshot map to their unchanged short ids. Recovery can
+                // therefore reject additions that were never covered by this
+                // launch instead of accepting a matching subset.
+                return Dictionary(uniqueKeysWithValues: repositorySnapshotIDs.map { oldID in
                     (oldID, changedRewrites[oldID] ?? String(oldID.prefix(8)))
                 })
             }
@@ -2225,6 +2271,11 @@ public final class BackupEngine: Sendable {
                 )
             }
             let liveIds = liveSnapshotIdsByDestination[entry.destId] ?? []
+            guard liveIds.count == rewrites.count else {
+                // Extra snapshots were not part of the launch-authorized
+                // repository generation and cannot inherit its watermark.
+                continue
+            }
             let generationMatches = rewrites.allSatisfy { oldId, newShortId in
                 if newShortId == String(oldId.prefix(8)) {
                     // A selected no-op remains present under its original id.
@@ -2882,10 +2933,17 @@ public final class BackupEngine: Sendable {
                 auditRunId: kind.isDestructive ? run.runId : nil
             )
         }
+        let executionPreflightFailure: PreflightFailure?
+        if case .didNotRun(let reason, let preflightFailure, let operationMayHaveRun) = result,
+           !operationMayHaveRun {
+            executionPreflightFailure = preflightFailure ?? .reason(reason)
+        } else {
+            executionPreflightFailure = nil
+        }
         return .completed(ChildRun(
             child: SetRunChild(runId: run.runId, kind: kind, destId: destination.id, status: status),
             outcome: result.outcome,
-            preflightFailure: nil,
+            preflightFailure: executionPreflightFailure,
             infrastructureFailure: childInfrastructureFailure
         ))
     }
@@ -2998,6 +3056,12 @@ public final class BackupEngine: Sendable {
                 reason: error.userFacingMessage,
                 operationMayHaveRun: error == .timedOut
             )
+        } catch let error as PurgeApplyError {
+            logWriter?.appendLine("restic did not run: \(error)")
+            if case .infrastructureFailure(let reason, let operationMayHaveRun) = error {
+                return .didNotRun(reason: reason, operationMayHaveRun: operationMayHaveRun)
+            }
+            return .didNotRun(reason: "purge launch preflight failed — \(error)")
         } catch {
             logWriter?.appendLine("restic did not run: \(error)")
             return .didNotRun(

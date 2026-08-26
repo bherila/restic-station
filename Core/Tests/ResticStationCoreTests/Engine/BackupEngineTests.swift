@@ -4832,6 +4832,65 @@ struct BackupEngineTests {
         #expect((applied[env.primary.id] ?? []).isEmpty)
     }
 
+    @Test("purge launch preserves malformed snapshot evidence as an infrastructure reason")
+    func purgeLaunchPreservesSnapshotParseFailure() async throws {
+        let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]
+        let hostnames = [Self.setId: Set(["example-mac.local"])]
+        let env = Self.makeEnv(
+            script: [], retention: nil, purgeExcludes: ["build/**"], reachableSecondaries: [],
+            purgeSourcePaths: sourcePaths, purgeHostnames: hostnames
+        )
+        defer { env.cleanUp() }
+        let snapshotsJSON = try FixtureLoader.string("snapshots.json")
+        let snapshots = try parseSnapshots(Data(snapshotsJSON.utf8))
+        let plan = PurgePlan(
+            destinationId: env.primary.id,
+            snapshots: snapshots,
+            sourcePaths: sourcePaths[Self.setId]!,
+            hostnames: hostnames[Self.setId]!,
+            patterns: env.set.purgeExcludes
+        )
+        let token = try #require(try env.engine.issuePurgeToken(
+            set: env.set,
+            destinations: [env.primary],
+            plans: [plan],
+            executable: try env.requireResticExecutable()
+        ))
+        env.fake.script = Self.repositoryConfigCall(
+            env.primary.repoURL,
+            dest: env.primary.id
+        ) + Self.resticCall(
+            ["-r", env.primary.repoURL, "snapshots", "--json"],
+            dest: env.primary.id,
+            stdoutLines: [snapshotsJSON]
+        ) + Self.repositoryConfigCall(
+            env.primary.repoURL,
+            dest: env.primary.id
+        ) + Self.resticCall(
+            ["-r", env.primary.repoURL, "snapshots", "--json"],
+            dest: env.primary.id,
+            stdoutLines: ["[{\"truncated\":" ]
+        )
+
+        do {
+            _ = try await env.engine.runPurge(
+                set: env.set,
+                destinations: [env.primary],
+                token: token.value
+            )
+            Issue.record("malformed launch evidence must refuse purge")
+        } catch let error as PurgeApplyError {
+            guard case .infrastructureFailure(let reason, let operationMayHaveRun) = error else {
+                Issue.record("expected infrastructure failure, got \(error)")
+                return
+            }
+            #expect(reason.contains("repository snapshot evidence is malformed"))
+            #expect(!operationMayHaveRun)
+        }
+        #expect(!env.resticArgvs.contains { $0.contains("rewrite") })
+        #expect(throws: Never.self) { _ = try env.engine.purgeTokenDestinationIDs(token.value) }
+    }
+
     @Test("watermark recovery rejects a pre-purge repository generation with the same config id")
     func purgeRecoveryBindsSnapshotGeneration() async throws {
         let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]
@@ -4908,6 +4967,103 @@ struct BackupEngineTests {
 
         #expect(result.status == .success)
         #expect(result.children.count == 1, "restored pre-purge snapshots must be rewritten again")
+        #expect(env.resticArgvs.filter { $0.contains("rewrite") }.count == 1)
+    }
+
+    @Test("watermark recovery rejects an attributed snapshot absent from terminal generation")
+    func purgeRecoveryRejectsExtraAttributedSnapshot() async throws {
+        let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]
+        let hostnames = [Self.setId: Set(["example-mac.local"])]
+        let env = Self.makeEnv(
+            script: [], retention: nil, purgeExcludes: ["build/**"], reachableSecondaries: [],
+            purgeSourcePaths: sourcePaths, purgeHostnames: hostnames
+        )
+        defer { env.cleanUp() }
+        let snapshotsJSON = try FixtureLoader.string("snapshots.json")
+        let snapshots = try parseSnapshots(Data(snapshotsJSON.utf8))
+        let rewrittenSnapshotsJSON = snapshotsJSON
+            .replacingOccurrences(
+                of: snapshots[0].id,
+                with: "14a53542" + String(repeating: "a", count: 56)
+            )
+            .replacingOccurrences(of: snapshots[0].shortId, with: "14a53542")
+            .replacingOccurrences(
+                of: snapshots[1].id,
+                with: "3ca2e0a5" + String(repeating: "b", count: 56)
+            )
+            .replacingOccurrences(of: snapshots[1].shortId, with: "3ca2e0a5")
+        let extra = "{\"time\":\"2026-07-28T16:57:06Z\",\"id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"short_id\":\"aaaaaaaa\",\"paths\":[\"/Users/user/example/src\"],\"hostname\":\"example-mac.local\",\"username\":\"stale\"}"
+        let liveJSON = String(
+            rewrittenSnapshotsJSON.trimmingCharacters(in: .whitespacesAndNewlines).dropLast()
+        ) + ",\(extra)]"
+        let liveSnapshots = try parseSnapshots(Data(liveJSON.utf8))
+        var historical = try env.runStore.begin(
+            kind: .purge,
+            setId: Self.setId,
+            destId: Self.primaryId,
+            trigger: .scheduled
+        )
+        historical.argvRedacted = [Self.resticPath, "rewrite", "--forget"] + snapshots.map(\.id)
+        historical.purgePatterns = env.set.purgeExcludes
+        historical.purgeRepositoryId = Self.repositoryId
+        try env.runStore.markDestructiveLaunchAuthorized(historical)
+        try env.runStore.finish(
+            historical,
+            status: .success,
+            resticExitCode: 0,
+            purgeSnapshotRewrites: [
+                snapshots[0].id: "14a53542",
+                snapshots[1].id: "3ca2e0a5",
+            ]
+        )
+        let plan = PurgePlan(
+            destinationId: env.primary.id,
+            snapshots: liveSnapshots,
+            sourcePaths: sourcePaths[Self.setId]!,
+            hostnames: hostnames[Self.setId]!,
+            patterns: env.set.purgeExcludes
+        )
+        let token = try #require(try env.engine.issuePurgeToken(
+            set: env.set,
+            destinations: [env.primary],
+            plans: [plan],
+            executable: try env.requireResticExecutable()
+        ))
+        let rewrite = """
+        snapshot aaaaaaaa of [example-mac.local] at 2026-07-28 16:57:06 +0000 UTC by stale@host:
+        saved new snapshot cccccccc
+        removed old snapshot aaaaaaaa
+        modified 1 snapshots
+        """
+        env.fake.script = Self.repositoryConfigCall(
+            env.primary.repoURL,
+            dest: env.primary.id
+        ) + Self.resticCall(
+            ["-r", env.primary.repoURL, "snapshots", "--json"],
+            dest: env.primary.id,
+            stdoutLines: [liveJSON]
+        ) + Self.purgeLaunchValidationCalls(
+            env.primary.repoURL,
+            dest: env.primary.id,
+            snapshotsJSON: liveJSON
+        ) + Self.resticCall(
+            Self.rewriteArgv(
+                env.primary.repoURL,
+                snapshotIDs: liveSnapshots.map(\.id),
+                patterns: env.set.purgeExcludes
+            ),
+            dest: env.primary.id,
+            stdoutLines: rewrite.split(separator: "\n").map(String.init)
+        )
+
+        let result = try await env.engine.runPurge(
+            set: env.set,
+            destinations: [env.primary],
+            token: token.value
+        )
+
+        #expect(result.status == .success)
+        #expect(result.children.count == 1, "extra attributed snapshots must receive their own rewrite")
         #expect(env.resticArgvs.filter { $0.contains("rewrite") }.count == 1)
     }
 
