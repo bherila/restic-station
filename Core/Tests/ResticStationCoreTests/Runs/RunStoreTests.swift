@@ -175,7 +175,7 @@ private func setRunStoreTestErrno(_ value: Int32) {
         #expect(entry.groupId == run.runId)
     }
 
-    @Test("purge patterns are launch-bound, terminal, and legacy-compatible")
+    @Test("purge patterns and repository identity are launch-bound, terminal, and legacy-compatible")
     func purgePatternsRoundTripThroughAuditMetadata() throws {
         let paths = makePaths()
         defer { cleanup(paths) }
@@ -188,15 +188,21 @@ private func setRunStoreTestErrno(_ value: Int32) {
         )
         run.argvRedacted = ["restic", "rewrite", "--forget", "snapshot"]
         run.purgePatterns = ["build/**", ".cache/**"]
+        run.purgeRepositoryId = "repository-a"
 
         #expect(try store.metadata(runId: run.runId).purgePatterns == nil)
+        #expect(try store.metadata(runId: run.runId).purgeRepositoryId == nil)
         try store.markDestructiveLaunchAuthorized(run)
         #expect(try store.metadata(runId: run.runId).purgePatterns == run.purgePatterns)
+        #expect(try store.metadata(runId: run.runId).purgeRepositoryId == run.purgeRepositoryId)
         let launchedPatterns = run.purgePatterns
+        let launchedRepositoryId = run.purgeRepositoryId
         run.purgePatterns = ["mutated-after-launch/**"]
+        run.purgeRepositoryId = "repository-b"
         try store.finish(run, status: .success, resticExitCode: 0)
         let final = try store.metadata(runId: run.runId)
         #expect(final.purgePatterns == launchedPatterns)
+        #expect(final.purgeRepositoryId == launchedRepositoryId)
 
         var object = try #require(
             JSONSerialization.jsonObject(
@@ -204,9 +210,11 @@ private func setRunStoreTestErrno(_ value: Int32) {
             ) as? [String: Any]
         )
         object.removeValue(forKey: "purgePatterns")
+        object.removeValue(forKey: "purgeRepositoryId")
         let legacyBytes = try JSONSerialization.data(withJSONObject: object)
         let legacy = try ConfigStore.makeDecoder().decode(RunMetadata.self, from: legacyBytes)
         #expect(legacy.purgePatterns == nil)
+        #expect(legacy.purgeRepositoryId == nil)
     }
 
     @Test func groupIdPropagatesAcrossRunsInAGroup() throws {

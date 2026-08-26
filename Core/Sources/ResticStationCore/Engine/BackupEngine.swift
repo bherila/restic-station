@@ -1606,21 +1606,31 @@ public final class BackupEngine: Sendable {
         }
 
         // The automatic planner reads pending patterns before it can acquire
-        // this process-wide lease. Bind that observation here, at the point
-        // of use: a peer may have completed the same purge in the meantime.
-        // A token containing even one already-applied pattern is stale and
-        // must never authorize a repeated rewrite.
+        // this process-wide lease. Recompute each destination's narrower
+        // pending subset here, at the point of use: destinations legitimately
+        // diverge when one was offline, and a peer may also have completed
+        // one destination in the meantime. Already-applied pairs are skipped;
+        // no preview pattern may be widened or repeated for that destination.
+        var pendingPatternsByDestination: [UUID: [String]] = [:]
         for destination in destinations {
             let applied = Set(
                 scheduleStateLease.state.sets[set.id]?
                     .appliedPurgeExcludes[destination.id] ?? []
             )
-            guard preview.patterns.allSatisfy({ !applied.contains($0) }) else {
-                throw PurgeApplyError.tokenDoesNotMatchCurrentPlan
+            pendingPatternsByDestination[destination.id] = preview.patterns.filter {
+                !applied.contains($0)
             }
         }
+        let pendingDestinations = destinations.filter {
+            !(pendingPatternsByDestination[$0.id] ?? []).isEmpty
+        }
+        guard !pendingDestinations.isEmpty else {
+            throw PurgeApplyError.tokenDoesNotMatchCurrentPlan
+        }
 
-        guard await secretsAvailable(for: destinations) else { throw PurgeApplyError.unavailable }
+        guard await secretsAvailable(for: pendingDestinations) else {
+            throw PurgeApplyError.unavailable
+        }
 
         // Acquire the machine-wide destructive gate before the final live
         // repository observations, not merely before spending the token.
@@ -1675,6 +1685,26 @@ public final class BackupEngine: Sendable {
             )
         }
 
+        // Re-read each repository before history can satisfy a missing
+        // watermark. The plan binds the current snapshot attribution to the
+        // token; its restic config id binds any recovered terminal evidence
+        // to the repository that was actually rewritten.
+        var plans: [(destination: Destination, plan: PurgePlan, repositoryId: String)] = []
+        for destination in pendingDestinations.sorted(by: { $0.id.uuidString < $1.id.uuidString }) {
+            let current = try await currentPurgePlan(
+                set: set,
+                destination: destination,
+                patterns: pendingPatternsByDestination[destination.id] ?? [],
+                executable: executable
+            )
+            guard let tokenDestination = preview.destinations.first(where: {
+                $0.destinationId == destination.id
+            }), tokenDestination.snapshotIDs.sorted() == current.plan.matched.map(\.id).sorted() else {
+                throw PurgeApplyError.tokenDoesNotMatchCurrentPlan
+            }
+            plans.append((destination, current.plan, current.repositoryId))
+        }
+
         // `rewrite --forget` publishes terminal run metadata before the
         // schedule watermark. If the later directory fsync fails, a crash
         // may lose that rename even though the repository mutation and its
@@ -1687,7 +1717,10 @@ public final class BackupEngine: Sendable {
         do {
             successfulPatterns = try successfulPurgePatterns(
                 setId: set.id,
-                destinationIds: requestedIds
+                pendingPatternsByDestination: pendingPatternsByDestination,
+                repositoryIdsByDestination: Dictionary(
+                    uniqueKeysWithValues: plans.map { ($0.destination.id, $0.repositoryId) }
+                )
             )
         } catch {
             throw PurgeApplyError.infrastructureFailure(
@@ -1696,13 +1729,13 @@ public final class BackupEngine: Sendable {
             )
         }
         var reconciledAnyPattern = false
-        for destination in destinations {
+        for destination in pendingDestinations {
             guard let successful = successfulPatterns[destination.id] else { continue }
             let applied = Set(
                 scheduleStateLease.state.sets[set.id]?
                     .appliedPurgeExcludes[destination.id] ?? []
             )
-            let recovered = preview.patterns.filter {
+            let recovered = (pendingPatternsByDestination[destination.id] ?? []).filter {
                 successful.contains($0) && !applied.contains($0)
             }
             guard !recovered.isEmpty else { continue }
@@ -1723,32 +1756,18 @@ public final class BackupEngine: Sendable {
             } catch {
                 throw PurgeApplyError.unavailable
             }
-            let fullyReconciled = destinations.allSatisfy { destination in
+            let fullyReconciled = pendingDestinations.allSatisfy { destination in
                 let applied = Set(
                     scheduleStateLease.state.sets[set.id]?
                         .appliedPurgeExcludes[destination.id] ?? []
                 )
-                return preview.patterns.allSatisfy(applied.contains)
+                return (pendingPatternsByDestination[destination.id] ?? [])
+                    .allSatisfy(applied.contains)
             }
             guard fullyReconciled else {
                 throw PurgeApplyError.tokenDoesNotMatchCurrentPlan
             }
             return PurgeRunResult(status: .success, children: [])
-        }
-
-        var plans: [(destination: Destination, plan: PurgePlan)] = []
-        for destination in destinations.sorted(by: { $0.id.uuidString < $1.id.uuidString }) {
-            let plan = try await currentPurgePlan(
-                set: set,
-                destination: destination,
-                patterns: preview.patterns,
-                executable: executable
-            )
-            guard let tokenDestination = preview.destinations.first(where: { $0.destinationId == destination.id }),
-                  tokenDestination.snapshotIDs.sorted() == plan.matched.map(\.id).sorted() else {
-                throw PurgeApplyError.tokenDoesNotMatchCurrentPlan
-            }
-            plans.append((destination, plan))
         }
 
         do {
@@ -1769,7 +1788,7 @@ public final class BackupEngine: Sendable {
         var children: [SetRunChild] = []
         var resolvedGroupId = groupId
         var isFirstPurgeChild = true
-        for (destination, plan) in plans {
+        for (destination, plan, repositoryId) in plans {
             guard !plan.matched.isEmpty else {
                 // Nothing to rewrite. Advancing the watermark is only correct
                 // when the repository genuinely holds nothing this machine
@@ -1781,7 +1800,7 @@ public final class BackupEngine: Sendable {
                     try markPurgePatternsApplied(
                         setId: set.id,
                         destinationId: destination.id,
-                        patterns: preview.patterns,
+                        patterns: plan.patterns,
                         operationMayHaveRun: !children.isEmpty,
                         scheduleStateLease: scheduleStateLease
                     )
@@ -1798,7 +1817,8 @@ public final class BackupEngine: Sendable {
             let purgeResult = await purgeChild(
                 destination: destination,
                 snapshotIDs: plan.matched.map(\.id),
-                patterns: preview.patterns,
+                patterns: plan.patterns,
+                repositoryId: repositoryId,
                 setId: set.id,
                 trigger: trigger,
                 groupId: resolvedGroupId,
@@ -1869,7 +1889,7 @@ public final class BackupEngine: Sendable {
                 try markPurgePatternsApplied(
                     setId: set.id,
                     destinationId: destination.id,
-                    patterns: preview.patterns,
+                    patterns: plan.patterns,
                     operationMayHaveRun: true,
                     scheduleStateLease: scheduleStateLease
                 )
@@ -1895,13 +1915,32 @@ public final class BackupEngine: Sendable {
         destination: Destination,
         patterns: [String],
         executable: ResticRunner.MaintenanceExecutable
-    ) async throws -> PurgePlan {
+    ) async throws -> (plan: PurgePlan, repositoryId: String) {
         let probe = await reachability.probe(
             destination,
             expectedExecutableIdentity: executable.identity
         )
         guard probe == .reachable else {
             throw PurgeApplyError.destinationOffline(destinationId: destination.id)
+        }
+        let repositoryConfigOutcome: ResticOutcome
+        do {
+            repositoryConfigOutcome = try await restic.run(
+                .catConfig(repo: destination.repoURL),
+                for: ResticInvocation(
+                    destination: destination,
+                    expectedExecutableIdentity: executable.identity
+                )
+            )
+        } catch {
+            throw PurgeApplyError.unavailable
+        }
+        guard repositoryConfigOutcome.status == .success,
+              let repositoryConfig = try? parseRepositoryConfig(
+                  Data(repositoryConfigOutcome.rawOutput.utf8)
+              ),
+              !repositoryConfig.id.isEmpty else {
+            throw PurgeApplyError.unavailable
         }
         let outcome: ResticOutcome
         do {
@@ -1919,12 +1958,15 @@ public final class BackupEngine: Sendable {
               let snapshots = try? parseSnapshots(Data(outcome.rawOutput.utf8)) else {
             throw PurgeApplyError.unavailable
         }
-        return PurgePlan(
-            destinationId: destination.id,
-            snapshots: snapshots,
-            sourcePaths: sourcePaths(for: set),
-            hostnames: hostnames(for: set),
-            patterns: patterns
+        return (
+            plan: PurgePlan(
+                destinationId: destination.id,
+                snapshots: snapshots,
+                sourcePaths: sourcePaths(for: set),
+                hostnames: hostnames(for: set),
+                patterns: patterns
+            ),
+            repositoryId: repositoryConfig.id
         )
     }
 
@@ -1935,6 +1977,7 @@ public final class BackupEngine: Sendable {
         destination: Destination,
         snapshotIDs: [String],
         patterns: [String],
+        repositoryId: String,
         setId: UUID,
         trigger: RunTrigger,
         groupId: String?,
@@ -1979,6 +2022,7 @@ public final class BackupEngine: Sendable {
             afterLaunchFailure: afterLaunchFailure,
             callerHoldsDestructiveAuditGate: callerHoldsDestructiveAuditGate,
             purgePatterns: patterns,
+            purgeRepositoryId: repositoryId,
             purgeSnapshotRewrites: { outcome in
                 Dictionary(uniqueKeysWithValues: parseRewrite(outcome.rawOutput).snapshots.compactMap { rewrite in
                     guard let oldID = fullIDByShortID[rewrite.shortID], let newID = rewrite.newSnapshotShortID else {
@@ -2006,13 +2050,14 @@ public final class BackupEngine: Sendable {
     /// its index projection and refuses malformed or incomplete history.
     private func successfulPurgePatterns(
         setId: UUID,
-        destinationIds: Set<UUID>
+        pendingPatternsByDestination: [UUID: [String]],
+        repositoryIdsByDestination: [UUID: String]
     ) throws -> [UUID: Set<String>] {
         var result: [UUID: Set<String>] = [:]
         for entry in try runStore.recentRuns(setId: setId, limit: Int.max)
             where entry.kind == .purge
                 && entry.status == .success
-                && destinationIds.contains(entry.destId) {
+                && repositoryIdsByDestination[entry.destId] != nil {
             let metadata = try runStore.metadata(runId: entry.runId)
             guard metadata.runId == entry.runId,
                   metadata.kind == .purge,
@@ -2024,6 +2069,16 @@ public final class BackupEngine: Sendable {
                 )
             }
             guard let patterns = metadata.purgePatterns else { continue }
+            let pending = Set(pendingPatternsByDestination[entry.destId] ?? [])
+            guard !pending.isDisjoint(with: patterns) else { continue }
+            guard let recordedRepositoryId = metadata.purgeRepositoryId else {
+                throw RunStoreError.discardUnsafe(
+                    path: paths.runMetadataFile(runId: entry.runId).path
+                )
+            }
+            guard recordedRepositoryId == repositoryIdsByDestination[entry.destId] else {
+                continue
+            }
             result[entry.destId, default: []].formUnion(patterns)
         }
         return result
@@ -2057,7 +2112,7 @@ public final class BackupEngine: Sendable {
         guard let executable = restic.maintenanceExecutable() else {
             throw PurgeApplyError.resticUnavailable
         }
-        let plan = try await currentPurgePlan(
+        let current = try await currentPurgePlan(
             set: set,
             destination: destination,
             patterns: patterns,
@@ -2068,7 +2123,10 @@ public final class BackupEngine: Sendable {
             token = try previewTokens.issue(
                 machineId: machineId,
                 setId: set.id,
-                destinations: [PreviewTokenDestination(destinationId: destination.id, snapshotIDs: plan.matched.map(\.id))],
+                destinations: [PreviewTokenDestination(
+                    destinationId: destination.id,
+                    snapshotIDs: current.plan.matched.map(\.id)
+                )],
                 config: config,
                 patterns: patterns,
                 executableIdentity: executable.identity
@@ -2400,6 +2458,7 @@ public final class BackupEngine: Sendable {
         downgradeSuccessToWarning: (@Sendable (ResticOutcome) -> Bool)? = nil,
         callerHoldsDestructiveAuditGate: Bool = false,
         purgePatterns: [String]? = nil,
+        purgeRepositoryId: String? = nil,
         purgeSnapshotRewrites: (@Sendable (ResticOutcome) -> [String: String]?)? = nil
     ) async -> RecordedChildResult {
         let destructiveAuditGate: FileLock?
@@ -2471,6 +2530,7 @@ public final class BackupEngine: Sendable {
         run.argvRedacted = remoteCommand?.passwordStdinArgv
             ?? restic.redactedArgv(command, for: invocation)
         run.purgePatterns = purgePatterns
+        run.purgeRepositoryId = purgeRepositoryId
 
         let logWriter: LogWriter?
         do {

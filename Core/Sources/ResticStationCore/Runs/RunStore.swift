@@ -28,6 +28,9 @@ public struct ActiveRun: Equatable, Sendable {
     /// Exact purge exclusions authorized for this destructive launch. This
     /// is nil for every non-purge run and for legacy purge records.
     public var purgePatterns: [String]?
+    /// Exact restic repository config id observed during apply validation.
+    /// Launch-bound with `purgePatterns`; nil for non-purge and legacy runs.
+    public var purgeRepositoryId: String?
 }
 
 /// The one field audit verification may inspect without trusting the rest of
@@ -361,7 +364,8 @@ public struct RunStore: Sendable {
             start: start,
             pid: pid,
             argvRedacted: [],
-            purgePatterns: nil
+            purgePatterns: nil,
+            purgeRepositoryId: nil
         )
     }
 
@@ -390,15 +394,18 @@ public struct RunStore: Sendable {
         let destructiveLaunchAuthorizedAt: Date?
         let destructiveAuditContractVersion: Int?
         let purgePatterns: [String]?
+        let purgeRepositoryId: String?
         if run.kind.isDestructive {
             let canonical = try metadata(runId: run.runId)
             destructiveLaunchAuthorizedAt = canonical.destructiveLaunchAuthorizedAt
             destructiveAuditContractVersion = canonical.destructiveAuditContractVersion
             purgePatterns = canonical.purgePatterns
+            purgeRepositoryId = canonical.purgeRepositoryId
         } else {
             destructiveLaunchAuthorizedAt = nil
             destructiveAuditContractVersion = nil
             purgePatterns = nil
+            purgeRepositoryId = nil
         }
         var metadata = RunMetadata(
             runId: run.runId,
@@ -421,6 +428,7 @@ public struct RunStore: Sendable {
             stats: stats,
             purgeSnapshotRewrites: purgeSnapshotRewrites,
             purgePatterns: purgePatterns,
+            purgeRepositoryId: purgeRepositoryId,
             destructiveAuditContractVersion: destructiveAuditContractVersion,
             destructiveLaunchAuthorizedAt: destructiveLaunchAuthorizedAt,
             auditFailureReason: auditFailureReason,
@@ -449,6 +457,7 @@ public struct RunStore: Sendable {
         existing.destructiveLaunchAuthorizedAt = now()
         existing.argvRedacted = run.argvRedacted
         existing.purgePatterns = run.purgePatterns
+        existing.purgeRepositoryId = run.purgeRepositoryId
         try writeMetadataAtomic(existing)
     }
 

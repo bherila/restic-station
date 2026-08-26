@@ -349,15 +349,21 @@ The engine logs the decline instead. A removed pattern stays recorded and is
 never used to trigger a rewrite.
 
 The pending-pattern observation is revalidated after acquiring the shared
-schedule-state lease. If another helper applied any authorized pattern during
-the earlier repository planning window, the token is stale and no rewrite
-launches. Terminal successful purge metadata is durably committed before the
-watermark. If the watermark's directory fsync then fails and a crash loses its
-visible rename, the next apply holds both the destructive-audit gate and the
-schedule-state lease, verifies the complete run history, and restores only the
-exact `purgePatterns` bound to successful runs. It consumes the stale token and
-does not query or rewrite the repository again. Malformed, incomplete, legacy,
-or only partially matching history cannot authorize that shortcut.
+schedule-state lease. Each destination is narrowed to the preview patterns it
+still needs: a primary and an offline mirror may legitimately have different
+watermarks, while a destination/pattern pair applied by another helper during
+the earlier planning window must not be rewritten. A token with no pending
+pair is stale and is refused. Terminal successful purge metadata is durably
+committed before the watermark. If the watermark's directory fsync then fails
+and a crash loses its visible rename, the next apply holds both the
+destructive-audit gate and the schedule-state lease, revalidates the token's
+snapshot attribution, reads the live restic repository config id, verifies the
+complete run history, and restores only the exact `purgePatterns` whose
+launch-bound `purgeRepositoryId` matches that live repository. It consumes the
+stale token and does not rewrite the repository again. Evidence from a replaced
+repository is ignored so the replacement receives its own rewrite; malformed,
+incomplete, identity-less legacy, or only partially matching history cannot
+authorize the recovery shortcut.
 
 ## Locking
 
