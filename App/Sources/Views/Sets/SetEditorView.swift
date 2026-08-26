@@ -23,6 +23,12 @@ struct SetEditorView: View {
     /// Exact config revision this draft was derived from. It is advanced by
     /// this editor's own successful writes, never by a background reload.
     @State private var configFingerprint: String
+    /// Destination sheets must update the keychain before the parent draft
+    /// can be saved. Retain the old values until the config CAS commits, so
+    /// abandoning/reverting the draft or losing a fleet-sync race restores
+    /// the matching credentials.
+    @State private var pendingSecretRollbacks: [AppModel.DestinationSecretsRollback] = []
+    @State private var secretRollbackInProgress = false
 
     init(initialSet: BackupSet, isNew: Bool, configFingerprint: String) {
         _draft = State(initialValue: initialSet)
@@ -65,6 +71,7 @@ struct SetEditorView: View {
             DestinationTable(
                 set: $draft,
                 configFingerprint: $configFingerprint,
+                pendingSecretRollbacks: $pendingSecretRollbacks,
                 errorMessage: fieldErrors[.destinations]
             )
 
@@ -87,6 +94,9 @@ struct SetEditorView: View {
                 sharedConfig: model.config,
                 currentMachineID: model.machine.machineId
             )
+        }
+        .onDisappear {
+            Task { _ = await restorePendingSecrets() }
         }
     }
 
@@ -173,12 +183,16 @@ struct SetEditorView: View {
                     .foregroundStyle(.green)
             }
 
-            Button("Revert") { revert() }
-                .disabled(!hasUnsavedChanges || persisted == nil)
+            Button("Revert") {
+                Task { await revert() }
+            }
+            .disabled(!hasUnsavedChanges || persisted == nil || secretRollbackInProgress)
 
-            Button("Save") { save() }
-                .keyboardShortcut("s", modifiers: .command)
-                .disabled(!hasUnsavedChanges)
+            Button("Save") {
+                Task { await save() }
+            }
+            .keyboardShortcut("s", modifiers: .command)
+            .disabled(!hasUnsavedChanges || secretRollbackInProgress)
         }
     }
 
@@ -193,8 +207,12 @@ struct SetEditorView: View {
         persisted != draft
     }
 
-    private func revert() {
+    private func revert() async {
         guard let persisted else { return }
+        if let rollbackError = await restorePendingSecrets() {
+            fieldErrors[.general] = rollbackError
+            return
+        }
         draft = persisted
         configFingerprint = model.configFingerprint
         fieldErrors = [:]
@@ -203,7 +221,7 @@ struct SetEditorView: View {
     /// Validate → `AppModel.saveSet` → `AppConfig.validate()` →
     /// `ConfigStore.save`. The name check is the editor's own: an unnamed set
     /// is valid config but useless in every list that shows it.
-    private func save() {
+    private func save() async {
         fieldErrors = [:]
         let trimmedName = draft.name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedName.isEmpty else {
@@ -219,11 +237,37 @@ struct SetEditorView: View {
                 draft,
                 ifUnchangedFrom: configFingerprint
             )
+            pendingSecretRollbacks.removeAll()
             isNew = false
             didSave = true
         } catch {
             let mapped = SetsCopy.fieldMessage(for: error)
-            fieldErrors[mapped.field] = mapped.message
+            var message = mapped.message
+            if case ConfigStoreError.changedOnDisk = error,
+               let rollbackError = await restorePendingSecrets() {
+                message += " " + rollbackError
+            }
+            fieldErrors[mapped.field] = message
+        }
+    }
+
+    /// Restores every keychain edit which has not yet been paired with a
+    /// successful config write. The list is retained if restoration itself
+    /// fails, allowing an explicit Revert to retry while this editor lives.
+    private func restorePendingSecrets() async -> String? {
+        guard !pendingSecretRollbacks.isEmpty else { return nil }
+        guard !secretRollbackInProgress else {
+            return "The previous keychain values are still being restored."
+        }
+        secretRollbackInProgress = true
+        defer { secretRollbackInProgress = false }
+        do {
+            try await model.restoreDestinationSecrets(pendingSecretRollbacks)
+            pendingSecretRollbacks.removeAll()
+            return nil
+        } catch {
+            return "The previous keychain values could not be restored (\(error)). "
+                + "Re-open the destination and verify its credentials before running a backup."
         }
     }
 }

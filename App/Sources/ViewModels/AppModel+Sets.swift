@@ -210,6 +210,17 @@ extension AppModel {
         try await restoreDestinationSecrets(rollback, using: makeSecretStore())
     }
 
+    /// Rolls a sequence of edits back in reverse order. Editing the same
+    /// destination twice produces a chain of snapshots, so restoring in
+    /// insertion order would stop at the value installed by the first edit
+    /// instead of returning to the value that preceded the editor session.
+    func restoreDestinationSecrets(_ rollbacks: [DestinationSecretsRollback]) async throws {
+        let store = try makeSecretStore()
+        for rollback in rollbacks.reversed() {
+            try await restoreDestinationSecrets(rollback, using: store)
+        }
+    }
+
     private func restoreDestinationSecrets(
         _ rollback: DestinationSecretsRollback,
         using store: any SecretStore

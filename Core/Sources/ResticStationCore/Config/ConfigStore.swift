@@ -547,7 +547,13 @@ enum AtomicFile {
         do {
             displacedFingerprint = SHA256Digest.hex(try Data(contentsOf: source))
         } catch {
-            _ = renameX(from: source, to: destination, flags: UInt32(RENAME_SWAP))
+            let rollback = renameX(from: source, to: destination, flags: UInt32(RENAME_SWAP))
+            guard rollback == 0 else {
+                let rollbackErrno = errno
+                throw ConfigStoreError.replacementRollbackFailed(
+                    errno: rollbackErrno, candidateMayBeInstalledAt: destination.path
+                )
+            }
             throw error
         }
 
@@ -558,8 +564,9 @@ enum AtomicFile {
 
         let rollback = renameX(from: source, to: destination, flags: UInt32(RENAME_SWAP))
         guard rollback == 0 else {
-            throw ConfigStoreError.renameFailed(
-                errno: errno, from: source.path, to: destination.path
+            let rollbackErrno = errno
+            throw ConfigStoreError.replacementRollbackFailed(
+                errno: rollbackErrno, candidateMayBeInstalledAt: destination.path
             )
         }
 
@@ -609,6 +616,7 @@ enum AtomicFile {
 /// Low-level failures from `ConfigStore.save(_:)`'s atomic rename step.
 public enum ConfigStoreError: Error, Equatable, Sendable, CustomStringConvertible {
     case renameFailed(errno: Int32, from: String, to: String)
+    case replacementRollbackFailed(errno: Int32, candidateMayBeInstalledAt: String)
     case changedOnDisk
     case writeLockBusy(path: String)
     case writeLockUnusable(LockFailure)
@@ -617,6 +625,9 @@ public enum ConfigStoreError: Error, Equatable, Sendable, CustomStringConvertibl
         switch self {
         case .renameFailed(let errno, let from, let to):
             return "rename(\(from), \(to)) failed: errno \(errno)"
+        case .replacementRollbackFailed(let errno, let path):
+            return "could not roll back a refused config replacement (errno \(errno)); "
+                + "the uncommitted candidate may be installed at \(path)"
         case .changedOnDisk:
             return "config.json changed on disk; reload the latest settings before saving"
         case .writeLockBusy(let path):

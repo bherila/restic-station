@@ -21,6 +21,7 @@ struct DestinationTable: View {
 
     @Binding var set: BackupSet
     @Binding var configFingerprint: String
+    @Binding var pendingSecretRollbacks: [AppModel.DestinationSecretsRollback]
     let errorMessage: String?
 
     @State private var sheet: DestinationSheetTarget?
@@ -71,6 +72,7 @@ struct DestinationTable: View {
             DestinationEditorView(
                 set: $set,
                 configFingerprint: $configFingerprint,
+                pendingSecretRollbacks: $pendingSecretRollbacks,
                 initialDestination: destination(for: target),
                 isNew: target.isNew
             )
@@ -250,18 +252,30 @@ struct DestinationTable: View {
         // primary destination, instead of a confusing failure right here.
         let isPersisted = model.config.sets.contains { $0.id == set.id }
         let staysValid = updated.destinations.contains(where: \.isPrimary)
+        var persistedWholeDraft = false
         if isPersisted && staysValid {
             do {
                 configFingerprint = try model.saveSet(
                     updated,
                     ifUnchangedFrom: configFingerprint
                 )
+                persistedWholeDraft = true
             } catch {
                 removalError = SetsCopy.fieldMessage(for: error).message
                 return
             }
         }
         set = updated
+        if persistedWholeDraft {
+            // saveSet wrote every destination in the parent draft, not just
+            // the removal, so every retained secret edit is committed too.
+            pendingSecretRollbacks.removeAll()
+        } else {
+            // The removed destination no longer participates in a future
+            // config save. Its deletion is the intended secret outcome, so
+            // an editor rollback must not recreate those items later.
+            pendingSecretRollbacks.removeAll { $0.destId == destination.id }
+        }
 
         Task { await model.deleteDestinationSecrets(destId: destination.id) }
     }

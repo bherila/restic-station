@@ -548,6 +548,71 @@ struct AppModelMachineOverrideTests {
         #expect(try store.load() == fleetReplacement)
         #expect(model.configChangedOnDisk)
     }
+
+    @Test("stacked destination edits restore the pre-editor secret")
+    func stackedDestinationSecretRollbacksRunInReverse() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-secret-stack-app-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let destinationId = UUID()
+        let secrets = MemorySecretStore(passwords: [destinationId: "original-password"])
+        let model = AppModel(paths: AppPaths(root: root), secretStoreFactory: { secrets })
+
+        let first = try await model.storeDestinationSecrets(
+            destId: destinationId,
+            password: "first-edit",
+            secretEnv: nil,
+            ifConfigUnchangedFrom: model.configFingerprint
+        )
+        let second = try await model.storeDestinationSecrets(
+            destId: destinationId,
+            password: "second-edit",
+            secretEnv: nil,
+            ifConfigUnchangedFrom: model.configFingerprint
+        )
+
+        try await model.restoreDestinationSecrets([first, second])
+
+        #expect(try await secrets.password(destId: destinationId) == "original-password")
+    }
+}
+
+private actor MemorySecretStore: SecretStore {
+    nonisolated let backend: SecretBackend = .keychain
+    private var passwords: [UUID: String]
+    private var secretEnvironments: [UUID: [String: String]] = [:]
+
+    init(passwords: [UUID: String] = [:]) {
+        self.passwords = passwords
+    }
+
+    func setPassword(_ password: String, destId: UUID) async throws {
+        passwords[destId] = password
+    }
+
+    func password(destId: UUID) async throws -> String {
+        guard let password = passwords[destId] else { throw SecretStoreError.itemNotFound }
+        return password
+    }
+
+    func deletePassword(destId: UUID) async throws {
+        passwords.removeValue(forKey: destId)
+    }
+
+    func setSecretEnv(_ env: [String: String], destId: UUID) async throws {
+        secretEnvironments[destId] = env
+    }
+
+    func secretEnv(destId: UUID) async throws -> [String: String] {
+        secretEnvironments[destId] ?? [:]
+    }
+
+    func deleteSecretEnv(destId: UUID) async throws {
+        secretEnvironments.removeValue(forKey: destId)
+    }
+
+    nonisolated func passwordCommand(destId: UUID) -> String { "test-secret-store" }
 }
 
 private actor RacingSecretStore: SecretStore {

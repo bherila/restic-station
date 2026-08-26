@@ -25,6 +25,7 @@ struct DestinationEditorView: View {
 
     @Binding var set: BackupSet
     @Binding var configFingerprint: String
+    @Binding var pendingSecretRollbacks: [AppModel.DestinationSecretsRollback]
     private let isNew: Bool
 
     // Config-backed fields.
@@ -58,11 +59,13 @@ struct DestinationEditorView: View {
     init(
         set: Binding<BackupSet>,
         configFingerprint: Binding<String>,
+        pendingSecretRollbacks: Binding<[AppModel.DestinationSecretsRollback]>,
         initialDestination destination: Destination,
         isNew: Bool
     ) {
         _set = set
         _configFingerprint = configFingerprint
+        _pendingSecretRollbacks = pendingSecretRollbacks
         self.isNew = isNew
         _draft = State(initialValue: destination)
 
@@ -551,7 +554,8 @@ struct DestinationEditorView: View {
         Task {
             busy = .saving
             defer { busy = nil }
-            if await commitDraft() != nil {
+            if let committed = await commitDraft() {
+                pendingSecretRollbacks.append(committed.secretsRollback)
                 dismiss()
             }
         }
@@ -675,6 +679,10 @@ struct DestinationEditorView: View {
                 committed.updated,
                 ifUnchangedFrom: configFingerprint
             )
+            // This write persisted the entire parent draft, including any
+            // earlier destination edits, so every retained keychain change
+            // now has matching config bytes.
+            pendingSecretRollbacks.removeAll()
             return true
         } catch {
             do {
