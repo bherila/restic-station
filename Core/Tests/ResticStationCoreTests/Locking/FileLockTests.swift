@@ -666,8 +666,8 @@ let canInjectPermissionFaults = geteuid() != 0
         }
     }
 
-    @Test("LockingHealth ignores the unused file-secret lock for keychain storage")
-    func lockingHealthScopesSecretLockToActiveBackend() throws {
+    @Test("LockingHealth probes the shared secret lock for both production backends")
+    func lockingHealthProbesSecretLockForBothBackends() throws {
         let root = makeDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let paths = AppPaths(root: root)
@@ -677,13 +677,13 @@ let canInjectPermissionFaults = geteuid() != 0
             withIntermediateDirectories: true
         )
 
-        #expect(
-            LockingHealth.probe(
-                paths: paths,
-                configuredSetIds: [],
-                secretBackend: .keychain
-            ) == nil
-        )
+        let keychainFailure = try #require(LockingHealth.probe(
+            paths: paths,
+            configuredSetIds: [],
+            secretBackend: .keychain
+        ))
+        #expect(keychainFailure.scope == .administrative)
+        #expect(keychainFailure.path == paths.secretsLockFile.path)
         let fileFailure = try #require(LockingHealth.probe(
             paths: paths,
             configuredSetIds: [],

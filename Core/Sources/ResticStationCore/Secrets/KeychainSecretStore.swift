@@ -167,34 +167,39 @@ public struct KeychainSecretStore: SecretStore {
 
     public func restoreDestinationSecretsIfCurrent(
         _ rollback: DestinationSecretRollback
-    ) async throws -> Bool {
+    ) async throws -> DestinationSecretRestoreResult {
         try await withMutationLock {
             let passwordAccount = SecretAccount.password(rollback.destId)
             let envAccount = SecretAccount.secretEnv(rollback.destId)
+            var passwordRestored: Bool?
             if let change = rollback.password {
                 let current = try await readOptionalValue(account: passwordAccount)
-                guard current == change.installed else { return false }
+                passwordRestored = current == change.installed
             }
+            var secretEnvRestored: Bool?
             if let change = rollback.secretEnv {
                 let current = try await readOptionalValue(account: envAccount)
                     .map(SecretEnvBlob.decode) ?? [:]
-                guard current == change.installed else { return false }
+                secretEnvRestored = current == change.installed
             }
-            if let change = rollback.password {
+            if passwordRestored == true, let change = rollback.password {
                 if let previous = change.previous {
                     try await setValue(previous, account: passwordAccount)
                 } else {
                     try await deleteValueTolerant(account: passwordAccount)
                 }
             }
-            if let change = rollback.secretEnv {
+            if secretEnvRestored == true, let change = rollback.secretEnv {
                 if change.previous.isEmpty {
                     try await deleteValueTolerant(account: envAccount)
                 } else {
                     try await setValue(try SecretEnvBlob.encode(change.previous), account: envAccount)
                 }
             }
-            return true
+            return DestinationSecretRestoreResult(
+                passwordRestored: passwordRestored,
+                secretEnvRestored: secretEnvRestored
+            )
         }
     }
 

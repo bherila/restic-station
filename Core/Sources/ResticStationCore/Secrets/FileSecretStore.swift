@@ -218,31 +218,37 @@ public struct FileSecretStore: SecretStore {
 
     public func restoreDestinationSecretsIfCurrent(
         _ rollback: DestinationSecretRollback
-    ) async throws -> Bool {
+    ) async throws -> DestinationSecretRestoreResult {
         try await withWriteLock {
-            guard rollback.password != nil || rollback.secretEnv != nil else { return true }
             var document = try load()
             let passwordAccount = SecretAccount.password(rollback.destId)
             let envAccount = SecretAccount.secretEnv(rollback.destId)
-            if let change = rollback.password,
-               document.secrets[passwordAccount] != change.installed {
-                return false
+            let passwordRestored = rollback.password.map { change in
+                document.secrets[passwordAccount] == change.installed
             }
+            let secretEnvRestored: Bool?
             if let change = rollback.secretEnv {
                 let current = try document.secrets[envAccount].map(SecretEnvBlob.decode) ?? [:]
-                guard current == change.installed else { return false }
+                secretEnvRestored = current == change.installed
+            } else {
+                secretEnvRestored = nil
             }
-            if let change = rollback.password {
+            if passwordRestored == true, let change = rollback.password {
                 document.secrets[passwordAccount] = change.previous
             }
-            if let change = rollback.secretEnv {
+            if secretEnvRestored == true, let change = rollback.secretEnv {
                 document.secrets[envAccount] = change.previous.isEmpty
                     ? nil
                     : try SecretEnvBlob.encode(change.previous)
             }
-            document.version = Self.currentVersion
-            try store(document)
-            return true
+            if passwordRestored == true || secretEnvRestored == true {
+                document.version = Self.currentVersion
+                try store(document)
+            }
+            return DestinationSecretRestoreResult(
+                passwordRestored: passwordRestored,
+                secretEnvRestored: secretEnvRestored
+            )
         }
     }
 

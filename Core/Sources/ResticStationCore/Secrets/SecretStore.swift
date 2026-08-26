@@ -103,7 +103,9 @@ public protocol SecretStore: Sendable {
     /// their shared mutation lock, so a newer CLI write can never be
     /// overwritten by a stale UI rollback.
     @discardableResult
-    func restoreDestinationSecretsIfCurrent(_ rollback: DestinationSecretRollback) async throws -> Bool
+    func restoreDestinationSecretsIfCurrent(
+        _ rollback: DestinationSecretRollback
+    ) async throws -> DestinationSecretRestoreResult
 
     // MARK: Password command
 
@@ -184,7 +186,8 @@ extension SecretStore {
     /// comparison semantics without needing storage-specific plumbing.
     public func restoreDestinationSecretsIfCurrent(
         _ rollback: DestinationSecretRollback
-    ) async throws -> Bool {
+    ) async throws -> DestinationSecretRestoreResult {
+        var passwordRestored: Bool?
         if let change = rollback.password {
             let current: String?
             do {
@@ -192,26 +195,30 @@ extension SecretStore {
             } catch SecretStoreError.itemNotFound {
                 current = nil
             }
-            guard current == change.installed else { return false }
+            passwordRestored = current == change.installed
         }
+        var secretEnvRestored: Bool?
         if let change = rollback.secretEnv {
-            guard try await secretEnv(destId: rollback.destId) == change.installed else { return false }
+            secretEnvRestored = try await secretEnv(destId: rollback.destId) == change.installed
         }
-        if let change = rollback.password {
+        if passwordRestored == true, let change = rollback.password {
             if let previous = change.previous {
                 try await setPassword(previous, destId: rollback.destId)
             } else {
                 try await deletePassword(destId: rollback.destId)
             }
         }
-        if let change = rollback.secretEnv {
+        if secretEnvRestored == true, let change = rollback.secretEnv {
             if change.previous.isEmpty {
                 try await deleteSecretEnv(destId: rollback.destId)
             } else {
                 try await setSecretEnv(change.previous, destId: rollback.destId)
             }
         }
-        return true
+        return DestinationSecretRestoreResult(
+            passwordRestored: passwordRestored,
+            secretEnvRestored: secretEnvRestored
+        )
     }
 }
 
@@ -238,6 +245,25 @@ public struct DestinationSecretRollback: Equatable, Sendable {
         self.destId = destId
         self.password = password
         self.secretEnv = secretEnv
+    }
+}
+
+/// Per-field outcome of a conditional editor rollback. `nil` means the
+/// editor did not manage that field; `false` means a newer mutation won and
+/// was deliberately preserved. Keeping the fields separate lets an
+/// unchanged environment roll back even when a helper replaced the password
+/// (and vice versa).
+public struct DestinationSecretRestoreResult: Equatable, Sendable {
+    public let passwordRestored: Bool?
+    public let secretEnvRestored: Bool?
+
+    public init(passwordRestored: Bool?, secretEnvRestored: Bool?) {
+        self.passwordRestored = passwordRestored
+        self.secretEnvRestored = secretEnvRestored
+    }
+
+    public var allRestored: Bool {
+        passwordRestored != false && secretEnvRestored != false
     }
 }
 

@@ -141,7 +141,10 @@ public enum LockingHealth {
         ).probe(createIfMissing: false).map {
             LockingHealthFailure(scope: .administrative, failure: $0)
         }
-        if administrativeFailure == nil, secretBackend == .file {
+        // Both production backends mutate under secrets.lock: the file
+        // backend protects its JSON read-modify-write, and the keychain
+        // backend protects multi-item capture/update/conditional rollback.
+        if administrativeFailure == nil {
             administrativeFailure = FileLock(
                 path: paths.secretsLockFile, trustedRoot: paths.root
             ).probe(createIfMissing: false).map {

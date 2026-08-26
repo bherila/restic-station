@@ -625,6 +625,108 @@ struct AppModelMachineOverrideTests {
         #expect(!restored)
         #expect(try await secrets.password(destId: destinationId) == "newer-helper-password")
     }
+
+    @Test("a newer password does not prevent restoring the editor environment")
+    func destinationSecretFieldsRollBackIndependently() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-secret-fields-app-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let destinationId = UUID()
+        let secrets = MemorySecretStore(
+            passwords: [destinationId: "original-password"],
+            secretEnvironments: [destinationId: ["TOKEN": "original"]]
+        )
+        let model = AppModel(paths: AppPaths(root: root), secretStoreFactory: { secrets })
+        let rollback = try await model.storeDestinationSecrets(
+            destId: destinationId,
+            password: "editor-password",
+            secretEnv: ["TOKEN": "editor"],
+            ifConfigUnchangedFrom: model.configFingerprint
+        )
+
+        try await secrets.setPassword("newer-helper-password", destId: destinationId)
+        let restored = try await model.restoreDestinationSecrets(rollback)
+
+        #expect(!restored)
+        #expect(try await secrets.password(destId: destinationId) == "newer-helper-password")
+        #expect(try await secrets.secretEnv(destId: destinationId) == ["TOKEN": "original"])
+    }
+
+    @Test("a conflict on one destination does not strand another destination's edit")
+    func destinationRollbackConflictsStayDestinationScoped() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-secret-destinations-app-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let firstId = UUID()
+        let secondId = UUID()
+        let secrets = MemorySecretStore(passwords: [
+            firstId: "first-original",
+            secondId: "second-original",
+        ])
+        let model = AppModel(paths: AppPaths(root: root), secretStoreFactory: { secrets })
+        let first = try await model.storeDestinationSecrets(
+            destId: firstId,
+            password: "first-editor",
+            secretEnv: nil,
+            ifConfigUnchangedFrom: model.configFingerprint
+        )
+        let second = try await model.storeDestinationSecrets(
+            destId: secondId,
+            password: "second-editor",
+            secretEnv: nil,
+            ifConfigUnchangedFrom: model.configFingerprint
+        )
+
+        try await secrets.setPassword("second-helper", destId: secondId)
+        try await model.restoreDestinationSecrets([first, second])
+
+        #expect(try await secrets.password(destId: firstId) == "first-original")
+        #expect(try await secrets.password(destId: secondId) == "second-helper")
+    }
+
+    @Test("a conflict skips older tokens only for the same destination field")
+    func destinationRollbackConflictBlocksItsOlderFieldChain() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-secret-chain-conflict-app-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let destinationId = UUID()
+        let secrets = MemorySecretStore(passwords: [destinationId: "original-password"])
+        let model = AppModel(paths: AppPaths(root: root), secretStoreFactory: { secrets })
+        let first = try await model.storeDestinationSecrets(
+            destId: destinationId,
+            password: "first-editor",
+            secretEnv: nil,
+            ifConfigUnchangedFrom: model.configFingerprint
+        )
+        let second = try await model.storeDestinationSecrets(
+            destId: destinationId,
+            password: "second-editor",
+            secretEnv: nil,
+            ifConfigUnchangedFrom: model.configFingerprint
+        )
+
+        try await secrets.setPassword("newer-helper-password", destId: destinationId)
+        try await model.restoreDestinationSecrets([first, second])
+
+        #expect(try await secrets.password(destId: destinationId) == "newer-helper-password")
+    }
+
+    @Test("config preflight failures never advise unlocking the keychain")
+    func destinationSecretFailureCopyDistinguishesConfigAndKeychain() {
+        let configMessage = SetsCopy.destinationSecretFailureMessage(
+            for: ConfigStoreError.writeLockBusy(path: "/tmp/config.lock")
+        )
+        #expect(configMessage.contains("No keychain item was changed"))
+        #expect(!configMessage.contains("Unlock your login keychain"))
+
+        let keychainMessage = SetsCopy.destinationSecretFailureMessage(
+            for: SecretStoreError.backendFailed("login keychain is locked")
+        )
+        #expect(keychainMessage.contains("Unlock your login keychain"))
+    }
 }
 
 private actor MemorySecretStore: SecretStore {
@@ -632,8 +734,12 @@ private actor MemorySecretStore: SecretStore {
     private var passwords: [UUID: String]
     private var secretEnvironments: [UUID: [String: String]] = [:]
 
-    init(passwords: [UUID: String] = [:]) {
+    init(
+        passwords: [UUID: String] = [:],
+        secretEnvironments: [UUID: [String: String]] = [:]
+    ) {
         self.passwords = passwords
+        self.secretEnvironments = secretEnvironments
     }
 
     func setPassword(_ password: String, destId: UUID) async throws {

@@ -667,7 +667,7 @@ public final class StateWatcher: ObservableObject {
                 paths.runPublicationLockFile,
                 paths.healthLockFile,
             ]
-            if secretBackend == .file { urls.append(paths.secretsLockFile) }
+            urls.append(paths.secretsLockFile)
             urls += configuredSetIds.map { paths.setLockFile(setId: $0) }
         }
         if stateDirSource != nil {

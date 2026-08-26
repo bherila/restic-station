@@ -225,16 +225,23 @@ struct KeychainSecretStoreTests {
         #expect(runner.invocations[0].argv.contains(Self.account))
     }
 
-    @Test("conditional rollback does not overwrite a newer keychain value")
-    func conditionalRollbackPreservesNewerValue() async throws {
+    @Test("conditional rollback preserves a newer password and restores the unchanged environment")
+    func conditionalRollbackRestoresFieldsIndependently() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("restic-station-keychain-rollback-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
+        let installedEnv = try SecretEnvBlob.encode(["TOKEN": "editor"])
         let runner = FakeProcessRunner(script: [
             .init(
                 argvPrefix: ["/usr/bin/security", "find-generic-password"],
                 stdoutLines: ["newer-helper-password"]
             ),
+            .init(
+                argvPrefix: ["/usr/bin/security", "find-generic-password"],
+                stdoutLines: [installedEnv]
+            ),
+            .init(argvPrefix: ["/usr/bin/security", "delete-generic-password"], exitCode: 0),
+            .init(argvPrefix: ["/usr/bin/security", "add-generic-password"], exitCode: 0),
         ])
         let client = KeychainSecretStore(runner: runner, paths: AppPaths(root: root))
         let rollback = DestinationSecretRollback(
@@ -243,13 +250,20 @@ struct KeychainSecretStoreTests {
                 installed: "editor-password",
                 previous: "original-password"
             ),
-            secretEnv: nil
+            secretEnv: SecretRollbackChange(
+                installed: ["TOKEN": "editor"],
+                previous: ["TOKEN": "original"]
+            )
         )
 
-        let restored = try await client.restoreDestinationSecretsIfCurrent(rollback)
+        let result = try await client.restoreDestinationSecretsIfCurrent(rollback)
 
-        #expect(!restored)
-        #expect(runner.invocations.count == 1)
+        #expect(result.passwordRestored == false)
+        #expect(result.secretEnvRestored == true)
+        #expect(!result.allRestored)
+        #expect(runner.invocations.count == 4)
+        let restoredEnv = try SecretEnvBlob.decode(runner.invocations[3].argv[7])
+        #expect(restoredEnv == ["TOKEN": "original"])
     }
 
     @Test("production keychain mutations wait for the shared secrets lock")

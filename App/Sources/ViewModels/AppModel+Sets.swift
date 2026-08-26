@@ -180,7 +180,7 @@ extension AppModel {
     /// config CAS refuses. Fields the editor left alone are not touched.
     @discardableResult
     func restoreDestinationSecrets(_ rollback: DestinationSecretsRollback) async throws -> Bool {
-        try await restoreDestinationSecrets(rollback, using: makeSecretStore())
+        try await restoreDestinationSecrets(rollback, using: makeSecretStore()).allRestored
     }
 
     /// Rolls a sequence of edits back in reverse order. Editing the same
@@ -189,13 +189,31 @@ extension AppModel {
     /// instead of returning to the value that preceded the editor session.
     func restoreDestinationSecrets(_ rollbacks: [DestinationSecretsRollback]) async throws {
         let store = try makeSecretStore()
+        var passwordConflicts: Set<UUID> = []
+        var secretEnvConflicts: Set<UUID> = []
         for rollback in rollbacks.reversed() {
-            guard try await restoreDestinationSecrets(rollback, using: store) else {
-                // A newer helper/CLI mutation won. Stop the rollback chain:
-                // applying an older token after that mismatch could still
-                // overwrite the external value if it happens to equal an
-                // intermediate editor value.
-                return
+            let transaction = DestinationSecretRollback(
+                destId: rollback.destId,
+                password: passwordConflicts.contains(rollback.destId)
+                    ? nil
+                    : rollback.transaction.password,
+                secretEnv: secretEnvConflicts.contains(rollback.destId)
+                    ? nil
+                    : rollback.transaction.secretEnv
+            )
+            let result = try await restoreDestinationSecrets(
+                DestinationSecretsRollback(transaction: transaction),
+                using: store
+            )
+            // Once a newer mutation wins one field, skip only that field's
+            // older tokens for this destination. Independent fields and
+            // other destinations must still return to their pre-editor
+            // values.
+            if result.passwordRestored == false {
+                passwordConflicts.insert(rollback.destId)
+            }
+            if result.secretEnvRestored == false {
+                secretEnvConflicts.insert(rollback.destId)
             }
         }
     }
@@ -203,7 +221,7 @@ extension AppModel {
     private func restoreDestinationSecrets(
         _ rollback: DestinationSecretsRollback,
         using store: any SecretStore
-    ) async throws -> Bool {
+    ) async throws -> DestinationSecretRestoreResult {
         try await store.restoreDestinationSecretsIfCurrent(rollback.transaction)
     }
 
