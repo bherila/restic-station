@@ -309,7 +309,10 @@ snapshot a permanent omission. The fixed order is:
    attributed snapshot ids, even when every pattern is already recorded;
 3. for each reachable secondary, revalidate and purge it first, then copy only
    the exact primary snapshot generation produced by step 2;
-4. run ordinary retention only where its existing freshness rules permit it.
+4. after each bounded copy, re-list the primary generation; mark the mirror
+   synced and run its retention only if that generation is still exactly the
+   one copied;
+5. run primary retention last.
 
 **Attribution** decides which snapshots a purge is allowed to touch, and is
 therefore normative. A repository-wide `snapshots --json` listing is filtered
@@ -376,8 +379,9 @@ replacement or stale-host backup in the earlier planning window refuses launch
 and restores a first-child token. Watermark recovery
 likewise rechecks that canonical purge metadata still reproduces the exact
 verified index projection, including its purge-evidence digest, at the point
-that evidence is consumed. The full snapshot ids selected for every destination
-must also have unique eight-character prefixes,
+that evidence is consumed. Every full snapshot id in each destination's
+complete launch generation — selected or unattributed — must also have a
+unique eight-character prefix,
 because those prefixes are the only old-id keys in restic's rewrite transcript;
 ambiguity refuses before token consumption or destructive launch. Manual
 recovery consumes the stale token and does not rewrite the repository again;
@@ -396,8 +400,12 @@ snapshots. Scheduled `copy` passes exactly those result ids as operands. A
 snapshot created after the launch observation is absent from the copy argv;
 because the watermark cannot suppress the next scheduled revalidation, that
 snapshot becomes attributed purge work on the next run rather than retaining
-excluded data permanently. Prefix ambiguity makes Restic fail closed instead
-of widening the copy.
+excluded data permanently. After a bounded copy succeeds, Restic Station
+re-lists the primary and compares the live full ids to those exact output
+prefixes. A changed or unreadable generation makes the run an infrastructure
+failure and withholds both `lastSyncedAt` and mirror retention. Prefix
+ambiguity fails before rewrite instead of becoming a post-mutation audit
+failure or widening the copy.
 
 ## Locking
 

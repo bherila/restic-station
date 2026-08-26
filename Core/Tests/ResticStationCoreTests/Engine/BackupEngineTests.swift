@@ -3709,7 +3709,7 @@ struct BackupEngineTests {
         #expect(throws: Never.self) { _ = try env.engine.purgeTokenDestinationIDs(token.value) }
     }
 
-    @Test("runPurge refuses ambiguous rewrite transcript ids before destructive launch")
+    @Test("runPurge refuses complete-generation prefix collisions before destructive launch")
     func purgeApplyRejectsAmbiguousRewriteTranscriptIDs() async throws {
         let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]
         let hostnames = [Self.setId: Set(["example-mac.local"])]
@@ -3723,12 +3723,15 @@ struct BackupEngineTests {
         let fixtureSnapshots = try parseSnapshots(Data(fixtureJSON.utf8))
         let collidingID = String(fixtureSnapshots[0].id.prefix(8))
             + String(fixtureSnapshots[1].id.dropFirst(8))
-        let snapshotsJSON = fixtureJSON.replacingOccurrences(
-            of: fixtureSnapshots[1].id,
-            with: collidingID
-        ).replacingOccurrences(
-            of: fixtureSnapshots[1].shortId,
-            with: fixtureSnapshots[0].shortId
+        var snapshotObjects = try #require(
+            JSONSerialization.jsonObject(with: Data(fixtureJSON.utf8)) as? [[String: Any]]
+        )
+        snapshotObjects[1]["id"] = collidingID
+        snapshotObjects[1]["short_id"] = fixtureSnapshots[0].shortId
+        snapshotObjects[1]["hostname"] = "other-machine"
+        let snapshotsJSON = String(
+            decoding: try JSONSerialization.data(withJSONObject: snapshotObjects),
+            as: UTF8.self
         )
         let snapshots = try parseSnapshots(Data(snapshotsJSON.utf8))
         #expect(snapshots[0].id != snapshots[1].id)
@@ -3741,6 +3744,8 @@ struct BackupEngineTests {
             hostnames: hostnames[Self.setId]!,
             patterns: env.set.purgeExcludes
         )
+        #expect(plan.matched.map(\.id) == [snapshots[0].id])
+        #expect(plan.unattributed.map(\.id) == [snapshots[1].id])
         let token = try #require(try env.engine.issuePurgeToken(
             set: env.set,
             destinations: [env.primary],
@@ -3768,7 +3773,7 @@ struct BackupEngineTests {
                 Issue.record("expected infrastructure failure, got \(error)")
                 return
             }
-            #expect(reason.contains("ambiguous restic transcript prefixes"))
+            #expect(reason.contains("repository generation has ambiguous restic transcript prefixes"))
             #expect(!operationMayHaveRun)
         }
         #expect(!env.resticArgvs.contains { $0.contains("rewrite") })
@@ -4050,7 +4055,7 @@ struct BackupEngineTests {
         let copyExcludedLateSnapshot = Box(false)
         let lateSnapshotID = "deadbeef" + String(repeating: "c", count: 56)
         let env = Self.makeEnv(
-            script: [], retention: nil, purgeExcludes: ["build/**"], reachableSecondaries: [true],
+            script: [], purgeExcludes: ["build/**"], reachableSecondaries: [true],
             onSpawn: { argv in
                 if argv.contains("rewrite"), argv.contains(where: { $0.hasSuffix("/primary") }) {
                     // Model a peer committing `lateSnapshotID` after the
@@ -4073,6 +4078,21 @@ struct BackupEngineTests {
             .replacingOccurrences(of: "09b3295c", with: snapshots[0].shortId)
             .replacingOccurrences(of: "b2435423", with: snapshots[1].shortId)
         let rewriteLines = rewrite.split(separator: "\n").map(String.init)
+        var postCopyObjects = try #require(
+            JSONSerialization.jsonObject(with: Data(snapshotsJSON.utf8)) as? [[String: Any]]
+        )
+        postCopyObjects[0]["id"] = "14a53542" + String(repeating: "a", count: 56)
+        postCopyObjects[0]["short_id"] = "14a53542"
+        postCopyObjects[1]["id"] = "3ca2e0a5" + String(repeating: "b", count: 56)
+        postCopyObjects[1]["short_id"] = "3ca2e0a5"
+        var lateSnapshot = postCopyObjects[1]
+        lateSnapshot["id"] = lateSnapshotID
+        lateSnapshot["short_id"] = String(lateSnapshotID.prefix(8))
+        postCopyObjects.append(lateSnapshot)
+        let postCopySnapshotsJSON = String(
+            decoding: try JSONSerialization.data(withJSONObject: postCopyObjects),
+            as: UTF8.self
+        )
         let secondary = env.secondaries[0]
         env.fake.script = Self.resticCall(Self.backupArgv(env.primary.repoURL, excludes: env.set.purgeExcludes), dest: Self.primaryId, stdoutLines: Self.backupStream())
             + Self.repositoryConfigCall(env.primary.repoURL, dest: Self.primaryId)
@@ -4104,6 +4124,12 @@ struct BackupEngineTests {
                 dest: secondary.id,
                 from: env.primary.id
             )
+            + Self.resticCall(
+                ["-r", env.primary.repoURL, "snapshots", "--json"],
+                dest: env.primary.id,
+                stdoutLines: [postCopySnapshotsJSON]
+            )
+            + Self.resticCall(Self.forgetArgv(env.primary.repoURL), dest: env.primary.id)
 
         let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
 
@@ -4128,15 +4154,18 @@ struct BackupEngineTests {
                 from: env.primary.repoURL,
                 snapshotIDs: ["14a53542", "3ca2e0a5"]
             ),
+            [Self.resticPath, "-r", env.primary.repoURL, "snapshots", "--json"],
+            [Self.resticPath] + Self.forgetArgv(env.primary.repoURL),
         ]
         #expect(env.resticArgvs == expectedArgvs)
         #expect(copyExcludedLateSnapshot.value)
-        guard case .completed(let status, _, let children) = outcome else {
-            Issue.record("expected .completed, got \(outcome)")
+        guard case .infrastructureFailure(let reason) = outcome else {
+            Issue.record("the peer snapshot must prevent a false caught-up result: \(outcome)")
             return
         }
-        #expect(status == .success)
-        #expect(children.map(\.kind) == [.backup, .purge, .purge, .copy])
+        #expect(reason.contains("primary snapshot generation changed during bounded copy"))
+        #expect(env.repoStatus(secondary)?.lastSyncedAt == nil)
+        #expect(!env.resticArgvs.contains([Self.resticPath] + Self.forgetArgv(secondary.repoURL)))
         let applied = env.stateStore.readScheduleState()?.sets[Self.setId]?.appliedPurgeExcludes
         #expect(applied?[env.primary.id] == env.set.purgeExcludes)
         #expect(applied?[secondary.id] == env.set.purgeExcludes)
@@ -4355,6 +4384,17 @@ struct BackupEngineTests {
             .replacingOccurrences(of: "09b3295c", with: snapshots[0].shortId)
             .replacingOccurrences(of: "b2435423", with: snapshots[1].shortId)
         let copySnapshotIDs = ["14a53542", "3ca2e0a5"]
+        let rewrittenSnapshotsJSON = snapshotsJSON
+            .replacingOccurrences(
+                of: snapshots[0].id,
+                with: "14a53542" + String(repeating: "a", count: 56)
+            )
+            .replacingOccurrences(of: snapshots[0].shortId, with: "14a53542")
+            .replacingOccurrences(
+                of: snapshots[1].id,
+                with: "3ca2e0a5" + String(repeating: "b", count: 56)
+            )
+            .replacingOccurrences(of: snapshots[1].shortId, with: "3ca2e0a5")
         func successfulPurgeCalls(
             repo: String,
             destinationId: UUID
@@ -4411,6 +4451,10 @@ struct BackupEngineTests {
             ),
             dest: healthy.id,
             from: env.primary.id
+        ) + Self.resticCall(
+            ["-r", env.primary.repoURL, "snapshots", "--json"],
+            dest: env.primary.id,
+            stdoutLines: [rewrittenSnapshotsJSON]
         ) + Self.resticCall(
             Self.forgetArgv(healthy.repoURL), dest: healthy.id
         ) + Self.resticCall(
