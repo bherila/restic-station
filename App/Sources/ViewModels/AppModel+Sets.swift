@@ -833,7 +833,10 @@ extension AppModel {
     /// Reads back what the destination editor needs to pre-fill. A missing
     /// password is not an error here (a destination can exist before its
     /// password was ever stored) — the caller shows "leave blank to keep".
-    func loadDestinationSecrets(destId: UUID) async throws -> (password: String?, secretEnv: [String: String]) {
+    func loadDestinationSecrets(
+        destId: UUID,
+        editorSessionId: UUID? = nil
+    ) async throws -> (password: String?, secretEnv: [String: String]) {
         // A rollback which was already in flight when this editor opened may
         // still own the value currently in the backend. Prefill only after it
         // settles, matching the serialization used by credential writes.
@@ -841,14 +844,62 @@ extension AppModel {
             await pendingSecretRollbackTask.value
         }
         await waitForInFlightSecretRollbackRestorations()
+        guard !hasOtherLiveSecretEditorOwnership(
+            destId: destId,
+            excluding: editorSessionId
+        ) else {
+            throw AppModelError.newerSecretEditorMutation
+        }
         // A closed editor can leave a batch queued rather than running while
         // another set editor is open. Reconcile this destination explicitly
         // so its abandoned value is never copied into the surviving draft.
         try await drainQueuedSecretRollbacks(forDestination: destId)
+        guard !hasOtherLiveSecretEditorOwnership(
+            destId: destId,
+            excluding: editorSessionId
+        ) else {
+            throw AppModelError.newerSecretEditorMutation
+        }
         guard let store = self.secrets else { return (nil, [:]) }
         let password = try? await store.password(destId: destId)
         let env = (try? await store.secretEnv(destId: destId)) ?? [:]
+        // Reads leave the main actor. If another editor acquired ownership or
+        // closed and queued its rollback during either backend await, these
+        // values are not a stable baseline and must not enable Save.
+        let queuedDuringRead = pendingSecretRollbackBatches
+            .flatMap({ $0 })
+            .compactMap(rollbackWithUncommittedFields)
+            .contains { $0.destId == destId }
+        guard !queuedDuringRead,
+              !hasOtherLiveSecretEditorOwnership(
+                destId: destId,
+                excluding: editorSessionId
+              ) else {
+            throw AppModelError.newerSecretEditorMutation
+        }
         return (password, env)
+    }
+
+    private func hasOtherLiveSecretEditorOwnership(
+        destId: UUID,
+        excluding sessionId: UUID?
+    ) -> Bool {
+        let hasInFlightMutation = inFlightSecretEditorMutations.contains { session, mutations in
+            (sessionId == nil || session != sessionId)
+                && mutations.values.contains { $0.destId == destId }
+        }
+        if hasInFlightMutation { return true }
+
+        var otherSessions = activeSecretEditorSessions
+        if let sessionId {
+            otherSessions.remove(sessionId)
+        }
+        return otherSessions.contains { session in
+            ((claimedSecretEditorRollbacks[session] ?? [])
+                + (unclaimedSecretEditorRollbacks[session] ?? []))
+                .compactMap(rollbackWithUncommittedFields)
+                .contains { $0.destId == destId }
+        }
     }
 
     /// Both stored secrets for a destination, as promised by the remove

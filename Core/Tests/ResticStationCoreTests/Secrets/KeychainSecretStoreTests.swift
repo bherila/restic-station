@@ -297,6 +297,50 @@ struct KeychainSecretStoreTests {
         #expect(try await client.secretEnv(destId: Self.destId).isEmpty)
     }
 
+    @Test("failed direct password mutations restore the previous generation marker")
+    func failedDirectPasswordMutationRestoresGeneration() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-keychain-generation-failure-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let generationAccount = "\(Self.account)-generation"
+        let runner = StatefulKeychainRunner(items: [
+            Self.account: "editor-password",
+            generationAccount: "editor-generation",
+        ])
+        runner.failNextDelete(account: Self.account)
+        let client = KeychainSecretStore(runner: runner, paths: AppPaths(root: root))
+
+        await #expect(throws: SecretStoreError.backendFailed("injected delete failure")) {
+            try await client.setPassword("helper-password", destId: Self.destId)
+        }
+
+        #expect(runner.value(account: Self.account) == "editor-password")
+        #expect(runner.value(account: generationAccount) == "editor-generation")
+    }
+
+    @Test("failed direct environment deletes restore the previous generation marker")
+    func failedDirectEnvironmentDeleteRestoresGeneration() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-keychain-env-generation-failure-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let envAccount = "\(Self.account)-env"
+        let generationAccount = "\(envAccount)-generation"
+        let raw = try SecretEnvBlob.encode(["TOKEN": "editor"])
+        let runner = StatefulKeychainRunner(items: [
+            envAccount: raw,
+            generationAccount: "editor-generation",
+        ])
+        runner.failNextDelete(account: envAccount)
+        let client = KeychainSecretStore(runner: runner, paths: AppPaths(root: root))
+
+        await #expect(throws: SecretStoreError.backendFailed("injected delete failure")) {
+            try await client.deleteSecretEnv(destId: Self.destId)
+        }
+
+        #expect(runner.value(account: envAccount) == raw)
+        #expect(runner.value(account: generationAccount) == "editor-generation")
+    }
+
     @Test("failed password update does not rewrite an untouched environment")
     func failedPasswordUpdateRestoresOnlyStartedFields() async throws {
         let root = FileManager.default.temporaryDirectory
@@ -458,6 +502,7 @@ struct KeychainSecretStoreTests {
         #expect(heldLock.acquire() == .acquired)
 
         let runner = FakeProcessRunner(script: [
+            .init(argvPrefix: ["/usr/bin/security", "find-generic-password"], exitCode: 44),
             .init(argvPrefix: ["/usr/bin/security", "delete-generic-password"], exitCode: 44),
             .init(argvPrefix: ["/usr/bin/security", "add-generic-password"], exitCode: 0),
             .init(argvPrefix: ["/usr/bin/security", "delete-generic-password"], exitCode: 44),
@@ -471,16 +516,25 @@ struct KeychainSecretStoreTests {
         #expect(runner.invocations.isEmpty)
         heldLock.release()
         try await mutation.value
-        #expect(runner.invocations.count == 3)
+        #expect(runner.invocations.count == 4)
     }
 }
 
 private final class StatefulKeychainRunner: ProcessRunning, @unchecked Sendable {
     private let lock = NSLock()
     private var items: [String: String]
+    private var deleteFailures: Set<String> = []
 
     init(items: [String: String]) {
         self.items = items
+    }
+
+    func failNextDelete(account: String) {
+        _ = withLock { deleteFailures.insert(account) }
+    }
+
+    func value(account: String) -> String? {
+        withLock { items[account] }
     }
 
     func run(
@@ -504,6 +558,13 @@ private final class StatefulKeychainRunner: ProcessRunning, @unchecked Sendable 
                 }
                 return ProcessResult(exitCode: 0, stdout: Data((value + "\n").utf8), stderr: Data())
             case "delete-generic-password":
+                if deleteFailures.remove(account) != nil {
+                    return ProcessResult(
+                        exitCode: 1,
+                        stdout: Data(),
+                        stderr: Data("injected delete failure".utf8)
+                    )
+                }
                 guard items.removeValue(forKey: account) != nil else {
                     return ProcessResult(exitCode: 44, stdout: Data(), stderr: Data())
                 }

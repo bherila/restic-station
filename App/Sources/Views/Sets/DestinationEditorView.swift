@@ -771,7 +771,10 @@ struct DestinationEditorView: View {
 
         let secrets: (password: String?, secretEnv: [String: String])
         do {
-            secrets = try await model.loadDestinationSecrets(destId: draft.id)
+            secrets = try await model.loadDestinationSecrets(
+                destId: draft.id,
+                editorSessionId: secretEditorSessionID
+            )
         } catch {
             secretsNote = "Stored credentials could not be safely reconciled."
             message = .error("Credentials could not be loaded safely (\(error)). Retry after resolving the credential restoration warning.")

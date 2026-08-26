@@ -120,7 +120,7 @@ The target Linux host is headless: no desktop session, no D-Bus user bus, no key
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "secrets": {
     "<uuid-lowercased>": "the repository password",
     "<uuid-lowercased>-env": "{\"AWS_ACCESS_KEY_ID\":\"…\"}"
@@ -132,7 +132,7 @@ The target Linux host is headless: no desktop session, no D-Bus user bus, no key
 }
 ```
 
-Deliberately mirrors the keychain account naming (`SecretAccount`), so a destination's storage key is the same string on both platforms and the two backends stay comparable. `generations` is optional when decoding older files and is populated on the next mutation. Its values carry no secret material; they distinguish same-value cross-process writes for conditional editor rollback. A `version` newer than this build understands is refused rather than overwritten.
+Deliberately mirrors the keychain account naming (`SecretAccount`), so a destination's storage key is the same string on both platforms and the two backends stay comparable. Format 2 adds `generations`; current readers remain compatible with legacy format-1 files where that member is absent and upgrade them on the next mutation. Its values carry no secret material; they distinguish same-value cross-process writes for conditional editor rollback. A `version` newer than this build understands is refused rather than overwritten.
 
 ### Threat model
 

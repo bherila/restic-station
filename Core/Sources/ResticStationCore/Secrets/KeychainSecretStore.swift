@@ -59,8 +59,9 @@ public struct KeychainSecretStore: SecretStore {
     public func setPassword(_ password: String, destId: UUID) async throws {
         try await withMutationLock {
             let account = SecretAccount.password(destId)
-            try await advanceGenerationIfTracked(account: account)
-            try await setValue(password, account: account)
+            try await mutateTrackedValue(account: account) {
+                try await setValue(password, account: account)
+            }
         }
     }
 
@@ -71,8 +72,9 @@ public struct KeychainSecretStore: SecretStore {
     public func deletePassword(destId: UUID) async throws {
         try await withMutationLock {
             let account = SecretAccount.password(destId)
-            try await advanceGenerationIfTracked(account: account)
-            try await deleteValueTolerant(account: account)
+            try await mutateTrackedValue(account: account) {
+                try await deleteValueTolerant(account: account)
+            }
         }
     }
 
@@ -86,8 +88,9 @@ public struct KeychainSecretStore: SecretStore {
         let json = try SecretEnvBlob.encode(env)
         try await withMutationLock {
             let account = SecretAccount.secretEnv(destId)
-            try await advanceGenerationIfTracked(account: account)
-            try await setValue(json, account: account)
+            try await mutateTrackedValue(account: account) {
+                try await setValue(json, account: account)
+            }
         }
     }
 
@@ -106,8 +109,9 @@ public struct KeychainSecretStore: SecretStore {
     public func deleteSecretEnv(destId: UUID) async throws {
         try await withMutationLock {
             let account = SecretAccount.secretEnv(destId)
-            try await advanceGenerationIfTracked(account: account)
-            try await deleteValueTolerant(account: account)
+            try await mutateTrackedValue(account: account) {
+                try await deleteValueTolerant(account: account)
+            }
         }
     }
 
@@ -305,9 +309,35 @@ public struct KeychainSecretStore: SecretStore {
         "\(account)-generation"
     }
 
-    private func advanceGenerationIfTracked(account: String) async throws {
-        guard paths != nil else { return }
-        try await setValue(UUID().uuidString, account: generationAccount(for: account))
+    /// Advances the non-secret mutation identity and the credential under the
+    /// same cross-process lock. If any security(1) step fails, restore the
+    /// prior identity before returning the original error so a still-current
+    /// app rollback is not falsely classified as externally superseded.
+    private func mutateTrackedValue(
+        account: String,
+        mutation: () async throws -> Void
+    ) async throws {
+        guard paths != nil else {
+            try await mutation()
+            return
+        }
+        let previousGeneration = try await readOptionalValue(
+            account: generationAccount(for: account)
+        )
+        do {
+            try await setValue(UUID().uuidString, account: generationAccount(for: account))
+            try await mutation()
+        } catch let mutationError {
+            do {
+                try await restoreGeneration(previousGeneration, account: account)
+            } catch {
+                throw SecretStoreError.backendFailed(
+                    "keychain mutation failed and restoring its generation marker also failed; "
+                        + "verify this destination's credentials before running a backup"
+                )
+            }
+            throw mutationError
+        }
     }
 
     private func restoreGeneration(_ generation: String?, account: String) async throws {

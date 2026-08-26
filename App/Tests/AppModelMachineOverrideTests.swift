@@ -1697,7 +1697,10 @@ struct AppModelMachineOverrideTests {
         model.beginSecretEditorSession(sessionId)
         var prefillFinished = false
         let prefill = Task { @MainActor in
-            let loaded = try await model.loadDestinationSecrets(destId: destinationId)
+            let loaded = try await model.loadDestinationSecrets(
+                destId: destinationId,
+                editorSessionId: sessionId
+            )
             prefillFinished = true
             return loaded
         }
@@ -1735,12 +1738,57 @@ struct AppModelMachineOverrideTests {
 
         #expect(model.pendingSecretRollbackTask == nil)
         #expect(model.pendingSecretRollbackBatches.count == 1)
-        let loaded = try await model.loadDestinationSecrets(destId: destinationId)
+        let loaded = try await model.loadDestinationSecrets(
+            destId: destinationId,
+            editorSessionId: survivingSession
+        )
 
         #expect(loaded.password == "original-password")
         #expect(loaded.secretEnv == ["TOKEN": "original"])
         #expect(model.pendingSecretRollbackBatches.isEmpty)
         model.endSecretEditorSession(survivingSession)
+    }
+
+    @Test("destination prefill refuses credentials owned by another live editor")
+    func destinationPrefillRefusesOtherLiveEditorOwnership() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-secret-live-owner-prefill-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let destinationId = UUID()
+        let owningSession = UUID()
+        let loadingSession = UUID()
+        let secrets = CheckpointingSecretStore(passwords: [destinationId: "original-password"])
+        let model = AppModel(paths: AppPaths(root: root), secretStoreFactory: { secrets })
+        model.beginSecretEditorSession(owningSession)
+        let owned = try await model.storeDestinationSecrets(
+            destId: destinationId,
+            password: "live-editor-password",
+            secretEnv: nil,
+            ifConfigUnchangedFrom: model.configFingerprint,
+            editorSessionId: owningSession
+        )
+        #expect(model.claimEditorSecretRollback(owned, sessionId: owningSession))
+        model.beginSecretEditorSession(loadingSession)
+
+        do {
+            _ = try await model.loadDestinationSecrets(
+                destId: destinationId,
+                editorSessionId: loadingSession
+            )
+            Issue.record("expected prefill to refuse another editor's live credential")
+        } catch AppModelError.newerSecretEditorMutation {
+            // Expected: the loading editor cannot adopt another draft's value.
+        }
+
+        var remaining = [owned]
+        _ = try await model.restoreDestinationSecrets(
+            remaining,
+            editorSessionId: owningSession,
+            onProgress: { remaining = $0 }
+        )
+        model.endSecretEditorSession(loadingSession)
+        model.endSecretEditorSession(owningSession)
     }
 
     @Test("a dequeued prefill rollback remains visible to older explicit reverts")
@@ -1778,7 +1826,10 @@ struct AppModelMachineOverrideTests {
 
         await secrets.pauseNextPasswordWrite()
         let prefill = Task { @MainActor in
-            try await model.loadDestinationSecrets(destId: destinationId)
+            try await model.loadDestinationSecrets(
+                destId: destinationId,
+                editorSessionId: olderSession
+            )
         }
         for _ in 0..<40 {
             if await secrets.passwordWriteIsPaused() { break }
@@ -1833,7 +1884,10 @@ struct AppModelMachineOverrideTests {
         await secrets.failNextPasswordWrite()
 
         await #expect(throws: SecretStoreError.backendFailed("injected password failure")) {
-            try await model.loadDestinationSecrets(destId: destinationId)
+            try await model.loadDestinationSecrets(
+                destId: destinationId,
+                editorSessionId: survivingSession
+            )
         }
         #expect(model.pendingSecretRollbackBatches.flatMap { $0 }.contains { $0.sequence == abandoned.sequence })
         #expect(model.pendingSecretRollbackError != nil)
