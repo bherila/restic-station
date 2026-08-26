@@ -178,23 +178,34 @@ struct MaintenancePrune: AsyncParsableCommand, JSONRenderable {
                 destinationId: destinationId,
                 effectiveDestinationFingerprint: fingerprint
             )
-        } catch PreviewTokenError.unavailable {
-            throw CLIFailure(
-                code: .setBusy,
-                message: "The reclaim confirmation is temporarily unavailable. Run the dry run again.",
-                details: CLIErrorDetails(setId: setId, destinationId: destinationId)
-            )
-        } catch PreviewTokenError.storeUnusable(let detail) {
-            // Not `set_busy`: "run the dry run again" is the wrong advice
-            // for a token store that no retry will fix (#110).
-            throw CLIFailure(
-                code: .internalError,
-                message: CLIFailure.bounded(
-                    "The confirmation store could not be used: \(detail). "
-                        + "Check the permissions on the Restic Station data directory."
-                ),
-                details: CLIErrorDetails(setId: setId, destinationId: destinationId)
-            )
+        } catch let error as PreviewTokenError {
+            // An exhaustive switch (no `default`, no partial catch list) so a
+            // new `PreviewTokenError` case must be classified here rather
+            // than falling through to whatever the generic mapper guesses.
+            switch error {
+            case .unavailable:
+                throw CLIFailure(
+                    code: .setBusy,
+                    message: "The reclaim confirmation is temporarily unavailable. Run the dry run again.",
+                    details: CLIErrorDetails(setId: setId, destinationId: destinationId)
+                )
+            case .storeUnusable(let detail):
+                // Not `set_busy`: "run the dry run again" is the wrong advice
+                // for a token store that no retry will fix (#110).
+                throw CLIFailure(
+                    code: .internalError,
+                    message: CLIFailure.bounded(
+                        "The confirmation store could not be used: \(detail). "
+                            + "Check the permissions on the Restic Station data directory."
+                    ),
+                    details: CLIErrorDetails(setId: setId, destinationId: destinationId)
+                )
+            case .unknown, .expired, .alreadyUsed:
+                // Consume-side refusals that issuing never raises. Rethrown
+                // unchanged — exactly what the previous partial catch list
+                // did — so behavior is identical if they ever appear.
+                throw error
+            }
         }
     }
 

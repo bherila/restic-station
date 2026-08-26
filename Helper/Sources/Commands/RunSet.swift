@@ -141,7 +141,9 @@ struct RunSet: AsyncParsableCommand {
             switch status {
             case .failed:
                 HelperExit.fail("backup failed — see the run log")
-            default:
+            case .success, .warning, .skipped, .running:
+                // Enumerated (no `default`) so a new `RunStatus` case must
+                // choose an exit here rather than silently printing success.
                 print("backup \(status.rawValue) (\(children.count) run\(children.count == 1 ? "" : "s"))")
             }
         case .skipped:
