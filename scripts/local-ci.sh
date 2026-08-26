@@ -22,6 +22,12 @@
 #   - scripts/integration-test.sh                       [macos job]
 #   - scripts/secret-cli-test.sh                        [macos job]
 #   - scripts/headless-cli-test.sh                      [macos job]
+#   - scripts/cli-contract-test.sh                      [linux + macos jobs]
+#     (FULL for the doc↔table drift check and every `live` contract row —
+#     the fake restic makes those platform-independent; the `env` rows it
+#     skips here are the same ones CI's linux job skips, e.g. systemd
+#     timer refusals, so a green local run of this script means what a
+#     green CI run of it means, minus nothing.)
 #
 # PARTIAL — real compilation, no execution:
 #   - Linux cross-compile via the Static Linux SDK. This genuinely type-checks
@@ -113,6 +119,7 @@ else
 fi
 step "secret CLI end to end"   scripts/secret-cli-test.sh
 step "headless CLI end to end" scripts/headless-cli-test.sh
+step "CLI JSON contract"       scripts/cli-contract-test.sh
 
 # ── Linux cross-compile ─────────────────────────────────────────────────
 # The only way to type-check `#if os(Linux)` code on this machine without

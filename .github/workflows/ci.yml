@@ -67,6 +67,11 @@ jobs:
       - name: Headless CLI (config/status/sets/runs) end to end
         run: scripts/headless-cli-test.sh
 
+      # docs/cli-json.md is normative; this fails on doc↔code drift before
+      # it can become a review finding. Fake restic, so no restic needed.
+      - name: CLI JSON contract (docs/cli-json.md is executable)
+        run: scripts/cli-contract-test.sh
+
       # T25 acceptance criteria that only a real Linux run can show.
       - name: fda-check is a no-op on Linux
         run: |
@@ -356,6 +361,8 @@ jobs:
       # reflects it) that the Linux job cannot.
       - name: Headless CLI (config/status/sets/runs) end to end
         run: scripts/headless-cli-test.sh "dd/Build/Products/Debug/Restic Station.app/Contents/MacOS/restic-station-helper"
+      - name: CLI JSON contract (docs/cli-json.md is executable)
+        run: scripts/cli-contract-test.sh "dd/Build/Products/Debug/Restic Station.app/Contents/MacOS/restic-station-helper"
       - name: Ad-hoc sign and package app artifact
         run: |
           APP="dd/Build/Products/Debug/Restic Station.app"
