@@ -902,6 +902,57 @@ struct AppModelMachineOverrideTests {
         #expect(try await secrets.password(destId: destinationId) == "original-password")
     }
 
+    @Test("an older rollback waits until a live editor registers its newer transaction")
+    func abandonedRollbackWaitsForActiveEditor() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-secret-active-editor-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let destinationId = UUID()
+        let sessionId = UUID()
+        let secrets = CheckpointingSecretStore(passwords: [destinationId: "original-password"])
+        let model = AppModel(paths: AppPaths(root: root), secretStoreFactory: { secrets })
+        let first = try await model.storeDestinationSecrets(
+            destId: destinationId,
+            password: "first-editor-password",
+            secretEnv: nil,
+            ifConfigUnchangedFrom: model.configFingerprint
+        )
+        await secrets.failNextPasswordWrite()
+        model.retainPendingSecretRollbacks([first])
+        for _ in 0..<40 {
+            if model.pendingSecretRollbackError != nil { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(model.pendingSecretRollbackError != nil)
+
+        model.beginSecretEditorSession(sessionId)
+        let second = try await model.storeDestinationSecrets(
+            destId: destinationId,
+            password: "second-editor-password",
+            secretEnv: nil,
+            ifConfigUnchangedFrom: model.configFingerprint,
+            editorSessionId: sessionId
+        )
+
+        model.retryPendingSecretRollbacks()
+        #expect(model.pendingSecretRollbackTask == nil)
+        #expect(model.pendingSecretRollbackBatches.count == 1)
+        #expect(try await secrets.password(destId: destinationId) == "second-editor-password")
+
+        #expect(model.claimEditorSecretRollback(second, sessionId: sessionId))
+        model.endSecretEditorSession(sessionId)
+        model.retainPendingSecretRollbacks([second])
+        for _ in 0..<80 {
+            if model.pendingSecretRollbackBatches.isEmpty { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+
+        #expect(model.pendingSecretRollbackBatches.isEmpty)
+        #expect(model.pendingSecretRollbackError == nil)
+        #expect(try await secrets.password(destId: destinationId) == "original-password")
+    }
+
     @Test("a credential-only destination edit makes the parent set saveable")
     func credentialOnlyDestinationEditIsUnsavedWork() {
         let destinationId = UUID()

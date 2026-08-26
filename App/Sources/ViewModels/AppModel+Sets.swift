@@ -196,6 +196,10 @@ extension AppModel {
         if let stranded = unclaimedSecretEditorRollbacks.removeValue(forKey: sessionId) {
             retainPendingSecretRollbacks(stranded)
         }
+        // A queued abandoned-session rollback is deliberately paused while
+        // any editor can still produce a newer rollback. Resume it once the
+        // last editor has synchronously transferred its ownership here.
+        retryPendingSecretRollbacks()
     }
 
     /// Claims the rollback parked before an async keychain write returned to
@@ -364,6 +368,11 @@ extension AppModel {
 
     func retryPendingSecretRollbacks() {
         guard pendingSecretRollbackTask == nil else { return }
+        // Do not unwind an older abandoned edit while a live editor may be
+        // between changing the keychain and parking/claiming its rollback.
+        // Once the editor ends, endSecretEditorSession() resumes newest-first
+        // processing with every transaction registered in one place.
+        guard activeSecretEditorSessions.isEmpty else { return }
         pendingSecretRollbackError = nil
         pendingSecretRollbackTask = Task { @MainActor [weak self] in
             guard let self else { return }

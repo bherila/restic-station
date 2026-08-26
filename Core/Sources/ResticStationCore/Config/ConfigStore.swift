@@ -674,7 +674,11 @@ enum AtomicFile {
                 try? FileManager.default.removeItem(at: source)
                 return false
             }
-            throw error
+            // config.json is still absent and the bytes that were live are
+            // stranded at `evacuated`. The original read error no longer
+            // describes the commit state; surface the preserved location as
+            // uncertain so paired side effects are not rolled back blindly.
+            throw ConfigStoreError.rollbackArtifactPreserved(path: evacuated.path)
         }
 
         let revisionToRestore = evacuatedIsCandidate ? source : evacuated
@@ -758,7 +762,8 @@ public enum ConfigStoreError: Error, Equatable, Sendable, CustomStringConvertibl
             return "could not roll back a refused config replacement (errno \(errno)); "
                 + "the uncommitted candidate may be installed at \(path)"
         case .rollbackArtifactPreserved(let path):
-            return "config.json changed repeatedly during save; an uncertain rollback artifact "
+            return "config.json save recovery could not determine or restore the live revision; "
+                + "an uncertain rollback artifact "
                 + "was preserved at \(path); reload settings and reconcile that file before saving"
         case .changedOnDisk:
             return "config.json changed on disk; reload the latest settings before saving"
