@@ -297,15 +297,18 @@ Rules (anacron semantics):
 
 ## Purge-exclusion ordering
 
-When a set has a `purgeExcludes` pattern absent from a destination's
-`appliedPurgeExcludes` state, the next successful backup run adds a purge
-phase. The fixed order is:
+When a set has any active `purgeExcludes`, every successful scheduled backup
+run adds a purge phase. `appliedPurgeExcludes` is durable audit history, not a
+repository-generation lock: another host can add a snapshot after one
+`snapshots` process exits and before the separate `rewrite` process starts.
+Trusting the watermark to skip future live observation would make that
+snapshot a permanent omission. The fixed order is:
 
 1. back up the primary with the effective forward excludes;
-2. purge the primary with `rewrite --forget` over newly attributed snapshot
-   ids;
-3. for each reachable secondary, purge it first when stale, then copy from
-   the primary;
+2. revalidate and purge the primary with `rewrite --forget` over its currently
+   attributed snapshot ids, even when every pattern is already recorded;
+3. for each reachable secondary, revalidate and purge it first, then copy only
+   the exact primary snapshot generation produced by step 2;
 4. run ordinary retention only where its existing freshness rules permit it.
 
 **Attribution** decides which snapshots a purge is allowed to touch, and is
@@ -345,18 +348,17 @@ repository has nothing to rewrite. A plan that matched nothing while snapshots
 *were* declined instead fails the complete apply during its all-destination
 read-only planning pass, before token consumption or any rewrite/copy launch:
 that combination is evidence attribution is wrong, and recording the patterns
-as applied would skip the rewrite permanently while continuing with a
-success-shaped outcome. A removed pattern stays recorded and is never used to
-trigger a rewrite.
+as applied would create a false success-shaped outcome. A removed pattern
+stays recorded as history, but only currently configured patterns are
+revalidated.
 
-The pending-pattern observation is revalidated after acquiring the shared
-schedule-state lease. Each destination is narrowed to the preview patterns it
-still needs: a primary and an offline mirror may legitimately have different
-watermarks, while a destination/pattern pair applied by another helper during
-the earlier planning window must not be rewritten. A token with no pending
-pair is stale and is refused. Terminal successful purge metadata is durably
-committed before the watermark. If the watermark's directory fsync then fails
-and a crash loses its visible rename, the next apply holds both the
+Manual token apply still narrows each destination to preview patterns absent
+from its watermark and refuses a token with no pending pair. Scheduled apply
+does not: it binds every active pattern into a fresh token and revalidates all
+of them under the shared schedule-state lease. Terminal successful purge
+metadata is durably committed before the watermark. If the watermark's
+directory fsync then fails and a crash loses its visible rename, a later
+manual apply holds both the
 destructive-audit gate and the schedule-state lease, revalidates the token's
 snapshot attribution, reads the live restic repository config id, verifies the
 complete run history, and restores only the exact `purgePatterns` whose
@@ -377,12 +379,25 @@ verified index projection, including its purge-evidence digest, at the point
 that evidence is consumed. The full snapshot ids selected for every destination
 must also have unique eight-character prefixes,
 because those prefixes are the only old-id keys in restic's rewrite transcript;
-ambiguity refuses before token consumption or destructive launch. Recovery
-consumes the stale token and does not rewrite the repository again. Evidence
+ambiguity refuses before token consumption or destructive launch. Manual
+recovery consumes the stale token and does not rewrite the repository again;
+scheduled apply deliberately does not take this shortcut. Evidence
 from a replaced repository or a same-id repository restored to a pre-purge
 generation is ignored so the live history receives its own rewrite; malformed,
 incomplete, identity-less legacy, or only partially matching history cannot
 authorize the recovery shortcut.
+
+There is no Restic CLI transaction that can hold the repository lock across
+the separate attribution query and `rewrite --forget` spawn. The remaining
+cross-host race is contained by the terminal rewrite metadata: it maps every
+full snapshot id in the launch-time repository generation to its resulting
+short id, including identity mappings for legitimate no-ops and unattributed
+snapshots. Scheduled `copy` passes exactly those result ids as operands. A
+snapshot created after the launch observation is absent from the copy argv;
+because the watermark cannot suppress the next scheduled revalidation, that
+snapshot becomes attributed purge work on the next run rather than retaining
+excluded data permanently. Prefix ambiguity makes Restic fail closed instead
+of widening the copy.
 
 ## Locking
 

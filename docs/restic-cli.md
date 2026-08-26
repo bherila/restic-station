@@ -104,9 +104,9 @@ Each backup passes `BackupSet.effectiveBackupExcludes`: `excludes` followed by `
 
 ### copy (mirror primary → secondary)
 ```
-restic -r <secondaryRepo> copy --from-repo <primaryRepo>
+restic -r <secondaryRepo> copy --from-repo <primaryRepo> [<snapshotID>...]
 ```
-Direction: **`-r` is the DESTINATION, `--from-repo` is the SOURCE.** Env: destination password via `RESTIC_PASSWORD_COMMAND`, source via `RESTIC_FROM_PASSWORD_COMMAND`. No snapshot IDs = copy all snapshots not yet present (dedup via the `original` field restic stamps on copied snapshots). `copy` has **no `--json`** in 0.18 — output is human text (`copy.txt`):
+Direction: **`-r` is the DESTINATION, `--from-repo` is the SOURCE.** Env: destination password via `RESTIC_PASSWORD_COMMAND`, source via `RESTIC_FROM_PASSWORD_COMMAND`. With active `purgeExcludes`, scheduled mirroring always supplies the exact resulting snapshot ids from the primary purge's complete launch-generation mapping. A snapshot created after that purge process starts is therefore not copied under stale purge authority. With no purge rules, no snapshot IDs means copy all snapshots not yet present (dedup via the `original` field restic stamps on copied snapshots). `copy` has **no `--json`** in 0.18 — output is human text (`copy.txt`):
 ```
 snapshot e9ffc5cb of [/Users/user/example/src] at 2026-07-26 16:57:04…
   copy started, this may take a while...

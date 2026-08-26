@@ -406,20 +406,26 @@ public final class BackupEngine: Sendable {
         // copied anywhere. A failed primary purge terminates the group: a
         // copy would otherwise propagate rewritten snapshots while leaving
         // their originals on an unpurged mirror.
-        let primaryPurgePatterns: [String]
-        do {
-            primaryPurgePatterns = try pendingPurgePatterns(
-                setId: set.id,
-                set: set,
-                destinationId: primary.id
-            )
-        } catch {
-            let reason = "schedule state unusable before purge — \(error)"
-            logWarning("BackupEngine: \(reason)")
-            return .infrastructureFailure(reason: reason)
-        }
+        // A purge watermark records history; it is not repository-generation
+        // evidence. Revalidate every active rule on every run so a snapshot
+        // created by another host during the previous query→rewrite gap can
+        // never be omitted permanently.
+        let primaryPurgePatterns = set.purgeExcludes
+        var primaryPurgeSnapshotIDs: [String] = []
         if !primaryPurgePatterns.isEmpty {
             do {
+                // Validate the canonical state before repository I/O. The
+                // automatic path no longer trusts the watermark to skip a
+                // purge, but corruption must still fail closed rather than
+                // be overwritten by the later audit update.
+                do {
+                    _ = try trustedScheduleState()
+                } catch {
+                    throw PurgeApplyError.infrastructureFailure(
+                        reason: "schedule state unusable before purge — \(error)",
+                        operationMayHaveRun: false
+                    )
+                }
                 let purge = try await runAutomaticPurge(
                     set: set,
                     destination: primary,
@@ -436,6 +442,13 @@ public final class BackupEngine: Sendable {
                     }
                     return .completed(status: .failed, groupId: groupId, children: children)
                 }
+                guard let snapshotIDs = purge.snapshotIDsByDestination[primary.id],
+                      !snapshotIDs.isEmpty else {
+                    return .infrastructureFailure(
+                        reason: "primary purge did not produce a copy-bound snapshot generation"
+                    )
+                }
+                primaryPurgeSnapshotIDs = snapshotIDs
             } catch {
                 logWarning(
                     "BackupEngine: could not purge primary \"\(primary.label)\" before mirroring: \(error)"
@@ -471,20 +484,17 @@ public final class BackupEngine: Sendable {
             // would retain its old snapshots alongside the primary's rewritten
             // replacements. A failed purge skips only this secondary; another
             // mirror can still make a safe copy.
-            let secondaryPurgePatterns: [String]
-            do {
-                secondaryPurgePatterns = try pendingPurgePatterns(
-                    setId: set.id,
-                    set: set,
-                    destinationId: secondary.id
-                )
-            } catch {
-                let reason = "schedule state unusable before purge — \(error)"
-                logWarning("BackupEngine: \(reason)")
-                return .infrastructureFailure(reason: reason)
-            }
+            let secondaryPurgePatterns = set.purgeExcludes
             if !secondaryPurgePatterns.isEmpty {
                 do {
+                    do {
+                        _ = try trustedScheduleState()
+                    } catch {
+                        throw PurgeApplyError.infrastructureFailure(
+                            reason: "schedule state unusable before purge — \(error)",
+                            operationMayHaveRun: false
+                        )
+                    }
                     let purge = try await runAutomaticPurge(
                         set: set,
                         destination: secondary,
@@ -520,7 +530,11 @@ public final class BackupEngine: Sendable {
                 groupId: groupId,
                 phase: "copying-\(secondary.id.uuidString)",
                 // `-r` is the DESTINATION, `--from-repo` is the SOURCE.
-                command: .copy(toRepo: secondary.repoURL, fromRepo: primary.repoURL),
+                command: .copy(
+                    toRepo: secondary.repoURL,
+                    fromRepo: primary.repoURL,
+                    snapshotIDs: primaryPurgeSnapshotIDs
+                ),
                 invocation: ResticInvocation(destination: secondary, fromDestination: primary),
                 streamProgress: false
             )
@@ -1551,7 +1565,8 @@ public final class BackupEngine: Sendable {
         destinations: [Destination],
         token: String,
         trigger: RunTrigger,
-        groupId: String?
+        groupId: String?,
+        revalidateAllPatterns: Bool = false
     ) async throws -> PurgeRunResult {
         // Bind the watermark evidence through repository validation, every
         // destructive launch, and the matching durable acknowledgement. The
@@ -1605,20 +1620,22 @@ public final class BackupEngine: Sendable {
             throw PurgeApplyError.tokenDoesNotMatchCurrentPlan
         }
 
-        // The automatic planner reads pending patterns before it can acquire
-        // this process-wide lease. Recompute each destination's narrower
-        // pending subset here, at the point of use: destinations legitimately
-        // diverge when one was offline, and a peer may also have completed
-        // one destination in the meantime. Already-applied pairs are skipped;
-        // no preview pattern may be widened or repeated for that destination.
+        // Manual apply retains the historical pending-pattern behavior. A
+        // scheduled apply deliberately revalidates every active pattern:
+        // the watermark cannot prove that another host did not add a new
+        // snapshot after the preceding purge query.
         var pendingPatternsByDestination: [UUID: [String]] = [:]
         for destination in destinations {
-            let applied = Set(
-                scheduleStateLease.state.sets[set.id]?
-                    .appliedPurgeExcludes[destination.id] ?? []
-            )
-            pendingPatternsByDestination[destination.id] = preview.patterns.filter {
-                !applied.contains($0)
+            if revalidateAllPatterns {
+                pendingPatternsByDestination[destination.id] = preview.patterns
+            } else {
+                let applied = Set(
+                    scheduleStateLease.state.sets[set.id]?
+                        .appliedPurgeExcludes[destination.id] ?? []
+                )
+                pendingPatternsByDestination[destination.id] = preview.patterns.filter {
+                    !applied.contains($0)
+                }
             }
         }
         let pendingDestinations = destinations.filter {
@@ -1754,7 +1771,7 @@ public final class BackupEngine: Sendable {
         // history fail closed before it can feed this decision.
         let successfulPatterns: [UUID: Set<String>]
         do {
-            successfulPatterns = try successfulPurgePatterns(
+            successfulPatterns = revalidateAllPatterns ? [:] : try successfulPurgePatterns(
                 setId: set.id,
                 pendingPatternsByDestination: pendingPatternsByDestination,
                 repositoryIdsByDestination: Dictionary(
@@ -1833,6 +1850,7 @@ public final class BackupEngine: Sendable {
         }
 
         var children: [SetRunChild] = []
+        var snapshotIDsByDestination: [UUID: [String]] = [:]
         var resolvedGroupId = groupId
         var isFirstPurgeChild = true
         for (destination, plan, repositoryId, destinationSecretEnv) in plans {
@@ -1847,6 +1865,7 @@ public final class BackupEngine: Sendable {
                     operationMayHaveRun: !children.isEmpty,
                     scheduleStateLease: scheduleStateLease
                 )
+                snapshotIDsByDestination[destination.id] = []
                 continue
             }
             let restoreAfterLaunchFailure = isFirstPurgeChild ? restorePurgeToken : nil
@@ -1924,6 +1943,30 @@ public final class BackupEngine: Sendable {
             }
             if resolvedGroupId == nil { resolvedGroupId = purge.child.runId }
             if purge.child.status == .success {
+                let rewrites: [String: String]
+                do {
+                    guard let recorded = try runStore.metadata(runId: purge.child.runId)
+                        .purgeSnapshotRewrites,
+                          !recorded.isEmpty else {
+                        throw RunStoreError.discardUnsafe(
+                            path: paths.runMetadataFile(runId: purge.child.runId).path
+                        )
+                    }
+                    rewrites = recorded
+                } catch {
+                    throw PurgeApplyError.infrastructureFailure(
+                        reason: "could not read the purge output generation — \(error)",
+                        operationMayHaveRun: true
+                    )
+                }
+                let outputSnapshotIDs = rewrites.values.sorted()
+                guard Set(outputSnapshotIDs).count == outputSnapshotIDs.count else {
+                    throw PurgeApplyError.infrastructureFailure(
+                        reason: "the purge output generation contains ambiguous snapshot ids",
+                        operationMayHaveRun: true
+                    )
+                }
+                snapshotIDsByDestination[destination.id] = outputSnapshotIDs
                 try markPurgePatternsApplied(
                     setId: set.id,
                     destinationId: destination.id,
@@ -1933,7 +1976,11 @@ public final class BackupEngine: Sendable {
                 )
             }
         }
-        return PurgeRunResult(status: Self.worstStatus(children.map(\.status)), children: children)
+        return PurgeRunResult(
+            status: Self.worstStatus(children.map(\.status)),
+            children: children,
+            snapshotIDsByDestination: snapshotIDsByDestination
+        )
     }
 
     /// Obtains a fresh attributed plan for token validation.  It is purposely
@@ -2217,16 +2264,6 @@ public final class BackupEngine: Sendable {
         )
     }
 
-    private func pendingPurgePatterns(
-        setId: UUID,
-        set: BackupSet,
-        destinationId: UUID
-    ) throws -> [String] {
-        let applied = try trustedScheduleState()
-            .sets[setId]?.appliedPurgeExcludes[destinationId] ?? []
-        return set.purgeExcludes.filter { !applied.contains($0) }
-    }
-
     /// Returns only patterns bound into durable, terminal successful purge
     /// records. The caller must first hold the destructive gate and pass
     /// `unresolvedAuditFailures`, which verifies canonical metadata against
@@ -2359,7 +2396,8 @@ public final class BackupEngine: Sendable {
             destinations: [destination],
             token: token.value,
             trigger: trigger,
-            groupId: groupId
+            groupId: groupId,
+            revalidateAllPatterns: true
         )
     }
 

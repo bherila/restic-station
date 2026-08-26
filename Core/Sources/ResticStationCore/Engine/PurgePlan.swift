@@ -137,10 +137,20 @@ public struct PurgePreviewSession: Sendable {
 public struct PurgeRunResult: Equatable, Sendable {
     public let status: RunStatus
     public let children: [SetRunChild]
+    /// Exact unambiguous snapshot id prefixes proven to be the output
+    /// generation of each successful rewrite. Callers use these ids for
+    /// `restic copy` so a snapshot created after the purge query cannot bypass
+    /// the rewrite and hitch a ride to a mirror.
+    public let snapshotIDsByDestination: [UUID: [String]]
 
-    public init(status: RunStatus, children: [SetRunChild]) {
+    public init(
+        status: RunStatus,
+        children: [SetRunChild],
+        snapshotIDsByDestination: [UUID: [String]] = [:]
+    ) {
         self.status = status
         self.children = children
+        self.snapshotIDsByDestination = snapshotIDsByDestination
     }
 }
 
