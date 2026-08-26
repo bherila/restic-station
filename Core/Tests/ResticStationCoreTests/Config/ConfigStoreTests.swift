@@ -226,6 +226,27 @@ import Testing
         #expect(snapshot.fingerprint == store.fileFingerprint())
     }
 
+    @Test("revision preflight classifies raw config read failures")
+    func unchangedRevisionWrapsConfigReadFailure() async throws {
+        let (store, root) = makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(
+            at: store.paths.configFile,
+            withIntermediateDirectories: true
+        )
+
+        do {
+            _ = try await store.withUnchangedRevision(from: "unreadable") { true }
+            Issue.record("expected the unreadable config preflight to fail")
+        } catch let error as ConfigStoreError {
+            guard case .readFailed(let path, _) = error else {
+                Issue.record("expected readFailed, got \(error)")
+                return
+            }
+            #expect(path == store.paths.configFile.path)
+        }
+    }
+
     @Test("config readers wait for a writer and then read the installed revision")
     func configReadWaitsForTheWriterLock() throws {
         let (store, root) = makeStore()

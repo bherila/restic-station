@@ -1165,6 +1165,15 @@ struct AppModelMachineOverrideTests {
         #expect(configMessage.contains("No keychain item was changed"))
         #expect(!configMessage.contains("Unlock your login keychain"))
 
+        let readMessage = SetsCopy.destinationSecretFailureMessage(
+            for: ConfigStoreError.readFailed(
+                path: "/tmp/config.json",
+                reason: "permission denied"
+            )
+        )
+        #expect(readMessage.contains("Settings could not be checked safely"))
+        #expect(!readMessage.contains("Unlock your login keychain"))
+
         let keychainMessage = SetsCopy.destinationSecretFailureMessage(
             for: SecretStoreError.backendFailed("login keychain is locked"),
             backend: .keychain

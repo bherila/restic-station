@@ -417,14 +417,26 @@ public struct ConfigStore: Sendable {
         }
         defer { lock.release() }
 
-        guard try currentFileFingerprint() == expectedFingerprint else {
+        guard try unchangedRevisionFingerprint() == expectedFingerprint else {
             throw ConfigStoreError.changedOnDisk
         }
         let result = try await operation()
-        guard try currentFileFingerprint() == expectedFingerprint else {
+        guard try unchangedRevisionFingerprint() == expectedFingerprint else {
             throw ConfigStoreError.changedOnDisk
         }
         return result
+    }
+
+    /// Turns raw Foundation I/O failures into a configuration-domain error
+    /// before callers enter their secret-backend fallback copy.
+    private func unchangedRevisionFingerprint() throws -> String {
+        do {
+            return try currentFileFingerprint()
+        } catch let error as ConfigStoreError {
+            throw error
+        } catch {
+            throw ConfigStoreError.readFailed(path: paths.configFile.path, reason: "\(error)")
+        }
     }
 
     private func persist(_ data: Data) throws {
@@ -766,6 +778,7 @@ enum AtomicFile {
 /// Low-level failures from `ConfigStore.save(_:)`'s atomic rename step.
 public enum ConfigStoreError: Error, Equatable, Sendable, CustomStringConvertible {
     case renameFailed(errno: Int32, from: String, to: String)
+    case readFailed(path: String, reason: String)
     case replacementRollbackFailed(errno: Int32, candidateMayBeInstalledAt: String)
     case rollbackArtifactPreserved(path: String)
     case changedOnDisk
@@ -776,6 +789,8 @@ public enum ConfigStoreError: Error, Equatable, Sendable, CustomStringConvertibl
         switch self {
         case .renameFailed(let errno, let from, let to):
             return "rename(\(from), \(to)) failed: errno \(errno)"
+        case .readFailed(let path, let reason):
+            return "could not read \(path) while verifying its revision: \(reason)"
         case .replacementRollbackFailed(let errno, let path):
             return "could not roll back a refused config replacement (errno \(errno)); "
                 + "the uncommitted candidate may be installed at \(path)"
