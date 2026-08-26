@@ -38,8 +38,13 @@ struct MainWindow: View {
         }
         .navigationTitle("Restic Station")
         .safeAreaInset(edge: .top, spacing: 0) {
-            if model.configChangedOnDisk {
-                ConfigChangeBanner()
+            VStack(spacing: 0) {
+                if model.configChangedOnDisk {
+                    ConfigChangeBanner()
+                }
+                if let error = model.pendingSecretRollbackError {
+                    SecretRollbackBanner(message: error)
+                }
             }
         }
         // ui-spec: min size ~900×560.
@@ -66,6 +71,28 @@ struct MainWindow: View {
         case .maintenance:
             MaintenanceRootView()
         }
+    }
+}
+
+struct SecretRollbackBanner: View {
+    @EnvironmentObject private var model: AppModel
+    let message: String
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "key.fill")
+                .foregroundStyle(.red)
+            Text(message)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 12)
+            Button("Retry Restoration") {
+                model.retryPendingSecretRollbacks()
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 9)
+        .background(.bar)
+        .overlay(alignment: .bottom) { Divider() }
     }
 }
 

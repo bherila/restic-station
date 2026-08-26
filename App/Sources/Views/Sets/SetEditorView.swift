@@ -96,7 +96,11 @@ struct SetEditorView: View {
             )
         }
         .onDisappear {
-            Task { _ = await restorePendingSecrets() }
+            // Transfer ownership synchronously before SwiftUI destroys this
+            // view. AppModel retries and surfaces failures window-wide.
+            let abandoned = pendingSecretRollbacks
+            pendingSecretRollbacks.removeAll()
+            model.retainPendingSecretRollbacks(abandoned)
         }
     }
 
@@ -263,8 +267,10 @@ struct SetEditorView: View {
         secretRollbackInProgress = true
         defer { secretRollbackInProgress = false }
         do {
-            try await model.restoreDestinationSecrets(pendingSecretRollbacks)
-            pendingSecretRollbacks.removeAll()
+            try await model.restoreDestinationSecrets(
+                pendingSecretRollbacks,
+                onProgress: { pendingSecretRollbacks = $0 }
+            )
             return nil
         } catch {
             return "The previous keychain values could not be restored (\(error)). "

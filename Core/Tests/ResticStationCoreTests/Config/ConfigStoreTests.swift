@@ -122,6 +122,36 @@ import Testing
         #expect(!FileManager.default.fileExists(atPath: store.tempConfigFile.path))
     }
 
+    #if canImport(Darwin)
+    @Test("CAS rollback keeps a raw replacement that landed after the exchange live")
+    func rollbackDoesNotDemoteNewerReplacement() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-cas-rollback-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+        let displaced = root.appendingPathComponent("config.json.tmp")
+        let destination = root.appendingPathComponent("config.json")
+        let older = Data("older fleet revision".utf8)
+        let candidate = Data("stale app candidate".utf8)
+        let newest = Data("newest fleet revision".utf8)
+        try older.write(to: displaced)
+        // This is the exact state after a raw writer replaces config.json
+        // between the initial exchange and the refused-save rollback.
+        try newest.write(to: destination)
+
+        let removedCandidate = try AtomicFile.rollbackCandidateIfCurrent(
+            displaced: displaced,
+            destination: destination,
+            candidateFingerprint: SHA256Digest.hex(candidate)
+        )
+
+        #expect(!removedCandidate)
+        #expect(try Data(contentsOf: destination) == newest)
+        #expect(!FileManager.default.fileExists(atPath: displaced.path))
+    }
+    #endif
+
     @Test("a stale preflight refuses before a related external side effect")
     func unchangedAssertionRefusesAStaleRevision() throws {
         let (store, root) = makeStore()

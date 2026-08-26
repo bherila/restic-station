@@ -714,6 +714,93 @@ struct AppModelMachineOverrideTests {
         #expect(try await secrets.password(destId: destinationId) == "newer-helper-password")
     }
 
+    @Test("a multi-field rollback retries from its last completed field")
+    func destinationRollbackCheckpointsPartialProgress() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-secret-retry-app-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let destinationId = UUID()
+        let secrets = CheckpointingSecretStore(
+            passwords: [destinationId: "original-password"],
+            secretEnvironments: [destinationId: ["TOKEN": "original"]]
+        )
+        let model = AppModel(paths: AppPaths(root: root), secretStoreFactory: { secrets })
+        let first = try await model.storeDestinationSecrets(
+            destId: destinationId,
+            password: "first-password",
+            secretEnv: ["TOKEN": "first"],
+            ifConfigUnchangedFrom: model.configFingerprint
+        )
+        let second = try await model.storeDestinationSecrets(
+            destId: destinationId,
+            password: "second-password",
+            secretEnv: ["TOKEN": "second"],
+            ifConfigUnchangedFrom: model.configFingerprint
+        )
+        await secrets.failNextEnvironmentWrite()
+
+        var remaining = [first, second]
+        await #expect(throws: SecretStoreError.backendFailed("injected environment failure")) {
+            try await model.restoreDestinationSecrets(
+                remaining,
+                onProgress: { remaining = $0 }
+            )
+        }
+
+        #expect(try await secrets.password(destId: destinationId) == "first-password")
+        #expect(try await secrets.secretEnv(destId: destinationId) == ["TOKEN": "second"])
+        #expect(remaining.count == 2)
+        #expect(remaining.last?.transaction.password == nil)
+        #expect(remaining.last?.transaction.secretEnv != nil)
+
+        try await model.restoreDestinationSecrets(
+            remaining,
+            onProgress: { remaining = $0 }
+        )
+        #expect(remaining.isEmpty)
+        #expect(try await secrets.password(destId: destinationId) == "original-password")
+        #expect(try await secrets.secretEnv(destId: destinationId) == ["TOKEN": "original"])
+    }
+
+    @Test("an abandoned editor rollback is retained, surfaced, and retryable")
+    func abandonedDestinationRollbackSurvivesViewTeardown() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-secret-abandon-app-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let destinationId = UUID()
+        let secrets = CheckpointingSecretStore(passwords: [destinationId: "original-password"])
+        let model = AppModel(paths: AppPaths(root: root), secretStoreFactory: { secrets })
+        let rollback = try await model.storeDestinationSecrets(
+            destId: destinationId,
+            password: "editor-password",
+            secretEnv: nil,
+            ifConfigUnchangedFrom: model.configFingerprint
+        )
+        await secrets.failNextPasswordWrite()
+
+        model.retainPendingSecretRollbacks([rollback])
+        for _ in 0..<40 {
+            if model.pendingSecretRollbackError != nil { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+
+        #expect(model.pendingSecretRollbackError != nil)
+        #expect(model.pendingSecretRollbackBatches.count == 1)
+        #expect(try await secrets.password(destId: destinationId) == "editor-password")
+
+        model.retryPendingSecretRollbacks()
+        for _ in 0..<40 {
+            if model.pendingSecretRollbackBatches.isEmpty { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+
+        #expect(model.pendingSecretRollbackBatches.isEmpty)
+        #expect(model.pendingSecretRollbackError == nil)
+        #expect(try await secrets.password(destId: destinationId) == "original-password")
+    }
+
     @Test("config preflight failures never advise unlocking the keychain")
     func destinationSecretFailureCopyDistinguishesConfigAndKeychain() {
         let configMessage = SetsCopy.destinationSecretFailureMessage(
@@ -818,6 +905,73 @@ private actor RacingSecretStore: SecretStore {
     }
 
     func deleteSecretEnv(destId: UUID) async throws {
+        secretEnvironments.removeValue(forKey: destId)
+    }
+
+    nonisolated func passwordCommand(destId: UUID) -> String { "test-secret-store" }
+}
+
+private actor CheckpointingSecretStore: SecretStore {
+    nonisolated let backend: SecretBackend = .keychain
+    private var passwords: [UUID: String]
+    private var secretEnvironments: [UUID: [String: String]]
+    private var passwordWriteShouldFail = false
+    private var environmentWriteShouldFail = false
+
+    init(
+        passwords: [UUID: String] = [:],
+        secretEnvironments: [UUID: [String: String]] = [:]
+    ) {
+        self.passwords = passwords
+        self.secretEnvironments = secretEnvironments
+    }
+
+    func failNextPasswordWrite() {
+        passwordWriteShouldFail = true
+    }
+
+    func failNextEnvironmentWrite() {
+        environmentWriteShouldFail = true
+    }
+
+    func setPassword(_ password: String, destId: UUID) async throws {
+        if passwordWriteShouldFail {
+            passwordWriteShouldFail = false
+            throw SecretStoreError.backendFailed("injected password failure")
+        }
+        passwords[destId] = password
+    }
+
+    func password(destId: UUID) async throws -> String {
+        guard let password = passwords[destId] else { throw SecretStoreError.itemNotFound }
+        return password
+    }
+
+    func deletePassword(destId: UUID) async throws {
+        if passwordWriteShouldFail {
+            passwordWriteShouldFail = false
+            throw SecretStoreError.backendFailed("injected password failure")
+        }
+        passwords.removeValue(forKey: destId)
+    }
+
+    func setSecretEnv(_ env: [String: String], destId: UUID) async throws {
+        if environmentWriteShouldFail {
+            environmentWriteShouldFail = false
+            throw SecretStoreError.backendFailed("injected environment failure")
+        }
+        secretEnvironments[destId] = env
+    }
+
+    func secretEnv(destId: UUID) async throws -> [String: String] {
+        secretEnvironments[destId] ?? [:]
+    }
+
+    func deleteSecretEnv(destId: UUID) async throws {
+        if environmentWriteShouldFail {
+            environmentWriteShouldFail = false
+            throw SecretStoreError.backendFailed("injected environment failure")
+        }
         secretEnvironments.removeValue(forKey: destId)
     }
 

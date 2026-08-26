@@ -85,6 +85,18 @@ final class AppModel: ObservableObject {
     /// Last save/validation failure, for surfacing in the UI.
     @Published private(set) var lastConfigError: String?
 
+    /// A set editor can disappear because the window closed or the sidebar
+    /// changed, without getting an opportunity to await its secret rollback.
+    /// The model takes ownership of those tokens before the view is torn
+    /// down and surfaces any failed retry in every main window.
+    @Published var pendingSecretRollbackError: String?
+
+    /// Each inner array is one editor session and must be unwound in reverse
+    /// order. Keeping batches separate lets a failed older session remain at
+    /// the front while a later disappearing editor is retained behind it.
+    var pendingSecretRollbackBatches: [[DestinationSecretsRollback]] = []
+    var pendingSecretRollbackTask: Task<Void, Never>?
+
     /// One entry per configured set, in config order.
     @Published private(set) var setHealths: [SetHealth] = []
     /// Drives the menu bar icon (`docs/ui-spec.md` §Menu bar).

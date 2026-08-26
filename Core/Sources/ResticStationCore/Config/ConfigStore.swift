@@ -542,8 +542,8 @@ enum AtomicFile {
     /// Atomically installs `source` only when `destination` is the revision
     /// the caller edited. Darwin's `RENAME_SWAP` supplies the missing atomic
     /// boundary: the bytes displaced by the swap are the exact bytes that
-    /// were present when the candidate became visible. A mismatch is swapped
-    /// straight back and reported without accepting the stale edit.
+    /// were present when the candidate became visible. A mismatch is rolled
+    /// back with exclusive renames so a later raw replacement always wins.
     static func replaceIfMatches(
         from source: URL,
         to destination: URL,
@@ -574,13 +574,11 @@ enum AtomicFile {
         do {
             displacedFingerprint = SHA256Digest.hex(try Data(contentsOf: source))
         } catch {
-            let rollback = renameX(from: source, to: destination, flags: UInt32(RENAME_SWAP))
-            guard rollback == 0 else {
-                let rollbackErrno = errno
-                throw ConfigStoreError.replacementRollbackFailed(
-                    errno: rollbackErrno, candidateMayBeInstalledAt: destination.path
-                )
-            }
+            _ = try rollbackCandidateIfCurrent(
+                displaced: source,
+                destination: destination,
+                candidateFingerprint: candidateFingerprint
+            )
             throw error
         }
 
@@ -589,33 +587,11 @@ enum AtomicFile {
             return true
         }
 
-        let rollback = renameX(from: source, to: destination, flags: UInt32(RENAME_SWAP))
-        guard rollback == 0 else {
-            let rollbackErrno = errno
-            throw ConfigStoreError.replacementRollbackFailed(
-                errno: rollbackErrno, candidateMayBeInstalledAt: destination.path
-            )
-        }
-
-        // Normally the source now holds our candidate. If a non-cooperating
-        // writer replaced the destination during the tiny rollback window,
-        // the source instead holds that external revision. Never swap it
-        // back over `destination`: a still-newer writer could land between
-        // our fingerprint read and that second swap. Preserve the displaced
-        // bytes under a unique sibling name and surface the recovery path;
-        // whatever currently names config.json remains untouched.
-        let rolledOut: Data
-        do {
-            rolledOut = try Data(contentsOf: source)
-        } catch {
-            let recovery = try preserveRollbackArtifact(from: source, beside: destination)
-            throw ConfigStoreError.rollbackArtifactPreserved(path: recovery.path)
-        }
-        if SHA256Digest.hex(rolledOut) != candidateFingerprint {
-            let recovery = try preserveRollbackArtifact(from: source, beside: destination)
-            throw ConfigStoreError.rollbackArtifactPreserved(path: recovery.path)
-        }
-        try? FileManager.default.removeItem(at: source)
+        _ = try rollbackCandidateIfCurrent(
+            displaced: source,
+            destination: destination,
+            candidateFingerprint: candidateFingerprint
+        )
         return false
         #else
         // The Linux helper's supported writers all use `config.lock`.
@@ -639,6 +615,107 @@ enum AtomicFile {
                 Darwin.renamex_np(fromC, toC, flags)
             }
         }
+    }
+
+    /// Refuses an exchanged candidate without ever swapping a newer raw
+    /// replacement back out of `config.json`. The live name is first moved
+    /// to a private sibling. If it is our candidate, the displaced revision
+    /// is restored with `RENAME_EXCL`; if it is an external replacement,
+    /// that exact newer file is restored instead. A writer that lands in the
+    /// short name-vacant interval wins because every restore is exclusive.
+    ///
+    /// Internal for the Darwin race regression: tests can begin from the
+    /// exact post-exchange state without a timing-dependent syscall hook.
+    @discardableResult
+    static func rollbackCandidateIfCurrent(
+        displaced source: URL,
+        destination: URL,
+        candidateFingerprint: String
+    ) throws -> Bool {
+        let evacuated = destination.deletingLastPathComponent().appendingPathComponent(
+            destination.lastPathComponent + ".rollback-live-" + UUID().uuidString + ".json",
+            isDirectory: false
+        )
+        let evacuate = renameX(from: destination, to: evacuated, flags: UInt32(RENAME_EXCL))
+        guard evacuate == 0 else {
+            let evacuateErrno = errno
+            if evacuateErrno == ENOENT {
+                // A raw writer removed the candidate. Restore the displaced
+                // revision only if no still-newer writer has already landed.
+                let restore = renameX(from: source, to: destination, flags: UInt32(RENAME_EXCL))
+                if restore == 0 { return false }
+                if errno == EEXIST {
+                    try? FileManager.default.removeItem(at: source)
+                    return false
+                }
+                let restoreErrno = errno
+                throw ConfigStoreError.replacementRollbackFailed(
+                    errno: restoreErrno, candidateMayBeInstalledAt: destination.path
+                )
+            }
+            throw ConfigStoreError.replacementRollbackFailed(
+                errno: evacuateErrno, candidateMayBeInstalledAt: destination.path
+            )
+        }
+
+        let evacuatedIsCandidate: Bool
+        do {
+            evacuatedIsCandidate = SHA256Digest.hex(try Data(contentsOf: evacuated))
+                == candidateFingerprint
+        } catch {
+            // We cannot classify these bytes, so put the exact file that was
+            // live back without overwriting a writer that arrived meanwhile.
+            let restore = renameX(from: evacuated, to: destination, flags: UInt32(RENAME_EXCL))
+            if restore == 0 {
+                let recovery = try preserveRollbackArtifact(from: source, beside: destination)
+                throw ConfigStoreError.rollbackArtifactPreserved(path: recovery.path)
+            }
+            if errno == EEXIST {
+                try? FileManager.default.removeItem(at: evacuated)
+                try? FileManager.default.removeItem(at: source)
+                return false
+            }
+            throw error
+        }
+
+        let revisionToRestore = evacuatedIsCandidate ? source : evacuated
+        let restore = renameX(
+            from: revisionToRestore,
+            to: destination,
+            flags: UInt32(RENAME_EXCL)
+        )
+        if restore == 0 {
+            if evacuatedIsCandidate {
+                try? FileManager.default.removeItem(at: evacuated)
+            } else {
+                // The replacement that arrived before rollback is live
+                // again; the older displaced revision is no longer needed.
+                try? FileManager.default.removeItem(at: source)
+            }
+            return evacuatedIsCandidate
+        }
+
+        let restoreErrno = errno
+        if restoreErrno == EEXIST {
+            // A still-newer raw writer won the vacant-name race. Never
+            // overwrite it with either the candidate or an older revision.
+            try? FileManager.default.removeItem(at: evacuated)
+            try? FileManager.default.removeItem(at: source)
+            return false
+        }
+
+        // No safe live-name mutation remains. Preserve the non-candidate
+        // bytes under a unique recovery name and report the exact path.
+        if evacuatedIsCandidate {
+            try? FileManager.default.removeItem(at: evacuated)
+            let recovery = try preserveRollbackArtifact(from: source, beside: destination)
+            throw ConfigStoreError.rollbackArtifactPreserved(path: recovery.path)
+        }
+        let recovery = evacuated
+        if FileManager.default.fileExists(atPath: source.path) {
+            _ = try? preserveRollbackArtifact(from: source, beside: destination)
+        }
+        throw ConfigStoreError.rollbackArtifactPreserved(path: recovery.path)
     }
 
     /// Moves an artifact out of the fixed `.tmp` path without replacing
