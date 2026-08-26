@@ -298,7 +298,7 @@ Secret-env item is optional (absent for local/sftp destinations without credenti
 {"runId":"20260726T205704Z-backup-6f9619ff","kind":"backup","setId":"6F9619FF-...","destId":"0A1B2C3D-...","status":"success","start":"2026-07-26T20:57:04Z","end":"2026-07-26T20:58:11Z","trigger":"scheduled","snapshotId":"f391ba97c096...","filesNew":3,"filesChanged":1,"dataAdded":67860,"errorSummary":null}
 ```
 
-`kind`: `backup` | `copy` | `check` | `prune` | `purge` | `restore` | `init`. A scheduled set run produces **multiple** index lines: one `backup` (primary), an optional `purge` per destination with newly added `purgeExcludes`, one `copy` per attempted secondary, one `prune` per repo where retention ran. They share a `groupId` field (= the backup's runId) so the UI can nest them. Each append uses a complete-write loop that retries `EINTR`, then `fsync`s the index before releasing `index.jsonl.lock`; creation of the first index also syncs the `runs/` directory entry. Before appending, an unterminated corrupt tail from an interrupted prior write is truncated to the last complete line (or a complete newline-less JSON record is terminated), so a recovery line cannot be concatenated onto corrupt JSON. History readers take the last decodable projection for each run and order runs by canonical start time; an older repaired record therefore cannot masquerade as the latest run.
+`kind`: `backup` | `copy` | `check` | `prune` | `purge` | `restore` | `init`. A scheduled set run produces **multiple** index lines: one `backup` (primary), an optional `purge` per destination with newly added `purgeExcludes`, one `copy` per attempted secondary, one `prune` per repo where retention ran. They share a `groupId` field (= the backup's runId) so the UI can nest them. Each append uses a complete-write loop that retries `EINTR`, then `fsync`s the index (also retrying `EINTR`) before releasing `index.jsonl.lock`; creation of the first index also syncs the `runs/` directory entry. Before appending, the writer reads only the final byte in the normal newline-terminated case. An unterminated corrupt tail triggers a bounded backward scan and is truncated to the last complete line (or a complete newline-less JSON record is terminated), so a recovery line cannot be concatenated onto corrupt JSON without making every normal append reread the full history. History readers take the last decodable projection for each run and order runs by canonical start time; an older repaired record therefore cannot masquerade as the latest run.
 
 ## runs/<runId>/metadata.json — `RunMetadata`
 
@@ -379,7 +379,10 @@ repository mutation occurred, so terminal metadata retains
 `repository_outcome_unknown` even when that terminal record and index append
 both succeed.
 
-Reconciliation runs on helper recovery and explicit history repair. It is
+Reconciliation runs on helper recovery and explicit history repair. It first
+requires each decoded metadata `runId` to match the directory being scanned,
+before constructing any write path, so misplaced evidence cannot overwrite a
+different run's canonical record. It is
 idempotent. It may append one missing index projection for terminal canonical
 metadata and may convert a dead, still-running non-destructive record to the
 existing `failed/interrupted` outcome. If a non-destructive run already has a

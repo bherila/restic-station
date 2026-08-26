@@ -327,6 +327,7 @@ private func setRunStoreTestErrno(_ value: Int32) {
         defer { cleanup(paths) }
         let live = RunStoreFileOperations.live
         let writeCalls = Box(0)
+        let syncCalls = Box(0)
         let operations = RunStoreFileOperations(
             openAt: live.openAt,
             write: { fd, buffer, count in
@@ -337,7 +338,14 @@ private func setRunStoreTestErrno(_ value: Int32) {
                 }
                 return live.write(fd, buffer, min(count, 7))
             },
-            sync: live.sync,
+            sync: { fd in
+                syncCalls.value += 1
+                if syncCalls.value == 1 {
+                    setRunStoreTestErrno(EINTR)
+                    return -1
+                }
+                return live.sync(fd)
+            },
             renameAt: live.renameAt,
             unlinkAt: live.unlinkAt
         )
@@ -353,6 +361,7 @@ private func setRunStoreTestErrno(_ value: Int32) {
         try store.finish(run, status: .success, resticExitCode: 0)
 
         #expect(writeCalls.value > 3)
+        #expect(syncCalls.value > 1)
         #expect(try store.metadata(runId: run.runId).status == .success)
         #expect(try store.recentRuns(limit: 10).map(\.runId) == [run.runId])
         #expect(try store.unresolvedAuditFailures().isEmpty)
@@ -661,6 +670,27 @@ private func setRunStoreTestErrno(_ value: Int32) {
         #expect(history.first?.status == .failed)
         #expect(history.first?.errorSummary == "interrupted")
         #expect(try store.lastRun(setId: run.setId, kind: .backup)?.status == .failed)
+    }
+
+    @Test("recovery rejects a misplaced embedded run id before rewriting either record")
+    func recoveryRejectsRunDirectoryIDMismatch() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+        let store = RunStore(paths: paths, now: { Date() })
+        let first = try store.begin(kind: .backup, setId: UUID(), destId: UUID(), trigger: .manual)
+        try store.finish(first, status: .success, resticExitCode: 0)
+        let second = try store.begin(kind: .backup, setId: UUID(), destId: UUID(), trigger: .manual)
+        try store.finish(second, status: .success, resticExitCode: 0)
+
+        let secondURL = paths.runMetadataFile(runId: second.runId)
+        let secondBytes = try Data(contentsOf: secondURL)
+        try secondBytes.write(to: paths.runMetadataFile(runId: first.runId))
+
+        #expect(throws: RunStoreError.self) {
+            try store.recoverInterrupted()
+        }
+        #expect(try Data(contentsOf: secondURL) == secondBytes)
+        #expect(try store.metadata(runId: second.runId).runId == second.runId)
     }
 
     @Test("terminal destructive metadata missing from the index is an audit failure")

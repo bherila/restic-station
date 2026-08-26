@@ -496,6 +496,12 @@ public struct RunStore: Sendable {
             let metadataFile = dir.appendingPathComponent("metadata.json", isDirectory: false)
             guard let data = try? Data(contentsOf: metadataFile) else { continue }
             guard let metadata = try? decoder.decode(RunMetadata.self, from: data) else { continue }
+            guard dir.lastPathComponent == metadata.runId else {
+                throw RunStoreError.runDirectoryIDMismatch(
+                    path: metadataFile.path,
+                    encodedRunId: metadata.runId
+                )
+            }
             if metadata.status != .running {
                 // Canonical metadata wins. Repair only a wholly absent
                 // destructive projection; duplicates or divergence remain an
@@ -1038,14 +1044,11 @@ public struct RunStore: Sendable {
 
         do {
             try writeAll(data, to: tempFD, path: dir.appendingPathComponent(tempName).path)
-            if fileOperations.sync(tempFD) != 0 {
-                let code = errno
-                throw RunStoreError.durableWriteFailed(
-                    operation: "fsync metadata temp",
-                    errno: code,
-                    path: dir.appendingPathComponent(tempName).path
-                )
-            }
+            try syncFileDescriptor(
+                tempFD,
+                operation: "fsync metadata temp",
+                path: dir.appendingPathComponent(tempName).path
+            )
         } catch {
             closeFileDescriptor(tempFD)
             _ = fileOperations.unlinkAt(directoryFD, tempName)
@@ -1062,14 +1065,11 @@ public struct RunStore: Sendable {
                 to: target.path
             )
         }
-        if fileOperations.sync(directoryFD) != 0 {
-            let code = errno
-            throw RunStoreError.durableWriteFailed(
-                operation: "fsync metadata directory",
-                errno: code,
-                path: dir.path
-            )
-        }
+        try syncFileDescriptor(
+            directoryFD,
+            operation: "fsync metadata directory",
+            path: dir.path
+        )
     }
 
     // MARK: - Index append
@@ -1107,17 +1107,16 @@ public struct RunStore: Sendable {
 
         try repairIncompleteIndexTail(fd: fd, path: indexPath)
         try writeAll(line, to: fd, path: indexPath, indexWrite: true)
-        if fileOperations.sync(fd) != 0 {
-            let code = errno
-            throw RunStoreError.indexAppendFailed(errno: code, path: indexPath)
-        }
+        try syncFileDescriptor(fd, operation: "fsync index", path: indexPath, indexWrite: true)
         // This is needed when the first append also creates index.jsonl;
         // harmlessly syncing the directory on later appends keeps the
         // durability boundary simple and reviewable.
-        if fileOperations.sync(runsDirectoryFD) != 0 {
-            let code = errno
-            throw RunStoreError.indexAppendFailed(errno: code, path: indexPath)
-        }
+        try syncFileDescriptor(
+            runsDirectoryFD,
+            operation: "fsync index directory",
+            path: indexPath,
+            indexWrite: true
+        )
     }
 
     private func syncExistingIndex() throws {
@@ -1139,14 +1138,13 @@ public struct RunStore: Sendable {
             throw RunStoreError.indexAppendFailed(errno: code, path: indexPath)
         }
         defer { closeFileDescriptor(fd) }
-        if fileOperations.sync(fd) != 0 {
-            let code = errno
-            throw RunStoreError.indexAppendFailed(errno: code, path: indexPath)
-        }
-        if fileOperations.sync(runsDirectoryFD) != 0 {
-            let code = errno
-            throw RunStoreError.indexAppendFailed(errno: code, path: indexPath)
-        }
+        try syncFileDescriptor(fd, operation: "fsync index", path: indexPath, indexWrite: true)
+        try syncFileDescriptor(
+            runsDirectoryFD,
+            operation: "fsync index directory",
+            path: indexPath,
+            indexWrite: true
+        )
     }
 
     private func acquireIndexLock() throws -> FileLock {
@@ -1207,29 +1205,55 @@ public struct RunStore: Sendable {
     /// Preserve a complete newline-less final record by terminating it;
     /// otherwise truncate only the invalid tail back to the last newline.
     private func repairIncompleteIndexTail(fd: Int32, path: String) throws {
-        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: false)
-        let data: Data
-        do {
-            data = try handle.readToEnd() ?? Data()
-        } catch {
-            throw RunStoreError.indexAppendFailed(errno: EIO, path: path)
+        var info = stat()
+        #if canImport(Darwin)
+        let statResult = Darwin.fstat(fd, &info)
+        #elseif canImport(Glibc)
+        let statResult = Glibc.fstat(fd, &info)
+        #elseif canImport(Musl)
+        let statResult = Musl.fstat(fd, &info)
+        #endif
+        guard statResult == 0 else {
+            throw RunStoreError.indexAppendFailed(errno: errno, path: path)
         }
-        guard !data.isEmpty, data.last != 0x0A else { return }
+        let fileSize = Int(info.st_size)
+        guard fileSize > 0 else { return }
+        let finalByte = try readIndexBytes(fd: fd, offset: fileSize - 1, count: 1, path: path)
+        guard finalByte.first != 0x0A else { return }
 
-        let suffixStart = data.lastIndex(of: 0x0A).map { data.index(after: $0) } ?? data.startIndex
-        let suffix = Data(data[suffixStart...])
+        // The common case above reads one byte. Only an actually incomplete
+        // tail scans backward, in bounded chunks, until its preceding newline.
+        var cursor = fileSize
+        var reverseSuffixChunks: [Data] = []
+        var validLength = 0
+        while cursor > 0 {
+            let start = max(0, cursor - 4_096)
+            let chunk = try readIndexBytes(fd: fd, offset: start, count: cursor - start, path: path)
+            if let newline = chunk.lastIndex(of: 0x0A) {
+                let newlineOffset = chunk.distance(from: chunk.startIndex, to: newline)
+                validLength = start + newlineOffset + 1
+                let suffixStart = chunk.index(after: newline)
+                reverseSuffixChunks.append(Data(chunk[suffixStart...]))
+                break
+            }
+            reverseSuffixChunks.append(chunk)
+            cursor = start
+        }
+        var suffix = Data()
+        for chunk in reverseSuffixChunks.reversed() {
+            suffix.append(chunk)
+        }
         if (try? ConfigStore.makeDecoder().decode(RunIndexEntry.self, from: suffix)) != nil {
             try writeAll(Data([0x0A]), to: fd, path: path, indexWrite: true)
             return
         }
 
-        let validLength = off_t(data.lastIndex(of: 0x0A).map { data.distance(from: data.startIndex, to: $0) + 1 } ?? 0)
         #if canImport(Darwin)
-        let result = Darwin.ftruncate(fd, validLength)
+        let result = Darwin.ftruncate(fd, off_t(validLength))
         #elseif canImport(Glibc)
-        let result = Glibc.ftruncate(fd, validLength)
+        let result = Glibc.ftruncate(fd, off_t(validLength))
         #elseif canImport(Musl)
-        let result = Musl.ftruncate(fd, validLength)
+        let result = Musl.ftruncate(fd, off_t(validLength))
         #endif
         if result != 0 {
             throw RunStoreError.indexAppendFailed(errno: errno, path: path)
@@ -1239,14 +1263,54 @@ public struct RunStore: Sendable {
     private func syncDirectory(_ directory: URL) throws {
         let fd = try openDirectory(directory)
         defer { closeFileDescriptor(fd) }
-        if fileOperations.sync(fd) != 0 {
+        try syncFileDescriptor(fd, operation: "fsync directory", path: directory.path)
+    }
+
+    private func syncFileDescriptor(
+        _ fd: Int32,
+        operation: String,
+        path: String,
+        indexWrite: Bool = false
+    ) throws {
+        while fileOperations.sync(fd) != 0 {
             let code = errno
+            if code == EINTR { continue }
+            if indexWrite {
+                throw RunStoreError.indexAppendFailed(errno: code, path: path)
+            }
             throw RunStoreError.durableWriteFailed(
-                operation: "fsync directory",
+                operation: operation,
                 errno: code,
-                path: directory.path
+                path: path
             )
         }
+    }
+
+    private func readIndexBytes(fd: Int32, offset: Int, count: Int, path: String) throws -> Data {
+        var data = Data(count: count)
+        var total = 0
+        while total < count {
+            let readCount = data.withUnsafeMutableBytes { raw -> Int in
+                guard let base = raw.baseAddress else { return 0 }
+                #if canImport(Darwin)
+                return Darwin.pread(fd, base.advanced(by: total), count - total, off_t(offset + total))
+                #elseif canImport(Glibc)
+                return Glibc.pread(fd, base.advanced(by: total), count - total, off_t(offset + total))
+                #elseif canImport(Musl)
+                return Musl.pread(fd, base.advanced(by: total), count - total, off_t(offset + total))
+                #endif
+            }
+            if readCount < 0 {
+                let code = errno
+                if code == EINTR { continue }
+                throw RunStoreError.indexAppendFailed(errno: code, path: path)
+            }
+            if readCount == 0 {
+                throw RunStoreError.indexAppendFailed(errno: EIO, path: path)
+            }
+            total += readCount
+        }
+        return data
     }
 
     private func writeAll(
