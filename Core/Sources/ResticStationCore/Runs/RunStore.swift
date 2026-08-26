@@ -657,22 +657,26 @@ public struct RunStore: Sendable {
             let reason: RunAuditFailureReason?
             if let recorded = metadata.auditFailureReason {
                 reason = recorded
-            } else if metadata.destructiveLaunchAuthorizedAt == nil {
-                // Current records explicitly identify the contract under
-                // which a missing marker means safely unstarted. Historical
-                // running records have no such discriminator: their helper
-                // may have launched before launch markers existed, so their
-                // repository outcome is unknown even when a recycled/live
-                // pid or another helper keeps the machine-wide gate busy.
-                reason = metadata.status == .running
-                    && metadata.destructiveAuditContractVersion != Self.destructiveAuditContractVersion
-                    ? .launchedWithoutTerminalMetadata
-                    : nil
             } else if metadata.status == .running {
-                reason = destructiveOperationIsActive && Self.isProcessAlive(pid: metadata.pid)
-                    ? nil
-                    : .launchedWithoutTerminalMetadata
+                if metadata.destructiveLaunchAuthorizedAt == nil {
+                    // Current running records explicitly identify the
+                    // contract under which a missing marker means safely
+                    // unstarted. Historical running records have no such
+                    // discriminator and therefore fail closed.
+                    reason = metadata.destructiveAuditContractVersion
+                        == Self.destructiveAuditContractVersion
+                        ? nil
+                        : .launchedWithoutTerminalMetadata
+                } else {
+                    reason = destructiveOperationIsActive && Self.isProcessAlive(pid: metadata.pid)
+                        ? nil
+                        : .launchedWithoutTerminalMetadata
+                }
             } else {
+                // Terminal projection integrity applies to every destructive
+                // record, including pre-contract records with no launch
+                // marker. A legacy marker says nothing about whether its
+                // canonical terminal metadata reached the derived index.
                 let projections = indexedByRunId[metadata.runId] ?? []
                 if projections.isEmpty {
                     reason = .terminalMetadataMissingIndex

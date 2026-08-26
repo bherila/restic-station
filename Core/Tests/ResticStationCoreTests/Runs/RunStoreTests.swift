@@ -302,6 +302,25 @@ private final class TickCounter: @unchecked Sendable {
         #expect(try store.metadata(runId: run.runId).status == .success)
     }
 
+    @Test("legacy terminal destructive metadata still requires an exact index projection")
+    func legacyTerminalDestructiveMetadataMissingIndex() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+        let store = RunStore(paths: paths, now: { Date() })
+        let run = try store.begin(kind: .purge, setId: UUID(), destId: UUID(), trigger: .manual)
+        try store.finish(run, status: .success, resticExitCode: 0)
+
+        var legacy = try store.metadata(runId: run.runId)
+        legacy.destructiveAuditContractVersion = nil
+        legacy.destructiveLaunchAuthorizedAt = nil
+        try writeRawMetadata(legacy, paths: paths)
+        try FileManager.default.removeItem(at: paths.runsIndexFile)
+
+        let failure = try #require(store.unresolvedAuditFailures().first)
+        #expect(failure.runId == run.runId)
+        #expect(failure.reason == .terminalMetadataMissingIndex)
+    }
+
     @Test("a duplicate or divergent index projection remains an audit failure")
     func terminalDestructiveMetadataRequiresExactlyOneMatchingIndex() throws {
         let paths = makePaths()
