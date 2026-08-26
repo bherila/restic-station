@@ -13,6 +13,10 @@ import Musl
 /// `state/schedule-state.json` — see `docs/data-model.md`
 /// §state/schedule-state.json. Keyed by `BackupSet.id`.
 public struct ScheduleState: Codable, Equatable, Sendable {
+    /// Current on-disk envelope version. Legacy documents without a version
+    /// remain readable and are upgraded on their next successful mutation.
+    public static let currentVersion = 1
+
     public var sets: [UUID: SetScheduleState]
 
     public init(sets: [UUID: SetScheduleState] = [:]) {
@@ -29,16 +33,19 @@ public struct ScheduleState: Codable, Equatable, Sendable {
     /// the dynamic-key container on both sides.
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        guard container.contains(.sets) else {
-            self.sets = [:]
-            return
-        }
         let setsContainer = try container.nestedContainer(keyedBy: DynamicCodingKey.self, forKey: .sets)
         var result: [UUID: SetScheduleState] = [:]
         for key in setsContainer.allKeys {
-            // Unknown/malformed keys are skipped, not fatal — state files
-            // are regenerable caches (docs/data-model.md §Versioning).
-            guard let id = UUID(uuidString: key.stringValue) else { continue }
+            // Unlike regenerable state, this dictionary contains destructive
+            // purge watermarks. Silently dropping one malformed key would
+            // turn corruption into permission to run a rewrite again.
+            guard let id = UUID(uuidString: key.stringValue) else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: key,
+                    in: setsContainer,
+                    debugDescription: "Schedule-state set key is not a UUID: \(key.stringValue)"
+                )
+            }
             result[id] = try setsContainer.decode(SetScheduleState.self, forKey: key)
         }
         self.sets = result
@@ -48,7 +55,7 @@ public struct ScheduleState: Codable, Equatable, Sendable {
         var container = encoder.container(keyedBy: CodingKeys.self)
         var setsContainer = container.nestedContainer(keyedBy: DynamicCodingKey.self, forKey: .sets)
         for (id, value) in sets {
-            guard let key = DynamicCodingKey(stringValue: id.uuidString) else { continue }
+            let key = DynamicCodingKey(stringValue: id.uuidString)!
             try setsContainer.encode(value, forKey: key)
         }
     }
@@ -71,12 +78,9 @@ public struct SetScheduleState: Codable, Equatable, Sendable {
     /// ("every 4th check", `docs/scheduling.md` §Check scheduling). `nil`
     /// before any check has succeeded.
     ///
-    /// Added by T09 (`BackupEngine.runCheck`) — the rotation rule needs a
-    /// counter and `docs/data-model.md` §schedule-state.json documents no
-    /// field for it. Optional, so a `schedule-state.json` written by an
-    /// earlier build (which has no `checkCount` key) still decodes: state
-    /// files carry no version and are regenerable caches
-    /// (`docs/data-model.md` §Versioning & migration).
+    /// Added by T09 (`BackupEngine.runCheck`). Optional so a legacy
+    /// unversioned `schedule-state.json` written before `checkCount` existed
+    /// still decodes and can be upgraded to the checksummed envelope.
     public var checkCount: Int?
     /// Per destination, the purge patterns that have already been rewritten
     /// out of that repository. Removing a pattern deliberately does not
@@ -115,7 +119,13 @@ public struct SetScheduleState: Codable, Equatable, Sendable {
         let nested = try container.nestedContainer(keyedBy: DynamicCodingKey.self, forKey: .appliedPurgeExcludes)
         var values: [UUID: [String]] = [:]
         for key in nested.allKeys {
-            guard let id = UUID(uuidString: key.stringValue) else { continue }
+            guard let id = UUID(uuidString: key.stringValue) else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: key,
+                    in: nested,
+                    debugDescription: "Schedule-state destination key is not a UUID: \(key.stringValue)"
+                )
+            }
             values[id] = try nested.decode([String].self, forKey: key)
         }
         appliedPurgeExcludes = values
@@ -130,9 +140,81 @@ public struct SetScheduleState: Codable, Equatable, Sendable {
         try container.encode(checkCount, forKey: .checkCount)
         var nested = container.nestedContainer(keyedBy: DynamicCodingKey.self, forKey: .appliedPurgeExcludes)
         for (id, patterns) in appliedPurgeExcludes {
-            guard let key = DynamicCodingKey(stringValue: id.uuidString) else { continue }
+            let key = DynamicCodingKey(stringValue: id.uuidString)!
             try nested.encode(patterns, forKey: key)
         }
+    }
+}
+
+/// Versioned, checksummed representation of ``ScheduleState``. The digest is
+/// over the canonical encoding of the logical state (`{"sets": ...}`), so
+/// it is independent of envelope field order and identical on macOS/Linux.
+private struct ScheduleStateDocument: Codable {
+    let version: Int
+    let checksum: String
+    let sets: [UUID: SetScheduleState]
+
+    init(state: ScheduleState) throws {
+        version = ScheduleState.currentVersion
+        checksum = try StateStore.scheduleStateChecksum(state)
+        sets = state.sets
+    }
+
+    var state: ScheduleState { ScheduleState(sets: sets) }
+
+    private enum CodingKeys: String, CodingKey {
+        case version, checksum, sets
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        version = try container.decode(Int.self, forKey: .version)
+        checksum = try container.decode(String.self, forKey: .checksum)
+        let nested = try container.nestedContainer(keyedBy: DynamicCodingKey.self, forKey: .sets)
+        var decoded: [UUID: SetScheduleState] = [:]
+        for key in nested.allKeys {
+            guard let id = UUID(uuidString: key.stringValue) else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: key,
+                    in: nested,
+                    debugDescription: "Schedule-state set key is not a UUID: \(key.stringValue)"
+                )
+            }
+            decoded[id] = try nested.decode(SetScheduleState.self, forKey: key)
+        }
+        sets = decoded
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(version, forKey: .version)
+        try container.encode(checksum, forKey: .checksum)
+        var nested = container.nestedContainer(keyedBy: DynamicCodingKey.self, forKey: .sets)
+        for (id, entry) in sets {
+            try nested.encode(entry, forKey: DynamicCodingKey(stringValue: id.uuidString)!)
+        }
+    }
+}
+
+private struct ScheduleStateVersionProbe: Decodable {
+    let version: Int?
+    let hasChecksum: Bool
+
+    private enum CodingKeys: String, CodingKey {
+        case version, checksum
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        if container.contains(.version) {
+            // An explicit null is not a legacy marker. Requiring an integer
+            // prevents a damaged envelope from bypassing checksum validation
+            // by changing its version field to null.
+            version = try container.decode(Int.self, forKey: .version)
+        } else {
+            version = nil
+        }
+        hasChecksum = container.contains(.checksum)
     }
 }
 
@@ -260,13 +342,78 @@ public struct FdaCheckResult: Codable, Equatable, Sendable {
 
 // MARK: - StateStoreError
 
+public enum ScheduleStateReadFailureReason: Equatable, Sendable, CustomStringConvertible {
+    case malformedDocument
+    case checksumMismatch
+    case unsupportedVersion(found: Int, current: Int)
+    case unsafeFile(reason: String)
+    case ioFailure(operation: String, errno: Int32)
+    case tooLarge(bytes: Int64, limit: Int64)
+
+    public var description: String {
+        switch self {
+        case .malformedDocument:
+            return "the document is malformed"
+        case .checksumMismatch:
+            return "the checksum does not match the schedule payload"
+        case .unsupportedVersion(let found, let current):
+            return "the document version is \(found), but this build supports version \(current)"
+        case .unsafeFile(let reason):
+            return "the canonical path is unsafe: \(reason)"
+        case .ioFailure(let operation, let code):
+            return "\(operation) failed with errno \(code)"
+        case .tooLarge(let bytes, let limit):
+            return "the document is \(bytes) bytes; the safety limit is \(limit) bytes"
+        }
+    }
+}
+
+/// Evidence retained when an existing schedule document cannot be trusted.
+/// The canonical path is deliberately left in place as a fail-closed
+/// sentinel; when bytes were readable, an immutable-by-name recovery copy is
+/// also published beside it using the raw-byte SHA-256.
+public struct ScheduleStateReadFailure: Equatable, Sendable, CustomStringConvertible {
+    public let reason: ScheduleStateReadFailureReason
+    public let canonicalPath: String
+    public let quarantinePath: String?
+    public let quarantineWriteFailed: Bool
+
+    public init(
+        reason: ScheduleStateReadFailureReason,
+        canonicalPath: String,
+        quarantinePath: String? = nil,
+        quarantineWriteFailed: Bool = false
+    ) {
+        self.reason = reason
+        self.canonicalPath = canonicalPath
+        self.quarantinePath = quarantinePath
+        self.quarantineWriteFailed = quarantineWriteFailed
+    }
+
+    public var description: String {
+        var message = "schedule state is unreadable: \(reason); canonical file left unchanged at \(canonicalPath)"
+        if let quarantinePath {
+            message += "; recovery copy: \(quarantinePath)"
+        } else if quarantineWriteFailed {
+            message += "; writing a recovery copy also failed"
+        }
+        return message
+    }
+
+    public var recoveryMessage: String {
+        description
+            + ". Stop Restic Station, inspect the preserved bytes, then explicitly replace the canonical file "
+            + "with a valid document. Deleting it accepts loss of schedule, check, and purge-watermark bookkeeping."
+    }
+}
+
 /// The outcome of reading the schedule state. Unlike the other regenerable
 /// state files, this document holds destructive purge bookkeeping, so a
 /// corrupt existing file must never be mistaken for an absent one.
 public enum ScheduleStateReadResult: Equatable, Sendable {
     case missing
     case valid(ScheduleState)
-    case corrupt
+    case corrupt(ScheduleStateReadFailure)
 
     public var state: ScheduleState? {
         guard case .valid(let state) = self else { return nil }
@@ -275,6 +422,7 @@ public enum ScheduleStateReadResult: Equatable, Sendable {
 }
 
 public enum StateStoreError: Error, Equatable, Sendable, CustomStringConvertible {
+    case durableWriteFailed(operation: String, errno: Int32, path: String)
     case renameFailed(errno: Int32, from: String, to: String)
     /// The schedule-state lock could not be used at all — distinct from
     /// ``scheduleStateLockTimeout``, which means a peer genuinely held it
@@ -283,30 +431,107 @@ public enum StateStoreError: Error, Equatable, Sendable, CustomStringConvertible
     /// `schedule-state.json`'s companion lock could not be acquired within
     /// the bounded retry window.
     case scheduleStateLockTimeout(path: String)
-    case scheduleStateCorrupt(path: String)
+    case scheduleStateCorrupt(ScheduleStateReadFailure)
 
     public var description: String {
         switch self {
+        case .durableWriteFailed(let operation, let code, let path):
+            return "\(operation) failed for \(path): errno \(code)"
         case .renameFailed(let errno, let from, let to):
             return "rename(\(from), \(to)) failed: errno \(errno)"
         case .scheduleStateLockTimeout(let path):
             return "timed out waiting for schedule state lock \(path)"
         case .lockUnusable(let failure):
             return "schedule-state lock unusable: \(failure)"
-        case .scheduleStateCorrupt(let path):
-            return "schedule state is corrupt and was left unchanged: \(path)"
+        case .scheduleStateCorrupt(let failure):
+            return failure.recoveryMessage
         }
     }
+}
+
+/// Narrow POSIX seam for schedule-state durability fault injection.
+struct StateStoreFileOperations: @unchecked Sendable {
+    let openAt: @Sendable (Int32, String, Int32, mode_t) -> Int32
+    let read: @Sendable (Int32, UnsafeMutableRawPointer, Int) -> Int
+    let write: @Sendable (Int32, UnsafeRawPointer, Int) -> Int
+    let sync: @Sendable (Int32) -> Int32
+    let stat: @Sendable (Int32, UnsafeMutablePointer<stat>) -> Int32
+    let renameAt: @Sendable (Int32, String, Int32, String) -> Int32
+    let unlinkAt: @Sendable (Int32, String) -> Int32
+    let close: @Sendable (Int32) -> Int32
+
+    static let live = StateStoreFileOperations(
+        openAt: { directory, name, flags, mode in
+            name.withCString { openat(directory, $0, flags, mode) }
+        },
+        read: { fd, buffer, count in
+            #if canImport(Darwin)
+            Darwin.read(fd, buffer, count)
+            #elseif canImport(Glibc)
+            Glibc.read(fd, buffer, count)
+            #elseif canImport(Musl)
+            Musl.read(fd, buffer, count)
+            #endif
+        },
+        write: { fd, buffer, count in
+            #if canImport(Darwin)
+            Darwin.write(fd, buffer, count)
+            #elseif canImport(Glibc)
+            Glibc.write(fd, buffer, count)
+            #elseif canImport(Musl)
+            Musl.write(fd, buffer, count)
+            #endif
+        },
+        sync: { fd in
+            #if canImport(Darwin)
+            Darwin.fsync(fd)
+            #elseif canImport(Glibc)
+            Glibc.fsync(fd)
+            #elseif canImport(Musl)
+            Musl.fsync(fd)
+            #endif
+        },
+        stat: { fd, info in
+            #if canImport(Darwin)
+            Darwin.fstat(fd, info)
+            #elseif canImport(Glibc)
+            Glibc.fstat(fd, info)
+            #elseif canImport(Musl)
+            Musl.fstat(fd, info)
+            #endif
+        },
+        renameAt: { oldDirectory, oldName, newDirectory, newName in
+            oldName.withCString { oldNamePointer in
+                newName.withCString { newNamePointer in
+                    renameat(oldDirectory, oldNamePointer, newDirectory, newNamePointer)
+                }
+            }
+        },
+        unlinkAt: { directory, name in
+            name.withCString { unlinkat(directory, $0, 0) }
+        },
+        close: { fd in
+            #if canImport(Darwin)
+            Darwin.close(fd)
+            #elseif canImport(Glibc)
+            Glibc.close(fd)
+            #elseif canImport(Musl)
+            Musl.close(fd)
+            #endif
+        }
+    )
 }
 
 // MARK: - StateStore
 
 /// Typed read/write access to the four `state/` files described in
 /// `docs/data-model.md`. Writes are atomic (temp file + `rename(2)`, same
-/// convention as `ConfigStore.save(_:)`). Most reads tolerate missing or
-/// corrupt files as regenerable cache. Schedule state is the exception: it
-/// contains purge bookkeeping, so its typed read result distinguishes a
-/// missing file from a corrupt existing one and mutations fail closed.
+/// convention as `ConfigStore.save(_:)`). Schedule-state publication also
+/// fsyncs the complete temp file and containing directory. Most reads
+/// tolerate missing or corrupt files as regenerable cache. Schedule state is
+/// the exception: it contains purge bookkeeping, so its typed read result
+/// distinguishes a missing file from a corrupt existing one and mutations
+/// fail closed.
 ///
 /// After every write (including `clearCurrentRun`, which deletes a file),
 /// posts the best-effort `DistributedNotificationCenter` nudge described in
@@ -314,27 +539,160 @@ public enum StateStoreError: Error, Equatable, Sendable, CustomStringConvertible
 /// remains the source of truth on every platform.
 public struct StateStore: Sendable {
     public let paths: AppPaths
+    private let fileOperations: StateStoreFileOperations
 
     public init(paths: AppPaths) {
         self.paths = paths
+        fileOperations = .live
+    }
+
+    init(paths: AppPaths, fileOperations: StateStoreFileOperations) {
+        self.paths = paths
+        self.fileOperations = fileOperations
     }
 
     // MARK: - schedule-state.json
 
     public func readScheduleStateResult() -> ScheduleStateReadResult {
-        let url = paths.scheduleStateFile
-        do {
-            let data = try Data(contentsOf: url)
-            guard let state = try? Self.makeDecoder().decode(ScheduleState.self, from: data) else {
-                return .corrupt
+        switch readScheduleStateBytes() {
+        case .missing:
+            return .missing
+        case .failed(let reason):
+            return .corrupt(scheduleStateFailure(reason: reason, bytes: nil))
+        case .bytes(let data):
+            do {
+                let decoder = Self.makeDecoder()
+                let probe = try decoder.decode(ScheduleStateVersionProbe.self, from: data)
+                guard let version = probe.version else {
+                    guard !probe.hasChecksum else {
+                        return .corrupt(scheduleStateFailure(reason: .malformedDocument, bytes: data))
+                    }
+                    // Legacy v0: no checksum existed. Preserve compatibility,
+                    // then upgrade under the mutation lock on the next write.
+                    return .valid(try decoder.decode(ScheduleState.self, from: data))
+                }
+                guard version == ScheduleState.currentVersion else {
+                    return .corrupt(scheduleStateFailure(
+                        reason: .unsupportedVersion(found: version, current: ScheduleState.currentVersion),
+                        bytes: data
+                    ))
+                }
+                let document = try decoder.decode(ScheduleStateDocument.self, from: data)
+                let checksum = try Self.scheduleStateChecksum(document.state)
+                guard document.checksum.count == 64,
+                      document.checksum.allSatisfy({ $0.isHexDigit && !$0.isUppercase }),
+                      document.checksum == checksum else {
+                    return .corrupt(scheduleStateFailure(reason: .checksumMismatch, bytes: data))
+                }
+                return .valid(document.state)
+            } catch {
+                return .corrupt(scheduleStateFailure(reason: .malformedDocument, bytes: data))
             }
-            return .valid(state)
-        } catch {
-            let nsError = error as NSError
-            return nsError.domain == NSCocoaErrorDomain
-                && (nsError.code == NSFileNoSuchFileError || nsError.code == NSFileReadNoSuchFileError)
+        }
+    }
+
+    private static let maximumScheduleStateBytes: Int64 = 64 * 1_024 * 1_024
+
+    private enum ScheduleStateBytesRead {
+        case missing
+        case bytes(Data)
+        case failed(ScheduleStateReadFailureReason)
+    }
+
+    /// Opens the owner-controlled state directory and canonical file without
+    /// following a symlink. A schedule document is authority for destructive
+    /// bookkeeping, so unlike regenerable caches it must be a regular file
+    /// owned by the effective uid.
+    private func readScheduleStateBytes() -> ScheduleStateBytesRead {
+        let directoryFD = fileOperations.openAt(
+            AT_FDCWD,
+            paths.stateDir.path,
+            O_RDONLY | O_DIRECTORY | O_CLOEXEC,
+            0
+        )
+        guard directoryFD >= 0 else {
+            let code = errno
+            return code == ENOENT
                 ? .missing
-                : .corrupt
+                : .failed(.ioFailure(operation: "open state directory", errno: code))
+        }
+        defer { _ = fileOperations.close(directoryFD) }
+
+        let filename = paths.scheduleStateFile.lastPathComponent
+        let fd = fileOperations.openAt(directoryFD, filename, O_RDONLY | O_CLOEXEC | O_NOFOLLOW, 0)
+        guard fd >= 0 else {
+            let code = errno
+            return code == ENOENT
+                ? .missing
+                : .failed(.ioFailure(operation: "open schedule state", errno: code))
+        }
+        defer { _ = fileOperations.close(fd) }
+
+        var info = stat()
+        guard fileOperations.stat(fd, &info) == 0 else {
+            return .failed(.ioFailure(operation: "fstat schedule state", errno: errno))
+        }
+        guard (info.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG) else {
+            return .failed(.unsafeFile(reason: "not a regular file"))
+        }
+        guard info.st_uid == geteuid() else {
+            return .failed(.unsafeFile(reason: "owned by uid \(info.st_uid), expected \(geteuid())"))
+        }
+        guard info.st_size >= 0,
+              info.st_size <= Self.maximumScheduleStateBytes else {
+            return .failed(.tooLarge(bytes: info.st_size, limit: Self.maximumScheduleStateBytes))
+        }
+
+        var data = Data()
+        data.reserveCapacity(max(0, Int(info.st_size)))
+        var buffer = [UInt8](repeating: 0, count: 64 * 1_024)
+        while true {
+            let count = buffer.withUnsafeMutableBytes { raw -> Int in
+                guard let base = raw.baseAddress else { return 0 }
+                return fileOperations.read(fd, base, raw.count)
+            }
+            if count < 0 {
+                let code = errno
+                if code == EINTR { continue }
+                return .failed(.ioFailure(operation: "read schedule state", errno: code))
+            }
+            if count == 0 { break }
+            guard Int64(data.count + count) <= Self.maximumScheduleStateBytes else {
+                return .failed(.tooLarge(
+                    bytes: Int64(data.count + count),
+                    limit: Self.maximumScheduleStateBytes
+                ))
+            }
+            data.append(contentsOf: buffer.prefix(count))
+        }
+        return .bytes(data)
+    }
+
+    private func scheduleStateFailure(
+        reason: ScheduleStateReadFailureReason,
+        bytes: Data?
+    ) -> ScheduleStateReadFailure {
+        guard let bytes else {
+            return ScheduleStateReadFailure(reason: reason, canonicalPath: paths.scheduleStateFile.path)
+        }
+        let fingerprint = SHA256Digest.hex(bytes)
+        let quarantine = paths.stateDir.appendingPathComponent(
+            "schedule-state.corrupt-\(fingerprint).json",
+            isDirectory: false
+        )
+        do {
+            try preserveScheduleStateQuarantine(bytes, at: quarantine)
+            return ScheduleStateReadFailure(
+                reason: reason,
+                canonicalPath: paths.scheduleStateFile.path,
+                quarantinePath: quarantine.path
+            )
+        } catch {
+            return ScheduleStateReadFailure(
+                reason: reason,
+                canonicalPath: paths.scheduleStateFile.path,
+                quarantineWriteFailed: true
+            )
         }
     }
 
@@ -409,13 +767,13 @@ public struct StateStore: Sendable {
             state = ScheduleState()
         case .valid(let loaded):
             state = loaded
-        case .corrupt:
-            throw StateStoreError.scheduleStateCorrupt(path: paths.scheduleStateFile.path)
+        case .corrupt(let failure):
+            throw StateStoreError.scheduleStateCorrupt(failure)
         }
         var entry = state.sets[setId] ?? SetScheduleState()
         mutate(&entry)
         state.sets[setId] = entry
-        try write(state, to: paths.scheduleStateFile)
+        try writeScheduleState(state)
         return state
     }
 
@@ -504,6 +862,208 @@ public struct StateStore: Sendable {
     }
 
     // MARK: - Generic read/write
+
+    fileprivate static func scheduleStateChecksum(_ state: ScheduleState) throws -> String {
+        SHA256Digest.hex(try makeEncoder().encode(state))
+    }
+
+    private func writeScheduleState(_ state: ScheduleState) throws {
+        let document = try ScheduleStateDocument(state: state)
+        let data = try Self.makeEncoder().encode(document)
+        try writeDurably(
+            data,
+            to: paths.scheduleStateFile,
+            tempName: paths.scheduleStateFile.lastPathComponent + ".tmp",
+            postNotification: true
+        )
+    }
+
+    /// Retains the exact untrusted bytes under a content-addressed filename.
+    /// The canonical file remains untouched and therefore continues to block
+    /// mutations until an operator explicitly replaces it with valid state.
+    private func preserveScheduleStateQuarantine(_ data: Data, at url: URL) throws {
+        // Repeated health/status reads of the same bad canonical bytes must
+        // not turn into repeated durable writes. The name binds the SHA-256,
+        // and equality verifies that an existing name still holds those
+        // exact bytes before it is reused.
+        if existingOwnedRegularFile(at: url, equals: data) {
+            return
+        }
+        try writeDurably(
+            data,
+            to: url,
+            tempName: url.lastPathComponent + ".tmp-\(UUID().uuidString)",
+            postNotification: false
+        )
+    }
+
+    /// Descriptor-based equality check for an existing recovery copy. The
+    /// state watcher performs a second read after the first copy's directory
+    /// event; avoiding another rename stops that event from feeding itself.
+    /// `O_NOFOLLOW` and descriptor metadata checks keep that optimization
+    /// from trusting a symlink or foreign/non-regular inode.
+    private func existingOwnedRegularFile(at url: URL, equals expected: Data) -> Bool {
+        let directoryFD = fileOperations.openAt(
+            AT_FDCWD,
+            url.deletingLastPathComponent().path,
+            O_RDONLY | O_DIRECTORY | O_CLOEXEC,
+            0
+        )
+        guard directoryFD >= 0 else { return false }
+        defer { _ = fileOperations.close(directoryFD) }
+
+        let fd = fileOperations.openAt(
+            directoryFD,
+            url.lastPathComponent,
+            O_RDONLY | O_CLOEXEC | O_NOFOLLOW,
+            0
+        )
+        guard fd >= 0 else { return false }
+        defer { _ = fileOperations.close(fd) }
+
+        var info = stat()
+        guard fileOperations.stat(fd, &info) == 0,
+              (info.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG),
+              info.st_uid == geteuid(),
+              Int64(info.st_size) == Int64(expected.count) else {
+            return false
+        }
+
+        var offset = 0
+        var buffer = [UInt8](repeating: 0, count: 64 * 1_024)
+        while offset < expected.count {
+            let requested = min(buffer.count, expected.count - offset)
+            let count = buffer.withUnsafeMutableBytes { raw -> Int in
+                guard let base = raw.baseAddress else { return 0 }
+                return fileOperations.read(fd, base, requested)
+            }
+            if count < 0 {
+                if errno == EINTR { continue }
+                return false
+            }
+            guard count > 0,
+                  expected[offset..<(offset + count)].elementsEqual(buffer.prefix(count)) else {
+                return false
+            }
+            offset += count
+        }
+
+        // Reject a file that grew after fstat even when its prefix matched.
+        let trailing = buffer.withUnsafeMutableBytes { raw -> Int in
+            guard let base = raw.baseAddress else { return 0 }
+            return fileOperations.read(fd, base, 1)
+        }
+        return trailing == 0
+    }
+
+    /// Complete write + file fsync + descriptor-relative rename + directory
+    /// fsync. Returning success means both bytes and directory entry crossed
+    /// the durability boundary; an fsync failure is never reported as a
+    /// successful schedule mutation.
+    private func writeDurably(
+        _ data: Data,
+        to url: URL,
+        tempName: String,
+        postNotification shouldPostNotification: Bool
+    ) throws {
+        try paths.ensureDirectories()
+        let directory = url.deletingLastPathComponent()
+        let directoryFD = fileOperations.openAt(
+            AT_FDCWD,
+            directory.path,
+            O_RDONLY | O_DIRECTORY | O_CLOEXEC,
+            0
+        )
+        guard directoryFD >= 0 else {
+            throw StateStoreError.durableWriteFailed(
+                operation: "open state directory",
+                errno: errno,
+                path: directory.path
+            )
+        }
+        defer { _ = fileOperations.close(directoryFD) }
+
+        if fileOperations.unlinkAt(directoryFD, tempName) != 0 {
+            let code = errno
+            if code != ENOENT {
+                throw StateStoreError.durableWriteFailed(
+                    operation: "unlink stale state temp",
+                    errno: code,
+                    path: directory.appendingPathComponent(tempName).path
+                )
+            }
+        }
+        let tempPath = directory.appendingPathComponent(tempName).path
+        let tempFD = fileOperations.openAt(
+            directoryFD,
+            tempName,
+            O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC | O_NOFOLLOW,
+            0o600
+        )
+        guard tempFD >= 0 else {
+            throw StateStoreError.durableWriteFailed(
+                operation: "open state temp",
+                errno: errno,
+                path: tempPath
+            )
+        }
+
+        do {
+            try writeAll(data, to: tempFD, path: tempPath)
+            try sync(tempFD, operation: "fsync state temp", path: tempPath)
+        } catch {
+            _ = fileOperations.close(tempFD)
+            _ = fileOperations.unlinkAt(directoryFD, tempName)
+            throw error
+        }
+        if fileOperations.close(tempFD) != 0 {
+            let code = errno
+            _ = fileOperations.unlinkAt(directoryFD, tempName)
+            throw StateStoreError.durableWriteFailed(
+                operation: "close state temp",
+                errno: code,
+                path: tempPath
+            )
+        }
+
+        let targetName = url.lastPathComponent
+        guard fileOperations.renameAt(directoryFD, tempName, directoryFD, targetName) == 0 else {
+            let code = errno
+            _ = fileOperations.unlinkAt(directoryFD, tempName)
+            throw StateStoreError.renameFailed(errno: code, from: tempPath, to: url.path)
+        }
+        try sync(directoryFD, operation: "fsync state directory", path: directory.path)
+        if shouldPostNotification {
+            postStateChangedNotification()
+        }
+    }
+
+    private func writeAll(_ data: Data, to fd: Int32, path: String) throws {
+        var offset = 0
+        try data.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress else { return }
+            while offset < raw.count {
+                let count = fileOperations.write(fd, base.advanced(by: offset), raw.count - offset)
+                if count < 0 {
+                    let code = errno
+                    if code == EINTR { continue }
+                    throw StateStoreError.durableWriteFailed(operation: "write", errno: code, path: path)
+                }
+                guard count > 0 else {
+                    throw StateStoreError.durableWriteFailed(operation: "write", errno: EIO, path: path)
+                }
+                offset += count
+            }
+        }
+    }
+
+    private func sync(_ fd: Int32, operation: String, path: String) throws {
+        while fileOperations.sync(fd) != 0 {
+            let code = errno
+            if code == EINTR { continue }
+            throw StateStoreError.durableWriteFailed(operation: operation, errno: code, path: path)
+        }
+    }
 
     private func read<T: Decodable>(_ type: T.Type, from url: URL) -> T? {
         guard let data = try? Data(contentsOf: url) else { return nil }

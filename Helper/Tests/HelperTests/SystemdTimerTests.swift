@@ -936,6 +936,22 @@ private func lingerResponder(_ value: String) -> @Sendable ([String]) -> Process
         #expect(activity.lines[0].contains(paths.configFile.path))
         #expect(!activity.lines.contains("no backup sets configured — the tick runs and exits immediately"))
     }
+
+    @Test("corrupt schedule state is a recovery problem, never an empty schedule")
+    func unreadableScheduleStateIsAProblem() throws {
+        let paths = makePaths()
+        try paths.ensureDirectories()
+        defer { try? FileManager.default.removeItem(at: paths.root) }
+        let corrupt = Data("not schedule json {{{".utf8)
+        try corrupt.write(to: paths.scheduleStateFile)
+
+        let activity = TimerCommand.Status.activity(paths: paths)
+        #expect(activity.problems == [.scheduleStateUnreadable])
+        #expect(activity.lines.contains { $0.contains("schedule state is unreadable") })
+        #expect(activity.lines.contains { $0.contains("schedule-state.corrupt-") })
+        #expect(!activity.lines.contains("no backup sets configured — the tick runs and exits immediately"))
+        #expect(try Data(contentsOf: paths.scheduleStateFile) == corrupt)
+    }
 }
 
 // MARK: - Host detection

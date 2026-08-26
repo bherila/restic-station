@@ -1,6 +1,6 @@
 # Data model
 
-All persisted JSON uses `JSONEncoder` with `.sortedKeys` + `.prettyPrinted` (except JSONL lines: compact, one per line) and ISO 8601 dates (`.iso8601` with fractional seconds encoder/decoder). All writes are atomic: write to a temp file in the same directory, then `rename(2)` over the target.
+All persisted JSON uses `JSONEncoder` with `.sortedKeys` + `.prettyPrinted` (except JSONL lines: compact, one per line) and ISO 8601 dates (`.iso8601` with fractional seconds encoder/decoder). All writes are atomic: write to a temp file in the same directory, then `rename(2)` over the target. Safety-authoritative schedule state additionally completes the temp write, `fsync`s it, renames through a held directory descriptor, and `fsync`s the directory before reporting success.
 
 Two files hold configuration, and the split matters:
 
@@ -438,6 +438,8 @@ creating a filesystem event.
 
 ```json
 {
+  "version": 1,
+  "checksum": "<64 lowercase hex SHA-256>",
   "sets": {
     "6F9619FF-...": {
       "lastBackupStart": "2026-07-26T20:57:04Z",
@@ -451,7 +453,30 @@ creating a filesystem event.
 }
 ```
 
+The checksum covers the canonical sorted-key encoding of the logical
+`{"sets": ...}` payload, not the envelope's textual field order. The UUIDs
+and checksum above are abbreviated for readability. A successful mutation is
+acknowledged only after the new file and its directory entry cross the crash-
+durability boundary.
+
 `lastBackupStart` is the *start* time of the last **attempted** scheduled backup (success or failure) — due-computation keys off attempts, so a failing set retries at its next slot, not every tick. Manual runs also update it (a manual backup satisfies the schedule). `checkSliceCursor` is the `n` most recently used in `--read-data-subset=n/t`. `appliedPurgeExcludes` records, per destination UUID, only patterns whose `rewrite --forget` child succeeded. Removing a pattern never removes it from this watermark: history cannot be restored, and a smaller list must not trigger a pointless rewrite.
+
+An absent file is a new, empty schedule. A legacy unversioned document remains
+readable and is upgraded to version 1 on its next mutation. Everything else
+fails closed: malformed JSON or UUID keys, a checksum mismatch, an unsupported
+version, an oversized document, an I/O error, a symlink, or a non-regular or
+foreign-owned canonical file. Readable untrusted bytes are copied exactly to
+`schedule-state.corrupt-<sha256>.json`; the canonical file remains untouched
+as the sentinel that prevents an accidental empty-state rewrite. Repeated
+reads reuse the same content-addressed recovery copy.
+
+Recovery is deliberately an operator action: stop Restic Station's scheduler
+and any manual run, inspect the canonical and recovery-copy bytes, then replace
+the canonical path with a valid document that preserves every trustworthy
+timestamp, cursor, and purge watermark. Run `restic-station-helper status
+--json` before restarting scheduling. Deleting the canonical file is accepted
+only as an explicit decision to discard all of that bookkeeping; it is never
+performed automatically.
 
 ## state/repo-status-<destId>.json
 
@@ -535,7 +560,7 @@ The tick clears it: `recoverInterrupted()` returns the `setId` alongside the
 
 ## Versioning & migration
 
-`AppConfig.currentVersion` is **3**. Loader behavior: version > current → refuse with a clear error ("config written by a newer Restic Station"); version < current → run the in-code migration chain, then persist. State/run files carry no version field — they are regenerable caches/history; on decode failure, skip the record and log, never crash. The exception is `state/schedule-state.json`: it contains destructive purge bookkeeping, so a corrupt or unreadable existing file is preserved and makes schedule mutations and `status` fail unhealthy until explicit recovery is designed. `machine.json` versions independently (`MachineConfig.currentVersion`, currently 1).
+`AppConfig.currentVersion` is **3**. Loader behavior: version > current → refuse with a clear error ("config written by a newer Restic Station"); version < current → run the in-code migration chain, then persist. Regenerable state/run caches carry no version field and tolerate decode failure. The exception is `state/schedule-state.json`, whose current envelope version is **1** and whose checksum protects destructive purge bookkeeping. Legacy unversioned schedule state is accepted and upgraded on mutation; malformed, tampered, or newer-version state is preserved and makes schedule mutations, `status`, and the app fail unhealthy until explicit recovery. `machine.json` versions independently (`MachineConfig.currentVersion`, currently 1).
 
 ### v1 → v2
 
@@ -631,7 +656,7 @@ Never a secret: `nonSecretEnv` is exactly `Destination.nonSecretEnv` (never the 
 
 ### `status --json`
 
-Reads recorded state (`state/schedule-state.json`, `state/current-run-*.json`, `state/repo-status-*.json`, `runs/index.jsonl`) and performs the same live locking probe as the app — no restic invocation. A corrupt or unreadable existing schedule-state file is not treated as an empty schedule: `status` returns a structured state-unreadable failure and leaves the file in place. The lock probe may create dedicated owner-only `health.lock` inodes in `locks/`, `state/`, and `runs/` so it exercises `flock(2)` on each possibly distinct filesystem, and creates then removes a uniquely named scratch inode inside health-only `.health/` directories on all three filesystems to catch quota or full-filesystem failures; it never creates operation locks. Normal operation setup does not create or depend on any health scratch directory. It inspects set locks only for sets in this machine's resolved configuration, so persistent orphaned names do not create false outages. When readable state is available, `health` reuses `HealthDerivation.appHealth` verbatim (`Core/Sources/ResticStationCore/Support/HealthDerivation.swift`), so the CLI and the app's menu bar use the same warning derivation.
+Reads recorded state (`state/schedule-state.json`, `state/current-run-*.json`, `state/repo-status-*.json`, `runs/index.jsonl`) and performs the same live locking probe as the app — no restic invocation. A corrupt or unreadable existing schedule-state file is not treated as an empty schedule: `status` returns a structured state-unreadable failure, identifies any exact-byte recovery copy, and leaves the canonical file in place. The lock probe may create dedicated owner-only `health.lock` inodes in `locks/`, `state/`, and `runs/` so it exercises `flock(2)` on each possibly distinct filesystem, and creates then removes a uniquely named scratch inode inside health-only `.health/` directories on all three filesystems to catch quota or full-filesystem failures; it never creates operation locks. Normal operation setup does not create or depend on any health scratch directory. It inspects set locks only for sets in this machine's resolved configuration, so persistent orphaned names do not create false outages. When readable state is available, `health` reuses `HealthDerivation.appHealth` verbatim (`Core/Sources/ResticStationCore/Support/HealthDerivation.swift`), so the CLI and the app's menu bar use the same warning derivation.
 
 It also inspects the platform scheduler: the same `SystemdTimerManager` used by `timer status` on Linux, and `launchctl print gui/$UID/net.herila.ResticStation.helper` on macOS. See `scheduling.md` §`status` and the scheduler. Only a definite `false` contributes a warning; a failed probe reports `healthy: null`.
 

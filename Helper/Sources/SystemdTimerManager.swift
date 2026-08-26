@@ -569,6 +569,7 @@ enum TimerProblem: String, Equatable, Sendable, CaseIterable {
     case notActive
     case lingerDisabled
     case configUnreadable
+    case scheduleStateUnreadable
     case dataDirectoryMismatch
     case dataDirectoryUnpinned
 
@@ -588,6 +589,8 @@ enum TimerProblem: String, Equatable, Sendable, CaseIterable {
         case .lingerDisabled:
             return "lingering is disabled — the timer stops at logout "
                 + "(`sudo loginctl enable-linger <user>`)"
+        case .scheduleStateUnreadable:
+            return "schedule state needs explicit recovery before the tick can run"
         case .configUnreadable:
             return "the configuration could not be loaded, so every tick will fail"
         case .dataDirectoryMismatch:

@@ -21,6 +21,12 @@ struct MenuBarView: View {
 
     var body: some View {
         Group {
+            if let failure = model.scheduleStateFailure {
+                Text("Schedule state needs recovery")
+                    .help(failure.recoveryMessage)
+                Divider()
+            }
+
             if let error = model.pendingSecretRollbackError {
                 Text("Credential restoration needs attention")
                     .help(error)
@@ -51,7 +57,7 @@ struct MenuBarView: View {
                     .disabled(model.isBusy(setId: health.setId))
                 }
             }
-            .disabled(model.setHealths.isEmpty)
+            .disabled(model.setHealths.isEmpty || model.scheduleStateFailure != nil)
 
             Divider()
 

@@ -30,6 +30,10 @@ import Darwin
 @MainActor
 public final class StateWatcher: ObservableObject {
     @Published public private(set) var scheduleState: ScheduleState?
+    /// Integrity failure for the one state document that is not a
+    /// regenerable cache. Kept separate from `scheduleState == nil` so the
+    /// UI cannot mistake corruption for a never-run machine.
+    @Published public private(set) var scheduleStateFailure: ScheduleStateReadFailure?
     /// Live in-flight run progress, keyed by `BackupSet.id`. Sourced from
     /// `state/current-run-<setId>.json` files, discovered by enumerating
     /// `state/` and matching the `current-run-<uuid>.json` filename pattern
@@ -323,7 +327,17 @@ public final class StateWatcher: ObservableObject {
             refreshConfigFileSource()
             refreshLockFileSources()
         }
-        scheduleState = stateStore.readScheduleState()
+        switch stateStore.readScheduleStateResult() {
+        case .missing:
+            scheduleState = nil
+            scheduleStateFailure = nil
+        case .valid(let state):
+            scheduleState = state
+            scheduleStateFailure = nil
+        case .corrupt(let failure):
+            scheduleState = nil
+            scheduleStateFailure = failure
+        }
         fdaCheck = stateStore.readFdaCheck()
 
         let discovered = enumerateStateDirectory()

@@ -656,6 +656,11 @@ entry = sets[set_id]
 if "lastBackupStart" not in entry:
     sys.exit(f"no lastBackupStart in schedule-state entry: {sorted(entry)}")
 entry["lastBackupStart"] = "2020-01-01T00:00:00Z"
+# This test-only time travel cannot truthfully retain the v1 checksum. Write
+# the supported legacy shape instead; the tick must accept it and upgrade it
+# under the schedule-state lock before launching restic.
+state.pop("version", None)
+state.pop("checksum", None)
 with open(path, "w") as handle:
     json.dump(state, handle)
 WIND
@@ -726,6 +731,11 @@ assert_retention() {
     rc=$?
     set -e
     [[ $rc -eq 0 ]] || fail "$step" "tick exited $rc: $out"
+    jq -e '
+        .version == 1
+        and (.checksum | type == "string" and test("^[0-9a-f]{64}$"))
+    ' "$DATA_DIR/state/schedule-state.json" >/dev/null \
+        || fail "$step" "the scheduled mutation did not upgrade legacy schedule state to a checksummed v1 envelope"
 
     local scheduled_after
     # Whitespace-tolerant: `jq -c` emits `"trigger":"scheduled"` while the

@@ -83,7 +83,7 @@ RunStore: temp-dir AppPaths; crash-recovery test (write `running` metadata with 
 
 `RunStoreCrashDurabilityTests` runs the crash matrix: every step boundary of `begin`, `markDestructiveLaunchAuthorized`, `finish` (destructive and not), and `recoverInterrupted` itself (each matrix's largest crash point asserts the flow completed, so a flow that grows new steps fails the coverage check loudly rather than silently shrinking the matrix); torn index appends at byte offsets including mid-UTF-8-scalar; and `EINTR` injected at every fsync site of both the publication and recovery flows.
 
-Model limits, deliberately: crashes replay at seam-call boundaries against the real filesystem — losing un-fsynced page cache is not simulated, and `FileManager` calls (mkdir/remove) are outside the seam, so a crash "between" one of those and a seam call is not representable. `ConfigStore`/`AppPaths` durability is tested separately (their own seams); `StateStore` promises only atomic replacement (temp + rename), covered by the stale-temp test in the same suite.
+Model limits, deliberately: crashes replay at seam-call boundaries against the real filesystem — losing un-fsynced page cache is not simulated, and `FileManager` calls (mkdir/remove) are outside the seam, so a crash "between" one of those and a seam call is not representable. `ConfigStore`/`AppPaths` durability is tested separately (their own seams). Regenerable `StateStore` files promise atomic replacement; safety-authoritative `schedule-state.json` has its own narrow `StateStoreFileOperations` seam and tests injected failures at temp-file fsync, rename, and directory fsync, plus checksum tampering and exact-byte quarantine.
 
 ## Layer 2 — integration script (`scripts/integration-test.sh`)
 

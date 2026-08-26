@@ -1,3 +1,4 @@
+import ResticStationCore
 import SwiftUI
 
 /// The app shell (`docs/ui-spec.md` §Shell): a `NavigationSplitView` whose
@@ -81,7 +82,33 @@ struct AppAlertBanners: View {
             if let error = model.pendingSecretRollbackError {
                 SecretRollbackBanner(message: error)
             }
+            if let failure = model.scheduleStateFailure {
+                ScheduleStateIntegrityBanner(failure: failure)
+            }
         }
+    }
+}
+
+struct ScheduleStateIntegrityBanner: View {
+    let failure: ScheduleStateReadFailure
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "externaldrive.badge.xmark")
+                .foregroundStyle(.red)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Schedule state needs recovery")
+                    .fontWeight(.semibold)
+                Text("Scheduled work is paused to protect purge history. Inspect the preserved file before replacing or deleting it.")
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 12)
+        }
+        .help(failure.recoveryMessage)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 9)
+        .background(.bar)
+        .overlay(alignment: .bottom) { Divider() }
     }
 }
 

@@ -3805,6 +3805,43 @@ struct BackupEngineTests {
         #expect(env.resticArgvs.count == 2)
     }
 
+    @Test("automatic purge refuses corruption introduced after backup before any rewrite")
+    func automaticPurgeRefusesCorruptScheduleState() async throws {
+        let paths = Box<AppPaths?>(nil)
+        let env = Self.makeEnv(
+            script: [],
+            retention: nil,
+            purgeExcludes: ["build/**"],
+            reachableSecondaries: [],
+            onSpawn: { argv in
+                guard argv.contains("backup"), let paths = paths.value else { return }
+                try? Data("corrupt after attempt timestamp {{{".utf8)
+                    .write(to: paths.scheduleStateFile)
+            }
+        )
+        paths.value = env.paths
+        defer { env.cleanUp() }
+        env.fake.script = Self.resticCall(
+            Self.backupArgv(env.primary.repoURL, excludes: env.set.purgeExcludes),
+            dest: Self.primaryId,
+            stdoutLines: Self.backupStream()
+        )
+
+        let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
+
+        guard case .infrastructureFailure(let reason) = outcome else {
+            Issue.record("corrupt watermark state must stop automatic purge: \(outcome)")
+            return
+        }
+        #expect(reason.contains("schedule state unusable before purge"))
+        #expect(env.resticArgvs.count == 1)
+        #expect(!env.resticArgvs.contains { $0.contains("rewrite") })
+        guard case .corrupt = env.stateStore.readScheduleStateResult() else {
+            Issue.record("the corrupt canonical schedule state was not preserved")
+            return
+        }
+    }
+
     @Test("a secondary purge infrastructure failure does not skip later independent work")
     func secondaryPurgeInfrastructureFailureContinuesOtherDestinations() async throws {
         let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]

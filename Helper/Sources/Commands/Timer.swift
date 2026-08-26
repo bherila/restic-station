@@ -223,10 +223,23 @@ extension TimerCommand {
                 problems.append(.configUnreadable)
             }
 
+            let scheduleState: ScheduleState?
+            var scheduleStateFailure: ScheduleStateReadFailure?
+            switch StateStore(paths: paths).readScheduleStateResult() {
+            case .missing:
+                scheduleState = nil
+            case .valid(let state):
+                scheduleState = state
+            case .corrupt(let failure):
+                scheduleState = nil
+                scheduleStateFailure = failure
+                problems.append(.scheduleStateUnreadable)
+            }
+
             let recentRuns = (try? RunStore(paths: paths).recentRuns(limit: 1)) ?? []
             var lines = SystemdTimerActivity.lines(
                 config: config,
-                scheduleState: StateStore(paths: paths).readScheduleState(),
+                scheduleState: scheduleState,
                 recentRuns: recentRuns,
                 now: Date()
             )
@@ -235,6 +248,9 @@ extension TimerCommand {
                 // from an empty stand-in config and describing them as this
                 // host's backup sets would be worse than saying nothing.
                 lines = ["could not load \(paths.configFile.path) — every tick will fail on it"]
+            }
+            if let scheduleStateFailure {
+                lines.append(scheduleStateFailure.recoveryMessage)
             }
             return TimerActivity(lines: lines, problems: problems)
         }

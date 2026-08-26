@@ -406,11 +406,18 @@ public final class BackupEngine: Sendable {
         // copied anywhere. A failed primary purge terminates the group: a
         // copy would otherwise propagate rewritten snapshots while leaving
         // their originals on an unpurged mirror.
-        let primaryPurgePatterns = pendingPurgePatterns(
-            setId: set.id,
-            set: set,
-            destinationId: primary.id
-        )
+        let primaryPurgePatterns: [String]
+        do {
+            primaryPurgePatterns = try pendingPurgePatterns(
+                setId: set.id,
+                set: set,
+                destinationId: primary.id
+            )
+        } catch {
+            let reason = "schedule state unusable before purge — \(error)"
+            logWarning("BackupEngine: \(reason)")
+            return .infrastructureFailure(reason: reason)
+        }
         if !primaryPurgePatterns.isEmpty {
             do {
                 let purge = try await runAutomaticPurge(
@@ -464,11 +471,18 @@ public final class BackupEngine: Sendable {
             // would retain its old snapshots alongside the primary's rewritten
             // replacements. A failed purge skips only this secondary; another
             // mirror can still make a safe copy.
-            let secondaryPurgePatterns = pendingPurgePatterns(
-                setId: set.id,
-                set: set,
-                destinationId: secondary.id
-            )
+            let secondaryPurgePatterns: [String]
+            do {
+                secondaryPurgePatterns = try pendingPurgePatterns(
+                    setId: set.id,
+                    set: set,
+                    destinationId: secondary.id
+                )
+            } catch {
+                let reason = "schedule state unusable before purge — \(error)"
+                logWarning("BackupEngine: \(reason)")
+                return .infrastructureFailure(reason: reason)
+            }
             if !secondaryPurgePatterns.isEmpty {
                 do {
                     let purge = try await runAutomaticPurge(
@@ -637,8 +651,11 @@ public final class BackupEngine: Sendable {
         defer { try? stateStore.clearCurrentRun(setId: set.id) }
 
         // Attempt semantics, exactly like `lastBackupStart`.
+        let updatedScheduleState: ScheduleState
         do {
-            try updateScheduleState(setId: set.id) { $0.lastCheckStart = self.now() }
+            updatedScheduleState = try updateScheduleState(setId: set.id) {
+                $0.lastCheckStart = self.now()
+            }
         } catch {
             let reason = "schedule state unusable — \(error)"
             recordInfrastructureFailure(
@@ -652,7 +669,7 @@ public final class BackupEngine: Sendable {
         }
 
         let totalSlices = set.checkPolicy?.readDataSubsetSlices ?? Self.defaultCheckSlices
-        let previousState = stateStore.readScheduleState()?.sets[set.id]
+        let previousState = updatedScheduleState.sets[set.id]
         let slice = ScheduleMath.nextCheckSlice(
             cursor: previousState?.checkSliceCursor ?? 0,
             totalSlices: totalSlices
@@ -1536,6 +1553,19 @@ public final class BackupEngine: Sendable {
         trigger: RunTrigger,
         groupId: String?
     ) async throws -> PurgeRunResult {
+        // The watermark is required both to decide automatic work and to
+        // acknowledge any successful manual rewrite afterward. Refuse before
+        // token consumption or repository queries if the canonical state is
+        // already untrustworthy.
+        do {
+            _ = try trustedScheduleState()
+        } catch {
+            throw PurgeApplyError.infrastructureFailure(
+                reason: "schedule state unusable before purge — \(error)",
+                operationMayHaveRun: false
+            )
+        }
+
         let preview: PreviewToken
         do {
             preview = try previewTokens.token(token)
@@ -1879,9 +1909,25 @@ public final class BackupEngine: Sendable {
         )
     }
 
-    private func pendingPurgePatterns(setId: UUID, set: BackupSet, destinationId: UUID) -> [String] {
-        let applied = stateStore.readScheduleState()?.sets[setId]?.appliedPurgeExcludes[destinationId] ?? []
+    private func pendingPurgePatterns(
+        setId: UUID,
+        set: BackupSet,
+        destinationId: UUID
+    ) throws -> [String] {
+        let applied = try trustedScheduleState()
+            .sets[setId]?.appliedPurgeExcludes[destinationId] ?? []
         return set.purgeExcludes.filter { !applied.contains($0) }
+    }
+
+    private func trustedScheduleState() throws -> ScheduleState {
+        switch stateStore.readScheduleStateResult() {
+        case .missing:
+            return ScheduleState()
+        case .valid(let state):
+            return state
+        case .corrupt(let failure):
+            throw StateStoreError.scheduleStateCorrupt(failure)
+        }
     }
 
     /// Mints a local token from a fresh plan and consumes it through the same
@@ -2774,10 +2820,11 @@ public final class BackupEngine: Sendable {
         )
     }
 
+    @discardableResult
     private func updateScheduleState(
         setId: UUID,
         mutate: (inout SetScheduleState) -> Void
-    ) throws {
+    ) throws -> ScheduleState {
         try stateStore.updateScheduleState(setId: setId, mutate: mutate)
     }
 

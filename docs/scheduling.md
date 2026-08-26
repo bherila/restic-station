@@ -167,6 +167,13 @@ from `state/schedule-state.json` and `runs/index.jsonl`. Exits 0 when
 scheduled backups really will happen and 1 otherwise, so it works as a health
 check.
 
+An existing but unreadable or checksum-invalid `schedule-state.json` is never
+reported as "never run". It is preserved, copied byte-for-byte to the
+content-addressed recovery path named in the error when readable, and makes
+`timer status`/`status --json` unhealthy until an operator replaces the
+canonical file. This prevents lost purge watermarks from silently authorizing
+a second rewrite.
+
 The last thing it prints is the verdict it exits on, so the exit code never
 has to be inferred from the evidence above it:
 
@@ -187,6 +194,7 @@ up", not "does a unit file exist":
 | `notActive` | not firing now |
 | `lingerDisabled` | systemd kills this user's units at logout — the single most common silent stop on a headless box |
 | `configUnreadable` | `config.json` will not parse, so every tick exits 1 |
+| `scheduleStateUnreadable` | schedule/check/purge bookkeeping failed integrity or safe-file validation, so every tick exits 1 until explicit recovery |
 | `dataDirectoryMismatch` | the unit pins a *different* data directory than this command reads — the timer is fine, and ticks somewhere else |
 | `dataDirectoryUnpinned` | the unit pins none, so the tick re-derives it from the user manager's environment (a unit written before #48) |
 
@@ -382,7 +390,7 @@ For every destination: `stale ⟺ now − lastSyncedAt > stalenessWarningDays` (
 
 The app is macOS-only; on Linux the helper is the whole product.
 
-The app never computes schedules. It renders `schedule-state.json` + `repo-status-*.json` + `nextDue()` (calling ScheduleMath for display only), registers/unregisters the LaunchAgent, and invokes the helper for manual actions:
+The app never computes schedules. It renders `schedule-state.json` + `repo-status-*.json` + `nextDue()` (calling ScheduleMath for display only), registers/unregisters the LaunchAgent, and invokes the helper for manual actions. A schedule-state integrity failure makes the menu-bar glyph critical, names the recovery requirement in both menu and window, and disables **Back Up Now** until the canonical file is explicitly repaired:
 - `Back Up Now` → `restic-station-helper run-set --set <uuid>`
 - kick a tick early (after config edits) → `launchctl kickstart gui/<uid>/net.herila.ResticStation.helper`
 

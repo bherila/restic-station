@@ -102,6 +102,43 @@ private final class ReplacementAuditLoader: @unchecked Sendable {
 @Suite("StateWatcher lock health", .serialized)
 @MainActor
 struct StateWatcherTests {
+    @Test("schedule-state corruption is published, quarantined, and cleared only by explicit recovery")
+    func scheduleStateCorruptionPublishesRecoveryState() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-schedule-state-watcher-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = AppPaths(root: root)
+        try paths.ensureDirectories()
+        let corrupt = Data("not schedule json {{{".utf8)
+        try corrupt.write(to: paths.scheduleStateFile)
+
+        let watcher = StateWatcher(
+            paths: paths,
+            runStore: RunStore(paths: paths),
+            stateStore: StateStore(paths: paths)
+        )
+        watcher.reloadNow()
+
+        #expect(watcher.scheduleState == nil)
+        let failure = try #require(watcher.scheduleStateFailure)
+        #expect(failure.reason == .malformedDocument)
+        #expect(try Data(contentsOf: URL(fileURLWithPath: #require(failure.quarantinePath))) == corrupt)
+
+        // The same published failure must drive the process-wide app glyph
+        // red even with no configured sets and no main window.
+        let model = AppModel(paths: paths)
+        #expect(model.scheduleStateFailure != nil)
+        #expect(model.appHealth == .critical)
+
+        // Recovery is explicit: replacing the canonical bytes with a valid
+        // legacy document is accepted; no reader silently deletes the bad
+        // file or invents empty state.
+        try Data("{\"sets\":{}}".utf8).write(to: paths.scheduleStateFile)
+        watcher.reloadNow()
+        #expect(watcher.scheduleState == ScheduleState())
+        #expect(watcher.scheduleStateFailure == nil)
+    }
+
     @Test("keychain secret-lock metadata changes refresh administrative health")
     func keychainSecretLockMetadataRefreshesHealth() async throws {
         let root = FileManager.default.temporaryDirectory
