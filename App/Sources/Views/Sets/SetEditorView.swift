@@ -288,6 +288,7 @@ struct SetEditorView: View {
                 draft,
                 ifUnchangedFrom: configFingerprint
             )
+            model.retirePendingSecretRollbackFields(committedBy: pendingSecretRollbacks)
             pendingSecretRollbacks.removeAll()
             isNew = false
             didSave = true
@@ -304,6 +305,7 @@ struct SetEditorView: View {
                 // The candidate may be live but unreadable. Restoring its
                 // paired secrets could create a worse config/credential
                 // mismatch; require explicit operator reconciliation.
+                model.retirePendingSecretRollbackFields(committedBy: pendingSecretRollbacks)
                 pendingSecretRollbacks.removeAll()
                 message += " Its credential changes were left in place because the app could not "
                     + "determine which config revision is live. Reload settings and verify this destination."

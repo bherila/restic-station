@@ -42,9 +42,7 @@ struct SettingsRootView: View {
         // explanatory copy; the others simply get room to breathe.
         .frame(width: 620, height: 520)
         .safeAreaInset(edge: .top, spacing: 0) {
-            if model.configChangedOnDisk {
-                ConfigChangeBanner()
-            }
+            AppAlertBanners()
         }
         // The `Settings` scene injects only `AppModel` and `LaunchdManager`
         // (`ResticStationApp.swift`); panes that render live on-disk state

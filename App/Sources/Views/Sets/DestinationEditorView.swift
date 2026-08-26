@@ -694,6 +694,9 @@ struct DestinationEditorView: View {
             // This write persisted the entire parent draft, including any
             // earlier destination edits, so every retained keychain change
             // now has matching config bytes.
+            model.retirePendingSecretRollbackFields(
+                committedBy: pendingSecretRollbacks + [committed.secretsRollback]
+            )
             pendingSecretRollbacks.removeAll()
             return true
         } catch {
@@ -701,6 +704,9 @@ struct DestinationEditorView: View {
                storeError.commitMayBeUncertain {
                 // The candidate may be live but unreadable. Do not restore
                 // credentials that candidate might already reference.
+                model.retirePendingSecretRollbackFields(
+                    committedBy: pendingSecretRollbacks + [committed.secretsRollback]
+                )
                 pendingSecretRollbacks.removeAll()
                 message = .error("The backup set's installed revision could not be determined (\(error)). "
                     + "Its credential changes were left in place. Reload settings and verify this destination "

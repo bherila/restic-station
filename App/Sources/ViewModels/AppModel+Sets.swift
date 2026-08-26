@@ -19,6 +19,11 @@ extension AppModel {
         var destId: UUID { transaction.destId }
     }
 
+    private struct CommittedSecretFields {
+        var password = false
+        var secretEnv = false
+    }
+
     // MARK: - Collaborators
 
     /// The secret store this app writes destination passwords into — the
@@ -378,6 +383,47 @@ extension AppModel {
         retryPendingSecretRollbacks()
     }
 
+    /// A successful config commit — or an uncertain commit whose credentials
+    /// are deliberately left installed for reconciliation — makes each field
+    /// changed by that editor authoritative. Retire matching fields from
+    /// older, model-owned rollback batches even when the new edit wrote the
+    /// same value: value-based rollback conflict detection cannot distinguish
+    /// "still abandoned" from "explicitly retained" in that case.
+    func retirePendingSecretRollbackFields(
+        committedBy rollbacks: [DestinationSecretsRollback]
+    ) {
+        var committed: [UUID: CommittedSecretFields] = [:]
+        for rollback in rollbacks {
+            var fields = committed[rollback.destId] ?? CommittedSecretFields()
+            fields.password = fields.password || rollback.transaction.password != nil
+            fields.secretEnv = fields.secretEnv || rollback.transaction.secretEnv != nil
+            committed[rollback.destId] = fields
+        }
+        guard !committed.isEmpty else { return }
+
+        pendingSecretRollbackBatches = pendingSecretRollbackBatches.compactMap { batch in
+            let remaining = batch.compactMap { rollback -> DestinationSecretsRollback? in
+                guard let fields = committed[rollback.destId] else { return rollback }
+                let transaction = rollback.transaction
+                let password = fields.password ? nil : transaction.password
+                let secretEnv = fields.secretEnv ? nil : transaction.secretEnv
+                guard password != nil || secretEnv != nil else { return nil }
+                return DestinationSecretsRollback(
+                    transaction: DestinationSecretRollback(
+                        destId: transaction.destId,
+                        password: password,
+                        secretEnv: secretEnv,
+                        previousSecretEnvRaw: secretEnv == nil ? nil : transaction.previousSecretEnvRaw
+                    )
+                )
+            }
+            return remaining.isEmpty ? nil : remaining
+        }
+        if pendingSecretRollbackBatches.isEmpty {
+            pendingSecretRollbackError = nil
+        }
+    }
+
     func retryPendingSecretRollbacks() {
         guard pendingSecretRollbackTask == nil else { return }
         // Do not unwind an older abandoned edit while a live editor may be
@@ -431,6 +477,12 @@ extension AppModel {
     /// password is not an error here (a destination can exist before its
     /// password was ever stored) — the caller shows "leave blank to keep".
     func loadDestinationSecrets(destId: UUID) async -> (password: String?, secretEnv: [String: String]) {
+        // A rollback which was already in flight when this editor opened may
+        // still own the value currently in the backend. Prefill only after it
+        // settles, matching the serialization used by credential writes.
+        if let pendingSecretRollbackTask {
+            await pendingSecretRollbackTask.value
+        }
         guard let store = self.secrets else { return (nil, [:]) }
         let password = try? await store.password(destId: destId)
         let env = (try? await store.secretEnv(destId: destId)) ?? [:]

@@ -508,6 +508,52 @@ struct AppModelMachineOverrideTests {
         #expect(!model.configChangedOnDisk)
     }
 
+    @Test("app startup never waits on a contended config lock")
+    func contendedConfigDoesNotBlockAppModelInitialization() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-contended-startup-app-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let paths = AppPaths(root: root)
+        let installed = AppConfig(showMenuBarIcon: false)
+        try ConfigStore(paths: paths).save(installed)
+        let heldLock = FileLock(path: paths.configLockFile, trustedRoot: root)
+        #expect(heldLock.acquire() == .acquired)
+        defer { heldLock.release() }
+
+        let startedAt = Date()
+        let model = AppModel(paths: paths)
+
+        #expect(Date().timeIntervalSince(startedAt) < 1)
+        #expect(model.config == installed)
+    }
+
+    @Test("legacy config migration is deferred from startup initialization")
+    func legacyConfigMigratesAfterStart() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-deferred-migration-app-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let paths = AppPaths(root: root)
+        let migratedPath = "/usr/local/bin/restic-from-startup-v1"
+        let legacy = AppConfig(version: 1, resticPath: migratedPath)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try ConfigStore.makeEncoder().encode(legacy).write(to: paths.configFile, options: .atomic)
+
+        let model = AppModel(paths: paths)
+        #expect(model.config.version == 1)
+        model.start()
+        defer { model.stop() }
+        for _ in 0..<80 {
+            if model.config.version == AppConfig.currentVersion { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+
+        #expect(model.config.version == AppConfig.currentVersion)
+        #expect(model.machine.resticPath == migratedPath)
+        #expect(model.configLoadError == nil)
+    }
+
     @Test("an older reload completion cannot replace a newer published snapshot")
     func concurrentReloadsPublishNewestRequestOnly() async throws {
         let root = FileManager.default.temporaryDirectory
@@ -1069,6 +1115,105 @@ struct AppModelMachineOverrideTests {
         }
         #expect(model.pendingSecretRollbackBatches.isEmpty)
         #expect(try await secrets.password(destId: destinationId) == "original-password")
+    }
+
+    @Test("destination prefill waits for an older rollback already in flight")
+    func destinationPrefillWaitsForRunningRollback() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-secret-running-prefill-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let destinationId = UUID()
+        let sessionId = UUID()
+        let secrets = CheckpointingSecretStore(passwords: [destinationId: "original-password"])
+        let model = AppModel(paths: AppPaths(root: root), secretStoreFactory: { secrets })
+        let abandoned = try await model.storeDestinationSecrets(
+            destId: destinationId,
+            password: "abandoned-editor-password",
+            secretEnv: nil,
+            ifConfigUnchangedFrom: model.configFingerprint
+        )
+        await secrets.pauseNextPasswordWrite()
+        model.retainPendingSecretRollbacks([abandoned])
+        for _ in 0..<40 {
+            if await secrets.passwordWriteIsPaused() { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        #expect(await secrets.passwordWriteIsPaused())
+
+        model.beginSecretEditorSession(sessionId)
+        var prefillFinished = false
+        let prefill = Task { @MainActor in
+            let loaded = await model.loadDestinationSecrets(destId: destinationId)
+            prefillFinished = true
+            return loaded
+        }
+        try await Task.sleep(for: .milliseconds(20))
+        #expect(!prefillFinished)
+
+        await secrets.resumePausedPasswordWrite()
+        let loaded = await prefill.value
+        #expect(prefillFinished)
+        #expect(loaded.password == "original-password")
+        model.endSecretEditorSession(sessionId)
+    }
+
+    @Test("committing the same credential retires an older abandoned rollback")
+    func committedCredentialRetiresOlderRollback() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-secret-committed-same-value-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let destinationId = UUID()
+        let sessionId = UUID()
+        let secrets = CheckpointingSecretStore(passwords: [destinationId: "original-password"])
+        let model = AppModel(paths: AppPaths(root: root), secretStoreFactory: { secrets })
+        let abandoned = try await model.storeDestinationSecrets(
+            destId: destinationId,
+            password: "retained-password",
+            secretEnv: nil,
+            ifConfigUnchangedFrom: model.configFingerprint
+        )
+        await secrets.failNextPasswordWrite()
+        model.retainPendingSecretRollbacks([abandoned])
+        for _ in 0..<40 {
+            if model.pendingSecretRollbackError != nil { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(model.pendingSecretRollbackError != nil)
+
+        model.beginSecretEditorSession(sessionId)
+        let committed = try await model.storeDestinationSecrets(
+            destId: destinationId,
+            password: "retained-password",
+            secretEnv: nil,
+            ifConfigUnchangedFrom: model.configFingerprint,
+            editorSessionId: sessionId
+        )
+        #expect(model.claimEditorSecretRollback(committed, sessionId: sessionId))
+        model.retirePendingSecretRollbackFields(committedBy: [committed])
+
+        #expect(model.pendingSecretRollbackBatches.isEmpty)
+        #expect(model.pendingSecretRollbackError == nil)
+        model.endSecretEditorSession(sessionId)
+        #expect(try await secrets.password(destId: destinationId) == "retained-password")
+    }
+
+    @Test("credential restoration failure changes process-wide app health")
+    func credentialRollbackFailureWarnsInMenuBarHealth() {
+        #expect(AppModel.health(.idle, pendingSecretRollbackError: nil) == .idle)
+        #expect(AppModel.health(
+            .idle,
+            pendingSecretRollbackError: "Credential restoration failed"
+        ) == .warning)
+        #expect(AppModel.health(
+            .running,
+            pendingSecretRollbackError: "Credential restoration failed"
+        ) == .warning)
+        #expect(AppModel.health(
+            .critical,
+            pendingSecretRollbackError: "Credential restoration failed"
+        ) == .critical)
     }
 
     @Test("editor teardown keeps claimed and parked rollbacks in chronological order")

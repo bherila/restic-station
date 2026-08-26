@@ -94,8 +94,13 @@ final class AppModel: ObservableObject {
     /// A set editor can disappear because the window closed or the sidebar
     /// changed, without getting an opportunity to await its secret rollback.
     /// The model takes ownership of those tokens before the view is torn
-    /// down and surfaces any failed retry in every main window.
-    @Published var pendingSecretRollbackError: String?
+    /// down and surfaces any failed retry in every surviving app scene.
+    @Published var pendingSecretRollbackError: String? {
+        didSet {
+            guard oldValue != pendingSecretRollbackError else { return }
+            recomputeDerivedState()
+        }
+    }
 
     /// Each inner array is one editor session and must be unwound in reverse
     /// order. Keeping batches separate lets a failed older session remain
@@ -219,9 +224,14 @@ final class AppModel: ObservableObject {
         let loadedConfig: AppConfig
         let loadedConfigFingerprint: String
         do {
-            let snapshot = try configStore.snapshot()
+            // Startup is main-actor isolated, so it must never enter the
+            // config lock's bounded polling loop. Atomic replacement makes
+            // this immediate whole-file read safe as an initial view; a
+            // legacy schema is migrated asynchronously from start().
+            let snapshot = try configStore.reconciliationSnapshot()
             loadedConfig = snapshot.config
             loadedConfigFingerprint = snapshot.fingerprint
+            configReloadRequired = snapshot.config.version < AppConfig.currentVersion
         } catch {
             // A default, empty config keeps the UI alive and explainable;
             // `configLoadError` blocks writes so nothing is clobbered.
@@ -289,6 +299,9 @@ final class AppModel: ObservableObject {
                 self.recomputeDerivedState()
             }
         }
+        if configReloadRequired {
+            Task { await reloadConfigFromDisk() }
+        }
         Task { await refreshResticInfo() }
     }
 
@@ -322,6 +335,11 @@ final class AppModel: ObservableObject {
     ) throws -> String {
         if let configLoadError {
             throw AppModelError.configUnreadable(configLoadError)
+        }
+        if configReloadRequired {
+            throw AppModelError.configUnreadable(
+                "Settings are still being migrated. Wait for Reload Settings to finish before saving."
+            )
         }
         let editFingerprint = expectedFingerprint ?? configFingerprint
         let installedFingerprint: String
@@ -596,7 +614,7 @@ final class AppModel: ObservableObject {
             visibleSince: paths.configurationVisibleSince(),
             runLiveness: runLiveness
         )
-        appHealth = HealthDerivation.appHealth(
+        let derivedHealth = HealthDerivation.appHealth(
             setHealths: setHealths,
             runsInFlight: Array(stateWatcher.currentRuns.values),
             // Only a *definite* denial is a warning: a missing
@@ -615,6 +633,23 @@ final class AppModel: ObservableObject {
                 || stateWatcher.auditVerificationFailed,
             runLiveness: runLiveness
         )
+        // A failed abandoned-edit rollback can leave scheduled backups using
+        // credentials that do not match config. Keep the menu-bar glyph red
+        // only for destructive-audit failures, otherwise make this warning
+        // visible even when no app window survives.
+        appHealth = Self.health(
+            derivedHealth,
+            pendingSecretRollbackError: pendingSecretRollbackError
+        )
+    }
+
+    static func health(
+        _ derivedHealth: AppHealth,
+        pendingSecretRollbackError: String?
+    ) -> AppHealth {
+        pendingSecretRollbackError == nil || derivedHealth == .critical
+            ? derivedHealth
+            : .warning
     }
 
     /// `StateWatcher` and `LaunchdManager` are nested `ObservableObject`s;

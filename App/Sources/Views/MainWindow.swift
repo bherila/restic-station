@@ -38,14 +38,7 @@ struct MainWindow: View {
         }
         .navigationTitle("Restic Station")
         .safeAreaInset(edge: .top, spacing: 0) {
-            VStack(spacing: 0) {
-                if model.configChangedOnDisk {
-                    ConfigChangeBanner()
-                }
-                if let error = model.pendingSecretRollbackError {
-                    SecretRollbackBanner(message: error)
-                }
-            }
+            AppAlertBanners()
         }
         // ui-spec: min size ~900×560.
         .frame(minWidth: 900, minHeight: 560)
@@ -70,6 +63,24 @@ struct MainWindow: View {
             RestoreRootView()
         case .maintenance:
             MaintenanceRootView()
+        }
+    }
+}
+
+/// Process-wide safety alerts shared by every window scene. Keeping this as
+/// one view prevents Settings from silently losing a warning merely because
+/// the main window was closed.
+struct AppAlertBanners: View {
+    @EnvironmentObject private var model: AppModel
+
+    var body: some View {
+        VStack(spacing: 0) {
+            if model.configChangedOnDisk {
+                ConfigChangeBanner()
+            }
+            if let error = model.pendingSecretRollbackError {
+                SecretRollbackBanner(message: error)
+            }
         }
     }
 }
