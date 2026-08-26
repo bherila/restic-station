@@ -638,13 +638,14 @@ public struct StateStore: Sendable {
         guard info.st_uid == geteuid() else {
             return .failed(.unsafeFile(reason: "owned by uid \(info.st_uid), expected \(geteuid())"))
         }
-        guard info.st_size >= 0,
-              info.st_size <= Self.maximumScheduleStateBytes else {
-            return .failed(.tooLarge(bytes: info.st_size, limit: Self.maximumScheduleStateBytes))
+        let fileSize = Int64(info.st_size)
+        guard fileSize >= 0,
+              fileSize <= Self.maximumScheduleStateBytes else {
+            return .failed(.tooLarge(bytes: fileSize, limit: Self.maximumScheduleStateBytes))
         }
 
         var data = Data()
-        data.reserveCapacity(max(0, Int(info.st_size)))
+        data.reserveCapacity(Int(fileSize))
         var buffer = [UInt8](repeating: 0, count: 64 * 1_024)
         while true {
             let count = buffer.withUnsafeMutableBytes { raw -> Int in
