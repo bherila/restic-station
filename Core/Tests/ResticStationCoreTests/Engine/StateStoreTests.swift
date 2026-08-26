@@ -60,6 +60,7 @@ private final class ScheduleStateFaultInjector: @unchecked Sendable {
                 return live.sync(fd)
             },
             stat: live.stat,
+            setMode: live.setMode,
             renameAt: { [self] oldDirectory, oldName, newDirectory, newName in
                 if point == .rename {
                     errno = EIO
@@ -70,6 +71,92 @@ private final class ScheduleStateFaultInjector: @unchecked Sendable {
             unlinkAt: live.unlinkAt,
             close: live.close
         )
+    }
+}
+
+private final class ScheduleStateMigrationPause: @unchecked Sendable {
+    private let live = StateStoreFileOperations.live
+    private let markerPublished = DispatchSemaphore(value: 0)
+    private let resumeWriter = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var didPause = false
+
+    func operations() -> StateStoreFileOperations {
+        StateStoreFileOperations(
+            openAt: live.openAt,
+            read: live.read,
+            write: live.write,
+            sync: live.sync,
+            stat: live.stat,
+            setMode: live.setMode,
+            renameAt: { [self] oldDirectory, oldName, newDirectory, newName in
+                let result = live.renameAt(oldDirectory, oldName, newDirectory, newName)
+                guard result == 0, newName == "schedule-state.version-1" else { return result }
+                lock.lock()
+                let shouldPause = !didPause
+                didPause = true
+                lock.unlock()
+                if shouldPause {
+                    markerPublished.signal()
+                    resumeWriter.wait()
+                }
+                return result
+            },
+            unlinkAt: live.unlinkAt,
+            close: live.close
+        )
+    }
+
+    func waitUntilMarkerPublished() { markerPublished.wait() }
+    func resume() { resumeWriter.signal() }
+}
+
+private final class ScheduleStateReadRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: ScheduleStateReadResult?
+
+    func record(_ result: ScheduleStateReadResult) {
+        lock.lock()
+        stored = result
+        lock.unlock()
+    }
+
+    var result: ScheduleStateReadResult? {
+        lock.lock()
+        defer { lock.unlock() }
+        return stored
+    }
+}
+
+private final class RecoveryWriteCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    func operations() -> StateStoreFileOperations {
+        let live = StateStoreFileOperations.live
+        return StateStoreFileOperations(
+            openAt: live.openAt,
+            read: live.read,
+            write: { [self] _, _, _ in
+                lock.lock()
+                count += 1
+                lock.unlock()
+                errno = ENOSPC
+                return -1
+            },
+            sync: live.sync,
+            stat: live.stat,
+            setMode: live.setMode,
+            renameAt: live.renameAt,
+            unlinkAt: live.unlinkAt,
+            close: live.close
+        )
+    }
+
+    var writes: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return count
     }
 }
 
@@ -332,6 +419,59 @@ struct StateStoreTests {
         #expect(store.readScheduleState()?.sets[setId]?.checkSliceCursor == 5)
     }
 
+    @Test("a reader binds the migration marker and canonical document under the writer lock")
+    func migrationReadWaitsForOneStableGeneration() throws {
+        let (liveStore, root) = makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try liveStore.paths.ensureDirectories()
+        let setId = UUID()
+        try Data("{\"sets\":{\"\(setId.uuidString)\":{\"checkSliceCursor\":4}}}".utf8)
+            .write(to: liveStore.paths.scheduleStateFile)
+
+        let pause = ScheduleStateMigrationPause()
+        let writer = StateStore(paths: liveStore.paths, fileOperations: pause.operations())
+        let errors = StateStoreErrorRecorder()
+        let read = ScheduleStateReadRecorder()
+        let readerFinished = DispatchSemaphore(value: 0)
+        let group = DispatchGroup()
+
+        group.enter()
+        DispatchQueue.global().async {
+            defer { group.leave() }
+            do {
+                try writer.updateScheduleState(setId: setId) { $0.checkSliceCursor = 5 }
+            } catch {
+                errors.record(error)
+            }
+        }
+        pause.waitUntilMarkerPublished()
+
+        group.enter()
+        DispatchQueue.global().async {
+            defer {
+                readerFinished.signal()
+                group.leave()
+            }
+            read.record(liveStore.readScheduleStateResult())
+        }
+
+        #expect(
+            readerFinished.wait(timeout: .now() + 0.2) == .timedOut,
+            "the reader must wait instead of quarantining the marker/legacy publication window"
+        )
+        pause.resume()
+        #expect(group.wait(timeout: .now() + 3) == .success)
+        #expect(errors.recorded.isEmpty)
+        guard case .valid(let state) = read.result else {
+            Issue.record("reader did not return the completed migration: \(String(describing: read.result))")
+            return
+        }
+        #expect(state.sets[setId]?.checkSliceCursor == 5)
+        let quarantines = try FileManager.default.contentsOfDirectory(atPath: liveStore.paths.stateDir.path)
+            .filter { $0.hasPrefix("schedule-state.corrupt-") }
+        #expect(quarantines.isEmpty)
+    }
+
     @Test("a migrated schedule state cannot be downgraded by stripping its envelope")
     func strippedVersionedEnvelopeFailsClosed() throws {
         let (store, root) = makeStore()
@@ -373,6 +513,119 @@ struct StateStoreTests {
             return
         }
         #expect(failure.reason == .versionMarkerMissing)
+        #expect(failure.recoveryMessage.contains("repair the owner-only marker"))
+        #expect(failure.recoveryMessage.contains("mode 0600"))
+        #expect(failure.recoveryMessage.contains("Replacing only the canonical JSON cannot repair"))
+    }
+
+    @Test("failed recovery-copy writes can be suppressed for the same canonical bytes")
+    func failedRecoveryCopyDoesNotFeedItself() throws {
+        let (liveStore, root) = makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try liveStore.paths.ensureDirectories()
+        try Data("corrupt schedule {{{".utf8).write(to: liveStore.paths.scheduleStateFile)
+        let counter = RecoveryWriteCounter()
+        let store = StateStore(paths: liveStore.paths, fileOperations: counter.operations())
+
+        guard case .corrupt(let first) = store.readScheduleStateResult() else {
+            Issue.record("first corrupt read was not classified")
+            return
+        }
+        #expect(first.quarantineWriteFailed)
+        let fingerprint = try #require(first.contentFingerprint)
+        #expect(counter.writes == 1)
+
+        guard case .corrupt(let second) = store.readScheduleStateResult(
+            suppressingRecoveryCopyFor: fingerprint
+        ) else {
+            Issue.record("suppressed corrupt read was not classified")
+            return
+        }
+        #expect(second.contentFingerprint == fingerprint)
+        #expect(second.quarantineWriteFailed)
+        #expect(counter.writes == 1, "a self-generated reload must not attempt another recovery write")
+    }
+
+    @Test("a recovery copy renamed before an indeterminate directory sync is recognized on reread")
+    func indeterminateRecoveryCopyIsRecognizedWithoutRewrite() throws {
+        let (liveStore, root) = makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try liveStore.paths.ensureDirectories()
+        let corrupt = Data("corrupt schedule after rename {{{".utf8)
+        try corrupt.write(to: liveStore.paths.scheduleStateFile)
+        let injector = ScheduleStateFaultInjector(.secondSync)
+        let store = StateStore(paths: liveStore.paths, fileOperations: injector.operations())
+
+        guard case .corrupt(let first) = store.readScheduleStateResult() else {
+            Issue.record("first corrupt read was not classified")
+            return
+        }
+        #expect(first.quarantineWriteFailed)
+        let fingerprint = try #require(first.contentFingerprint)
+
+        guard case .corrupt(let second) = store.readScheduleStateResult(
+            suppressingRecoveryCopyFor: fingerprint
+        ) else {
+            Issue.record("second corrupt read was not classified")
+            return
+        }
+        #expect(second.quarantineWriteFailed == false)
+        #expect(try Data(contentsOf: URL(fileURLWithPath: #require(second.quarantinePath))) == corrupt)
+    }
+
+    @Test("durable schedule-state temps are pinned and verified as owner-only")
+    func durableTempsIgnoreRestrictiveCreationModes() throws {
+        let (liveStore, root) = makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let live = StateStoreFileOperations.live
+        let maskedCreation = StateStoreFileOperations(
+            openAt: { directory, name, flags, mode in
+                live.openAt(directory, name, flags, flags & O_CREAT == 0 ? mode : 0)
+            },
+            read: live.read,
+            write: live.write,
+            sync: live.sync,
+            stat: live.stat,
+            setMode: live.setMode,
+            renameAt: live.renameAt,
+            unlinkAt: live.unlinkAt,
+            close: live.close
+        )
+        let store = StateStore(paths: liveStore.paths, fileOperations: maskedCreation)
+        try store.updateScheduleState(setId: UUID()) { $0.checkSliceCursor = 1 }
+
+        for path in [store.paths.scheduleStateVersionMarkerFile.path, store.paths.scheduleStateFile.path] {
+            var info = stat()
+            #expect(path.withCString { lstat($0, &info) } == 0)
+            #expect(info.st_mode & 0o7777 == 0o600)
+        }
+
+        let unverifiable = StateStoreFileOperations(
+            openAt: { directory, name, flags, mode in
+                live.openAt(directory, name, flags, flags & O_CREAT == 0 ? mode : 0)
+            },
+            read: live.read,
+            write: live.write,
+            sync: live.sync,
+            stat: live.stat,
+            setMode: { _, _ in 0 },
+            renameAt: live.renameAt,
+            unlinkAt: live.unlinkAt,
+            close: live.close
+        )
+        let otherRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-mode-verify-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: otherRoot) }
+        let unverifiableStore = StateStore(
+            paths: AppPaths(root: otherRoot),
+            fileOperations: unverifiable
+        )
+        #expect(throws: StateStoreError.self) {
+            try unverifiableStore.updateScheduleState(setId: UUID()) { $0.checkSliceCursor = 1 }
+        }
+        #expect(!FileManager.default.fileExists(
+            atPath: unverifiableStore.paths.scheduleStateVersionMarkerFile.path
+        ))
     }
 
     @Test("a checksum mismatch is quarantined and cannot be overwritten")

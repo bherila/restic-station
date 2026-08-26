@@ -125,6 +125,12 @@ public final class StateWatcher: ObservableObject {
     /// asynchronous refresh begins. Detached filesystem reads can finish out
     /// of order; only the newest requested observation may publish UI state.
     private var auditRefreshGeneration: UInt64 = 0
+    /// Exact canonical bytes whose recovery-copy publication already failed
+    /// in this watcher process. Passing the fingerprint back to StateStore
+    /// prevents temp create/remove events from retriggering the same failed
+    /// write forever; any canonical byte change produces a new fingerprint
+    /// and automatically retries preservation.
+    private var failedScheduleStateRecoveryFingerprint: String?
 
     private enum WatchTarget {
         case rootGrandparent
@@ -327,16 +333,23 @@ public final class StateWatcher: ObservableObject {
             refreshConfigFileSource()
             refreshLockFileSources()
         }
-        switch stateStore.readScheduleStateResult() {
+        switch stateStore.readScheduleStateResult(
+            suppressingRecoveryCopyFor: failedScheduleStateRecoveryFingerprint
+        ) {
         case .missing:
             scheduleState = nil
             scheduleStateFailure = nil
+            failedScheduleStateRecoveryFingerprint = nil
         case .valid(let state):
             scheduleState = state
             scheduleStateFailure = nil
+            failedScheduleStateRecoveryFingerprint = nil
         case .corrupt(let failure):
             scheduleState = nil
             scheduleStateFailure = failure
+            failedScheduleStateRecoveryFingerprint = failure.quarantineWriteFailed
+                ? failure.contentFingerprint
+                : nil
         }
         fdaCheck = stateStore.readFdaCheck()
 

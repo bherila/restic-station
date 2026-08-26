@@ -122,6 +122,7 @@ struct StateWatcherTests {
         #expect(watcher.scheduleState == nil)
         let failure = try #require(watcher.scheduleStateFailure)
         #expect(failure.reason == .malformedDocument)
+        #expect(failure.contentFingerprint != nil)
         #expect(try Data(contentsOf: URL(fileURLWithPath: #require(failure.quarantinePath))) == corrupt)
 
         // The same published failure must drive the process-wide app glyph
