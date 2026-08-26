@@ -227,6 +227,85 @@ private func setRunStoreTestErrno(_ value: Int32) {
         #expect(try store.unresolvedAuditFailures().isEmpty)
     }
 
+    @Test("a failed initial-publication rollback reports an indeterminate directory sync")
+    func failedInitialPublicationSurfacesCleanupSyncFailure() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+        let live = RunStoreFileOperations.live
+        let failCleanupSync = Box(false)
+        let cleanupSyncCalls = Box(0)
+        let operations = RunStoreFileOperations(
+            openAt: live.openAt,
+            write: live.write,
+            sync: { fd in
+                guard failCleanupSync.value else { return live.sync(fd) }
+                cleanupSyncCalls.value += 1
+                setRunStoreTestErrno(EIO)
+                return -1
+            },
+            renameAt: live.renameAt,
+            unlinkAt: live.unlinkAt
+        )
+        let start = Date(timeIntervalSince1970: 1_700_000_100)
+        let setId = UUID()
+        let runId = RunStore.formatRunId(kind: .prune, setId: setId, date: start)
+        let store = RunStore(
+            paths: paths,
+            now: { start },
+            initialPublicationHook: { directory in
+                failCleanupSync.value = true
+                throw RunStoreError.discardUnsafe(path: directory.path)
+            },
+            fileOperations: operations
+        )
+
+        var capturedError: RunStoreError?
+        do {
+            _ = try store.begin(kind: .prune, setId: setId, destId: UUID(), trigger: .manual)
+        } catch let error as RunStoreError {
+            capturedError = error
+        }
+        switch capturedError {
+        case .initialPublicationCleanupFailed(_, _, let cleanupError):
+            #expect(cleanupError.contains("fsync directory failed"))
+        default:
+            Issue.record("expected initialPublicationCleanupFailed, got \(String(describing: capturedError))")
+        }
+        #expect(cleanupSyncCalls.value > 0)
+        #expect(!FileManager.default.fileExists(atPath: paths.runDir(runId: runId).path))
+    }
+
+    @Test("discarding an unstarted run durably removes its directory")
+    func discardUnstartedSyncsRunsDirectory() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+        let live = RunStoreFileOperations.live
+        let syncCalls = Box(0)
+        let operations = RunStoreFileOperations(
+            openAt: live.openAt,
+            write: live.write,
+            sync: { fd in
+                syncCalls.value += 1
+                return live.sync(fd)
+            },
+            renameAt: live.renameAt,
+            unlinkAt: live.unlinkAt
+        )
+        let store = RunStore(
+            paths: paths,
+            now: { Date() },
+            initialPublicationHook: { _ in },
+            fileOperations: operations
+        )
+        let run = try store.begin(kind: .prune, setId: UUID(), destId: UUID(), trigger: .manual)
+        let callsBeforeDiscard = syncCalls.value
+
+        try store.discardUnstarted(run)
+
+        #expect(syncCalls.value > callsBeforeDiscard)
+        #expect(!FileManager.default.fileExists(atPath: paths.runDir(runId: run.runId).path))
+    }
+
     // MARK: - Crash recovery
 
     @Test func recoverInterruptedRewritesDeadPidRunsAsFailed() throws {
@@ -577,6 +656,27 @@ private func setRunStoreTestErrno(_ value: Int32) {
         #expect(try Data(contentsOf: paths.runsIndexFile).last == 0x0A)
     }
 
+    @Test("recovery preserves valid index entries before a torn UTF-8 tail")
+    func recoveryPreservesIndexPrefixBeforeTornUTF8() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+        let store = RunStore(paths: paths, now: { Date() })
+        let run = try store.begin(kind: .prune, setId: UUID(), destId: UUID(), trigger: .manual)
+        try store.markDestructiveLaunchAuthorized(run)
+        try store.finish(run, status: .success, resticExitCode: 0)
+
+        var indexBytes = try Data(contentsOf: paths.runsIndexFile)
+        indexBytes.append(contentsOf: [0x7B, 0x22, 0x78, 0x22, 0x3A, 0xF0, 0x9F])
+        try indexBytes.write(to: paths.runsIndexFile)
+
+        #expect(try store.recoverInterrupted().isEmpty)
+        #expect(try store.recentRuns(limit: 10).map(\.runId) == [run.runId])
+        #expect(try store.unresolvedAuditFailures().isEmpty)
+        let repairedLines = try String(contentsOf: paths.runsIndexFile, encoding: .utf8)
+            .split(separator: "\n")
+        #expect(repairedLines.count == 1)
+    }
+
     @Test("legacy recovery commits a pending marker before attempting its missing index append")
     func legacyRecoveryMarksPendingBeforeAppend() throws {
         let paths = makePaths()
@@ -618,6 +718,49 @@ private func setRunStoreTestErrno(_ value: Int32) {
             try recoveringStore.recoverInterrupted()
         }
         #expect(try recoveringStore.metadata(runId: run.runId).indexPublicationPending == true)
+    }
+
+    @Test("recovery fsyncs an exact legacy projection before accepting it")
+    func legacyMatchingProjectionIsConfirmedDurable() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+        let liveStore = RunStore(paths: paths, now: { Date() })
+        let run = try liveStore.begin(kind: .prune, setId: UUID(), destId: UUID(), trigger: .manual)
+        try liveStore.markDestructiveLaunchAuthorized(run)
+        try liveStore.finish(run, status: .success, resticExitCode: 0)
+        #expect(try liveStore.metadata(runId: run.runId).indexPublicationPending == nil)
+
+        let live = RunStoreFileOperations.live
+        let indexFD = Box<Int32?>(nil)
+        let indexSyncCalls = Box(0)
+        let operations = RunStoreFileOperations(
+            openAt: { directory, name, flags, mode in
+                let fd = live.openAt(directory, name, flags, mode)
+                if name == paths.runsIndexFile.lastPathComponent {
+                    indexFD.value = fd
+                }
+                return fd
+            },
+            write: live.write,
+            sync: { fd in
+                if fd == indexFD.value {
+                    indexSyncCalls.value += 1
+                }
+                return live.sync(fd)
+            },
+            renameAt: live.renameAt,
+            unlinkAt: live.unlinkAt
+        )
+        let recoveringStore = RunStore(
+            paths: paths,
+            now: { Date() },
+            initialPublicationHook: { _ in },
+            fileOperations: operations
+        )
+
+        #expect(try recoveringStore.recoverInterrupted().isEmpty)
+        #expect(indexSyncCalls.value > 0)
+        #expect(try recoveringStore.unresolvedAuditFailures().isEmpty)
     }
 
     @Test("repairing an older projection cannot replace the latest run")

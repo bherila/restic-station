@@ -328,6 +328,10 @@ public struct RunStore: Sendable {
             let publicationError = String(describing: error)
             do {
                 try FileManager.default.removeItem(at: runDirectory)
+                // The removal is part of rolling back publication. Persist it
+                // before reporting the failed begin as safely unpublished;
+                // otherwise a crash can resurrect the canonical directory.
+                try syncDirectory(paths.runsDir)
             } catch let cleanupError {
                 throw RunStoreError.initialPublicationCleanupFailed(
                     path: runDirectory.path,
@@ -450,6 +454,7 @@ public struct RunStore: Sendable {
             throw RunStoreError.discardUnsafe(path: metadataURL.path)
         }
         try FileManager.default.removeItem(at: directory)
+        try syncDirectory(paths.runsDir)
     }
 
     // MARK: - Crash recovery
@@ -486,7 +491,13 @@ public struct RunStore: Sendable {
 
         let decoder = ConfigStore.makeDecoder()
         var recovered: [RecoveredRun] = []
-        var indexedByRunId = Dictionary(grouping: try readIndexEntries(), by: \.runId)
+        // Repair a torn final record before taking the recovery snapshot. In
+        // particular, a split UTF-8 scalar must not make the valid prefix look
+        // empty and cause duplicate projections to be appended below.
+        var indexedByRunId = Dictionary(
+            grouping: try readIndexEntriesRepairingTail(),
+            by: \.runId
+        )
 
         for dir in runDirs {
             var isDirectory: ObjCBool = false
@@ -520,18 +531,14 @@ public struct RunStore: Sendable {
                     indexedByRunId[metadata.runId] = [projection]
                     projectionIsDurable = true
                 } else if projections == [metadata.indexEntry] {
-                    // A pending marker can survive an `fsync` error while the
-                    // complete line remains visible in this boot. Confirm it
-                    // again before clearing the canonical marker.
-                    if metadata.indexPublicationPending == true {
-                        try syncExistingIndex()
-                    }
+                    // The recovery snapshot was fsynced before it was decoded,
+                    // so this exact projection is now durably confirmed even
+                    // for legacy metadata that predates the pending marker.
                     projectionIsDurable = true
                 } else if !metadata.kind.isDestructive {
                     if projections.last == metadata.indexEntry {
-                        if metadata.indexPublicationPending == true {
-                            try syncExistingIndex()
-                        }
+                        // The initial recovery snapshot confirmed this final
+                        // physical projection durably as well.
                         projectionIsDurable = true
                     } else {
                         var pending = metadata
@@ -577,11 +584,11 @@ public struct RunStore: Sendable {
                 indexedByRunId[updated.runId] = [projection]
                 projectionIsDurable = true
             } else if projections == [updated.indexEntry] {
-                try syncExistingIndex()
+                // The recovery snapshot was fsynced before decoding.
                 projectionIsDurable = true
             } else if !updated.kind.isDestructive {
                 if projections.last == updated.indexEntry {
-                    try syncExistingIndex()
+                    // The recovery snapshot was fsynced before decoding.
                 } else {
                     let projection = updated.indexEntry
                     try appendIndexEntry(projection)
@@ -893,6 +900,43 @@ public struct RunStore: Sendable {
         return decodeIndexEntries(data)
     }
 
+    /// Recovery is allowed to repair only an incomplete physical tail. It
+    /// does so under the index lock and durably commits that repair before
+    /// deciding which canonical records still need a projection.
+    private func readIndexEntriesRepairingTail() throws -> [RunIndexEntry] {
+        try paths.ensureDirectories()
+        let lock = try acquireIndexLock()
+        defer { lock.release() }
+
+        let indexPath = paths.runsIndexFile.path
+        guard FileManager.default.fileExists(atPath: indexPath) else { return [] }
+
+        let runsDirectoryFD = try openDirectory(paths.runsDir)
+        defer { closeFileDescriptor(runsDirectoryFD) }
+        let fd = fileOperations.openAt(
+            runsDirectoryFD,
+            paths.runsIndexFile.lastPathComponent,
+            O_RDWR | O_CLOEXEC | O_NOFOLLOW,
+            0
+        )
+        guard fd >= 0 else {
+            throw RunStoreError.indexAppendFailed(errno: errno, path: indexPath)
+        }
+        defer { closeFileDescriptor(fd) }
+
+        _ = try repairIncompleteIndexTail(fd: fd, path: indexPath)
+        // One recovery-wide durability confirmation covers both a repaired
+        // tail and matching legacy projections that have no pending marker.
+        try syncFileDescriptor(fd, operation: "fsync recovery index", path: indexPath, indexWrite: true)
+        try syncFileDescriptor(
+            runsDirectoryFD,
+            operation: "fsync index directory",
+            path: indexPath,
+            indexWrite: true
+        )
+        return decodeIndexEntries(try Data(contentsOf: paths.runsIndexFile))
+    }
+
     /// Returns one logical projection per run, ordered by canonical start
     /// time. A corrective recovery projection is physically appended after
     /// the stale line it supersedes; taking the last projection per run keeps
@@ -1119,34 +1163,6 @@ public struct RunStore: Sendable {
         )
     }
 
-    private func syncExistingIndex() throws {
-        try paths.ensureDirectories()
-        let lock = try acquireIndexLock()
-        defer { lock.release() }
-
-        let indexPath = paths.runsIndexFile.path
-        let runsDirectoryFD = try openDirectory(paths.runsDir)
-        defer { closeFileDescriptor(runsDirectoryFD) }
-        let fd = fileOperations.openAt(
-            runsDirectoryFD,
-            paths.runsIndexFile.lastPathComponent,
-            O_WRONLY | O_CLOEXEC | O_NOFOLLOW,
-            0
-        )
-        guard fd >= 0 else {
-            let code = errno
-            throw RunStoreError.indexAppendFailed(errno: code, path: indexPath)
-        }
-        defer { closeFileDescriptor(fd) }
-        try syncFileDescriptor(fd, operation: "fsync index", path: indexPath, indexWrite: true)
-        try syncFileDescriptor(
-            runsDirectoryFD,
-            operation: "fsync index directory",
-            path: indexPath,
-            indexWrite: true
-        )
-    }
-
     private func acquireIndexLock() throws -> FileLock {
         let lock = FileLock(path: indexLockFile, trustedRoot: paths.root)
         let deadline = now().addingTimeInterval(Self.indexLockTimeout)
@@ -1204,7 +1220,8 @@ public struct RunStore: Sendable {
     /// directly after it would concatenate the repair line onto corrupt JSON.
     /// Preserve a complete newline-less final record by terminating it;
     /// otherwise truncate only the invalid tail back to the last newline.
-    private func repairIncompleteIndexTail(fd: Int32, path: String) throws {
+    @discardableResult
+    private func repairIncompleteIndexTail(fd: Int32, path: String) throws -> Bool {
         var info = stat()
         #if canImport(Darwin)
         let statResult = Darwin.fstat(fd, &info)
@@ -1217,9 +1234,9 @@ public struct RunStore: Sendable {
             throw RunStoreError.indexAppendFailed(errno: errno, path: path)
         }
         let fileSize = Int(info.st_size)
-        guard fileSize > 0 else { return }
+        guard fileSize > 0 else { return false }
         let finalByte = try readIndexBytes(fd: fd, offset: fileSize - 1, count: 1, path: path)
-        guard finalByte.first != 0x0A else { return }
+        guard finalByte.first != 0x0A else { return false }
 
         // The common case above reads one byte. Only an actually incomplete
         // tail scans backward, in bounded chunks, until its preceding newline.
@@ -1245,7 +1262,7 @@ public struct RunStore: Sendable {
         }
         if (try? ConfigStore.makeDecoder().decode(RunIndexEntry.self, from: suffix)) != nil {
             try writeAll(Data([0x0A]), to: fd, path: path, indexWrite: true)
-            return
+            return true
         }
 
         #if canImport(Darwin)
@@ -1258,6 +1275,7 @@ public struct RunStore: Sendable {
         if result != 0 {
             throw RunStoreError.indexAppendFailed(errno: errno, path: path)
         }
+        return true
     }
 
     private func syncDirectory(_ directory: URL) throws {
