@@ -435,6 +435,15 @@ public struct ConfigStore: Sendable {
     /// read: backups remain readable, but no schema side effect can run
     /// without the administrative lock.
     private func withConfigReadLock<T>(_ body: (Bool) throws -> T) throws -> T {
+        // A pre-lock release legitimately has no locks/ directory yet. Give
+        // the normal upgrade path a chance to establish it before deciding
+        // that migration is unavailable. A real setup failure still falls
+        // back to a strictly read-only load below.
+        do {
+            try paths.ensureDirectories()
+        } catch {
+            return try body(false)
+        }
         let lock = FileLock(path: paths.configLockFile, trustedRoot: paths.root)
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: .seconds(60))

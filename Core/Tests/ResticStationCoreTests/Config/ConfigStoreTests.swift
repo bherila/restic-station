@@ -196,6 +196,23 @@ import Testing
         #expect(!FileManager.default.fileExists(atPath: store.paths.configV1BackupFile.path))
     }
 
+    @Test("a legacy config creates missing lock infrastructure before migrating")
+    func legacyReadCreatesLockDirectoryBeforeMigration() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-config-upgrade-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let store = ConfigStore(paths: AppPaths(root: root))
+        let legacy = AppConfig(version: 1, resticPath: "/usr/local/bin/restic")
+        try ConfigStore.makeEncoder().encode(legacy).write(to: store.paths.configFile)
+
+        let loaded = try store.load()
+
+        #expect(loaded.version == AppConfig.currentVersion)
+        #expect(FileManager.default.fileExists(atPath: store.paths.locksDir.path))
+        #expect(FileManager.default.fileExists(atPath: store.paths.configV1BackupFile.path))
+    }
+
     @Test func saveCreatesDirectoriesIfMissing() throws {
         let (store, root) = makeStore()
         defer { try? FileManager.default.removeItem(at: root) }
