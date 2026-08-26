@@ -265,6 +265,11 @@ struct SetEditorView: View {
     /// `ConfigStore.save`. The name check is the editor's own: an unnamed set
     /// is valid config but useless in every list that shows it.
     private func save() async {
+        guard !secretRollbackInProgress else {
+            fieldErrors[.general] = "The previous credentials are still being restored. "
+                + "Wait for restoration to finish before saving."
+            return
+        }
         fieldErrors = [:]
         let trimmedName = draft.name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedName.isEmpty else {

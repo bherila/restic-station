@@ -440,7 +440,7 @@ struct AppModelMachineOverrideTests {
         }
         #expect(try store.load() == fleetReplacement)
 
-        model.reloadConfigFromDisk()
+        await model.reloadConfigFromDisk()
         #expect(model.config == fleetReplacement)
         #expect(!model.configChangedOnDisk)
 
@@ -453,7 +453,7 @@ struct AppModelMachineOverrideTests {
     }
 
     @Test("a migrating reload resolves with the newly persisted restic path")
-    func migratingReloadRefreshesMachineState() throws {
+    func migratingReloadRefreshesMachineState() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("restic-station-migrating-reload-app-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -469,13 +469,43 @@ struct AppModelMachineOverrideTests {
         let legacyBytes = try ConfigStore.makeEncoder().encode(legacy)
         try legacyBytes.write(to: paths.configFile, options: .atomic)
 
-        model.reloadConfigFromDisk()
+        await model.reloadConfigFromDisk()
 
         #expect(model.config.version == AppConfig.currentVersion)
         #expect(model.config.resticPath == nil)
         #expect(model.machine.resticPath == migratedPath)
         #expect(model.resticPath == migratedPath)
         #expect(model.configLoadError == nil)
+    }
+
+    @Test("a contended config reload yields the main actor while waiting for the writer")
+    func contendedReloadDoesNotFreezeMainActor() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-contended-reload-app-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let paths = AppPaths(root: root)
+        try ConfigStore(paths: paths).save(AppConfig(showMenuBarIcon: false))
+        let model = AppModel(paths: paths)
+        let heldLock = FileLock(path: paths.configLockFile, trustedRoot: root)
+        #expect(heldLock.acquire() == .acquired)
+        defer { heldLock.release() }
+
+        var reloadFinished = false
+        let reload = Task { @MainActor in
+            await model.reloadConfigFromDisk()
+            reloadFinished = true
+        }
+        try await Task.sleep(for: .milliseconds(75))
+
+        #expect(!reloadFinished)
+        model.noteConfigChangedOnDisk()
+        #expect(model.configChangedOnDisk)
+
+        heldLock.release()
+        await reload.value
+        #expect(reloadFinished)
+        #expect(!model.configChangedOnDisk)
     }
 
     @Test("a failed reload keeps its reload affordance after the old bytes return")
@@ -495,7 +525,7 @@ struct AppModelMachineOverrideTests {
         defer { model.stateWatcher.stop() }
 
         try Data("not json".utf8).write(to: paths.configFile, options: .atomic)
-        model.reloadConfigFromDisk()
+        await model.reloadConfigFromDisk()
         #expect(model.configLoadError != nil)
         #expect(model.configChangedOnDisk)
 
@@ -507,7 +537,7 @@ struct AppModelMachineOverrideTests {
         }
         #expect(model.configChangedOnDisk)
 
-        model.reloadConfigFromDisk()
+        await model.reloadConfigFromDisk()
         #expect(model.configLoadError == nil)
         #expect(!model.configChangedOnDisk)
         #expect(model.config == original)

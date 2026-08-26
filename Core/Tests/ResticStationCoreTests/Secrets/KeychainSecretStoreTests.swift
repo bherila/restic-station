@@ -342,6 +342,37 @@ struct KeychainSecretStoreTests {
         #expect(runner.invocations[4].argv[8] == malformedRaw)
     }
 
+    @Test("rolling back a cleared environment recreates it with the trusted ACL")
+    func clearedEnvironmentRollbackUsesTrustedCreationPath() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-keychain-cleared-env-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let previousRaw = try SecretEnvBlob.encode(["TOKEN": "original"])
+        let runner = FakeProcessRunner(script: [
+            .init(
+                argvPrefix: ["/usr/bin/security", "find-generic-password"],
+                stdoutLines: [previousRaw]
+            ),
+            .init(argvPrefix: ["/usr/bin/security", "delete-generic-password"], exitCode: 0),
+            .init(argvPrefix: ["/usr/bin/security", "find-generic-password"], exitCode: 44),
+            .init(argvPrefix: ["/usr/bin/security", "delete-generic-password"], exitCode: 44),
+            .init(argvPrefix: ["/usr/bin/security", "add-generic-password"], exitCode: 0),
+        ])
+        let client = KeychainSecretStore(runner: runner, paths: AppPaths(root: root))
+        let rollback = try await client.updateDestinationSecrets(
+            DestinationSecretUpdate(destId: Self.destId, password: nil, secretEnv: [:])
+        )
+
+        let result = try await client.restoreDestinationSecretsIfCurrent(rollback)
+
+        #expect(result.secretEnvRestored == true)
+        let creationArgv = runner.invocations[4].argv
+        #expect(creationArgv.contains("-T"))
+        #expect(creationArgv.contains("/usr/bin/security"))
+        #expect(!creationArgv.contains("-U"))
+        #expect(creationArgv[7] == previousRaw)
+    }
+
     @Test("production keychain mutations wait for the shared secrets lock")
     func keychainMutationUsesSharedLock() async throws {
         let root = FileManager.default.temporaryDirectory

@@ -59,6 +59,12 @@ public struct ConfigStore: Sendable {
         }
     }
 
+    /// Main-actor clients use this form so lock contention waits on a worker
+    /// rather than freezing the UI for the read lock's bounded retry period.
+    public func snapshotAsync() async throws -> ConfigSnapshot {
+        try await Task.detached { try snapshot() }.value
+    }
+
     private func snapshotLocked(migrationAllowed: Bool) throws -> ConfigSnapshot {
         guard let bytes = try readConfigBytes() else {
             return ConfigSnapshot(bytes: Data(), fingerprint: "absent", config: AppConfig())

@@ -202,7 +202,14 @@ public struct KeychainSecretStore: SecretStore {
             }
             if secretEnvRestored == true, let change = rollback.secretEnv {
                 if let previousRaw = rollback.previousSecretEnvRaw {
-                    try await updateExistingValue(previousRaw, account: envAccount)
+                    if change.installed.isEmpty {
+                        // Clearing removed the item, so this is creation and
+                        // must re-establish the trusted `/usr/bin/security`
+                        // ACL rather than using update-only `-U`.
+                        try await setValue(previousRaw, account: envAccount)
+                    } else {
+                        try await updateExistingValue(previousRaw, account: envAccount)
+                    }
                 } else if change.previous.isEmpty {
                     try await deleteValueTolerant(account: envAccount)
                 } else {

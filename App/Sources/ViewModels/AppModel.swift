@@ -383,9 +383,9 @@ final class AppModel: ObservableObject {
     /// surfaced a replacement. A failed reload retains the last understood
     /// config and blocks every save, so corrupt fleet-sync output cannot be
     /// overwritten by an open window.
-    func reloadConfigFromDisk() {
+    func reloadConfigFromDisk() async {
         do {
-            let snapshot = try configStore.snapshot()
+            let snapshot = try await configStore.snapshotAsync()
             let previous = config
             let previousResticPath = resticPath
 

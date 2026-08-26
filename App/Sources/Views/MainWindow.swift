@@ -110,7 +110,7 @@ struct ConfigChangeBanner: View {
                 .fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 12)
             Button("Reload Settings") {
-                model.reloadConfigFromDisk()
+                Task { await model.reloadConfigFromDisk() }
             }
         }
         .padding(.horizontal, 14)
