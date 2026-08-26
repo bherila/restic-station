@@ -319,7 +319,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Install tools
-        run: brew install xcodegen restic jq
+        run: brew install xcodegen restic jq shellcheck
+      - name: ShellCheck and Bash 3.2 syntax
+        run: scripts/shell-lint.sh
       - name: Generate Xcode project
         run: xcodegen generate
       - name: Build and run app unit tests

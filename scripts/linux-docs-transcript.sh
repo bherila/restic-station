@@ -26,6 +26,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 WORK="$(mktemp -d)"
+# shellcheck disable=SC2329 # invoked indirectly by trap
 cleanup() { rm -rf "$WORK"; }
 trap cleanup EXIT
 
@@ -46,8 +47,6 @@ export RESTIC_STATION_SECRET_BACKEND=file
 # override safe for tests and for giving a host a second identity. It is
 # never written to machine.json.
 export RESTIC_STATION_MACHINE_ID=linux-nas
-
-FAILURES=0
 
 # Echoes the command, runs it, and always returns 0 so one failing/expected-
 # to-fail command doesn't stop the transcript short — the docs need to show

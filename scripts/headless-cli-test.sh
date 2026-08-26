@@ -131,6 +131,7 @@ capture_clean_status_rc() {
     fi
 }
 
+# shellcheck disable=SC2016 # literal $, deliberately awkward, never expanded
 SECRET_PASSWORD='h34dl3ss "cli" $ecret with spaces '
 
 # ─────────────────────────────────────────────────────────────────────────
