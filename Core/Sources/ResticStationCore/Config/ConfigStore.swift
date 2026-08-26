@@ -572,18 +572,21 @@ enum AtomicFile {
 
         // Normally the source now holds our candidate. If a non-cooperating
         // writer replaced the destination during the tiny rollback window,
-        // the source instead holds that newer external revision. Put it back
-        // rather than discarding it; the stale app edit still loses.
-        if let rolledOut = try? Data(contentsOf: source),
-           SHA256Digest.hex(rolledOut) != candidateFingerprint {
-            let restoreExternal = renameX(
-                from: source, to: destination, flags: UInt32(RENAME_SWAP)
-            )
-            guard restoreExternal == 0 else {
-                throw ConfigStoreError.renameFailed(
-                    errno: errno, from: source.path, to: destination.path
-                )
-            }
+        // the source instead holds that external revision. Never swap it
+        // back over `destination`: a still-newer writer could land between
+        // our fingerprint read and that second swap. Preserve the displaced
+        // bytes under a unique sibling name and surface the recovery path;
+        // whatever currently names config.json remains untouched.
+        let rolledOut: Data
+        do {
+            rolledOut = try Data(contentsOf: source)
+        } catch {
+            let recovery = try preserveRollbackArtifact(from: source, beside: destination)
+            throw ConfigStoreError.rollbackArtifactPreserved(path: recovery.path)
+        }
+        if SHA256Digest.hex(rolledOut) != candidateFingerprint {
+            let recovery = try preserveRollbackArtifact(from: source, beside: destination)
+            throw ConfigStoreError.rollbackArtifactPreserved(path: recovery.path)
         }
         try? FileManager.default.removeItem(at: source)
         return false
@@ -610,6 +613,28 @@ enum AtomicFile {
             }
         }
     }
+
+    /// Moves an artifact out of the fixed `.tmp` path without replacing
+    /// anything. The caller has already discovered that it cannot safely
+    /// discard these bytes; a unique sibling survives this failed save and
+    /// cannot be overwritten by the next ordinary attempt.
+    private static func preserveRollbackArtifact(
+        from source: URL,
+        beside destination: URL
+    ) throws -> URL {
+        let recovery = destination.deletingLastPathComponent().appendingPathComponent(
+            destination.lastPathComponent + ".rollback-" + UUID().uuidString + ".json",
+            isDirectory: false
+        )
+        let preserve = renameX(from: source, to: recovery, flags: UInt32(RENAME_EXCL))
+        guard preserve == 0 else {
+            let preserveErrno = errno
+            throw ConfigStoreError.renameFailed(
+                errno: preserveErrno, from: source.path, to: recovery.path
+            )
+        }
+        return recovery
+    }
     #endif
 }
 
@@ -617,6 +642,7 @@ enum AtomicFile {
 public enum ConfigStoreError: Error, Equatable, Sendable, CustomStringConvertible {
     case renameFailed(errno: Int32, from: String, to: String)
     case replacementRollbackFailed(errno: Int32, candidateMayBeInstalledAt: String)
+    case rollbackArtifactPreserved(path: String)
     case changedOnDisk
     case writeLockBusy(path: String)
     case writeLockUnusable(LockFailure)
@@ -628,12 +654,27 @@ public enum ConfigStoreError: Error, Equatable, Sendable, CustomStringConvertibl
         case .replacementRollbackFailed(let errno, let path):
             return "could not roll back a refused config replacement (errno \(errno)); "
                 + "the uncommitted candidate may be installed at \(path)"
+        case .rollbackArtifactPreserved(let path):
+            return "config.json changed repeatedly during save; an uncertain rollback artifact "
+                + "was preserved at \(path); reload settings and reconcile that file before saving"
         case .changedOnDisk:
             return "config.json changed on disk; reload the latest settings before saving"
         case .writeLockBusy(let path):
             return "another process is changing config.json (lock busy: \(path)); reload and try again"
         case .writeLockUnusable(let failure):
             return "cannot safely lock config.json for writing: \(failure)"
+        }
+    }
+
+    /// Both cases mean the caller's edit revision lost to an external
+    /// writer and should expose the same reload affordance. The preservation
+    /// case carries extra recovery information but is still a CAS refusal.
+    public var isRevisionConflict: Bool {
+        switch self {
+        case .changedOnDisk, .rollbackArtifactPreserved:
+            return true
+        default:
+            return false
         }
     }
 }

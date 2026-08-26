@@ -452,6 +452,32 @@ struct AppModelMachineOverrideTests {
         #expect(try store.load() == fleetReplacement)
     }
 
+    @Test("a migrating reload resolves with the newly persisted restic path")
+    func migratingReloadRefreshesMachineState() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-migrating-reload-app-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let paths = AppPaths(root: root)
+        let store = ConfigStore(paths: paths)
+        try store.save(AppConfig())
+        let model = AppModel(paths: paths)
+        #expect(model.resticPath == nil)
+
+        let migratedPath = "/usr/local/bin/restic-from-v1"
+        let legacy = AppConfig(version: 1, resticPath: migratedPath)
+        let legacyBytes = try ConfigStore.makeEncoder().encode(legacy)
+        try legacyBytes.write(to: paths.configFile, options: .atomic)
+
+        model.reloadConfigFromDisk()
+
+        #expect(model.config.version == AppConfig.currentVersion)
+        #expect(model.config.resticPath == nil)
+        #expect(model.machine.resticPath == migratedPath)
+        #expect(model.resticPath == migratedPath)
+        #expect(model.configLoadError == nil)
+    }
+
     @Test("a failed reload keeps its reload affordance after the old bytes return")
     func failedConfigReloadCanRecoverWhenTheSameRevisionReturns() async throws {
         let root = FileManager.default.temporaryDirectory

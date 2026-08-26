@@ -243,7 +243,8 @@ struct SetEditorView: View {
         } catch {
             let mapped = SetsCopy.fieldMessage(for: error)
             var message = mapped.message
-            if case ConfigStoreError.changedOnDisk = error,
+            if let storeError = error as? ConfigStoreError,
+               storeError.isRevisionConflict,
                let rollbackError = await restorePendingSecrets() {
                 message += " " + rollbackError
             }

@@ -295,7 +295,8 @@ final class AppModel: ObservableObject {
                 ifUnchangedFrom: editFingerprint
             )
         } catch {
-            if case ConfigStoreError.changedOnDisk = error {
+            if let storeError = error as? ConfigStoreError,
+               storeError.isRevisionConflict {
                 configChangedOnDisk = true
             }
             lastConfigError = "\(error)"
@@ -332,13 +333,30 @@ final class AppModel: ObservableObject {
             let previous = config
             let previousResticPath = resticPath
 
+            // snapshot() may migrate a legacy top-level resticPath into
+            // machine.json. Resolve the migrated config against the machine
+            // bytes *after* that write, while retaining an in-memory machine
+            // and an explicit diagnostic if the refreshed file is invalid.
+            let refreshedMachine: MachineConfig
+            do {
+                refreshedMachine = try machineStore.load()
+                machineLoadError = nil
+            } catch {
+                refreshedMachine = machine
+                machineLoadError = Self.describe(
+                    machineLoadFailure: error,
+                    path: paths.machineFile.path
+                )
+            }
+
+            machine = refreshedMachine
             config = snapshot.config
             configFingerprint = snapshot.fingerprint
             configReloadRequired = false
             configChangedOnDisk = false
             configLoadError = machineLoadError
-            resolvedConfig = snapshot.config.resolved(for: machine).config
-            addressableConfig = snapshot.config.addressable(for: machine)
+            resolvedConfig = snapshot.config.resolved(for: refreshedMachine).config
+            addressableConfig = snapshot.config.addressable(for: refreshedMachine)
             stateWatcher.updateConfiguredSetIds(Set(resolvedConfig.sets.map(\.id)))
             lastConfigError = nil
             recomputeDerivedState()

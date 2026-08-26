@@ -652,7 +652,8 @@ struct DestinationEditorView: View {
             return nil
         }
 
-        var updated = self.set
+        let original = self.set
+        var updated = original
         if let index = updated.destinations.firstIndex(where: { $0.id == destination.id }) {
             updated.destinations[index] = destination
         } else {
@@ -667,7 +668,11 @@ struct DestinationEditorView: View {
 
         draft = destination
         set = updated
-        return DestinationCommit(updated: updated, secretsRollback: secretsRollback)
+        return DestinationCommit(
+            original: original,
+            updated: updated,
+            secretsRollback: secretsRollback
+        )
     }
 
     /// Persists the whole set so the helper can see this destination. Any
@@ -685,6 +690,11 @@ struct DestinationEditorView: View {
             pendingSecretRollbacks.removeAll()
             return true
         } catch {
+            // commitDraft already merged the destination into the parent
+            // binding. Since no config write committed it, put that binding
+            // back alongside the secrets so a later parent Save cannot pair
+            // the edited URL/environment with restored credentials.
+            set = committed.original
             do {
                 try await model.restoreDestinationSecrets(committed.secretsRollback)
             } catch let rollbackError {
@@ -736,6 +746,7 @@ struct DestinationEditorView: View {
     }
 
     private struct DestinationCommit {
+        let original: BackupSet
         let updated: BackupSet
         let secretsRollback: AppModel.DestinationSecretsRollback
     }

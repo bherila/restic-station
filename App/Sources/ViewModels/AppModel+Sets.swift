@@ -197,7 +197,8 @@ extension AppModel {
                     )
                 }
             }
-            if case ConfigStoreError.changedOnDisk = error {
+            if let storeError = error as? ConfigStoreError,
+               storeError.isRevisionConflict {
                 noteConfigChangedOnDisk()
             }
             throw error
