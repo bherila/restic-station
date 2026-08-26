@@ -158,22 +158,42 @@ import Testing
         #expect(try store.load() == installed)
     }
 
-    @Test("config readers never observe a writer's in-flight replacement")
-    func configReadUsesTheWriterLock() throws {
+    @Test("config readers wait for a writer and then read the installed revision")
+    func configReadWaitsForTheWriterLock() throws {
         let (store, root) = makeStore()
         defer { try? FileManager.default.removeItem(at: root) }
 
-        try store.save(sampleConfig())
+        let installed = sampleConfig()
+        try store.save(installed)
         let lock = FileLock(path: store.paths.configLockFile, trustedRoot: root)
         #expect(lock.acquire() == .acquired)
-        defer { lock.release() }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.1) {
+            lock.release()
+        }
 
-        #expect(throws: ConfigStoreError.writeLockBusy(path: store.paths.configLockFile.path)) {
-            _ = try store.load()
-        }
-        #expect(throws: ConfigStoreError.writeLockBusy(path: store.paths.configLockFile.path)) {
-            _ = try store.snapshot()
-        }
+        #expect(try store.load() == installed)
+        #expect(try store.snapshot().config == installed)
+    }
+
+    @Test("an unusable config lock permits no migration side effects")
+    func brokenReadLockDisablesMigration() throws {
+        let (store, root) = makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try store.paths.ensureDirectories()
+
+        let legacy = AppConfig(version: 1, resticPath: "/usr/local/bin/restic")
+        let original = try ConfigStore.makeEncoder().encode(legacy)
+        try original.write(to: store.paths.configFile)
+        try FileManager.default.removeItem(at: store.paths.locksDir)
+        try Data("not a directory".utf8).write(to: store.paths.locksDir)
+
+        #expect(try store.load() == legacy)
+        let snapshot = try store.snapshot()
+        #expect(snapshot.config == legacy)
+        #expect(snapshot.bytes == original)
+        #expect(try Data(contentsOf: store.paths.configFile) == original)
+        #expect(!FileManager.default.fileExists(atPath: store.paths.machineFile.path))
+        #expect(!FileManager.default.fileExists(atPath: store.paths.configV1BackupFile.path))
     }
 
     @Test func saveCreatesDirectoriesIfMissing() throws {

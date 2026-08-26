@@ -348,11 +348,13 @@ private func installMachine(at paths: AppPaths, resticPath: String? = nil) throw
 
         let loaded = try store.load()
 
-        // The in-memory result still reflects the version bump — migration
-        // is a pure function of the input regardless of whether its side
-        // effects landed...
-        #expect(loaded.version == 3)
-        // ...but nothing was persisted: no backup, and config.json unchanged.
+        // With no usable config lock, the store must not even produce an
+        // in-memory migrated value: another process could concurrently write
+        // config.json while migration performs its machine and backup side
+        // effects. The original version remains readable, but migration waits
+        // for a later load that can acquire the lock.
+        #expect(loaded.version == 2)
+        // Nothing was persisted: no backup, and config.json is unchanged.
         #expect(!FileManager.default.fileExists(atPath: paths.configBackupFile(fromVersion: 2).path))
         #expect(try Data(contentsOf: paths.configFile) == original)
         let onDisk = try ConfigStore.makeDecoder().decode(AppConfig.self, from: Data(contentsOf: paths.configFile))

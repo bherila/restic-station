@@ -61,7 +61,7 @@ public struct FileSecretStore: SecretStore {
     /// How long a writer waits for `locks/secrets.lock` before giving up.
     /// Generous: the critical section is a small read-modify-write, and the
     /// only realistic contender is another `secret` invocation.
-    static let lockTimeout: TimeInterval = 10
+    static let lockTimeout: Duration = .seconds(10)
     private static let lockPollNanoseconds: UInt64 = 25_000_000
 
     public let backend = SecretBackend.file
@@ -180,6 +180,69 @@ public struct FileSecretStore: SecretStore {
     public func deleteSecretEnv(destId: UUID) async throws {
         try await mutate { document in
             document.secrets.removeValue(forKey: SecretAccount.secretEnv(destId))
+        }
+    }
+
+    public func updateDestinationSecrets(
+        _ update: DestinationSecretUpdate
+    ) async throws -> DestinationSecretRollback {
+        try await withWriteLock {
+            var document = try load()
+            let passwordAccount = SecretAccount.password(update.destId)
+            let envAccount = SecretAccount.secretEnv(update.destId)
+            let previousPassword = update.password == nil ? nil : document.secrets[passwordAccount]
+            let previousEnv = try update.secretEnv == nil
+                ? nil
+                : document.secrets[envAccount].map(SecretEnvBlob.decode) ?? [:]
+            let rollback = DestinationSecretRollback(
+                destId: update.destId,
+                password: update.password.map {
+                    SecretRollbackChange(installed: Optional($0), previous: previousPassword)
+                },
+                secretEnv: update.secretEnv.map {
+                    SecretRollbackChange(installed: $0, previous: previousEnv ?? [:])
+                }
+            )
+            guard update.password != nil || update.secretEnv != nil else { return rollback }
+            if let password = update.password {
+                document.secrets[passwordAccount] = password
+            }
+            if let env = update.secretEnv {
+                document.secrets[envAccount] = env.isEmpty ? nil : try SecretEnvBlob.encode(env)
+            }
+            document.version = Self.currentVersion
+            try store(document)
+            return rollback
+        }
+    }
+
+    public func restoreDestinationSecretsIfCurrent(
+        _ rollback: DestinationSecretRollback
+    ) async throws -> Bool {
+        try await withWriteLock {
+            guard rollback.password != nil || rollback.secretEnv != nil else { return true }
+            var document = try load()
+            let passwordAccount = SecretAccount.password(rollback.destId)
+            let envAccount = SecretAccount.secretEnv(rollback.destId)
+            if let change = rollback.password,
+               document.secrets[passwordAccount] != change.installed {
+                return false
+            }
+            if let change = rollback.secretEnv {
+                let current = try document.secrets[envAccount].map(SecretEnvBlob.decode) ?? [:]
+                guard current == change.installed else { return false }
+            }
+            if let change = rollback.password {
+                document.secrets[passwordAccount] = change.previous
+            }
+            if let change = rollback.secretEnv {
+                document.secrets[envAccount] = change.previous.isEmpty
+                    ? nil
+                    : try SecretEnvBlob.encode(change.previous)
+            }
+            document.version = Self.currentVersion
+            try store(document)
+            return true
         }
     }
 
@@ -393,21 +456,22 @@ public struct FileSecretStore: SecretStore {
         }
     }
 
-    private func withWriteLock(_ body: () throws -> Void) async throws {
+    private func withWriteLock<T>(_ body: () throws -> T) async throws -> T {
         // `store` repeats the check inside the lock so it remains safe if it
         // is ever called from another write path. Keep this pre-lock check to
         // create the lock directory, but report a degraded mode only once.
         try prepareDirectories(reportWarnings: false)
         let lock = FileLock(path: lockFileURL, trustedRoot: paths.root)
-        let deadline = Date().addingTimeInterval(Self.lockTimeout)
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: Self.lockTimeout)
         while true {
             switch lock.acquire() {
             case .acquired:
                 break
             case .busy:
-                guard Date() < deadline else {
+                guard clock.now < deadline else {
                     throw SecretStoreError.backendFailed(
-                        "timed out after \(Int(Self.lockTimeout))s waiting for the secrets lock at "
+                        "timed out after 10s waiting for the secrets lock at "
                             + "\(lockFileURL.path). Another Restic Station process may be stuck; "
                             + "check for running restic-station-helper processes."
                     )
@@ -424,7 +488,7 @@ public struct FileSecretStore: SecretStore {
             break
         }
         defer { lock.release() }
-        try body()
+        return try body()
     }
 
     /// temp file (`O_EXCL`, `0600`) → `fsync` → `rename(2)`.

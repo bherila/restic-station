@@ -352,7 +352,7 @@ The operation-exclusion locks use `flock(2)` `LOCK_EX | LOCK_NB` on files under 
 | `set-<setId>.lock` | any run touching that set (scheduled or manual, incl. restore & prune) | one operation per set at a time |
 | `health.lock` | a live health probe | exercise the backing filesystem's actual `flock(2)` support without contending with production work |
 | `state/health.lock`, `runs/health.lock` | a live health probe | exercise `flock(2)` on state/run filesystems when they are separate mounts |
-| `secrets.lock` | a Linux secret-store mutation | serialize owner-only `secrets.json` read-modify-write |
+| `secrets.lock` | any secret-store mutation | serialize file-backend read-modify-write and keychain capture/update/conditional rollback across app and helper CLI |
 | `state/schedule-state.lock` | a schedule-state mutation | serialize schedule timestamps, check cursors, and purge watermarks across sets |
 | `state/preview-tokens.lock` | a preview-token mutation | preserve single-use destructive capabilities across sets |
 | `runs/index.jsonl.lock` | a run-index append | keep append ordering and records intact across sets |

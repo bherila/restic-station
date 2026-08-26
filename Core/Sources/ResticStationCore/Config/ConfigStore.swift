@@ -54,12 +54,12 @@ public struct ConfigStore: Sendable {
     /// retaken over the post-migration bytes. Migration is one-way and
     /// terminates, so the retry cannot loop.
     public func snapshot() throws -> ConfigSnapshot {
-        try withConfigReadLock {
-            try snapshotLocked()
+        try withConfigReadLock { migrationAllowed in
+            try snapshotLocked(migrationAllowed: migrationAllowed)
         }
     }
 
-    private func snapshotLocked() throws -> ConfigSnapshot {
+    private func snapshotLocked(migrationAllowed: Bool) throws -> ConfigSnapshot {
         guard let bytes = try readConfigBytes() else {
             return ConfigSnapshot(bytes: Data(), fingerprint: "absent", config: AppConfig())
         }
@@ -69,7 +69,14 @@ public struct ConfigStore: Sendable {
         }
         try decoded.validate()
         guard decoded.version == AppConfig.currentVersion else {
-            _ = try loadLocked()   // migrates and rewrites under this lock
+            guard migrationAllowed else {
+                return ConfigSnapshot(
+                    bytes: bytes,
+                    fingerprint: SHA256Digest.hex(bytes),
+                    config: decoded
+                )
+            }
+            _ = try loadLocked(migrationAllowed: true)   // migrates and rewrites under this lock
             return try snapshotAfterMigration()
         }
         return ConfigSnapshot(bytes: bytes, fingerprint: SHA256Digest.hex(bytes), config: decoded)
@@ -126,15 +133,17 @@ public struct ConfigStore: Sendable {
     /// is the *shared*, machine-agnostic view. Call
     /// `AppConfig.resolved(for:)` to get the effective one for this host.
     public func load() throws -> AppConfig {
-        try withConfigReadLock {
-            try loadLocked()
+        try withConfigReadLock { migrationAllowed in
+            try loadLocked(migrationAllowed: migrationAllowed)
         }
     }
 
-    /// The read/validate/migrate body while `config.lock` is held. Keeping
-    /// readers on the same lock as writers means a rejected Darwin exchange
-    /// can never expose its candidate to a helper between swap and rollback.
-    private func loadLocked() throws -> AppConfig {
+    /// The read/validate/migrate body. A usable `config.lock` lets the caller
+    /// pass `migrationAllowed: true`; otherwise this remains a read-only load
+    /// of the original schema. Keeping migrations and ordinary readers on the
+    /// same lock as writers means a rejected Darwin exchange can never expose
+    /// its candidate to a helper between swap and rollback.
+    private func loadLocked(migrationAllowed: Bool) throws -> AppConfig {
         let fileManager = FileManager.default
         guard fileManager.fileExists(atPath: paths.configFile.path) else {
             return AppConfig()
@@ -155,6 +164,7 @@ public struct ConfigStore: Sendable {
         guard config.version < AppConfig.currentVersion else {
             return config
         }
+        guard migrationAllowed else { return config }
         let migration = migrateToCurrentVersion(config, originalBytes: data)
         // Mirrors the original single-function behavior exactly: config.json
         // is never overwritten unless the v1 backup is confirmed on disk —
@@ -418,21 +428,29 @@ public struct ConfigStore: Sendable {
         }
     }
 
-    /// Readers refuse while a live writer holds the lock, so none can observe
-    /// the candidate between Darwin's exchange and rollback. A structurally unusable lock
-    /// falls back to the historical read path: no writer can acquire that
-    /// same broken lock, and read-only backup operation must keep working
-    /// when only administrative mutation is unavailable.
-    private func withConfigReadLock<T>(_ body: () throws -> T) throws -> T {
+    /// Readers wait out ordinary writer contention, so a keychain-backed
+    /// destination edit cannot turn a valid config into a transient helper
+    /// outage and none can observe Darwin's exchange/rollback window. A
+    /// structurally unusable lock falls back to a strictly non-migrating
+    /// read: backups remain readable, but no schema side effect can run
+    /// without the administrative lock.
+    private func withConfigReadLock<T>(_ body: (Bool) throws -> T) throws -> T {
         let lock = FileLock(path: paths.configLockFile, trustedRoot: paths.root)
-        switch lock.acquire() {
-        case .acquired:
-            defer { lock.release() }
-            return try body()
-        case .busy:
-            throw ConfigStoreError.writeLockBusy(path: paths.configLockFile.path)
-        case .failed:
-            return try body()
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(60))
+        while true {
+            switch lock.acquire() {
+            case .acquired:
+                defer { lock.release() }
+                return try body(true)
+            case .busy:
+                guard clock.now < deadline else {
+                    throw ConfigStoreError.writeLockBusy(path: paths.configLockFile.path)
+                }
+                usleep(20_000)
+            case .failed:
+                return try body(false)
+            }
         }
     }
 

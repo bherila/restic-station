@@ -602,6 +602,29 @@ struct AppModelMachineOverrideTests {
 
         #expect(try await secrets.password(destId: destinationId) == "original-password")
     }
+
+    @Test("a newer helper secret wins over a stale editor rollback")
+    func newerDestinationSecretIsNotRolledBack() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-secret-newer-app-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let destinationId = UUID()
+        let secrets = MemorySecretStore(passwords: [destinationId: "original-password"])
+        let model = AppModel(paths: AppPaths(root: root), secretStoreFactory: { secrets })
+        let rollback = try await model.storeDestinationSecrets(
+            destId: destinationId,
+            password: "editor-password",
+            secretEnv: nil,
+            ifConfigUnchangedFrom: model.configFingerprint
+        )
+
+        try await secrets.setPassword("newer-helper-password", destId: destinationId)
+        let restored = try await model.restoreDestinationSecrets(rollback)
+
+        #expect(!restored)
+        #expect(try await secrets.password(destId: destinationId) == "newer-helper-password")
+    }
 }
 
 private actor MemorySecretStore: SecretStore {

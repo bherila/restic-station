@@ -32,15 +32,29 @@ public struct KeychainSecretStore: SecretStore {
     public let backend = SecretBackend.keychain
 
     private let runner: ProcessRunning
+    private let paths: AppPaths?
+    private static let lockTimeout: Duration = .seconds(30)
+    private static let lockPollNanoseconds: UInt64 = 25_000_000
 
-    public init(runner: ProcessRunning) {
+    public init(runner: ProcessRunning, paths: AppPaths) {
         self.runner = runner
+        self.paths = paths
+    }
+
+    /// Lock-free construction is internal for argv-focused test doubles.
+    /// Production callers must supply `paths` and therefore participate in
+    /// the cross-process mutation lock.
+    init(runner: ProcessRunning) {
+        self.runner = runner
+        self.paths = nil
     }
 
     // MARK: - Repo password
 
     public func setPassword(_ password: String, destId: UUID) async throws {
-        try await setValue(password, account: SecretAccount.password(destId))
+        try await withMutationLock {
+            try await setValue(password, account: SecretAccount.password(destId))
+        }
     }
 
     public func password(destId: UUID) async throws -> String {
@@ -48,7 +62,9 @@ public struct KeychainSecretStore: SecretStore {
     }
 
     public func deletePassword(destId: UUID) async throws {
-        try await deleteValueTolerant(account: SecretAccount.password(destId))
+        try await withMutationLock {
+            try await deleteValueTolerant(account: SecretAccount.password(destId))
+        }
     }
 
     // MARK: - Secret env (e.g. S3 keys)
@@ -59,7 +75,9 @@ public struct KeychainSecretStore: SecretStore {
     /// itself and injects the real env vars.
     public func setSecretEnv(_ env: [String: String], destId: UUID) async throws {
         let json = try SecretEnvBlob.encode(env)
-        try await setValue(json, account: SecretAccount.secretEnv(destId))
+        try await withMutationLock {
+            try await setValue(json, account: SecretAccount.secretEnv(destId))
+        }
     }
 
     /// A missing item is not an error here — it just means no secret env
@@ -75,7 +93,109 @@ public struct KeychainSecretStore: SecretStore {
     }
 
     public func deleteSecretEnv(destId: UUID) async throws {
-        try await deleteValueTolerant(account: SecretAccount.secretEnv(destId))
+        try await withMutationLock {
+            try await deleteValueTolerant(account: SecretAccount.secretEnv(destId))
+        }
+    }
+
+    public func updateDestinationSecrets(
+        _ update: DestinationSecretUpdate
+    ) async throws -> DestinationSecretRollback {
+        try await withMutationLock {
+            let passwordAccount = SecretAccount.password(update.destId)
+            let envAccount = SecretAccount.secretEnv(update.destId)
+            let previousPassword = update.password == nil
+                ? nil
+                : try await readOptionalValue(account: passwordAccount)
+            let previousEnv: [String: String]? = if update.secretEnv == nil {
+                nil
+            } else if let raw = try await readOptionalValue(account: envAccount) {
+                try SecretEnvBlob.decode(raw)
+            } else {
+                [:]
+            }
+            let rollback = DestinationSecretRollback(
+                destId: update.destId,
+                password: update.password.map {
+                    SecretRollbackChange(installed: Optional($0), previous: previousPassword)
+                },
+                secretEnv: update.secretEnv.map {
+                    SecretRollbackChange(installed: $0, previous: previousEnv ?? [:])
+                }
+            )
+            do {
+                if let password = update.password {
+                    try await setValue(password, account: passwordAccount)
+                }
+                if let env = update.secretEnv {
+                    if env.isEmpty {
+                        try await deleteValueTolerant(account: envAccount)
+                    } else {
+                        try await setValue(try SecretEnvBlob.encode(env), account: envAccount)
+                    }
+                }
+            } catch {
+                // The lock excludes newer writers, so restoring the captured
+                // values here repairs a partial delete/add sequence without
+                // risking an external mutation.
+                do {
+                    if update.password != nil {
+                        if let previousPassword {
+                            try await setValue(previousPassword, account: passwordAccount)
+                        } else {
+                            try await deleteValueTolerant(account: passwordAccount)
+                        }
+                    }
+                    if update.secretEnv != nil {
+                        if let previousEnv, !previousEnv.isEmpty {
+                            try await setValue(try SecretEnvBlob.encode(previousEnv), account: envAccount)
+                        } else {
+                            try await deleteValueTolerant(account: envAccount)
+                        }
+                    }
+                } catch {
+                    throw SecretStoreError.backendFailed(
+                        "keychain update failed and restoring the prior values also failed; "
+                            + "verify this destination's credentials before running a backup"
+                    )
+                }
+                throw error
+            }
+            return rollback
+        }
+    }
+
+    public func restoreDestinationSecretsIfCurrent(
+        _ rollback: DestinationSecretRollback
+    ) async throws -> Bool {
+        try await withMutationLock {
+            let passwordAccount = SecretAccount.password(rollback.destId)
+            let envAccount = SecretAccount.secretEnv(rollback.destId)
+            if let change = rollback.password {
+                let current = try await readOptionalValue(account: passwordAccount)
+                guard current == change.installed else { return false }
+            }
+            if let change = rollback.secretEnv {
+                let current = try await readOptionalValue(account: envAccount)
+                    .map(SecretEnvBlob.decode) ?? [:]
+                guard current == change.installed else { return false }
+            }
+            if let change = rollback.password {
+                if let previous = change.previous {
+                    try await setValue(previous, account: passwordAccount)
+                } else {
+                    try await deleteValueTolerant(account: passwordAccount)
+                }
+            }
+            if let change = rollback.secretEnv {
+                if change.previous.isEmpty {
+                    try await deleteValueTolerant(account: envAccount)
+                } else {
+                    try await setValue(try SecretEnvBlob.encode(change.previous), account: envAccount)
+                }
+            }
+            return true
+        }
     }
 
     // MARK: - Documented command string
@@ -131,6 +251,14 @@ public struct KeychainSecretStore: SecretStore {
         return raw
     }
 
+    private func readOptionalValue(account: String) async throws -> String? {
+        do {
+            return try await readValue(account: account)
+        } catch SecretStoreError.itemNotFound {
+            return nil
+        }
+    }
+
     /// Deletes the item, throwing `SecretStoreError.itemNotFound` (typed) if
     /// there wasn't one. Used both directly and by the tolerant wrapper.
     private func deleteValue(account: String) async throws {
@@ -168,6 +296,37 @@ public struct KeychainSecretStore: SecretStore {
             onStderrLine: nil,
             timeout: nil
         )
+    }
+
+    /// Keychain operations are individually atomic, but an editor rollback
+    /// needs compare-and-restore atomicity across several `security`
+    /// subprocesses. Production construction supplies `paths`, placing app
+    /// and helper CLI mutations under the same cross-process lock. Tests
+    /// that exercise argv construction can omit it.
+    private func withMutationLock<T>(
+        _ body: () async throws -> T
+    ) async throws -> T {
+        guard let paths else { return try await body() }
+        try paths.ensureDirectories()
+        let lock = FileLock(path: paths.secretsLockFile, trustedRoot: paths.root)
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: Self.lockTimeout)
+        while true {
+            switch lock.acquire() {
+            case .acquired:
+                defer { lock.release() }
+                return try await body()
+            case .busy:
+                guard clock.now < deadline else {
+                    throw SecretStoreError.backendFailed(
+                        "timed out waiting for the secrets lock at \(paths.secretsLockFile.path)"
+                    )
+                }
+                try await Task.sleep(nanoseconds: Self.lockPollNanoseconds)
+            case .failed(let failure):
+                throw SecretStoreError.lockUnusable(failure)
+            }
+        }
     }
 
     private static func trimmedStderr(_ result: ProcessResult) -> String {

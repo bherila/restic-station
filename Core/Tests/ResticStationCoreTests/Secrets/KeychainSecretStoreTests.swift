@@ -224,5 +224,57 @@ struct KeychainSecretStoreTests {
         }
         #expect(runner.invocations[0].argv.contains(Self.account))
     }
+
+    @Test("conditional rollback does not overwrite a newer keychain value")
+    func conditionalRollbackPreservesNewerValue() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-keychain-rollback-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = FakeProcessRunner(script: [
+            .init(
+                argvPrefix: ["/usr/bin/security", "find-generic-password"],
+                stdoutLines: ["newer-helper-password"]
+            ),
+        ])
+        let client = KeychainSecretStore(runner: runner, paths: AppPaths(root: root))
+        let rollback = DestinationSecretRollback(
+            destId: Self.destId,
+            password: SecretRollbackChange(
+                installed: "editor-password",
+                previous: "original-password"
+            ),
+            secretEnv: nil
+        )
+
+        let restored = try await client.restoreDestinationSecretsIfCurrent(rollback)
+
+        #expect(!restored)
+        #expect(runner.invocations.count == 1)
+    }
+
+    @Test("production keychain mutations wait for the shared secrets lock")
+    func keychainMutationUsesSharedLock() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-keychain-lock-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = AppPaths(root: root)
+        try paths.ensureDirectories()
+        let heldLock = FileLock(path: paths.secretsLockFile, trustedRoot: root)
+        #expect(heldLock.acquire() == .acquired)
+
+        let runner = FakeProcessRunner(script: [
+            .init(argvPrefix: ["/usr/bin/security", "delete-generic-password"], exitCode: 44),
+        ])
+        let client = KeychainSecretStore(runner: runner, paths: paths)
+        let mutation = Task {
+            try await client.deletePassword(destId: Self.destId)
+        }
+
+        try await Task.sleep(for: .milliseconds(75))
+        #expect(runner.invocations.isEmpty)
+        heldLock.release()
+        try await mutation.value
+        #expect(runner.invocations.count == 1)
+    }
 }
 #endif

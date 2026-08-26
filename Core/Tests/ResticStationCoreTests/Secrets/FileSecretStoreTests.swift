@@ -68,6 +68,28 @@ struct FileSecretStoreTests {
         return info.st_uid
     }
 
+    @Test("conditional rollback preserves a newer secret mutation")
+    func conditionalRollbackPreservesNewerPassword() async throws {
+        let (store, root) = Self.makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        try await store.setPassword("editor-password", destId: Self.destId)
+        let rollback = DestinationSecretRollback(
+            destId: Self.destId,
+            password: SecretRollbackChange(
+                installed: "editor-password",
+                previous: "original-password"
+            ),
+            secretEnv: nil
+        )
+        try await store.setPassword("newer-helper-password", destId: Self.destId)
+
+        let restored = try await store.restoreDestinationSecretsIfCurrent(rollback)
+
+        #expect(!restored)
+        #expect(try await store.password(destId: Self.destId) == "newer-helper-password")
+    }
+
     // MARK: - Permissions at creation
 
     @Test("the secrets file is created 0600 and its directory 0700, at creation time")

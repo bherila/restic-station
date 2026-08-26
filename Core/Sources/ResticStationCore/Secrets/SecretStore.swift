@@ -93,6 +93,18 @@ public protocol SecretStore: Sendable {
     func secretEnv(destId: UUID) async throws -> [String: String]
     func deleteSecretEnv(destId: UUID) async throws
 
+    /// Captures the previous managed fields and installs their replacements.
+    /// Production backends do both atomically under their shared mutation
+    /// lock. `nil` means that field is outside the update.
+    func updateDestinationSecrets(_ update: DestinationSecretUpdate) async throws -> DestinationSecretRollback
+
+    /// Restores editor-written values only while they are still current.
+    /// Production backends implement the comparison and restoration under
+    /// their shared mutation lock, so a newer CLI write can never be
+    /// overwritten by a stale UI rollback.
+    @discardableResult
+    func restoreDestinationSecretsIfCurrent(_ rollback: DestinationSecretRollback) async throws -> Bool
+
     // MARK: Password command
 
     /// The exact command restic is configured to run via
@@ -128,6 +140,117 @@ public protocol SecretStore: Sendable {
 extension SecretStore {
     /// Most backends need nothing.
     public var passwordCommandEnvironment: [String: String] { [:] }
+
+    public func updateDestinationSecrets(
+        _ update: DestinationSecretUpdate
+    ) async throws -> DestinationSecretRollback {
+        let previousPassword: String?
+        if update.password != nil {
+            do {
+                previousPassword = try await password(destId: update.destId)
+            } catch SecretStoreError.itemNotFound {
+                previousPassword = nil
+            }
+        } else {
+            previousPassword = nil
+        }
+        let previousEnv = update.secretEnv == nil
+            ? nil
+            : try await secretEnv(destId: update.destId)
+        let rollback = DestinationSecretRollback(
+            destId: update.destId,
+            password: update.password.map {
+                SecretRollbackChange(installed: Optional($0), previous: previousPassword)
+            },
+            secretEnv: update.secretEnv.map {
+                SecretRollbackChange(installed: $0, previous: previousEnv ?? [:])
+            }
+        )
+        if let password = update.password {
+            try await setPassword(password, destId: update.destId)
+        }
+        if let env = update.secretEnv {
+            if env.isEmpty {
+                try await deleteSecretEnv(destId: update.destId)
+            } else {
+                try await setSecretEnv(env, destId: update.destId)
+            }
+        }
+        return rollback
+    }
+
+    /// Test/minimal-store fallback. Production stores override this with a
+    /// single locked transaction; actors used by clients still get the same
+    /// comparison semantics without needing storage-specific plumbing.
+    public func restoreDestinationSecretsIfCurrent(
+        _ rollback: DestinationSecretRollback
+    ) async throws -> Bool {
+        if let change = rollback.password {
+            let current: String?
+            do {
+                current = try await password(destId: rollback.destId)
+            } catch SecretStoreError.itemNotFound {
+                current = nil
+            }
+            guard current == change.installed else { return false }
+        }
+        if let change = rollback.secretEnv {
+            guard try await secretEnv(destId: rollback.destId) == change.installed else { return false }
+        }
+        if let change = rollback.password {
+            if let previous = change.previous {
+                try await setPassword(previous, destId: rollback.destId)
+            } else {
+                try await deletePassword(destId: rollback.destId)
+            }
+        }
+        if let change = rollback.secretEnv {
+            if change.previous.isEmpty {
+                try await deleteSecretEnv(destId: rollback.destId)
+            } else {
+                try await setSecretEnv(change.previous, destId: rollback.destId)
+            }
+        }
+        return true
+    }
+}
+
+public struct SecretRollbackChange<Value: Equatable & Sendable>: Equatable, Sendable {
+    public let installed: Value
+    public let previous: Value
+
+    public init(installed: Value, previous: Value) {
+        self.installed = installed
+        self.previous = previous
+    }
+}
+
+public struct DestinationSecretRollback: Equatable, Sendable {
+    public let destId: UUID
+    public let password: SecretRollbackChange<String?>?
+    public let secretEnv: SecretRollbackChange<[String: String]>?
+
+    public init(
+        destId: UUID,
+        password: SecretRollbackChange<String?>?,
+        secretEnv: SecretRollbackChange<[String: String]>?
+    ) {
+        self.destId = destId
+        self.password = password
+        self.secretEnv = secretEnv
+    }
+}
+
+public struct DestinationSecretUpdate: Equatable, Sendable {
+    public let destId: UUID
+    public let password: String?
+    public let secretEnv: [String: String]?
+
+    public init(destId: UUID, password: String?, secretEnv: [String: String]?) {
+        self.destId = destId
+        self.password = password
+        self.secretEnv = secretEnv
+    }
 }
 
 // MARK: - Account naming

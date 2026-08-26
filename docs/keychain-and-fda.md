@@ -40,6 +40,8 @@ Keychain item ACLs are per-code-identity. An item created through the Security f
 
 Items (see data-model.md): service `restic-station`, account `<dest-uuid>` (repo password) and `<dest-uuid>-env` (JSON dict of secret env vars, e.g. S3 keys — restic's password-command mechanism can't deliver those, so `ResticRunner` reads the blob itself and injects real env vars).
 
+Every production keychain mutation also holds `locks/secrets.lock`. This is what makes an app editor's capture/update and conditional rollback one transaction with the helper's `secret set`, `set-env`, and `rm` commands: a stale editor rollback compares the current values while holding the same lock and leaves a newer CLI mutation untouched. Ordinary reads take no lock because each keychain item lookup is already atomic.
+
 ### Accepted tradeoff (document, don't "fix")
 Passing `-w <password>` puts the secret in `security`'s argv, momentarily visible in `ps` on the local machine. Alternatives (interactive `-w` prompt) don't work programmatically. For a single-user local machine this is acceptable; note it in code comments and README.
 

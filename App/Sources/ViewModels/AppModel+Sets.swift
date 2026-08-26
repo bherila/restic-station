@@ -14,15 +14,9 @@ import ResticStationCore
 extension AppModel {
 
     struct DestinationSecretsRollback: Sendable {
-        enum Password: Sendable {
-            case unchanged
-            case absent
-            case value(String)
-        }
+        let transaction: DestinationSecretRollback
 
-        let destId: UUID
-        let password: Password
-        let secretEnv: [String: String]?
+        var destId: UUID { transaction.destId }
     }
 
     // MARK: - Collaborators
@@ -153,38 +147,15 @@ extension AppModel {
         var rollback: DestinationSecretsRollback?
         do {
             return try await configStore.withUnchangedRevision(from: expectedFingerprint) {
-                let priorPassword: DestinationSecretsRollback.Password
-                if password?.isEmpty == false {
-                    do {
-                        priorPassword = .value(try await store.password(destId: destId))
-                    } catch SecretStoreError.itemNotFound {
-                        priorPassword = .absent
-                    }
-                } else {
-                    priorPassword = .unchanged
-                }
-                let priorSecretEnv: [String: String]? = if secretEnv == nil {
-                    nil
-                } else {
-                    try await store.secretEnv(destId: destId)
-                }
-                let snapshot = DestinationSecretsRollback(
-                    destId: destId,
-                    password: priorPassword,
-                    secretEnv: priorSecretEnv
+                let transaction = try await store.updateDestinationSecrets(
+                    DestinationSecretUpdate(
+                        destId: destId,
+                        password: password?.isEmpty == false ? password : nil,
+                        secretEnv: secretEnv
+                    )
                 )
+                let snapshot = DestinationSecretsRollback(transaction: transaction)
                 rollback = snapshot
-
-                if let password, !password.isEmpty {
-                    try await store.setPassword(password, destId: destId)
-                }
-                if let secretEnv {
-                    if secretEnv.isEmpty {
-                        try await store.deleteSecretEnv(destId: destId)
-                    } else {
-                        try await store.setSecretEnv(secretEnv, destId: destId)
-                    }
-                }
                 return snapshot
             }
         } catch {
@@ -207,7 +178,8 @@ extension AppModel {
 
     /// Restores the exact fields the editor changed when the subsequent
     /// config CAS refuses. Fields the editor left alone are not touched.
-    func restoreDestinationSecrets(_ rollback: DestinationSecretsRollback) async throws {
+    @discardableResult
+    func restoreDestinationSecrets(_ rollback: DestinationSecretsRollback) async throws -> Bool {
         try await restoreDestinationSecrets(rollback, using: makeSecretStore())
     }
 
@@ -218,29 +190,21 @@ extension AppModel {
     func restoreDestinationSecrets(_ rollbacks: [DestinationSecretsRollback]) async throws {
         let store = try makeSecretStore()
         for rollback in rollbacks.reversed() {
-            try await restoreDestinationSecrets(rollback, using: store)
+            guard try await restoreDestinationSecrets(rollback, using: store) else {
+                // A newer helper/CLI mutation won. Stop the rollback chain:
+                // applying an older token after that mismatch could still
+                // overwrite the external value if it happens to equal an
+                // intermediate editor value.
+                return
+            }
         }
     }
 
     private func restoreDestinationSecrets(
         _ rollback: DestinationSecretsRollback,
         using store: any SecretStore
-    ) async throws {
-        switch rollback.password {
-        case .unchanged:
-            break
-        case .absent:
-            try await store.deletePassword(destId: rollback.destId)
-        case .value(let password):
-            try await store.setPassword(password, destId: rollback.destId)
-        }
-        if let secretEnv = rollback.secretEnv {
-            if secretEnv.isEmpty {
-                try await store.deleteSecretEnv(destId: rollback.destId)
-            } else {
-                try await store.setSecretEnv(secretEnv, destId: rollback.destId)
-            }
-        }
+    ) async throws -> Bool {
+        try await store.restoreDestinationSecretsIfCurrent(rollback.transaction)
     }
 
     /// Reads back what the destination editor needs to pre-fill. A missing
