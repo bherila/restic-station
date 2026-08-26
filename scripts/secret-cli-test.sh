@@ -39,6 +39,7 @@ DEST_ID_LOWER="$(printf '%s' "$DEST_ID" | tr '[:upper:]' '[:lower:]')"
 
 # Deliberately awkward: spaces, quotes, a dollar sign and a trailing space,
 # so "we read stdin raw" is a real claim and not an artifact of a tame value.
+# shellcheck disable=SC2016 # literal $, deliberately awkward, never expanded
 PASSWORD='p@ss "word" with $spaces and a trailing space '
 
 WORK=""

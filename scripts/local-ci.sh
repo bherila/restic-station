@@ -16,6 +16,7 @@
 # ── COVERAGE ────────────────────────────────────────────────────────────
 #
 # FULLY equivalent to CI (same command, same inputs):
+#   - scripts/shell-lint.sh                            [macos job]
 #   - `swift test` (root package)                       [linux + macos jobs]
 #   - `swift test --package-path Core`                  [linux + macos jobs]
 #   - `xcodebuild -scheme "Restic Station"`             [macos job]
@@ -69,7 +70,7 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-cd "$REPO_ROOT"
+cd "$REPO_ROOT" || exit 1
 
 FAST=0
 [[ "${1:-}" == "--fast" ]] && FAST=1
@@ -91,6 +92,13 @@ skip() {
     SKIPPED+=("$1 — $2")
     printf '\n\033[2m━━ %s (skipped: %s)\033[0m\n' "$1" "$2"
 }
+
+# ── Shell portability ───────────────────────────────────────────────────
+if command -v shellcheck >/dev/null 2>&1; then
+    step "shellcheck + Bash 3.2 syntax" scripts/shell-lint.sh
+else
+    skip "shellcheck + Bash 3.2 syntax" "shellcheck not on PATH"
+fi
 
 # ── Unit tests, both packages ───────────────────────────────────────────
 # SwiftPM does not run a path dependency's tests, so Core needs its own
