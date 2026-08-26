@@ -949,10 +949,15 @@ public struct RunStore: Sendable {
 
         let runsDirectoryFD = try openDirectory(paths.runsDir)
         defer { closeFileDescriptor(runsDirectoryFD) }
+        // `O_APPEND` is load-bearing: the tail repair reads only with
+        // `pread`, which leaves the file offset at 0, so the terminating
+        // newline written for a complete newline-less final record would
+        // otherwise land on the first byte of the index — destroying the
+        // oldest record instead of finishing the newest one.
         let fd = fileOperations.openAt(
             runsDirectoryFD,
             paths.runsIndexFile.lastPathComponent,
-            O_RDWR | O_CLOEXEC | O_NOFOLLOW,
+            O_RDWR | O_APPEND | O_CLOEXEC | O_NOFOLLOW,
             0
         )
         guard fd >= 0 else {

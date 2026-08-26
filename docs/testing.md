@@ -62,6 +62,19 @@ ScheduleMath: table-driven tests per rule in scheduling.md — incl. DST spring-
 
 RunStore: temp-dir AppPaths; crash-recovery test (write `running` metadata with dead pid → recover marks `failed`); index append under contention (two FileLocks, in-process; flock is per-open-file-description — take care to open separately).
 
+### RunStore fault injection (crash-durability harness)
+
+`RunStoreFileOperations` is `RunStore`'s narrow POSIX seam — `openat`/`write`/`fsync`/`renameat`/`unlinkat`; directory fsyncs go through the same `sync` closure against descriptors RunStore opens with `O_DIRECTORY`. Production always uses `.live`; the internal `RunStore` initializer accepts a replacement, and behavior with `.live` is byte-identical to having no seam. `FaultInjectingFileOperations` (Core test support) is the programmable double on top of it:
+
+- `crashAfter(operations:)` — every seam call past the given 1-based ordinal silently no-ops while *reporting success*: the in-process analog of dying at that step boundary (nothing later reaches the disk, and no error path runs, because a dead process has no error path). The test then "remounts" — a fresh live `RunStore` over the same directory, the dead process's recorded pid rewritten to an unreachable one where the on-disk record still claims `.running` — and asserts the recovered view is consistent.
+- `failSync(atCall:errno:)` — one-shot fsync failures (`EINTR`, `EIO`, `ENOSPC`, …) at an exact fsync ordinal, counted across all descriptors.
+- `tearWrite(toFileNamed:keepingBytes:)` — the first write to the named file persists only a prefix, then the process "crashes".
+- an operation **trace**, each write/fsync labeled with the file name it was opened under through the seam or `.directory` (detected by `fstat`), used to assert the documented ordering contracts (write → fsync file → rename → fsync directory; pending marker before the index append it guards; marker cleared only after the projection's fsyncs) directly rather than inferring them from end states.
+
+`RunStoreCrashDurabilityTests` runs the crash matrix: every step boundary of `begin`, `markDestructiveLaunchAuthorized`, `finish` (destructive and not), and `recoverInterrupted` itself (each matrix's largest crash point asserts the flow completed, so a flow that grows new steps fails the coverage check loudly rather than silently shrinking the matrix); torn index appends at byte offsets including mid-UTF-8-scalar; and `EINTR` injected at every fsync site of both the publication and recovery flows.
+
+Model limits, deliberately: crashes replay at seam-call boundaries against the real filesystem — losing un-fsynced page cache is not simulated, and `FileManager` calls (mkdir/remove) are outside the seam, so a crash "between" one of those and a seam call is not representable. `ConfigStore`/`AppPaths` durability is tested separately (their own seams); `StateStore` promises only atomic replacement (temp + rename), covered by the stale-temp test in the same suite.
+
 ## Layer 2 — integration script (`scripts/integration-test.sh`)
 
 Real restic (from PATH; CI: `brew install restic` on macOS, and the **official 0.18.1 release binary** on Linux — deliberately *not* `apt-get install restic`, because Ubuntu 24.04 ships 0.16.4, below the 0.17.0 minimum `ResticDiscovery` enforces, so any scenario that relies on discovery rather than a pinned `resticPath` fails — since issue #50 with an explicit "restic 0.16.4 … is too old", previously with a flatly misleading "restic not found"). Runs on **both platforms** (extended for Linux by T29 / issue #31 — one script, so the two platforms cannot silently drift in what they cover). Contract:
