@@ -562,8 +562,8 @@ struct DestinationEditorView: View {
             busy = .testing
             defer { busy = nil }
             probe = nil
-            guard let updated = await commitDraft(), persistSet(updated) else { return }
-            probe = await model.probeDestination(setId: updated.id, destId: draft.id)
+            guard let committed = await commitDraft(), await persistSet(committed) else { return }
+            probe = await model.probeDestination(setId: committed.updated.id, destId: draft.id)
         }
     }
 
@@ -571,8 +571,8 @@ struct DestinationEditorView: View {
         Task {
             busy = .testingRemoteMaintenance
             defer { busy = nil }
-            guard let updated = await commitDraft(), persistSet(updated) else { return }
-            switch await model.testRemoteMaintenance(setId: updated.id, destId: draft.id) {
+            guard let committed = await commitDraft(), await persistSet(committed) else { return }
+            switch await model.testRemoteMaintenance(setId: committed.updated.id, destId: draft.id) {
             case .available(let text):
                 message = .success(text)
             case .failed(let text):
@@ -585,8 +585,8 @@ struct DestinationEditorView: View {
         Task {
             busy = .initializing
             defer { busy = nil }
-            guard let updated = await commitDraft(), persistSet(updated) else { return }
-            switch await model.initializeRepository(setId: updated.id, destId: draft.id) {
+            guard let committed = await commitDraft(), await persistSet(committed) else { return }
+            switch await model.initializeRepository(setId: committed.updated.id, destId: draft.id) {
             case .initialized(let text):
                 message = .success(text)
                 probe = .reachable(text)
@@ -601,7 +601,7 @@ struct DestinationEditorView: View {
     /// not have to read it back through the binding, which is not guaranteed
     /// to reflect the write within the same update), or `nil` with `message`
     /// set when anything refused.
-    private func commitDraft() async -> BackupSet? {
+    private func commitDraft() async -> DestinationCommit? {
         message = nil
 
         let label = draft.label.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -630,8 +630,9 @@ struct DestinationEditorView: View {
         destination.repoURL = repoURL
         destination.nonSecretEnv = assembledNonSecretEnv
 
+        let secretsRollback: AppModel.DestinationSecretsRollback
         do {
-            try await model.storeDestinationSecrets(
+            secretsRollback = try await model.storeDestinationSecrets(
                 destId: destination.id,
                 password: password.isEmpty ? nil : password,
                 secretEnv: secretEnvToWrite,
@@ -662,20 +663,28 @@ struct DestinationEditorView: View {
 
         draft = destination
         set = updated
-        return updated
+        return DestinationCommit(updated: updated, secretsRollback: secretsRollback)
     }
 
     /// Persists the whole set so the helper can see this destination. Any
     /// validation failure is the *set's* (no sources yet, for example) and is
     /// reported here with that context.
-    private func persistSet(_ updated: BackupSet) -> Bool {
+    private func persistSet(_ committed: DestinationCommit) async -> Bool {
         do {
             configFingerprint = try model.saveSet(
-                updated,
+                committed.updated,
                 ifUnchangedFrom: configFingerprint
             )
             return true
         } catch {
+            do {
+                try await model.restoreDestinationSecrets(committed.secretsRollback)
+            } catch let rollbackError {
+                message = .error("The backup set could not be saved (\(error)), and the previous keychain "
+                    + "values could not be restored (\(rollbackError)). Re-open this destination and "
+                    + "verify its credentials before running a backup.")
+                return false
+            }
             let mapped = SetsCopy.fieldMessage(for: error)
             message = .error(mapped.message
                 + " Testing and initializing save the backup set first, because the background "
@@ -716,6 +725,11 @@ struct DestinationEditorView: View {
     private enum EditorMessage: Equatable {
         case error(String)
         case success(String)
+    }
+
+    private struct DestinationCommit {
+        let updated: BackupSet
+        let secretsRollback: AppModel.DestinationSecretsRollback
     }
 
     enum BusyKind: Equatable {

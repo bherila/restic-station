@@ -148,14 +148,32 @@ import Testing
         try store.save(installed)
         let lock = FileLock(path: store.paths.configLockFile, trustedRoot: root)
         #expect(lock.acquire() == .acquired)
-        defer { lock.release() }
 
         var competing = installed
         competing.showMenuBarIcon.toggle()
         #expect(throws: ConfigStoreError.writeLockBusy(path: store.paths.configLockFile.path)) {
             try store.save(competing)
         }
+        lock.release()
         #expect(try store.load() == installed)
+    }
+
+    @Test("config readers never observe a writer's in-flight replacement")
+    func configReadUsesTheWriterLock() throws {
+        let (store, root) = makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        try store.save(sampleConfig())
+        let lock = FileLock(path: store.paths.configLockFile, trustedRoot: root)
+        #expect(lock.acquire() == .acquired)
+        defer { lock.release() }
+
+        #expect(throws: ConfigStoreError.writeLockBusy(path: store.paths.configLockFile.path)) {
+            _ = try store.load()
+        }
+        #expect(throws: ConfigStoreError.writeLockBusy(path: store.paths.configLockFile.path)) {
+            _ = try store.snapshot()
+        }
     }
 
     @Test func saveCreatesDirectoriesIfMissing() throws {

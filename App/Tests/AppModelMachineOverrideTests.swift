@@ -486,4 +486,120 @@ struct AppModelMachineOverrideTests {
         #expect(!model.configChangedOnDisk)
         #expect(model.config == original)
     }
+
+    @Test("a machine-only load error does not offer an irrelevant config reload")
+    func machineLoadErrorDoesNotClaimConfigChanged() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-machine-error-app-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let paths = AppPaths(root: root)
+        try ConfigStore(paths: paths).save(AppConfig(showMenuBarIcon: true))
+        try Data("not json".utf8).write(to: paths.machineFile, options: .atomic)
+
+        let model = AppModel(paths: paths)
+        try await Task.sleep(nanoseconds: 100_000_000)
+
+        #expect(model.machineLoadError != nil)
+        #expect(model.configLoadError != nil)
+        #expect(!model.configChangedOnDisk)
+    }
+
+    @Test("a fleet replacement during a keychain write restores the prior secret")
+    func configRaceRollsBackDestinationSecrets() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-secret-cas-app-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let paths = AppPaths(root: root)
+        let destinationId = UUID()
+        let set = BackupSet(
+            id: UUID(), name: "Documents", sources: ["/tmp/source"],
+            schedule: .daily(hour: 2, minute: 30),
+            destinations: [
+                Destination(id: destinationId, label: "Primary", repoURL: "/tmp/repo", isPrimary: true)
+            ]
+        )
+        let original = AppConfig(sets: [set])
+        let store = ConfigStore(paths: paths)
+        try store.save(original)
+        let editFingerprint = try store.snapshot().fingerprint
+
+        var fleetReplacement = original
+        fleetReplacement.sets[0].destinations[0].repoURL = "/tmp/fleet-repo"
+        let replacementBytes = try ConfigStore.makeEncoder().encode(fleetReplacement)
+        let secrets = RacingSecretStore(
+            initialPassword: "old-password",
+            replacementBytes: replacementBytes,
+            configFile: paths.configFile
+        )
+        let model = AppModel(paths: paths, secretStoreFactory: { secrets })
+
+        await #expect(throws: ConfigStoreError.changedOnDisk) {
+            try await model.storeDestinationSecrets(
+                destId: destinationId,
+                password: "new-password",
+                secretEnv: nil,
+                ifConfigUnchangedFrom: editFingerprint
+            )
+        }
+
+        #expect(try await secrets.password(destId: destinationId) == "old-password")
+        #expect(try store.load() == fleetReplacement)
+        #expect(model.configChangedOnDisk)
+    }
+}
+
+private actor RacingSecretStore: SecretStore {
+    nonisolated let backend: SecretBackend = .keychain
+    private var passwords: [UUID: String]
+    private var secretEnvironments: [UUID: [String: String]] = [:]
+    private let replacementBytes: Data
+    private let configFile: URL
+    private var installedReplacement = false
+
+    init(initialPassword: String, replacementBytes: Data, configFile: URL) {
+        self.passwords = [:]
+        self.replacementBytes = replacementBytes
+        self.configFile = configFile
+        // The test uses one destination and seeds it on first read below.
+        self.initialPassword = initialPassword
+    }
+
+    private let initialPassword: String
+
+    func setPassword(_ password: String, destId: UUID) async throws {
+        if passwords[destId] == nil {
+            passwords[destId] = initialPassword
+        }
+        passwords[destId] = password
+        if !installedReplacement {
+            installedReplacement = true
+            try replacementBytes.write(to: configFile, options: .atomic)
+        }
+    }
+
+    func password(destId: UUID) async throws -> String {
+        if let password = passwords[destId] { return password }
+        passwords[destId] = initialPassword
+        return initialPassword
+    }
+
+    func deletePassword(destId: UUID) async throws {
+        passwords.removeValue(forKey: destId)
+    }
+
+    func setSecretEnv(_ env: [String: String], destId: UUID) async throws {
+        secretEnvironments[destId] = env
+    }
+
+    func secretEnv(destId: UUID) async throws -> [String: String] {
+        secretEnvironments[destId] ?? [:]
+    }
+
+    func deleteSecretEnv(destId: UUID) async throws {
+        secretEnvironments.removeValue(forKey: destId)
+    }
+
+    nonisolated func passwordCommand(destId: UUID) -> String { "test-secret-store" }
 }

@@ -72,6 +72,10 @@ final class AppModel: ObservableObject {
     /// overwriting a config we failed to understand would destroy the user's
     /// backup definitions.
     @Published private(set) var configLoadError: String?
+    /// True only when config.json itself failed to load or reload. Kept
+    /// separate from the combined operator-facing error, which can also
+    /// contain a machine.json failure that Reload Settings cannot repair.
+    private var configReloadRequired: Bool
     /// Non-`nil` when `machine.json` exists but could not be read. Tracked
     /// separately from `configLoadError` because it blocks a *different*
     /// write: `machine` is only a generated fallback while this is set, so
@@ -112,6 +116,10 @@ final class AppModel: ObservableObject {
     let stateWatcher: StateWatcher
     let launchd: LaunchdManager
     let helper: HelperInvoker
+    /// Injectable only so transaction tests can deterministically race a
+    /// secret mutation with a raw fleet replacement. Production builds use
+    /// the same factory as the helper.
+    let secretStoreFactory: () throws -> any SecretStore
 
     /// The minimum restic the docs require (`docs/restic-cli.md` §version).
     static let minimumResticVersion = "0.17.0"
@@ -132,6 +140,7 @@ final class AppModel: ObservableObject {
         paths: AppPaths = .default(),
         launchd: LaunchdManager? = nil,
         helper: HelperInvoker = HelperInvoker(),
+        secretStoreFactory: (() throws -> any SecretStore)? = nil,
         calendar: Calendar = .autoupdatingCurrent,
         now: @escaping @Sendable () -> Date = { Date() }
     ) {
@@ -147,6 +156,13 @@ final class AppModel: ObservableObject {
         )
         self.launchd = launchd ?? LaunchdManager()
         self.helper = helper
+        self.secretStoreFactory = secretStoreFactory ?? {
+            try SecretStoreFactory.make(
+                paths: paths,
+                runner: DefaultProcessRunner(),
+                helperExecutablePath: HelperInvoker.helperURL.path
+            )
+        }
         self.calendar = calendar
         self.now = now
 
@@ -161,6 +177,7 @@ final class AppModel: ObservableObject {
         // *read* until every stored property is initialized, and the machine
         // branch below needs to append to whatever the config branch found.
         var loadFailures: [String] = []
+        var configReloadRequired = false
 
         let loadedConfig: AppConfig
         let loadedConfigFingerprint: String
@@ -173,6 +190,7 @@ final class AppModel: ObservableObject {
             // `configLoadError` blocks writes so nothing is clobbered.
             loadedConfig = AppConfig()
             loadedConfigFingerprint = configStore.fileFingerprint()
+            configReloadRequired = true
             loadFailures.append(Self.describe(configLoadFailure: error, path: paths.configFile.path))
         }
 
@@ -196,6 +214,7 @@ final class AppModel: ObservableObject {
         }
 
         self.configLoadError = loadFailures.isEmpty ? nil : loadFailures.joined(separator: "\n\n")
+        self.configReloadRequired = configReloadRequired
 
         self.machine = loadedMachine
         self.config = loadedConfig
@@ -315,6 +334,7 @@ final class AppModel: ObservableObject {
 
             config = snapshot.config
             configFingerprint = snapshot.fingerprint
+            configReloadRequired = false
             configChangedOnDisk = false
             configLoadError = machineLoadError
             resolvedConfig = snapshot.config.resolved(for: machine).config
@@ -332,6 +352,7 @@ final class AppModel: ObservableObject {
         } catch {
             let detail = Self.describe(configLoadFailure: error, path: paths.configFile.path)
             configLoadError = [detail, machineLoadError].compactMap { $0 }.joined(separator: "\n\n")
+            configReloadRequired = true
             configChangedOnDisk = true
             lastConfigError = "Reload failed: \(error)"
         }
@@ -523,7 +544,7 @@ final class AppModel: ObservableObject {
                     // A failed reload must retain the only production reload
                     // affordance even if fleet sync restores the exact bytes
                     // already represented by `configFingerprint`.
-                    self.configChangedOnDisk = self.configLoadError != nil
+                    self.configChangedOnDisk = self.configReloadRequired
                         || observedFingerprint != self.configFingerprint
                 }
             }
@@ -661,6 +682,7 @@ struct HelperMessage: Equatable, Sendable, Identifiable {
 enum AppModelError: LocalizedError {
     case configUnreadable(String)
     case machineUnreadable(String)
+    case secretRollbackFailed(original: String, rollback: String)
 
     var errorDescription: String? {
         switch self {
@@ -669,6 +691,10 @@ enum AppModelError: LocalizedError {
         case .machineUnreadable(let detail):
             return "Restic Station cannot save this machine's settings while machine.json is unreadable — "
                 + "writing it now would replace this machine's identity with a generated one.\n\n\(detail)"
+        case .secretRollbackFailed(let original, let rollback):
+            return "The destination save failed (\(original)), and its previous keychain values could not "
+                + "be restored (\(rollback)). Re-open the destination and verify its credentials before "
+                + "running a backup."
         }
     }
 }

@@ -13,6 +13,18 @@ import ResticStationCore
 /// before it touches disk; nothing here bypasses it.
 extension AppModel {
 
+    struct DestinationSecretsRollback: Sendable {
+        enum Password: Sendable {
+            case unchanged
+            case absent
+            case value(String)
+        }
+
+        let destId: UUID
+        let password: Password
+        let secretEnv: [String: String]?
+    }
+
     // MARK: - Collaborators
 
     /// The secret store this app writes destination passwords into — the
@@ -33,11 +45,7 @@ extension AppModel {
     /// unrecognised — deliberately a hard error rather than a silent
     /// fallback to the wrong store.
     func makeSecretStore() throws -> any SecretStore {
-        try SecretStoreFactory.make(
-            paths: paths,
-            runner: DefaultProcessRunner(),
-            helperExecutablePath: HelperInvoker.helperURL.path
-        )
+        try secretStoreFactory()
     }
 
     /// `makeSecretStore()` for the call sites that can only degrade (reading
@@ -131,35 +139,94 @@ extension AppModel {
     /// items). A `nil` argument means "leave what is there alone": an empty
     /// password field on an existing destination keeps the stored password
     /// rather than clobbering it.
+    @discardableResult
     func storeDestinationSecrets(
         destId: UUID,
         password: String?,
         secretEnv: [String: String]?,
         ifConfigUnchangedFrom expectedFingerprint: String
-    ) async throws {
-        // Refuse a stale editor before opening or mutating the secret store.
-        // `saveSet` still performs the authoritative atomic CAS after these
-        // writes, covering a replacement that lands later.
+    ) async throws -> DestinationSecretsRollback {
         if let configLoadError {
             throw AppModelError.configUnreadable(configLoadError)
         }
+        let store = try makeSecretStore()
+        var rollback: DestinationSecretsRollback?
         do {
-            try configStore.assertUnchanged(from: expectedFingerprint)
+            return try await configStore.withUnchangedRevision(from: expectedFingerprint) {
+                let priorPassword: DestinationSecretsRollback.Password
+                if password?.isEmpty == false {
+                    do {
+                        priorPassword = .value(try await store.password(destId: destId))
+                    } catch SecretStoreError.itemNotFound {
+                        priorPassword = .absent
+                    }
+                } else {
+                    priorPassword = .unchanged
+                }
+                let priorSecretEnv: [String: String]? = if secretEnv == nil {
+                    nil
+                } else {
+                    try await store.secretEnv(destId: destId)
+                }
+                let snapshot = DestinationSecretsRollback(
+                    destId: destId,
+                    password: priorPassword,
+                    secretEnv: priorSecretEnv
+                )
+                rollback = snapshot
+
+                if let password, !password.isEmpty {
+                    try await store.setPassword(password, destId: destId)
+                }
+                if let secretEnv {
+                    if secretEnv.isEmpty {
+                        try await store.deleteSecretEnv(destId: destId)
+                    } else {
+                        try await store.setSecretEnv(secretEnv, destId: destId)
+                    }
+                }
+                return snapshot
+            }
         } catch {
+            if let rollback {
+                do {
+                    try await restoreDestinationSecrets(rollback, using: store)
+                } catch let rollbackError {
+                    throw AppModelError.secretRollbackFailed(
+                        original: "\(error)", rollback: "\(rollbackError)"
+                    )
+                }
+            }
             if case ConfigStoreError.changedOnDisk = error {
                 noteConfigChangedOnDisk()
             }
             throw error
         }
-        let store = try makeSecretStore()
-        if let password, !password.isEmpty {
-            try await store.setPassword(password, destId: destId)
+    }
+
+    /// Restores the exact fields the editor changed when the subsequent
+    /// config CAS refuses. Fields the editor left alone are not touched.
+    func restoreDestinationSecrets(_ rollback: DestinationSecretsRollback) async throws {
+        try await restoreDestinationSecrets(rollback, using: makeSecretStore())
+    }
+
+    private func restoreDestinationSecrets(
+        _ rollback: DestinationSecretsRollback,
+        using store: any SecretStore
+    ) async throws {
+        switch rollback.password {
+        case .unchanged:
+            break
+        case .absent:
+            try await store.deletePassword(destId: rollback.destId)
+        case .value(let password):
+            try await store.setPassword(password, destId: rollback.destId)
         }
-        if let secretEnv {
+        if let secretEnv = rollback.secretEnv {
             if secretEnv.isEmpty {
-                try await store.deleteSecretEnv(destId: destId)
+                try await store.deleteSecretEnv(destId: rollback.destId)
             } else {
-                try await store.setSecretEnv(secretEnv, destId: destId)
+                try await store.setSecretEnv(secretEnv, destId: rollback.destId)
             }
         }
     }
