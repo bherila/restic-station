@@ -234,6 +234,10 @@ public struct RunMetadata: Codable, Equatable, Sendable {
     /// derived index append and clears it only after that append is durable.
     /// Recovery may finish this mechanical transaction automatically.
     public var indexPublicationPending: Bool?
+    /// Version of the crash-durability contract used to publish this
+    /// canonical metadata record. Missing on legacy records whose visible
+    /// rename may not have been synced to stable storage.
+    public var publicationDurabilityContractVersion: Int?
 
     public init(
         runId: String,
@@ -258,7 +262,8 @@ public struct RunMetadata: Codable, Equatable, Sendable {
         destructiveAuditContractVersion: Int? = nil,
         destructiveLaunchAuthorizedAt: Date? = nil,
         auditFailureReason: RunAuditFailureReason? = nil,
-        indexPublicationPending: Bool? = nil
+        indexPublicationPending: Bool? = nil,
+        publicationDurabilityContractVersion: Int? = nil
     ) {
         self.runId = runId
         self.kind = kind
@@ -283,6 +288,7 @@ public struct RunMetadata: Codable, Equatable, Sendable {
         self.destructiveLaunchAuthorizedAt = destructiveLaunchAuthorizedAt
         self.auditFailureReason = auditFailureReason
         self.indexPublicationPending = indexPublicationPending
+        self.publicationDurabilityContractVersion = publicationDurabilityContractVersion
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -290,7 +296,7 @@ public struct RunMetadata: Codable, Equatable, Sendable {
         case pid, resticExitCode, argvRedacted
         case snapshotId, filesNew, filesChanged, dataAdded, errorSummary, stats, purgeSnapshotRewrites
         case destructiveAuditContractVersion, destructiveLaunchAuthorizedAt
-        case auditFailureReason, indexPublicationPending
+        case auditFailureReason, indexPublicationPending, publicationDurabilityContractVersion
     }
 
     // Explicit `null` for nil optionals — see AppConfig.encode(to:).
@@ -319,6 +325,10 @@ public struct RunMetadata: Codable, Equatable, Sendable {
         try container.encode(destructiveLaunchAuthorizedAt, forKey: .destructiveLaunchAuthorizedAt)
         try container.encode(auditFailureReason, forKey: .auditFailureReason)
         try container.encode(indexPublicationPending, forKey: .indexPublicationPending)
+        try container.encode(
+            publicationDurabilityContractVersion,
+            forKey: .publicationDurabilityContractVersion
+        )
     }
 
     /// The compact index-line projection of this metadata, appended to

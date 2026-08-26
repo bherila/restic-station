@@ -207,6 +207,7 @@ public struct RunStore: Sendable {
     /// be pre-launch. Missing or unknown versions predate that guarantee and
     /// are treated as an unknown repository outcome while still running.
     public static let destructiveAuditContractVersion = 1
+    private static let publicationDurabilityContractVersion = 1
 
     public init(paths: AppPaths) {
         self.init(
@@ -269,13 +270,17 @@ public struct RunStore: Sendable {
         trigger: RunTrigger,
         groupId: String? = nil
     ) throws -> ActiveRun {
-        let directorySyncChain = missingDirectorySyncChain(to: paths.runsDir)
+        let newlyCreatedSyncChain = missingDirectorySyncChain(to: paths.runsDir)
         try paths.ensureDirectories()
-        // `ensureDirectories()` may have created several ancestors at once.
-        // Persist every new directory entry, bottom-up, before any operation
-        // can reach its launch boundary. Syncing only `runs/` would still let
-        // a crash lose `runs/`, the data root, or another newly-created
-        // ancestor from its parent directory.
+        // Another setup path (notably Tick) may have created this hierarchy
+        // immediately before begin. Always confirm runs/, the data root, and
+        // the data-root parent; also preserve every additional ancestor this
+        // call itself had to create.
+        var directorySyncChain = newlyCreatedSyncChain
+        for required in [paths.runsDir, paths.root, paths.root.deletingLastPathComponent()]
+            where !directorySyncChain.contains(where: { $0.path == required.path }) {
+            directorySyncChain.append(required)
+        }
         for directory in directorySyncChain {
             try syncDirectory(directory)
         }
@@ -314,7 +319,8 @@ public struct RunStore: Sendable {
             purgeSnapshotRewrites: nil,
             destructiveAuditContractVersion: kind.isDestructive
                 ? Self.destructiveAuditContractVersion
-                : nil
+                : nil,
+            publicationDurabilityContractVersion: Self.publicationDurabilityContractVersion
         )
         let runDirectory = paths.runDir(runId: runId)
         try FileManager.default.createDirectory(at: runDirectory, withIntermediateDirectories: true)
@@ -410,7 +416,8 @@ public struct RunStore: Sendable {
             destructiveAuditContractVersion: destructiveAuditContractVersion,
             destructiveLaunchAuthorizedAt: destructiveLaunchAuthorizedAt,
             auditFailureReason: auditFailureReason,
-            indexPublicationPending: true
+            indexPublicationPending: true,
+            publicationDurabilityContractVersion: Self.publicationDurabilityContractVersion
         )
         try writeMetadataAtomic(metadata)
         try appendIndexEntry(metadata.indexEntry)
@@ -519,11 +526,15 @@ public struct RunStore: Sendable {
                 // explicit destructive audit failure. Non-destructive history
                 // can publish a corrective last projection safely.
                 let projections = indexedByRunId[metadata.runId, default: []]
+                let needsDurabilityUpgrade = metadata.publicationDurabilityContractVersion
+                    != Self.publicationDurabilityContractVersion
                 var projectionIsDurable = false
                 if projections.isEmpty {
                     var pending = metadata
-                    if pending.indexPublicationPending != true {
+                    if pending.indexPublicationPending != true || needsDurabilityUpgrade {
                         pending.indexPublicationPending = true
+                        pending.publicationDurabilityContractVersion =
+                            Self.publicationDurabilityContractVersion
                         try writeMetadataAtomic(pending)
                     }
                     let projection = pending.indexEntry
@@ -532,18 +543,33 @@ public struct RunStore: Sendable {
                     projectionIsDurable = true
                 } else if projections == [metadata.indexEntry] {
                     // The recovery snapshot was fsynced before it was decoded,
-                    // so this exact projection is now durably confirmed even
-                    // for legacy metadata that predates the pending marker.
+                    // but legacy canonical metadata also needs durable
+                    // republication before the pair can be accepted.
+                    if needsDurabilityUpgrade {
+                        var upgraded = metadata
+                        upgraded.publicationDurabilityContractVersion =
+                            Self.publicationDurabilityContractVersion
+                        try writeMetadataAtomic(upgraded)
+                    }
                     projectionIsDurable = true
                 } else if !metadata.kind.isDestructive {
                     if projections.last == metadata.indexEntry {
                         // The initial recovery snapshot confirmed this final
-                        // physical projection durably as well.
+                        // physical projection durably as well. Upgrade legacy
+                        // canonical metadata before accepting the pair.
+                        if needsDurabilityUpgrade {
+                            var upgraded = metadata
+                            upgraded.publicationDurabilityContractVersion =
+                                Self.publicationDurabilityContractVersion
+                            try writeMetadataAtomic(upgraded)
+                        }
                         projectionIsDurable = true
                     } else {
                         var pending = metadata
-                        if pending.indexPublicationPending != true {
+                        if pending.indexPublicationPending != true || needsDurabilityUpgrade {
                             pending.indexPublicationPending = true
+                            pending.publicationDurabilityContractVersion =
+                                Self.publicationDurabilityContractVersion
                             try writeMetadataAtomic(pending)
                         }
                         let projection = pending.indexEntry
@@ -557,6 +583,8 @@ public struct RunStore: Sendable {
                        || (!metadata.kind.isDestructive && projections.last != metadata.indexEntry)) {
                     var reconciled = metadata
                     reconciled.indexPublicationPending = nil
+                    reconciled.publicationDurabilityContractVersion =
+                        Self.publicationDurabilityContractVersion
                     try writeMetadataAtomic(reconciled)
                 }
                 continue
@@ -575,6 +603,7 @@ public struct RunStore: Sendable {
                 updated.errorSummary = "interrupted"
             }
             updated.indexPublicationPending = true
+            updated.publicationDurabilityContractVersion = Self.publicationDurabilityContractVersion
             try writeMetadataAtomic(updated)
             let projections = indexedByRunId[updated.runId, default: []]
             var projectionIsDurable = false
@@ -829,6 +858,13 @@ public struct RunStore: Sendable {
                         ? nil
                         : .launchedWithoutTerminalMetadata
                 }
+            } else if metadata.publicationDurabilityContractVersion
+                != Self.publicationDurabilityContractVersion {
+                // A visible legacy canonical rename is not proof that its
+                // file and directory entry reached stable storage. Recovery
+                // must durably republish it before verification can authorize
+                // another destructive operation.
+                reason = .terminalMetadataMissingIndex
             } else if metadata.indexPublicationPending == true {
                 // The index line may be absent, partial, or fully visible but
                 // not durably confirmed. Treat all three as one incomplete
@@ -959,16 +995,14 @@ public struct RunStore: Sendable {
     private func decodeIndexEntries(_ data: Data?) -> [RunIndexEntry] {
         guard let data else { return [] }
         let indexFile = paths.runsIndexFile
-        guard let text = String(data: data, encoding: .utf8) else {
-            warn("RunStore: \(indexFile.path) is not valid UTF-8; treating as empty")
-            return []
-        }
-
         let decoder = ConfigStore.makeDecoder()
         var results: [RunIndexEntry] = []
-        for (offset, rawLine) in text.split(separator: "\n", omittingEmptySubsequences: true).enumerated() {
+        // Decode at byte-line boundaries. A torn UTF-8 scalar in one
+        // newline-terminated legacy record must not hide valid JSON records
+        // before or after it.
+        for (offset, rawLine) in data.split(separator: 0x0A, omittingEmptySubsequences: true).enumerated() {
             let lineNumber = offset + 1
-            let lineData = Data(rawLine.utf8)
+            let lineData = Data(rawLine)
             do {
                 results.append(try decoder.decode(RunIndexEntry.self, from: lineData))
             } catch {

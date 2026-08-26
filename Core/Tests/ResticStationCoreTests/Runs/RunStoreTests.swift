@@ -400,6 +400,40 @@ private func setRunStoreTestErrno(_ value: Int32) {
         #expect(callsBeforePublication.value >= 3)
     }
 
+    @Test("begin syncs the history hierarchy even when scheduler setup created it first")
+    func beginSyncsPrecreatedHistoryAncestors() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+        try paths.ensureDirectories()
+        let live = RunStoreFileOperations.live
+        let syncCalls = Box(0)
+        let callsBeforePublication = Box(0)
+        let operations = RunStoreFileOperations(
+            openAt: live.openAt,
+            write: live.write,
+            sync: { fd in
+                syncCalls.value += 1
+                return live.sync(fd)
+            },
+            renameAt: live.renameAt,
+            unlinkAt: live.unlinkAt
+        )
+        let store = RunStore(
+            paths: paths,
+            now: { Date() },
+            initialPublicationHook: { _ in
+                callsBeforePublication.value = syncCalls.value
+            },
+            fileOperations: operations
+        )
+
+        _ = try store.begin(kind: .prune, setId: UUID(), destId: UUID(), trigger: .scheduled)
+
+        // runs/, the data root, and its parent are confirmed even though the
+        // scheduler made the whole hierarchy visible before begin.
+        #expect(callsBeforePublication.value >= 3)
+    }
+
     @Test("durable writes retry EINTR and complete every short write")
     func durableWritesCompleteShortWritesAndRetryEINTR() throws {
         let paths = makePaths()
@@ -677,6 +711,35 @@ private func setRunStoreTestErrno(_ value: Int32) {
         #expect(repairedLines.count == 1)
     }
 
+    @Test("recovery decodes valid records around an invalid UTF-8 interior line")
+    func recoveryPreservesIndexAroundInteriorInvalidUTF8() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+        let store = RunStore(paths: paths, now: { Date() })
+        let first = try store.begin(kind: .prune, setId: UUID(), destId: UUID(), trigger: .manual)
+        try store.markDestructiveLaunchAuthorized(first)
+        try store.finish(first, status: .success, resticExitCode: 0)
+        let second = try store.begin(kind: .prune, setId: UUID(), destId: UUID(), trigger: .manual)
+        try store.markDestructiveLaunchAuthorized(second)
+        try store.finish(second, status: .success, resticExitCode: 0)
+
+        let validLines = try Data(contentsOf: paths.runsIndexFile)
+            .split(separator: 0x0A, omittingEmptySubsequences: true)
+        #expect(validLines.count == 2)
+        var damaged = Data(validLines[0])
+        damaged.append(0x0A)
+        damaged.append(contentsOf: [0x7B, 0x22, 0x78, 0x22, 0x3A, 0xF0, 0x9F, 0x0A])
+        damaged.append(Data(validLines[1]))
+        damaged.append(0x0A)
+        try damaged.write(to: paths.runsIndexFile)
+
+        #expect(try store.recoverInterrupted().isEmpty)
+        #expect(Set(try store.recentRuns(limit: 10).map(\.runId)) == [first.runId, second.runId])
+        #expect(try store.unresolvedAuditFailures().isEmpty)
+        #expect(try Data(contentsOf: paths.runsIndexFile)
+            .split(separator: 0x0A, omittingEmptySubsequences: true).count == 3)
+    }
+
     @Test("legacy recovery commits a pending marker before attempting its missing index append")
     func legacyRecoveryMarksPendingBeforeAppend() throws {
         let paths = makePaths()
@@ -761,6 +824,27 @@ private func setRunStoreTestErrno(_ value: Int32) {
         #expect(try recoveringStore.recoverInterrupted().isEmpty)
         #expect(indexSyncCalls.value > 0)
         #expect(try recoveringStore.unresolvedAuditFailures().isEmpty)
+    }
+
+    @Test("recovery durably republishes exact legacy canonical metadata")
+    func legacyMatchingMetadataIsRepublishedDurably() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+        let store = RunStore(paths: paths, now: { Date() })
+        let run = try store.begin(kind: .prune, setId: UUID(), destId: UUID(), trigger: .manual)
+        try store.markDestructiveLaunchAuthorized(run)
+        try store.finish(run, status: .success, resticExitCode: 0)
+        let indexBefore = try Data(contentsOf: paths.runsIndexFile)
+
+        var legacy = try store.metadata(runId: run.runId)
+        legacy.publicationDurabilityContractVersion = nil
+        try writeRawMetadata(legacy, paths: paths)
+
+        #expect(try store.unresolvedAuditFailures().first?.reason == .terminalMetadataMissingIndex)
+        #expect(try store.recoverInterrupted().isEmpty)
+        #expect(try store.metadata(runId: run.runId).publicationDurabilityContractVersion == 1)
+        #expect(try Data(contentsOf: paths.runsIndexFile) == indexBefore)
+        #expect(try store.unresolvedAuditFailures().isEmpty)
     }
 
     @Test("repairing an older projection cannot replace the latest run")
