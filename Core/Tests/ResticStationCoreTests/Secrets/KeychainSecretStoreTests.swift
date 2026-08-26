@@ -384,6 +384,51 @@ struct KeychainSecretStoreTests {
         #expect(runner.invocations[5].argv[7] == "original-password")
     }
 
+    @Test("a failed generation write never recreates an untouched credential")
+    func failedGenerationWriteRestoresOnlyItsMarker() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-keychain-generation-stage-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let generationAccount = "\(Self.account)-generation"
+        let runner = FakeProcessRunner(script: [
+            .init(
+                argvPrefix: ["/usr/bin/security", "find-generic-password"],
+                stdoutLines: ["original-password"]
+            ),
+            .init(
+                argvPrefix: ["/usr/bin/security", "find-generic-password"],
+                stdoutLines: ["original-generation"]
+            ),
+            .init(argvPrefix: ["/usr/bin/security", "delete-generic-password"], exitCode: 0),
+            .init(
+                argvPrefix: ["/usr/bin/security", "add-generic-password"],
+                stderr: "injected generation failure",
+                exitCode: 1
+            ),
+            .init(argvPrefix: ["/usr/bin/security", "delete-generic-password"], exitCode: 44),
+            .init(argvPrefix: ["/usr/bin/security", "add-generic-password"], exitCode: 0),
+        ])
+        let client = KeychainSecretStore(runner: runner, paths: AppPaths(root: root))
+
+        await #expect(throws: SecretStoreError.backendFailed("injected generation failure")) {
+            _ = try await client.updateDestinationSecrets(
+                DestinationSecretUpdate(
+                    destId: Self.destId,
+                    password: "new-password",
+                    secretEnv: nil
+                )
+            )
+        }
+
+        #expect(runner.invocations.count == 6)
+        #expect(runner.invocations.dropFirst().allSatisfy { invocation in
+            guard let accountIndex = invocation.argv.firstIndex(of: "-a"),
+                  accountIndex + 1 < invocation.argv.count else { return false }
+            return invocation.argv[accountIndex + 1] == generationAccount
+        })
+        #expect(runner.invocations.last?.argv[7] == "original-generation")
+    }
+
     @Test("a failed conditional replacement remains retryable without deleting the installed item")
     func conditionalRollbackReplacementIsAtomicAndRetryable() async throws {
         let root = FileManager.default.temporaryDirectory

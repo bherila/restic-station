@@ -162,27 +162,31 @@ public struct KeychainSecretStore: SecretStore {
                     SecretRollbackGeneration(installed: $0, previous: previousEnvGeneration)
                 }
             )
-            var passwordMutationBegan = false
-            var environmentMutationBegan = false
+            var passwordGenerationMutationBegan = false
+            var passwordCredentialMutationBegan = false
+            var environmentGenerationMutationBegan = false
+            var environmentCredentialMutationBegan = false
             do {
                 if let password = update.password {
-                    passwordMutationBegan = true
                     if let installedPasswordGeneration {
+                        passwordGenerationMutationBegan = true
                         try await setValue(
                             installedPasswordGeneration,
                             account: generationAccount(for: passwordAccount)
                         )
                     }
+                    passwordCredentialMutationBegan = true
                     try await setValue(password, account: passwordAccount)
                 }
                 if let env = update.secretEnv {
-                    environmentMutationBegan = true
                     if let installedEnvGeneration {
+                        environmentGenerationMutationBegan = true
                         try await setValue(
                             installedEnvGeneration,
                             account: generationAccount(for: envAccount)
                         )
                     }
+                    environmentCredentialMutationBegan = true
                     if env.isEmpty {
                         try await deleteValueTolerant(account: envAccount)
                     } else {
@@ -194,18 +198,20 @@ public struct KeychainSecretStore: SecretStore {
                 // values here repairs a partial delete/add sequence without
                 // risking an external mutation.
                 do {
-                    if passwordMutationBegan {
+                    if passwordCredentialMutationBegan {
                         if let previousPassword {
                             try await setValue(previousPassword, account: passwordAccount)
                         } else {
                             try await deleteValueTolerant(account: passwordAccount)
                         }
+                    }
+                    if passwordGenerationMutationBegan {
                         try await restoreGeneration(
                             previousPasswordGeneration,
                             account: passwordAccount
                         )
                     }
-                    if environmentMutationBegan {
+                    if environmentCredentialMutationBegan {
                         if let previousEnvRaw {
                             try await setValue(previousEnvRaw, account: envAccount)
                         } else if let previousEnv, !previousEnv.isEmpty {
@@ -213,6 +219,8 @@ public struct KeychainSecretStore: SecretStore {
                         } else {
                             try await deleteValueTolerant(account: envAccount)
                         }
+                    }
+                    if environmentGenerationMutationBegan {
                         try await restoreGeneration(previousEnvGeneration, account: envAccount)
                     }
                 } catch {

@@ -443,16 +443,14 @@ final class AppModel: ObservableObject {
     func reloadConfigFromDisk() async {
         configReloadGeneration &+= 1
         let requestGeneration = configReloadGeneration
+        let watcherRevisionAtStart = stateWatcher.configFileRevision
         do {
             let snapshot = try await configSnapshotLoader()
             guard requestGeneration == configReloadGeneration else { return }
             let liveFingerprint = try await configRevisionLoader()
             guard requestGeneration == configReloadGeneration else { return }
-            let observedFingerprint = stateWatcher.configFileFingerprint
-            let watcherObservedAnotherRevision = observedFingerprint != configFingerprint
-                && observedFingerprint != snapshot.fingerprint
             guard liveFingerprint == snapshot.fingerprint,
-                  !watcherObservedAnotherRevision else {
+                  stateWatcher.configFileRevision == watcherRevisionAtStart else {
                 configChangedOnDisk = true
                 lastConfigError = "Settings changed again while Reload Settings was reading them. Reload again."
                 return

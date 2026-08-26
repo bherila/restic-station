@@ -58,6 +58,10 @@ public final class StateWatcher: ObservableObject {
     /// sentinel for absence/unreadability. AppModel compares this with the
     /// revision its editors loaded; StateWatcher never decodes the config.
     @Published public private(set) var configFileFingerprint: String
+    /// Advances on every observed config revision, even when the bytes later
+    /// return to an earlier fingerprint. AppModel uses this ABA-safe identity
+    /// to reject reload results overtaken by B -> A replacement sequences.
+    @Published public private(set) var configFileRevision: UInt64 = 0
 
     private let paths: AppPaths
     private let runStore: RunStore
@@ -308,6 +312,7 @@ public final class StateWatcher: ObservableObject {
         let observedConfigFingerprint = ConfigStore(paths: paths).fileFingerprint()
         if configFileFingerprint != observedConfigFingerprint {
             configFileFingerprint = observedConfigFingerprint
+            configFileRevision &+= 1
         }
         lockingFailure = LockingHealth.probe(
             paths: paths,

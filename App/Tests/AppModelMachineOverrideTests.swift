@@ -592,6 +592,58 @@ struct AppModelMachineOverrideTests {
         #expect(model.configFingerprint == "newer")
     }
 
+    @Test("reload rejects a watcher revision that returns to its starting fingerprint")
+    func reloadRejectsWatcherABACycle() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-reload-aba-app-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let paths = AppPaths(root: root)
+        let original = AppConfig(showMenuBarIcon: true)
+        let replacement = AppConfig(showMenuBarIcon: false)
+        let store = ConfigStore(paths: paths)
+        try store.save(original)
+        let originalBytes = try Data(contentsOf: paths.configFile)
+        let replacementBytes = try ConfigStore.makeEncoder().encode(replacement)
+        try replacementBytes.write(to: paths.configFile, options: .atomic)
+        let replacementFingerprint = store.fileFingerprint()
+        try originalBytes.write(to: paths.configFile, options: .atomic)
+        let replacementSnapshot = ConfigSnapshot(
+            bytes: replacementBytes,
+            fingerprint: replacementFingerprint,
+            config: replacement
+        )
+        let snapshots = SequencedConfigSnapshotLoader(
+            first: replacementSnapshot,
+            second: replacementSnapshot
+        )
+        let model = AppModel(
+            paths: paths,
+            configSnapshotLoader: { await snapshots.load() },
+            // Simulates the completed revalidation of B just before the
+            // watcher publishes the later replacement back to A.
+            configRevisionLoader: { replacementFingerprint }
+        )
+
+        let reload = Task { @MainActor in await model.reloadConfigFromDisk() }
+        for _ in 0..<40 {
+            if await snapshots.firstRequestIsWaiting() { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        #expect(await snapshots.firstRequestIsWaiting())
+
+        try replacementBytes.write(to: paths.configFile, options: .atomic)
+        model.stateWatcher.reloadNow()
+        try ConfigStore.makeEncoder().encode(original).write(to: paths.configFile, options: .atomic)
+        model.stateWatcher.reloadNow()
+        await snapshots.releaseFirstRequest()
+        await reload.value
+
+        #expect(model.config == original)
+        #expect(model.configChangedOnDisk)
+        #expect(model.lastConfigError?.contains("changed again") == true)
+    }
+
     @Test("an app save invalidates a reload already off the main actor")
     func appSaveInvalidatesPendingReload() async throws {
         let root = FileManager.default.temporaryDirectory
