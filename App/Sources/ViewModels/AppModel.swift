@@ -112,6 +112,10 @@ final class AppModel: ObservableObject {
     /// its parent editor session is still alive.
     var activeSecretEditorSessions: Set<UUID> = []
     var unclaimedSecretEditorRollbacks: [UUID: [DestinationSecretsRollback]] = [:]
+    /// Claimed tokens remain indexed here while SwiftUI owns the matching
+    /// value copies, so one editor can detect a newer live mutation before
+    /// attempting an out-of-order explicit Revert.
+    var claimedSecretEditorRollbacks: [UUID: [DestinationSecretsRollback]] = [:]
     /// Global mutation order, independent of which SwiftUI editor happens to
     /// disappear first. Rollback and commit cutoffs use these sequence values
     /// to preserve cross-window credential causality.
@@ -828,6 +832,7 @@ enum AppModelError: LocalizedError {
     case configUnreadable(String)
     case machineUnreadable(String)
     case secretRollbackFailed(original: String, rollback: String)
+    case newerSecretEditorMutation
 
     var errorDescription: String? {
         switch self {
@@ -840,6 +845,9 @@ enum AppModelError: LocalizedError {
             return "The destination save failed (\(original)), and its previous keychain values could not "
                 + "be restored (\(rollback)). Re-open the destination and verify its credentials before "
                 + "running a backup."
+        case .newerSecretEditorMutation:
+            return "A newer credential edit is still open or awaiting restoration. Finish or close the "
+                + "newer edit, or close this editor so Restic Station can restore credentials in order."
         }
     }
 }

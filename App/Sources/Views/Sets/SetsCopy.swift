@@ -281,7 +281,7 @@ enum SetsCopy {
             case .configUnreadable:
                 return (appError.errorDescription ?? "The configuration is unreadable.")
                     + "\n\nNo keychain item was changed."
-            case .machineUnreadable, .secretRollbackFailed:
+            case .machineUnreadable, .secretRollbackFailed, .newerSecretEditorMutation:
                 return appError.errorDescription ?? "\(appError)"
             }
         }

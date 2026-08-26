@@ -1055,6 +1055,127 @@ struct AppModelMachineOverrideTests {
         #expect(try await secrets.password(destId: destinationId) == "original-password")
     }
 
+    @Test("an older explicit revert waits for a newer live editor mutation")
+    func explicitRevertDefersToNewerLiveEditor() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-secret-live-revert-order-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let destinationId = UUID()
+        let olderSession = UUID()
+        let newerSession = UUID()
+        let secrets = CheckpointingSecretStore(passwords: [destinationId: "original-password"])
+        let model = AppModel(paths: AppPaths(root: root), secretStoreFactory: { secrets })
+        model.beginSecretEditorSession(olderSession)
+        let older = try await model.storeDestinationSecrets(
+            destId: destinationId,
+            password: "older-editor-password",
+            secretEnv: nil,
+            ifConfigUnchangedFrom: model.configFingerprint,
+            editorSessionId: olderSession
+        )
+        #expect(model.claimEditorSecretRollback(older, sessionId: olderSession))
+
+        model.beginSecretEditorSession(newerSession)
+        let newer = try await model.storeDestinationSecrets(
+            destId: destinationId,
+            password: "newer-editor-password",
+            secretEnv: nil,
+            ifConfigUnchangedFrom: model.configFingerprint,
+            editorSessionId: newerSession
+        )
+        #expect(model.claimEditorSecretRollback(newer, sessionId: newerSession))
+
+        var olderRemaining = [older]
+        do {
+            _ = try await model.restoreDestinationSecrets(
+                olderRemaining,
+                editorSessionId: olderSession,
+                onProgress: { olderRemaining = $0 }
+            )
+            Issue.record("expected the older revert to defer")
+        } catch AppModelError.newerSecretEditorMutation {
+            // Expected: no secret I/O and no progress-token loss.
+        }
+        #expect(olderRemaining.count == 1)
+        #expect(olderRemaining.first?.sequence == older.sequence)
+        #expect(try await secrets.password(destId: destinationId) == "newer-editor-password")
+
+        var newerRemaining = [newer]
+        _ = try await model.restoreDestinationSecrets(
+            newerRemaining,
+            editorSessionId: newerSession,
+            onProgress: { newerRemaining = $0 }
+        )
+        #expect(newerRemaining.isEmpty)
+        #expect(try await secrets.password(destId: destinationId) == "older-editor-password")
+
+        _ = try await model.restoreDestinationSecrets(
+            olderRemaining,
+            editorSessionId: olderSession,
+            onProgress: { olderRemaining = $0 }
+        )
+        #expect(olderRemaining.isEmpty)
+        #expect(try await secrets.password(destId: destinationId) == "original-password")
+        model.endSecretEditorSession(newerSession)
+        model.endSecretEditorSession(olderSession)
+    }
+
+    @Test("an older explicit revert waits for a newer queued mutation")
+    func explicitRevertDefersToNewerQueuedMutation() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-secret-queued-revert-order-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let destinationId = UUID()
+        let olderSession = UUID()
+        let newerSession = UUID()
+        let secrets = CheckpointingSecretStore(passwords: [destinationId: "original-password"])
+        let model = AppModel(paths: AppPaths(root: root), secretStoreFactory: { secrets })
+        model.beginSecretEditorSession(olderSession)
+        let older = try await model.storeDestinationSecrets(
+            destId: destinationId,
+            password: "older-editor-password",
+            secretEnv: nil,
+            ifConfigUnchangedFrom: model.configFingerprint,
+            editorSessionId: olderSession
+        )
+        #expect(model.claimEditorSecretRollback(older, sessionId: olderSession))
+
+        model.beginSecretEditorSession(newerSession)
+        let newer = try await model.storeDestinationSecrets(
+            destId: destinationId,
+            password: "newer-editor-password",
+            secretEnv: nil,
+            ifConfigUnchangedFrom: model.configFingerprint,
+            editorSessionId: newerSession
+        )
+        #expect(model.claimEditorSecretRollback(newer, sessionId: newerSession))
+        model.endSecretEditorSession(newerSession, claimedRollbacks: [newer])
+
+        var olderRemaining = [older]
+        do {
+            _ = try await model.restoreDestinationSecrets(
+                olderRemaining,
+                editorSessionId: olderSession,
+                onProgress: { olderRemaining = $0 }
+            )
+            Issue.record("expected the older revert to defer")
+        } catch AppModelError.newerSecretEditorMutation {
+            // Expected: the queued newer rollback must run first.
+        }
+        #expect(olderRemaining.count == 1)
+        #expect(try await secrets.password(destId: destinationId) == "newer-editor-password")
+
+        model.endSecretEditorSession(olderSession, claimedRollbacks: olderRemaining)
+        for _ in 0..<40 {
+            if model.pendingSecretRollbackBatches.isEmpty { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(model.pendingSecretRollbackBatches.isEmpty)
+        #expect(try await secrets.password(destId: destinationId) == "original-password")
+    }
+
     @Test("an older rollback waits until a live editor registers its newer transaction")
     func abandonedRollbackWaitsForActiveEditor() async throws {
         let root = FileManager.default.temporaryDirectory

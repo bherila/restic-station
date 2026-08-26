@@ -719,7 +719,10 @@ struct DestinationEditorView: View {
             // the edited URL/environment with restored credentials.
             set = committed.original
             do {
-                try await model.restoreDestinationSecrets(committed.secretsRollback)
+                try await model.restoreDestinationSecrets(
+                    committed.secretsRollback,
+                    editorSessionId: secretEditorSessionID
+                )
             } catch let rollbackError {
                 message = .error("The backup set could not be saved (\(error)), and the previous keychain "
                     + "values could not be restored (\(rollbackError)). Re-open this destination and "

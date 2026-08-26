@@ -327,6 +327,7 @@ struct SetEditorView: View {
         do {
             try await model.restoreDestinationSecrets(
                 pendingSecretRollbacks,
+                editorSessionId: secretEditorSessionID,
                 onProgress: { pendingSecretRollbacks = $0 }
             )
             return nil

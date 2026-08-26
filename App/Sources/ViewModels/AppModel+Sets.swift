@@ -213,6 +213,7 @@ extension AppModel {
         claimedRollbacks: [DestinationSecretsRollback] = []
     ) {
         activeSecretEditorSessions.remove(sessionId)
+        claimedSecretEditorRollbacks.removeValue(forKey: sessionId)
         // Keep claimed and still-parked mutations together for ownership;
         // each token's global sequence, not this array's insertion order,
         // determines the eventual rollback order.
@@ -233,7 +234,7 @@ extension AppModel {
     ) -> Bool {
         guard activeSecretEditorSessions.contains(sessionId),
               var parked = unclaimedSecretEditorRollbacks[sessionId],
-              let index = parked.firstIndex(where: { $0.transaction == rollback.transaction }) else {
+              let index = parked.firstIndex(where: { $0.sequence == rollback.sequence }) else {
             return false
         }
         parked.remove(at: index)
@@ -242,6 +243,7 @@ extension AppModel {
         } else {
             unclaimedSecretEditorRollbacks[sessionId] = parked
         }
+        claimedSecretEditorRollbacks[sessionId, default: []].append(rollback)
         return true
     }
 
@@ -259,16 +261,24 @@ extension AppModel {
     /// Restores the exact fields the editor changed when the subsequent
     /// config CAS refuses. Fields the editor left alone are not touched.
     @discardableResult
-    func restoreDestinationSecrets(_ rollback: DestinationSecretsRollback) async throws -> Bool {
-        let store = try makeSecretStore()
+    func restoreDestinationSecrets(
+        _ rollback: DestinationSecretsRollback,
+        editorSessionId: UUID? = nil
+    ) async throws -> Bool {
         var remaining = [rollback]
         do {
             return try await restoreDestinationSecrets(
                 [rollback],
-                using: store,
+                editorSessionId: editorSessionId,
                 onProgress: { remaining = $0 }
             )
         } catch {
+            if let editorSessionId {
+                removeClaimedSecretRollbacks(
+                    withSequences: Set(remaining.map(\.sequence)),
+                    sessionId: editorSessionId
+                )
+            }
             retainPendingSecretRollbacks(remaining)
             throw error
         }
@@ -281,14 +291,78 @@ extension AppModel {
     @discardableResult
     func restoreDestinationSecrets(
         _ rollbacks: [DestinationSecretsRollback],
+        editorSessionId: UUID? = nil,
         onProgress: (([DestinationSecretsRollback]) -> Void)? = nil
     ) async throws -> Bool {
+        if let editorSessionId,
+           hasNewerOutstandingSecretRollback(than: rollbacks, excluding: editorSessionId) {
+            throw AppModelError.newerSecretEditorMutation
+        }
         let store = try makeSecretStore()
         return try await restoreDestinationSecrets(
             rollbacks,
             using: store,
-            onProgress: onProgress
+            onProgress: { progress in
+                if let editorSessionId {
+                    self.replaceClaimedSecretRollbacks(
+                        rollbacks,
+                        with: progress,
+                        sessionId: editorSessionId
+                    )
+                }
+                onProgress?(progress)
+            }
         )
+    }
+
+    private func hasNewerOutstandingSecretRollback(
+        than rollbacks: [DestinationSecretsRollback],
+        excluding sessionId: UUID
+    ) -> Bool {
+        let requested = rollbacks.compactMap(rollbackWithUncommittedFields)
+        guard !requested.isEmpty else { return false }
+        let otherSessions = activeSecretEditorSessions.subtracting([sessionId])
+        let outstanding = (otherSessions.flatMap { otherSession in
+            (claimedSecretEditorRollbacks[otherSession] ?? [])
+                + (unclaimedSecretEditorRollbacks[otherSession] ?? [])
+        } + pendingSecretRollbackBatches.flatMap { $0 })
+            .compactMap(rollbackWithUncommittedFields)
+
+        return requested.contains { older in
+            outstanding.contains { newer in
+                guard newer.destId == older.destId,
+                      newer.sequence > older.sequence else { return false }
+                let overlapsPassword = older.transaction.password != nil
+                    && newer.transaction.password != nil
+                let overlapsSecretEnv = older.transaction.secretEnv != nil
+                    && newer.transaction.secretEnv != nil
+                return overlapsPassword || overlapsSecretEnv
+            }
+        }
+    }
+
+    private func replaceClaimedSecretRollbacks(
+        _ originals: [DestinationSecretsRollback],
+        with progress: [DestinationSecretsRollback],
+        sessionId: UUID
+    ) {
+        let sequences = Set(originals.map(\.sequence))
+        removeClaimedSecretRollbacks(withSequences: sequences, sessionId: sessionId)
+        guard !progress.isEmpty else { return }
+        claimedSecretEditorRollbacks[sessionId, default: []].append(contentsOf: progress)
+    }
+
+    private func removeClaimedSecretRollbacks(
+        withSequences sequences: Set<UInt64>,
+        sessionId: UUID
+    ) {
+        guard var claimed = claimedSecretEditorRollbacks[sessionId] else { return }
+        claimed.removeAll { sequences.contains($0.sequence) }
+        if claimed.isEmpty {
+            claimedSecretEditorRollbacks.removeValue(forKey: sessionId)
+        } else {
+            claimedSecretEditorRollbacks[sessionId] = claimed
+        }
     }
 
     /// Restores one field at a time and publishes the remaining tokens after
