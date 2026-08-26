@@ -295,7 +295,8 @@ extension AppModel {
                     remaining[index] = DestinationSecretRollback(
                         destId: destId,
                         password: nil,
-                        secretEnv: remaining[index].secretEnv
+                        secretEnv: remaining[index].secretEnv,
+                        previousSecretEnvRaw: remaining[index].previousSecretEnvRaw
                     )
                     publishProgress()
                 } else {
@@ -305,7 +306,8 @@ extension AppModel {
                     remaining[index] = DestinationSecretRollback(
                         destId: destId,
                         password: nil,
-                        secretEnv: remaining[index].secretEnv
+                        secretEnv: remaining[index].secretEnv,
+                        previousSecretEnvRaw: remaining[index].previousSecretEnvRaw
                     )
                     if result.passwordRestored == false {
                         passwordConflicts.insert(destId)
@@ -320,17 +322,24 @@ extension AppModel {
                     remaining[index] = DestinationSecretRollback(
                         destId: destId,
                         password: remaining[index].password,
-                        secretEnv: nil
+                        secretEnv: nil,
+                        previousSecretEnvRaw: nil
                     )
                     publishProgress()
                 } else {
                     let result = try await store.restoreDestinationSecretsIfCurrent(
-                        DestinationSecretRollback(destId: destId, password: nil, secretEnv: secretEnv)
+                        DestinationSecretRollback(
+                            destId: destId,
+                            password: nil,
+                            secretEnv: secretEnv,
+                            previousSecretEnvRaw: remaining[index].previousSecretEnvRaw
+                        )
                     )
                     remaining[index] = DestinationSecretRollback(
                         destId: destId,
                         password: remaining[index].password,
-                        secretEnv: nil
+                        secretEnv: nil,
+                        previousSecretEnvRaw: nil
                     )
                     if result.secretEnvRestored == false {
                         secretEnvConflicts.insert(destId)

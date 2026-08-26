@@ -640,18 +640,11 @@ enum AtomicFile {
         guard evacuate == 0 else {
             let evacuateErrno = errno
             if evacuateErrno == ENOENT {
-                // A raw writer removed the candidate. Restore the displaced
-                // revision only if no still-newer writer has already landed.
-                let restore = renameX(from: source, to: destination, flags: UInt32(RENAME_EXCL))
-                if restore == 0 { return false }
-                if errno == EEXIST {
-                    try? FileManager.default.removeItem(at: source)
-                    return false
-                }
-                let restoreErrno = errno
-                throw ConfigStoreError.replacementRollbackFailed(
-                    errno: restoreErrno, candidateMayBeInstalledAt: destination.path
-                )
+                // A raw writer removed the candidate. Absence is itself a
+                // valid external revision; never resurrect displaced bytes
+                // over that later deletion.
+                try? FileManager.default.removeItem(at: source)
+                return false
             }
             throw ConfigStoreError.replacementRollbackFailed(
                 errno: evacuateErrno, candidateMayBeInstalledAt: destination.path

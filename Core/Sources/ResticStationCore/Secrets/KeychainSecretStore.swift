@@ -110,10 +110,13 @@ public struct KeychainSecretStore: SecretStore {
             let previousPassword = update.password == nil
                 ? nil
                 : try await readOptionalValue(account: passwordAccount)
+            let previousEnvRaw = update.secretEnv == nil
+                ? nil
+                : try await readOptionalValue(account: envAccount)
             let previousEnv: [String: String]? = if update.secretEnv == nil {
                 nil
-            } else if let raw = try await readOptionalValue(account: envAccount) {
-                try SecretEnvBlob.decode(raw)
+            } else if let previousEnvRaw {
+                (try? SecretEnvBlob.decode(previousEnvRaw)) ?? [:]
             } else {
                 [:]
             }
@@ -124,7 +127,8 @@ public struct KeychainSecretStore: SecretStore {
                 },
                 secretEnv: update.secretEnv.map {
                     SecretRollbackChange(installed: $0, previous: previousEnv ?? [:])
-                }
+                },
+                previousSecretEnvRaw: previousEnvRaw
             )
             do {
                 if let password = update.password {
@@ -150,7 +154,9 @@ public struct KeychainSecretStore: SecretStore {
                         }
                     }
                     if update.secretEnv != nil {
-                        if let previousEnv, !previousEnv.isEmpty {
+                        if let previousEnvRaw {
+                            try await setValue(previousEnvRaw, account: envAccount)
+                        } else if let previousEnv, !previousEnv.isEmpty {
                             try await setValue(try SecretEnvBlob.encode(previousEnv), account: envAccount)
                         } else {
                             try await deleteValueTolerant(account: envAccount)
@@ -181,9 +187,11 @@ public struct KeychainSecretStore: SecretStore {
             }
             var secretEnvRestored: Bool?
             if let change = rollback.secretEnv {
-                let current = try await readOptionalValue(account: envAccount)
-                    .map(SecretEnvBlob.decode) ?? [:]
-                secretEnvRestored = current == change.installed
+                if let currentRaw = try await readOptionalValue(account: envAccount) {
+                    secretEnvRestored = (try? SecretEnvBlob.decode(currentRaw)) == change.installed
+                } else {
+                    secretEnvRestored = change.installed.isEmpty
+                }
             }
             if passwordRestored == true, let change = rollback.password {
                 if let previous = change.previous {
@@ -193,7 +201,9 @@ public struct KeychainSecretStore: SecretStore {
                 }
             }
             if secretEnvRestored == true, let change = rollback.secretEnv {
-                if change.previous.isEmpty {
+                if let previousRaw = rollback.previousSecretEnvRaw {
+                    try await updateExistingValue(previousRaw, account: envAccount)
+                } else if change.previous.isEmpty {
                     try await deleteValueTolerant(account: envAccount)
                 } else {
                     try await updateExistingValue(

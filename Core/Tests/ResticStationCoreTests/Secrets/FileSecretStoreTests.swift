@@ -97,6 +97,42 @@ struct FileSecretStoreTests {
         #expect(try await store.secretEnv(destId: Self.destId) == ["TOKEN": "original"])
     }
 
+    @Test("a valid environment edit can replace and roll back a malformed secrets-file blob")
+    func malformedEnvironmentCanBeRepairedAndRestored() async throws {
+        let (store, root) = Self.makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try await store.setPassword("password", destId: Self.destId)
+
+        let account = SecretAccount.secretEnv(Self.destId)
+        let malformedRaw = "{not-json"
+        let document: [String: Any] = [
+            "version": 1,
+            "secrets": [
+                SecretAccount.password(Self.destId): "password",
+                account: malformedRaw,
+            ],
+        ]
+        try JSONSerialization.data(withJSONObject: document).write(to: store.fileURL)
+
+        let rollback = try await store.updateDestinationSecrets(
+            DestinationSecretUpdate(
+                destId: Self.destId,
+                password: nil,
+                secretEnv: ["TOKEN": "repaired"]
+            )
+        )
+        #expect(rollback.previousSecretEnvRaw == malformedRaw)
+        #expect(try await store.secretEnv(destId: Self.destId) == ["TOKEN": "repaired"])
+
+        let result = try await store.restoreDestinationSecretsIfCurrent(rollback)
+        let restoredDocument = try #require(
+            JSONSerialization.jsonObject(with: Data(contentsOf: store.fileURL)) as? [String: Any]
+        )
+        let restoredSecrets = try #require(restoredDocument["secrets"] as? [String: String])
+        #expect(result.secretEnvRestored == true)
+        #expect(restoredSecrets[account] == malformedRaw)
+    }
+
     // MARK: - Permissions at creation
 
     @Test("the secrets file is created 0600 and its directory 0700, at creation time")

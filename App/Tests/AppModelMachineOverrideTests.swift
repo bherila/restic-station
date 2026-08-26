@@ -929,9 +929,27 @@ struct AppModelMachineOverrideTests {
         #expect(!configMessage.contains("Unlock your login keychain"))
 
         let keychainMessage = SetsCopy.destinationSecretFailureMessage(
-            for: SecretStoreError.backendFailed("login keychain is locked")
+            for: SecretStoreError.backendFailed("login keychain is locked"),
+            backend: .keychain
         )
         #expect(keychainMessage.contains("Unlock your login keychain"))
+
+        let fileMessage = SetsCopy.destinationSecretFailureMessage(
+            for: SecretStoreError.backendFailed("unsafe permissions"),
+            backend: .file
+        )
+        #expect(fileMessage.contains("secrets file"))
+        #expect(fileMessage.contains("Check the permissions"))
+        #expect(!fileMessage.contains("Unlock your login keychain"))
+
+        #expect(SetEditorSaveState.canFinishRevert(
+            startingFingerprint: "same-revision",
+            currentFingerprint: "same-revision"
+        ))
+        #expect(!SetEditorSaveState.canFinishRevert(
+            startingFingerprint: "stale-revision",
+            currentFingerprint: "reloaded-revision"
+        ))
     }
 
     @Test("uncertain config recovery distinguishes a live candidate from another revision")

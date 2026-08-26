@@ -263,7 +263,10 @@ enum SetsCopy {
     /// Destination-secret persistence spans a config preflight and the
     /// selected secret backend. Keep those failures distinct: unlocking the
     /// login keychain cannot repair an unreadable config or broken lock.
-    static func destinationSecretFailureMessage(for error: Error) -> String {
+    static func destinationSecretFailureMessage(
+        for error: Error,
+        backend: SecretBackend = .configured
+    ) -> String {
         if let configError = error as? ConfigStoreError {
             if configError.isRevisionConflict {
                 return "Settings changed on disk while this destination was open. "
@@ -287,8 +290,8 @@ enum SetsCopy {
                 + "(\(error)). No keychain item was changed. Resolve the configuration or "
                 + "locking error, then try again."
         }
-        return "The keychain items for this destination could not be written "
-            + "(\(error)). Unlock your login keychain, then try again."
+        return "The credentials for this destination could not be written to \(backend.displayName) "
+            + "(\(error)). \(backend.unavailableAdvice)"
     }
 
     // MARK: - Passwords

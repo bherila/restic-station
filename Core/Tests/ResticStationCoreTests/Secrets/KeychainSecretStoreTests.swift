@@ -308,6 +308,40 @@ struct KeychainSecretStoreTests {
         #expect(runner.invocations[3].argv[8] == "original-password")
     }
 
+    @Test("a valid environment edit can replace and roll back a malformed keychain blob")
+    func malformedEnvironmentCanBeRepairedAndRestored() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-keychain-malformed-env-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let validEnv = ["TOKEN": "repaired"]
+        let validRaw = try SecretEnvBlob.encode(validEnv)
+        let malformedRaw = "{not-json"
+        let runner = FakeProcessRunner(script: [
+            .init(
+                argvPrefix: ["/usr/bin/security", "find-generic-password"],
+                stdoutLines: [malformedRaw]
+            ),
+            .init(argvPrefix: ["/usr/bin/security", "delete-generic-password"], exitCode: 0),
+            .init(argvPrefix: ["/usr/bin/security", "add-generic-password"], exitCode: 0),
+            .init(
+                argvPrefix: ["/usr/bin/security", "find-generic-password"],
+                stdoutLines: [validRaw]
+            ),
+            .init(argvPrefix: ["/usr/bin/security", "add-generic-password", "-U"], exitCode: 0),
+        ])
+        let client = KeychainSecretStore(runner: runner, paths: AppPaths(root: root))
+
+        let rollback = try await client.updateDestinationSecrets(
+            DestinationSecretUpdate(destId: Self.destId, password: nil, secretEnv: validEnv)
+        )
+        #expect(rollback.previousSecretEnvRaw == malformedRaw)
+        let result = try await client.restoreDestinationSecretsIfCurrent(rollback)
+
+        #expect(result.secretEnvRestored == true)
+        #expect(runner.invocations.count == 5)
+        #expect(runner.invocations[4].argv[8] == malformedRaw)
+    }
+
     @Test("production keychain mutations wait for the shared secrets lock")
     func keychainMutationUsesSharedLock() async throws {
         let root = FileManager.default.temporaryDirectory

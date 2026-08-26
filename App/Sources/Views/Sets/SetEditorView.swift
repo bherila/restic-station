@@ -11,6 +11,13 @@ enum SetEditorSaveState {
             $0.transaction.password != nil || $0.transaction.secretEnv != nil
         }
     }
+
+    static func canFinishRevert(
+        startingFingerprint: String,
+        currentFingerprint: String
+    ) -> Bool {
+        startingFingerprint == currentFingerprint
+    }
 }
 
 /// The set editor (`docs/ui-spec.md` §Backup Sets, **Set editor**): name,
@@ -236,8 +243,17 @@ struct SetEditorView: View {
 
     private func revert() async {
         guard let persisted else { return }
+        let revertFingerprint = model.configFingerprint
         if let rollbackError = await restorePendingSecrets() {
             fieldErrors[.general] = rollbackError
+            return
+        }
+        guard SetEditorSaveState.canFinishRevert(
+            startingFingerprint: revertFingerprint,
+            currentFingerprint: model.configFingerprint
+        ) else {
+            fieldErrors[.general] = "Settings were reloaded while credentials were being restored. "
+                + "This draft was left on its original revision; close it and reopen the latest settings."
             return
         }
         draft = persisted

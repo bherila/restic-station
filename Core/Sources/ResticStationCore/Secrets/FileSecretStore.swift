@@ -191,9 +191,10 @@ public struct FileSecretStore: SecretStore {
             let passwordAccount = SecretAccount.password(update.destId)
             let envAccount = SecretAccount.secretEnv(update.destId)
             let previousPassword = update.password == nil ? nil : document.secrets[passwordAccount]
-            let previousEnv = try update.secretEnv == nil
+            let previousEnvRaw = update.secretEnv == nil ? nil : document.secrets[envAccount]
+            let previousEnv = update.secretEnv == nil
                 ? nil
-                : document.secrets[envAccount].map(SecretEnvBlob.decode) ?? [:]
+                : previousEnvRaw.flatMap { try? SecretEnvBlob.decode($0) } ?? [:]
             let rollback = DestinationSecretRollback(
                 destId: update.destId,
                 password: update.password.map {
@@ -201,7 +202,8 @@ public struct FileSecretStore: SecretStore {
                 },
                 secretEnv: update.secretEnv.map {
                     SecretRollbackChange(installed: $0, previous: previousEnv ?? [:])
-                }
+                },
+                previousSecretEnvRaw: previousEnvRaw
             )
             guard update.password != nil || update.secretEnv != nil else { return rollback }
             if let password = update.password {
@@ -228,8 +230,11 @@ public struct FileSecretStore: SecretStore {
             }
             let secretEnvRestored: Bool?
             if let change = rollback.secretEnv {
-                let current = try document.secrets[envAccount].map(SecretEnvBlob.decode) ?? [:]
-                secretEnvRestored = current == change.installed
+                if let currentRaw = document.secrets[envAccount] {
+                    secretEnvRestored = (try? SecretEnvBlob.decode(currentRaw)) == change.installed
+                } else {
+                    secretEnvRestored = change.installed.isEmpty
+                }
             } else {
                 secretEnvRestored = nil
             }
@@ -237,9 +242,13 @@ public struct FileSecretStore: SecretStore {
                 document.secrets[passwordAccount] = change.previous
             }
             if secretEnvRestored == true, let change = rollback.secretEnv {
-                document.secrets[envAccount] = change.previous.isEmpty
-                    ? nil
-                    : try SecretEnvBlob.encode(change.previous)
+                if let previousRaw = rollback.previousSecretEnvRaw {
+                    document.secrets[envAccount] = previousRaw
+                } else {
+                    document.secrets[envAccount] = change.previous.isEmpty
+                        ? nil
+                        : try SecretEnvBlob.encode(change.previous)
+                }
             }
             if passwordRestored == true || secretEnvRestored == true {
                 document.version = Self.currentVersion

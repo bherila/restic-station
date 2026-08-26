@@ -150,6 +150,28 @@ import Testing
         #expect(try Data(contentsOf: destination) == newest)
         #expect(!FileManager.default.fileExists(atPath: displaced.path))
     }
+
+    @Test("CAS rollback preserves a raw deletion that landed after the exchange")
+    func rollbackDoesNotResurrectDeletedConfig() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-cas-delete-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+        let displaced = root.appendingPathComponent("config.json.tmp")
+        let destination = root.appendingPathComponent("config.json")
+        try Data("older fleet revision".utf8).write(to: displaced)
+
+        let removedCandidate = try AtomicFile.rollbackCandidateIfCurrent(
+            displaced: displaced,
+            destination: destination,
+            candidateFingerprint: SHA256Digest.hex(Data("stale app candidate".utf8))
+        )
+
+        #expect(!removedCandidate)
+        #expect(!FileManager.default.fileExists(atPath: destination.path))
+        #expect(!FileManager.default.fileExists(atPath: displaced.path))
+    }
     #endif
 
     @Test("a stale preflight refuses before a related external side effect")

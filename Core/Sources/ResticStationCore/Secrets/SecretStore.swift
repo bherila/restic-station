@@ -236,15 +236,21 @@ public struct DestinationSecretRollback: Equatable, Sendable {
     public let destId: UUID
     public let password: SecretRollbackChange<String?>?
     public let secretEnv: SecretRollbackChange<[String: String]>?
+    /// Exact pre-edit blob for production backends. This lets an explicit
+    /// valid replacement repair malformed legacy/manual JSON while an
+    /// abandoned editor can still restore those original bytes verbatim.
+    public let previousSecretEnvRaw: String?
 
     public init(
         destId: UUID,
         password: SecretRollbackChange<String?>?,
-        secretEnv: SecretRollbackChange<[String: String]>?
+        secretEnv: SecretRollbackChange<[String: String]>?,
+        previousSecretEnvRaw: String? = nil
     ) {
         self.destId = destId
         self.password = password
         self.secretEnv = secretEnv
+        self.previousSecretEnvRaw = previousSecretEnvRaw
     }
 }
 
