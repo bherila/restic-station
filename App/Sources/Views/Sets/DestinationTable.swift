@@ -23,6 +23,7 @@ struct DestinationTable: View {
     @Binding var configFingerprint: String
     @Binding var pendingSecretRollbacks: [AppModel.DestinationSecretsRollback]
     let secretEditorSessionID: UUID
+    let mutationsDisabled: Bool
     let errorMessage: String?
 
     @State private var sheet: DestinationSheetTarget?
@@ -59,6 +60,7 @@ struct DestinationTable: View {
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         }
+        .disabled(mutationsDisabled)
     }
 
     /// The sheet and the three confirmations hang off this row rather than
@@ -244,6 +246,11 @@ struct DestinationTable: View {
     private func remove(_ destination: Destination) {
         pendingRemoval = nil
         removalError = nil
+        guard !mutationsDisabled else {
+            removalError = "The previous credentials are still being restored. "
+                + "Wait for restoration to finish before changing destinations."
+            return
+        }
 
         var updated = set
         updated.destinations.removeAll { $0.id == destination.id }

@@ -508,6 +508,43 @@ struct AppModelMachineOverrideTests {
         #expect(!model.configChangedOnDisk)
     }
 
+    @Test("an older reload completion cannot replace a newer published snapshot")
+    func concurrentReloadsPublishNewestRequestOnly() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-reload-generation-app-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let paths = AppPaths(root: root)
+        try ConfigStore(paths: paths).save(AppConfig())
+        try MachineStore(paths: paths).save(MachineConfig(machineId: "reload-test"))
+        let older = AppConfig(showMenuBarIcon: true)
+        let newer = AppConfig(showMenuBarIcon: false)
+        let snapshots = SequencedConfigSnapshotLoader(
+            first: ConfigSnapshot(bytes: Data(), fingerprint: "older", config: older),
+            second: ConfigSnapshot(bytes: Data(), fingerprint: "newer", config: newer)
+        )
+        let model = AppModel(
+            paths: paths,
+            configSnapshotLoader: { await snapshots.load() }
+        )
+
+        let first = Task { @MainActor in await model.reloadConfigFromDisk() }
+        for _ in 0..<40 {
+            if await snapshots.firstRequestIsWaiting() { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        #expect(await snapshots.firstRequestIsWaiting())
+
+        await model.reloadConfigFromDisk()
+        #expect(model.config == newer)
+        #expect(model.configFingerprint == "newer")
+
+        await snapshots.releaseFirstRequest()
+        await first.value
+        #expect(model.config == newer)
+        #expect(model.configFingerprint == "newer")
+    }
+
     @Test("a failed reload keeps its reload affordance after the old bytes return")
     func failedConfigReloadCanRecoverWhenTheSameRevisionReturns() async throws {
         let root = FileManager.default.temporaryDirectory
@@ -941,8 +978,7 @@ struct AppModelMachineOverrideTests {
         #expect(try await secrets.password(destId: destinationId) == "second-editor-password")
 
         #expect(model.claimEditorSecretRollback(second, sessionId: sessionId))
-        model.endSecretEditorSession(sessionId)
-        model.retainPendingSecretRollbacks([second])
+        model.endSecretEditorSession(sessionId, claimedRollbacks: [second])
         for _ in 0..<80 {
             if model.pendingSecretRollbackBatches.isEmpty { break }
             try await Task.sleep(for: .milliseconds(10))
@@ -950,6 +986,100 @@ struct AppModelMachineOverrideTests {
 
         #expect(model.pendingSecretRollbackBatches.isEmpty)
         #expect(model.pendingSecretRollbackError == nil)
+        #expect(try await secrets.password(destId: destinationId) == "original-password")
+    }
+
+    @Test("a new editor waits for an older rollback already in flight")
+    func activeEditorWaitsForRunningRollback() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-secret-running-rollback-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let destinationId = UUID()
+        let sessionId = UUID()
+        let secrets = CheckpointingSecretStore(passwords: [destinationId: "original-password"])
+        let model = AppModel(paths: AppPaths(root: root), secretStoreFactory: { secrets })
+        let first = try await model.storeDestinationSecrets(
+            destId: destinationId,
+            password: "first-editor-password",
+            secretEnv: nil,
+            ifConfigUnchangedFrom: model.configFingerprint
+        )
+        await secrets.pauseNextPasswordWrite()
+        model.retainPendingSecretRollbacks([first])
+        for _ in 0..<40 {
+            if await secrets.passwordWriteIsPaused() { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        #expect(await secrets.passwordWriteIsPaused())
+
+        model.beginSecretEditorSession(sessionId)
+        var secondFinished = false
+        let secondTask = Task { @MainActor in
+            let rollback = try await model.storeDestinationSecrets(
+                destId: destinationId,
+                password: "second-editor-password",
+                secretEnv: nil,
+                ifConfigUnchangedFrom: model.configFingerprint,
+                editorSessionId: sessionId
+            )
+            secondFinished = true
+            return rollback
+        }
+        try await Task.sleep(for: .milliseconds(20))
+        #expect(!secondFinished)
+        #expect(try await secrets.password(destId: destinationId) == "first-editor-password")
+
+        await secrets.resumePausedPasswordWrite()
+        let second = try await secondTask.value
+        #expect(secondFinished)
+        #expect(try await secrets.password(destId: destinationId) == "second-editor-password")
+
+        #expect(model.claimEditorSecretRollback(second, sessionId: sessionId))
+        model.endSecretEditorSession(sessionId, claimedRollbacks: [second])
+        for _ in 0..<80 {
+            if model.pendingSecretRollbackBatches.isEmpty { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(model.pendingSecretRollbackBatches.isEmpty)
+        #expect(try await secrets.password(destId: destinationId) == "original-password")
+    }
+
+    @Test("editor teardown keeps claimed and parked rollbacks in chronological order")
+    func editorTeardownOrdersClaimedBeforeParkedRollbacks() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-secret-teardown-order-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let destinationId = UUID()
+        let sessionId = UUID()
+        let secrets = CheckpointingSecretStore(passwords: [destinationId: "original-password"])
+        let model = AppModel(paths: AppPaths(root: root), secretStoreFactory: { secrets })
+        model.beginSecretEditorSession(sessionId)
+
+        let claimed = try await model.storeDestinationSecrets(
+            destId: destinationId,
+            password: "first-editor-password",
+            secretEnv: nil,
+            ifConfigUnchangedFrom: model.configFingerprint,
+            editorSessionId: sessionId
+        )
+        #expect(model.claimEditorSecretRollback(claimed, sessionId: sessionId))
+
+        _ = try await model.storeDestinationSecrets(
+            destId: destinationId,
+            password: "second-editor-password",
+            secretEnv: nil,
+            ifConfigUnchangedFrom: model.configFingerprint,
+            editorSessionId: sessionId
+        )
+        model.endSecretEditorSession(sessionId, claimedRollbacks: [claimed])
+        for _ in 0..<80 {
+            if model.pendingSecretRollbackBatches.isEmpty { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+
+        #expect(model.pendingSecretRollbackBatches.isEmpty)
         #expect(try await secrets.password(destId: destinationId) == "original-password")
     }
 
@@ -1151,12 +1281,45 @@ private actor RacingSecretStore: SecretStore {
     nonisolated func passwordCommand(destId: UUID) -> String { "test-secret-store" }
 }
 
+private actor SequencedConfigSnapshotLoader {
+    private let first: ConfigSnapshot
+    private let second: ConfigSnapshot
+    private var requestCount = 0
+    private var firstRequestContinuation: CheckedContinuation<Void, Never>?
+
+    init(first: ConfigSnapshot, second: ConfigSnapshot) {
+        self.first = first
+        self.second = second
+    }
+
+    func load() async -> ConfigSnapshot {
+        requestCount += 1
+        guard requestCount == 1 else { return second }
+        await withCheckedContinuation { continuation in
+            firstRequestContinuation = continuation
+        }
+        return first
+    }
+
+    func firstRequestIsWaiting() -> Bool {
+        firstRequestContinuation != nil
+    }
+
+    func releaseFirstRequest() {
+        let continuation = firstRequestContinuation
+        firstRequestContinuation = nil
+        continuation?.resume()
+    }
+}
+
 private actor CheckpointingSecretStore: SecretStore {
     nonisolated let backend: SecretBackend = .keychain
     private var passwords: [UUID: String]
     private var secretEnvironments: [UUID: [String: String]]
     private var passwordWriteShouldFail = false
     private var environmentWriteShouldFail = false
+    private var passwordWriteShouldPause = false
+    private var passwordWritePauseContinuation: CheckedContinuation<Void, Never>?
 
     init(
         passwords: [UUID: String] = [:],
@@ -1174,7 +1337,27 @@ private actor CheckpointingSecretStore: SecretStore {
         environmentWriteShouldFail = true
     }
 
+    func pauseNextPasswordWrite() {
+        passwordWriteShouldPause = true
+    }
+
+    func passwordWriteIsPaused() -> Bool {
+        passwordWritePauseContinuation != nil
+    }
+
+    func resumePausedPasswordWrite() {
+        let continuation = passwordWritePauseContinuation
+        passwordWritePauseContinuation = nil
+        continuation?.resume()
+    }
+
     func setPassword(_ password: String, destId: UUID) async throws {
+        if passwordWriteShouldPause {
+            passwordWriteShouldPause = false
+            await withCheckedContinuation { continuation in
+                passwordWritePauseContinuation = continuation
+            }
+        }
         if passwordWriteShouldFail {
             passwordWriteShouldFail = false
             throw SecretStoreError.backendFailed("injected password failure")

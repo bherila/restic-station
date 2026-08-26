@@ -144,6 +144,13 @@ extension AppModel {
         if let configLoadError {
             throw AppModelError.configUnreadable(configLoadError)
         }
+        // A retry that was already running when this editor opened owns the
+        // older side of the credential chain. Let it finish before the newer
+        // mutation can compete for secrets.lock; retries that have not yet
+        // started are held by activeSecretEditorSessions below.
+        if let pendingSecretRollbackTask {
+            await pendingSecretRollbackTask.value
+        }
         let store = try makeSecretStore()
         var rollback: DestinationSecretsRollback?
         do {
@@ -191,11 +198,16 @@ extension AppModel {
         activeSecretEditorSessions.insert(sessionId)
     }
 
-    func endSecretEditorSession(_ sessionId: UUID) {
+    func endSecretEditorSession(
+        _ sessionId: UUID,
+        claimedRollbacks: [DestinationSecretsRollback] = []
+    ) {
         activeSecretEditorSessions.remove(sessionId)
-        if let stranded = unclaimedSecretEditorRollbacks.removeValue(forKey: sessionId) {
-            retainPendingSecretRollbacks(stranded)
-        }
+        // Claimed tokens precede any still-parked async mutation from this
+        // session. Keep them in one chronological batch so reverse-order
+        // restoration always unwinds newest -> oldest.
+        let stranded = unclaimedSecretEditorRollbacks.removeValue(forKey: sessionId) ?? []
+        retainPendingSecretRollbacks(claimedRollbacks + stranded)
         // A queued abandoned-session rollback is deliberately paused while
         // any editor can still produce a newer rollback. Resume it once the
         // last editor has synchronously transferred its ownership here.

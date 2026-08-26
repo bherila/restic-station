@@ -94,6 +94,7 @@ struct SetEditorView: View {
                 configFingerprint: $configFingerprint,
                 pendingSecretRollbacks: $pendingSecretRollbacks,
                 secretEditorSessionID: secretEditorSessionID,
+                mutationsDisabled: secretRollbackInProgress,
                 errorMessage: fieldErrors[.destinations]
             )
 
@@ -123,10 +124,12 @@ struct SetEditorView: View {
         .onDisappear {
             // Transfer ownership synchronously before SwiftUI destroys this
             // view. AppModel retries and surfaces failures window-wide.
-            model.endSecretEditorSession(secretEditorSessionID)
             let abandoned = pendingSecretRollbacks
             pendingSecretRollbacks.removeAll()
-            model.retainPendingSecretRollbacks(abandoned)
+            model.endSecretEditorSession(
+                secretEditorSessionID,
+                claimedRollbacks: abandoned
+            )
         }
     }
 

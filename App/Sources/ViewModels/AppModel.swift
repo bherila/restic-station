@@ -107,6 +107,9 @@ final class AppModel: ObservableObject {
     /// its parent editor session is still alive.
     var activeSecretEditorSessions: Set<UUID> = []
     var unclaimedSecretEditorRollbacks: [UUID: [DestinationSecretsRollback]] = [:]
+    /// Monotonic request identity for reloads that leave the main actor while
+    /// waiting on config.lock. Only the newest request may publish state.
+    private var configReloadGeneration: UInt64 = 0
 
     /// One entry per configured set, in config order.
     @Published private(set) var setHealths: [SetHealth] = []
@@ -139,6 +142,7 @@ final class AppModel: ObservableObject {
     let stateWatcher: StateWatcher
     let launchd: LaunchdManager
     let helper: HelperInvoker
+    let configSnapshotLoader: @Sendable () async throws -> ConfigSnapshot
     /// Injectable only so transaction tests can deterministically race a
     /// secret mutation with a raw fleet replacement. Production builds use
     /// the same factory as the helper.
@@ -164,11 +168,13 @@ final class AppModel: ObservableObject {
         launchd: LaunchdManager? = nil,
         helper: HelperInvoker = HelperInvoker(),
         secretStoreFactory: (() throws -> any SecretStore)? = nil,
+        configSnapshotLoader: (@Sendable () async throws -> ConfigSnapshot)? = nil,
         calendar: Calendar = .autoupdatingCurrent,
         now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.paths = paths
-        self.configStore = ConfigStore(paths: paths)
+        let configStore = ConfigStore(paths: paths)
+        self.configStore = configStore
         self.machineStore = MachineStore(paths: paths)
         self.stateStore = StateStore(paths: paths)
         self.runStore = RunStore(paths: paths)
@@ -179,6 +185,9 @@ final class AppModel: ObservableObject {
         )
         self.launchd = launchd ?? LaunchdManager()
         self.helper = helper
+        self.configSnapshotLoader = configSnapshotLoader ?? {
+            try await configStore.snapshotAsync()
+        }
         self.secretStoreFactory = secretStoreFactory ?? {
             try SecretStoreFactory.make(
                 paths: paths,
@@ -384,8 +393,11 @@ final class AppModel: ObservableObject {
     /// config and blocks every save, so corrupt fleet-sync output cannot be
     /// overwritten by an open window.
     func reloadConfigFromDisk() async {
+        configReloadGeneration &+= 1
+        let requestGeneration = configReloadGeneration
         do {
-            let snapshot = try await configStore.snapshotAsync()
+            let snapshot = try await configSnapshotLoader()
+            guard requestGeneration == configReloadGeneration else { return }
             let previous = config
             let previousResticPath = resticPath
 
@@ -424,6 +436,7 @@ final class AppModel: ObservableObject {
                 Task { await refreshResticInfo() }
             }
         } catch {
+            guard requestGeneration == configReloadGeneration else { return }
             let detail = Self.describe(configLoadFailure: error, path: paths.configFile.path)
             configLoadError = [detail, machineLoadError].compactMap { $0 }.joined(separator: "\n\n")
             configReloadRequired = true
