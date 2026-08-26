@@ -210,6 +210,22 @@ import Testing
         #expect(try store.load() == installed)
     }
 
+    @Test("uncertain recovery reads the live config without waiting on the write lock")
+    func reconciliationSnapshotDoesNotWaitForWriter() throws {
+        let (store, root) = makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let config = sampleConfig()
+        try store.save(config)
+        let heldLock = FileLock(path: store.paths.configLockFile, trustedRoot: root)
+        #expect(heldLock.acquire() == .acquired)
+        defer { heldLock.release() }
+
+        let snapshot = try store.reconciliationSnapshot()
+
+        #expect(snapshot.config == config)
+        #expect(snapshot.fingerprint == store.fileFingerprint())
+    }
+
     @Test("config readers wait for a writer and then read the installed revision")
     func configReadWaitsForTheWriterLock() throws {
         let (store, root) = makeStore()

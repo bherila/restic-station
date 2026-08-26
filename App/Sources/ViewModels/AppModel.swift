@@ -143,6 +143,7 @@ final class AppModel: ObservableObject {
     let launchd: LaunchdManager
     let helper: HelperInvoker
     let configSnapshotLoader: @Sendable () async throws -> ConfigSnapshot
+    let configRevisionLoader: @Sendable () async throws -> String
     /// Injectable only so transaction tests can deterministically race a
     /// secret mutation with a raw fleet replacement. Production builds use
     /// the same factory as the helper.
@@ -169,6 +170,7 @@ final class AppModel: ObservableObject {
         helper: HelperInvoker = HelperInvoker(),
         secretStoreFactory: (() throws -> any SecretStore)? = nil,
         configSnapshotLoader: (@Sendable () async throws -> ConfigSnapshot)? = nil,
+        configRevisionLoader: (@Sendable () async throws -> String)? = nil,
         calendar: Calendar = .autoupdatingCurrent,
         now: @escaping @Sendable () -> Date = { Date() }
     ) {
@@ -187,6 +189,9 @@ final class AppModel: ObservableObject {
         self.helper = helper
         self.configSnapshotLoader = configSnapshotLoader ?? {
             try await configStore.snapshotAsync()
+        }
+        self.configRevisionLoader = configRevisionLoader ?? {
+            try await configStore.currentFileFingerprintAsync()
         }
         self.secretStoreFactory = secretStoreFactory ?? {
             try SecretStoreFactory.make(
@@ -373,12 +378,13 @@ final class AppModel: ObservableObject {
         return installedFingerprint
     }
 
-    /// Read back the live bytes after a failed atomic-replacement recovery.
+    /// Read back the live bytes after a failed atomic-replacement recovery
+    /// without waiting on config.lock on the main actor.
     /// A semantic candidate match is enough: ConfigStore's encoder is stable,
     /// while an external writer may have serialized equivalent JSON bytes.
     func reconcileUncertainConfigCommit(candidate: AppConfig) -> UncertainConfigCommitOutcome {
         do {
-            let snapshot = try configStore.snapshot()
+            let snapshot = try configStore.reconciliationSnapshot()
             if snapshot.config == candidate {
                 return .candidateInstalled(fingerprint: snapshot.fingerprint)
             }
@@ -398,6 +404,17 @@ final class AppModel: ObservableObject {
         do {
             let snapshot = try await configSnapshotLoader()
             guard requestGeneration == configReloadGeneration else { return }
+            let liveFingerprint = try await configRevisionLoader()
+            guard requestGeneration == configReloadGeneration else { return }
+            let observedFingerprint = stateWatcher.configFileFingerprint
+            let watcherObservedAnotherRevision = observedFingerprint != configFingerprint
+                && observedFingerprint != snapshot.fingerprint
+            guard liveFingerprint == snapshot.fingerprint,
+                  !watcherObservedAnotherRevision else {
+                configChangedOnDisk = true
+                lastConfigError = "Settings changed again while Reload Settings was reading them. Reload again."
+                return
+            }
             let previous = config
             let previousResticPath = resticPath
 

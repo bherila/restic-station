@@ -266,6 +266,49 @@ struct KeychainSecretStoreTests {
         #expect(restoredEnv == ["TOKEN": "original"])
     }
 
+    @Test("failed password update does not rewrite an untouched environment")
+    func failedPasswordUpdateRestoresOnlyStartedFields() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-keychain-partial-update-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let previousEnvRaw = try SecretEnvBlob.encode(["TOKEN": "original"])
+        let runner = FakeProcessRunner(script: [
+            .init(
+                argvPrefix: ["/usr/bin/security", "find-generic-password"],
+                stdoutLines: ["original-password"]
+            ),
+            .init(
+                argvPrefix: ["/usr/bin/security", "find-generic-password"],
+                stdoutLines: [previousEnvRaw]
+            ),
+            .init(argvPrefix: ["/usr/bin/security", "delete-generic-password"], exitCode: 0),
+            .init(
+                argvPrefix: ["/usr/bin/security", "add-generic-password"],
+                stderr: "injected password failure",
+                exitCode: 1
+            ),
+            .init(argvPrefix: ["/usr/bin/security", "delete-generic-password"], exitCode: 44),
+            .init(argvPrefix: ["/usr/bin/security", "add-generic-password"], exitCode: 0),
+        ])
+        let client = KeychainSecretStore(runner: runner, paths: AppPaths(root: root))
+
+        await #expect(throws: SecretStoreError.backendFailed("injected password failure")) {
+            _ = try await client.updateDestinationSecrets(
+                DestinationSecretUpdate(
+                    destId: Self.destId,
+                    password: "new-password",
+                    secretEnv: ["TOKEN": "new"]
+                )
+            )
+        }
+
+        #expect(runner.invocations.count == 6)
+        #expect(runner.invocations.dropFirst(2).allSatisfy {
+            !$0.argv.contains("\(Self.account)-env")
+        })
+        #expect(runner.invocations[5].argv[7] == "original-password")
+    }
+
     @Test("a failed conditional replacement remains retryable without deleting the installed item")
     func conditionalRollbackReplacementIsAtomicAndRetryable() async throws {
         let root = FileManager.default.temporaryDirectory

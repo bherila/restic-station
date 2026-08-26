@@ -65,6 +65,24 @@ public struct ConfigStore: Sendable {
         try await Task.detached { try snapshot() }.value
     }
 
+    /// Re-reads the live revision away from an actor that must remain
+    /// responsive. Unlike ``fileFingerprint()``, failures are preserved;
+    /// unlike calling ``currentFileFingerprint()`` on the caller, ordinary
+    /// writer contention cannot block that caller's executor.
+    public func currentFileFingerprintAsync() async throws -> String {
+        try await Task.detached { try currentFileFingerprint() }.value
+    }
+
+    /// Recovery-only read after an atomic replacement has already reported
+    /// an uncertain outcome. It deliberately does not acquire config.lock:
+    /// callers need an immediate best-effort classification, never a
+    /// 60-second wait on the UI actor. Atomic replacement means one read sees
+    /// one whole file; a concurrent raw/invalid write simply decodes as
+    /// unreadable and remains uncertain.
+    public func reconciliationSnapshot() throws -> ConfigSnapshot {
+        try snapshotLocked(migrationAllowed: false)
+    }
+
     private func snapshotLocked(migrationAllowed: Bool) throws -> ConfigSnapshot {
         guard let bytes = try readConfigBytes() else {
             return ConfigSnapshot(bytes: Data(), fingerprint: "absent", config: AppConfig())

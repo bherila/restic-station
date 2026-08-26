@@ -130,11 +130,15 @@ public struct KeychainSecretStore: SecretStore {
                 },
                 previousSecretEnvRaw: previousEnvRaw
             )
+            var passwordMutationBegan = false
+            var environmentMutationBegan = false
             do {
                 if let password = update.password {
+                    passwordMutationBegan = true
                     try await setValue(password, account: passwordAccount)
                 }
                 if let env = update.secretEnv {
+                    environmentMutationBegan = true
                     if env.isEmpty {
                         try await deleteValueTolerant(account: envAccount)
                     } else {
@@ -146,14 +150,14 @@ public struct KeychainSecretStore: SecretStore {
                 // values here repairs a partial delete/add sequence without
                 // risking an external mutation.
                 do {
-                    if update.password != nil {
+                    if passwordMutationBegan {
                         if let previousPassword {
                             try await setValue(previousPassword, account: passwordAccount)
                         } else {
                             try await deleteValueTolerant(account: passwordAccount)
                         }
                     }
-                    if update.secretEnv != nil {
+                    if environmentMutationBegan {
                         if let previousEnvRaw {
                             try await setValue(previousEnvRaw, account: envAccount)
                         } else if let previousEnv, !previousEnv.isEmpty {

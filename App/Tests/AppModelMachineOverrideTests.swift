@@ -525,7 +525,8 @@ struct AppModelMachineOverrideTests {
         )
         let model = AppModel(
             paths: paths,
-            configSnapshotLoader: { await snapshots.load() }
+            configSnapshotLoader: { await snapshots.load() },
+            configRevisionLoader: { "newer" }
         )
 
         let first = Task { @MainActor in await model.reloadConfigFromDisk() }
@@ -543,6 +544,31 @@ struct AppModelMachineOverrideTests {
         await first.value
         #expect(model.config == newer)
         #expect(model.configFingerprint == "newer")
+    }
+
+    @Test("reload keeps the banner when the disk advances after its snapshot")
+    func reloadRefusesSnapshotThatIsNoLongerLive() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-reload-revalidate-app-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let paths = AppPaths(root: root)
+        let original = AppConfig(showMenuBarIcon: true)
+        try ConfigStore(paths: paths).save(original)
+        let stale = AppConfig(showMenuBarIcon: false)
+        let model = AppModel(
+            paths: paths,
+            configSnapshotLoader: {
+                ConfigSnapshot(bytes: Data(), fingerprint: "stale", config: stale)
+            },
+            configRevisionLoader: { "newer" }
+        )
+
+        await model.reloadConfigFromDisk()
+
+        #expect(model.config == original)
+        #expect(model.configChangedOnDisk)
+        #expect(model.lastConfigError?.contains("changed again") == true)
     }
 
     @Test("a failed reload keeps its reload affordance after the old bytes return")
