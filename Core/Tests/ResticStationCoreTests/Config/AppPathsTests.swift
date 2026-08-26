@@ -465,4 +465,34 @@ struct AppPathsEnvTests {
         try #require(root.path.withCString { stat($0, &rootInfo) } == 0)
         #expect(UInt32(rootInfo.st_mode) & 0o777 == 0o700)
     }
+
+    @Test("directory setup durably publishes every newly created ancestor")
+    func ensureDirectoriesSyncsEveryCreatedAncestorAndParent() throws {
+        let fileManager = FileManager.default
+        let base = fileManager.temporaryDirectory
+            .appendingPathComponent("restic-station-durability-test-\(UUID().uuidString)", isDirectory: true)
+        defer { try? fileManager.removeItem(at: base) }
+        try fileManager.createDirectory(at: base, withIntermediateDirectories: true)
+
+        let firstAncestor = base.appendingPathComponent("shared", isDirectory: true)
+        let secondAncestor = firstAncestor.appendingPathComponent("state", isDirectory: true)
+        let root = secondAncestor.appendingPathComponent("restic-station", isDirectory: true)
+        let paths = AppPaths(root: root)
+        var syncedPaths: [String] = []
+
+        try paths.ensureDirectories { syncedPaths.append($0.standardizedFileURL.path) }
+
+        #expect(syncedPaths == [
+            firstAncestor.path,
+            base.path,
+            secondAncestor.path,
+            firstAncestor.path,
+            root.path,
+            secondAncestor.path,
+            paths.runsDir.path,
+            paths.stateDir.path,
+            paths.locksDir.path,
+            root.path,
+        ])
+    }
 }

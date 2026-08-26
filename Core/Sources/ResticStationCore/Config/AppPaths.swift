@@ -336,19 +336,53 @@ public struct AppPaths: Equatable, Sendable {
     /// mode so `0700` is not imposed on shared XDG directories such as
     /// `~/.local` and `~/.local/state`. Idempotent.
     public func ensureDirectories() throws {
+        try ensureDirectories(syncDirectory: Self.syncDirectory)
+    }
+
+    /// Internal seam keeps the ordering of directory durability operations
+    /// directly testable without replacing process-wide POSIX functions.
+    func ensureDirectories(syncDirectory: (URL) throws -> Void) throws {
         let fileManager = FileManager.default
         let parent = root.deletingLastPathComponent()
         if parent.path != root.path {
-            try fileManager.createDirectory(at: parent, withIntermediateDirectories: true)
+            // `createDirectory(..., withIntermediateDirectories: true)` can
+            // create several ancestors at once, but does not make any of
+            // their directory entries crash-durable. Create and sync each
+            // missing component before moving to the next one so a later
+            // successful scheduler setup cannot inherit an unsynced
+            // `~/.local/state/...` chain from this call.
+            try Self.createMissingDirectoriesDurably(
+                to: parent,
+                fileManager: fileManager,
+                syncDirectory: syncDirectory
+            )
             if let failure = FileLock.validateTrustedRootParent(for: root) {
                 throw failure
             }
         }
-        try fileManager.createDirectory(
-            at: root,
-            withIntermediateDirectories: true,
-            attributes: [.posixPermissions: 0o700]
-        )
+        var rootIsDirectory: ObjCBool = false
+        let rootExists = fileManager.fileExists(atPath: root.path, isDirectory: &rootIsDirectory)
+        let rootWasMissing = !rootExists
+        if rootWasMissing || !rootIsDirectory.boolValue {
+            do {
+                try fileManager.createDirectory(
+                    at: root,
+                    withIntermediateDirectories: false,
+                    attributes: [.posixPermissions: 0o700]
+                )
+            } catch {
+                var isDirectory: ObjCBool = false
+                guard rootWasMissing,
+                      fileManager.fileExists(atPath: root.path, isDirectory: &isDirectory),
+                      isDirectory.boolValue else {
+                    throw error
+                }
+            }
+            try syncDirectory(root)
+            if parent.path != root.path {
+                try syncDirectory(parent)
+            }
+        }
         // All three directories own flock inodes, so another uid must never
         // be able to create or replace entries in them. `state/` additionally
         // holds `preview-tokens.json`, which contains live destructive
@@ -362,11 +396,13 @@ public struct AppPaths: Equatable, Sendable {
         // pre-existing 755 dir staying 755), and the protection that matters
         // is per-file: the token index is 0600 and refuses to load if it is
         // not. This narrows the exposure without overriding that choice.
+        var createdProtectedDirectory = false
         for (directory, tightenExisting) in [
             (runsDir, false),
             (stateDir, true),
             (locksDir, false),
         ] {
+            let wasMissing = !fileManager.fileExists(atPath: directory.path)
             if let failure = FileLock.ensureDirectory(
                 directory,
                 parent: root,
@@ -376,6 +412,76 @@ public struct AppPaths: Equatable, Sendable {
             ) {
                 throw failure
             }
+            if wasMissing {
+                // Persist the new directory inode now; one root sync after
+                // the loop persists all of their entries together.
+                try syncDirectory(directory)
+                createdProtectedDirectory = true
+            }
+        }
+        if createdProtectedDirectory {
+            try syncDirectory(root)
+        }
+    }
+
+    /// Creates a missing path one component at a time and commits both the
+    /// new directory and its entry in the parent before continuing deeper.
+    private static func createMissingDirectoriesDurably(
+        to directory: URL,
+        fileManager: FileManager,
+        syncDirectory: (URL) throws -> Void
+    ) throws {
+        var missing: [URL] = []
+        var cursor = directory.standardizedFileURL
+        while !fileManager.fileExists(atPath: cursor.path) {
+            missing.append(cursor)
+            let parent = cursor.deletingLastPathComponent()
+            guard parent.path != cursor.path else { break }
+            cursor = parent
+        }
+
+        for component in missing.reversed() {
+            do {
+                try fileManager.createDirectory(at: component, withIntermediateDirectories: false)
+            } catch {
+                // Another Restic Station process may have won the mkdir race.
+                // Accept only an actual directory, then provide the same
+                // durability confirmation on its behalf.
+                var isDirectory: ObjCBool = false
+                guard fileManager.fileExists(atPath: component.path, isDirectory: &isDirectory),
+                      isDirectory.boolValue else {
+                    throw error
+                }
+            }
+            try syncDirectory(component)
+            let parent = component.deletingLastPathComponent()
+            if parent.path != component.path {
+                try syncDirectory(parent)
+            }
+        }
+    }
+
+    private static func syncDirectory(_ directory: URL) throws {
+        let descriptor = directory.path.withCString {
+            open($0, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        }
+        guard descriptor >= 0 else {
+            throw LockFailure(
+                path: directory.path,
+                operation: "open directory for fsync",
+                errnoValue: errno
+            )
+        }
+        defer { close(descriptor) }
+
+        while fsync(descriptor) != 0 {
+            let code = errno
+            if code == EINTR { continue }
+            throw LockFailure(
+                path: directory.path,
+                operation: "fsync directory",
+                errnoValue: code
+            )
         }
     }
 }
