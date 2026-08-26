@@ -388,6 +388,10 @@ final class AppModel: ObservableObject {
 
         let previous = config
         let previousResticPath = resticPath
+        // Any reload that left the main actor before this successful save
+        // began is now stale, even if its snapshot and disk revalidation
+        // matched each other. It must not publish over this newer model state.
+        configReloadGeneration &+= 1
         config = newConfig
         configFingerprint = installedFingerprint
         configChangedOnDisk = false

@@ -232,6 +232,20 @@ public struct SecretRollbackChange<Value: Equatable & Sendable>: Equatable, Send
     }
 }
 
+/// Persistent identity for one managed-field mutation. Production stores
+/// advance this token even when a writer installs the same value (or deletes
+/// an already-absent value), closing the ABA hole that value comparison alone
+/// leaves across app/helper processes.
+public struct SecretRollbackGeneration: Equatable, Sendable {
+    public let installed: String
+    public let previous: String?
+
+    public init(installed: String, previous: String?) {
+        self.installed = installed
+        self.previous = previous
+    }
+}
+
 public struct DestinationSecretRollback: Equatable, Sendable {
     public let destId: UUID
     public let password: SecretRollbackChange<String?>?
@@ -240,17 +254,23 @@ public struct DestinationSecretRollback: Equatable, Sendable {
     /// valid replacement repair malformed legacy/manual JSON while an
     /// abandoned editor can still restore those original bytes verbatim.
     public let previousSecretEnvRaw: String?
+    public let passwordGeneration: SecretRollbackGeneration?
+    public let secretEnvGeneration: SecretRollbackGeneration?
 
     public init(
         destId: UUID,
         password: SecretRollbackChange<String?>?,
         secretEnv: SecretRollbackChange<[String: String]>?,
-        previousSecretEnvRaw: String? = nil
+        previousSecretEnvRaw: String? = nil,
+        passwordGeneration: SecretRollbackGeneration? = nil,
+        secretEnvGeneration: SecretRollbackGeneration? = nil
     ) {
         self.destId = destId
         self.password = password
         self.secretEnv = secretEnv
         self.previousSecretEnvRaw = previousSecretEnvRaw
+        self.passwordGeneration = passwordGeneration
+        self.secretEnvGeneration = secretEnvGeneration
     }
 }
 

@@ -294,9 +294,21 @@ extension AppModel {
         editorSessionId: UUID? = nil,
         onProgress: (([DestinationSecretsRollback]) -> Void)? = nil
     ) async throws -> Bool {
-        if let editorSessionId,
-           hasNewerOutstandingSecretRollback(than: rollbacks, excluding: editorSessionId) {
-            throw AppModelError.newerSecretEditorMutation
+        if let editorSessionId {
+            if let pendingSecretRollbackTask {
+                await pendingSecretRollbackTask.value
+            }
+            // Do not consume an intermediate queued link while an even newer
+            // live editor still owns the installed value. That editor must
+            // restore first or the queued chain would be misclassified as an
+            // external conflict and discarded.
+            if hasNewerLiveSecretRollback(than: rollbacks, excluding: editorSessionId) {
+                throw AppModelError.newerSecretEditorMutation
+            }
+            try await drainQueuedSecretRollbacks(newerThan: rollbacks)
+            if hasNewerLiveSecretRollback(than: rollbacks, excluding: editorSessionId) {
+                throw AppModelError.newerSecretEditorMutation
+            }
         }
         let store = try makeSecretStore()
         return try await restoreDestinationSecrets(
@@ -315,21 +327,20 @@ extension AppModel {
         )
     }
 
-    private func hasNewerOutstandingSecretRollback(
+    private func hasNewerLiveSecretRollback(
         than rollbacks: [DestinationSecretsRollback],
         excluding sessionId: UUID
     ) -> Bool {
         let requested = rollbacks.compactMap(rollbackWithUncommittedFields)
         guard !requested.isEmpty else { return false }
         let otherSessions = activeSecretEditorSessions.subtracting([sessionId])
-        let outstanding = (otherSessions.flatMap { otherSession in
+        let live = otherSessions.flatMap { otherSession in
             (claimedSecretEditorRollbacks[otherSession] ?? [])
                 + (unclaimedSecretEditorRollbacks[otherSession] ?? [])
-        } + pendingSecretRollbackBatches.flatMap { $0 })
-            .compactMap(rollbackWithUncommittedFields)
+        }.compactMap(rollbackWithUncommittedFields)
 
         return requested.contains { older in
-            outstanding.contains { newer in
+            live.contains { newer in
                 guard newer.destId == older.destId,
                       newer.sequence > older.sequence else { return false }
                 let overlapsPassword = older.transaction.password != nil
@@ -338,6 +349,56 @@ extension AppModel {
                     && newer.transaction.secretEnv != nil
                 return overlapsPassword || overlapsSecretEnv
             }
+        }
+    }
+
+    /// An explicit Revert remains usable when a newer editor has already
+    /// closed. Drain the causally newer queued transitions first, one global
+    /// sequence at a time, then let the caller restore its older view-owned
+    /// chain. The current editor stays active so unrelated background retry
+    /// work remains paused.
+    private func drainQueuedSecretRollbacks(
+        newerThan requestedRollbacks: [DestinationSecretsRollback]
+    ) async throws {
+        let requested = requestedRollbacks.compactMap(rollbackWithUncommittedFields)
+        guard !requested.isEmpty else { return }
+
+        while let queued = pendingSecretRollbackBatches
+            .flatMap({ $0 })
+            .compactMap(rollbackWithUncommittedFields)
+            .filter({ newer in
+                requested.contains { older in
+                    guard newer.destId == older.destId,
+                          newer.sequence > older.sequence else { return false }
+                    return (newer.transaction.password != nil && older.transaction.password != nil)
+                        || (newer.transaction.secretEnv != nil && older.transaction.secretEnv != nil)
+                }
+            })
+            .max(by: { $0.sequence < $1.sequence }) {
+            removePendingSecretRollback(sequence: queued.sequence)
+            var remaining = [queued]
+            do {
+                _ = try await restoreDestinationSecrets(
+                    [queued],
+                    onProgress: { remaining = $0 }
+                )
+            } catch {
+                pendingSecretRollbackBatches.append(remaining)
+                pendingSecretRollbackError =
+                    "Some destination credentials could not be restored (\(error)). "
+                    + "Backups may use credentials from an abandoned edit until restoration succeeds."
+                throw error
+            }
+        }
+        if pendingSecretRollbackBatches.isEmpty {
+            pendingSecretRollbackError = nil
+        }
+    }
+
+    private func removePendingSecretRollback(sequence: UInt64) {
+        pendingSecretRollbackBatches = pendingSecretRollbackBatches.compactMap { batch in
+            let remaining = batch.filter { $0.sequence != sequence }
+            return remaining.isEmpty ? nil : remaining
         }
     }
 
@@ -402,18 +463,25 @@ extension AppModel {
                         destId: destId,
                         password: nil,
                         secretEnv: remaining[index].secretEnv,
-                        previousSecretEnvRaw: remaining[index].previousSecretEnvRaw
+                        previousSecretEnvRaw: remaining[index].previousSecretEnvRaw,
+                        secretEnvGeneration: remaining[index].secretEnvGeneration
                     )
                     publishProgress()
                 } else {
                     let result = try await store.restoreDestinationSecretsIfCurrent(
-                        DestinationSecretRollback(destId: destId, password: password, secretEnv: nil)
+                        DestinationSecretRollback(
+                            destId: destId,
+                            password: password,
+                            secretEnv: nil,
+                            passwordGeneration: remaining[index].passwordGeneration
+                        )
                     )
                     remaining[index] = DestinationSecretRollback(
                         destId: destId,
                         password: nil,
                         secretEnv: remaining[index].secretEnv,
-                        previousSecretEnvRaw: remaining[index].previousSecretEnvRaw
+                        previousSecretEnvRaw: remaining[index].previousSecretEnvRaw,
+                        secretEnvGeneration: remaining[index].secretEnvGeneration
                     )
                     if result.passwordRestored == false {
                         passwordConflicts.insert(destId)
@@ -429,7 +497,8 @@ extension AppModel {
                         destId: destId,
                         password: remaining[index].password,
                         secretEnv: nil,
-                        previousSecretEnvRaw: nil
+                        previousSecretEnvRaw: nil,
+                        passwordGeneration: remaining[index].passwordGeneration
                     )
                     publishProgress()
                 } else {
@@ -438,14 +507,16 @@ extension AppModel {
                             destId: destId,
                             password: nil,
                             secretEnv: secretEnv,
-                            previousSecretEnvRaw: remaining[index].previousSecretEnvRaw
+                            previousSecretEnvRaw: remaining[index].previousSecretEnvRaw,
+                            secretEnvGeneration: remaining[index].secretEnvGeneration
                         )
                     )
                     remaining[index] = DestinationSecretRollback(
                         destId: destId,
                         password: remaining[index].password,
                         secretEnv: nil,
-                        previousSecretEnvRaw: nil
+                        previousSecretEnvRaw: nil,
+                        passwordGeneration: remaining[index].passwordGeneration
                     )
                     if result.secretEnvRestored == false {
                         secretEnvConflicts.insert(destId)
@@ -520,7 +591,9 @@ extension AppModel {
                 destId: transaction.destId,
                 password: password,
                 secretEnv: secretEnv,
-                previousSecretEnvRaw: secretEnv == nil ? nil : transaction.previousSecretEnvRaw
+                previousSecretEnvRaw: secretEnv == nil ? nil : transaction.previousSecretEnvRaw,
+                passwordGeneration: password == nil ? nil : transaction.passwordGeneration,
+                secretEnvGeneration: secretEnv == nil ? nil : transaction.secretEnvGeneration
             ),
             sequence: rollback.sequence
         )

@@ -142,7 +142,9 @@ public struct FileSecretStore: SecretStore {
 
     public func setPassword(_ password: String, destId: UUID) async throws {
         try await mutate { document in
-            document.secrets[SecretAccount.password(destId)] = password
+            let account = SecretAccount.password(destId)
+            document.generations[account] = UUID().uuidString
+            document.secrets[account] = password
         }
     }
 
@@ -155,7 +157,9 @@ public struct FileSecretStore: SecretStore {
 
     public func deletePassword(destId: UUID) async throws {
         try await mutate { document in
-            document.secrets.removeValue(forKey: SecretAccount.password(destId))
+            let account = SecretAccount.password(destId)
+            document.generations[account] = UUID().uuidString
+            document.secrets.removeValue(forKey: account)
         }
     }
 
@@ -164,7 +168,9 @@ public struct FileSecretStore: SecretStore {
     public func setSecretEnv(_ env: [String: String], destId: UUID) async throws {
         let json = try SecretEnvBlob.encode(env)
         try await mutate { document in
-            document.secrets[SecretAccount.secretEnv(destId)] = json
+            let account = SecretAccount.secretEnv(destId)
+            document.generations[account] = UUID().uuidString
+            document.secrets[account] = json
         }
     }
 
@@ -179,7 +185,9 @@ public struct FileSecretStore: SecretStore {
 
     public func deleteSecretEnv(destId: UUID) async throws {
         try await mutate { document in
-            document.secrets.removeValue(forKey: SecretAccount.secretEnv(destId))
+            let account = SecretAccount.secretEnv(destId)
+            document.generations[account] = UUID().uuidString
+            document.secrets.removeValue(forKey: account)
         }
     }
 
@@ -192,6 +200,10 @@ public struct FileSecretStore: SecretStore {
             let envAccount = SecretAccount.secretEnv(update.destId)
             let previousPassword = update.password == nil ? nil : document.secrets[passwordAccount]
             let previousEnvRaw = update.secretEnv == nil ? nil : document.secrets[envAccount]
+            let previousPasswordGeneration = update.password == nil ? nil : document.generations[passwordAccount]
+            let previousEnvGeneration = update.secretEnv == nil ? nil : document.generations[envAccount]
+            let installedPasswordGeneration = update.password.map { _ in UUID().uuidString }
+            let installedEnvGeneration = update.secretEnv.map { _ in UUID().uuidString }
             let previousEnv = update.secretEnv == nil
                 ? nil
                 : previousEnvRaw.flatMap { try? SecretEnvBlob.decode($0) } ?? [:]
@@ -203,13 +215,21 @@ public struct FileSecretStore: SecretStore {
                 secretEnv: update.secretEnv.map {
                     SecretRollbackChange(installed: $0, previous: previousEnv ?? [:])
                 },
-                previousSecretEnvRaw: previousEnvRaw
+                previousSecretEnvRaw: previousEnvRaw,
+                passwordGeneration: installedPasswordGeneration.map {
+                    SecretRollbackGeneration(installed: $0, previous: previousPasswordGeneration)
+                },
+                secretEnvGeneration: installedEnvGeneration.map {
+                    SecretRollbackGeneration(installed: $0, previous: previousEnvGeneration)
+                }
             )
             guard update.password != nil || update.secretEnv != nil else { return rollback }
             if let password = update.password {
+                document.generations[passwordAccount] = installedPasswordGeneration
                 document.secrets[passwordAccount] = password
             }
             if let env = update.secretEnv {
+                document.generations[envAccount] = installedEnvGeneration
                 document.secrets[envAccount] = env.isEmpty ? nil : try SecretEnvBlob.encode(env)
             }
             document.version = Self.currentVersion
@@ -226,11 +246,16 @@ public struct FileSecretStore: SecretStore {
             let passwordAccount = SecretAccount.password(rollback.destId)
             let envAccount = SecretAccount.secretEnv(rollback.destId)
             let passwordRestored = rollback.password.map { change in
-                document.secrets[passwordAccount] == change.installed
+                if let generation = rollback.passwordGeneration {
+                    return document.generations[passwordAccount] == generation.installed
+                }
+                return document.secrets[passwordAccount] == change.installed
             }
             let secretEnvRestored: Bool?
             if let change = rollback.secretEnv {
-                if let currentRaw = document.secrets[envAccount] {
+                if let generation = rollback.secretEnvGeneration {
+                    secretEnvRestored = document.generations[envAccount] == generation.installed
+                } else if let currentRaw = document.secrets[envAccount] {
                     secretEnvRestored = (try? SecretEnvBlob.decode(currentRaw)) == change.installed
                 } else {
                     secretEnvRestored = change.installed.isEmpty
@@ -240,6 +265,9 @@ public struct FileSecretStore: SecretStore {
             }
             if passwordRestored == true, let change = rollback.password {
                 document.secrets[passwordAccount] = change.previous
+                if let generation = rollback.passwordGeneration {
+                    document.generations[passwordAccount] = generation.previous
+                }
             }
             if secretEnvRestored == true, let change = rollback.secretEnv {
                 if let previousRaw = rollback.previousSecretEnvRaw {
@@ -248,6 +276,9 @@ public struct FileSecretStore: SecretStore {
                     document.secrets[envAccount] = change.previous.isEmpty
                         ? nil
                         : try SecretEnvBlob.encode(change.previous)
+                }
+                if let generation = rollback.secretEnvGeneration {
+                    document.generations[envAccount] = generation.previous
                 }
             }
             if passwordRestored == true || secretEnvRestored == true {
@@ -360,17 +391,35 @@ public struct FileSecretStore: SecretStore {
 
     // MARK: - Document
 
-    /// The on-disk shape:
-    /// `{"version":1,"secrets":{"<uuid>":"…","<uuid>-env":"{…}"}}` —
-    /// deliberately mirroring the keychain account naming so the two
-    /// backends stay structurally comparable.
+    /// The on-disk shape contains `secrets` plus a parallel, non-secret
+    /// `generations` dictionary. Both use the same `<uuid>` / `<uuid>-env`
+    /// keys as the keychain backend; missing generations decode as empty for
+    /// compatibility with files written before conditional rollback needed
+    /// persistent cross-process mutation identity.
     struct Document: Codable, Equatable {
         var version: Int
         var secrets: [String: String]
+        var generations: [String: String]
 
-        init(version: Int = FileSecretStore.currentVersion, secrets: [String: String] = [:]) {
+        init(
+            version: Int = FileSecretStore.currentVersion,
+            secrets: [String: String] = [:],
+            generations: [String: String] = [:]
+        ) {
             self.version = version
             self.secrets = secrets
+            self.generations = generations
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case version, secrets, generations
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            version = try container.decode(Int.self, forKey: .version)
+            secrets = try container.decode([String: String].self, forKey: .secrets)
+            generations = try container.decodeIfPresent([String: String].self, forKey: .generations) ?? [:]
         }
     }
 

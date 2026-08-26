@@ -592,6 +592,43 @@ struct AppModelMachineOverrideTests {
         #expect(model.configFingerprint == "newer")
     }
 
+    @Test("an app save invalidates a reload already off the main actor")
+    func appSaveInvalidatesPendingReload() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-reload-save-race-app-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let paths = AppPaths(root: root)
+        let store = ConfigStore(paths: paths)
+        let original = AppConfig(showMenuBarIcon: true)
+        try store.save(original)
+        try MachineStore(paths: paths).save(MachineConfig(machineId: "reload-save-test"))
+        let staleSnapshot = try store.snapshot()
+        let snapshots = SequencedConfigSnapshotLoader(first: staleSnapshot, second: staleSnapshot)
+        let model = AppModel(
+            paths: paths,
+            configSnapshotLoader: { await snapshots.load() },
+            // Deliberately returns the matching stale revision: generation
+            // invalidation, not disk revalidation, must reject this reload.
+            configRevisionLoader: { staleSnapshot.fingerprint }
+        )
+
+        let reload = Task { @MainActor in await model.reloadConfigFromDisk() }
+        for _ in 0..<40 {
+            if await snapshots.firstRequestIsWaiting() { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        #expect(await snapshots.firstRequestIsWaiting())
+
+        let saved = AppConfig(showMenuBarIcon: false)
+        let savedFingerprint = try model.saveConfig(saved)
+        await snapshots.releaseFirstRequest()
+        await reload.value
+
+        #expect(model.config == saved)
+        #expect(model.configFingerprint == savedFingerprint)
+    }
+
     @Test("reload keeps the banner when the disk advances after its snapshot")
     func reloadRefusesSnapshotThatIsNoLongerLive() async throws {
         let root = FileManager.default.temporaryDirectory
@@ -1121,8 +1158,8 @@ struct AppModelMachineOverrideTests {
         model.endSecretEditorSession(olderSession)
     }
 
-    @Test("an older explicit revert waits for a newer queued mutation")
-    func explicitRevertDefersToNewerQueuedMutation() async throws {
+    @Test("an older explicit revert drains a newer queued mutation")
+    func explicitRevertDrainsNewerQueuedMutation() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("restic-station-secret-queued-revert-order-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -1154,26 +1191,79 @@ struct AppModelMachineOverrideTests {
         model.endSecretEditorSession(newerSession, claimedRollbacks: [newer])
 
         var olderRemaining = [older]
+        _ = try await model.restoreDestinationSecrets(
+            olderRemaining,
+            editorSessionId: olderSession,
+            onProgress: { olderRemaining = $0 }
+        )
+        #expect(olderRemaining.isEmpty)
+        #expect(model.pendingSecretRollbackBatches.isEmpty)
+        #expect(try await secrets.password(destId: destinationId) == "original-password")
+        model.endSecretEditorSession(olderSession)
+    }
+
+    @Test("an older explicit revert preserves queued links behind a newer live editor")
+    func explicitRevertDoesNotDrainBehindNewerLiveEditor() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-secret-live-before-queued-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let destinationId = UUID()
+        let olderSession = UUID()
+        let queuedSession = UUID()
+        let liveSession = UUID()
+        let secrets = CheckpointingSecretStore(passwords: [destinationId: "original-password"])
+        let model = AppModel(paths: AppPaths(root: root), secretStoreFactory: { secrets })
+
+        func mutate(_ value: String, session: UUID) async throws -> AppModel.DestinationSecretsRollback {
+            model.beginSecretEditorSession(session)
+            let rollback = try await model.storeDestinationSecrets(
+                destId: destinationId,
+                password: value,
+                secretEnv: nil,
+                ifConfigUnchangedFrom: model.configFingerprint,
+                editorSessionId: session
+            )
+            #expect(model.claimEditorSecretRollback(rollback, sessionId: session))
+            return rollback
+        }
+
+        let older = try await mutate("older-editor-password", session: olderSession)
+        let queued = try await mutate("queued-editor-password", session: queuedSession)
+        model.endSecretEditorSession(queuedSession, claimedRollbacks: [queued])
+        let live = try await mutate("live-editor-password", session: liveSession)
+
+        var olderRemaining = [older]
         do {
             _ = try await model.restoreDestinationSecrets(
                 olderRemaining,
                 editorSessionId: olderSession,
                 onProgress: { olderRemaining = $0 }
             )
-            Issue.record("expected the older revert to defer")
+            Issue.record("expected the older revert to wait for the live editor")
         } catch AppModelError.newerSecretEditorMutation {
-            // Expected: the queued newer rollback must run first.
+            // Expected: neither the live nor queued newer link was consumed.
         }
-        #expect(olderRemaining.count == 1)
-        #expect(try await secrets.password(destId: destinationId) == "newer-editor-password")
+        #expect(model.pendingSecretRollbackBatches.flatMap { $0 }.contains { $0.sequence == queued.sequence })
+        #expect(try await secrets.password(destId: destinationId) == "live-editor-password")
 
-        model.endSecretEditorSession(olderSession, claimedRollbacks: olderRemaining)
-        for _ in 0..<40 {
-            if model.pendingSecretRollbackBatches.isEmpty { break }
-            try await Task.sleep(for: .milliseconds(10))
-        }
+        var liveRemaining = [live]
+        _ = try await model.restoreDestinationSecrets(
+            liveRemaining,
+            editorSessionId: liveSession,
+            onProgress: { liveRemaining = $0 }
+        )
+        model.endSecretEditorSession(liveSession)
+        _ = try await model.restoreDestinationSecrets(
+            olderRemaining,
+            editorSessionId: olderSession,
+            onProgress: { olderRemaining = $0 }
+        )
+
+        #expect(olderRemaining.isEmpty)
         #expect(model.pendingSecretRollbackBatches.isEmpty)
         #expect(try await secrets.password(destId: destinationId) == "original-password")
+        model.endSecretEditorSession(olderSession)
     }
 
     @Test("an older rollback waits until a live editor registers its newer transaction")

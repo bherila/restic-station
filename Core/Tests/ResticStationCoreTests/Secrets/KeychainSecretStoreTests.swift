@@ -266,6 +266,37 @@ struct KeychainSecretStoreTests {
         #expect(restoredEnv == ["TOKEN": "original"])
     }
 
+    @Test("conditional rollback preserves same-value writes from another process")
+    func conditionalRollbackUsesPersistentGenerations() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-keychain-generations-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let envAccount = "\(Self.account)-env"
+        let runner = StatefulKeychainRunner(items: [
+            Self.account: "original-password",
+            envAccount: try SecretEnvBlob.encode(["TOKEN": "original"]),
+        ])
+        let client = KeychainSecretStore(runner: runner, paths: AppPaths(root: root))
+        let rollback = try await client.updateDestinationSecrets(
+            DestinationSecretUpdate(
+                destId: Self.destId,
+                password: "editor-password",
+                secretEnv: [:]
+            )
+        )
+
+        // A separate helper invocation takes the same cross-process lock and
+        // advances the field identity even though the values do not change.
+        try await client.setPassword("editor-password", destId: Self.destId)
+        try await client.deleteSecretEnv(destId: Self.destId)
+        let result = try await client.restoreDestinationSecretsIfCurrent(rollback)
+
+        #expect(result.passwordRestored == false)
+        #expect(result.secretEnvRestored == false)
+        #expect(try await client.password(destId: Self.destId) == "editor-password")
+        #expect(try await client.secretEnv(destId: Self.destId).isEmpty)
+    }
+
     @Test("failed password update does not rewrite an untouched environment")
     func failedPasswordUpdateRestoresOnlyStartedFields() async throws {
         let root = FileManager.default.temporaryDirectory
@@ -290,7 +321,7 @@ struct KeychainSecretStoreTests {
             .init(argvPrefix: ["/usr/bin/security", "delete-generic-password"], exitCode: 44),
             .init(argvPrefix: ["/usr/bin/security", "add-generic-password"], exitCode: 0),
         ])
-        let client = KeychainSecretStore(runner: runner, paths: AppPaths(root: root))
+        let client = KeychainSecretStore(runner: runner)
 
         await #expect(throws: SecretStoreError.backendFailed("injected password failure")) {
             _ = try await client.updateDestinationSecrets(
@@ -372,7 +403,7 @@ struct KeychainSecretStoreTests {
             ),
             .init(argvPrefix: ["/usr/bin/security", "add-generic-password", "-U"], exitCode: 0),
         ])
-        let client = KeychainSecretStore(runner: runner, paths: AppPaths(root: root))
+        let client = KeychainSecretStore(runner: runner)
 
         let rollback = try await client.updateDestinationSecrets(
             DestinationSecretUpdate(destId: Self.destId, password: nil, secretEnv: validEnv)
@@ -401,7 +432,7 @@ struct KeychainSecretStoreTests {
             .init(argvPrefix: ["/usr/bin/security", "delete-generic-password"], exitCode: 44),
             .init(argvPrefix: ["/usr/bin/security", "add-generic-password"], exitCode: 0),
         ])
-        let client = KeychainSecretStore(runner: runner, paths: AppPaths(root: root))
+        let client = KeychainSecretStore(runner: runner)
         let rollback = try await client.updateDestinationSecrets(
             DestinationSecretUpdate(destId: Self.destId, password: nil, secretEnv: [:])
         )
@@ -428,6 +459,8 @@ struct KeychainSecretStoreTests {
 
         let runner = FakeProcessRunner(script: [
             .init(argvPrefix: ["/usr/bin/security", "delete-generic-password"], exitCode: 44),
+            .init(argvPrefix: ["/usr/bin/security", "add-generic-password"], exitCode: 0),
+            .init(argvPrefix: ["/usr/bin/security", "delete-generic-password"], exitCode: 44),
         ])
         let client = KeychainSecretStore(runner: runner, paths: paths)
         let mutation = Task {
@@ -438,7 +471,59 @@ struct KeychainSecretStoreTests {
         #expect(runner.invocations.isEmpty)
         heldLock.release()
         try await mutation.value
-        #expect(runner.invocations.count == 1)
+        #expect(runner.invocations.count == 3)
+    }
+}
+
+private final class StatefulKeychainRunner: ProcessRunning, @unchecked Sendable {
+    private let lock = NSLock()
+    private var items: [String: String]
+
+    init(items: [String: String]) {
+        self.items = items
+    }
+
+    func run(
+        _ argv: [String],
+        env: [String: String]?,
+        stdin: Data?,
+        currentDirectory: String?,
+        onStdoutLine: (@Sendable (String) -> Void)?,
+        onStderrLine: (@Sendable (String) -> Void)?,
+        timeout: TimeInterval?
+    ) async throws -> ProcessResult {
+        withLock {
+            guard let accountFlag = argv.firstIndex(of: "-a"), accountFlag + 1 < argv.count else {
+                return ProcessResult(exitCode: 1, stdout: Data(), stderr: Data("missing account".utf8))
+            }
+            let account = argv[accountFlag + 1]
+            switch argv.dropFirst().first {
+            case "find-generic-password":
+                guard let value = items[account] else {
+                    return ProcessResult(exitCode: 44, stdout: Data(), stderr: Data())
+                }
+                return ProcessResult(exitCode: 0, stdout: Data((value + "\n").utf8), stderr: Data())
+            case "delete-generic-password":
+                guard items.removeValue(forKey: account) != nil else {
+                    return ProcessResult(exitCode: 44, stdout: Data(), stderr: Data())
+                }
+                return ProcessResult(exitCode: 0, stdout: Data(), stderr: Data())
+            case "add-generic-password":
+                guard let passwordFlag = argv.firstIndex(of: "-w"), passwordFlag + 1 < argv.count else {
+                    return ProcessResult(exitCode: 1, stdout: Data(), stderr: Data("missing value".utf8))
+                }
+                items[account] = argv[passwordFlag + 1]
+                return ProcessResult(exitCode: 0, stdout: Data(), stderr: Data())
+            default:
+                return ProcessResult(exitCode: 1, stdout: Data(), stderr: Data("unsupported command".utf8))
+            }
+        }
+    }
+
+    private func withLock<T>(_ body: () -> T) -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return body()
     }
 }
 #endif

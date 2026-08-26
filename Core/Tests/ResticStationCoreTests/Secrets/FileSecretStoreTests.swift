@@ -97,6 +97,34 @@ struct FileSecretStoreTests {
         #expect(try await store.secretEnv(destId: Self.destId) == ["TOKEN": "original"])
     }
 
+    @Test("conditional rollback preserves same-value writes from another process")
+    func conditionalRollbackUsesPersistentGenerations() async throws {
+        let (store, root) = Self.makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        try await store.setPassword("original-password", destId: Self.destId)
+        try await store.setSecretEnv(["TOKEN": "original"], destId: Self.destId)
+        let rollback = try await store.updateDestinationSecrets(
+            DestinationSecretUpdate(
+                destId: Self.destId,
+                password: "editor-password",
+                secretEnv: [:]
+            )
+        )
+
+        // These helper-style mutations are value-identical to the app's
+        // installation, including deletion of an already-absent env item.
+        try await store.setPassword("editor-password", destId: Self.destId)
+        try await store.deleteSecretEnv(destId: Self.destId)
+
+        let result = try await store.restoreDestinationSecretsIfCurrent(rollback)
+
+        #expect(result.passwordRestored == false)
+        #expect(result.secretEnvRestored == false)
+        #expect(try await store.password(destId: Self.destId) == "editor-password")
+        #expect(try await store.secretEnv(destId: Self.destId).isEmpty)
+    }
+
     @Test("a valid environment edit can replace and roll back a malformed secrets-file blob")
     func malformedEnvironmentCanBeRepairedAndRestored() async throws {
         let (store, root) = Self.makeStore()

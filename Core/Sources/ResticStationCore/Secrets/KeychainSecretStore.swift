@@ -16,8 +16,10 @@ import Foundation
 /// `-T /usr/bin/security`. This guarantees every item this type creates
 /// carries the trusted-application ACL, regardless of what existed before.
 /// Conditional editor rollback is the narrow exception: it has just verified
-/// that the current item is one this type installed, so `-U` atomically
-/// restores the previous value without a delete/add failure window.
+/// that the current item's non-secret companion generation is the one this
+/// type installed, so `-U` atomically restores the previous value without a
+/// delete/add failure window. Helper writes advance that companion even for
+/// same-value writes and idempotent deletes.
 ///
 /// Note (documented, not "fixed" — see keychain-and-fda.md): passing
 /// `-w <value>` puts the secret in `security`'s argv, momentarily visible
@@ -56,7 +58,9 @@ public struct KeychainSecretStore: SecretStore {
 
     public func setPassword(_ password: String, destId: UUID) async throws {
         try await withMutationLock {
-            try await setValue(password, account: SecretAccount.password(destId))
+            let account = SecretAccount.password(destId)
+            try await advanceGenerationIfTracked(account: account)
+            try await setValue(password, account: account)
         }
     }
 
@@ -66,7 +70,9 @@ public struct KeychainSecretStore: SecretStore {
 
     public func deletePassword(destId: UUID) async throws {
         try await withMutationLock {
-            try await deleteValueTolerant(account: SecretAccount.password(destId))
+            let account = SecretAccount.password(destId)
+            try await advanceGenerationIfTracked(account: account)
+            try await deleteValueTolerant(account: account)
         }
     }
 
@@ -79,7 +85,9 @@ public struct KeychainSecretStore: SecretStore {
     public func setSecretEnv(_ env: [String: String], destId: UUID) async throws {
         let json = try SecretEnvBlob.encode(env)
         try await withMutationLock {
-            try await setValue(json, account: SecretAccount.secretEnv(destId))
+            let account = SecretAccount.secretEnv(destId)
+            try await advanceGenerationIfTracked(account: account)
+            try await setValue(json, account: account)
         }
     }
 
@@ -97,7 +105,9 @@ public struct KeychainSecretStore: SecretStore {
 
     public func deleteSecretEnv(destId: UUID) async throws {
         try await withMutationLock {
-            try await deleteValueTolerant(account: SecretAccount.secretEnv(destId))
+            let account = SecretAccount.secretEnv(destId)
+            try await advanceGenerationIfTracked(account: account)
+            try await deleteValueTolerant(account: account)
         }
     }
 
@@ -113,6 +123,18 @@ public struct KeychainSecretStore: SecretStore {
             let previousEnvRaw = update.secretEnv == nil
                 ? nil
                 : try await readOptionalValue(account: envAccount)
+            let previousPasswordGeneration = update.password == nil || paths == nil
+                ? nil
+                : try await readOptionalValue(account: generationAccount(for: passwordAccount))
+            let previousEnvGeneration = update.secretEnv == nil || paths == nil
+                ? nil
+                : try await readOptionalValue(account: generationAccount(for: envAccount))
+            let installedPasswordGeneration = update.password == nil || paths == nil
+                ? nil
+                : UUID().uuidString
+            let installedEnvGeneration = update.secretEnv == nil || paths == nil
+                ? nil
+                : UUID().uuidString
             let previousEnv: [String: String]? = if update.secretEnv == nil {
                 nil
             } else if let previousEnvRaw {
@@ -128,17 +150,35 @@ public struct KeychainSecretStore: SecretStore {
                 secretEnv: update.secretEnv.map {
                     SecretRollbackChange(installed: $0, previous: previousEnv ?? [:])
                 },
-                previousSecretEnvRaw: previousEnvRaw
+                previousSecretEnvRaw: previousEnvRaw,
+                passwordGeneration: installedPasswordGeneration.map {
+                    SecretRollbackGeneration(installed: $0, previous: previousPasswordGeneration)
+                },
+                secretEnvGeneration: installedEnvGeneration.map {
+                    SecretRollbackGeneration(installed: $0, previous: previousEnvGeneration)
+                }
             )
             var passwordMutationBegan = false
             var environmentMutationBegan = false
             do {
                 if let password = update.password {
                     passwordMutationBegan = true
+                    if let installedPasswordGeneration {
+                        try await setValue(
+                            installedPasswordGeneration,
+                            account: generationAccount(for: passwordAccount)
+                        )
+                    }
                     try await setValue(password, account: passwordAccount)
                 }
                 if let env = update.secretEnv {
                     environmentMutationBegan = true
+                    if let installedEnvGeneration {
+                        try await setValue(
+                            installedEnvGeneration,
+                            account: generationAccount(for: envAccount)
+                        )
+                    }
                     if env.isEmpty {
                         try await deleteValueTolerant(account: envAccount)
                     } else {
@@ -156,6 +196,10 @@ public struct KeychainSecretStore: SecretStore {
                         } else {
                             try await deleteValueTolerant(account: passwordAccount)
                         }
+                        try await restoreGeneration(
+                            previousPasswordGeneration,
+                            account: passwordAccount
+                        )
                     }
                     if environmentMutationBegan {
                         if let previousEnvRaw {
@@ -165,6 +209,7 @@ public struct KeychainSecretStore: SecretStore {
                         } else {
                             try await deleteValueTolerant(account: envAccount)
                         }
+                        try await restoreGeneration(previousEnvGeneration, account: envAccount)
                     }
                 } catch {
                     throw SecretStoreError.backendFailed(
@@ -186,12 +231,20 @@ public struct KeychainSecretStore: SecretStore {
             let envAccount = SecretAccount.secretEnv(rollback.destId)
             var passwordRestored: Bool?
             if let change = rollback.password {
-                let current = try await readOptionalValue(account: passwordAccount)
-                passwordRestored = current == change.installed
+                if let generation = rollback.passwordGeneration {
+                    let current = try await readOptionalValue(account: generationAccount(for: passwordAccount))
+                    passwordRestored = current == generation.installed
+                } else {
+                    let current = try await readOptionalValue(account: passwordAccount)
+                    passwordRestored = current == change.installed
+                }
             }
             var secretEnvRestored: Bool?
             if let change = rollback.secretEnv {
-                if let currentRaw = try await readOptionalValue(account: envAccount) {
+                if let generation = rollback.secretEnvGeneration {
+                    let current = try await readOptionalValue(account: generationAccount(for: envAccount))
+                    secretEnvRestored = current == generation.installed
+                } else if let currentRaw = try await readOptionalValue(account: envAccount) {
                     secretEnvRestored = (try? SecretEnvBlob.decode(currentRaw)) == change.installed
                 } else {
                     secretEnvRestored = change.installed.isEmpty
@@ -202,6 +255,9 @@ public struct KeychainSecretStore: SecretStore {
                     try await updateExistingValue(previous, account: passwordAccount)
                 } else {
                     try await deleteValueTolerant(account: passwordAccount)
+                }
+                if let generation = rollback.passwordGeneration {
+                    try await restoreGeneration(generation.previous, account: passwordAccount)
                 }
             }
             if secretEnvRestored == true, let change = rollback.secretEnv {
@@ -222,6 +278,9 @@ public struct KeychainSecretStore: SecretStore {
                         account: envAccount
                     )
                 }
+                if let generation = rollback.secretEnvGeneration {
+                    try await restoreGeneration(generation.previous, account: envAccount)
+                }
             }
             return DestinationSecretRestoreResult(
                 passwordRestored: passwordRestored,
@@ -241,6 +300,25 @@ public struct KeychainSecretStore: SecretStore {
     }
 
     // MARK: - security subprocess plumbing
+
+    private func generationAccount(for account: String) -> String {
+        "\(account)-generation"
+    }
+
+    private func advanceGenerationIfTracked(account: String) async throws {
+        guard paths != nil else { return }
+        try await setValue(UUID().uuidString, account: generationAccount(for: account))
+    }
+
+    private func restoreGeneration(_ generation: String?, account: String) async throws {
+        guard paths != nil else { return }
+        let markerAccount = generationAccount(for: account)
+        if let generation {
+            try await setValue(generation, account: markerAccount)
+        } else {
+            try await deleteValueTolerant(account: markerAccount)
+        }
+    }
 
     private func setValue(_ value: String, account: String) async throws {
         do {
