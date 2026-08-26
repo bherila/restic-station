@@ -1147,7 +1147,10 @@ public final class BackupEngine: Sendable {
                     return .completed(.success)
                 case .warningIncompleteRead:
                     return .completed(.warning)
-                default:
+                case .fatal, .repoDoesNotExist, .repoLocked, .wrongPassword, .other:
+                    // Every failing exit class keeps its own identity in the
+                    // typed result; enumerated (no `default`) so a new
+                    // `ResticExitClass` case must choose a lane here.
                     return .failed(.restic(outcome.status))
                 }
             case .didNotRun:
@@ -2449,7 +2452,10 @@ public final class BackupEngine: Sendable {
             case .warningIncompleteRead:
                 status = .warning
                 errorSummary = outcome.status.userFacingMessage
-            default:
+            case .fatal, .repoDoesNotExist, .repoLocked, .wrongPassword, .other:
+                // Enumerated (no `default`) so a new `ResticExitClass` case
+                // must decide its run status here rather than silently
+                // recording `.failed`.
                 status = .failed
                 errorSummary = outcome.status.userFacingMessage
             }
@@ -2812,7 +2818,13 @@ public final class BackupEngine: Sendable {
             return reason
         case .token(.storeUnusable(let detail)):
             return "preview-token store unusable — \(detail)"
-        default:
+        case .token(.unavailable), .token(.unknown), .token(.expired),
+             .token(.alreadyUsed), .tokenDoesNotMatchCurrentPlan, .busy,
+             .destinationOffline, .unavailable, .resticUnavailable:
+            // Refusals and transient conditions, not broken infrastructure.
+            // Enumerated (no `default`) so a new `PurgeApplyError` or
+            // `PreviewTokenError` case must decide whether it is an
+            // infrastructure fault instead of silently reading as "not one".
             return nil
         }
     }

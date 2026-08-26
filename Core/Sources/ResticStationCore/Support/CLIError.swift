@@ -433,7 +433,14 @@ extension CLIFailure {
                 ),
                 details: CLIErrorDetails(setId: setId)
             )
-        case .token, .tokenDoesNotMatchCurrentPlan:
+        case .token(.unavailable), .token(.unknown), .token(.alreadyUsed),
+             .tokenDoesNotMatchCurrentPlan:
+            // Deliberately one opaque refusal for all four: a caller must not
+            // be able to probe the token store for whether a value is
+            // unknown, spent, or merely stale. Spelled case-by-case (no
+            // `.token` catch-all) so a new `PreviewTokenError` case is a
+            // compile error here instead of silently inheriting this
+            // fail-closed wording.
             return CLIFailure(
                 code: .operationNotAllowed,
                 message: "The purge preview does not match the current plan. Run purge preview again.",
@@ -749,12 +756,19 @@ extension CLIFailure {
                     versionSupported: String(supported)
                 )
             )
-        default:
+        case .remoteMaintenanceRequiresSFTP, .notExactlyOnePrimaryDestination,
+             .duplicateIdentifier, .emptySources, .relativeSourcePath,
+             .emptyPurgeExcludePattern, .invalidSchedule,
+             .invalidStalenessWarningDays, .invalidReadDataSubsetSlices,
+             .invalidMachineIdKey, .relativeOverrideSourcePath,
+             .notExactlyOnePrimaryDestinationForMachine:
             // Every other case is a validation failure of a config this
             // build *can* read. They are one code on purpose: a caller
             // fixes them all the same way — edit config.json — and the
             // per-field detail is in `message`, which is where a human
-            // needs it.
+            // needs it. Enumerated (no `default`) so a future `ConfigError`
+            // case must be classified here deliberately rather than
+            // inheriting this collapse by omission.
             return CLIFailure(code: .configInvalid, message: bounded(error.description))
         }
     }
