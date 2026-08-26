@@ -548,6 +548,45 @@ struct StateWatcherTests {
         loader.finishThird()
     }
 
+    @Test("a debounced replacement invalidates its prior scan before sleeping")
+    func debouncedAuditReplacementInvalidatesSynchronously() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-audit-debounce-generation-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = AppPaths(root: root)
+        let failure = RunAuditFailure(
+            runId: "current-debounced-audit-failure",
+            kind: .prune,
+            setId: UUID(),
+            destId: UUID(),
+            start: Date(),
+            reason: .launchedWithoutTerminalMetadata
+        )
+        let loader = ReplacementAuditLoader(currentResult: .success([failure]))
+        let watcher = StateWatcher(
+            paths: paths,
+            runStore: RunStore(paths: paths),
+            stateStore: StateStore(paths: paths),
+            auditHealthLoader: { loader.load() }
+        )
+
+        await watcher.refreshAuditHealthOffMain()
+        #expect(watcher.auditFailures == [failure])
+        let staleRefresh = Task { await watcher.refreshAuditHealthOffMain() }
+        await Task.detached { loader.waitUntilSecondStarted() }.value
+
+        // This synchronous call represents a filesystem event. The
+        // replacement is still in its 250 ms sleep when the old detached
+        // loader finishes.
+        watcher.scheduleDebouncedReload()
+        loader.finishSecond()
+        await staleRefresh.value
+        #expect(watcher.auditFailures == [failure])
+
+        await Task.detached { loader.waitUntilThirdStarted() }.value
+        loader.finishThird()
+    }
+
     @Test("explicit reload audit scans never run on the main thread")
     func explicitAuditRefreshRunsOffMain() async throws {
         let root = FileManager.default.temporaryDirectory

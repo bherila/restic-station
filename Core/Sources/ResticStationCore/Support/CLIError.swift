@@ -488,6 +488,17 @@ extension CLIFailure {
                 message: CLIFailure.bounded(message),
                 details: CLIErrorDetails(setId: setId)
             )
+        case .auditFailure(let reason, let operationMayHaveRun, let runId):
+            let message = operationMayHaveRun
+                ? "The purge may have changed repository data, but its result could not be recorded or trusted: "
+                    + "\(reason). Inspect the repositories before retrying."
+                : "The purge was blocked by an earlier destructive operation whose audit evidence is incomplete: "
+                    + "\(reason). Inspect the repositories and reconcile run history before retrying."
+            return CLIFailure(
+                code: .operationCompletedAuditFailed,
+                message: CLIFailure.bounded(message),
+                details: CLIErrorDetails(setId: setId, runId: runId)
+            )
         case .destinationOffline(let destinationId):
             return CLIFailure(
                 code: .repositoryOffline,

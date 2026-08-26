@@ -153,6 +153,10 @@ public enum PruneRepositoryFailure: Equatable, Sendable {
     /// Restic may have completed, failed, or never launched; none may report
     /// success without the required locking and bookkeeping invariants.
     case infrastructure(String)
+    /// Run-history infrastructure failed for a specific destructive run.
+    /// The helper publishes `runId` as structured error data so an operator
+    /// can inspect the canonical record without parsing prose.
+    case auditInfrastructure(reason: String, runId: String)
 }
 
 // MARK: - BackupEngine
@@ -377,8 +381,8 @@ public final class BackupEngine: Sendable {
             backup = child
         case .deferred(let reason):
             return .infrastructureFailure(reason: reason)
-        case .infrastructureFailure(let reason):
-            return .infrastructureFailure(reason: reason)
+        case .infrastructureFailure(let failure):
+            return .infrastructureFailure(reason: failure.reason)
         }
         children.append(backup.child)
         let groupId = backup.child.runId
@@ -672,8 +676,8 @@ public final class BackupEngine: Sendable {
             primaryCheck = child
         case .deferred(let reason):
             return .infrastructureFailure(reason: reason)
-        case .infrastructureFailure(let reason):
-            return .infrastructureFailure(reason: reason)
+        case .infrastructureFailure(let failure):
+            return .infrastructureFailure(reason: failure.reason)
         }
         var statuses = [primaryCheck.child.status]
         var infrastructureFailures: [String] = []
@@ -869,9 +873,9 @@ public final class BackupEngine: Sendable {
             primaryPrune = child
         case .deferred:
             return .skipped
-        case .infrastructureFailure(let reason):
+        case .infrastructureFailure(let failure):
             return .infrastructureFailure(
-                reason: reason,
+                reason: failure.reason,
                 operationMayHaveRun: false
             )
         case .notRequired:
@@ -915,9 +919,9 @@ public final class BackupEngine: Sendable {
                     return .infrastructureFailure(reason: reason, operationMayHaveRun: true)
                 }
                 statuses.append(prune.child.status)
-            case .infrastructureFailure(let reason):
+            case .infrastructureFailure(let failure):
                 return .infrastructureFailure(
-                    reason: reason,
+                    reason: failure.reason,
                     // The primary prune, and possibly earlier mirrors, have
                     // already executed by the time this later record fails.
                     operationMayHaveRun: true
@@ -1077,11 +1081,17 @@ public final class BackupEngine: Sendable {
                 prune = child
             case .deferred:
                 return .skipped(.busy)
-            case .infrastructureFailure(let reason):
-                return .failed(.infrastructure(reason))
+            case .infrastructureFailure(let failure):
+                if let runId = failure.auditRunId {
+                    return .failed(.auditInfrastructure(reason: failure.reason, runId: runId))
+                }
+                return .failed(.infrastructure(failure.reason))
             }
-            if let reason = prune.infrastructureFailureReason {
-                return .failed(.infrastructure(reason))
+            if let failure = prune.infrastructureFailure {
+                if let runId = failure.auditRunId {
+                    return .failed(.auditInfrastructure(reason: failure.reason, runId: runId))
+                }
+                return .failed(.infrastructure(failure.reason))
             }
             switch prune.preflightFailure {
             case .previewChanged:
@@ -1170,11 +1180,17 @@ public final class BackupEngine: Sendable {
             prune = child
         case .deferred:
             return .skipped(.busy)
-        case .infrastructureFailure(let reason):
-            return .failed(.infrastructure(reason))
+        case .infrastructureFailure(let failure):
+            if let runId = failure.auditRunId {
+                return .failed(.auditInfrastructure(reason: failure.reason, runId: runId))
+            }
+            return .failed(.infrastructure(failure.reason))
         }
-        if let reason = prune.infrastructureFailureReason {
-            return .failed(.infrastructure(reason))
+        if let failure = prune.infrastructureFailure {
+            if let runId = failure.auditRunId {
+                return .failed(.auditInfrastructure(reason: failure.reason, runId: runId))
+            }
+            return .failed(.infrastructure(failure.reason))
         }
         switch prune.preflightFailure {
         case .previewChanged:
@@ -1582,6 +1598,33 @@ public final class BackupEngine: Sendable {
         }
         defer { destructiveAuditGate.release() }
 
+        // A gate holder that has not launched anything must not make an
+        // abandoned record with a recycled PID look active to health scans.
+        // Verify immediately after acquisition, before potentially slow
+        // repository revalidation queries, and keep the existing
+        // performChild check as the final launch-boundary defense.
+        do {
+            if let unresolved = try runStore.unresolvedAuditFailures(
+                callerHoldsDestructiveAuditGate: true
+            ).first {
+                let reason = "operation_completed_audit_failed — destructive run "
+                    + "\(unresolved.runId) has unresolved \(unresolved.reason.rawValue) audit evidence; "
+                    + "inspect and reconcile run history before retrying"
+                throw PurgeApplyError.auditFailure(
+                    reason: reason,
+                    operationMayHaveRun: false,
+                    runId: unresolved.runId
+                )
+            }
+        } catch let error as PurgeApplyError {
+            throw error
+        } catch {
+            throw PurgeApplyError.infrastructureFailure(
+                reason: "run history unusable — could not verify destructive audit history: \(error)",
+                operationMayHaveRun: false
+            )
+        }
+
         var plans: [(destination: Destination, plan: PurgePlan)] = []
         for destination in destinations.sorted(by: { $0.id.uuidString < $1.id.uuidString }) {
             let plan = try await currentPurgePlan(
@@ -1666,10 +1709,17 @@ public final class BackupEngine: Sendable {
                     reason: reason,
                     operationMayHaveRun: true
                 )
-            case .infrastructureFailure(let reason):
+            case .infrastructureFailure(let failure):
                 if wasFirstPurgeChild { restorePurgeToken() }
+                if let runId = failure.auditRunId {
+                    throw PurgeApplyError.auditFailure(
+                        reason: failure.reason,
+                        operationMayHaveRun: !children.isEmpty,
+                        runId: runId
+                    )
+                }
                 throw PurgeApplyError.infrastructureFailure(
-                    reason: reason,
+                    reason: failure.reason,
                     operationMayHaveRun: !children.isEmpty
                 )
             }
@@ -1689,9 +1739,16 @@ public final class BackupEngine: Sendable {
                 )
             }
             children.append(purge.child)
-            if let reason = purge.infrastructureFailureReason {
+            if let failure = purge.infrastructureFailure {
+                if let runId = failure.auditRunId {
+                    throw PurgeApplyError.auditFailure(
+                        reason: failure.reason,
+                        operationMayHaveRun: true,
+                        runId: runId
+                    )
+                }
                 throw PurgeApplyError.infrastructureFailure(
-                    reason: reason,
+                    reason: failure.reason,
                     operationMayHaveRun: true
                 )
             }
@@ -1929,9 +1986,9 @@ public final class BackupEngine: Sendable {
             restore = child
         case .deferred(let reason):
             return .infrastructureFailure(reason: reason, operationMayHaveRun: false)
-        case .infrastructureFailure(let reason):
+        case .infrastructureFailure(let failure):
             return .infrastructureFailure(
-                reason: reason,
+                reason: failure.reason,
                 operationMayHaveRun: false
             )
         }
@@ -1996,9 +2053,9 @@ public final class BackupEngine: Sendable {
             initRun = child
         case .deferred(let reason):
             return .infrastructureFailure(reason: reason, operationMayHaveRun: false)
-        case .infrastructureFailure(let reason):
+        case .infrastructureFailure(let failure):
             return .infrastructureFailure(
-                reason: reason,
+                reason: failure.reason,
                 operationMayHaveRun: false
             )
         }
@@ -2078,7 +2135,21 @@ public final class BackupEngine: Sendable {
         /// The child may have completed and its terminal metadata may exist,
         /// while the append-only index write failed. Every caller must
         /// surface that as machine infrastructure failure, never success.
-        let infrastructureFailureReason: String?
+        let infrastructureFailure: ChildInfrastructureFailure?
+
+        var infrastructureFailureReason: String? {
+            infrastructureFailure?.reason
+        }
+    }
+
+    private struct ChildInfrastructureFailure {
+        let reason: String
+        let auditRunId: String?
+
+        init(_ reason: String, auditRunId: String? = nil) {
+            self.reason = reason
+            self.auditRunId = auditRunId
+        }
     }
 
     /// A command either obtained a durable run record before launch or was
@@ -2090,14 +2161,14 @@ public final class BackupEngine: Sendable {
         /// Expected machine-wide destructive-gate contention. Nothing was
         /// recorded or launched, so callers may safely defer and retry.
         case deferred(String)
-        case infrastructureFailure(String)
+        case infrastructureFailure(ChildInfrastructureFailure)
     }
 
     private enum RetentionChildResult {
         case notRequired
         case completed(ChildRun)
         case deferred(String)
-        case infrastructureFailure(String)
+        case infrastructureFailure(ChildInfrastructureFailure)
     }
 
     private enum PreflightFailure: Sendable {
@@ -2178,7 +2249,7 @@ public final class BackupEngine: Sendable {
             } catch {
                 let reason = "run history unusable — could not prepare the destructive audit gate: \(error)"
                 logWarning("BackupEngine: \(reason)")
-                return .infrastructureFailure(reason)
+                return .infrastructureFailure(ChildInfrastructureFailure(reason))
             }
             let gate = FileLock(path: paths.destructiveAuditLockFile, trustedRoot: paths.root)
             switch gate.acquire() {
@@ -2191,7 +2262,7 @@ public final class BackupEngine: Sendable {
             case .failed(let failure):
                 let reason = "run history unusable — destructive audit gate unusable: \(failure)"
                 logWarning("BackupEngine: \(reason)")
-                return .infrastructureFailure(reason)
+                return .infrastructureFailure(ChildInfrastructureFailure(reason))
             }
         } else {
             destructiveAuditGate = nil
@@ -2207,12 +2278,15 @@ public final class BackupEngine: Sendable {
                         + "\(unresolved.runId) has unresolved \(unresolved.reason.rawValue) audit evidence; "
                         + "inspect and reconcile run history before retrying"
                     logWarning("BackupEngine: \(reason)")
-                    return .infrastructureFailure(reason)
+                    return .infrastructureFailure(ChildInfrastructureFailure(
+                        reason,
+                        auditRunId: unresolved.runId
+                    ))
                 }
             } catch {
                 let reason = "run history unusable — could not verify destructive audit history: \(error)"
                 logWarning("BackupEngine: \(reason)")
-                return .infrastructureFailure(reason)
+                return .infrastructureFailure(ChildInfrastructureFailure(reason))
             }
         }
 
@@ -2228,7 +2302,7 @@ public final class BackupEngine: Sendable {
         } catch {
             let reason = "run history unusable — could not create a \(kind.rawValue) run record: \(error)"
             logWarning("BackupEngine: \(reason)")
-            return .infrastructureFailure(reason)
+            return .infrastructureFailure(ChildInfrastructureFailure(reason))
         }
         // Reproduces the exact spawned command line, including an invocation
         // override selected by a validated maintenance request. Secrets never
@@ -2246,7 +2320,7 @@ public final class BackupEngine: Sendable {
                     + "for run \(run.runId): \(error)"
                 let finishFailure = finish(run, status: .failed, errorSummary: reason)
                 logWarning("BackupEngine: \(reason)")
-                return .infrastructureFailure(finishFailure ?? reason)
+                return .infrastructureFailure(ChildInfrastructureFailure(finishFailure ?? reason))
             }
             logWriter = nil
         }
@@ -2267,7 +2341,7 @@ public final class BackupEngine: Sendable {
                         child: SetRunChild(runId: run.runId, kind: kind, destId: destination.id, status: .skipped),
                         outcome: nil,
                         preflightFailure: failure,
-                        infrastructureFailureReason: nil
+                        infrastructureFailure: nil
                     ))
                 } catch {
                     logWarning("BackupEngine: could not discard unavailable preflight run \(run.runId): \(error)")
@@ -2278,7 +2352,7 @@ public final class BackupEngine: Sendable {
                 child: SetRunChild(runId: run.runId, kind: kind, destId: destination.id, status: .failed),
                 outcome: nil,
                 preflightFailure: failure,
-                infrastructureFailureReason: infrastructureFailure
+                infrastructureFailure: infrastructureFailure.map { ChildInfrastructureFailure($0) }
             ))
         }
 
@@ -2327,7 +2401,7 @@ public final class BackupEngine: Sendable {
                         child: SetRunChild(runId: run.runId, kind: kind, destId: destination.id, status: .skipped),
                         outcome: nil,
                         preflightFailure: launchPreflightFailure,
-                        infrastructureFailureReason: nil
+                        infrastructureFailure: nil
                     ))
                 } catch {
                     logWarning("BackupEngine: could not discard unavailable launch preflight run \(run.runId): \(error)")
@@ -2342,7 +2416,7 @@ public final class BackupEngine: Sendable {
                 child: SetRunChild(runId: run.runId, kind: kind, destId: destination.id, status: .failed),
                 outcome: nil,
                 preflightFailure: launchPreflightFailure,
-                infrastructureFailureReason: infrastructureFailure
+                infrastructureFailure: infrastructureFailure.map { ChildInfrastructureFailure($0) }
             ))
         }
 
@@ -2400,11 +2474,17 @@ public final class BackupEngine: Sendable {
         let auditCondition = auditFailureReason.map { reason in
             "operation_completed_audit_failed — destructive run \(run.runId) has unresolved \(reason.rawValue) audit evidence"
         }
+        let childInfrastructureFailure = (infrastructureFailure ?? auditCondition).map {
+            ChildInfrastructureFailure(
+                $0,
+                auditRunId: kind.isDestructive ? run.runId : nil
+            )
+        }
         return .completed(ChildRun(
             child: SetRunChild(runId: run.runId, kind: kind, destId: destination.id, status: status),
             outcome: result.outcome,
             preflightFailure: nil,
-            infrastructureFailureReason: infrastructureFailure ?? auditCondition
+            infrastructureFailure: childInfrastructureFailure
         ))
     }
 
@@ -2727,6 +2807,8 @@ public final class BackupEngine: Sendable {
         case .lockUnusable(let detail):
             return detail
         case .infrastructureFailure(let reason, _):
+            return reason
+        case .auditFailure(let reason, _, _):
             return reason
         case .token(.storeUnusable(let detail)):
             return "preview-token store unusable — \(detail)"

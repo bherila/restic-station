@@ -289,6 +289,13 @@ struct MaintenancePrune: AsyncParsableCommand, JSONRenderable {
                 setId: setId,
                 destinationId: destination.id
             )
+        case .failed(.auditInfrastructure(let reason, let runId)):
+            throw Self.infrastructureFailure(
+                reason: reason,
+                setId: setId,
+                destinationId: destination.id,
+                runId: runId
+            )
         }
     }
 
@@ -298,7 +305,8 @@ struct MaintenancePrune: AsyncParsableCommand, JSONRenderable {
     static func infrastructureFailure(
         reason: String,
         setId: UUID,
-        destinationId: UUID
+        destinationId: UUID,
+        runId: String? = nil
     ) -> CLIFailure {
         let auditFailed = reason.hasPrefix("operation_completed_audit_failed")
         let guidance = auditFailed
@@ -309,7 +317,11 @@ struct MaintenancePrune: AsyncParsableCommand, JSONRenderable {
                 ? .operationCompletedAuditFailed
                 : .internalError,
             message: "Prune could not complete safely: \(reason). \(guidance)",
-            details: CLIErrorDetails(setId: setId, destinationId: destinationId)
+            details: CLIErrorDetails(
+                setId: setId,
+                destinationId: destinationId,
+                runId: runId
+            )
         )
     }
 }

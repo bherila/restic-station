@@ -1975,11 +1975,12 @@ struct BackupEngineTests {
 
         let result = await env.engine.runPruneRepository(set: env.set, destination: env.primary)
 
-        guard case .failed(.infrastructure(let reason)) = result else {
+        guard case .failed(.auditInfrastructure(let reason, let runId)) = result else {
             Issue.record("a missing terminal index entry must fail standalone prune: \(result)")
             return
         }
         #expect(reason.contains("operation_completed_audit_failed"))
+        #expect(runId.contains("-prune-"))
         #expect(env.indexEntries.isEmpty)
     }
 
@@ -2009,11 +2010,12 @@ struct BackupEngineTests {
 
         let result = await env.engine.runPruneRepository(set: env.set, destination: env.primary)
 
-        guard case .failed(.infrastructure(let reason)) = result else {
+        guard case .failed(.auditInfrastructure(let reason, let runId)) = result else {
             Issue.record("combined launch/index failure must stay infrastructure failure: \(result)")
             return
         }
         #expect(reason.contains("operation_completed_audit_failed"))
+        #expect(runId.contains("-prune-"))
         #expect(env.indexEntries.isEmpty)
     }
 
@@ -2061,11 +2063,12 @@ struct BackupEngineTests {
 
         let result = await env.engine.runPruneRepository(set: set, destination: destination)
 
-        guard case .failed(.infrastructure(let reason)) = result else {
+        guard case .failed(.auditInfrastructure(let reason, let runId)) = result else {
             Issue.record("a missing terminal index entry must fail remote prune: \(result)")
             return
         }
         #expect(reason.contains("operation_completed_audit_failed"))
+        #expect(runId.contains("-prune-"))
         #expect(env.indexEntries.isEmpty)
     }
 
@@ -3280,6 +3283,59 @@ struct BackupEngineTests {
         #expect(!env.resticArgvs.contains { $0.contains("rewrite") })
     }
 
+    @Test("purge verifies abandoned audit evidence immediately after acquiring the gate")
+    func purgeApplyRejectsAbandonedAuditBeforeRepositoryQueries() async throws {
+        let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]
+        let hostnames = [Self.setId: Set(["example-mac.local"])]
+        let env = Self.makeEnv(
+            script: [], retention: nil, purgeExcludes: ["build/**"], reachableSecondaries: [],
+            purgeSourcePaths: sourcePaths, purgeHostnames: hostnames
+        )
+        defer { env.cleanUp() }
+
+        let snapshotsJSON = try FixtureLoader.string("snapshots.json")
+        let snapshots = try parseSnapshots(Data(snapshotsJSON.utf8))
+        let plan = PurgePlan(
+            destinationId: env.primary.id,
+            snapshots: snapshots,
+            sourcePaths: sourcePaths[Self.setId]!,
+            hostnames: hostnames[Self.setId]!,
+            patterns: env.set.purgeExcludes
+        )
+        let token = try #require(try env.engine.issuePurgeToken(
+            set: env.set,
+            destinations: [env.primary],
+            plans: [plan],
+            executable: try env.requireResticExecutable()
+        ))
+        let abandoned = try env.runStore.begin(
+            kind: .prune,
+            setId: UUID(),
+            destId: UUID(),
+            trigger: .manual
+        )
+        try env.runStore.markDestructiveLaunchAuthorized(abandoned)
+
+        var thrown: PurgeApplyError?
+        do {
+            _ = try await env.engine.runPurge(
+                set: env.set,
+                destinations: [env.primary],
+                token: token.value
+            )
+        } catch let error as PurgeApplyError {
+            thrown = error
+        }
+        guard case .auditFailure(_, let operationMayHaveRun, let runId) = try #require(thrown) else {
+            Issue.record("expected structured prior-audit failure, got \(String(describing: thrown))")
+            return
+        }
+        #expect(!operationMayHaveRun)
+        #expect(runId == abandoned.runId)
+        #expect(env.resticArgvs.isEmpty, "no repository query or destructive argv may run first")
+        #expect(throws: Never.self) { _ = try env.engine.purgeTokenDestinationIDs(token.value) }
+    }
+
     /// The classification half of #118, and a second instance of the same
     /// defect the review found: `issuePurgeToken` let a bare
     /// `PreviewTokenError` escape, where `runPurgeLocked` wraps its own.
@@ -3597,12 +3653,13 @@ struct BackupEngineTests {
             )
             Issue.record("a missing terminal run record must fail the purge")
         } catch let error as PurgeApplyError {
-            guard case .infrastructureFailure(let reason, let operationMayHaveRun) = error else {
+            guard case .auditFailure(let reason, let operationMayHaveRun, let runId) = error else {
                 Issue.record("expected infrastructure failure, got \(error)")
                 return
             }
             #expect(reason.contains("operation_completed_audit_failed"))
             #expect(operationMayHaveRun)
+            #expect(runId.contains("-purge-"))
         }
         #expect(env.resticArgvs.contains { $0.contains("rewrite") && $0.contains("--forget") })
     }

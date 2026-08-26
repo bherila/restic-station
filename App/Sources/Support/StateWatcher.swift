@@ -351,14 +351,22 @@ public final class StateWatcher: ObservableObject {
 
     // MARK: - Debounce
 
-    private func scheduleDebouncedReload() {
+    /// Internal for deterministic ordering tests; production callers are the
+    /// filesystem and distributed-notification event handlers above.
+    func scheduleDebouncedReload() {
         debounceTask?.cancel()
+        // Reserve the replacement observation now, before the debounce
+        // sleep. Cancelling a Task does not cancel the detached loader it
+        // may already be awaiting, so delaying this increment would let the
+        // canceled scan publish stale health during the 250 ms window.
+        auditRefreshGeneration &+= 1
+        let generation = auditRefreshGeneration
         debounceTask = Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: Self.debounceNanoseconds)
             guard !Task.isCancelled else { return }
             guard let self else { return }
             self.reloadCachedStateNow()
-            await self.refreshAuditHealthOffMain()
+            await self.refreshAuditHealthOffMain(generation: generation)
         }
     }
 

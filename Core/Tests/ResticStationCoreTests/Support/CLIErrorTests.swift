@@ -213,6 +213,18 @@ struct CLIErrorContractTests {
         #expect(blockedByPriorAuditFailure.code == .operationCompletedAuditFailed)
         #expect(!blockedByPriorAuditFailure.retryable)
         #expect(blockedByPriorAuditFailure.message.contains("blocked by an earlier destructive operation"))
+
+        let runId = "20260825T210000Z-purge-deadbeef"
+        let structuredAuditFailure = CLIFailure.classifyPurgeApply(
+            PurgeApplyError.auditFailure(
+                reason: "operation_completed_audit_failed — prior destructive run needs inspection",
+                operationMayHaveRun: false,
+                runId: runId
+            ),
+            setId: setId
+        )
+        #expect(structuredAuditFailure.code == .operationCompletedAuditFailed)
+        #expect(structuredAuditFailure.details.runId == runId)
     }
 }
 
