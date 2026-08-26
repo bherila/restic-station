@@ -436,7 +436,7 @@ struct StateStoreTests {
         let group = DispatchGroup()
 
         group.enter()
-        DispatchQueue.global().async {
+        let writerThread = Thread {
             defer { group.leave() }
             do {
                 try writer.updateScheduleState(setId: setId) { $0.checkSliceCursor = 5 }
@@ -444,16 +444,18 @@ struct StateStoreTests {
                 errors.record(error)
             }
         }
+        writerThread.start()
         pause.waitUntilMarkerPublished()
 
         group.enter()
-        DispatchQueue.global().async {
+        let readerThread = Thread {
             defer {
                 readerFinished.signal()
                 group.leave()
             }
             read.record(liveStore.readScheduleStateResult())
         }
+        readerThread.start()
 
         #expect(
             readerFinished.wait(timeout: .now() + 0.2) == .timedOut,
