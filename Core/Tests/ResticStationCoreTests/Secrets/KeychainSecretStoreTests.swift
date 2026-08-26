@@ -240,7 +240,6 @@ struct KeychainSecretStoreTests {
                 argvPrefix: ["/usr/bin/security", "find-generic-password"],
                 stdoutLines: [installedEnv]
             ),
-            .init(argvPrefix: ["/usr/bin/security", "delete-generic-password"], exitCode: 0),
             .init(argvPrefix: ["/usr/bin/security", "add-generic-password"], exitCode: 0),
         ])
         let client = KeychainSecretStore(runner: runner, paths: AppPaths(root: root))
@@ -261,9 +260,52 @@ struct KeychainSecretStoreTests {
         #expect(result.passwordRestored == false)
         #expect(result.secretEnvRestored == true)
         #expect(!result.allRestored)
-        #expect(runner.invocations.count == 4)
-        let restoredEnv = try SecretEnvBlob.decode(runner.invocations[3].argv[7])
+        #expect(runner.invocations.count == 3)
+        #expect(runner.invocations[2].argv.contains("-U"))
+        let restoredEnv = try SecretEnvBlob.decode(runner.invocations[2].argv[8])
         #expect(restoredEnv == ["TOKEN": "original"])
+    }
+
+    @Test("a failed conditional replacement remains retryable without deleting the installed item")
+    func conditionalRollbackReplacementIsAtomicAndRetryable() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-keychain-retry-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = FakeProcessRunner(script: [
+            .init(
+                argvPrefix: ["/usr/bin/security", "find-generic-password"],
+                stdoutLines: ["editor-password"]
+            ),
+            .init(
+                argvPrefix: ["/usr/bin/security", "add-generic-password", "-U"],
+                stderr: "transient failure",
+                exitCode: 1
+            ),
+            .init(
+                argvPrefix: ["/usr/bin/security", "find-generic-password"],
+                stdoutLines: ["editor-password"]
+            ),
+            .init(argvPrefix: ["/usr/bin/security", "add-generic-password", "-U"], exitCode: 0),
+        ])
+        let client = KeychainSecretStore(runner: runner, paths: AppPaths(root: root))
+        let rollback = DestinationSecretRollback(
+            destId: Self.destId,
+            password: SecretRollbackChange(
+                installed: "editor-password",
+                previous: "original-password"
+            ),
+            secretEnv: nil
+        )
+
+        await #expect(throws: SecretStoreError.backendFailed("transient failure")) {
+            _ = try await client.restoreDestinationSecretsIfCurrent(rollback)
+        }
+        let result = try await client.restoreDestinationSecretsIfCurrent(rollback)
+
+        #expect(result.passwordRestored == true)
+        #expect(runner.invocations.count == 4)
+        #expect(!runner.invocations.contains { $0.argv.contains("delete-generic-password") })
+        #expect(runner.invocations[3].argv[8] == "original-password")
     }
 
     @Test("production keychain mutations wait for the shared secrets lock")

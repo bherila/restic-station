@@ -22,6 +22,7 @@ struct DestinationTable: View {
     @Binding var set: BackupSet
     @Binding var configFingerprint: String
     @Binding var pendingSecretRollbacks: [AppModel.DestinationSecretsRollback]
+    let secretEditorSessionID: UUID
     let errorMessage: String?
 
     @State private var sheet: DestinationSheetTarget?
@@ -73,6 +74,7 @@ struct DestinationTable: View {
                 set: $set,
                 configFingerprint: $configFingerprint,
                 pendingSecretRollbacks: $pendingSecretRollbacks,
+                secretEditorSessionID: secretEditorSessionID,
                 initialDestination: destination(for: target),
                 isNew: target.isNew
             )

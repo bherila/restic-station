@@ -781,6 +781,17 @@ public enum ConfigStoreError: Error, Equatable, Sendable, CustomStringConvertibl
             return false
         }
     }
+
+    /// The save failed after a Darwin exchange entered recovery, so callers
+    /// must inspect the live config before undoing any related side effect.
+    public var commitMayBeUncertain: Bool {
+        switch self {
+        case .replacementRollbackFailed, .rollbackArtifactPreserved:
+            return true
+        default:
+            return false
+        }
+    }
 }
 
 /// `config.json`'s bytes, their fingerprint, and the configuration decoded

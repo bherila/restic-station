@@ -41,11 +41,13 @@ struct SetEditorView: View {
     /// the matching credentials.
     @State private var pendingSecretRollbacks: [AppModel.DestinationSecretsRollback] = []
     @State private var secretRollbackInProgress = false
+    @State private var secretEditorSessionID: UUID
 
     init(initialSet: BackupSet, isNew: Bool, configFingerprint: String) {
         _draft = State(initialValue: initialSet)
         _isNew = State(initialValue: isNew)
         _configFingerprint = State(initialValue: configFingerprint)
+        _secretEditorSessionID = State(initialValue: UUID())
     }
 
     var body: some View {
@@ -84,6 +86,7 @@ struct SetEditorView: View {
                 set: $draft,
                 configFingerprint: $configFingerprint,
                 pendingSecretRollbacks: $pendingSecretRollbacks,
+                secretEditorSessionID: secretEditorSessionID,
                 errorMessage: fieldErrors[.destinations]
             )
 
@@ -107,9 +110,13 @@ struct SetEditorView: View {
                 currentMachineID: model.machine.machineId
             )
         }
+        .onAppear {
+            model.beginSecretEditorSession(secretEditorSessionID)
+        }
         .onDisappear {
             // Transfer ownership synchronously before SwiftUI destroys this
             // view. AppModel retries and surfaces failures window-wide.
+            model.endSecretEditorSession(secretEditorSessionID)
             let abandoned = pendingSecretRollbacks
             pendingSecretRollbacks.removeAll()
             model.retainPendingSecretRollbacks(abandoned)
@@ -265,8 +272,17 @@ struct SetEditorView: View {
             var message = mapped.message
             if let storeError = error as? ConfigStoreError,
                storeError.isRevisionConflict,
+               !storeError.commitMayBeUncertain,
                let rollbackError = await restorePendingSecrets() {
                 message += " " + rollbackError
+            } else if let storeError = error as? ConfigStoreError,
+                      storeError.commitMayBeUncertain {
+                // The candidate may be live but unreadable. Restoring its
+                // paired secrets could create a worse config/credential
+                // mismatch; require explicit operator reconciliation.
+                pendingSecretRollbacks.removeAll()
+                message += " Its credential changes were left in place because the app could not "
+                    + "determine which config revision is live. Reload settings and verify this destination."
             }
             fieldErrors[mapped.field] = message
         }

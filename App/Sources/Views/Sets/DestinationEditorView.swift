@@ -26,6 +26,7 @@ struct DestinationEditorView: View {
     @Binding var set: BackupSet
     @Binding var configFingerprint: String
     @Binding var pendingSecretRollbacks: [AppModel.DestinationSecretsRollback]
+    private let secretEditorSessionID: UUID
     private let isNew: Bool
 
     // Config-backed fields.
@@ -60,12 +61,14 @@ struct DestinationEditorView: View {
         set: Binding<BackupSet>,
         configFingerprint: Binding<String>,
         pendingSecretRollbacks: Binding<[AppModel.DestinationSecretsRollback]>,
+        secretEditorSessionID: UUID,
         initialDestination destination: Destination,
         isNew: Bool
     ) {
         _set = set
         _configFingerprint = configFingerprint
         _pendingSecretRollbacks = pendingSecretRollbacks
+        self.secretEditorSessionID = secretEditorSessionID
         self.isNew = isNew
         _draft = State(initialValue: destination)
 
@@ -640,8 +643,17 @@ struct DestinationEditorView: View {
                 destId: destination.id,
                 password: password.isEmpty ? nil : password,
                 secretEnv: secretEnvToWrite,
-                ifConfigUnchangedFrom: configFingerprint
+                ifConfigUnchangedFrom: configFingerprint,
+                editorSessionId: secretEditorSessionID
             )
+            guard model.claimEditorSecretRollback(
+                secretsRollback,
+                sessionId: secretEditorSessionID
+            ) else {
+                message = .error("This backup-set editor closed before its credential change finished. "
+                    + "The previous credentials are being restored.")
+                return nil
+            }
         } catch {
             message = .error(SetsCopy.destinationSecretFailureMessage(for: error))
             return nil
@@ -685,6 +697,16 @@ struct DestinationEditorView: View {
             pendingSecretRollbacks.removeAll()
             return true
         } catch {
+            if let storeError = error as? ConfigStoreError,
+               storeError.commitMayBeUncertain {
+                // The candidate may be live but unreadable. Do not restore
+                // credentials that candidate might already reference.
+                pendingSecretRollbacks.removeAll()
+                message = .error("The backup set's installed revision could not be determined (\(error)). "
+                    + "Its credential changes were left in place. Reload settings and verify this destination "
+                    + "before running a backup.")
+                return false
+            }
             // commitDraft already merged the destination into the parent
             // binding. Since no config write committed it, put that binding
             // back alongside the secrets so a later parent Save cannot pair

@@ -801,6 +801,77 @@ struct AppModelMachineOverrideTests {
         #expect(try await secrets.password(destId: destinationId) == "original-password")
     }
 
+    @Test("a secret mutation finishing after editor teardown is restored by the model")
+    func lateDestinationMutationCannotEscapeDestroyedViewState() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-secret-late-editor-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let destinationId = UUID()
+        let sessionId = UUID()
+        let secrets = CheckpointingSecretStore(passwords: [destinationId: "original-password"])
+        let model = AppModel(paths: AppPaths(root: root), secretStoreFactory: { secrets })
+        model.beginSecretEditorSession(sessionId)
+        model.endSecretEditorSession(sessionId)
+
+        let rollback = try await model.storeDestinationSecrets(
+            destId: destinationId,
+            password: "late-editor-password",
+            secretEnv: nil,
+            ifConfigUnchangedFrom: model.configFingerprint,
+            editorSessionId: sessionId
+        )
+        #expect(!model.claimEditorSecretRollback(rollback, sessionId: sessionId))
+        for _ in 0..<40 {
+            if model.pendingSecretRollbackBatches.isEmpty { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+
+        #expect(model.pendingSecretRollbackBatches.isEmpty)
+        #expect(model.pendingSecretRollbackError == nil)
+        #expect(try await secrets.password(destId: destinationId) == "original-password")
+    }
+
+    @Test("overlapping abandoned editor sessions unwind newest first")
+    func overlappingAbandonedSessionsRestoreOriginalCredentials() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-secret-session-order-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let destinationId = UUID()
+        let secrets = CheckpointingSecretStore(passwords: [destinationId: "original-password"])
+        let model = AppModel(paths: AppPaths(root: root), secretStoreFactory: { secrets })
+        let first = try await model.storeDestinationSecrets(
+            destId: destinationId,
+            password: "first-editor-password",
+            secretEnv: nil,
+            ifConfigUnchangedFrom: model.configFingerprint
+        )
+        await secrets.failNextPasswordWrite()
+        model.retainPendingSecretRollbacks([first])
+        for _ in 0..<40 {
+            if model.pendingSecretRollbackError != nil { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(model.pendingSecretRollbackError != nil)
+
+        let second = try await model.storeDestinationSecrets(
+            destId: destinationId,
+            password: "second-editor-password",
+            secretEnv: nil,
+            ifConfigUnchangedFrom: model.configFingerprint
+        )
+        model.retainPendingSecretRollbacks([second])
+        for _ in 0..<80 {
+            if model.pendingSecretRollbackBatches.isEmpty { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+
+        #expect(model.pendingSecretRollbackBatches.isEmpty)
+        #expect(model.pendingSecretRollbackError == nil)
+        #expect(try await secrets.password(destId: destinationId) == "original-password")
+    }
+
     @Test("a credential-only destination edit makes the parent set saveable")
     func credentialOnlyDestinationEditIsUnsavedWork() {
         let destinationId = UUID()
@@ -861,6 +932,28 @@ struct AppModelMachineOverrideTests {
             for: SecretStoreError.backendFailed("login keychain is locked")
         )
         #expect(keychainMessage.contains("Unlock your login keychain"))
+    }
+
+    @Test("uncertain config recovery distinguishes a live candidate from another revision")
+    func uncertainConfigCommitIsReconciledFromLiveBytes() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-config-reconcile-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let model = AppModel(paths: AppPaths(root: root))
+        let candidate = AppConfig(showMenuBarIcon: false)
+        let fingerprint = try model.configStore.save(
+            candidate,
+            ifUnchangedFrom: model.configFingerprint
+        )
+
+        #expect(model.reconcileUncertainConfigCommit(candidate: candidate)
+            == .candidateInstalled(fingerprint: fingerprint))
+        #expect(model.reconcileUncertainConfigCommit(candidate: AppConfig())
+            == .differentRevisionInstalled)
+        #expect(ConfigStoreError.replacementRollbackFailed(
+            errno: 5,
+            candidateMayBeInstalledAt: model.paths.configFile.path
+        ).commitMayBeUncertain)
     }
 }
 

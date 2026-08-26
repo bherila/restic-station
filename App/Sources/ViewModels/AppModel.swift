@@ -3,6 +3,12 @@ import Combine
 import Foundation
 import ResticStationCore
 
+enum UncertainConfigCommitOutcome: Equatable {
+    case candidateInstalled(fingerprint: String)
+    case differentRevisionInstalled
+    case unreadable
+}
+
 /// The object every screen builds on (`docs/ui-spec.md` §Shell): it owns the
 /// loaded `AppConfig`, the live on-disk state (`StateWatcher`), the launchd
 /// registration (`LaunchdManager`), helper invocation (`HelperInvoker`), and
@@ -92,10 +98,15 @@ final class AppModel: ObservableObject {
     @Published var pendingSecretRollbackError: String?
 
     /// Each inner array is one editor session and must be unwound in reverse
-    /// order. Keeping batches separate lets a failed older session remain at
-    /// the front while a later disappearing editor is retained behind it.
+    /// order. Keeping batches separate lets a failed older session remain
+    /// queued while a later disappearing editor is unwound first.
     var pendingSecretRollbackBatches: [[DestinationSecretsRollback]] = []
     var pendingSecretRollbackTask: Task<Void, Never>?
+    /// Rollbacks produced by an async destination save are parked here before
+    /// control returns to SwiftUI. The view claims them synchronously only if
+    /// its parent editor session is still alive.
+    var activeSecretEditorSessions: Set<UUID> = []
+    var unclaimedSecretEditorRollbacks: [UUID: [DestinationSecretsRollback]] = [:]
 
     /// One entry per configured set, in config order.
     @Published private(set) var setHealths: [SetHealth] = []
@@ -308,11 +319,29 @@ final class AppModel: ObservableObject {
             )
         } catch {
             if let storeError = error as? ConfigStoreError,
-               storeError.isRevisionConflict {
-                configChangedOnDisk = true
+               storeError.commitMayBeUncertain {
+                switch reconcileUncertainConfigCommit(candidate: newConfig) {
+                case .candidateInstalled(let fingerprint):
+                    // Recovery failed noisily, but the exact candidate is
+                    // live. Adopt it so callers commit their paired secret
+                    // mutations instead of rolling them back underneath it.
+                    installedFingerprint = fingerprint
+                case .differentRevisionInstalled:
+                    configChangedOnDisk = true
+                    lastConfigError = "\(ConfigStoreError.changedOnDisk)"
+                    throw ConfigStoreError.changedOnDisk
+                case .unreadable:
+                    lastConfigError = "\(error)"
+                    throw error
+                }
+            } else {
+                if let storeError = error as? ConfigStoreError,
+                   storeError.isRevisionConflict {
+                    configChangedOnDisk = true
+                }
+                lastConfigError = "\(error)"
+                throw error
             }
-            lastConfigError = "\(error)"
-            throw error
         }
 
         let previous = config
@@ -333,6 +362,21 @@ final class AppModel: ObservableObject {
             Task { await refreshResticInfo() }
         }
         return installedFingerprint
+    }
+
+    /// Read back the live bytes after a failed atomic-replacement recovery.
+    /// A semantic candidate match is enough: ConfigStore's encoder is stable,
+    /// while an external writer may have serialized equivalent JSON bytes.
+    func reconcileUncertainConfigCommit(candidate: AppConfig) -> UncertainConfigCommitOutcome {
+        do {
+            let snapshot = try configStore.snapshot()
+            if snapshot.config == candidate {
+                return .candidateInstalled(fingerprint: snapshot.fingerprint)
+            }
+            return .differentRevisionInstalled
+        } catch {
+            return .unreadable
+        }
     }
 
     /// Adopts the latest valid on-disk configuration after the watcher has

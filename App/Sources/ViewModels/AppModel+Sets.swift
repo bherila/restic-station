@@ -138,7 +138,8 @@ extension AppModel {
         destId: UUID,
         password: String?,
         secretEnv: [String: String]?,
-        ifConfigUnchangedFrom expectedFingerprint: String
+        ifConfigUnchangedFrom expectedFingerprint: String,
+        editorSessionId: UUID? = nil
     ) async throws -> DestinationSecretsRollback {
         if let configLoadError {
             throw AppModelError.configUnreadable(configLoadError)
@@ -146,7 +147,7 @@ extension AppModel {
         let store = try makeSecretStore()
         var rollback: DestinationSecretsRollback?
         do {
-            return try await configStore.withUnchangedRevision(from: expectedFingerprint) {
+            let snapshot = try await configStore.withUnchangedRevision(from: expectedFingerprint) {
                 let transaction = try await store.updateDestinationSecrets(
                     DestinationSecretUpdate(
                         destId: destId,
@@ -158,6 +159,10 @@ extension AppModel {
                 rollback = snapshot
                 return snapshot
             }
+            if let editorSessionId {
+                parkEditorSecretRollback(snapshot, sessionId: editorSessionId)
+            }
+            return snapshot
         } catch {
             if let rollback {
                 var remaining = [rollback]
@@ -180,6 +185,49 @@ extension AppModel {
             }
             throw error
         }
+    }
+
+    func beginSecretEditorSession(_ sessionId: UUID) {
+        activeSecretEditorSessions.insert(sessionId)
+    }
+
+    func endSecretEditorSession(_ sessionId: UUID) {
+        activeSecretEditorSessions.remove(sessionId)
+        if let stranded = unclaimedSecretEditorRollbacks.removeValue(forKey: sessionId) {
+            retainPendingSecretRollbacks(stranded)
+        }
+    }
+
+    /// Claims the rollback parked before an async keychain write returned to
+    /// SwiftUI. Main-actor serialization makes claim + local append atomic
+    /// with respect to the parent editor's `onDisappear`.
+    func claimEditorSecretRollback(
+        _ rollback: DestinationSecretsRollback,
+        sessionId: UUID
+    ) -> Bool {
+        guard activeSecretEditorSessions.contains(sessionId),
+              var parked = unclaimedSecretEditorRollbacks[sessionId],
+              let index = parked.firstIndex(where: { $0.transaction == rollback.transaction }) else {
+            return false
+        }
+        parked.remove(at: index)
+        if parked.isEmpty {
+            unclaimedSecretEditorRollbacks.removeValue(forKey: sessionId)
+        } else {
+            unclaimedSecretEditorRollbacks[sessionId] = parked
+        }
+        return true
+    }
+
+    private func parkEditorSecretRollback(
+        _ rollback: DestinationSecretsRollback,
+        sessionId: UUID
+    ) {
+        guard activeSecretEditorSessions.contains(sessionId) else {
+            retainPendingSecretRollbacks([rollback])
+            return
+        }
+        unclaimedSecretEditorRollbacks[sessionId, default: []].append(rollback)
     }
 
     /// Restores the exact fields the editor changed when the subsequent
@@ -311,28 +359,33 @@ extension AppModel {
         pendingSecretRollbackTask = Task { @MainActor [weak self] in
             guard let self else { return }
             defer { self.pendingSecretRollbackTask = nil }
-            while let batch = self.pendingSecretRollbackBatches.first {
+            // Sessions can overlap after a failed restoration. Unwind the
+            // newest session first so a chain old -> A -> B returns through
+            // B -> A before the older A -> old transaction is evaluated.
+            while !self.pendingSecretRollbackBatches.isEmpty {
+                let batchIndex = self.pendingSecretRollbackBatches.count - 1
+                let batch = self.pendingSecretRollbackBatches[batchIndex]
                 var remaining = batch
                 do {
                     _ = try await self.restoreDestinationSecrets(
                         batch,
                         onProgress: { progress in
                             remaining = progress
-                            if self.pendingSecretRollbackBatches.isEmpty {
+                            if batchIndex >= self.pendingSecretRollbackBatches.count {
                                 self.pendingSecretRollbackBatches = [progress]
                             } else {
-                                self.pendingSecretRollbackBatches[0] = progress
+                                self.pendingSecretRollbackBatches[batchIndex] = progress
                             }
                         }
                     )
-                    if !self.pendingSecretRollbackBatches.isEmpty {
-                        self.pendingSecretRollbackBatches.removeFirst()
+                    if batchIndex < self.pendingSecretRollbackBatches.count {
+                        self.pendingSecretRollbackBatches.remove(at: batchIndex)
                     }
                 } catch {
-                    if self.pendingSecretRollbackBatches.isEmpty {
+                    if batchIndex >= self.pendingSecretRollbackBatches.count {
                         self.pendingSecretRollbackBatches = [remaining]
                     } else {
-                        self.pendingSecretRollbackBatches[0] = remaining
+                        self.pendingSecretRollbackBatches[batchIndex] = remaining
                     }
                     self.pendingSecretRollbackError =
                         "Some destination credentials could not be restored (\(error)). "

@@ -10,11 +10,14 @@ import Foundation
 /// context can read it back without a GUI consent prompt.
 ///
 /// `-U` cannot repair an item that was created without `-T` (ACLs are fixed
-/// at creation), so every write here follows a delete-then-add sequence:
+/// at creation), so every ordinary write here follows a delete-then-add sequence:
 /// always `delete-generic-password` first (a not-found there is expected
 /// and ignored), then `add-generic-password` *without* `-U`, always with
 /// `-T /usr/bin/security`. This guarantees every item this type creates
 /// carries the trusted-application ACL, regardless of what existed before.
+/// Conditional editor rollback is the narrow exception: it has just verified
+/// that the current item is one this type installed, so `-U` atomically
+/// restores the previous value without a delete/add failure window.
 ///
 /// Note (documented, not "fixed" — see keychain-and-fda.md): passing
 /// `-w <value>` puts the secret in `security`'s argv, momentarily visible
@@ -184,7 +187,7 @@ public struct KeychainSecretStore: SecretStore {
             }
             if passwordRestored == true, let change = rollback.password {
                 if let previous = change.previous {
-                    try await setValue(previous, account: passwordAccount)
+                    try await updateExistingValue(previous, account: passwordAccount)
                 } else {
                     try await deleteValueTolerant(account: passwordAccount)
                 }
@@ -193,7 +196,10 @@ public struct KeychainSecretStore: SecretStore {
                 if change.previous.isEmpty {
                     try await deleteValueTolerant(account: envAccount)
                 } else {
-                    try await setValue(try SecretEnvBlob.encode(change.previous), account: envAccount)
+                    try await updateExistingValue(
+                        try SecretEnvBlob.encode(change.previous),
+                        account: envAccount
+                    )
                 }
             }
             return DestinationSecretRestoreResult(
@@ -228,6 +234,23 @@ public struct KeychainSecretStore: SecretStore {
             "-a", account,
             "-w", value,
             "-T", Self.securityPath,
+        ]
+        let result = try await runSecurity(argv)
+        guard result.exitCode == 0 else {
+            throw SecretStoreError.backendFailed(Self.trimmedStderr(result))
+        }
+    }
+
+    /// Atomically changes an item whose Restic Station ACL was established by
+    /// `setValue`. Used only after conditional rollback verified that exact
+    /// editor-installed value is still current.
+    private func updateExistingValue(_ value: String, account: String) async throws {
+        let argv = [
+            Self.securityPath, "add-generic-password",
+            "-U",
+            "-s", Self.service,
+            "-a", account,
+            "-w", value,
         ]
         let result = try await runSecurity(argv)
         guard result.exitCode == 0 else {
