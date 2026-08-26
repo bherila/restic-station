@@ -35,6 +35,52 @@ private struct RunAuditDiscriminator: Decodable {
     let kind: RunKind
 }
 
+/// Narrow POSIX seam for deterministic durability fault injection. Production
+/// uses the real syscalls; tests can force short writes, `EINTR`, `ENOSPC`,
+/// permission failures, or an interrupted rename without changing paths or
+/// relying on the uid running the test suite.
+struct RunStoreFileOperations: @unchecked Sendable {
+    let openAt: @Sendable (Int32, String, Int32, mode_t) -> Int32
+    let write: @Sendable (Int32, UnsafeRawPointer, Int) -> Int
+    let sync: @Sendable (Int32) -> Int32
+    let renameAt: @Sendable (Int32, String, Int32, String) -> Int32
+    let unlinkAt: @Sendable (Int32, String) -> Int32
+
+    static let live = RunStoreFileOperations(
+        openAt: { directory, name, flags, mode in
+            name.withCString { openat(directory, $0, flags, mode) }
+        },
+        write: { fd, buffer, count in
+            #if canImport(Darwin)
+            Darwin.write(fd, buffer, count)
+            #elseif canImport(Glibc)
+            Glibc.write(fd, buffer, count)
+            #elseif canImport(Musl)
+            Musl.write(fd, buffer, count)
+            #endif
+        },
+        sync: { fd in
+            #if canImport(Darwin)
+            Darwin.fsync(fd)
+            #elseif canImport(Glibc)
+            Glibc.fsync(fd)
+            #elseif canImport(Musl)
+            Musl.fsync(fd)
+            #endif
+        },
+        renameAt: { oldDirectory, oldName, newDirectory, newName in
+            oldName.withCString { oldNamePointer in
+                newName.withCString { newNamePointer in
+                    renameat(oldDirectory, oldNamePointer, newDirectory, newNamePointer)
+                }
+            }
+        },
+        unlinkAt: { directory, name in
+            name.withCString { unlinkat(directory, $0, 0) }
+        }
+    )
+}
+
 /// One run `recoverInterrupted()` rewrote from `.running` to `.failed`.
 ///
 /// Carries the `setId` as well as the `runId` because the caller has a second
@@ -76,6 +122,7 @@ public enum CurrentRunLiveness: String, Equatable, Sendable {
 /// Errors surfaced by `RunStore`'s own I/O beyond ordinary `Data`/`JSONDecoder`
 /// throws (which propagate as-is from `metadata(runId:)`).
 public enum RunStoreError: Error, Equatable, Sendable, CustomStringConvertible {
+    case durableWriteFailed(operation: String, errno: Int32, path: String)
     case renameFailed(errno: Int32, from: String, to: String)
     case indexAppendFailed(errno: Int32, path: String)
     /// A caller tried to discard something other than its own fresh,
@@ -103,6 +150,8 @@ public enum RunStoreError: Error, Equatable, Sendable, CustomStringConvertible {
 
     public var description: String {
         switch self {
+        case .durableWriteFailed(let operation, let errno, let path):
+            return "\(operation) failed for \(path): errno \(errno)"
         case .renameFailed(let errno, let from, let to):
             return "rename(\(from), \(to)) failed: errno \(errno)"
         case .indexAppendFailed(let errno, let path):
@@ -129,16 +178,17 @@ public enum RunStoreError: Error, Equatable, Sendable, CustomStringConvertible {
 /// §runs/<runId>/metadata.json) and `docs/architecture.md` (§RunStatus,
 /// §AppPaths `runId` format).
 ///
-/// All writes are atomic per the data-model.md preamble: `metadata.json` is
-/// written to a temp file in the same directory then `rename(2)`d over the
-/// target; the `index.jsonl` append is a single `O_APPEND` `write(2)` under
-/// a companion `FileLock` (`runs/index.jsonl.lock`).
+/// Run records are crash-durable per docs/data-model.md: `metadata.json` is
+/// fully written and synced before a descriptor-relative rename and parent
+/// directory sync; `index.jsonl` is fully appended and synced while its
+/// companion `FileLock` (`runs/index.jsonl.lock`) remains held.
 public struct RunStore: Sendable {
     public let paths: AppPaths
     private let now: @Sendable () -> Date
     private let uptime: @Sendable () -> TimeInterval
     private let initialPublicationHook: @Sendable (URL) throws -> Void
     private let publicationLockMaxAttempts: Int
+    private let fileOperations: RunStoreFileOperations
 
     /// Five minutes is ten missed 30-second heartbeats: long enough to absorb
     /// scheduling pressure, short enough for a monitoring check to catch a
@@ -157,6 +207,7 @@ public struct RunStore: Sendable {
     /// be pre-launch. Missing or unknown versions predate that guarantee and
     /// are treated as an unknown repository outcome while still running.
     public static let destructiveAuditContractVersion = 1
+    private static let publicationDurabilityContractVersion = 1
 
     public init(paths: AppPaths) {
         self.init(
@@ -179,6 +230,7 @@ public struct RunStore: Sendable {
         self.uptime = uptime
         self.initialPublicationHook = { _ in }
         self.publicationLockMaxAttempts = Self.publicationLockMaxAttempts
+        self.fileOperations = .live
     }
 
     /// Fault-injection seam for the publication rollback regression test.
@@ -189,7 +241,8 @@ public struct RunStore: Sendable {
         now: @escaping @Sendable () -> Date,
         uptime: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
         initialPublicationHook: @escaping @Sendable (URL) throws -> Void,
-        publicationLockMaxAttempts: Int = 1_000
+        publicationLockMaxAttempts: Int = 1_000,
+        fileOperations: RunStoreFileOperations = .live
     ) {
         precondition(publicationLockMaxAttempts > 0)
         self.paths = paths
@@ -197,6 +250,7 @@ public struct RunStore: Sendable {
         self.uptime = uptime
         self.initialPublicationHook = initialPublicationHook
         self.publicationLockMaxAttempts = publicationLockMaxAttempts
+        self.fileOperations = fileOperations
     }
 
     // MARK: - begin / finish
@@ -216,7 +270,20 @@ public struct RunStore: Sendable {
         trigger: RunTrigger,
         groupId: String? = nil
     ) throws -> ActiveRun {
+        let newlyCreatedSyncChain = missingDirectorySyncChain(to: paths.runsDir)
         try paths.ensureDirectories()
+        // Another setup path (notably Tick) may have created this hierarchy
+        // immediately before begin. Always confirm runs/, the data root, and
+        // the data-root parent; also preserve every additional ancestor this
+        // call itself had to create.
+        var directorySyncChain = newlyCreatedSyncChain
+        for required in [paths.runsDir, paths.root, paths.root.deletingLastPathComponent()]
+            where !directorySyncChain.contains(where: { $0.path == required.path }) {
+            directorySyncChain.append(required)
+        }
+        for directory in directorySyncChain {
+            try syncDirectory(directory)
+        }
 
         // A verifier must never observe the directory between mkdir and its
         // first metadata commit. The separate publication lock also lets two
@@ -252,17 +319,25 @@ public struct RunStore: Sendable {
             purgeSnapshotRewrites: nil,
             destructiveAuditContractVersion: kind.isDestructive
                 ? Self.destructiveAuditContractVersion
-                : nil
+                : nil,
+            publicationDurabilityContractVersion: Self.publicationDurabilityContractVersion
         )
         let runDirectory = paths.runDir(runId: runId)
         try FileManager.default.createDirectory(at: runDirectory, withIntermediateDirectories: true)
         do {
             try initialPublicationHook(runDirectory)
             try writeMetadataAtomic(metadata)
+            // `metadata.json` is durable inside the new run directory; now
+            // make the directory entry itself durable in `runs/`.
+            try syncDirectory(paths.runsDir)
         } catch {
             let publicationError = String(describing: error)
             do {
                 try FileManager.default.removeItem(at: runDirectory)
+                // The removal is part of rolling back publication. Persist it
+                // before reporting the failed begin as safely unpublished;
+                // otherwise a crash can resurrect the canonical directory.
+                try syncDirectory(paths.runsDir)
             } catch let cleanupError {
                 throw RunStoreError.initialPublicationCleanupFailed(
                     path: runDirectory.path,
@@ -318,7 +393,7 @@ public struct RunStore: Sendable {
             destructiveLaunchAuthorizedAt = nil
             destructiveAuditContractVersion = nil
         }
-        let metadata = RunMetadata(
+        var metadata = RunMetadata(
             runId: run.runId,
             kind: run.kind,
             setId: run.setId,
@@ -340,10 +415,14 @@ public struct RunStore: Sendable {
             purgeSnapshotRewrites: purgeSnapshotRewrites,
             destructiveAuditContractVersion: destructiveAuditContractVersion,
             destructiveLaunchAuthorizedAt: destructiveLaunchAuthorizedAt,
-            auditFailureReason: auditFailureReason
+            auditFailureReason: auditFailureReason,
+            indexPublicationPending: true,
+            publicationDurabilityContractVersion: Self.publicationDurabilityContractVersion
         )
         try writeMetadataAtomic(metadata)
         try appendIndexEntry(metadata.indexEntry)
+        metadata.indexPublicationPending = nil
+        try writeMetadataAtomic(metadata)
     }
 
     /// Commits the destructive launch boundary immediately before the argv
@@ -382,6 +461,7 @@ public struct RunStore: Sendable {
             throw RunStoreError.discardUnsafe(path: metadataURL.path)
         }
         try FileManager.default.removeItem(at: directory)
+        try syncDirectory(paths.runsDir)
     }
 
     // MARK: - Crash recovery
@@ -418,6 +498,13 @@ public struct RunStore: Sendable {
 
         let decoder = ConfigStore.makeDecoder()
         var recovered: [RecoveredRun] = []
+        // Repair a torn final record before taking the recovery snapshot. In
+        // particular, a split UTF-8 scalar must not make the valid prefix look
+        // empty and cause duplicate projections to be appended below.
+        var indexedByRunId = Dictionary(
+            grouping: try readIndexEntriesRepairingTail(),
+            by: \.runId
+        )
 
         for dir in runDirs {
             var isDirectory: ObjCBool = false
@@ -427,7 +514,81 @@ public struct RunStore: Sendable {
             let metadataFile = dir.appendingPathComponent("metadata.json", isDirectory: false)
             guard let data = try? Data(contentsOf: metadataFile) else { continue }
             guard let metadata = try? decoder.decode(RunMetadata.self, from: data) else { continue }
-            guard metadata.status == .running else { continue }
+            guard dir.lastPathComponent == metadata.runId else {
+                throw RunStoreError.runDirectoryIDMismatch(
+                    path: metadataFile.path,
+                    encodedRunId: metadata.runId
+                )
+            }
+            if metadata.status != .running {
+                // Canonical metadata wins. Repair only a wholly absent
+                // destructive projection; duplicates or divergence remain an
+                // explicit destructive audit failure. Non-destructive history
+                // can publish a corrective last projection safely.
+                let projections = indexedByRunId[metadata.runId, default: []]
+                let needsDurabilityUpgrade = metadata.publicationDurabilityContractVersion
+                    != Self.publicationDurabilityContractVersion
+                var projectionIsDurable = false
+                if projections.isEmpty {
+                    var pending = metadata
+                    if pending.indexPublicationPending != true || needsDurabilityUpgrade {
+                        pending.indexPublicationPending = true
+                        pending.publicationDurabilityContractVersion =
+                            Self.publicationDurabilityContractVersion
+                        try writeMetadataAtomic(pending)
+                    }
+                    let projection = pending.indexEntry
+                    try appendIndexEntry(projection)
+                    indexedByRunId[metadata.runId] = [projection]
+                    projectionIsDurable = true
+                } else if projections == [metadata.indexEntry] {
+                    // The recovery snapshot was fsynced before it was decoded,
+                    // but legacy canonical metadata also needs durable
+                    // republication before the pair can be accepted.
+                    if needsDurabilityUpgrade {
+                        var upgraded = metadata
+                        upgraded.publicationDurabilityContractVersion =
+                            Self.publicationDurabilityContractVersion
+                        try writeMetadataAtomic(upgraded)
+                    }
+                    projectionIsDurable = true
+                } else if !metadata.kind.isDestructive {
+                    if projections.last == metadata.indexEntry {
+                        // The initial recovery snapshot confirmed this final
+                        // physical projection durably as well. Upgrade legacy
+                        // canonical metadata before accepting the pair.
+                        if needsDurabilityUpgrade {
+                            var upgraded = metadata
+                            upgraded.publicationDurabilityContractVersion =
+                                Self.publicationDurabilityContractVersion
+                            try writeMetadataAtomic(upgraded)
+                        }
+                        projectionIsDurable = true
+                    } else {
+                        var pending = metadata
+                        if pending.indexPublicationPending != true || needsDurabilityUpgrade {
+                            pending.indexPublicationPending = true
+                            pending.publicationDurabilityContractVersion =
+                                Self.publicationDurabilityContractVersion
+                            try writeMetadataAtomic(pending)
+                        }
+                        let projection = pending.indexEntry
+                        try appendIndexEntry(projection)
+                        indexedByRunId[metadata.runId, default: []].append(projection)
+                        projectionIsDurable = true
+                    }
+                }
+                if projectionIsDurable,
+                   (metadata.indexPublicationPending == true || projections.isEmpty
+                       || (!metadata.kind.isDestructive && projections.last != metadata.indexEntry)) {
+                    var reconciled = metadata
+                    reconciled.indexPublicationPending = nil
+                    reconciled.publicationDurabilityContractVersion =
+                        Self.publicationDurabilityContractVersion
+                    try writeMetadataAtomic(reconciled)
+                }
+                continue
+            }
             if Self.isProcessAlive(pid: metadata.pid) { continue }
 
             var updated = metadata
@@ -441,8 +602,33 @@ public struct RunStore: Sendable {
             } else {
                 updated.errorSummary = "interrupted"
             }
+            updated.indexPublicationPending = true
+            updated.publicationDurabilityContractVersion = Self.publicationDurabilityContractVersion
             try writeMetadataAtomic(updated)
-            try appendIndexEntry(updated.indexEntry)
+            let projections = indexedByRunId[updated.runId, default: []]
+            var projectionIsDurable = false
+            if projections.isEmpty {
+                let projection = updated.indexEntry
+                try appendIndexEntry(projection)
+                indexedByRunId[updated.runId] = [projection]
+                projectionIsDurable = true
+            } else if projections == [updated.indexEntry] {
+                // The recovery snapshot was fsynced before decoding.
+                projectionIsDurable = true
+            } else if !updated.kind.isDestructive {
+                if projections.last == updated.indexEntry {
+                    // The recovery snapshot was fsynced before decoding.
+                } else {
+                    let projection = updated.indexEntry
+                    try appendIndexEntry(projection)
+                    indexedByRunId[updated.runId, default: []].append(projection)
+                }
+                projectionIsDurable = true
+            }
+            if projectionIsDurable {
+                updated.indexPublicationPending = nil
+                try writeMetadataAtomic(updated)
+            }
             recovered.append(RecoveredRun(runId: metadata.runId, setId: metadata.setId))
         }
 
@@ -525,14 +711,14 @@ public struct RunStore: Sendable {
     /// shared, unfiltered window by busier sets' more numerous newer runs.
     /// `runs list --set` (T27, issue #29 finding 3) depends on this order.
     public func recentRuns(setId: UUID? = nil, limit: Int) throws -> [RunIndexEntry] {
-        let entries = try readIndexEntries()
+        let entries = try logicalIndexEntries()
         let scoped = setId.map { id in entries.filter { $0.setId == id } } ?? entries
         return Array(scoped.reversed().prefix(max(limit, 0)))
     }
 
     /// Most recent index entry for `setId`/`kind`, or `nil` if none.
     public func lastRun(setId: UUID, kind: RunKind) throws -> RunIndexEntry? {
-        let entries = try readIndexEntries()
+        let entries = try logicalIndexEntries()
         for entry in entries.reversed() where entry.setId == setId && entry.kind == kind {
             return entry
         }
@@ -549,7 +735,7 @@ public struct RunStore: Sendable {
 
     /// Reconstructs unresolved destructive audit failures from the canonical
     /// per-run metadata and the derived index. It never mutates either one;
-    /// #120 owns idempotent reconciliation toward metadata.
+    /// `recoverInterrupted()` owns idempotent reconciliation toward metadata.
     public func unresolvedAuditFailures(
         callerHoldsDestructiveAuditGate: Bool = false
     ) throws -> [RunAuditFailure] {
@@ -672,6 +858,18 @@ public struct RunStore: Sendable {
                         ? nil
                         : .launchedWithoutTerminalMetadata
                 }
+            } else if metadata.publicationDurabilityContractVersion
+                != Self.publicationDurabilityContractVersion {
+                // A visible legacy canonical rename is not proof that its
+                // file and directory entry reached stable storage. Recovery
+                // must durably republish it before verification can authorize
+                // another destructive operation.
+                reason = .terminalMetadataMissingIndex
+            } else if metadata.indexPublicationPending == true {
+                // The index line may be absent, partial, or fully visible but
+                // not durably confirmed. Treat all three as one incomplete
+                // derived publication until recovery finishes the transaction.
+                reason = .terminalMetadataMissingIndex
             } else {
                 // Terminal projection integrity applies to every destructive
                 // record, including pre-contract records with no launch
@@ -738,19 +936,73 @@ public struct RunStore: Sendable {
         return decodeIndexEntries(data)
     }
 
+    /// Recovery is allowed to repair only an incomplete physical tail. It
+    /// does so under the index lock and durably commits that repair before
+    /// deciding which canonical records still need a projection.
+    private func readIndexEntriesRepairingTail() throws -> [RunIndexEntry] {
+        try paths.ensureDirectories()
+        let lock = try acquireIndexLock()
+        defer { lock.release() }
+
+        let indexPath = paths.runsIndexFile.path
+        guard FileManager.default.fileExists(atPath: indexPath) else { return [] }
+
+        let runsDirectoryFD = try openDirectory(paths.runsDir)
+        defer { closeFileDescriptor(runsDirectoryFD) }
+        let fd = fileOperations.openAt(
+            runsDirectoryFD,
+            paths.runsIndexFile.lastPathComponent,
+            O_RDWR | O_CLOEXEC | O_NOFOLLOW,
+            0
+        )
+        guard fd >= 0 else {
+            throw RunStoreError.indexAppendFailed(errno: errno, path: indexPath)
+        }
+        defer { closeFileDescriptor(fd) }
+
+        _ = try repairIncompleteIndexTail(fd: fd, path: indexPath)
+        // One recovery-wide durability confirmation covers both a repaired
+        // tail and matching legacy projections that have no pending marker.
+        try syncFileDescriptor(fd, operation: "fsync recovery index", path: indexPath, indexWrite: true)
+        try syncFileDescriptor(
+            runsDirectoryFD,
+            operation: "fsync index directory",
+            path: indexPath,
+            indexWrite: true
+        )
+        return decodeIndexEntries(try Data(contentsOf: paths.runsIndexFile))
+    }
+
+    /// Returns one logical projection per run, ordered by canonical start
+    /// time. A corrective recovery projection is physically appended after
+    /// the stale line it supersedes; taking the last projection per run keeps
+    /// history truthful without hiding duplicate destructive projections from
+    /// `unresolvedAuditFailures()`, which reads the raw entries independently.
+    private func logicalIndexEntries() throws -> [RunIndexEntry] {
+        let physical = try readIndexEntries()
+        var latestByRunId: [String: (offset: Int, entry: RunIndexEntry)] = [:]
+        for (offset, entry) in physical.enumerated() {
+            latestByRunId[entry.runId] = (offset, entry)
+        }
+        return latestByRunId.values.sorted {
+            if $0.entry.start != $1.entry.start {
+                return $0.entry.start < $1.entry.start
+            }
+            return $0.offset < $1.offset
+        }.map(\.entry)
+    }
+
     private func decodeIndexEntries(_ data: Data?) -> [RunIndexEntry] {
         guard let data else { return [] }
         let indexFile = paths.runsIndexFile
-        guard let text = String(data: data, encoding: .utf8) else {
-            warn("RunStore: \(indexFile.path) is not valid UTF-8; treating as empty")
-            return []
-        }
-
         let decoder = ConfigStore.makeDecoder()
         var results: [RunIndexEntry] = []
-        for (offset, rawLine) in text.split(separator: "\n", omittingEmptySubsequences: true).enumerated() {
+        // Decode at byte-line boundaries. A torn UTF-8 scalar in one
+        // newline-terminated legacy record must not hide valid JSON records
+        // before or after it.
+        for (offset, rawLine) in data.split(separator: 0x0A, omittingEmptySubsequences: true).enumerated() {
             let lineNumber = offset + 1
-            let lineData = Data(rawLine.utf8)
+            let lineData = Data(rawLine)
             do {
                 results.append(try decoder.decode(RunIndexEntry.self, from: lineData))
             } catch {
@@ -834,24 +1086,68 @@ public struct RunStore: Sendable {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
 
         let target = paths.runMetadataFile(runId: metadata.runId)
-        let temp = target.deletingLastPathComponent()
-            .appendingPathComponent(target.lastPathComponent + ".tmp", isDirectory: false)
-
         let data = try ConfigStore.makeEncoder().encode(metadata)
-        try data.write(to: temp)
+        let directoryFD = try openDirectory(dir)
+        defer { closeFileDescriptor(directoryFD) }
 
-        let fromPath = temp.path
-        let toPath = target.path
-        let renameResult = fromPath.withCString { fromC in
-            toPath.withCString { toC in
-                rename(fromC, toC)
+        let targetName = target.lastPathComponent
+        let tempName = targetName + ".tmp"
+        // A crash may leave the old temp inode behind. Remove it relative to
+        // the already-open directory and then require creation of a fresh,
+        // non-symlink file.
+        if fileOperations.unlinkAt(directoryFD, tempName) != 0 {
+            let code = errno
+            if code != ENOENT {
+                throw RunStoreError.durableWriteFailed(
+                    operation: "unlinkat stale metadata temp",
+                    errno: code,
+                    path: dir.appendingPathComponent(tempName).path
+                )
             }
         }
-        if renameResult != 0 {
-            let renameErrno = errno
-            try? FileManager.default.removeItem(at: temp)
-            throw RunStoreError.renameFailed(errno: renameErrno, from: fromPath, to: toPath)
+        let tempFD = fileOperations.openAt(
+            directoryFD,
+            tempName,
+            O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC | O_NOFOLLOW,
+            0o644
+        )
+        guard tempFD >= 0 else {
+            let code = errno
+            throw RunStoreError.durableWriteFailed(
+                operation: "openat metadata temp",
+                errno: code,
+                path: dir.appendingPathComponent(tempName).path
+            )
         }
+
+        do {
+            try writeAll(data, to: tempFD, path: dir.appendingPathComponent(tempName).path)
+            try syncFileDescriptor(
+                tempFD,
+                operation: "fsync metadata temp",
+                path: dir.appendingPathComponent(tempName).path
+            )
+        } catch {
+            closeFileDescriptor(tempFD)
+            _ = fileOperations.unlinkAt(directoryFD, tempName)
+            throw error
+        }
+        closeFileDescriptor(tempFD)
+
+        guard fileOperations.renameAt(directoryFD, tempName, directoryFD, targetName) == 0 else {
+            let renameErrno = errno
+            _ = fileOperations.unlinkAt(directoryFD, tempName)
+            throw RunStoreError.renameFailed(
+                errno: renameErrno,
+                from: dir.appendingPathComponent(tempName).path,
+                to: target.path
+            )
+        }
+        try syncFileDescriptor(
+            directoryFD,
+            operation: "fsync metadata directory",
+            path: dir.path
+        )
     }
 
     // MARK: - Index append
@@ -861,11 +1157,47 @@ public struct RunStore: Sendable {
     }
 
     /// Appends one compact JSON line under `FileLock` on the `index.jsonl`
-    /// companion lock file. The write itself is a single `O_APPEND`
-    /// `write(2)` call, per the data-model.md atomic-write preamble.
+    /// companion lock file. The complete-write loop and `fsync` finish before
+    /// the companion lock is released.
     private func appendIndexEntry(_ entry: RunIndexEntry) throws {
         try paths.ensureDirectories()
 
+        let lock = try acquireIndexLock()
+        defer { lock.release() }
+
+        var line = try Self.makeIndexLineEncoder().encode(entry)
+        line.append(0x0A) // "\n"
+
+        let indexPath = paths.runsIndexFile.path
+        let runsDirectoryFD = try openDirectory(paths.runsDir)
+        defer { closeFileDescriptor(runsDirectoryFD) }
+        let fd = fileOperations.openAt(
+            runsDirectoryFD,
+            paths.runsIndexFile.lastPathComponent,
+            O_CREAT | O_RDWR | O_APPEND | O_CLOEXEC | O_NOFOLLOW,
+            0o644
+        )
+        guard fd >= 0 else {
+            let code = errno
+            throw RunStoreError.indexAppendFailed(errno: code, path: indexPath)
+        }
+        defer { closeFileDescriptor(fd) }
+
+        try repairIncompleteIndexTail(fd: fd, path: indexPath)
+        try writeAll(line, to: fd, path: indexPath, indexWrite: true)
+        try syncFileDescriptor(fd, operation: "fsync index", path: indexPath, indexWrite: true)
+        // This is needed when the first append also creates index.jsonl;
+        // harmlessly syncing the directory on later appends keeps the
+        // durability boundary simple and reviewable.
+        try syncFileDescriptor(
+            runsDirectoryFD,
+            operation: "fsync index directory",
+            path: indexPath,
+            indexWrite: true
+        )
+    }
+
+    private func acquireIndexLock() throws -> FileLock {
         let lock = FileLock(path: indexLockFile, trustedRoot: paths.root)
         let deadline = now().addingTimeInterval(Self.indexLockTimeout)
         // Contention is waited out; a lock that cannot be opened is not
@@ -873,36 +1205,212 @@ public struct RunStore: Sendable {
         while true {
             switch lock.acquire() {
             case .acquired:
-                break
+                return lock
             case .busy:
                 if now() > deadline {
                     throw RunStoreError.indexLockTimeout(path: indexLockFile.path)
                 }
                 usleep(Self.indexLockPollInterval)
-                continue
             case .failed(let failure):
                 throw RunStoreError.lockUnusable(failure)
             }
-            break
         }
-        defer { lock.release() }
+    }
 
-        var line = try Self.makeIndexLineEncoder().encode(entry)
-        line.append(0x0A) // "\n"
-
-        let indexPath = paths.runsIndexFile.path
-        let fd = indexPath.withCString { open($0, O_CREAT | O_WRONLY | O_APPEND, 0o644) }
+    private func openDirectory(_ directory: URL) throws -> Int32 {
+        let fd = directory.path.withCString { open($0, O_RDONLY | O_DIRECTORY | O_CLOEXEC) }
         guard fd >= 0 else {
-            throw RunStoreError.indexAppendFailed(errno: errno, path: indexPath)
+            let code = errno
+            throw RunStoreError.durableWriteFailed(
+                operation: "open directory",
+                errno: code,
+                path: directory.path
+            )
         }
-        defer { close(fd) }
+        return fd
+    }
 
-        let written = line.withUnsafeBytes { buffer -> Int in
-            write(fd, buffer.baseAddress, buffer.count)
+    /// Captures the directories whose entries will be created by
+    /// `ensureDirectories()`, followed by the first existing ancestor. After
+    /// creation, syncing this chain in returned order persists every path
+    /// component from the new leaf back into stable storage.
+    private func missingDirectorySyncChain(to leaf: URL) -> [URL] {
+        var missing: [URL] = []
+        var cursor = leaf.standardizedFileURL
+        let fileManager = FileManager.default
+        while !fileManager.fileExists(atPath: cursor.path) {
+            missing.append(cursor)
+            let parent = cursor.deletingLastPathComponent()
+            guard parent.path != cursor.path else { break }
+            cursor = parent
         }
-        if written != line.count {
-            throw RunStoreError.indexAppendFailed(errno: errno, path: indexPath)
+        if !missing.isEmpty, missing.last?.path != cursor.path {
+            missing.append(cursor)
         }
+        return missing
+    }
+
+    /// An interrupted append can leave an unterminated fragment. Appending
+    /// directly after it would concatenate the repair line onto corrupt JSON.
+    /// Preserve a complete newline-less final record by terminating it;
+    /// otherwise truncate only the invalid tail back to the last newline.
+    @discardableResult
+    private func repairIncompleteIndexTail(fd: Int32, path: String) throws -> Bool {
+        var info = stat()
+        #if canImport(Darwin)
+        let statResult = Darwin.fstat(fd, &info)
+        #elseif canImport(Glibc)
+        let statResult = Glibc.fstat(fd, &info)
+        #elseif canImport(Musl)
+        let statResult = Musl.fstat(fd, &info)
+        #endif
+        guard statResult == 0 else {
+            throw RunStoreError.indexAppendFailed(errno: errno, path: path)
+        }
+        let fileSize = Int(info.st_size)
+        guard fileSize > 0 else { return false }
+        let finalByte = try readIndexBytes(fd: fd, offset: fileSize - 1, count: 1, path: path)
+        guard finalByte.first != 0x0A else { return false }
+
+        // The common case above reads one byte. Only an actually incomplete
+        // tail scans backward, in bounded chunks, until its preceding newline.
+        var cursor = fileSize
+        var reverseSuffixChunks: [Data] = []
+        var validLength = 0
+        while cursor > 0 {
+            let start = max(0, cursor - 4_096)
+            let chunk = try readIndexBytes(fd: fd, offset: start, count: cursor - start, path: path)
+            if let newline = chunk.lastIndex(of: 0x0A) {
+                let newlineOffset = chunk.distance(from: chunk.startIndex, to: newline)
+                validLength = start + newlineOffset + 1
+                let suffixStart = chunk.index(after: newline)
+                reverseSuffixChunks.append(Data(chunk[suffixStart...]))
+                break
+            }
+            reverseSuffixChunks.append(chunk)
+            cursor = start
+        }
+        var suffix = Data()
+        for chunk in reverseSuffixChunks.reversed() {
+            suffix.append(chunk)
+        }
+        if (try? ConfigStore.makeDecoder().decode(RunIndexEntry.self, from: suffix)) != nil {
+            try writeAll(Data([0x0A]), to: fd, path: path, indexWrite: true)
+            return true
+        }
+
+        #if canImport(Darwin)
+        let result = Darwin.ftruncate(fd, off_t(validLength))
+        #elseif canImport(Glibc)
+        let result = Glibc.ftruncate(fd, off_t(validLength))
+        #elseif canImport(Musl)
+        let result = Musl.ftruncate(fd, off_t(validLength))
+        #endif
+        if result != 0 {
+            throw RunStoreError.indexAppendFailed(errno: errno, path: path)
+        }
+        return true
+    }
+
+    private func syncDirectory(_ directory: URL) throws {
+        let fd = try openDirectory(directory)
+        defer { closeFileDescriptor(fd) }
+        try syncFileDescriptor(fd, operation: "fsync directory", path: directory.path)
+    }
+
+    private func syncFileDescriptor(
+        _ fd: Int32,
+        operation: String,
+        path: String,
+        indexWrite: Bool = false
+    ) throws {
+        while fileOperations.sync(fd) != 0 {
+            let code = errno
+            if code == EINTR { continue }
+            if indexWrite {
+                throw RunStoreError.indexAppendFailed(errno: code, path: path)
+            }
+            throw RunStoreError.durableWriteFailed(
+                operation: operation,
+                errno: code,
+                path: path
+            )
+        }
+    }
+
+    private func readIndexBytes(fd: Int32, offset: Int, count: Int, path: String) throws -> Data {
+        var data = Data(count: count)
+        var total = 0
+        while total < count {
+            let readCount = data.withUnsafeMutableBytes { raw -> Int in
+                guard let base = raw.baseAddress else { return 0 }
+                #if canImport(Darwin)
+                return Darwin.pread(fd, base.advanced(by: total), count - total, off_t(offset + total))
+                #elseif canImport(Glibc)
+                return Glibc.pread(fd, base.advanced(by: total), count - total, off_t(offset + total))
+                #elseif canImport(Musl)
+                return Musl.pread(fd, base.advanced(by: total), count - total, off_t(offset + total))
+                #endif
+            }
+            if readCount < 0 {
+                let code = errno
+                if code == EINTR { continue }
+                throw RunStoreError.indexAppendFailed(errno: code, path: path)
+            }
+            if readCount == 0 {
+                throw RunStoreError.indexAppendFailed(errno: EIO, path: path)
+            }
+            total += readCount
+        }
+        return data
+    }
+
+    private func writeAll(
+        _ data: Data,
+        to fd: Int32,
+        path: String,
+        indexWrite: Bool = false
+    ) throws {
+        var offset = 0
+        try data.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress else { return }
+            while offset < raw.count {
+                let written = fileOperations.write(
+                    fd,
+                    base.advanced(by: offset),
+                    raw.count - offset
+                )
+                if written < 0 {
+                    let code = errno
+                    if code == EINTR { continue }
+                    if indexWrite {
+                        throw RunStoreError.indexAppendFailed(errno: code, path: path)
+                    }
+                    throw RunStoreError.durableWriteFailed(
+                        operation: "write",
+                        errno: code,
+                        path: path
+                    )
+                }
+                if written == 0 {
+                    if indexWrite {
+                        throw RunStoreError.indexAppendFailed(errno: EIO, path: path)
+                    }
+                    throw RunStoreError.durableWriteFailed(operation: "write", errno: EIO, path: path)
+                }
+                offset += written
+            }
+        }
+    }
+
+    private func closeFileDescriptor(_ fd: Int32) {
+        #if canImport(Darwin)
+        _ = Darwin.close(fd)
+        #elseif canImport(Glibc)
+        _ = Glibc.close(fd)
+        #elseif canImport(Musl)
+        _ = Musl.close(fd)
+        #endif
     }
 
     /// Compact (no pretty-printing) single-line JSON encoder for

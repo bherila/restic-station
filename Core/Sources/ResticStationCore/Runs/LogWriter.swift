@@ -45,6 +45,7 @@ public final class LogWriter: @unchecked Sendable {
             var remaining = buffer.count
             while remaining > 0 {
                 let n = write(fd, base, remaining)
+                if n < 0, errno == EINTR { continue }
                 if n <= 0 { break } // best-effort; nothing sane to do with a log-write failure
                 remaining -= n
                 base += n

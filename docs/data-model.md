@@ -298,11 +298,11 @@ Secret-env item is optional (absent for local/sftp destinations without credenti
 {"runId":"20260726T205704Z-backup-6f9619ff","kind":"backup","setId":"6F9619FF-...","destId":"0A1B2C3D-...","status":"success","start":"2026-07-26T20:57:04Z","end":"2026-07-26T20:58:11Z","trigger":"scheduled","snapshotId":"f391ba97c096...","filesNew":3,"filesChanged":1,"dataAdded":67860,"errorSummary":null}
 ```
 
-`kind`: `backup` | `copy` | `check` | `prune` | `purge` | `restore` | `init`. A scheduled set run produces **multiple** index lines: one `backup` (primary), an optional `purge` per destination with newly added `purgeExcludes`, one `copy` per attempted secondary, one `prune` per repo where retention ran. They share a `groupId` field (= the backup's runId) so the UI can nest them.
+`kind`: `backup` | `copy` | `check` | `prune` | `purge` | `restore` | `init`. A scheduled set run produces **multiple** index lines: one `backup` (primary), an optional `purge` per destination with newly added `purgeExcludes`, one `copy` per attempted secondary, one `prune` per repo where retention ran. They share a `groupId` field (= the backup's runId) so the UI can nest them. Each append uses a complete-write loop that retries `EINTR`, then `fsync`s the index (also retrying `EINTR`) before releasing `index.jsonl.lock`; creation of the first index also syncs the `runs/` directory entry. Before appending, the writer reads only the final byte in the normal newline-terminated case. An unterminated corrupt tail triggers a bounded backward scan and is truncated to the last complete line (or a complete newline-less JSON record is terminated), so a recovery line cannot be concatenated onto corrupt JSON without making every normal append reread the full history. Recovery performs that repair before decoding its index snapshot, so a torn multibyte UTF-8 scalar cannot hide or duplicate the valid prefix. Decoding happens independently at byte-line boundaries, preserving valid records on either side of a newline-terminated line with invalid UTF-8. History readers take the last decodable projection for each run and order runs by canonical start time; an older repaired record therefore cannot masquerade as the latest run.
 
 ## runs/<runId>/metadata.json — `RunMetadata`
 
-Superset of the index line, plus: `pid`, `resticExitCode`, `argvRedacted` (argv with env not included), `stats` (full decoded summary message where applicable), `groupId`, `destructiveAuditContractVersion`, `destructiveLaunchAuthorizedAt`, and `auditFailureReason`. A successful `purge` run additionally carries `purgeSnapshotRewrites`, an old full snapshot id → new snapshot id mapping. It is an audit record only: older run records continue to name their historical snapshot ids. Written once at start (`status: "running"`, no `end`) and atomically rewritten on completion.
+Superset of the index line, plus: `pid`, `resticExitCode`, `argvRedacted` (argv with env not included), `stats` (full decoded summary message where applicable), `groupId`, `destructiveAuditContractVersion`, `destructiveLaunchAuthorizedAt`, `auditFailureReason`, the optional two-phase marker `indexPublicationPending`, and `publicationDurabilityContractVersion`. A successful `purge` run additionally carries `purgeSnapshotRewrites`, an old full snapshot id → new snapshot id mapping. It is an audit record only: older run records continue to name their historical snapshot ids. Written once at start (`status: "running"`, no `end`) and atomically rewritten on completion. The temp file is completely written, `fsync`ed, and renamed with `renameat(2)` against a held directory descriptor; the containing directory is then `fsync`ed before success is reported. A newly created run directory is likewise made durable in `runs/` before `begin` returns. On a fresh hierarchy, every newly created `runs/`/data-root ancestor entry and the first pre-existing parent are synced bottom-up before initial run publication, so a later crash cannot lose the entire canonical history path. `begin` also confirms `runs/`, the data root, and its parent when a scheduler setup path created them first. If initial publication fails, removing its fresh directory and discarding a safely unstarted run both sync `runs/` before reporting success; a cleanup sync failure is surfaced as indeterminate instead of claiming a durable rollback.
 
 ### Normative destructive-operation audit contract
 
@@ -318,9 +318,9 @@ about to hand the exact argv to the process runner. Before that boundary the
 run is safely unstarted. The run directory and initial metadata must exist,
 `log.txt` must be open, and the exact redacted argv must be persisted in the
 same metadata rewrite as the marker before the marker may be written. Failure
-of any of those prerequisites refuses process creation. The crash-durability details
-that make these successful writes survive power loss are specified by #120;
-they do not weaken this ordering or the fail-closed launch rule.
+of any of those prerequisites refuses process creation. Every successful
+metadata publication crosses the crash-durability boundary described above;
+those mechanics do not weaken this ordering or the fail-closed launch rule.
 
 New destructive records persist `destructiveAuditContractVersion: 1` in their
 initial metadata, making a markerless current-version record affirmative
@@ -379,10 +379,16 @@ repository mutation occurred, so terminal metadata retains
 `repository_outcome_unknown` even when that terminal record and index append
 both succeed.
 
-Reconciliation runs on helper recovery and explicit history repair. It is
+Reconciliation runs on helper recovery and explicit history repair. It first
+requires each decoded metadata `runId` to match the directory being scanned,
+before constructing any write path, so misplaced evidence cannot overwrite a
+different run's canonical record. It is
 idempotent. It may append one missing index projection for terminal canonical
 metadata and may convert a dead, still-running non-destructive record to the
-existing `failed/interrupted` outcome. A dead destructive record carrying a
+existing `failed/interrupted` outcome. If a non-destructive run already has a
+stale divergent projection, recovery appends one corrective canonical
+projection; logical history takes that last projection without displaying a
+duplicate. A dead destructive record carrying a
 launch marker must instead retain
 `auditFailureReason: launched_without_terminal_metadata`; reconciliation may
 index that condition but must not invent a repository result or clear the
@@ -390,12 +396,30 @@ critical condition. Only an explicit repair after human inspection may clear
 that uncertainty. Repeated reconciliation must neither append duplicates nor
 alter an already terminal repository outcome.
 
+Terminal publication is a durable two-phase transaction. Canonical metadata
+first commits `indexPublicationPending: true`, the derived line is completely
+written and synced under `index.jsonl.lock`, and canonical metadata is then
+rewritten with the marker cleared. A crash or surfaced sync error at any point
+therefore leaves either running launch evidence, a terminal record whose index
+is absent, or a terminal pending marker. Verification treats the pending marker
+as `terminal_metadata_missing_index` even when a full but not-yet-confirmed line
+is visible. Recovery first commits the pending marker even for legacy terminal
+records, repairs an incomplete physical tail before appending, and clears the
+marker only after the canonical projection has been synced. Recovery also
+fsyncs its existing index snapshot once before accepting matching legacy
+projections whose metadata predates the pending marker. A legacy canonical
+record without `publicationDurabilityContractVersion` is atomically
+republished before a matching pair is accepted; destructive verification
+fails closed on that missing marker until recovery completes the upgrade.
+Destructive duplicates or divergence remain critical; non-destructive divergence receives
+one idempotent corrective projection as described above.
+
 Verification requires every run directory's canonical `metadata.json` to be
 readable and decodable. It fails closed on missing or corrupt canonical
 evidence instead of skipping the directory. A terminal destructive record is
 complete only when the index contains exactly one projection equal to
 `metadata.indexEntry`; an absent, duplicate, or divergent projection remains
-critical until #120's reconciliation repairs it. Conversely, a destructive
+critical until reconciliation repairs an absent projection. Conversely, a destructive
 index projection whose entire canonical run directory is missing reports
 `canonical_metadata_missing`; a directory-driven scan must never silently
 authorize another destructive launch after that loss.

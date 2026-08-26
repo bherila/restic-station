@@ -37,7 +37,7 @@ public enum RunAuditFailureReason: String, Codable, Equatable, Sendable {
     /// terminal metadata was committed. The repository outcome is unknown.
     case launchedWithoutTerminalMetadata = "launched_without_terminal_metadata"
     /// Terminal metadata is canonical and present, but its derived index
-    /// projection is absent.
+    /// projection is absent or its durable publication is still pending.
     case terminalMetadataMissingIndex = "terminal_metadata_missing_index"
     /// The index contains one or more projections for the run, but not
     /// exactly one byte-semantic projection of the canonical metadata.
@@ -230,6 +230,14 @@ public struct RunMetadata: Codable, Equatable, Sendable {
     /// outcome could not be captured. Unlike a missing derived index entry,
     /// reconciliation must not clear this without explicit human inspection.
     public var auditFailureReason: RunAuditFailureReason?
+    /// Two-phase publication marker. Terminal metadata sets this before its
+    /// derived index append and clears it only after that append is durable.
+    /// Recovery may finish this mechanical transaction automatically.
+    public var indexPublicationPending: Bool?
+    /// Version of the crash-durability contract used to publish this
+    /// canonical metadata record. Missing on legacy records whose visible
+    /// rename may not have been synced to stable storage.
+    public var publicationDurabilityContractVersion: Int?
 
     public init(
         runId: String,
@@ -253,7 +261,9 @@ public struct RunMetadata: Codable, Equatable, Sendable {
         purgeSnapshotRewrites: [String: String]? = nil,
         destructiveAuditContractVersion: Int? = nil,
         destructiveLaunchAuthorizedAt: Date? = nil,
-        auditFailureReason: RunAuditFailureReason? = nil
+        auditFailureReason: RunAuditFailureReason? = nil,
+        indexPublicationPending: Bool? = nil,
+        publicationDurabilityContractVersion: Int? = nil
     ) {
         self.runId = runId
         self.kind = kind
@@ -277,6 +287,8 @@ public struct RunMetadata: Codable, Equatable, Sendable {
         self.destructiveAuditContractVersion = destructiveAuditContractVersion
         self.destructiveLaunchAuthorizedAt = destructiveLaunchAuthorizedAt
         self.auditFailureReason = auditFailureReason
+        self.indexPublicationPending = indexPublicationPending
+        self.publicationDurabilityContractVersion = publicationDurabilityContractVersion
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -284,7 +296,7 @@ public struct RunMetadata: Codable, Equatable, Sendable {
         case pid, resticExitCode, argvRedacted
         case snapshotId, filesNew, filesChanged, dataAdded, errorSummary, stats, purgeSnapshotRewrites
         case destructiveAuditContractVersion, destructiveLaunchAuthorizedAt
-        case auditFailureReason
+        case auditFailureReason, indexPublicationPending, publicationDurabilityContractVersion
     }
 
     // Explicit `null` for nil optionals — see AppConfig.encode(to:).
@@ -312,6 +324,11 @@ public struct RunMetadata: Codable, Equatable, Sendable {
         try container.encode(destructiveAuditContractVersion, forKey: .destructiveAuditContractVersion)
         try container.encode(destructiveLaunchAuthorizedAt, forKey: .destructiveLaunchAuthorizedAt)
         try container.encode(auditFailureReason, forKey: .auditFailureReason)
+        try container.encode(indexPublicationPending, forKey: .indexPublicationPending)
+        try container.encode(
+            publicationDurabilityContractVersion,
+            forKey: .publicationDurabilityContractVersion
+        )
     }
 
     /// The compact index-line projection of this metadata, appended to

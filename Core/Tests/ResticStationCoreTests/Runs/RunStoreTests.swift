@@ -23,6 +23,16 @@ private final class TickCounter: @unchecked Sendable {
     }
 }
 
+private func setRunStoreTestErrno(_ value: Int32) {
+    #if canImport(Darwin)
+    __error().pointee = value
+    #elseif canImport(Glibc)
+    __errno_location().pointee = value
+    #elseif canImport(Musl)
+    __errno_location().pointee = value
+    #endif
+}
+
 @Suite struct RunStoreTests {
     private func makePaths() -> AppPaths {
         let root = FileManager.default.temporaryDirectory
@@ -217,6 +227,85 @@ private final class TickCounter: @unchecked Sendable {
         #expect(try store.unresolvedAuditFailures().isEmpty)
     }
 
+    @Test("a failed initial-publication rollback reports an indeterminate directory sync")
+    func failedInitialPublicationSurfacesCleanupSyncFailure() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+        let live = RunStoreFileOperations.live
+        let failCleanupSync = Box(false)
+        let cleanupSyncCalls = Box(0)
+        let operations = RunStoreFileOperations(
+            openAt: live.openAt,
+            write: live.write,
+            sync: { fd in
+                guard failCleanupSync.value else { return live.sync(fd) }
+                cleanupSyncCalls.value += 1
+                setRunStoreTestErrno(EIO)
+                return -1
+            },
+            renameAt: live.renameAt,
+            unlinkAt: live.unlinkAt
+        )
+        let start = Date(timeIntervalSince1970: 1_700_000_100)
+        let setId = UUID()
+        let runId = RunStore.formatRunId(kind: .prune, setId: setId, date: start)
+        let store = RunStore(
+            paths: paths,
+            now: { start },
+            initialPublicationHook: { directory in
+                failCleanupSync.value = true
+                throw RunStoreError.discardUnsafe(path: directory.path)
+            },
+            fileOperations: operations
+        )
+
+        var capturedError: RunStoreError?
+        do {
+            _ = try store.begin(kind: .prune, setId: setId, destId: UUID(), trigger: .manual)
+        } catch let error as RunStoreError {
+            capturedError = error
+        }
+        switch capturedError {
+        case .initialPublicationCleanupFailed(_, _, let cleanupError):
+            #expect(cleanupError.contains("fsync directory failed"))
+        default:
+            Issue.record("expected initialPublicationCleanupFailed, got \(String(describing: capturedError))")
+        }
+        #expect(cleanupSyncCalls.value > 0)
+        #expect(!FileManager.default.fileExists(atPath: paths.runDir(runId: runId).path))
+    }
+
+    @Test("discarding an unstarted run durably removes its directory")
+    func discardUnstartedSyncsRunsDirectory() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+        let live = RunStoreFileOperations.live
+        let syncCalls = Box(0)
+        let operations = RunStoreFileOperations(
+            openAt: live.openAt,
+            write: live.write,
+            sync: { fd in
+                syncCalls.value += 1
+                return live.sync(fd)
+            },
+            renameAt: live.renameAt,
+            unlinkAt: live.unlinkAt
+        )
+        let store = RunStore(
+            paths: paths,
+            now: { Date() },
+            initialPublicationHook: { _ in },
+            fileOperations: operations
+        )
+        let run = try store.begin(kind: .prune, setId: UUID(), destId: UUID(), trigger: .manual)
+        let callsBeforeDiscard = syncCalls.value
+
+        try store.discardUnstarted(run)
+
+        #expect(syncCalls.value > callsBeforeDiscard)
+        #expect(!FileManager.default.fileExists(atPath: paths.runDir(runId: run.runId).path))
+    }
+
     // MARK: - Crash recovery
 
     @Test func recoverInterruptedRewritesDeadPidRunsAsFailed() throws {
@@ -276,6 +365,559 @@ private final class TickCounter: @unchecked Sendable {
         // No index line should have been written for an untouched run.
         let index = try store.recentRuns(limit: 10)
         #expect(index.isEmpty)
+    }
+
+    @Test("begin persists every newly created history-directory ancestor before publication")
+    func beginSyncsNewHistoryAncestors() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+        let live = RunStoreFileOperations.live
+        let syncCalls = Box(0)
+        let callsBeforePublication = Box(0)
+        let operations = RunStoreFileOperations(
+            openAt: live.openAt,
+            write: live.write,
+            sync: { fd in
+                syncCalls.value += 1
+                return live.sync(fd)
+            },
+            renameAt: live.renameAt,
+            unlinkAt: live.unlinkAt
+        )
+        let store = RunStore(
+            paths: paths,
+            now: { Date() },
+            initialPublicationHook: { _ in
+                callsBeforePublication.value = syncCalls.value
+            },
+            fileOperations: operations
+        )
+
+        _ = try store.begin(kind: .backup, setId: UUID(), destId: UUID(), trigger: .manual)
+
+        // runs/, the data root, and the pre-existing temporary parent are
+        // synced bottom-up before the initial metadata hook can run.
+        #expect(callsBeforePublication.value >= 3)
+    }
+
+    @Test("begin syncs the history hierarchy even when scheduler setup created it first")
+    func beginSyncsPrecreatedHistoryAncestors() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+        try paths.ensureDirectories()
+        let live = RunStoreFileOperations.live
+        let syncCalls = Box(0)
+        let callsBeforePublication = Box(0)
+        let operations = RunStoreFileOperations(
+            openAt: live.openAt,
+            write: live.write,
+            sync: { fd in
+                syncCalls.value += 1
+                return live.sync(fd)
+            },
+            renameAt: live.renameAt,
+            unlinkAt: live.unlinkAt
+        )
+        let store = RunStore(
+            paths: paths,
+            now: { Date() },
+            initialPublicationHook: { _ in
+                callsBeforePublication.value = syncCalls.value
+            },
+            fileOperations: operations
+        )
+
+        _ = try store.begin(kind: .prune, setId: UUID(), destId: UUID(), trigger: .scheduled)
+
+        // runs/, the data root, and its parent are confirmed even though the
+        // scheduler made the whole hierarchy visible before begin.
+        #expect(callsBeforePublication.value >= 3)
+    }
+
+    @Test("durable writes retry EINTR and complete every short write")
+    func durableWritesCompleteShortWritesAndRetryEINTR() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+        let live = RunStoreFileOperations.live
+        let writeCalls = Box(0)
+        let syncCalls = Box(0)
+        let operations = RunStoreFileOperations(
+            openAt: live.openAt,
+            write: { fd, buffer, count in
+                writeCalls.value += 1
+                if writeCalls.value == 1 {
+                    setRunStoreTestErrno(EINTR)
+                    return -1
+                }
+                return live.write(fd, buffer, min(count, 7))
+            },
+            sync: { fd in
+                syncCalls.value += 1
+                if syncCalls.value == 1 {
+                    setRunStoreTestErrno(EINTR)
+                    return -1
+                }
+                return live.sync(fd)
+            },
+            renameAt: live.renameAt,
+            unlinkAt: live.unlinkAt
+        )
+        let store = RunStore(
+            paths: paths,
+            now: { Date() },
+            initialPublicationHook: { _ in },
+            fileOperations: operations
+        )
+
+        let run = try store.begin(kind: .prune, setId: UUID(), destId: UUID(), trigger: .manual)
+        try store.markDestructiveLaunchAuthorized(run)
+        try store.finish(run, status: .success, resticExitCode: 0)
+
+        #expect(writeCalls.value > 3)
+        #expect(syncCalls.value > 1)
+        #expect(try store.metadata(runId: run.runId).status == .success)
+        #expect(try store.recentRuns(limit: 10).map(\.runId) == [run.runId])
+        #expect(try store.unresolvedAuditFailures().isEmpty)
+    }
+
+    @Test("ENOSPC during terminal metadata leaves explicit launched-without-terminal evidence")
+    func terminalMetadataENOSPCFailsClosed() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+        let live = RunStoreFileOperations.live
+        let failWrites = Box(false)
+        let operations = RunStoreFileOperations(
+            openAt: live.openAt,
+            write: { fd, buffer, count in
+                guard failWrites.value else { return live.write(fd, buffer, count) }
+                setRunStoreTestErrno(ENOSPC)
+                return -1
+            },
+            sync: live.sync,
+            renameAt: live.renameAt,
+            unlinkAt: live.unlinkAt
+        )
+        let store = RunStore(
+            paths: paths,
+            now: { Date() },
+            initialPublicationHook: { _ in },
+            fileOperations: operations
+        )
+        let run = try store.begin(kind: .prune, setId: UUID(), destId: UUID(), trigger: .manual)
+        try store.markDestructiveLaunchAuthorized(run)
+        failWrites.value = true
+
+        #expect(throws: RunStoreError.self) {
+            try store.finish(run, status: .success, resticExitCode: 0)
+        }
+
+        #expect(try store.metadata(runId: run.runId).status == .running)
+        #expect(try store.unresolvedAuditFailures().first?.reason == .launchedWithoutTerminalMetadata)
+        #expect(!FileManager.default.fileExists(
+            atPath: paths.runMetadataFile(runId: run.runId).path + ".tmp"
+        ))
+    }
+
+    @Test("a read-only metadata directory fault cannot publish terminal success")
+    func readOnlyRunDirectoryFailsClosed() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+        let live = RunStoreFileOperations.live
+        let denyMetadataTemp = Box(false)
+        let operations = RunStoreFileOperations(
+            openAt: { directory, name, flags, mode in
+                if denyMetadataTemp.value, name == "metadata.json.tmp" {
+                    setRunStoreTestErrno(EACCES)
+                    return -1
+                }
+                return live.openAt(directory, name, flags, mode)
+            },
+            write: live.write,
+            sync: live.sync,
+            renameAt: live.renameAt,
+            unlinkAt: live.unlinkAt
+        )
+        let store = RunStore(
+            paths: paths,
+            now: { Date() },
+            initialPublicationHook: { _ in },
+            fileOperations: operations
+        )
+        let run = try store.begin(kind: .purge, setId: UUID(), destId: UUID(), trigger: .manual)
+        try store.markDestructiveLaunchAuthorized(run)
+        denyMetadataTemp.value = true
+
+        #expect(throws: RunStoreError.self) {
+            try store.finish(run, status: .success, resticExitCode: 0)
+        }
+        #expect(try store.unresolvedAuditFailures().first?.reason == .launchedWithoutTerminalMetadata)
+        #expect(try store.recentRuns(limit: 10).isEmpty)
+    }
+
+    @Test("an interrupted atomic rename preserves the prior canonical launch record")
+    func interruptedAtomicMetadataRenameFailsClosed() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+        let live = RunStoreFileOperations.live
+        let interruptRename = Box(false)
+        let operations = RunStoreFileOperations(
+            openAt: live.openAt,
+            write: live.write,
+            sync: live.sync,
+            renameAt: { oldDirectory, oldName, newDirectory, newName in
+                guard interruptRename.value else {
+                    return live.renameAt(oldDirectory, oldName, newDirectory, newName)
+                }
+                setRunStoreTestErrno(EIO)
+                return -1
+            },
+            unlinkAt: live.unlinkAt
+        )
+        let store = RunStore(
+            paths: paths,
+            now: { Date() },
+            initialPublicationHook: { _ in },
+            fileOperations: operations
+        )
+        let run = try store.begin(kind: .prune, setId: UUID(), destId: UUID(), trigger: .manual)
+        try store.markDestructiveLaunchAuthorized(run)
+        interruptRename.value = true
+
+        #expect(throws: RunStoreError.self) {
+            try store.finish(run, status: .success, resticExitCode: 0)
+        }
+        let canonical = try store.metadata(runId: run.runId)
+        #expect(canonical.status == .running)
+        #expect(canonical.destructiveLaunchAuthorizedAt != nil)
+        #expect(try store.unresolvedAuditFailures().first?.reason == .launchedWithoutTerminalMetadata)
+    }
+
+    @Test("a failed index fsync leaves a pending marker until recovery confirms the projection")
+    func indexSyncFailureLeavesPendingPublication() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+        let live = RunStoreFileOperations.live
+        let failDuringFinish = Box(false)
+        let finishSyncCalls = Box(0)
+        let operations = RunStoreFileOperations(
+            openAt: live.openAt,
+            write: live.write,
+            sync: { fd in
+                guard failDuringFinish.value else { return live.sync(fd) }
+                finishSyncCalls.value += 1
+                // terminal temp, metadata directory, then index file
+                if finishSyncCalls.value == 3 {
+                    setRunStoreTestErrno(EIO)
+                    return -1
+                }
+                return live.sync(fd)
+            },
+            renameAt: live.renameAt,
+            unlinkAt: live.unlinkAt
+        )
+        let store = RunStore(
+            paths: paths,
+            now: { Date() },
+            initialPublicationHook: { _ in },
+            fileOperations: operations
+        )
+        let run = try store.begin(kind: .prune, setId: UUID(), destId: UUID(), trigger: .manual)
+        try store.markDestructiveLaunchAuthorized(run)
+        failDuringFinish.value = true
+
+        #expect(throws: RunStoreError.self) {
+            try store.finish(run, status: .success, resticExitCode: 0)
+        }
+        let pending = try store.metadata(runId: run.runId)
+        #expect(pending.status == .success)
+        #expect(pending.indexPublicationPending == true)
+        #expect(try store.recentRuns(limit: 10).map(\.runId) == [run.runId])
+        #expect(try store.unresolvedAuditFailures().first?.reason == .terminalMetadataMissingIndex)
+
+        #expect(try store.recoverInterrupted().isEmpty)
+        #expect(try store.metadata(runId: run.runId).indexPublicationPending == nil)
+        #expect(try store.recentRuns(limit: 10).map(\.runId) == [run.runId])
+        #expect(try store.unresolvedAuditFailures().isEmpty)
+    }
+
+    @Test("recovery appends a missing terminal projection exactly once")
+    func recoveryReconcilesTerminalMetadataIdempotently() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+        let store = RunStore(paths: paths, now: { Date() })
+        let run = try store.begin(kind: .prune, setId: UUID(), destId: UUID(), trigger: .manual)
+        try store.markDestructiveLaunchAuthorized(run)
+        try FileManager.default.createDirectory(
+            at: paths.runsIndexLockFile,
+            withIntermediateDirectories: true
+        )
+        #expect(throws: (any Error).self) {
+            try store.finish(run, status: .success, resticExitCode: 0)
+        }
+        try FileManager.default.removeItem(at: paths.runsIndexLockFile)
+
+        #expect(try store.unresolvedAuditFailures().first?.reason == .terminalMetadataMissingIndex)
+        #expect(try store.recoverInterrupted().isEmpty)
+        #expect(try store.recoverInterrupted().isEmpty)
+
+        let history = try store.recentRuns(limit: 10)
+        #expect(history.count == 1)
+        #expect(history.first?.runId == run.runId)
+        #expect(try store.unresolvedAuditFailures().isEmpty)
+    }
+
+    @Test("recovery removes an incomplete index tail before publishing its replacement")
+    func recoveryRepairsPartialIndexTail() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+        let store = RunStore(paths: paths, now: { Date() })
+        let run = try store.begin(kind: .prune, setId: UUID(), destId: UUID(), trigger: .manual)
+        try store.markDestructiveLaunchAuthorized(run)
+        try FileManager.default.createDirectory(
+            at: paths.runsIndexLockFile,
+            withIntermediateDirectories: true
+        )
+        #expect(throws: (any Error).self) {
+            try store.finish(run, status: .success, resticExitCode: 0)
+        }
+        try FileManager.default.removeItem(at: paths.runsIndexLockFile)
+        try Data("{\"runId\":\"unterminated".utf8).write(to: paths.runsIndexFile)
+
+        #expect(try store.recoverInterrupted().isEmpty)
+        #expect(try store.metadata(runId: run.runId).indexPublicationPending == nil)
+        #expect(try store.recentRuns(limit: 10).map(\.runId) == [run.runId])
+        #expect(try store.unresolvedAuditFailures().isEmpty)
+        #expect(try Data(contentsOf: paths.runsIndexFile).last == 0x0A)
+    }
+
+    @Test("recovery preserves valid index entries before a torn UTF-8 tail")
+    func recoveryPreservesIndexPrefixBeforeTornUTF8() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+        let store = RunStore(paths: paths, now: { Date() })
+        let run = try store.begin(kind: .prune, setId: UUID(), destId: UUID(), trigger: .manual)
+        try store.markDestructiveLaunchAuthorized(run)
+        try store.finish(run, status: .success, resticExitCode: 0)
+
+        var indexBytes = try Data(contentsOf: paths.runsIndexFile)
+        indexBytes.append(contentsOf: [0x7B, 0x22, 0x78, 0x22, 0x3A, 0xF0, 0x9F])
+        try indexBytes.write(to: paths.runsIndexFile)
+
+        #expect(try store.recoverInterrupted().isEmpty)
+        #expect(try store.recentRuns(limit: 10).map(\.runId) == [run.runId])
+        #expect(try store.unresolvedAuditFailures().isEmpty)
+        let repairedLines = try String(contentsOf: paths.runsIndexFile, encoding: .utf8)
+            .split(separator: "\n")
+        #expect(repairedLines.count == 1)
+    }
+
+    @Test("recovery decodes valid records around an invalid UTF-8 interior line")
+    func recoveryPreservesIndexAroundInteriorInvalidUTF8() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+        let store = RunStore(paths: paths, now: { Date() })
+        let first = try store.begin(kind: .prune, setId: UUID(), destId: UUID(), trigger: .manual)
+        try store.markDestructiveLaunchAuthorized(first)
+        try store.finish(first, status: .success, resticExitCode: 0)
+        let second = try store.begin(kind: .prune, setId: UUID(), destId: UUID(), trigger: .manual)
+        try store.markDestructiveLaunchAuthorized(second)
+        try store.finish(second, status: .success, resticExitCode: 0)
+
+        let validLines = try Data(contentsOf: paths.runsIndexFile)
+            .split(separator: 0x0A, omittingEmptySubsequences: true)
+        #expect(validLines.count == 2)
+        var damaged = Data(validLines[0])
+        damaged.append(0x0A)
+        damaged.append(contentsOf: [0x7B, 0x22, 0x78, 0x22, 0x3A, 0xF0, 0x9F, 0x0A])
+        damaged.append(Data(validLines[1]))
+        damaged.append(0x0A)
+        try damaged.write(to: paths.runsIndexFile)
+
+        #expect(try store.recoverInterrupted().isEmpty)
+        #expect(Set(try store.recentRuns(limit: 10).map(\.runId)) == [first.runId, second.runId])
+        #expect(try store.unresolvedAuditFailures().isEmpty)
+        #expect(try Data(contentsOf: paths.runsIndexFile)
+            .split(separator: 0x0A, omittingEmptySubsequences: true).count == 3)
+    }
+
+    @Test("legacy recovery commits a pending marker before attempting its missing index append")
+    func legacyRecoveryMarksPendingBeforeAppend() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+        let liveStore = RunStore(paths: paths, now: { Date() })
+        let run = try liveStore.begin(kind: .backup, setId: UUID(), destId: UUID(), trigger: .manual)
+        try liveStore.finish(run, status: .success, resticExitCode: 0)
+        try FileManager.default.removeItem(at: paths.runsIndexFile)
+
+        let live = RunStoreFileOperations.live
+        let indexFD = Box<Int32?>(nil)
+        let operations = RunStoreFileOperations(
+            openAt: { directory, name, flags, mode in
+                let fd = live.openAt(directory, name, flags, mode)
+                if name == paths.runsIndexFile.lastPathComponent {
+                    indexFD.value = fd
+                }
+                return fd
+            },
+            write: { fd, buffer, count in
+                if fd == indexFD.value {
+                    setRunStoreTestErrno(ENOSPC)
+                    return -1
+                }
+                return live.write(fd, buffer, count)
+            },
+            sync: live.sync,
+            renameAt: live.renameAt,
+            unlinkAt: live.unlinkAt
+        )
+        let recoveringStore = RunStore(
+            paths: paths,
+            now: { Date() },
+            initialPublicationHook: { _ in },
+            fileOperations: operations
+        )
+
+        #expect(throws: RunStoreError.self) {
+            try recoveringStore.recoverInterrupted()
+        }
+        #expect(try recoveringStore.metadata(runId: run.runId).indexPublicationPending == true)
+    }
+
+    @Test("recovery fsyncs an exact legacy projection before accepting it")
+    func legacyMatchingProjectionIsConfirmedDurable() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+        let liveStore = RunStore(paths: paths, now: { Date() })
+        let run = try liveStore.begin(kind: .prune, setId: UUID(), destId: UUID(), trigger: .manual)
+        try liveStore.markDestructiveLaunchAuthorized(run)
+        try liveStore.finish(run, status: .success, resticExitCode: 0)
+        #expect(try liveStore.metadata(runId: run.runId).indexPublicationPending == nil)
+
+        let live = RunStoreFileOperations.live
+        let indexFD = Box<Int32?>(nil)
+        let indexSyncCalls = Box(0)
+        let operations = RunStoreFileOperations(
+            openAt: { directory, name, flags, mode in
+                let fd = live.openAt(directory, name, flags, mode)
+                if name == paths.runsIndexFile.lastPathComponent {
+                    indexFD.value = fd
+                }
+                return fd
+            },
+            write: live.write,
+            sync: { fd in
+                if fd == indexFD.value {
+                    indexSyncCalls.value += 1
+                }
+                return live.sync(fd)
+            },
+            renameAt: live.renameAt,
+            unlinkAt: live.unlinkAt
+        )
+        let recoveringStore = RunStore(
+            paths: paths,
+            now: { Date() },
+            initialPublicationHook: { _ in },
+            fileOperations: operations
+        )
+
+        #expect(try recoveringStore.recoverInterrupted().isEmpty)
+        #expect(indexSyncCalls.value > 0)
+        #expect(try recoveringStore.unresolvedAuditFailures().isEmpty)
+    }
+
+    @Test("recovery durably republishes exact legacy canonical metadata")
+    func legacyMatchingMetadataIsRepublishedDurably() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+        let store = RunStore(paths: paths, now: { Date() })
+        let run = try store.begin(kind: .prune, setId: UUID(), destId: UUID(), trigger: .manual)
+        try store.markDestructiveLaunchAuthorized(run)
+        try store.finish(run, status: .success, resticExitCode: 0)
+        let indexBefore = try Data(contentsOf: paths.runsIndexFile)
+
+        var legacy = try store.metadata(runId: run.runId)
+        legacy.publicationDurabilityContractVersion = nil
+        try writeRawMetadata(legacy, paths: paths)
+
+        #expect(try store.unresolvedAuditFailures().first?.reason == .terminalMetadataMissingIndex)
+        #expect(try store.recoverInterrupted().isEmpty)
+        #expect(try store.metadata(runId: run.runId).publicationDurabilityContractVersion == 1)
+        #expect(try Data(contentsOf: paths.runsIndexFile) == indexBefore)
+        #expect(try store.unresolvedAuditFailures().isEmpty)
+    }
+
+    @Test("repairing an older projection cannot replace the latest run")
+    func repairedHistoryRemainsChronological() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+        let clock = Box(Date(timeIntervalSince1970: 2_000_000_000))
+        let store = RunStore(paths: paths, now: { clock.value })
+        let setId = UUID()
+        let destId = UUID()
+
+        let older = try store.begin(kind: .backup, setId: setId, destId: destId, trigger: .manual)
+        try store.finish(older, status: .success, resticExitCode: 0)
+        clock.value = clock.value.addingTimeInterval(60)
+        let newer = try store.begin(kind: .backup, setId: setId, destId: destId, trigger: .manual)
+        try store.finish(newer, status: .failed, resticExitCode: 1)
+
+        let physicalLines = try String(contentsOf: paths.runsIndexFile, encoding: .utf8)
+            .split(separator: "\n")
+        #expect(physicalLines.count == 2)
+        try Data((String(physicalLines[1]) + "\n").utf8).write(to: paths.runsIndexFile)
+
+        #expect(try store.recoverInterrupted().isEmpty)
+        let history = try store.recentRuns(setId: setId, limit: 10)
+        #expect(history.map(\.runId) == [newer.runId, older.runId])
+        #expect(try store.lastRun(setId: setId, kind: .backup)?.runId == newer.runId)
+        #expect(try store.lastRun(setId: setId, kind: .backup)?.status == .failed)
+    }
+
+    @Test("recovery publishes one corrective projection for stale non-destructive history")
+    func recoveryCorrectsNonDestructiveProjection() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+        let store = RunStore(paths: paths, now: { Date() })
+        let run = try store.begin(kind: .backup, setId: UUID(), destId: UUID(), trigger: .manual)
+        try store.finish(run, status: .success, resticExitCode: 0)
+
+        var rolledBack = try store.metadata(runId: run.runId)
+        rolledBack.status = .running
+        rolledBack.end = nil
+        rolledBack.resticExitCode = nil
+        rolledBack.pid = 999_999
+        try writeRawMetadata(rolledBack, paths: paths)
+
+        #expect(try store.recoverInterrupted().map(\.runId) == [run.runId])
+        #expect(try store.recoverInterrupted().isEmpty)
+        let history = try store.recentRuns(limit: 10)
+        #expect(history.count == 1)
+        #expect(history.first?.runId == run.runId)
+        #expect(history.first?.status == .failed)
+        #expect(history.first?.errorSummary == "interrupted")
+        #expect(try store.lastRun(setId: run.setId, kind: .backup)?.status == .failed)
+    }
+
+    @Test("recovery rejects a misplaced embedded run id before rewriting either record")
+    func recoveryRejectsRunDirectoryIDMismatch() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+        let store = RunStore(paths: paths, now: { Date() })
+        let first = try store.begin(kind: .backup, setId: UUID(), destId: UUID(), trigger: .manual)
+        try store.finish(first, status: .success, resticExitCode: 0)
+        let second = try store.begin(kind: .backup, setId: UUID(), destId: UUID(), trigger: .manual)
+        try store.finish(second, status: .success, resticExitCode: 0)
+
+        let secondURL = paths.runMetadataFile(runId: second.runId)
+        let secondBytes = try Data(contentsOf: secondURL)
+        try secondBytes.write(to: paths.runMetadataFile(runId: first.runId))
+
+        #expect(throws: RunStoreError.self) {
+            try store.recoverInterrupted()
+        }
+        #expect(try Data(contentsOf: secondURL) == secondBytes)
+        #expect(try store.metadata(runId: second.runId).runId == second.runId)
     }
 
     @Test("terminal destructive metadata missing from the index is an audit failure")
