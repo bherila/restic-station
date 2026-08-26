@@ -116,6 +116,10 @@ final class AppModel: ObservableObject {
     /// value copies, so one editor can detect a newer live mutation before
     /// attempting an out-of-order explicit Revert.
     var claimedSecretEditorRollbacks: [UUID: [DestinationSecretsRollback]] = [:]
+    /// Field ownership registered before an editor awaits the secret backend.
+    /// This closes the interval before a completed transaction can be parked
+    /// as a rollback token; explicit older Reverts must wait for these too.
+    var inFlightSecretEditorMutations: [UUID: [UUID: SecretEditorMutationIntent]] = [:]
     /// Global mutation order, independent of which SwiftUI editor happens to
     /// disappear first. Rollback and commit cutoffs use these sequence values
     /// to preserve cross-window credential causality.
@@ -784,6 +788,12 @@ final class AppModel: ObservableObject {
             + "so per-machine settings do not apply and saving is disabled — fix or delete that file "
             + "(it is re-created automatically), then reopen Restic Station."
     }
+}
+
+struct SecretEditorMutationIntent {
+    let destId: UUID
+    let changesPassword: Bool
+    let changesSecretEnv: Bool
 }
 
 // MARK: - ResticStatus

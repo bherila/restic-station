@@ -1158,6 +1158,80 @@ struct AppModelMachineOverrideTests {
         model.endSecretEditorSession(olderSession)
     }
 
+    @Test("an older explicit revert waits for a newer in-flight editor mutation")
+    func explicitRevertDefersToNewerInFlightEditor() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-secret-inflight-revert-order-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let destinationId = UUID()
+        let olderSession = UUID()
+        let newerSession = UUID()
+        let secrets = CheckpointingSecretStore(passwords: [destinationId: "original-password"])
+        let model = AppModel(paths: AppPaths(root: root), secretStoreFactory: { secrets })
+        model.beginSecretEditorSession(olderSession)
+        let older = try await model.storeDestinationSecrets(
+            destId: destinationId,
+            password: "older-editor-password",
+            secretEnv: nil,
+            ifConfigUnchangedFrom: model.configFingerprint,
+            editorSessionId: olderSession
+        )
+        #expect(model.claimEditorSecretRollback(older, sessionId: olderSession))
+
+        model.beginSecretEditorSession(newerSession)
+        await secrets.pauseNextPasswordWrite()
+        let newerWrite = Task { @MainActor in
+            try await model.storeDestinationSecrets(
+                destId: destinationId,
+                password: "newer-editor-password",
+                secretEnv: nil,
+                ifConfigUnchangedFrom: model.configFingerprint,
+                editorSessionId: newerSession
+            )
+        }
+        for _ in 0..<40 {
+            if await secrets.passwordWriteIsPaused() { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        #expect(await secrets.passwordWriteIsPaused())
+
+        var olderRemaining = [older]
+        do {
+            _ = try await model.restoreDestinationSecrets(
+                olderRemaining,
+                editorSessionId: olderSession,
+                onProgress: { olderRemaining = $0 }
+            )
+            Issue.record("expected the older revert to wait for the in-flight editor")
+        } catch AppModelError.newerSecretEditorMutation {
+            // Expected: the older token and installed value remain untouched.
+        }
+        #expect(olderRemaining.count == 1)
+        #expect(try await secrets.password(destId: destinationId) == "older-editor-password")
+
+        await secrets.resumePausedPasswordWrite()
+        let newer = try await newerWrite.value
+        #expect(model.claimEditorSecretRollback(newer, sessionId: newerSession))
+        var newerRemaining = [newer]
+        _ = try await model.restoreDestinationSecrets(
+            newerRemaining,
+            editorSessionId: newerSession,
+            onProgress: { newerRemaining = $0 }
+        )
+        model.endSecretEditorSession(newerSession)
+        _ = try await model.restoreDestinationSecrets(
+            olderRemaining,
+            editorSessionId: olderSession,
+            onProgress: { olderRemaining = $0 }
+        )
+
+        #expect(newerRemaining.isEmpty)
+        #expect(olderRemaining.isEmpty)
+        #expect(try await secrets.password(destId: destinationId) == "original-password")
+        model.endSecretEditorSession(olderSession)
+    }
+
     @Test("an older explicit revert drains a newer queued mutation")
     func explicitRevertDrainsNewerQueuedMutation() async throws {
         let root = FileManager.default.temporaryDirectory

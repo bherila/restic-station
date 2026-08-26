@@ -158,16 +158,29 @@ extension AppModel {
             await pendingSecretRollbackTask.value
         }
         let store = try makeSecretStore()
+        let update = DestinationSecretUpdate(
+            destId: destId,
+            password: password?.isEmpty == false ? password : nil,
+            secretEnv: secretEnv
+        )
+        let mutationIntentId: UUID?
+        if let editorSessionId, update.password != nil || update.secretEnv != nil {
+            mutationIntentId = registerSecretEditorMutation(
+                update,
+                sessionId: editorSessionId
+            )
+        } else {
+            mutationIntentId = nil
+        }
+        defer {
+            if let editorSessionId, let mutationIntentId {
+                unregisterSecretEditorMutation(mutationIntentId, sessionId: editorSessionId)
+            }
+        }
         var rollback: DestinationSecretsRollback?
         do {
             let snapshot = try await configStore.withUnchangedRevision(from: expectedFingerprint) {
-                let transaction = try await store.updateDestinationSecrets(
-                    DestinationSecretUpdate(
-                        destId: destId,
-                        password: password?.isEmpty == false ? password : nil,
-                        secretEnv: secretEnv
-                    )
-                )
+                let transaction = try await store.updateDestinationSecrets(update)
                 nextSecretRollbackSequence &+= 1
                 let snapshot = DestinationSecretsRollback(
                     transaction: transaction,
@@ -333,6 +346,18 @@ extension AppModel {
     ) -> Bool {
         let requested = rollbacks.compactMap(rollbackWithUncommittedFields)
         guard !requested.isEmpty else { return false }
+        let inFlight = inFlightSecretEditorMutations
+            .filter { $0.key != sessionId }
+            .flatMap { $0.value.values }
+        if requested.contains(where: { older in
+            inFlight.contains { mutation in
+                guard mutation.destId == older.destId else { return false }
+                return (mutation.changesPassword && older.transaction.password != nil)
+                    || (mutation.changesSecretEnv && older.transaction.secretEnv != nil)
+            }
+        }) {
+            return true
+        }
         let otherSessions = activeSecretEditorSessions.subtracting([sessionId])
         let live = otherSessions.flatMap { otherSession in
             (claimedSecretEditorRollbacks[otherSession] ?? [])
@@ -349,6 +374,30 @@ extension AppModel {
                     && newer.transaction.secretEnv != nil
                 return overlapsPassword || overlapsSecretEnv
             }
+        }
+    }
+
+    private func registerSecretEditorMutation(
+        _ update: DestinationSecretUpdate,
+        sessionId: UUID
+    ) -> UUID {
+        let mutationId = UUID()
+        inFlightSecretEditorMutations[sessionId, default: [:]][mutationId] =
+            SecretEditorMutationIntent(
+                destId: update.destId,
+                changesPassword: update.password != nil,
+                changesSecretEnv: update.secretEnv != nil
+            )
+        return mutationId
+    }
+
+    private func unregisterSecretEditorMutation(_ mutationId: UUID, sessionId: UUID) {
+        guard var mutations = inFlightSecretEditorMutations[sessionId] else { return }
+        mutations.removeValue(forKey: mutationId)
+        if mutations.isEmpty {
+            inFlightSecretEditorMutations.removeValue(forKey: sessionId)
+        } else {
+            inFlightSecretEditorMutations[sessionId] = mutations
         }
     }
 
