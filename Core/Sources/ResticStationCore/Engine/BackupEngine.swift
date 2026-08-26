@@ -1714,6 +1714,19 @@ public final class BackupEngine: Sendable {
             }), tokenDestination.snapshotIDs.sorted() == current.plan.matched.map(\.id).sorted() else {
                 throw PurgeApplyError.tokenDoesNotMatchCurrentPlan
             }
+            let snapshotIDs = current.plan.matched.map(\.id)
+            guard Self.hasUnambiguousRewriteTranscriptIDs(snapshotIDs) else {
+                // `restic rewrite` reports old snapshot ids through an
+                // eight-character human transcript. If two selected full ids
+                // share that prefix, a successful destructive command cannot
+                // be mapped back to its exact inputs afterward. Refuse while
+                // every destination is still in the read-only planning pass,
+                // before the capability is consumed or any rewrite launches.
+                throw PurgeApplyError.infrastructureFailure(
+                    reason: "purge snapshot ids have ambiguous restic transcript prefixes",
+                    operationMayHaveRun: false
+                )
+            }
             plans.append((destination, current.plan, current.repositoryId, destinationSecretEnv))
         }
 
@@ -2003,6 +2016,12 @@ public final class BackupEngine: Sendable {
             throw PurgeApplyError.unavailable
         }
         return config.id
+    }
+
+    private static func hasUnambiguousRewriteTranscriptIDs(_ snapshotIDs: [String]) -> Bool {
+        let transcriptIDs = snapshotIDs.map { String($0.prefix(8)) }
+        return transcriptIDs.allSatisfy { $0.count == 8 }
+            && Set(transcriptIDs).count == snapshotIDs.count
     }
 
     /// The only `rewrite --forget` call site.  It receives explicit ids from

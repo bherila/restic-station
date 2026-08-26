@@ -3570,6 +3570,73 @@ struct BackupEngineTests {
         #expect(env.resticArgvs.count == 4, "a replay must not spawn restic")
     }
 
+    @Test("runPurge refuses ambiguous rewrite transcript ids before destructive launch")
+    func purgeApplyRejectsAmbiguousRewriteTranscriptIDs() async throws {
+        let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]
+        let hostnames = [Self.setId: Set(["example-mac.local"])]
+        let env = Self.makeEnv(
+            script: [], retention: nil, purgeExcludes: ["build/**"], reachableSecondaries: [],
+            purgeSourcePaths: sourcePaths, purgeHostnames: hostnames
+        )
+        defer { env.cleanUp() }
+
+        let fixtureJSON = try FixtureLoader.string("snapshots.json")
+        let fixtureSnapshots = try parseSnapshots(Data(fixtureJSON.utf8))
+        let collidingID = String(fixtureSnapshots[0].id.prefix(8))
+            + String(fixtureSnapshots[1].id.dropFirst(8))
+        let snapshotsJSON = fixtureJSON.replacingOccurrences(
+            of: fixtureSnapshots[1].id,
+            with: collidingID
+        ).replacingOccurrences(
+            of: fixtureSnapshots[1].shortId,
+            with: fixtureSnapshots[0].shortId
+        )
+        let snapshots = try parseSnapshots(Data(snapshotsJSON.utf8))
+        #expect(snapshots[0].id != snapshots[1].id)
+        #expect(snapshots[0].shortId == snapshots[1].shortId)
+
+        let plan = PurgePlan(
+            destinationId: env.primary.id,
+            snapshots: snapshots,
+            sourcePaths: sourcePaths[Self.setId]!,
+            hostnames: hostnames[Self.setId]!,
+            patterns: env.set.purgeExcludes
+        )
+        let token = try #require(try env.engine.issuePurgeToken(
+            set: env.set,
+            destinations: [env.primary],
+            plans: [plan],
+            executable: try env.requireResticExecutable()
+        ))
+        env.fake.script = Self.repositoryConfigCall(
+            env.primary.repoURL,
+            dest: env.primary.id
+        ) + Self.resticCall(
+            ["-r", env.primary.repoURL, "snapshots", "--json"],
+            dest: env.primary.id,
+            stdoutLines: [snapshotsJSON]
+        )
+
+        do {
+            _ = try await env.engine.runPurge(
+                set: env.set,
+                destinations: [env.primary],
+                token: token.value
+            )
+            Issue.record("ambiguous transcript ids must refuse purge before launch")
+        } catch let error as PurgeApplyError {
+            guard case .infrastructureFailure(let reason, let operationMayHaveRun) = error else {
+                Issue.record("expected infrastructure failure, got \(error)")
+                return
+            }
+            #expect(reason.contains("ambiguous restic transcript prefixes"))
+            #expect(!operationMayHaveRun)
+        }
+        #expect(!env.resticArgvs.contains { $0.contains("rewrite") })
+        #expect(env.entries(kind: .purge).isEmpty)
+        #expect(throws: Never.self) { _ = try env.engine.purgeTokenDestinationIDs(token.value) }
+    }
+
     @Test("runPurge: an initial run-history failure is outcome-neutral infrastructure failure")
     func purgeRunCreationFailureIsOutcomeNeutral() async throws {
         let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]
