@@ -8,9 +8,9 @@ import ResticStationCore
 ///
 /// All the interesting logic is `ResticStationCore.CLIInstaller`, already
 /// covered by `CLIInstallerTests` in Core; this file only wires it to the
-/// running app's own embedded-helper path. It stays this thin on purpose —
-/// the App target has no test target of its own (issue #40), so any real
-/// decision belongs in Core, not here.
+/// running app's own embedded-helper path. It stays this thin on purpose:
+/// Core owns and tests the filesystem decisions, while the App target's
+/// projection tests pin the wiring that remains here.
 @MainActor
 extension AppModel {
 
