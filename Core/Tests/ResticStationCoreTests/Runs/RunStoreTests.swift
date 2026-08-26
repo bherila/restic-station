@@ -217,6 +217,42 @@ private func setRunStoreTestErrno(_ value: Int32) {
         #expect(legacy.purgeRepositoryId == nil)
     }
 
+    @Test("purge recovery evidence is bound into the independently verified index projection")
+    func purgeRecoveryEvidenceTamperingBreaksAuditProjection() throws {
+        for mutatedField in ["purgePatterns", "purgeRepositoryId"] {
+            let paths = makePaths()
+            defer { cleanup(paths) }
+            let store = RunStore(paths: paths, now: { Date() })
+            var run = try store.begin(
+                kind: .purge,
+                setId: UUID(),
+                destId: UUID(),
+                trigger: .manual
+            )
+            run.argvRedacted = ["restic", "rewrite", "--forget", "snapshot"]
+            run.purgePatterns = ["build/**", ".cache/**"]
+            run.purgeRepositoryId = "repository-a"
+            try store.markDestructiveLaunchAuthorized(run)
+            try store.finish(run, status: .success, resticExitCode: 0)
+
+            let projection = try #require(store.recentRuns(limit: 1).first)
+            #expect(projection.purgeEvidenceDigest != nil)
+            #expect(try store.unresolvedAuditFailures().isEmpty)
+
+            var tampered = try store.metadata(runId: run.runId)
+            if mutatedField == "purgePatterns" {
+                tampered.purgePatterns = ["build/**", "changed/**"]
+            } else {
+                tampered.purgeRepositoryId = "repository-b"
+            }
+            try writeRawMetadata(tampered, paths: paths)
+
+            let failure = try #require(store.unresolvedAuditFailures().first)
+            #expect(failure.runId == run.runId)
+            #expect(failure.reason == .terminalMetadataIndexMismatch)
+        }
+    }
+
     @Test func groupIdPropagatesAcrossRunsInAGroup() throws {
         let paths = makePaths()
         defer { cleanup(paths) }

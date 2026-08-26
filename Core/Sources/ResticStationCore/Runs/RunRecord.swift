@@ -122,6 +122,11 @@ public struct RunIndexEntry: Codable, Equatable, Sendable {
     public var filesChanged: Int?
     public var dataAdded: Int?
     public var errorSummary: String?
+    /// SHA-256 binding of a purge's launch-authorized repository id and
+    /// exact pattern sequence. Audit verification recomputes this from the
+    /// canonical metadata so neither recovery field can change independently
+    /// while the index projection still appears valid.
+    public var purgeEvidenceDigest: String?
 
     public init(
         runId: String,
@@ -137,7 +142,8 @@ public struct RunIndexEntry: Codable, Equatable, Sendable {
         filesNew: Int?,
         filesChanged: Int?,
         dataAdded: Int?,
-        errorSummary: String?
+        errorSummary: String?,
+        purgeEvidenceDigest: String? = nil
     ) {
         self.runId = runId
         self.kind = kind
@@ -153,11 +159,13 @@ public struct RunIndexEntry: Codable, Equatable, Sendable {
         self.filesChanged = filesChanged
         self.dataAdded = dataAdded
         self.errorSummary = errorSummary
+        self.purgeEvidenceDigest = purgeEvidenceDigest
     }
 
     private enum CodingKeys: String, CodingKey {
         case runId, kind, setId, destId, groupId, status, start, end, trigger
         case snapshotId, filesNew, filesChanged, dataAdded, errorSummary
+        case purgeEvidenceDigest
     }
 
     // Explicit `null` for nil optionals rather than omitting the key — see
@@ -178,6 +186,7 @@ public struct RunIndexEntry: Codable, Equatable, Sendable {
         try container.encode(filesChanged, forKey: .filesChanged)
         try container.encode(dataAdded, forKey: .dataAdded)
         try container.encode(errorSummary, forKey: .errorSummary)
+        try container.encode(purgeEvidenceDigest, forKey: .purgeEvidenceDigest)
     }
 }
 
@@ -364,7 +373,25 @@ public struct RunMetadata: Codable, Equatable, Sendable {
             filesNew: filesNew,
             filesChanged: filesChanged,
             dataAdded: dataAdded,
-            errorSummary: errorSummary
+            errorSummary: errorSummary,
+            purgeEvidenceDigest: purgeEvidenceDigest
         )
+    }
+
+    /// Length framing makes the binding unambiguous without depending on
+    /// JSON encoder details. The domain prefix permits a future format to
+    /// coexist without reinterpreting an existing digest.
+    private var purgeEvidenceDigest: String? {
+        guard kind == .purge,
+              let purgePatterns,
+              let purgeRepositoryId else { return nil }
+
+        var bytes = Data("restic-station-purge-evidence-v1:".utf8)
+        for component in [purgeRepositoryId] + purgePatterns {
+            let componentBytes = Data(component.utf8)
+            bytes.append(Data("\(componentBytes.count):".utf8))
+            bytes.append(componentBytes)
+        }
+        return SHA256Digest.hex(bytes)
     }
 }

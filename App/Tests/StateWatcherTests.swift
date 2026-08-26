@@ -146,6 +146,46 @@ struct StateWatcherTests {
         #expect(watcher.scheduleStateFailure == nil)
     }
 
+    @Test("in-place schedule-state corruption reaches the app without an unrelated directory event")
+    func inPlaceScheduleStateCorruptionTriggersReload() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-schedule-in-place-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = AppPaths(root: root)
+        try paths.ensureDirectories()
+        try Data("{\"sets\":{}}".utf8).write(to: paths.scheduleStateFile)
+
+        let watcher = StateWatcher(
+            paths: paths,
+            runStore: RunStore(paths: paths),
+            stateStore: StateStore(paths: paths)
+        )
+        watcher.start()
+        defer { watcher.stop() }
+        #expect(watcher.scheduleState == ScheduleState())
+        #expect(watcher.scheduleStateFailure == nil)
+        // Let start-up directory creation and health-probe events drain;
+        // otherwise one of those unrelated events could mask a missing
+        // direct file watch by reloading after the corruption below.
+        try await Task.sleep(nanoseconds: 750_000_000)
+        #expect(watcher.scheduleStateFailure == nil)
+
+        // FileHandle truncation/writing keeps the same directory entry and
+        // inode. Only the direct schedule-state vnode source can observe it;
+        // the parent state/ source receives no child-entry event.
+        let handle = try FileHandle(forWritingTo: paths.scheduleStateFile)
+        try handle.truncate(atOffset: 0)
+        try handle.write(contentsOf: Data("corrupt in place {{{".utf8))
+        try handle.close()
+
+        for _ in 0..<40 {
+            if watcher.scheduleStateFailure != nil { break }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        #expect(watcher.scheduleState == nil)
+        #expect(watcher.scheduleStateFailure?.reason == .malformedDocument)
+    }
+
     @Test("explicit reload retries a previously suppressed recovery copy")
     func explicitReloadRetriesScheduleStateRecoveryCopy() throws {
         let root = FileManager.default.temporaryDirectory

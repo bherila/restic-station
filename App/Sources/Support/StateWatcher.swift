@@ -110,6 +110,11 @@ public final class StateWatcher: ObservableObject {
     /// not modify the root directory entry. The root source discovers first
     /// creation and atomic replacement, then this source is reconciled.
     private var configFileSource: DispatchSourceFileSystemObject?
+    /// `state/` observes child entry creation/replacement but not writes to
+    /// an existing child's inode. Watch the safety-authoritative schedule
+    /// document directly so in-place truncation or corruption reaches the
+    /// same fail-closed reload path without waiting for an unrelated event.
+    private var scheduleStateFileSource: DispatchSourceFileSystemObject?
 
     /// Directories whose watch source is currently unavailable because the
     /// directory didn't exist at the last open attempt (typically: deleted
@@ -215,6 +220,7 @@ public final class StateWatcher: ObservableObject {
         locksDirSource?.cancel()
         lockFileSources.values.forEach { $0.cancel() }
         configFileSource?.cancel()
+        scheduleStateFileSource?.cancel()
         rootDirSource?.cancel()
         rootParentDirSource?.cancel()
         rootGrandparentDirSource?.cancel()
@@ -292,6 +298,8 @@ public final class StateWatcher: ObservableObject {
         lockFileSources.removeAll()
         configFileSource?.cancel()
         configFileSource = nil
+        scheduleStateFileSource?.cancel()
+        scheduleStateFileSource = nil
         rootDirSource?.cancel()
         rootDirSource = nil
         rootParentDirSource?.cancel()
@@ -337,6 +345,7 @@ public final class StateWatcher: ObservableObject {
         )
         if isRunning {
             refreshConfigFileSource()
+            refreshScheduleStateFileSource()
             refreshLockFileSources()
         }
         switch stateStore.readScheduleStateResult(
@@ -626,6 +635,8 @@ public final class StateWatcher: ObservableObject {
         lockFileSources.removeAll()
         configFileSource?.cancel()
         configFileSource = nil
+        scheduleStateFileSource?.cancel()
+        scheduleStateFileSource = nil
     }
 
     /// A watched subdirectory (`state/`, `runs/`, or `locks/`) was deleted or
@@ -650,6 +661,8 @@ public final class StateWatcher: ObservableObject {
         case .state:
             stateDirSource?.cancel()
             stateDirSource = nil
+            scheduleStateFileSource?.cancel()
+            scheduleStateFileSource = nil
         case .runs:
             runsDirSource?.cancel()
             runsDirSource = nil
@@ -763,6 +776,37 @@ public final class StateWatcher: ObservableObject {
         }
         source.setCancelHandler { close(fd) }
         configFileSource = source
+        source.resume()
+    }
+
+    private func refreshScheduleStateFileSource() {
+        guard rootDirSource != nil, stateDirSource != nil else {
+            scheduleStateFileSource?.cancel()
+            scheduleStateFileSource = nil
+            return
+        }
+        guard scheduleStateFileSource == nil else { return }
+
+        let fd = open(paths.scheduleStateFile.path, O_EVTONLY | O_NOFOLLOW | O_CLOEXEC)
+        guard fd >= 0 else { return }
+        let source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fd,
+            eventMask: [.write, .attrib, .delete, .rename],
+            queue: watchQueue
+        )
+        source.setEventHandler { [weak self] in
+            guard let self else { return }
+            let invalidated = source.data.contains(.delete) || source.data.contains(.rename)
+            MainActor.assumeIsolated {
+                if invalidated {
+                    self.scheduleStateFileSource?.cancel()
+                    self.scheduleStateFileSource = nil
+                }
+                self.scheduleDebouncedReload()
+            }
+        }
+        source.setCancelHandler { close(fd) }
+        scheduleStateFileSource = source
         source.resume()
     }
 
