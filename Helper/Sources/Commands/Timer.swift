@@ -250,7 +250,15 @@ extension TimerCommand {
                 lines = ["could not load \(paths.configFile.path) — every tick will fail on it"]
             }
             if let scheduleStateFailure {
-                lines.append(scheduleStateFailure.recoveryMessage)
+                if problems.contains(.configUnreadable) {
+                    lines.append(scheduleStateFailure.recoveryMessage)
+                } else {
+                    // A nil schedule passed to the ordinary renderer means
+                    // "never run". Here it means the opposite: an existing
+                    // canonical file was rejected, so no derived activity
+                    // line is trustworthy enough to keep.
+                    lines = [scheduleStateFailure.recoveryMessage]
+                }
             }
             return TimerActivity(lines: lines, problems: problems)
         }
