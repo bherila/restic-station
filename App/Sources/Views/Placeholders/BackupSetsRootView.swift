@@ -25,7 +25,13 @@ struct BackupSetsRootView: View {
             SetListView(
                 selection: $selection,
                 onCreate: createSet,
-                onEdit: { setId in editorTarget = SetEditorTarget(id: setId, isNew: false) }
+                onEdit: { setId in
+                    editorTarget = SetEditorTarget(
+                        id: setId,
+                        isNew: false,
+                        configFingerprint: model.configFingerprint
+                    )
+                }
             )
             .navigationDestination(item: $editorTarget) { target in
                 editor(for: target)
@@ -40,9 +46,17 @@ struct BackupSetsRootView: View {
     @ViewBuilder
     private func editor(for target: SetEditorTarget) -> some View {
         if target.isNew, let pendingNewSet, pendingNewSet.id == target.id {
-            SetEditorView(initialSet: pendingNewSet, isNew: true)
+            SetEditorView(
+                initialSet: pendingNewSet,
+                isNew: true,
+                configFingerprint: target.configFingerprint
+            )
         } else if let set = model.config.sets.first(where: { $0.id == target.id }) {
-            SetEditorView(initialSet: set, isNew: false)
+            SetEditorView(
+                initialSet: set,
+                isNew: false,
+                configFingerprint: target.configFingerprint
+            )
         } else {
             ContentUnavailableView(
                 "This backup set was deleted",
@@ -55,7 +69,11 @@ struct BackupSetsRootView: View {
     private func createSet() {
         let draft = model.newSetTemplate()
         pendingNewSet = draft
-        editorTarget = SetEditorTarget(id: draft.id, isNew: true)
+        editorTarget = SetEditorTarget(
+            id: draft.id,
+            isNew: true,
+            configFingerprint: model.configFingerprint
+        )
     }
 }
 
@@ -68,4 +86,5 @@ struct BackupSetsRootView: View {
 struct SetEditorTarget: Identifiable, Hashable, Sendable {
     let id: UUID
     let isNew: Bool
+    let configFingerprint: String
 }

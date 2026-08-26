@@ -20,10 +20,14 @@ struct SetEditorView: View {
     @State private var fieldErrors: [SetEditorField: String] = [:]
     @State private var didSave = false
     @State private var showingMachineOverrides = false
+    /// Exact config revision this draft was derived from. It is advanced by
+    /// this editor's own successful writes, never by a background reload.
+    @State private var configFingerprint: String
 
-    init(initialSet: BackupSet, isNew: Bool) {
+    init(initialSet: BackupSet, isNew: Bool, configFingerprint: String) {
         _draft = State(initialValue: initialSet)
         _isNew = State(initialValue: isNew)
+        _configFingerprint = State(initialValue: configFingerprint)
     }
 
     var body: some View {
@@ -60,6 +64,7 @@ struct SetEditorView: View {
 
             DestinationTable(
                 set: $draft,
+                configFingerprint: $configFingerprint,
                 errorMessage: fieldErrors[.destinations]
             )
 
@@ -191,6 +196,7 @@ struct SetEditorView: View {
     private func revert() {
         guard let persisted else { return }
         draft = persisted
+        configFingerprint = model.configFingerprint
         fieldErrors = [:]
     }
 
@@ -209,7 +215,10 @@ struct SetEditorView: View {
         }
 
         do {
-            try model.saveSet(draft)
+            configFingerprint = try model.saveSet(
+                draft,
+                ifUnchangedFrom: configFingerprint
+            )
             isNew = false
             didSave = true
         } catch {

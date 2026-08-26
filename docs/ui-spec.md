@@ -9,6 +9,7 @@ This spec fixes **information architecture, controls, states, and copy**. Visual
 - `NavigationSplitView`. Sidebar sections: **Backup Sets**, **Runs**, **Restore**, **Maintenance**, **Settings** (Settings also reachable via the standard ⌘, Settings scene).
 - Window title "Restic Station". Min size ~ 900×560.
 - `AppModel` (ObservableObject, injected via environment) owns: `AppConfig` (via ConfigStore), live state (via StateWatcher), and helper invocation. All mutations go config-edit → save → (if schedule-relevant) kickstart tick.
+- If `config.json` changes while the app is open, retain the current in-memory config and show a global "Settings changed on disk" banner with **Reload Settings**. Saving an editor whose edit-start fingerprint no longer matches is refused; explicit reload adopts the latest valid file but does not bless already-open stale drafts.
 
 ## Menu bar (`MenuBarExtra`, style `.menu`, `isInserted:` bound to `showMenuBarIcon`)
 

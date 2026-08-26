@@ -264,7 +264,7 @@ struct StatusReportTests {
         )
 
         let text = report.humanLines().joined(separator: "\n")
-        #expect(text.contains("SECRET CHANGES CANNOT RUN ON THIS MACHINE"))
+        #expect(text.contains("CONFIGURATION CHANGES CANNOT RUN ON THIS MACHINE"))
         #expect(!text.contains("NOTHING CAN RUN ON THIS MACHINE"))
         #expect(!text.contains("ONE OR MORE BACKUP SETS CANNOT RUN"))
 

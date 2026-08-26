@@ -345,6 +345,7 @@ The operation-exclusion locks use `flock(2)` `LOCK_EX | LOCK_NB` on files under 
 
 | Lock | Held by | Purpose |
 |---|---|---|
+| `config.lock` | a `config.json` write | serialize Restic Station writers; app saves additionally compare the edit-start fingerprint immediately before atomic replacement |
 | `tick.lock` | the whole tick | prevent overlapping scheduled evaluations when a backup outlives StartInterval |
 | `destructive-audit.lock` | destructive audit verification through terminal commit | serialize the fail-closed audit gate across every set; kernel release distinguishes a live helper from a recycled PID |
 | `run-publication.lock` | run-directory publication and destructive-audit verification | prevent a verifier from observing a run directory before its initial metadata; separately serialize verifiers so their contention is never mistaken for a live destructive operation |

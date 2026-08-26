@@ -409,4 +409,46 @@ struct AppModelMachineOverrideTests {
         #expect(MaintenanceLookup.set(model, id: setId) != nil)      // still addressable
         #expect(MaintenanceModel.scheduledSet(model, id: setId) == nil)  // but never scheduled
     }
+
+    @Test("an external config replacement is surfaced, preserved, and explicitly reloaded")
+    func externalConfigReplacementCannotBeOverwritten() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-config-cas-app-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let paths = AppPaths(root: root)
+        let store = ConfigStore(paths: paths)
+        let original = AppConfig(showMenuBarIcon: true)
+        try store.save(original)
+
+        let model = AppModel(paths: paths)
+        model.stateWatcher.start()
+        defer { model.stateWatcher.stop() }
+        let editStartFingerprint = model.configFingerprint
+
+        let fleetReplacement = AppConfig(showMenuBarIcon: false)
+        try store.save(fleetReplacement)
+        for _ in 0..<40 {
+            if model.configChangedOnDisk { break }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+
+        #expect(model.configChangedOnDisk)
+        #expect(model.config == original)
+        #expect(throws: ConfigStoreError.changedOnDisk) {
+            try model.saveConfig(original, ifUnchangedFrom: editStartFingerprint)
+        }
+        #expect(try store.load() == fleetReplacement)
+
+        model.reloadConfigFromDisk()
+        #expect(model.config == fleetReplacement)
+        #expect(!model.configChangedOnDisk)
+
+        // Reloading the model must not silently bless a draft that was
+        // opened against the old bytes.
+        #expect(throws: ConfigStoreError.changedOnDisk) {
+            try model.saveConfig(original, ifUnchangedFrom: editStartFingerprint)
+        }
+        #expect(try store.load() == fleetReplacement)
+    }
 }

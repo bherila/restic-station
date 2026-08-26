@@ -24,6 +24,7 @@ struct DestinationEditorView: View {
     @Environment(\.dismiss) private var dismiss
 
     @Binding var set: BackupSet
+    @Binding var configFingerprint: String
     private let isNew: Bool
 
     // Config-backed fields.
@@ -54,8 +55,14 @@ struct DestinationEditorView: View {
     @State private var message: EditorMessage?
     @State private var showingMachineOverrides = false
 
-    init(set: Binding<BackupSet>, initialDestination destination: Destination, isNew: Bool) {
+    init(
+        set: Binding<BackupSet>,
+        configFingerprint: Binding<String>,
+        initialDestination destination: Destination,
+        isNew: Bool
+    ) {
         _set = set
+        _configFingerprint = configFingerprint
         self.isNew = isNew
         _draft = State(initialValue: destination)
 
@@ -658,7 +665,10 @@ struct DestinationEditorView: View {
     /// reported here with that context.
     private func persistSet(_ updated: BackupSet) -> Bool {
         do {
-            try model.saveSet(updated)
+            configFingerprint = try model.saveSet(
+                updated,
+                ifUnchangedFrom: configFingerprint
+            )
             return true
         } catch {
             let mapped = SetsCopy.fieldMessage(for: error)

@@ -643,4 +643,34 @@ struct StateWatcherTests {
         #expect(!recorder.observations.isEmpty)
         #expect(recorder.observations.allSatisfy { !$0 })
     }
+
+    @Test("atomic config replacement publishes the new file fingerprint")
+    func configReplacementPublishesFingerprint() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-config-watcher-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let paths = AppPaths(root: root)
+        let store = ConfigStore(paths: paths)
+        try store.save(AppConfig(showMenuBarIcon: true))
+
+        let watcher = StateWatcher(
+            paths: paths,
+            runStore: RunStore(paths: paths),
+            stateStore: StateStore(paths: paths)
+        )
+        watcher.start()
+        defer { watcher.stop() }
+        let original = watcher.configFileFingerprint
+
+        try store.save(AppConfig(showMenuBarIcon: false))
+        let replacement = store.fileFingerprint()
+        #expect(replacement != original)
+
+        for _ in 0..<40 {
+            if watcher.configFileFingerprint == replacement { break }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        #expect(watcher.configFileFingerprint == replacement)
+    }
 }

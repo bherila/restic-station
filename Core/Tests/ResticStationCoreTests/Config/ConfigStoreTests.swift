@@ -49,6 +49,65 @@ import Testing
         #expect(loaded == config)
     }
 
+    @Test("compare-and-swap save installs the revision it began from")
+    func compareAndSwapSaveSucceedsForUnchangedRevision() throws {
+        let (store, root) = makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        try store.save(sampleConfig())
+        let snapshot = try store.snapshot()
+        var edited = snapshot.config
+        edited.showMenuBarIcon.toggle()
+
+        let installedFingerprint = try store.save(
+            edited,
+            ifUnchangedFrom: snapshot.fingerprint
+        )
+
+        #expect(try store.load() == edited)
+        #expect(installedFingerprint == store.fileFingerprint())
+    }
+
+    @Test("compare-and-swap save preserves a replacement made after editing began")
+    func compareAndSwapSaveRefusesChangedRevision() throws {
+        let (store, root) = makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        try store.save(sampleConfig())
+        let editingSnapshot = try store.snapshot()
+        var staleEdit = editingSnapshot.config
+        staleEdit.showMenuBarIcon.toggle()
+
+        var externalReplacement = editingSnapshot.config
+        externalReplacement.sets[0].name = "Fleet replacement"
+        try store.save(externalReplacement)
+
+        #expect(throws: ConfigStoreError.changedOnDisk) {
+            try store.save(staleEdit, ifUnchangedFrom: editingSnapshot.fingerprint)
+        }
+        #expect(try store.load() == externalReplacement)
+        #expect(!FileManager.default.fileExists(atPath: store.tempConfigFile.path))
+    }
+
+    @Test("config writers refuse contention without touching the installed file")
+    func configWriteLockSerializesWriters() throws {
+        let (store, root) = makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let installed = sampleConfig()
+        try store.save(installed)
+        let lock = FileLock(path: store.paths.configLockFile, trustedRoot: root)
+        #expect(lock.acquire() == .acquired)
+        defer { lock.release() }
+
+        var competing = installed
+        competing.showMenuBarIcon.toggle()
+        #expect(throws: ConfigStoreError.writeLockBusy(path: store.paths.configLockFile.path)) {
+            try store.save(competing)
+        }
+        #expect(try store.load() == installed)
+    }
+
     @Test func saveCreatesDirectoriesIfMissing() throws {
         let (store, root) = makeStore()
         defer { try? FileManager.default.removeItem(at: root) }

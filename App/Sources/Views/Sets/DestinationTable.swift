@@ -20,6 +20,7 @@ struct DestinationTable: View {
     @EnvironmentObject private var model: AppModel
 
     @Binding var set: BackupSet
+    @Binding var configFingerprint: String
     let errorMessage: String?
 
     @State private var sheet: DestinationSheetTarget?
@@ -69,6 +70,7 @@ struct DestinationTable: View {
         .sheet(item: $sheet) { target in
             DestinationEditorView(
                 set: $set,
+                configFingerprint: $configFingerprint,
                 initialDestination: destination(for: target),
                 isNew: target.isNew
             )
@@ -250,7 +252,10 @@ struct DestinationTable: View {
         let staysValid = updated.destinations.contains(where: \.isPrimary)
         if isPersisted && staysValid {
             do {
-                try model.saveSet(updated)
+                configFingerprint = try model.saveSet(
+                    updated,
+                    ifUnchangedFrom: configFingerprint
+                )
             } catch {
                 removalError = SetsCopy.fieldMessage(for: error).message
                 return

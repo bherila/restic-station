@@ -79,6 +79,13 @@ public struct AppPaths: Equatable, Sendable {
         root.appendingPathComponent("config.json", isDirectory: false)
     }
 
+    /// Serializes Restic Station writers of ``configFile``. Readers do not
+    /// take this lock; app saves additionally compare the exact fingerprint
+    /// they began editing against while the lock is held.
+    public var configLockFile: URL {
+        locksDir.appendingPathComponent("config.lock", isDirectory: false)
+    }
+
     /// `config.v<N>.backup.json` — the untouched copy of a `config.json` at
     /// schema version `N` that `ConfigStore` writes once, immediately before
     /// the first write at a newer version (`docs/data-model.md` §Versioning &

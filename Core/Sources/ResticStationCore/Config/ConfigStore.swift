@@ -54,7 +54,7 @@ public struct ConfigStore: Sendable {
     /// retaken over the post-migration bytes. Migration is one-way and
     /// terminates, so the retry cannot loop.
     public func snapshot() throws -> ConfigSnapshot {
-        guard let bytes = try? Data(contentsOf: paths.configFile) else {
+        guard let bytes = try readConfigBytes() else {
             return ConfigSnapshot(bytes: Data(), fingerprint: "absent", config: AppConfig())
         }
         let decoded = try Self.makeDecoder().decode(AppConfig.self, from: bytes)
@@ -70,7 +70,7 @@ public struct ConfigStore: Sendable {
     }
 
     private func snapshotAfterMigration() throws -> ConfigSnapshot {
-        guard let bytes = try? Data(contentsOf: paths.configFile) else {
+        guard let bytes = try readConfigBytes() else {
             return ConfigSnapshot(bytes: Data(), fingerprint: "absent", config: AppConfig())
         }
         let decoded = try Self.makeDecoder().decode(AppConfig.self, from: bytes)
@@ -100,7 +100,14 @@ public struct ConfigStore: Sendable {
     /// A missing file is a valid, empty configuration (see ``load()``), so
     /// it fingerprints as a fixed sentinel rather than failing.
     public func fileFingerprint() -> String {
-        guard let data = try? Data(contentsOf: paths.configFile) else { return "absent" }
+        (try? currentFileFingerprint()) ?? "unreadable"
+    }
+
+    /// The exact on-disk revision used by compare-and-swap saves. Unlike the
+    /// convenience ``fileFingerprint()``, an unreadable existing file throws
+    /// rather than being collapsed into the same sentinel as absence.
+    public func currentFileFingerprint() throws -> String {
+        guard let data = try readConfigBytes() else { return "absent" }
         return SHA256Digest.hex(data)
     }
 
@@ -293,8 +300,61 @@ public struct ConfigStore: Sendable {
         try paths.ensureDirectories()
 
         let data = try Self.makeEncoder().encode(config)
+        try withConfigWriteLock {
+            try persist(data)
+        }
+    }
+
+    /// Saves only when `config.json` is still the exact byte revision the
+    /// caller began editing. The comparison and every Restic Station write
+    /// are serialized by `locks/config.lock`; a fleet-sync tool need not
+    /// understand that lock because its replacement changes the fingerprint
+    /// checked immediately before the atomic rename.
+    ///
+    /// - Returns: the fingerprint of the bytes installed by this save.
+    @discardableResult
+    public func save(_ config: AppConfig, ifUnchangedFrom expectedFingerprint: String) throws -> String {
+        try config.validate()
+        try paths.ensureDirectories()
+
+        let data = try Self.makeEncoder().encode(config)
+        return try withConfigWriteLock {
+            // Write the complete candidate first. This leaves the comparison
+            // as close as possible to rename and never exposes partial JSON.
+            try data.write(to: tempConfigFile)
+            let actualFingerprint = try currentFileFingerprint()
+            guard actualFingerprint == expectedFingerprint else {
+                try? FileManager.default.removeItem(at: tempConfigFile)
+                throw ConfigStoreError.changedOnDisk
+            }
+            try AtomicFile.rename(from: tempConfigFile, to: paths.configFile)
+            return SHA256Digest.hex(data)
+        }
+    }
+
+    private func persist(_ data: Data) throws {
         try data.write(to: tempConfigFile)
         try AtomicFile.rename(from: tempConfigFile, to: paths.configFile)
+    }
+
+    private func readConfigBytes() throws -> Data? {
+        guard FileManager.default.fileExists(atPath: paths.configFile.path) else {
+            return nil
+        }
+        return try Data(contentsOf: paths.configFile)
+    }
+
+    private func withConfigWriteLock<T>(_ body: () throws -> T) throws -> T {
+        let lock = FileLock(path: paths.configLockFile, trustedRoot: paths.root)
+        switch lock.acquire() {
+        case .acquired:
+            defer { lock.release() }
+            return try body()
+        case .busy:
+            throw ConfigStoreError.writeLockBusy(path: paths.configLockFile.path)
+        case .failed(let failure):
+            throw ConfigStoreError.writeLockUnusable(failure)
+        }
     }
 
     // MARK: - Encoding
@@ -377,11 +437,20 @@ enum AtomicFile {
 /// Low-level failures from `ConfigStore.save(_:)`'s atomic rename step.
 public enum ConfigStoreError: Error, Equatable, Sendable, CustomStringConvertible {
     case renameFailed(errno: Int32, from: String, to: String)
+    case changedOnDisk
+    case writeLockBusy(path: String)
+    case writeLockUnusable(LockFailure)
 
     public var description: String {
         switch self {
         case .renameFailed(let errno, let from, let to):
             return "rename(\(from), \(to)) failed: errno \(errno)"
+        case .changedOnDisk:
+            return "config.json changed on disk; reload the latest settings before saving"
+        case .writeLockBusy(let path):
+            return "another process is changing config.json (lock busy: \(path)); reload and try again"
+        case .writeLockUnusable(let failure):
+            return "cannot safely lock config.json for writing: \(failure)"
         }
     }
 }

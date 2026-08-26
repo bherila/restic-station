@@ -37,6 +37,15 @@ final class AppModel: ObservableObject {
     /// Read-only to views; edits go through `saveConfig(_:)` /
     /// `updateConfig(_:)`.
     @Published private(set) var config: AppConfig
+    /// Byte revision of `config.json` from which ``config`` was decoded.
+    /// Every editor carries this token back to its save; it advances only
+    /// after a successful save or an explicit reload.
+    @Published private(set) var configFingerprint: String
+    /// A watcher observed a different on-disk revision. The in-memory value
+    /// is deliberately retained until the operator reloads, so an open draft
+    /// cannot silently change underneath them and its old token still fails
+    /// compare-and-swap.
+    @Published private(set) var configChangedOnDisk = false
     /// **What this machine backs up** (`ResolvedConfig.Scope.scheduling`):
     /// overrides applied, sets and destinations this machine does not run
     /// removed, `resticPath` filled in from `machine.json`.
@@ -154,12 +163,16 @@ final class AppModel: ObservableObject {
         var loadFailures: [String] = []
 
         let loadedConfig: AppConfig
+        let loadedConfigFingerprint: String
         do {
-            loadedConfig = try configStore.load()
+            let snapshot = try configStore.snapshot()
+            loadedConfig = snapshot.config
+            loadedConfigFingerprint = snapshot.fingerprint
         } catch {
             // A default, empty config keeps the UI alive and explainable;
             // `configLoadError` blocks writes so nothing is clobbered.
             loadedConfig = AppConfig()
+            loadedConfigFingerprint = configStore.fileFingerprint()
             loadFailures.append(Self.describe(configLoadFailure: error, path: paths.configFile.path))
         }
 
@@ -186,6 +199,7 @@ final class AppModel: ObservableObject {
 
         self.machine = loadedMachine
         self.config = loadedConfig
+        self.configFingerprint = loadedConfigFingerprint
         self.resolvedConfig = loadedConfig.resolved(for: loadedMachine).config
         self.addressableConfig = loadedConfig.addressable(for: loadedMachine)
         stateWatcher.updateConfiguredSetIds(Set(resolvedConfig.sets.map(\.id)))
@@ -245,14 +259,26 @@ final class AppModel: ObservableObject {
     /// Validates, persists, and — when the change can affect what the next
     /// tick does — asks launchd to run one now instead of within
     /// `StartInterval`.
-    func saveConfig(_ newConfig: AppConfig) throws {
+    @discardableResult
+    func saveConfig(
+        _ newConfig: AppConfig,
+        ifUnchangedFrom expectedFingerprint: String? = nil
+    ) throws -> String {
         if let configLoadError {
             throw AppModelError.configUnreadable(configLoadError)
         }
+        let editFingerprint = expectedFingerprint ?? configFingerprint
+        let installedFingerprint: String
         do {
             try newConfig.validate()
-            try configStore.save(newConfig)
+            installedFingerprint = try configStore.save(
+                newConfig,
+                ifUnchangedFrom: editFingerprint
+            )
         } catch {
+            if case ConfigStoreError.changedOnDisk = error {
+                configChangedOnDisk = true
+            }
             lastConfigError = "\(error)"
             throw error
         }
@@ -260,6 +286,8 @@ final class AppModel: ObservableObject {
         let previous = config
         let previousResticPath = resticPath
         config = newConfig
+        configFingerprint = installedFingerprint
+        configChangedOnDisk = false
         resolvedConfig = newConfig.resolved(for: machine).config
         addressableConfig = newConfig.addressable(for: machine)
         stateWatcher.updateConfiguredSetIds(Set(resolvedConfig.sets.map(\.id)))
@@ -271,6 +299,41 @@ final class AppModel: ObservableObject {
         }
         if previousResticPath != resticPath {
             Task { await refreshResticInfo() }
+        }
+        return installedFingerprint
+    }
+
+    /// Adopts the latest valid on-disk configuration after the watcher has
+    /// surfaced a replacement. A failed reload retains the last understood
+    /// config and blocks every save, so corrupt fleet-sync output cannot be
+    /// overwritten by an open window.
+    func reloadConfigFromDisk() {
+        do {
+            let snapshot = try configStore.snapshot()
+            let previous = config
+            let previousResticPath = resticPath
+
+            config = snapshot.config
+            configFingerprint = snapshot.fingerprint
+            configChangedOnDisk = false
+            configLoadError = machineLoadError
+            resolvedConfig = snapshot.config.resolved(for: machine).config
+            addressableConfig = snapshot.config.addressable(for: machine)
+            stateWatcher.updateConfiguredSetIds(Set(resolvedConfig.sets.map(\.id)))
+            lastConfigError = nil
+            recomputeDerivedState()
+
+            if ConfigDiff.isScheduleRelevantChange(from: previous, to: snapshot.config) {
+                launchd.kickstartTick()
+            }
+            if previousResticPath != resticPath {
+                Task { await refreshResticInfo() }
+            }
+        } catch {
+            let detail = Self.describe(configLoadFailure: error, path: paths.configFile.path)
+            configLoadError = [detail, machineLoadError].compactMap { $0 }.joined(separator: "\n\n")
+            configChangedOnDisk = true
+            lastConfigError = "Reload failed: \(error)"
         }
     }
 
@@ -444,6 +507,17 @@ final class AppModel: ObservableObject {
                 }
                 .store(in: &cancellables)
         }
+
+        stateWatcher.$configFileFingerprint
+            .removeDuplicates()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] observedFingerprint in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    self.configChangedOnDisk = observedFingerprint != self.configFingerprint
+                }
+            }
+            .store(in: &cancellables)
     }
 
     // MARK: - Actions

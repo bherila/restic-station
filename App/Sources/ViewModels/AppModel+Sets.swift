@@ -53,14 +53,18 @@ extension AppModel {
     /// Inserts or replaces `set` and saves. Throws `ConfigError` when the
     /// resulting config is invalid, which the editor maps to an inline field
     /// message.
-    func saveSet(_ set: BackupSet) throws {
+    @discardableResult
+    func saveSet(
+        _ set: BackupSet,
+        ifUnchangedFrom expectedFingerprint: String? = nil
+    ) throws -> String {
         var draft = config
         if let index = draft.sets.firstIndex(where: { $0.id == set.id }) {
             draft.sets[index] = set
         } else {
             draft.sets.append(set)
         }
-        try saveConfig(draft)
+        return try saveConfig(draft, ifUnchangedFrom: expectedFingerprint)
     }
 
     /// Deletes a set's configuration. Per the confirmation copy
