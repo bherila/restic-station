@@ -410,10 +410,12 @@ import Musl
         }
 
         // `lineLength - 1` keeps the whole JSON record and tears only the
-        // newline — the complete-newline-less tail covered by
-        // `recoveryTerminatesNewlinelessTailAtTheEnd`; excluded here so the
-        // torn-fragment matrix stays focused on strict prefixes.
-        for offset in stride(from: 1, to: lineLength, by: 3) where offset != lineLength - 1 {
+        // newline — the complete-newline-less repair path also pinned by
+        // `recoveryTerminatesNewlinelessTailAtTheEnd`. Every other offset
+        // leaves a strict, undecodable prefix for truncation.
+        var offsets = Array(stride(from: 1, to: lineLength, by: 3))
+        if !offsets.contains(lineLength - 1) { offsets.append(lineLength - 1) }
+        for offset in offsets {
             let paths = makePaths()
             defer { cleanup(paths) }
             let (firstRunId, secondRunId) = try runFlow(paths: paths, tearAt: offset)
@@ -438,6 +440,50 @@ import Musl
             #expect(try recoveryStore.unresolvedAuditFailures().isEmpty)
             #expect(try recoveryStore.recoverInterrupted().isEmpty, "offset \(offset): not idempotent")
         }
+    }
+
+    /// A write torn one byte short of the end leaves a complete JSON record
+    /// with no trailing newline. Recovery must terminate that record *at
+    /// the end of the file* — before the `O_APPEND` fix in
+    /// `readIndexEntriesRepairingTail`, the terminating newline was written
+    /// through a descriptor whose offset was still 0 (the repair reads only
+    /// with `pread`), overwriting the first byte of `index.jsonl`:
+    /// destroying the oldest record while leaving the tail unterminated.
+    /// (The same repair through `appendIndexEntry` was safe all along: its
+    /// descriptor carries `O_APPEND`.)
+    @Test("recovery terminates a complete newline-less index tail at the end, not at byte 0")
+    func recoveryTerminatesNewlinelessTailAtTheEnd() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+        let tick = TickBox()
+        let store = RunStore(paths: paths, now: {
+            Self.start.addingTimeInterval(TimeInterval(tick.next()))
+        })
+        let first = try store.begin(
+            kind: .backup, setId: Self.setId, destId: Self.destId, trigger: .manual
+        )
+        try store.finish(first, status: .success, resticExitCode: 0)
+        let second = try store.begin(
+            kind: .backup, setId: Self.setId, destId: Self.destId, trigger: .manual
+        )
+        try store.finish(second, status: .success, resticExitCode: 0)
+
+        var indexBytes = try Data(contentsOf: paths.runsIndexFile)
+        try #require(indexBytes.last == 0x0A)
+        indexBytes.removeLast()
+        try indexBytes.write(to: paths.runsIndexFile)
+
+        #expect(try store.recoverInterrupted().isEmpty)
+
+        let repaired = try Data(contentsOf: paths.runsIndexFile)
+        #expect(repaired.first == UInt8(ascii: "{"), "recovery overwrote the head of the index")
+        #expect(repaired.last == 0x0A, "the newline-less tail was never terminated")
+        #expect(repaired.split(separator: 0x0A, omittingEmptySubsequences: true).count == 2)
+        let history = try store.recentRuns(limit: 10)
+        #expect(history.map(\.runId) == [second.runId, first.runId])
+        #expect(try store.unresolvedAuditFailures().isEmpty)
+        #expect(try store.recoverInterrupted().isEmpty)
+        #expect(try Data(contentsOf: paths.runsIndexFile) == repaired)
     }
 
     // MARK: - EINTR at every fsync site
