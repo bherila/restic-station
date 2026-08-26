@@ -175,6 +175,40 @@ private func setRunStoreTestErrno(_ value: Int32) {
         #expect(entry.groupId == run.runId)
     }
 
+    @Test("purge patterns are launch-bound, terminal, and legacy-compatible")
+    func purgePatternsRoundTripThroughAuditMetadata() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+        let store = RunStore(paths: paths, now: { Date() })
+        var run = try store.begin(
+            kind: .purge,
+            setId: UUID(),
+            destId: UUID(),
+            trigger: .scheduled
+        )
+        run.argvRedacted = ["restic", "rewrite", "--forget", "snapshot"]
+        run.purgePatterns = ["build/**", ".cache/**"]
+
+        #expect(try store.metadata(runId: run.runId).purgePatterns == nil)
+        try store.markDestructiveLaunchAuthorized(run)
+        #expect(try store.metadata(runId: run.runId).purgePatterns == run.purgePatterns)
+        let launchedPatterns = run.purgePatterns
+        run.purgePatterns = ["mutated-after-launch/**"]
+        try store.finish(run, status: .success, resticExitCode: 0)
+        let final = try store.metadata(runId: run.runId)
+        #expect(final.purgePatterns == launchedPatterns)
+
+        var object = try #require(
+            JSONSerialization.jsonObject(
+                with: ConfigStore.makeEncoder().encode(final)
+            ) as? [String: Any]
+        )
+        object.removeValue(forKey: "purgePatterns")
+        let legacyBytes = try JSONSerialization.data(withJSONObject: object)
+        let legacy = try ConfigStore.makeDecoder().decode(RunMetadata.self, from: legacyBytes)
+        #expect(legacy.purgePatterns == nil)
+    }
+
     @Test func groupIdPropagatesAcrossRunsInAGroup() throws {
         let paths = makePaths()
         defer { cleanup(paths) }

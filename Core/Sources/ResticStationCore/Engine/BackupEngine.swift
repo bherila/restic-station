@@ -1605,6 +1605,21 @@ public final class BackupEngine: Sendable {
             throw PurgeApplyError.tokenDoesNotMatchCurrentPlan
         }
 
+        // The automatic planner reads pending patterns before it can acquire
+        // this process-wide lease. Bind that observation here, at the point
+        // of use: a peer may have completed the same purge in the meantime.
+        // A token containing even one already-applied pattern is stale and
+        // must never authorize a repeated rewrite.
+        for destination in destinations {
+            let applied = Set(
+                scheduleStateLease.state.sets[set.id]?
+                    .appliedPurgeExcludes[destination.id] ?? []
+            )
+            guard preview.patterns.allSatisfy({ !applied.contains($0) }) else {
+                throw PurgeApplyError.tokenDoesNotMatchCurrentPlan
+            }
+        }
+
         guard await secretsAvailable(for: destinations) else { throw PurgeApplyError.unavailable }
 
         // Acquire the machine-wide destructive gate before the final live
@@ -1658,6 +1673,67 @@ public final class BackupEngine: Sendable {
                 reason: "run history unusable — could not verify destructive audit history: \(error)",
                 operationMayHaveRun: false
             )
+        }
+
+        // `rewrite --forget` publishes terminal run metadata before the
+        // schedule watermark. If the later directory fsync fails, a crash
+        // may lose that rename even though the repository mutation and its
+        // canonical audit record are durable. Reconcile that exact success
+        // while both the destructive-audit gate and schedule-state lease are
+        // held, then consume this now-stale token before returning/refusing.
+        // The audit scan above makes malformed or incomplete destructive
+        // history fail closed before it can feed this decision.
+        let successfulPatterns: [UUID: Set<String>]
+        do {
+            successfulPatterns = try successfulPurgePatterns(
+                setId: set.id,
+                destinationIds: requestedIds
+            )
+        } catch {
+            throw PurgeApplyError.infrastructureFailure(
+                reason: "run history unusable — could not reconcile purge watermark evidence: \(error)",
+                operationMayHaveRun: false
+            )
+        }
+        var reconciledAnyPattern = false
+        for destination in destinations {
+            guard let successful = successfulPatterns[destination.id] else { continue }
+            let applied = Set(
+                scheduleStateLease.state.sets[set.id]?
+                    .appliedPurgeExcludes[destination.id] ?? []
+            )
+            let recovered = preview.patterns.filter {
+                successful.contains($0) && !applied.contains($0)
+            }
+            guard !recovered.isEmpty else { continue }
+            try markPurgePatternsApplied(
+                setId: set.id,
+                destinationId: destination.id,
+                patterns: recovered,
+                operationMayHaveRun: false,
+                scheduleStateLease: scheduleStateLease
+            )
+            reconciledAnyPattern = true
+        }
+        if reconciledAnyPattern {
+            do {
+                _ = try previewTokens.consume(token)
+            } catch let error as PreviewTokenError {
+                throw PurgeApplyError.token(error)
+            } catch {
+                throw PurgeApplyError.unavailable
+            }
+            let fullyReconciled = destinations.allSatisfy { destination in
+                let applied = Set(
+                    scheduleStateLease.state.sets[set.id]?
+                        .appliedPurgeExcludes[destination.id] ?? []
+                )
+                return preview.patterns.allSatisfy(applied.contains)
+            }
+            guard fullyReconciled else {
+                throw PurgeApplyError.tokenDoesNotMatchCurrentPlan
+            }
+            return PurgeRunResult(status: .success, children: [])
         }
 
         var plans: [(destination: Destination, plan: PurgePlan)] = []
@@ -1902,6 +1978,7 @@ public final class BackupEngine: Sendable {
             streamProgress: false,
             afterLaunchFailure: afterLaunchFailure,
             callerHoldsDestructiveAuditGate: callerHoldsDestructiveAuditGate,
+            purgePatterns: patterns,
             purgeSnapshotRewrites: { outcome in
                 Dictionary(uniqueKeysWithValues: parseRewrite(outcome.rawOutput).snapshots.compactMap { rewrite in
                     guard let oldID = fullIDByShortID[rewrite.shortID], let newID = rewrite.newSnapshotShortID else {
@@ -1921,6 +1998,35 @@ public final class BackupEngine: Sendable {
         let applied = try trustedScheduleState()
             .sets[setId]?.appliedPurgeExcludes[destinationId] ?? []
         return set.purgeExcludes.filter { !applied.contains($0) }
+    }
+
+    /// Returns only patterns bound into durable, terminal successful purge
+    /// records. The caller must first hold the destructive gate and pass
+    /// `unresolvedAuditFailures`, which verifies canonical metadata against
+    /// its index projection and refuses malformed or incomplete history.
+    private func successfulPurgePatterns(
+        setId: UUID,
+        destinationIds: Set<UUID>
+    ) throws -> [UUID: Set<String>] {
+        var result: [UUID: Set<String>] = [:]
+        for entry in try runStore.recentRuns(setId: setId, limit: Int.max)
+            where entry.kind == .purge
+                && entry.status == .success
+                && destinationIds.contains(entry.destId) {
+            let metadata = try runStore.metadata(runId: entry.runId)
+            guard metadata.runId == entry.runId,
+                  metadata.kind == .purge,
+                  metadata.setId == setId,
+                  metadata.destId == entry.destId,
+                  metadata.status == .success else {
+                throw RunStoreError.discardUnsafe(
+                    path: paths.runMetadataFile(runId: entry.runId).path
+                )
+            }
+            guard let patterns = metadata.purgePatterns else { continue }
+            result[entry.destId, default: []].formUnion(patterns)
+        }
+        return result
     }
 
     private func trustedScheduleState() throws -> ScheduleState {
@@ -2293,6 +2399,7 @@ public final class BackupEngine: Sendable {
         afterLaunchFailure: (@Sendable () -> Void)? = nil,
         downgradeSuccessToWarning: (@Sendable (ResticOutcome) -> Bool)? = nil,
         callerHoldsDestructiveAuditGate: Bool = false,
+        purgePatterns: [String]? = nil,
         purgeSnapshotRewrites: (@Sendable (ResticOutcome) -> [String: String]?)? = nil
     ) async -> RecordedChildResult {
         let destructiveAuditGate: FileLock?
@@ -2363,6 +2470,7 @@ public final class BackupEngine: Sendable {
         // persist.
         run.argvRedacted = remoteCommand?.passwordStdinArgv
             ?? restic.redactedArgv(command, for: invocation)
+        run.purgePatterns = purgePatterns
 
         let logWriter: LogWriter?
         do {

@@ -379,6 +379,24 @@ cmp -s "$CORRUPT_SCHEDULE/state/schedule-state.json" "${recovery_copies[0]}" \
     || fail "the schedule-state recovery copy is not byte-identical to the canonical input"
 ok "corrupt schedule state: status --json exits 1, preserves canonical bytes, and names recovery"
 
+# Tick must validate the safety-authoritative watermark before every healthy
+# early return. An empty scheduling view used to exit 0 before reading these
+# exact corrupt bytes, making a broken host look healthy indefinitely.
+TICK_CORRUPT_NO_SETS="$WORK/tick-corrupt-no-sets"
+make_status_fixture "$TICK_CORRUPT_NO_SETS"
+jq '.sets = []' "$TICK_CORRUPT_NO_SETS/config.json" \
+    > "$TICK_CORRUPT_NO_SETS/config.json.tmp"
+mv "$TICK_CORRUPT_NO_SETS/config.json.tmp" "$TICK_CORRUPT_NO_SETS/config.json"
+printf '%s' 'tick corrupt schedule json {{{' \
+    > "$TICK_CORRUPT_NO_SETS/state/schedule-state.json"
+RESTIC_STATION_DATA_DIR="$TICK_CORRUPT_NO_SETS" run_helper tick
+expect_rc 1
+grep -q 'schedule state is unreadable' "$OUT_FILE" \
+    || fail "tick did not diagnose corrupt schedule state before the empty-set return"
+grep -q 'no backup sets' "$OUT_FILE" \
+    && fail "tick reached the empty-set success path with corrupt schedule state"
+ok "tick safety gate: corrupt schedule state fails before the empty-set success path"
+
 # --- first backup grace: fresh config stays quiet; old never-run config warns. ---
 FIRST_BACKUP_FRESH="$WORK/status-first-backup-fresh"
 make_status_fixture "$FIRST_BACKUP_FRESH"

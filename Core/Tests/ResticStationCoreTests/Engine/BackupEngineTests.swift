@@ -73,6 +73,48 @@ final class ObservingProcessRunner: ProcessRunning, @unchecked Sendable {
     }
 }
 
+/// Fails exactly one state-directory fsync after a test arms it. The rename
+/// has already made the new watermark visible at that point, matching the
+/// crash window where visibility is not proof of directory-entry durability.
+final class ArmedScheduleDirectorySyncFailure: @unchecked Sendable {
+    private let live = StateStoreFileOperations.live
+    private let lock = NSLock()
+    private var armed = false
+
+    func arm() {
+        lock.lock()
+        armed = true
+        lock.unlock()
+    }
+
+    func operations() -> StateStoreFileOperations {
+        StateStoreFileOperations(
+            openAt: live.openAt,
+            read: live.read,
+            write: live.write,
+            sync: { [self] fd in
+                var info = stat()
+                let isDirectory = fstat(fd, &info) == 0
+                    && (info.st_mode & mode_t(S_IFMT)) == mode_t(S_IFDIR)
+                lock.lock()
+                let shouldFail = armed && isDirectory
+                if shouldFail { armed = false }
+                lock.unlock()
+                if shouldFail {
+                    errno = EIO
+                    return -1
+                }
+                return live.sync(fd)
+            },
+            stat: live.stat,
+            setMode: live.setMode,
+            renameAt: live.renameAt,
+            unlinkAt: live.unlinkAt,
+            close: live.close
+        )
+    }
+}
+
 // MARK: - Suite
 
 @Suite("BackupEngine: runSet sequence, checks, prune, restore, init")
@@ -196,6 +238,7 @@ struct BackupEngineTests {
         primaryRepoURL: String? = nil,
         onSecretPasswordRead: (@Sendable (UUID) -> Void)? = nil,
         logWriterFactory: (@Sendable (URL) throws -> LogWriter)? = nil,
+        stateStoreFileOperations: StateStoreFileOperations? = nil,
         /// Overridable so a test can point the engine at a binary it is
         /// allowed to modify, and assert what happens when restic is
         /// replaced mid-operation.
@@ -264,7 +307,9 @@ struct BackupEngineTests {
             runner: processRunner
         )
         let runStore = RunStore(paths: paths, now: clock.now)
-        let stateStore = StateStore(paths: paths)
+        let stateStore = stateStoreFileOperations.map {
+            StateStore(paths: paths, fileOperations: $0)
+        } ?? StateStore(paths: paths)
 
         let engine = BackupEngine(
             config: config,
@@ -3955,6 +4000,196 @@ struct BackupEngineTests {
         #expect(
             env.stateStore.readScheduleState()?.sets[Self.setId]?
                 .appliedPurgeExcludes[env.primary.id] == env.set.purgeExcludes
+        )
+    }
+
+    @Test("automatic purge revalidates pending patterns under the schedule-state lease")
+    func automaticPurgeRejectsPatternAppliedDuringPlanning() async throws {
+        let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]
+        let hostnames = [Self.setId: Set(["example-mac.local"])]
+        let stateStore = Box<StateStore?>(nil)
+        let changedState = Box(false)
+        let env = Self.makeEnv(
+            script: [], retention: nil, purgeExcludes: ["build/**"], reachableSecondaries: [],
+            onSpawn: { argv in
+                guard argv.contains("snapshots"),
+                      !changedState.value,
+                      let stateStore = stateStore.value else { return }
+                changedState.value = true
+                _ = try? stateStore.updateScheduleState(setId: Self.setId) { state in
+                    state.appliedPurgeExcludes[Self.primaryId] = ["build/**"]
+                }
+            },
+            purgeSourcePaths: sourcePaths,
+            purgeHostnames: hostnames
+        )
+        stateStore.value = env.stateStore
+        defer { env.cleanUp() }
+        let snapshotsJSON = try FixtureLoader.string("snapshots.json")
+        env.fake.script = Self.resticCall(
+            Self.backupArgv(env.primary.repoURL, excludes: env.set.purgeExcludes),
+            dest: Self.primaryId,
+            stdoutLines: Self.backupStream()
+        ) + Self.resticCall(
+            ["-r", env.primary.repoURL, "snapshots", "--json"],
+            dest: Self.primaryId,
+            stdoutLines: [snapshotsJSON]
+        )
+
+        let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
+
+        guard case .completed(let status, _, let children) = outcome else {
+            Issue.record("the stale automatic capability must be refused: \(outcome)")
+            return
+        }
+        #expect(status == .failed)
+        #expect(children.map(\.kind) == [.backup])
+        #expect(changedState.value)
+        #expect(env.resticArgvs.filter { $0.contains("snapshots") }.count == 1)
+        #expect(!env.resticArgvs.contains { $0.contains("rewrite") })
+    }
+
+    @Test("automatic purge repairs a lost watermark from durable terminal success")
+    func automaticPurgeReconcilesSuccessfulRunAfterWatermarkSyncFailure() async throws {
+        let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]
+        let hostnames = [Self.setId: Set(["example-mac.local"])]
+        let fault = ArmedScheduleDirectorySyncFailure()
+        let paths = Box<AppPaths?>(nil)
+        let preWatermarkBytes = Box<Data?>(nil)
+        let armed = Box(false)
+        let env = Self.makeEnv(
+            script: [], retention: nil, purgeExcludes: ["build/**"], reachableSecondaries: [],
+            onSpawn: { argv in
+                guard argv.contains("rewrite"),
+                      !argv.contains("--dry-run"),
+                      !armed.value,
+                      let paths = paths.value else { return }
+                preWatermarkBytes.value = try? Data(contentsOf: paths.scheduleStateFile)
+                armed.value = true
+                fault.arm()
+            },
+            purgeSourcePaths: sourcePaths,
+            purgeHostnames: hostnames,
+            stateStoreFileOperations: fault.operations()
+        )
+        paths.value = env.paths
+        defer { env.cleanUp() }
+        let snapshotsJSON = try FixtureLoader.string("snapshots.json")
+        let snapshots = try parseSnapshots(Data(snapshotsJSON.utf8))
+        let rewrite = try FixtureLoader.string("rewrite-forget.txt")
+            .replacingOccurrences(of: "09b3295c", with: snapshots[0].shortId)
+            .replacingOccurrences(of: "b2435423", with: snapshots[1].shortId)
+        env.fake.script = Self.resticCall(
+            Self.backupArgv(env.primary.repoURL, excludes: env.set.purgeExcludes),
+            dest: Self.primaryId,
+            stdoutLines: Self.backupStream()
+        ) + Self.resticCall(
+            ["-r", env.primary.repoURL, "snapshots", "--json"],
+            dest: Self.primaryId,
+            stdoutLines: [snapshotsJSON]
+        ) + Self.resticCall(
+            ["-r", env.primary.repoURL, "snapshots", "--json"],
+            dest: Self.primaryId,
+            stdoutLines: [snapshotsJSON]
+        ) + Self.resticCall(
+            Self.rewriteArgv(
+                env.primary.repoURL,
+                snapshotIDs: snapshots.map(\.id),
+                patterns: env.set.purgeExcludes
+            ),
+            dest: Self.primaryId,
+            stdoutLines: rewrite.split(separator: "\n").map(String.init)
+        ) + Self.resticCall(
+            Self.backupArgv(env.primary.repoURL, excludes: env.set.purgeExcludes),
+            dest: Self.primaryId,
+            stdoutLines: Self.backupStream()
+        ) + Self.resticCall(
+            ["-r", env.primary.repoURL, "snapshots", "--json"],
+            dest: Self.primaryId,
+            stdoutLines: [snapshotsJSON]
+        )
+
+        let first = await env.engine.runSet(env.set, trigger: .scheduled)
+        guard case .infrastructureFailure(let reason) = first else {
+            Issue.record("the injected watermark durability failure must surface: \(first)")
+            return
+        }
+        #expect(reason.contains("could not persist the purge watermark"))
+        #expect(env.resticArgvs.filter { $0.contains("rewrite") }.count == 1)
+        let purgeEntry = try #require(env.entries(kind: .purge).last)
+        let purgeMetadata = try env.runStore.metadata(runId: purgeEntry.runId)
+        #expect(purgeMetadata.status == .success)
+        #expect(purgeMetadata.purgePatterns == env.set.purgeExcludes)
+
+        // Model the crash outcome the failed directory fsync permits: the
+        // visible watermark rename disappears, while terminal run evidence
+        // (published by its independent durable transaction) survives.
+        let oldBytes = try #require(preWatermarkBytes.value)
+        try oldBytes.write(to: env.paths.scheduleStateFile)
+
+        let second = await env.engine.runSet(env.set, trigger: .scheduled)
+        guard case .completed(let status, _, let children) = second else {
+            Issue.record("terminal purge evidence should repair the watermark: \(second)")
+            return
+        }
+        #expect(status == .success)
+        #expect(children.map(\.kind) == [.backup])
+        #expect(env.resticArgvs.filter { $0.contains("rewrite") }.count == 1)
+        #expect(env.resticArgvs.filter { $0.contains("snapshots") }.count == 3)
+        #expect(
+            env.stateStore.readScheduleState()?.sets[Self.setId]?
+                .appliedPurgeExcludes[env.primary.id] == env.set.purgeExcludes
+        )
+    }
+
+    @Test("partial terminal purge evidence repairs only proven patterns and refuses the token")
+    func automaticPurgePartialReconciliationFailsClosed() async throws {
+        let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]
+        let hostnames = [Self.setId: Set(["example-mac.local"])]
+        let env = Self.makeEnv(
+            script: [],
+            retention: nil,
+            purgeExcludes: ["build/**", ".cache/**"],
+            reachableSecondaries: [],
+            purgeSourcePaths: sourcePaths,
+            purgeHostnames: hostnames
+        )
+        defer { env.cleanUp() }
+        var historical = try env.runStore.begin(
+            kind: .purge,
+            setId: Self.setId,
+            destId: Self.primaryId,
+            trigger: .scheduled
+        )
+        historical.argvRedacted = [Self.resticPath, "rewrite", "--forget", "snapshot"]
+        historical.purgePatterns = ["build/**"]
+        try env.runStore.markDestructiveLaunchAuthorized(historical)
+        try env.runStore.finish(historical, status: .success, resticExitCode: 0)
+
+        let snapshotsJSON = try FixtureLoader.string("snapshots.json")
+        env.fake.script = Self.resticCall(
+            Self.backupArgv(env.primary.repoURL, excludes: env.set.purgeExcludes),
+            dest: Self.primaryId,
+            stdoutLines: Self.backupStream()
+        ) + Self.resticCall(
+            ["-r", env.primary.repoURL, "snapshots", "--json"],
+            dest: Self.primaryId,
+            stdoutLines: [snapshotsJSON]
+        )
+
+        let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
+
+        guard case .completed(let status, _, let children) = outcome else {
+            Issue.record("partial evidence must refuse the stale token: \(outcome)")
+            return
+        }
+        #expect(status == .failed)
+        #expect(children.map(\.kind) == [.backup])
+        #expect(!env.resticArgvs.contains { $0.contains("rewrite") })
+        #expect(env.resticArgvs.filter { $0.contains("snapshots") }.count == 1)
+        #expect(
+            env.stateStore.readScheduleState()?.sets[Self.setId]?
+                .appliedPurgeExcludes[env.primary.id] == ["build/**"]
         )
     }
 

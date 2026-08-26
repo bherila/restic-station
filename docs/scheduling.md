@@ -246,14 +246,15 @@ scheduling information.
 
 ```
 1. acquire locks/tick.lock (flock LOCK_EX|LOCK_NB); busy → exit 0 silently (previous tick still evaluating/running)
-2. load config; if no config or no sets → exit 0
-3. recover: for any runs/<id>/metadata.json with status "running" whose pid is dead → rewrite as "failed" (message "interrupted")
-4. now = Date()
-5. for each set (sequentially, config order):
+2. recover: for any runs/<id>/metadata.json with status "running" whose pid is dead → rewrite as "failed" (message "interrupted")
+3. validate schedule-state.json; any unsafe or corrupt existing state → exit 1
+4. load config; if no config or no sets → exit 0; if no usable restic → explain and exit 0
+5. now = Date()
+6. for each set (sequentially, config order):
      if isDue(schedule, lastBackupStart, now) → BackupEngine.runSet(set, trigger: .scheduled)
      if checkPolicy.enabled && checkIsDue(lastCheckStart, now) → BackupEngine.runCheck(set)
-6. for each destination of each set: if last probe older than 30 min → Reachability.probe → write repo-status state
-7. release tick.lock; exit 0
+7. for each destination of each set: if last probe older than 30 min → Reachability.probe → write repo-status state
+8. release tick.lock; exit 0
 ```
 
 Sets run **sequentially** within a tick (restic saturates I/O; parallel sets thrash). The tick holds `tick.lock` for the whole duration including long backups; that is intentional — the per-set lock (below) exists so `Back Up Now` from the app still works for *other* sets while a scheduled run is in flight.
@@ -346,6 +347,17 @@ evidence attribution is wrong, and recording the patterns as applied would
 skip the rewrite permanently, silently, and with a success-shaped outcome.
 The engine logs the decline instead. A removed pattern stays recorded and is
 never used to trigger a rewrite.
+
+The pending-pattern observation is revalidated after acquiring the shared
+schedule-state lease. If another helper applied any authorized pattern during
+the earlier repository planning window, the token is stale and no rewrite
+launches. Terminal successful purge metadata is durably committed before the
+watermark. If the watermark's directory fsync then fails and a crash loses its
+visible rename, the next apply holds both the destructive-audit gate and the
+schedule-state lease, verifies the complete run history, and restores only the
+exact `purgePatterns` bound to successful runs. It consumes the stale token and
+does not query or rewrite the repository again. Malformed, incomplete, legacy,
+or only partially matching history cannot authorize that shortcut.
 
 ## Locking
 

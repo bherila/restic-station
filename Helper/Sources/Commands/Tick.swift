@@ -9,8 +9,8 @@ struct Tick: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "tick",
         abstract: "Run one scheduling pass (invoked by launchd every 2 minutes). "
-            + "Exit 0 always, except a hard config-load error, or a data directory or "
-            + "tick lock that cannot be used at all (exit 1)."
+            + "Exit 0 always, except unreadable schedule state, a hard config-load error, "
+            + "or a data directory or tick lock that cannot be used at all (exit 1)."
     )
 
     func run() async throws {
@@ -66,6 +66,21 @@ struct Tick: AsyncParsableCommand {
         // that the next tick clears it. Found by `@codex review` on #51.
         recoverInterruptedRuns(paths: paths)
 
+        // Schedule state is safety-authoritative even when there is no work
+        // to schedule or no usable restic binary. Validate it before either
+        // successful early return so a damaged purge watermark can never be
+        // reported as a healthy tick.
+        let stateStore = StateStore(paths: paths)
+        let scheduleState: ScheduleState?
+        switch stateStore.readScheduleStateResult() {
+        case .missing:
+            scheduleState = nil
+        case .valid(let state):
+            scheduleState = state
+        case .corrupt(let failure):
+            throw CLIFailure.stateUnreadable(failure.recoveryMessage)
+        }
+
         // ── Step 3: load config, resolve it for this machine; no config or
         // no sets that run here → exit 0. ────────────────────────────────
         let configStore = ConfigStore(paths: paths)
@@ -107,17 +122,6 @@ struct Tick: AsyncParsableCommand {
         }
 
         // ── Step 4/5: sequential due sets (config order). ────────────────
-        let scheduleState: ScheduleState?
-        switch context.stateStore.readScheduleStateResult() {
-        case .missing:
-            scheduleState = nil
-        case .valid(let state):
-            scheduleState = state
-        case .corrupt(let failure):
-            throw CLIFailure.stateUnreadable(
-                failure.recoveryMessage
-            )
-        }
         let now = Date()
         let calendar = Calendar.current
         /// Sets whose lock could not be *used* this tick. Non-empty means the

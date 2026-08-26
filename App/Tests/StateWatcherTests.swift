@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import CryptoKit
 import ResticStationCore
 import Testing
 @testable import Restic_Station
@@ -143,6 +144,48 @@ struct StateWatcherTests {
         watcher.reloadNow()
         #expect(watcher.scheduleState == ScheduleState())
         #expect(watcher.scheduleStateFailure == nil)
+    }
+
+    @Test("explicit reload retries a previously suppressed recovery copy")
+    func explicitReloadRetriesScheduleStateRecoveryCopy() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-recovery-retry-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = AppPaths(root: root)
+        try paths.ensureDirectories()
+        let corrupt = Data("retry this corrupt schedule state {{{".utf8)
+        try corrupt.write(to: paths.scheduleStateFile)
+        let fingerprint = SHA256.hash(data: corrupt)
+            .map { String(format: "%02x", $0) }
+            .joined()
+        let recovery = paths.stateDir.appendingPathComponent(
+            "schedule-state.corrupt-\(fingerprint).json",
+            isDirectory: false
+        )
+        // A directory at the content-addressed target makes the first atomic
+        // rename fail without depending on this test process's permissions.
+        try FileManager.default.createDirectory(at: recovery, withIntermediateDirectories: false)
+
+        let watcher = StateWatcher(
+            paths: paths,
+            runStore: RunStore(paths: paths),
+            stateStore: StateStore(paths: paths)
+        )
+        watcher.reloadNow()
+        let firstFailure = try #require(watcher.scheduleStateFailure)
+        #expect(firstFailure.contentFingerprint == fingerprint)
+        #expect(firstFailure.quarantineWriteFailed)
+        #expect(firstFailure.quarantinePath == nil)
+
+        // External repair removes the obstacle without changing the corrupt
+        // canonical bytes. An explicit reload must retry immediately rather
+        // than retaining event-feedback suppression until app restart.
+        try FileManager.default.removeItem(at: recovery)
+        watcher.reloadNow()
+        let retriedFailure = try #require(watcher.scheduleStateFailure)
+        #expect(!retriedFailure.quarantineWriteFailed)
+        #expect(retriedFailure.quarantinePath == recovery.path)
+        #expect(try Data(contentsOf: recovery) == corrupt)
     }
 
     @Test("keychain secret-lock metadata changes refresh administrative health")

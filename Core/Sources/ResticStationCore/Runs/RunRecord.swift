@@ -215,6 +215,10 @@ public struct RunMetadata: Codable, Equatable, Sendable {
     /// --forget`. Present only for successful/partially successful purge
     /// runs; historical run records deliberately remain untouched.
     public var purgeSnapshotRewrites: [String: String]?
+    /// Exact exclusion patterns bound to a purge launch. A terminal success
+    /// is durable evidence that these patterns completed for this run's
+    /// destination, even if the later schedule watermark commit was lost.
+    public var purgePatterns: [String]?
     /// Version of the destructive audit contract understood when this run
     /// was created. A current-version destructive run with no launch marker
     /// is known to be safely pre-launch; a markerless pre-contract running
@@ -259,6 +263,7 @@ public struct RunMetadata: Codable, Equatable, Sendable {
         errorSummary: String?,
         stats: BackupSummary?,
         purgeSnapshotRewrites: [String: String]? = nil,
+        purgePatterns: [String]? = nil,
         destructiveAuditContractVersion: Int? = nil,
         destructiveLaunchAuthorizedAt: Date? = nil,
         auditFailureReason: RunAuditFailureReason? = nil,
@@ -284,6 +289,7 @@ public struct RunMetadata: Codable, Equatable, Sendable {
         self.errorSummary = errorSummary
         self.stats = stats
         self.purgeSnapshotRewrites = purgeSnapshotRewrites
+        self.purgePatterns = purgePatterns
         self.destructiveAuditContractVersion = destructiveAuditContractVersion
         self.destructiveLaunchAuthorizedAt = destructiveLaunchAuthorizedAt
         self.auditFailureReason = auditFailureReason
@@ -295,6 +301,7 @@ public struct RunMetadata: Codable, Equatable, Sendable {
         case runId, kind, setId, destId, groupId, status, trigger, start, end
         case pid, resticExitCode, argvRedacted
         case snapshotId, filesNew, filesChanged, dataAdded, errorSummary, stats, purgeSnapshotRewrites
+        case purgePatterns
         case destructiveAuditContractVersion, destructiveLaunchAuthorizedAt
         case auditFailureReason, indexPublicationPending, publicationDurabilityContractVersion
     }
@@ -321,6 +328,7 @@ public struct RunMetadata: Codable, Equatable, Sendable {
         try container.encode(errorSummary, forKey: .errorSummary)
         try container.encode(stats, forKey: .stats)
         try container.encode(purgeSnapshotRewrites, forKey: .purgeSnapshotRewrites)
+        try container.encode(purgePatterns, forKey: .purgePatterns)
         try container.encode(destructiveAuditContractVersion, forKey: .destructiveAuditContractVersion)
         try container.encode(destructiveLaunchAuthorizedAt, forKey: .destructiveLaunchAuthorizedAt)
         try container.encode(auditFailureReason, forKey: .auditFailureReason)
