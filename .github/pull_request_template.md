@@ -20,3 +20,6 @@ a review against a superseded pair does not carry forward.
 - [ ] `Core/` and `Helper/` still build and test on Linux
 - [ ] Invariants preserved — see CONTRIBUTING.md; destructive-path changes name which one they touch
 - [ ] Destructive-path change? State the failure direction if the new code is wrong.
+- [ ] Behavior change? Blast radius swept — docs, task specs, UI copy, error envelopes, and test assertions all describe the post-change world
+- [ ] New/changed assertions red-checked (each demonstrably fails against the pre-change behavior)
+- [ ] New or extended safety invariant? Threat-model scenarios (concurrent processes, crash points, legacy state, PID reuse) stated in the description
