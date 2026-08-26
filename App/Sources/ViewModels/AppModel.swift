@@ -215,6 +215,7 @@ final class AppModel: ObservableObject {
                 try? await Task.sleep(nanoseconds: Self.healthRefreshIntervalNanoseconds)
                 guard !Task.isCancelled else { return }
                 guard let self else { return }
+                await self.stateWatcher.refreshAuditHealthOffMain()
                 self.recomputeDerivedState()
             }
         }
@@ -416,6 +417,8 @@ final class AppModel: ObservableObject {
             // prevent the state/run writes that drive every other refresh,
             // so the menu bar must not depend on those writes to turn red.
             lockingBroken: stateWatcher.lockingFailure != nil,
+            destructiveAuditFailure: !stateWatcher.auditFailures.isEmpty
+                || stateWatcher.auditVerificationFailed,
             runLiveness: runLiveness
         )
     }

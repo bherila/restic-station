@@ -128,6 +128,31 @@ struct StatusReportTests {
         failure: nil
     )
 
+    @Test("audit failure is explicit, non-retryable, and rendered as critical")
+    func auditFailureRendering() throws {
+        let failure = RunAuditFailure(
+            runId: "20260825T120000Z-prune-6f9619ff",
+            kind: .prune,
+            setId: setId,
+            destId: destId,
+            start: Date(timeIntervalSince1970: 1_800_000_000),
+            reason: .terminalMetadataMissingIndex
+        )
+        var report = StatusReport(
+            machineId: "studio-mac", generatedAt: Date(), health: "critical",
+            fullDiskAccessDenied: false, locking: Self.healthyLocking, scheduler: nil,
+            sets: [makeSetStatus(needsAttention: true, isRunning: false)],
+            unattributedRuns: [], excludedHere: []
+        )
+        report.auditFailures = [StatusReport.AuditFailure(failure)]
+
+        let text = String(decoding: try ConfigStore.makeEncoder().encode(report), as: UTF8.self)
+        #expect(text.contains("\"health\" : \"critical\""))
+        #expect(text.contains("\"code\" : \"operation_completed_audit_failed\""))
+        #expect(text.contains("\"retryable\" : false"))
+        #expect(report.humanLines().joined(separator: "\n").contains("AUDIT FAILED"))
+    }
+
     // MARK: - #110: locking is reported before anything else
 
     @Test("an unusable data directory is stated plainly, above the scheduler")

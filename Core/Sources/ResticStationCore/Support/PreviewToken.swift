@@ -268,6 +268,23 @@ public struct PreviewTokenStore: Sendable {
         }
     }
 
+    /// Restores a purge capability after the caller proves that no child
+    /// received the destructive argv. The complete issued token is matched,
+    /// not just its opaque value, so this cannot revive a replaced or
+    /// otherwise changed capability. Failure deliberately leaves it spent.
+    public func restore(_ value: String, matching expected: PreviewToken) throws {
+        try withStoreLock {
+            var index = try readIndex()
+            guard var token = index.tokens[value], token.usedAt != nil else {
+                throw PreviewTokenError.unknown
+            }
+            token.usedAt = nil
+            guard token == expected else { throw PreviewTokenError.unknown }
+            index.tokens[value] = token
+            try writeIndex(index)
+        }
+    }
+
     /// SHA-256 of the canonical persisted configuration bytes.  A full
     /// config change invalidates a destructive preview rather than trying to
     /// guess whether the changed field was relevant to an operation.

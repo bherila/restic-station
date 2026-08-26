@@ -160,6 +160,9 @@ public enum PurgeApplyError: Error, Equatable, Sendable {
     /// changed repository data before terminal history or watermark storage
     /// failed; callers must not encourage a blind retry in that case.
     case infrastructureFailure(reason: String, operationMayHaveRun: Bool)
+    /// A destructive run's canonical id is known and must be returned as
+    /// structured CLI data rather than flattened into presentation text.
+    case auditFailure(reason: String, operationMayHaveRun: Bool, runId: String)
     case destinationOffline(destinationId: UUID)
     case unavailable
     /// No restic executable could be identified, so no destructive purge

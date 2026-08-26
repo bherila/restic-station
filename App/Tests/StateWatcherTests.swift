@@ -4,6 +4,101 @@ import ResticStationCore
 import Testing
 @testable import Restic_Station
 
+private final class ScriptedAuditLoader: @unchecked Sendable {
+    private let lock = NSLock()
+    private var callCount = 0
+    private let firstStarted = DispatchSemaphore(value: 0)
+    private let releaseFirst = DispatchSemaphore(value: 0)
+    private let newerResult: AuditHealthRefreshResult
+
+    init(newerResult: AuditHealthRefreshResult) {
+        self.newerResult = newerResult
+    }
+
+    func load() -> AuditHealthRefreshResult {
+        lock.lock()
+        callCount += 1
+        let call = callCount
+        lock.unlock()
+        if call == 1 {
+            firstStarted.signal()
+            releaseFirst.wait()
+            return .success([])
+        }
+        return newerResult
+    }
+
+    func waitUntilFirstStarted() {
+        firstStarted.wait()
+    }
+
+    func finishFirst() {
+        releaseFirst.signal()
+    }
+}
+
+private final class AuditLoaderThreadRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var mainThreadObservations: [Bool] = []
+
+    func load() -> AuditHealthRefreshResult {
+        lock.lock()
+        mainThreadObservations.append(Thread.isMainThread)
+        lock.unlock()
+        return .success([])
+    }
+
+    func reset() {
+        lock.lock()
+        mainThreadObservations = []
+        lock.unlock()
+    }
+
+    var observations: [Bool] {
+        lock.lock()
+        defer { lock.unlock() }
+        return mainThreadObservations
+    }
+}
+
+private final class ReplacementAuditLoader: @unchecked Sendable {
+    private let lock = NSLock()
+    private var callCount = 0
+    private let secondStarted = DispatchSemaphore(value: 0)
+    private let releaseSecond = DispatchSemaphore(value: 0)
+    private let thirdStarted = DispatchSemaphore(value: 0)
+    private let releaseThird = DispatchSemaphore(value: 0)
+    private let currentResult: AuditHealthRefreshResult
+
+    init(currentResult: AuditHealthRefreshResult) {
+        self.currentResult = currentResult
+    }
+
+    func load() -> AuditHealthRefreshResult {
+        lock.lock()
+        callCount += 1
+        let call = callCount
+        lock.unlock()
+        switch call {
+        case 1:
+            return currentResult
+        case 2:
+            secondStarted.signal()
+            releaseSecond.wait()
+            return .success([])
+        default:
+            thirdStarted.signal()
+            releaseThird.wait()
+            return currentResult
+        }
+    }
+
+    func waitUntilSecondStarted() { secondStarted.wait() }
+    func finishSecond() { releaseSecond.signal() }
+    func waitUntilThirdStarted() { thirdStarted.wait() }
+    func finishThird() { releaseThird.signal() }
+}
+
 @Suite("StateWatcher lock health", .serialized)
 @MainActor
 struct StateWatcherTests {
@@ -349,5 +444,203 @@ struct StateWatcherTests {
         try await Task.sleep(nanoseconds: 750_000_000)
 
         #expect(changes == 0)
+    }
+
+    @Test("the liveness refresh notices a destructive helper dying without a file event")
+    func auditRefreshNoticesReleasedDestructiveGate() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-audit-refresh-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = AppPaths(root: root)
+        let runStore = RunStore(paths: paths)
+        let run = try runStore.begin(kind: .prune, setId: UUID(), destId: UUID(), trigger: .manual)
+        try runStore.markDestructiveLaunchAuthorized(run)
+        let gate = FileLock(path: paths.destructiveAuditLockFile, trustedRoot: paths.root)
+        #expect(gate.acquire() == .acquired)
+
+        let watcher = StateWatcher(
+            paths: paths,
+            runStore: runStore,
+            stateStore: StateStore(paths: paths)
+        )
+        watcher.reloadNow()
+        await watcher.refreshAuditHealthOffMain()
+        #expect(watcher.auditFailures.isEmpty)
+        #expect(!watcher.auditVerificationFailed)
+
+        // flock release has no vnode write for DispatchSource to observe.
+        gate.release()
+        await watcher.refreshAuditHealthOffMain()
+
+        #expect(watcher.auditFailures.first?.runId == run.runId)
+        #expect(watcher.auditFailures.first?.reason == .launchedWithoutTerminalMetadata)
+        #expect(!watcher.auditVerificationFailed)
+    }
+
+    @Test("an older detached audit scan cannot replace a newer refresh")
+    func staleDetachedAuditRefreshIsDiscarded() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-audit-generation-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = AppPaths(root: root)
+        let failure = RunAuditFailure(
+            runId: "newer-audit-state",
+            kind: .prune,
+            setId: UUID(),
+            destId: UUID(),
+            start: Date(),
+            reason: .launchedWithoutTerminalMetadata
+        )
+        let loader = ScriptedAuditLoader(newerResult: .success([failure]))
+        let watcher = StateWatcher(
+            paths: paths,
+            runStore: RunStore(paths: paths),
+            stateStore: StateStore(paths: paths),
+            auditHealthLoader: { loader.load() }
+        )
+
+        let staleRefresh = Task { await watcher.refreshAuditHealthOffMain() }
+        await Task.detached { loader.waitUntilFirstStarted() }.value
+        await watcher.refreshAuditHealthOffMain()
+        #expect(watcher.auditFailures == [failure])
+
+        loader.finishFirst()
+        await staleRefresh.value
+        #expect(watcher.auditFailures == [failure])
+        #expect(!watcher.auditVerificationFailed)
+    }
+
+    @Test("replacing an explicit audit scan invalidates it before the replacement starts")
+    func explicitAuditReplacementInvalidatesSynchronously() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-audit-replacement-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = AppPaths(root: root)
+        let failure = RunAuditFailure(
+            runId: "current-audit-failure",
+            kind: .purge,
+            setId: UUID(),
+            destId: UUID(),
+            start: Date(),
+            reason: .launchedWithoutTerminalMetadata
+        )
+        let loader = ReplacementAuditLoader(currentResult: .success([failure]))
+        let watcher = StateWatcher(
+            paths: paths,
+            runStore: RunStore(paths: paths),
+            stateStore: StateStore(paths: paths),
+            auditHealthLoader: { loader.load() }
+        )
+
+        await watcher.refreshAuditHealthOffMain()
+        #expect(watcher.auditFailures == [failure])
+
+        watcher.reloadNow()
+        await Task.detached { loader.waitUntilSecondStarted() }.value
+        watcher.reloadNow()
+        loader.finishSecond()
+        await Task.detached { loader.waitUntilThirdStarted() }.value
+
+        // The replacement is deliberately still blocked. The canceled scan
+        // has finished, but it must already be unable to publish its stale
+        // healthy result.
+        #expect(watcher.auditFailures == [failure])
+        loader.finishThird()
+    }
+
+    @Test("a debounced replacement invalidates its prior scan before sleeping")
+    func debouncedAuditReplacementInvalidatesSynchronously() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-audit-debounce-generation-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = AppPaths(root: root)
+        let failure = RunAuditFailure(
+            runId: "current-debounced-audit-failure",
+            kind: .prune,
+            setId: UUID(),
+            destId: UUID(),
+            start: Date(),
+            reason: .launchedWithoutTerminalMetadata
+        )
+        let loader = ReplacementAuditLoader(currentResult: .success([failure]))
+        let watcher = StateWatcher(
+            paths: paths,
+            runStore: RunStore(paths: paths),
+            stateStore: StateStore(paths: paths),
+            auditHealthLoader: { loader.load() }
+        )
+
+        await watcher.refreshAuditHealthOffMain()
+        #expect(watcher.auditFailures == [failure])
+        let staleRefresh = Task { await watcher.refreshAuditHealthOffMain() }
+        await Task.detached { loader.waitUntilSecondStarted() }.value
+
+        // This synchronous call represents a filesystem event. The
+        // replacement is still in its 250 ms sleep when the old detached
+        // loader finishes.
+        watcher.scheduleDebouncedReload()
+        loader.finishSecond()
+        await staleRefresh.value
+        #expect(watcher.auditFailures == [failure])
+
+        await Task.detached { loader.waitUntilThirdStarted() }.value
+        loader.finishThird()
+    }
+
+    @Test("explicit reload audit scans never run on the main thread")
+    func explicitAuditRefreshRunsOffMain() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-audit-explicit-thread-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = AppPaths(root: root)
+        let recorder = AuditLoaderThreadRecorder()
+        let watcher = StateWatcher(
+            paths: paths,
+            runStore: RunStore(paths: paths),
+            stateStore: StateStore(paths: paths),
+            auditHealthLoader: { recorder.load() }
+        )
+
+        watcher.reloadNow()
+        for _ in 0..<40 {
+            if !recorder.observations.isEmpty { break }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+
+        #expect(!recorder.observations.isEmpty)
+        #expect(recorder.observations.allSatisfy { !$0 })
+    }
+
+    @Test("filesystem-triggered audit scans never run on the main thread")
+    func filesystemAuditRefreshRunsOffMain() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-audit-event-thread-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = AppPaths(root: root)
+        let stateStore = StateStore(paths: paths)
+        let recorder = AuditLoaderThreadRecorder()
+        let watcher = StateWatcher(
+            paths: paths,
+            runStore: RunStore(paths: paths),
+            stateStore: stateStore,
+            auditHealthLoader: { recorder.load() }
+        )
+        watcher.start()
+        defer { watcher.stop() }
+        recorder.reset()
+
+        try stateStore.writeFdaCheck(FdaCheckResult(
+            checkedAt: Date(),
+            hasFullDiskAccess: true,
+            probedPath: "/tmp",
+            context: "test"
+        ))
+        for _ in 0..<40 {
+            if !recorder.observations.isEmpty { break }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+
+        #expect(!recorder.observations.isEmpty)
+        #expect(recorder.observations.allSatisfy { !$0 })
     }
 }

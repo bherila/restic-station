@@ -195,6 +195,7 @@ struct BackupEngineTests {
         machineId: String = "example-machine",
         primaryRepoURL: String? = nil,
         onSecretPasswordRead: (@Sendable (UUID) -> Void)? = nil,
+        logWriterFactory: (@Sendable (URL) throws -> LogWriter)? = nil,
         /// Overridable so a test can point the engine at a binary it is
         /// allowed to modify, and assert what happens when restic is
         /// replaced mid-operation.
@@ -276,7 +277,8 @@ struct BackupEngineTests {
             now: clock.now,
             purgeSourcePaths: purgeSourcePaths,
             purgeHostnames: purgeHostnames,
-            machineId: machineId
+            machineId: machineId,
+            logWriterFactory: logWriterFactory
         )
 
         return Env(
@@ -612,8 +614,8 @@ struct BackupEngineTests {
         #expect(env.indexEntries.isEmpty)
     }
 
-    @Test("a terminal-index failure does not strand otherwise safe mirror and retention work")
-    func runIndexFailureContinuesIndependentPhases() async throws {
+    @Test("a destructive terminal-index failure blocks the next destructive phase")
+    func destructiveIndexFailureBlocksNextDestructivePhase() async throws {
         let paths = Box<AppPaths?>(nil)
         let env = Self.makeEnv(
             script: [],
@@ -655,9 +657,9 @@ struct BackupEngineTests {
             [Self.resticPath] + Self.backupArgv(env.primary.repoURL),
             [Self.resticPath] + Self.copyArgv(to: secondary.repoURL, from: env.primary.repoURL),
             [Self.resticPath] + Self.forgetArgv(secondary.repoURL),
-            [Self.resticPath] + Self.forgetArgv(env.primary.repoURL),
         ]
         #expect(env.resticArgvs == expectedArgvs)
+        #expect(reason.contains("operation_completed_audit_failed"))
         #expect(env.indexEntries.isEmpty)
     }
 
@@ -1764,9 +1766,120 @@ struct BackupEngineTests {
             Issue.record("a terminal index failure must remain infrastructure failure: \(status)")
             return
         }
-        #expect(reason.contains("run history unusable"))
+        #expect(reason.contains("operation_completed_audit_failed"))
         #expect(operationMayHaveRun)
         #expect(env.indexEntries.isEmpty)
+    }
+
+    @Test("runPrune: losing metadata after launch cannot erase known repository uncertainty")
+    func prunePostLaunchMetadataLossStaysAuditFailure() async throws {
+        let paths = Box<AppPaths?>(nil)
+        let env = Self.makeEnv(
+            script: [],
+            reachableSecondaries: [],
+            onSpawn: { argv in
+                guard argv.contains("forget"), let paths = paths.value else { return }
+                let runDirectories = try? FileManager.default.contentsOfDirectory(
+                    at: paths.runsDir,
+                    includingPropertiesForKeys: [.isDirectoryKey]
+                )
+                for directory in runDirectories ?? [] {
+                    try? FileManager.default.removeItem(
+                        at: directory.appendingPathComponent("metadata.json")
+                    )
+                }
+            }
+        )
+        paths.value = env.paths
+        defer { env.cleanUp() }
+        env.fake.script = Self.resticCall(Self.forgetArgv(env.primary.repoURL), dest: Self.primaryId)
+
+        let status = await env.engine.runPruneUnchecked(env.set)
+
+        guard case .infrastructureFailure(let reason, let operationMayHaveRun) = status else {
+            Issue.record("post-launch metadata loss must remain an audit failure: \(status)")
+            return
+        }
+        #expect(operationMayHaveRun)
+        #expect(reason.contains("operation_completed_audit_failed"))
+        #expect(env.resticArgvs.count == 1)
+        #expect(env.indexEntries.isEmpty)
+    }
+
+    @Test("runPrune: an unopenable audit log refuses destructive launch")
+    func pruneLogOpenFailureRefusesLaunch() async throws {
+        let env = Self.makeEnv(
+            script: [],
+            reachableSecondaries: [],
+            logWriterFactory: { url in
+                throw LogWriterError.openFailed(errno: EACCES, path: url.path)
+            }
+        )
+        defer { env.cleanUp() }
+
+        let outcome = await env.engine.runPruneUnchecked(env.set)
+
+        guard case .infrastructureFailure(let reason, let operationMayHaveRun) = outcome else {
+            Issue.record("an unavailable destructive audit log must fail closed: \(outcome)")
+            return
+        }
+        #expect(reason.contains("required destructive audit log"))
+        #expect(!operationMayHaveRun)
+        #expect(env.resticArgvs.isEmpty, "no destructive argv may reach the process runner")
+        let run = try #require(env.entries(kind: .prune).first)
+        #expect(run.status == .failed)
+        #expect(try env.runStore.unresolvedAuditFailures().isEmpty)
+    }
+
+    @Test("runPrune: a post-launch timeout preserves unknown repository outcome and blocks retry")
+    func prunePostLaunchTimeoutPreservesAuditFailure() async throws {
+        let env = Self.makeEnv(script: [], reachableSecondaries: [])
+        defer { env.cleanUp() }
+        // The repo URL is allocated inside makeEnv, so bind the expectation
+        // after construction while preserving the one scripted timeout.
+        env.fake.script = [.init(
+            argvPrefix: [Self.resticPath] + Self.forgetArgv(env.primary.repoURL),
+            failure: .timeout
+        )]
+
+        let first = await env.engine.runPruneUnchecked(env.set)
+        guard case .infrastructureFailure(let firstReason, let operationMayHaveRun) = first else {
+            Issue.record("a timed-out destructive child must be an audit failure: \(first)")
+            return
+        }
+        #expect(operationMayHaveRun)
+        #expect(firstReason.contains("operation_completed_audit_failed"))
+        #expect(env.resticArgvs.count == 1)
+
+        let run = try #require(env.entries(kind: .prune).first)
+        let metadata = try env.runStore.metadata(runId: run.runId)
+        #expect(metadata.auditFailureReason == .repositoryOutcomeUnknown)
+        #expect(metadata.argvRedacted == [Self.resticPath] + Self.forgetArgv(env.primary.repoURL))
+        #expect(try env.runStore.unresolvedAuditFailures().first?.runId == run.runId)
+
+        let second = await env.engine.runPruneUnchecked(env.set)
+        guard case .infrastructureFailure(let secondReason, let secondMayHaveRun) = second else {
+            Issue.record("the unresolved timeout must block another prune: \(second)")
+            return
+        }
+        #expect(!secondMayHaveRun)
+        #expect(secondReason.contains("operation_completed_audit_failed"))
+        #expect(env.resticArgvs.count == 1, "the second destructive argv must never launch")
+    }
+
+    @Test("runPrune: the machine-wide destructive audit gate serializes different helpers")
+    func pruneRefusesWhileDestructiveAuditGateIsHeld() async throws {
+        let env = Self.makeEnv(script: [], reachableSecondaries: [])
+        defer { env.cleanUp() }
+        try env.paths.ensureDirectories()
+        let gate = FileLock(path: env.paths.destructiveAuditLockFile, trustedRoot: env.paths.root)
+        #expect(gate.acquire() == .acquired)
+        defer { gate.release() }
+
+        let outcome = await env.engine.runPruneUnchecked(env.set)
+
+        #expect(outcome == .skipped)
+        #expect(env.resticArgvs.isEmpty)
     }
 
     @Test("runPrune: an unusable set lock is a typed infrastructure failure")
@@ -1819,6 +1932,28 @@ struct BackupEngineTests {
         #expect(env.entries(kind: .prune).count == 1)
     }
 
+    @Test("standalone prune records the invocation-selected executable in canonical metadata")
+    func standalonePruneRecordsExecutableOverride() async throws {
+        let env = Self.makeEnv(script: [], retention: nil, reachableSecondaries: [])
+        defer { env.cleanUp() }
+        let selectedRestic = "/opt/validated/restic"
+        env.fake.script = [
+            .init(argvPrefix: [selectedRestic, "-r", env.primary.repoURL, "prune"]),
+        ]
+
+        let status = await env.engine.runPruneRepository(
+            set: env.set,
+            destination: env.primary,
+            resticExecutablePath: selectedRestic
+        )
+
+        #expect(status == .completed(.success))
+        let prune = try #require(env.entries(kind: .prune).first)
+        let metadata = try env.runStore.metadata(runId: prune.runId)
+        #expect(metadata.argvRedacted == env.fake.invocations[0].argv)
+        #expect(metadata.argvRedacted.first == selectedRestic)
+    }
+
     @Test("standalone prune: a terminal run-index failure cannot report success")
     func standalonePruneIndexFailureCannotReportSuccess() async throws {
         let paths = Box<AppPaths?>(nil)
@@ -1840,11 +1975,12 @@ struct BackupEngineTests {
 
         let result = await env.engine.runPruneRepository(set: env.set, destination: env.primary)
 
-        guard case .failed(.infrastructure(let reason)) = result else {
+        guard case .failed(.auditInfrastructure(let reason, let runId)) = result else {
             Issue.record("a missing terminal index entry must fail standalone prune: \(result)")
             return
         }
-        #expect(reason.contains("run history unusable"))
+        #expect(reason.contains("operation_completed_audit_failed"))
+        #expect(runId.contains("-prune-"))
         #expect(env.indexEntries.isEmpty)
     }
 
@@ -1874,11 +2010,12 @@ struct BackupEngineTests {
 
         let result = await env.engine.runPruneRepository(set: env.set, destination: env.primary)
 
-        guard case .failed(.infrastructure(let reason)) = result else {
+        guard case .failed(.auditInfrastructure(let reason, let runId)) = result else {
             Issue.record("combined launch/index failure must stay infrastructure failure: \(result)")
             return
         }
-        #expect(reason.contains("run history unusable"))
+        #expect(reason.contains("operation_completed_audit_failed"))
+        #expect(runId.contains("-prune-"))
         #expect(env.indexEntries.isEmpty)
     }
 
@@ -1926,11 +2063,12 @@ struct BackupEngineTests {
 
         let result = await env.engine.runPruneRepository(set: set, destination: destination)
 
-        guard case .failed(.infrastructure(let reason)) = result else {
+        guard case .failed(.auditInfrastructure(let reason, let runId)) = result else {
             Issue.record("a missing terminal index entry must fail remote prune: \(result)")
             return
         }
-        #expect(reason.contains("run history unusable"))
+        #expect(reason.contains("operation_completed_audit_failed"))
+        #expect(runId.contains("-prune-"))
         #expect(env.indexEntries.isEmpty)
     }
 
@@ -1967,6 +2105,10 @@ struct BackupEngineTests {
         #expect(env.resticArgvs.isEmpty, "remote maintenance must not fall back to local restic")
         let prune = try #require(env.entries(kind: .prune).first)
         #expect(env.log(runId: prune.runId).contains("repo-password") == false)
+        let metadata = try env.runStore.metadata(runId: prune.runId)
+        #expect(metadata.argvRedacted == env.fake.invocations[1].argv)
+        #expect(metadata.argvRedacted.contains("'-p'"))
+        #expect(metadata.argvRedacted.contains("'/dev/stdin'"))
     }
 
     @Test("standalone prune: unavailable SFTP remote maintenance never starts local restic")
@@ -2298,6 +2440,38 @@ struct BackupEngineTests {
         #expect(completed == .completed(.success))
     }
 
+    @Test("standalone prune: destructive audit contention is retryable and retains its preview token")
+    func standalonePruneAuditGateContentionRetainsPreviewToken() async throws {
+        let env = Self.makeEnv(script: [], retention: nil)
+        defer { env.cleanUp() }
+        let fingerprint = env.primary.pruneConfirmationFingerprint(secretEnv: [:])
+        let token = try PreviewTokenStore(paths: env.paths).issueMaintenancePrune(
+            machineId: env.machineId,
+            setId: env.set.id,
+            destinationId: env.primary.id,
+            effectiveDestinationFingerprint: fingerprint
+        )
+        let authorization = MaintenancePruneAuthorization(
+            token: token,
+            machineId: env.machineId,
+            effectiveDestinationFingerprint: fingerprint
+        )
+        let gate = FileLock(path: env.paths.destructiveAuditLockFile, trustedRoot: env.paths.root)
+        #expect(gate.acquire() == .acquired)
+
+        let result = await env.engine.runPruneRepository(
+            set: env.set,
+            destination: env.primary,
+            authorization: authorization
+        )
+        gate.release()
+
+        #expect(result == .skipped(.busy))
+        #expect(try PreviewTokenStore(paths: env.paths).token(token).value == token)
+        #expect(env.fake.invocations.isEmpty)
+        #expect(env.entries(kind: .prune).isEmpty)
+    }
+
     @Test("standalone prune: an invalid confirmation remains previewChanged")
     func standalonePruneInvalidConfirmationIsPreviewChanged() async throws {
         let env = Self.makeEnv(script: [], retention: nil)
@@ -2549,11 +2723,19 @@ struct BackupEngineTests {
             ),
         ]
 
-        let result = try await env.engine.runPurge(
-            set: env.set, destinations: [env.primary], token: token.value
-        )
-
-        #expect(result.status == .failed)
+        do {
+            _ = try await env.engine.runPurge(
+                set: env.set, destinations: [env.primary], token: token.value
+            )
+            Issue.record("a pre-launch executable swap must abort the purge apply")
+        } catch let error as PurgeApplyError {
+            guard case .infrastructureFailure(_, let operationMayHaveRun) = error else {
+                Issue.record("expected infrastructure failure, got \(error)")
+                return
+            }
+            #expect(!operationMayHaveRun)
+        }
+        #expect(throws: Never.self) { _ = try env.engine.purgeTokenDestinationIDs(token.value) }
         // The decisive assertion: no rewrite argv was ever produced.
         #expect(!env.resticArgvs.contains { $0.contains("rewrite") })
     }
@@ -2737,11 +2919,19 @@ struct BackupEngineTests {
             ),
         ]
 
-        let result = try await env.engine.runPurge(
-            set: env.set, destinations: [env.primary], token: token.value
-        )
-
-        #expect(result.status == .failed)
+        do {
+            _ = try await env.engine.runPurge(
+                set: env.set, destinations: [env.primary], token: token.value
+            )
+            Issue.record("a cache-defeating executable swap must abort the purge apply")
+        } catch let error as PurgeApplyError {
+            guard case .infrastructureFailure(_, let operationMayHaveRun) = error else {
+                Issue.record("expected infrastructure failure, got \(error)")
+                return
+            }
+            #expect(!operationMayHaveRun)
+        }
+        #expect(throws: Never.self) { _ = try env.engine.purgeTokenDestinationIDs(token.value) }
         #expect(
             !env.resticArgvs.contains { $0.contains("rewrite") },
             "a cache-defeating in-place swap must not reach the destructive command"
@@ -3046,6 +3236,106 @@ struct BackupEngineTests {
         #expect(throws: Never.self) { _ = try env.engine.purgeTokenDestinationIDs(token.value) }
     }
 
+    @Test("a busy destructive audit gate does not spend the purge token")
+    func purgeApplyBusyAuditGatePreservesToken() async throws {
+        let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]
+        let hostnames = [Self.setId: Set(["example-mac.local"])]
+        let env = Self.makeEnv(
+            script: [], retention: nil, purgeExcludes: ["build/**"], reachableSecondaries: [],
+            purgeSourcePaths: sourcePaths, purgeHostnames: hostnames
+        )
+        defer { env.cleanUp() }
+
+        let snapshotsJSON = try FixtureLoader.string("snapshots.json")
+        let snapshots = try parseSnapshots(Data(snapshotsJSON.utf8))
+        let plan = PurgePlan(
+            destinationId: env.primary.id,
+            snapshots: snapshots,
+            sourcePaths: sourcePaths[Self.setId]!,
+            hostnames: hostnames[Self.setId]!,
+            patterns: env.set.purgeExcludes
+        )
+        let token = try #require(try env.engine.issuePurgeToken(
+            set: env.set,
+            destinations: [env.primary],
+            plans: [plan],
+            executable: try env.requireResticExecutable()
+        ))
+        env.fake.script = [
+            .init(
+                argvPrefix: [env.resticPath, "-r", env.primary.repoURL, "snapshots", "--json"],
+                stdoutLines: [snapshotsJSON]
+            ),
+        ]
+
+        let gate = FileLock(path: env.paths.destructiveAuditLockFile, trustedRoot: env.paths.root)
+        #expect(gate.acquire() == .acquired)
+        await #expect(throws: PurgeApplyError.busy) {
+            _ = try await env.engine.runPurge(
+                set: env.set,
+                destinations: [env.primary],
+                token: token.value
+            )
+        }
+        gate.release()
+
+        #expect(throws: Never.self) { _ = try env.engine.purgeTokenDestinationIDs(token.value) }
+        #expect(!env.resticArgvs.contains { $0.contains("rewrite") })
+    }
+
+    @Test("purge verifies abandoned audit evidence immediately after acquiring the gate")
+    func purgeApplyRejectsAbandonedAuditBeforeRepositoryQueries() async throws {
+        let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]
+        let hostnames = [Self.setId: Set(["example-mac.local"])]
+        let env = Self.makeEnv(
+            script: [], retention: nil, purgeExcludes: ["build/**"], reachableSecondaries: [],
+            purgeSourcePaths: sourcePaths, purgeHostnames: hostnames
+        )
+        defer { env.cleanUp() }
+
+        let snapshotsJSON = try FixtureLoader.string("snapshots.json")
+        let snapshots = try parseSnapshots(Data(snapshotsJSON.utf8))
+        let plan = PurgePlan(
+            destinationId: env.primary.id,
+            snapshots: snapshots,
+            sourcePaths: sourcePaths[Self.setId]!,
+            hostnames: hostnames[Self.setId]!,
+            patterns: env.set.purgeExcludes
+        )
+        let token = try #require(try env.engine.issuePurgeToken(
+            set: env.set,
+            destinations: [env.primary],
+            plans: [plan],
+            executable: try env.requireResticExecutable()
+        ))
+        let abandoned = try env.runStore.begin(
+            kind: .prune,
+            setId: UUID(),
+            destId: UUID(),
+            trigger: .manual
+        )
+        try env.runStore.markDestructiveLaunchAuthorized(abandoned)
+
+        var thrown: PurgeApplyError?
+        do {
+            _ = try await env.engine.runPurge(
+                set: env.set,
+                destinations: [env.primary],
+                token: token.value
+            )
+        } catch let error as PurgeApplyError {
+            thrown = error
+        }
+        guard case .auditFailure(_, let operationMayHaveRun, let runId) = try #require(thrown) else {
+            Issue.record("expected structured prior-audit failure, got \(String(describing: thrown))")
+            return
+        }
+        #expect(!operationMayHaveRun)
+        #expect(runId == abandoned.runId)
+        #expect(env.resticArgvs.isEmpty, "no repository query or destructive argv may run first")
+        #expect(throws: Never.self) { _ = try env.engine.purgeTokenDestinationIDs(token.value) }
+    }
+
     /// The classification half of #118, and a second instance of the same
     /// defect the review found: `issuePurgeToken` let a bare
     /// `PreviewTokenError` escape, where `runPurgeLocked` wraps its own.
@@ -3117,10 +3407,20 @@ struct BackupEngineTests {
     func purgeApplyUsesTokenAndRecordsMapping() async throws {
         let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]
         let hostnames = [Self.setId: Set(["example-mac.local"])]
+        let paths = Box<AppPaths?>(nil)
+        let gateWasHeldDuringRevalidation = Box(false)
         let env = Self.makeEnv(
             script: [], retention: nil, purgeExcludes: ["build/**"], reachableSecondaries: [],
+            onSpawn: { argv in
+                guard argv.contains("snapshots"), let paths = paths.value else { return }
+                let probe = FileLock(path: paths.destructiveAuditLockFile, trustedRoot: paths.root)
+                let result = probe.acquire()
+                gateWasHeldDuringRevalidation.value = result == .busy
+                if result == .acquired { probe.release() }
+            },
             purgeSourcePaths: sourcePaths, purgeHostnames: hostnames
         )
+        paths.value = env.paths
         defer { env.cleanUp() }
 
         let snapshotsJSON = try FixtureLoader.string("snapshots.json")
@@ -3152,6 +3452,7 @@ struct BackupEngineTests {
         let result = try await env.engine.runPurge(set: env.set, destinations: [env.primary], token: token.value)
 
         #expect(result.status == .success)
+        #expect(gateWasHeldDuringRevalidation.value)
         #expect(env.resticArgvs == [
             [Self.resticPath, "-r", env.primary.repoURL, "snapshots", "--json"],
             [Self.resticPath] + Self.rewriteArgv(
@@ -3223,6 +3524,74 @@ struct BackupEngineTests {
             #expect(!operationMayHaveRun)
         }
         #expect(!env.resticArgvs.contains { $0.contains("rewrite") })
+        #expect(
+            throws: Never.self,
+            "a first-child pre-launch failure must leave the reviewed token retryable"
+        ) {
+            _ = try env.engine.purgeTokenDestinationIDs(token.value)
+        }
+    }
+
+    @Test("runPurge: a first-child launch failure restores the token and aborts later destinations")
+    func purgeLaunchFailureRestoresTokenAndAbortsLaterDestinations() async throws {
+        let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]
+        let hostnames = [Self.setId: Set(["example-mac.local"])]
+        let env = Self.makeEnv(
+            script: [], retention: nil, purgeExcludes: ["build/**"], reachableSecondaries: [true],
+            purgeSourcePaths: sourcePaths, purgeHostnames: hostnames
+        )
+        defer { env.cleanUp() }
+
+        let snapshotsJSON = try FixtureLoader.string("snapshots.json")
+        let snapshots = try parseSnapshots(Data(snapshotsJSON.utf8))
+        let secondary = try #require(env.secondaries.first)
+        let orderedDestinations = [env.primary, secondary].sorted { $0.id.uuidString < $1.id.uuidString }
+        let plans = orderedDestinations.map { destination in
+            PurgePlan(
+                destinationId: destination.id,
+                snapshots: snapshots,
+                sourcePaths: sourcePaths[Self.setId]!,
+                hostnames: hostnames[Self.setId]!,
+                patterns: env.set.purgeExcludes
+            )
+        }
+        let token = try #require(try env.engine.issuePurgeToken(
+            set: env.set, destinations: orderedDestinations, plans: plans,
+            executable: try env.requireResticExecutable()
+        ))
+        env.fake.script = orderedDestinations.flatMap { destination in
+            Self.resticCall(
+                ["-r", destination.repoURL, "snapshots", "--json"],
+                dest: destination.id,
+                stdoutLines: [snapshotsJSON]
+            )
+        } + [
+            .init(
+                argvPrefix: [Self.resticPath] + Self.rewriteArgv(
+                    orderedDestinations[0].repoURL,
+                    snapshotIDs: snapshots.map(\.id),
+                    patterns: env.set.purgeExcludes
+                ),
+                failure: .launchFailed("restic disappeared")
+            ),
+        ]
+
+        do {
+            _ = try await env.engine.runPurge(
+                set: env.set, destinations: orderedDestinations, token: token.value
+            )
+            Issue.record("a failed first launch must abort the complete purge apply")
+        } catch let error as PurgeApplyError {
+            guard case .infrastructureFailure(_, let operationMayHaveRun) = error else {
+                Issue.record("expected infrastructure failure, got \(error)")
+                return
+            }
+            #expect(!operationMayHaveRun)
+        }
+
+        #expect(throws: Never.self) { _ = try env.engine.purgeTokenDestinationIDs(token.value) }
+        #expect(env.resticArgvs.filter { $0.contains("rewrite") }.count == 1)
+        #expect(env.resticArgvs.last?.contains(orderedDestinations[0].repoURL) == true)
     }
 
     @Test("runPurge: terminal run-history failure reports that destructive work may have run")
@@ -3284,12 +3653,13 @@ struct BackupEngineTests {
             )
             Issue.record("a missing terminal run record must fail the purge")
         } catch let error as PurgeApplyError {
-            guard case .infrastructureFailure(let reason, let operationMayHaveRun) = error else {
+            guard case .auditFailure(let reason, let operationMayHaveRun, let runId) = error else {
                 Issue.record("expected infrastructure failure, got \(error)")
                 return
             }
-            #expect(reason.contains("run history unusable"))
+            #expect(reason.contains("operation_completed_audit_failed"))
             #expect(operationMayHaveRun)
+            #expect(runId.contains("-purge-"))
         }
         #expect(env.resticArgvs.contains { $0.contains("rewrite") && $0.contains("--forget") })
     }

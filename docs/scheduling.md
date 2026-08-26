@@ -220,6 +220,10 @@ exits on `HealthDerivation.hasWarningConditions`, which is the same rules
 without that precedence. Both read one shared predicate, so "what counts as a
 problem" has exactly one definition.
 
+An unresolved destructive audit failure is the exception: `critical`
+outranks `running`, exits 1, and blocks further destructive launches until
+the canonical run evidence is reconciled.
+
 The `null`/`unknown` cases contribute nothing to health, exactly as an absent
 `fda-check.json` does. `status` used to assert `backgroundAgentEnabled: true`
 on every platform, which read as "the scheduler is fine" and meant a Linux
@@ -342,6 +346,8 @@ The operation-exclusion locks use `flock(2)` `LOCK_EX | LOCK_NB` on files under 
 | Lock | Held by | Purpose |
 |---|---|---|
 | `tick.lock` | the whole tick | prevent overlapping scheduled evaluations when a backup outlives StartInterval |
+| `destructive-audit.lock` | destructive audit verification through terminal commit | serialize the fail-closed audit gate across every set; kernel release distinguishes a live helper from a recycled PID |
+| `run-publication.lock` | run-directory publication and destructive-audit verification | prevent a verifier from observing a run directory before its initial metadata; separately serialize verifiers so their contention is never mistaken for a live destructive operation |
 | `set-<setId>.lock` | any run touching that set (scheduled or manual, incl. restore & prune) | one operation per set at a time |
 | `health.lock` | a live health probe | exercise the backing filesystem's actual `flock(2)` support without contending with production work |
 | `state/health.lock`, `runs/health.lock` | a live health probe | exercise `flock(2)` on state/run filesystems when they are separate mounts |

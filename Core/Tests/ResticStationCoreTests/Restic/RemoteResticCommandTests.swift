@@ -29,6 +29,22 @@ import Testing
         #expect(command.password == Data("secret\n".utf8))
     }
 
+    @Test("passwordless construction exposes the exact redacted launch argv")
+    func passwordlessCommandExposesLaunchArgv() {
+        let pending = RemoteResticCommand(
+            sshTarget: "backup@example",
+            resticPath: "/usr/local/bin/restic",
+            repoPath: "/repo",
+            dryRun: false
+        )
+        let launched = pending.withPassword("secret")
+
+        #expect(pending.passwordStdinArgv == launched.argv)
+        #expect(pending.passwordStdinArgv.contains("'-p'"))
+        #expect(pending.passwordStdinArgv.contains("'/dev/stdin'"))
+        #expect(!pending.passwordStdinArgv.contains("secret"))
+    }
+
     @Test("remote version has no repository or password operands")
     func versionIsRemoteOnly() throws {
         let command = RemoteResticCommand.version(sshTarget: "user@host", resticPath: "/opt/restic")

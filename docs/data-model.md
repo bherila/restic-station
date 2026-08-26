@@ -302,7 +302,111 @@ Secret-env item is optional (absent for local/sftp destinations without credenti
 
 ## runs/<runId>/metadata.json — `RunMetadata`
 
-Superset of the index line, plus: `pid`, `resticExitCode`, `argvRedacted` (argv with env not included), `stats` (full decoded summary message where applicable), `groupId`. A successful `purge` run additionally carries `purgeSnapshotRewrites`, an old full snapshot id → new snapshot id mapping. It is an audit record only: older run records continue to name their historical snapshot ids. Written once at start (`status: "running"`, no `end`) and atomically rewritten on completion.
+Superset of the index line, plus: `pid`, `resticExitCode`, `argvRedacted` (argv with env not included), `stats` (full decoded summary message where applicable), `groupId`, `destructiveAuditContractVersion`, `destructiveLaunchAuthorizedAt`, and `auditFailureReason`. A successful `purge` run additionally carries `purgeSnapshotRewrites`, an old full snapshot id → new snapshot id mapping. It is an audit record only: older run records continue to name their historical snapshot ids. Written once at start (`status: "running"`, no `end`) and atomically rewritten on completion.
+
+### Normative destructive-operation audit contract
+
+`runs/<runId>/metadata.json` is the canonical record. `runs/index.jsonl` is a
+derived, append-only projection used for history queries; it never overrides
+metadata. Reconciliation therefore proceeds **from metadata toward the
+index**, never the reverse.
+
+For `prune` (retention or standalone pack reclamation) and `purge`,
+"operation started" means the helper has passed secret, executable and
+confirmation preflights, persisted `destructiveLaunchAuthorizedAt`, and is
+about to hand the exact argv to the process runner. Before that boundary the
+run is safely unstarted. The run directory and initial metadata must exist,
+`log.txt` must be open, and the exact redacted argv must be persisted in the
+same metadata rewrite as the marker before the marker may be written. Failure
+of any of those prerequisites refuses process creation. The crash-durability details
+that make these successful writes survive power loss are specified by #120;
+they do not weaken this ordering or the fail-closed launch rule.
+
+New destructive records persist `destructiveAuditContractVersion: 1` in their
+initial metadata, making a markerless current-version record affirmative
+evidence that launch has not yet been authorized. A markerless `running`
+record with a missing or unknown contract version predates that guarantee and
+fails closed as an unknown repository outcome until an operator reconciles it.
+
+One machine-wide `locks/destructive-audit.lock` serializes verification,
+launch, and terminal audit commit across every set. The helper acquires it
+before checking for unresolved evidence and holds it until terminal metadata
+and its index projection are committed. This closes the cross-set race in
+which two helpers could both pass verification before either recorded an
+audit failure. A single manual retention request holds the gate across its
+primary and every eligible mirror, so contention cannot turn a partially
+applied multi-repository request into an apparent success. A separate
+`locks/run-publication.lock` serializes audit scans
+with the directory-plus-initial-metadata publication performed by every run,
+so a verifier cannot mistake the writer's own mkdir-to-metadata interval for
+corruption. It also serializes read-only verifiers; contention between two
+scans therefore cannot be mistaken for ownership of the destructive gate. A
+terminal metadata rewrite and its index append, including crash recovery,
+hold that same publication lock as one verifier-visible transaction. A scan
+therefore cannot observe the canonical half of an ordinary finish without
+its derived projection. Audit readers snapshot the index bytes and canonical
+metadata bytes under the lock, then release it before decoding and comparing
+the full history. Publishers wait for that finite snapshot without timing
+out; a read-only health scan must never cause a post-operation terminal audit
+commit to fail. A failed first metadata write removes the unpublished run
+directory before releasing the lock, so it cannot leave permanent
+directory-shaped audit wreckage. A running launch marker is considered live
+only while the kernel-released
+destructive gate is held and its helper PID exists; PID existence alone is
+never trusted because PIDs are reusable. For run directories using the current
+documented runId format, the operation kind encoded in metadata must match the
+independently encoded kind in the directory name before a non-destructive
+record may be excluded from this audit scan. Older directories without an
+encoded kind remain readable; their fully decoded destructive metadata is
+still subject to the same audit rules.
+
+Repository outcome and audit outcome are independent axes:
+
+| Repository outcome | Audit complete | Audit incomplete |
+|---|---|---|
+| Not started | terminal failed/skipped evidence may be recorded; retry follows the ordinary typed error | infrastructure failure, but no destructive work may have run |
+| Known success, warning, or failure | terminal metadata plus exactly one matching index projection; normal policy applies | `operation_completed_audit_failed`; nonzero helper exit, critical health, never automatic retry |
+| Unknown after the launch boundary | terminal `auditFailureReason: repository_outcome_unknown` preserves that uncertainty | `operation_completed_audit_failed`; nonzero helper exit, critical health, never automatic retry |
+
+`operationMayHaveRun == false` permits a caller to correct the stated local
+prerequisite and submit a fresh request. `operationMayHaveRun == true`
+requires the caller to stop: it must not advise or perform an identical
+destructive retry. It must surface `operation_completed_audit_failed`, name
+the diagnostic run id when available, and require repository inspection plus
+run-history reconciliation first. A timeout or lost child after the launch
+boundary is conservative: absence of a reported outcome is not proof that no
+repository mutation occurred, so terminal metadata retains
+`repository_outcome_unknown` even when that terminal record and index append
+both succeed.
+
+Reconciliation runs on helper recovery and explicit history repair. It is
+idempotent. It may append one missing index projection for terminal canonical
+metadata and may convert a dead, still-running non-destructive record to the
+existing `failed/interrupted` outcome. A dead destructive record carrying a
+launch marker must instead retain
+`auditFailureReason: launched_without_terminal_metadata`; reconciliation may
+index that condition but must not invent a repository result or clear the
+critical condition. Only an explicit repair after human inspection may clear
+that uncertainty. Repeated reconciliation must neither append duplicates nor
+alter an already terminal repository outcome.
+
+Verification requires every run directory's canonical `metadata.json` to be
+readable and decodable. It fails closed on missing or corrupt canonical
+evidence instead of skipping the directory. A terminal destructive record is
+complete only when the index contains exactly one projection equal to
+`metadata.indexEntry`; an absent, duplicate, or divergent projection remains
+critical until #120's reconciliation repairs it. Conversely, a destructive
+index projection whose entire canonical run directory is missing reports
+`canonical_metadata_missing`; a directory-driven scan must never silently
+authorize another destructive launch after that loss.
+
+`status --json` exposes unresolved entries in `auditFailures`, each with
+`code: "operation_completed_audit_failed"` and `retryable: false`, and reports
+global `health: "critical"`. New destructive launches are refused while any
+such entry remains unresolved; read-only inspection and non-destructive
+backups remain available. The app re-runs this liveness-sensitive audit check
+on its 30-second health cadence because process death releases a flock without
+creating a filesystem event.
 
 ## state/schedule-state.json
 
@@ -505,9 +609,10 @@ Reads recorded state (`state/schedule-state.json`, `state/current-run-*.json`, `
 
 It also inspects the platform scheduler: the same `SystemdTimerManager` used by `timer status` on Linux, and `launchctl print gui/$UID/net.herila.ResticStation.helper` on macOS. See `scheduling.md` §`status` and the scheduler. Only a definite `false` contributes a warning; a failed probe reports `healthy: null`.
 
-Three things `status` will **not** do quietly, all of which used to make it report healthy for the wrong reason:
+Five things `status` will **not** do quietly, all of which would make it report healthy for the wrong reason:
 
 - An **unreadable `runs/index.jsonl`** (wrong owner, wrong mode, I/O error) exits non-zero naming the file, instead of reading as "no runs recorded" — which derives to idle, which exits 0. A corrupt or truncated *line* stays survivable: `RunStore.recentRuns` skips it with a warning, as documented above.
+- An **unresolved destructive audit failure** reports `critical`, populates `auditFailures`, exits non-zero, and prevents any later destructive launch. It is never flattened into an ordinary failed run whose retry policy is ambiguous.
 - An **abandoned `current-run-*.json`** (see §state/current-run) reports `warning` with `abandonedRun` populated and `isRunning: false`, instead of `running`.
 - A **stalled run** whose process still exists but has stopped heartbeating reports `warning` with `stalledRun` and `stalledRunLog` populated. It is never offered as safe-to-delete wreckage.
 - **Locking that does not work** — `locks/` uncreatable, uninspectable, or unsafe; unsupported `flock(2)`; inability to allocate a fresh lock inode; a production lock file owned by another user; a symlink where one should be — reports `locking.usable: false` and exits non-zero. `locking.scope` is `"set"` with the first detected affected `setId` for damaged set locks, `"administrative"` when only the mutation-only `secrets.lock` is damaged, and otherwise `"machine"` for a shared operation lock, directory, or filesystem-capability failure. Intrinsic damage confined to a dedicated `health.lock` or `.health/` scratch artifact instead reports `locking.usable: null`, `locking.scope: "diagnostic"`, and exits non-zero: monitoring is inconclusive, but production locks were not proven unusable. A failed `flock(2)` check or fresh-inode allocation remains machine-scoped even when its path is health-only, because production acquisition relies on the same capability. Human output preserves those distinctions and says either secret changes or one or more sets may be affected rather than understating a simultaneous broader outage. This is probed *live* rather than read from recorded state: the fault it describes is usually the reason nothing could be recorded. Machine-wide faults outrank `running`, because a stale `current-run-*.json` is exactly what such a machine tends to be left holding. See `scheduling.md` §Locking.
@@ -556,12 +661,13 @@ Three things `status` will **not** do quietly, all of which used to make it repo
       ]
     }
   ],
+  "auditFailures": [],
   "unattributedRuns": [],
   "excludedHere": []
 }
 ```
 
-`health`: `"idle"` | `"running"` | `"warning"` (`AppHealth.rawValue`). Exit code: **0** for `idle`/`running`, **1** for `warning` — usable directly as a Nagios/Icinga-style check. `lastBackup`/`lastCheck`/`lastPrune` are `null` before any attempt of that kind; `reachable` is `null` — never `false` — for a destination that has not been probed yet (`state/repo-status-<destId>.json` absent), the same "absent means not yet known, never a definite negative" rule `fda-check.json` uses. `firstBackupOverdue` explains the otherwise-empty warning for a never-attempted set. `excludedHere` has the same shape as `config show`'s.
+`health`: `"idle"` | `"running"` | `"warning"` | `"critical"` (`AppHealth.rawValue`). Exit code: **0** for `idle`/`running`, **1** for `warning`/`critical` — usable directly as a Nagios/Icinga-style check. `critical` is reserved for unresolved destructive audit failures and outranks a concurrently running backup. `auditFailures` is always present; each entry carries `code: "operation_completed_audit_failed"`, the run/set/destination identifiers, the bounded reason enum, and `retryable: false`. `lastBackup`/`lastCheck`/`lastPrune` are `null` before any attempt of that kind; `reachable` is `null` — never `false` — for a destination that has not been probed yet (`state/repo-status-<destId>.json` absent), the same "absent means not yet known, never a definite negative" rule `fda-check.json` uses. `firstBackupOverdue` explains the otherwise-empty warning for a never-attempted set. `excludedHere` has the same shape as `config show`'s.
 
 `unattributedRuns` contains any `current-run-<setId>.json` whose set is no longer in this machine's resolved configuration. Each entry carries the missing `setId`, `liveness` (`"live"`, `"stalled"`, or `"abandoned"`), the usual `currentRun` summary, and the exact `currentRunFile`. These runs still determine top-level health and the exit code, so an empty `sets` array never leaves their effect unexplained. Human output names the same run; abandoned entries print a shell-quoted cleanup command, while stalled entries direct the operator to the run log.
 

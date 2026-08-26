@@ -27,6 +27,14 @@ public struct ActiveRun: Equatable, Sendable {
     public var argvRedacted: [String]
 }
 
+/// The one field audit verification may inspect without trusting the rest of
+/// a metadata record. Historical non-destructive fixtures and records are not
+/// part of the destructive contract; once their kind is known, malformed
+/// unrelated fields must not prevent status from verifying destructive runs.
+private struct RunAuditDiscriminator: Decodable {
+    let kind: RunKind
+}
+
 /// One run `recoverInterrupted()` rewrote from `.running` to `.failed`.
 ///
 /// Carries the `setId` as well as the `runId` because the caller has a second
@@ -76,6 +84,19 @@ public enum RunStoreError: Error, Equatable, Sendable, CustomStringConvertible {
     /// The `index.jsonl` companion lock could not be acquired within the
     /// bounded retry window — see `RunStore.indexLockTimeout`.
     case indexLockTimeout(path: String)
+    /// A run publisher or audit verifier could not enter their short shared
+    /// critical section within the bounded retry window.
+    case publicationLockTimeout(path: String)
+    /// The independently encoded kind in a current-format run directory name
+    /// disagrees with metadata.
+    case runDirectoryKindMismatch(path: String, encodedKind: RunKind)
+    /// Destructive metadata is canonical only at `runs/<metadata.runId>`.
+    /// Accepting it under another directory could hide the disappearance of
+    /// the real canonical record from the orphan-index audit.
+    case runDirectoryIDMismatch(path: String, encodedRunId: String)
+    /// Initial metadata publication failed after its fresh run directory was
+    /// created, and removing that unpublished directory failed too.
+    case initialPublicationCleanupFailed(path: String, publicationError: String, cleanupError: String)
     /// The `index.jsonl` companion lock could not be used at all — wrong
     /// owner, unopenable, or an uncreatable `runs/` (#110).
     case lockUnusable(LockFailure)
@@ -90,8 +111,16 @@ public enum RunStoreError: Error, Equatable, Sendable, CustomStringConvertible {
             return "refusing to discard non-fresh run metadata at \(path)"
         case .indexLockTimeout(let path):
             return "timed out waiting for index lock \(path)"
+        case .publicationLockTimeout(let path):
+            return "timed out waiting for run-publication lock \(path)"
+        case .runDirectoryKindMismatch(let path, let encodedKind):
+            return "run directory kind does not match metadata kind \(encodedKind.rawValue): \(path)"
+        case .runDirectoryIDMismatch(let path, let encodedRunId):
+            return "run directory name does not match metadata run ID \(encodedRunId): \(path)"
+        case .initialPublicationCleanupFailed(let path, let publicationError, let cleanupError):
+            return "initial run publication failed at \(path): \(publicationError); cleanup also failed: \(cleanupError)"
         case .lockUnusable(let failure):
-            return "run-index lock unusable: \(failure)"
+            return "run-store lock unusable: \(failure)"
         }
     }
 }
@@ -108,6 +137,8 @@ public struct RunStore: Sendable {
     public let paths: AppPaths
     private let now: @Sendable () -> Date
     private let uptime: @Sendable () -> TimeInterval
+    private let initialPublicationHook: @Sendable (URL) throws -> Void
+    private let publicationLockMaxAttempts: Int
 
     /// Five minutes is ten missed 30-second heartbeats: long enough to absorb
     /// scheduling pressure, short enough for a monitoring check to catch a
@@ -121,6 +152,11 @@ public struct RunStore: Sendable {
     /// should never last anywhere near this long in practice.
     private static let indexLockTimeout: TimeInterval = 5
     private static let indexLockPollInterval: UInt32 = 5_000 // microseconds
+    private static let publicationLockMaxAttempts = 1_000
+    /// Markerless destructive runs created under this contract are known to
+    /// be pre-launch. Missing or unknown versions predate that guarantee and
+    /// are treated as an unknown repository outcome while still running.
+    public static let destructiveAuditContractVersion = 1
 
     public init(paths: AppPaths) {
         self.init(
@@ -141,6 +177,26 @@ public struct RunStore: Sendable {
         self.paths = paths
         self.now = now
         self.uptime = uptime
+        self.initialPublicationHook = { _ in }
+        self.publicationLockMaxAttempts = Self.publicationLockMaxAttempts
+    }
+
+    /// Fault-injection seam for the publication rollback regression test.
+    /// Kept internal so production callers cannot insert work between the
+    /// directory creation and first canonical metadata commit.
+    init(
+        paths: AppPaths,
+        now: @escaping @Sendable () -> Date,
+        uptime: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+        initialPublicationHook: @escaping @Sendable (URL) throws -> Void,
+        publicationLockMaxAttempts: Int = 1_000
+    ) {
+        precondition(publicationLockMaxAttempts > 0)
+        self.paths = paths
+        self.now = now
+        self.uptime = uptime
+        self.initialPublicationHook = initialPublicationHook
+        self.publicationLockMaxAttempts = publicationLockMaxAttempts
     }
 
     // MARK: - begin / finish
@@ -161,6 +217,13 @@ public struct RunStore: Sendable {
         groupId: String? = nil
     ) throws -> ActiveRun {
         try paths.ensureDirectories()
+
+        // A verifier must never observe the directory between mkdir and its
+        // first metadata commit. The separate publication lock also lets two
+        // read-only verifiers serialize without pretending one is a running
+        // destructive helper.
+        let publicationLock = try acquireRunPublicationLock(waitIndefinitely: true)
+        defer { publicationLock.release() }
 
         let start = now()
         let runId = try allocateRunId(kind: kind, setId: setId, start: start)
@@ -186,10 +249,29 @@ public struct RunStore: Sendable {
             dataAdded: nil,
             errorSummary: nil,
             stats: nil,
-            purgeSnapshotRewrites: nil
+            purgeSnapshotRewrites: nil,
+            destructiveAuditContractVersion: kind.isDestructive
+                ? Self.destructiveAuditContractVersion
+                : nil
         )
-        try FileManager.default.createDirectory(at: paths.runDir(runId: runId), withIntermediateDirectories: true)
-        try writeMetadataAtomic(metadata)
+        let runDirectory = paths.runDir(runId: runId)
+        try FileManager.default.createDirectory(at: runDirectory, withIntermediateDirectories: true)
+        do {
+            try initialPublicationHook(runDirectory)
+            try writeMetadataAtomic(metadata)
+        } catch {
+            let publicationError = String(describing: error)
+            do {
+                try FileManager.default.removeItem(at: runDirectory)
+            } catch let cleanupError {
+                throw RunStoreError.initialPublicationCleanupFailed(
+                    path: runDirectory.path,
+                    publicationError: publicationError,
+                    cleanupError: String(describing: cleanupError)
+                )
+            }
+            throw error
+        }
 
         return ActiveRun(
             runId: runId,
@@ -212,8 +294,30 @@ public struct RunStore: Sendable {
         stats: BackupSummary? = nil,
         errorSummary: String? = nil,
         resticExitCode: Int32? = nil,
-        purgeSnapshotRewrites: [String: String]? = nil
+        purgeSnapshotRewrites: [String: String]? = nil,
+        auditFailureReason: RunAuditFailureReason? = nil
     ) throws {
+        // Publish the canonical terminal rewrite and its derived index line
+        // as one verifier-visible transaction. Without this lock a scan can
+        // observe new terminal metadata against the old index snapshot and
+        // permanently misdiagnose an ordinary in-flight finish.
+        let publicationLock = try acquireRunPublicationLock(waitIndefinitely: true)
+        defer { publicationLock.release() }
+
+        // The launch marker is committed separately, immediately before
+        // process creation. Preserve that canonical evidence in the terminal
+        // rewrite. Failing to re-read it is itself an audit failure; do not
+        // replace the record with one that falsely claims no launch occurred.
+        let destructiveLaunchAuthorizedAt: Date?
+        let destructiveAuditContractVersion: Int?
+        if run.kind.isDestructive {
+            let canonical = try metadata(runId: run.runId)
+            destructiveLaunchAuthorizedAt = canonical.destructiveLaunchAuthorizedAt
+            destructiveAuditContractVersion = canonical.destructiveAuditContractVersion
+        } else {
+            destructiveLaunchAuthorizedAt = nil
+            destructiveAuditContractVersion = nil
+        }
         let metadata = RunMetadata(
             runId: run.runId,
             kind: run.kind,
@@ -233,10 +337,31 @@ public struct RunStore: Sendable {
             dataAdded: stats?.dataAdded,
             errorSummary: errorSummary,
             stats: stats,
-            purgeSnapshotRewrites: purgeSnapshotRewrites
+            purgeSnapshotRewrites: purgeSnapshotRewrites,
+            destructiveAuditContractVersion: destructiveAuditContractVersion,
+            destructiveLaunchAuthorizedAt: destructiveLaunchAuthorizedAt,
+            auditFailureReason: auditFailureReason
         )
         try writeMetadataAtomic(metadata)
         try appendIndexEntry(metadata.indexEntry)
+    }
+
+    /// Commits the destructive launch boundary immediately before the argv
+    /// is handed to the process runner. The caller must refuse launch if this
+    /// write fails. It is intentionally separate from `begin`: secret,
+    /// executable and confirmation-token preflights can still fail safely
+    /// before this point.
+    public func markDestructiveLaunchAuthorized(_ run: ActiveRun) throws {
+        precondition(run.kind.isDestructive)
+        var existing = try metadata(runId: run.runId)
+        guard existing.status == .running,
+              existing.runId == run.runId,
+              existing.pid == run.pid else {
+            throw RunStoreError.discardUnsafe(path: paths.runMetadataFile(runId: run.runId).path)
+        }
+        existing.destructiveLaunchAuthorizedAt = now()
+        existing.argvRedacted = run.argvRedacted
+        try writeMetadataAtomic(existing)
     }
 
     /// Removes a just-created run before it reaches the index. This is only
@@ -244,6 +369,9 @@ public struct RunStore: Sendable {
     /// presenting such contention as a failed maintenance run would replace
     /// the last real cleanup despite modifying no repository data.
     public func discardUnstarted(_ run: ActiveRun) throws {
+        let publicationLock = try acquireRunPublicationLock(waitIndefinitely: true)
+        defer { publicationLock.release() }
+
         let directory = paths.runDir(runId: run.runId)
         let metadataURL = directory.appendingPathComponent("metadata.json", isDirectory: false)
         let data = try Data(contentsOf: metadataURL)
@@ -275,6 +403,11 @@ public struct RunStore: Sendable {
     public func recoverInterrupted() throws -> [RecoveredRun] {
         try paths.ensureDirectories()
 
+        // Recovery performs the same terminal metadata + index publication
+        // as finish(), so it must obey the same verifier-visible boundary.
+        let publicationLock = try acquireRunPublicationLock(waitIndefinitely: true)
+        defer { publicationLock.release() }
+
         let fileManager = FileManager.default
         guard let runDirs = try? fileManager.contentsOfDirectory(
             at: paths.runsDir,
@@ -300,7 +433,14 @@ public struct RunStore: Sendable {
             var updated = metadata
             updated.status = .failed
             updated.end = now()
-            updated.errorSummary = "interrupted"
+            if updated.kind.isDestructive,
+               (updated.destructiveLaunchAuthorizedAt != nil
+                   || updated.destructiveAuditContractVersion != Self.destructiveAuditContractVersion) {
+                updated.auditFailureReason = .launchedWithoutTerminalMetadata
+                updated.errorSummary = "operation_completed_audit_failed — destructive operation may have run; repository outcome was not recorded"
+            } else {
+                updated.errorSummary = "interrupted"
+            }
             try writeMetadataAtomic(updated)
             try appendIndexEntry(updated.indexEntry)
             recovered.append(RecoveredRun(runId: metadata.runId, setId: metadata.setId))
@@ -407,6 +547,184 @@ public struct RunStore: Sendable {
         return try ConfigStore.makeDecoder().decode(RunMetadata.self, from: data)
     }
 
+    /// Reconstructs unresolved destructive audit failures from the canonical
+    /// per-run metadata and the derived index. It never mutates either one;
+    /// #120 owns idempotent reconciliation toward metadata.
+    public func unresolvedAuditFailures(
+        callerHoldsDestructiveAuditGate: Bool = false
+    ) throws -> [RunAuditFailure] {
+        let fileManager = FileManager.default
+        guard fileManager.fileExists(atPath: paths.runsDir.path) else { return [] }
+
+        let publicationLock = try acquireRunPublicationLock()
+        var publicationLockHeld = true
+        defer {
+            if publicationLockHeld { publicationLock.release() }
+        }
+
+        var gateProbe: FileLock?
+        let destructiveOperationIsActive: Bool
+        if callerHoldsDestructiveAuditGate {
+            // BackupEngine owns the gate before it scans and has not launched
+            // its new operation yet. Any older running marker is therefore
+            // unresolved, even if its PID has since been recycled.
+            gateProbe = nil
+            destructiveOperationIsActive = false
+        } else {
+            let probe = FileLock(path: paths.destructiveAuditLockFile, trustedRoot: paths.root)
+            switch probe.acquire() {
+            case .acquired:
+                // Keep the probe lock through the scan. This makes the
+                // no-active-operation observation atomic with a new helper's
+                // verify-and-launch sequence.
+                gateProbe = probe
+                destructiveOperationIsActive = false
+            case .busy:
+                gateProbe = nil
+                destructiveOperationIsActive = true
+            case .failed(let failure):
+                throw RunStoreError.lockUnusable(failure)
+            }
+        }
+        defer { gateProbe?.release() }
+
+        // Snapshot only bytes and structural names while publishers are
+        // excluded. JSON decoding, grouping and comparison happen after the
+        // lock is released so a large history cannot hold terminal writers
+        // behind avoidable CPU work. Publishers themselves wait without a
+        // timeout: after restic may have changed a repository, losing the
+        // terminal audit commit is less safe than waiting for a reader.
+        let indexData: Data?
+        if fileManager.fileExists(atPath: paths.runsIndexFile.path) {
+            indexData = try Data(contentsOf: paths.runsIndexFile)
+        } else {
+            indexData = nil
+        }
+        let runDirectories = try fileManager.contentsOfDirectory(
+            at: paths.runsDir,
+            includingPropertiesForKeys: [.isDirectoryKey]
+        )
+        var metadataSnapshots: [(directory: URL, data: Data)] = []
+        for directory in runDirectories {
+            let values = try directory.resourceValues(forKeys: [.isDirectoryKey])
+            guard values.isDirectory == true else { continue }
+            if directory.lastPathComponent == paths.runsIndexLockFile.lastPathComponent
+                || directory.lastPathComponent == paths.runsHealthProbeDir.lastPathComponent {
+                continue
+            }
+            let metadataURL = directory.appendingPathComponent("metadata.json", isDirectory: false)
+            metadataSnapshots.append((directory, try Data(contentsOf: metadataURL)))
+        }
+        publicationLock.release()
+        publicationLockHeld = false
+        // The liveness observation is now captured in
+        // `destructiveOperationIsActive`; decoding cannot change it. Release
+        // the machine-wide gate before CPU-only history work so a large
+        // health scan cannot spuriously defer a real destructive helper.
+        gateProbe?.release()
+        gateProbe = nil
+
+        let indexedEntries = decodeIndexEntries(indexData)
+        let indexedByRunId = Dictionary(grouping: indexedEntries, by: \.runId)
+        let decoder = ConfigStore.makeDecoder()
+        var failures: [RunAuditFailure] = []
+        var canonicalDestructiveRunIds: Set<String> = []
+
+        for snapshot in metadataSnapshots {
+            let directory = snapshot.directory
+            let metadataURL = directory.appendingPathComponent("metadata.json", isDirectory: false)
+            // Canonical evidence that cannot be read must make verification
+            // fail closed. Silently skipping it could hide the very marker
+            // this scan exists to enforce.
+            let data = snapshot.data
+            let discriminator = try decoder.decode(RunAuditDiscriminator.self, from: data)
+            if let directoryKind = Self.runKind(fromRunDirectoryName: directory.lastPathComponent),
+               directoryKind != discriminator.kind {
+                throw RunStoreError.runDirectoryKindMismatch(
+                    path: metadataURL.path,
+                    encodedKind: discriminator.kind
+                )
+            }
+            guard discriminator.kind.isDestructive else { continue }
+            let metadata = try decoder.decode(RunMetadata.self, from: data)
+            guard directory.lastPathComponent == metadata.runId else {
+                throw RunStoreError.runDirectoryIDMismatch(
+                    path: metadataURL.path,
+                    encodedRunId: metadata.runId
+                )
+            }
+            canonicalDestructiveRunIds.insert(metadata.runId)
+            let reason: RunAuditFailureReason?
+            if let recorded = metadata.auditFailureReason {
+                reason = recorded
+            } else if metadata.status == .running {
+                if metadata.destructiveLaunchAuthorizedAt == nil {
+                    // Current running records explicitly identify the
+                    // contract under which a missing marker means safely
+                    // unstarted. Historical running records have no such
+                    // discriminator and therefore fail closed.
+                    reason = metadata.destructiveAuditContractVersion
+                        == Self.destructiveAuditContractVersion
+                        ? nil
+                        : .launchedWithoutTerminalMetadata
+                } else {
+                    reason = destructiveOperationIsActive && Self.isProcessAlive(pid: metadata.pid)
+                        ? nil
+                        : .launchedWithoutTerminalMetadata
+                }
+            } else {
+                // Terminal projection integrity applies to every destructive
+                // record, including pre-contract records with no launch
+                // marker. A legacy marker says nothing about whether its
+                // canonical terminal metadata reached the derived index.
+                let projections = indexedByRunId[metadata.runId] ?? []
+                if projections.isEmpty {
+                    reason = .terminalMetadataMissingIndex
+                } else if projections.count == 1,
+                          projections[0] == metadata.indexEntry {
+                    reason = nil
+                } else {
+                    reason = .terminalMetadataIndexMismatch
+                }
+            }
+            if let reason {
+                failures.append(RunAuditFailure(
+                    runId: metadata.runId,
+                    kind: metadata.kind,
+                    setId: metadata.setId,
+                    destId: metadata.destId,
+                    start: metadata.start,
+                    reason: reason
+                ))
+            }
+        }
+
+        // The index is derived, but a destructive projection with no
+        // canonical record is still evidence of an operation whose durable
+        // audit source disappeared. Directory-driven scans alone would
+        // silently miss exactly that loss.
+        for (runId, projections) in indexedByRunId
+            where projections.contains(where: { $0.kind.isDestructive })
+                && !canonicalDestructiveRunIds.contains(runId) {
+            guard let projection = projections
+                .filter({ $0.kind.isDestructive })
+                .sorted(by: { $0.start < $1.start })
+                .first else { continue }
+            failures.append(RunAuditFailure(
+                runId: runId,
+                kind: projection.kind,
+                setId: projection.setId,
+                destId: projection.destId,
+                start: projection.start,
+                reason: .canonicalMetadataMissing
+            ))
+        }
+
+        return failures.sorted {
+            $0.start == $1.start ? $0.runId < $1.runId : $0.start < $1.start
+        }
+    }
+
     /// `runs/<runId>/log.txt` — see `AppPaths.runLogFile(runId:)`.
     public func logURL(runId: String) -> URL {
         paths.runLogFile(runId: runId)
@@ -417,6 +735,12 @@ public struct RunStore: Sendable {
         guard FileManager.default.fileExists(atPath: indexFile.path) else { return [] }
 
         let data = try Data(contentsOf: indexFile)
+        return decodeIndexEntries(data)
+    }
+
+    private func decodeIndexEntries(_ data: Data?) -> [RunIndexEntry] {
+        guard let data else { return [] }
+        let indexFile = paths.runsIndexFile
         guard let text = String(data: data, encoding: .utf8) else {
             warn("RunStore: \(indexFile.path) is not valid UTF-8; treating as empty")
             return []
@@ -435,6 +759,39 @@ public struct RunStore: Sendable {
             }
         }
         return results
+    }
+
+    /// The kind is a structural part of every run directory name:
+    /// `<timestamp>-<kind>-<set-prefix>[-collision]`. Audit verification
+    /// cross-checks this independent copy before allowing a valid but
+    /// corrupted metadata discriminator to skip the destructive contract.
+    private static func runKind(fromRunDirectoryName name: String) -> RunKind? {
+        let fields = name.split(separator: "-", omittingEmptySubsequences: false)
+        guard fields.count >= 3 else { return nil }
+        return RunKind(rawValue: String(fields[1]))
+    }
+
+    /// Coordinates the mkdir + initial metadata publication with audit
+    /// scans. The lock is deliberately separate from the destructive gate:
+    /// contention here can only mean another publisher/verifier, never proof
+    /// that a recorded destructive PID owns the operation gate.
+    private func acquireRunPublicationLock(waitIndefinitely: Bool = false) throws -> FileLock {
+        let lock = FileLock(path: paths.runPublicationLockFile, trustedRoot: paths.root)
+        var attempt = 0
+        while true {
+            switch lock.acquire() {
+            case .acquired:
+                return lock
+            case .busy:
+                attempt += 1
+                if !waitIndefinitely && attempt >= publicationLockMaxAttempts {
+                    throw RunStoreError.publicationLockTimeout(path: paths.runPublicationLockFile.path)
+                }
+                usleep(Self.indexLockPollInterval)
+            case .failed(let failure):
+                throw RunStoreError.lockUnusable(failure)
+            }
+        }
     }
 
     // MARK: - runId allocation

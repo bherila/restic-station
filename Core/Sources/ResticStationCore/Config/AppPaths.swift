@@ -261,6 +261,20 @@ public struct AppPaths: Equatable, Sendable {
         locksDir.appendingPathComponent("tick.lock", isDirectory: false)
     }
 
+    /// Serializes the verify-launch-terminal-commit sequence for every
+    /// destructive operation across all backup sets. Set locks alone cannot
+    /// close the audit race because two helpers may own different sets.
+    public var destructiveAuditLockFile: URL {
+        locksDir.appendingPathComponent("destructive-audit.lock", isDirectory: false)
+    }
+
+    /// Serializes run-directory publication with destructive audit scans.
+    /// This is distinct from ``destructiveAuditLockFile`` so contention from
+    /// another read-only verifier is never mistaken for a live operation.
+    public var runPublicationLockFile: URL {
+        locksDir.appendingPathComponent("run-publication.lock", isDirectory: false)
+    }
+
     /// Dedicated stable inode used only to verify that the backing
     /// filesystem implements `flock(2)`. It never serializes production
     /// work, so a status probe cannot make a tick skip.

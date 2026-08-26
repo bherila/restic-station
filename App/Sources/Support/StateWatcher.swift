@@ -16,11 +16,11 @@ import Darwin
 /// filesystem events, so a dropped/coalesced notification never causes stale
 /// UI, only a slightly later (bounded by the next filesystem event) refresh.
 ///
-/// All actual reads go through `StateStore`/`RunStore`, which are tolerant
-/// of missing/partial/corrupt files by construction (state is a regenerable
-/// cache, never a source of truth the reader must trust blindly — see
-/// `docs/data-model.md` §Versioning). `StateWatcher` itself never parses
-/// file contents; it only reacts to *that something changed* and re-reads
+/// All actual reads go through `StateStore`/`RunStore`. Regenerable state
+/// caches tolerate missing/partial/corrupt files; destructive canonical run
+/// metadata deliberately fails closed because skipping it could authorize a
+/// second destructive launch. `StateWatcher` itself never parses file
+/// contents; it only reacts to *that something changed* and re-reads
 /// everything through those APIs.
 ///
 /// No polling: every refresh is triggered by a `DispatchSource` filesystem
@@ -42,6 +42,14 @@ public final class StateWatcher: ObservableObject {
     @Published public private(set) var fdaCheck: FdaCheckResult?
     /// `RunStore.recentRuns(limit: 200)`, newest first.
     @Published public private(set) var recentRuns: [RunIndexEntry] = []
+    /// Destructive runs whose launch marker has no complete terminal
+    /// metadata/index pair. Reconstructed from run history on every reload;
+    /// never a second persisted source of truth.
+    @Published public private(set) var auditFailures: [RunAuditFailure] = []
+    /// Verification itself failed, so absence of a decoded failure is not
+    /// evidence of safety. The app treats this as critical and the helper
+    /// reports the underlying state-read error.
+    @Published public private(set) var auditVerificationFailed = false
     /// Live lock-health result, refreshed for state/run writes and every
     /// change under `locks/`. A lock failure can prevent all other writes,
     /// so the lock directory needs its own event source.
@@ -49,6 +57,7 @@ public final class StateWatcher: ObservableObject {
 
     private let paths: AppPaths
     private let runStore: RunStore
+    private let auditHealthLoader: @Sendable () -> AuditHealthRefreshResult
     private let stateStore: StateStore
     private let secretBackend: SecretBackend
     private var configuredSetIds: Set<UUID>
@@ -94,7 +103,12 @@ public final class StateWatcher: ObservableObject {
 
     private var distributedNotificationObserver: NSObjectProtocol?
     private var debounceTask: Task<Void, Never>?
+    private var explicitAuditRefreshTask: Task<Void, Never>?
     private var isRunning = false
+    /// Invalidates an older detached scan whenever any newer synchronous or
+    /// asynchronous refresh begins. Detached filesystem reads can finish out
+    /// of order; only the newest requested observation may publish UI state.
+    private var auditRefreshGeneration: UInt64 = 0
 
     private enum WatchTarget {
         case rootGrandparent
@@ -129,6 +143,31 @@ public final class StateWatcher: ObservableObject {
     ) {
         self.paths = paths
         self.runStore = runStore
+        self.auditHealthLoader = {
+            do {
+                return .success(try runStore.unresolvedAuditFailures())
+            } catch {
+                return .verificationFailed
+            }
+        }
+        self.stateStore = stateStore
+        self.secretBackend = secretBackend
+        self.configuredSetIds = configuredSetIds
+    }
+
+    /// Deterministic audit-loader seam for ordering tests. Production always
+    /// uses the public initializer above and reads through `RunStore`.
+    init(
+        paths: AppPaths,
+        runStore: RunStore,
+        stateStore: StateStore,
+        secretBackend: SecretBackend = .configured,
+        configuredSetIds: Set<UUID> = [],
+        auditHealthLoader: @escaping @Sendable () -> AuditHealthRefreshResult
+    ) {
+        self.paths = paths
+        self.runStore = runStore
+        self.auditHealthLoader = auditHealthLoader
         self.stateStore = stateStore
         self.secretBackend = secretBackend
         self.configuredSetIds = configuredSetIds
@@ -146,6 +185,7 @@ public final class StateWatcher: ObservableObject {
         // reference, but a bare `deinit` must not leak fds/observers if a
         // caller forgets.
         debounceTask?.cancel()
+        explicitAuditRefreshTask?.cancel()
         stateDirSource?.cancel()
         runsDirSource?.cancel()
         locksDirSource?.cancel()
@@ -161,8 +201,9 @@ public final class StateWatcher: ObservableObject {
     // MARK: - Lifecycle
 
     /// Opens the directory watches, registers the distributed-notification
-    /// observer, and performs an initial synchronous `reloadNow()` so
-    /// `@Published` state is populated before the first SwiftUI render.
+    /// observer, and performs an initial `reloadNow()`. Cheap `@Published`
+    /// state is populated synchronously; the potentially contended full
+    /// audit scan is detached from the first SwiftUI render.
     /// Idempotent — a second call while already running is a no-op.
     public func start() {
         guard !isRunning else { return }
@@ -213,6 +254,8 @@ public final class StateWatcher: ObservableObject {
 
         debounceTask?.cancel()
         debounceTask = nil
+        explicitAuditRefreshTask?.cancel()
+        explicitAuditRefreshTask = nil
 
         stateDirSource?.cancel()
         stateDirSource = nil
@@ -236,11 +279,19 @@ public final class StateWatcher: ObservableObject {
         }
     }
 
-    /// Synchronously re-reads every published property through
-    /// `StateStore`/`RunStore`. Safe to call at any time (including before
-    /// `start()`, e.g. to pre-populate a preview) — every read tolerates a
-    /// missing file or directory.
+    /// Re-reads every published property through `StateStore`/`RunStore`.
+    /// Event-backed caches update synchronously; the potentially contended
+    /// full audit scan always runs detached and publishes later through its
+    /// generation guard. Safe to call at any time, including before start.
     public func reloadNow() {
+        reloadCachedStateNow()
+        scheduleExplicitAuditRefresh()
+    }
+
+    /// Reloads event-backed caches that are cheap to read. Audit history is
+    /// deliberately separate because it may contend on a lock and traverse
+    /// every run; filesystem-triggered callers perform that scan detached.
+    private func reloadCachedStateNow() {
         lockingFailure = LockingHealth.probe(
             paths: paths,
             configuredSetIds: configuredSetIds,
@@ -257,14 +308,65 @@ public final class StateWatcher: ObservableObject {
         recentRuns = (try? runStore.recentRuns(limit: 200)) ?? []
     }
 
+    /// Performs the potentially contended full run-history scan away from
+    /// the main actor, then publishes only the small result here. A helper
+    /// dying releases its flock but creates no filesystem event, so AppModel
+    /// also calls this from its existing 30-second health refresh.
+    public func refreshAuditHealthOffMain() async {
+        auditRefreshGeneration &+= 1
+        let generation = auditRefreshGeneration
+        await refreshAuditHealthOffMain(generation: generation)
+    }
+
+    /// Runs a scan for a generation already reserved synchronously by its
+    /// caller. In particular, an explicit reload must invalidate the task it
+    /// replaces before the replacement Task gets a chance to execute.
+    private func refreshAuditHealthOffMain(generation: UInt64) async {
+        let loader = auditHealthLoader
+        let result = await Task.detached(priority: .utility) {
+            loader()
+        }.value
+
+        guard generation == auditRefreshGeneration else { return }
+
+        switch result {
+        case .success(let failures):
+            auditFailures = failures
+            auditVerificationFailed = false
+        case .verificationFailed:
+            auditFailures = []
+            auditVerificationFailed = true
+        }
+    }
+
+    private func scheduleExplicitAuditRefresh() {
+        explicitAuditRefreshTask?.cancel()
+        auditRefreshGeneration &+= 1
+        let generation = auditRefreshGeneration
+        explicitAuditRefreshTask = Task { @MainActor [weak self] in
+            guard let self, !Task.isCancelled else { return }
+            await self.refreshAuditHealthOffMain(generation: generation)
+        }
+    }
+
     // MARK: - Debounce
 
-    private func scheduleDebouncedReload() {
+    /// Internal for deterministic ordering tests; production callers are the
+    /// filesystem and distributed-notification event handlers above.
+    func scheduleDebouncedReload() {
         debounceTask?.cancel()
+        // Reserve the replacement observation now, before the debounce
+        // sleep. Cancelling a Task does not cancel the detached loader it
+        // may already be awaiting, so delaying this increment would let the
+        // canceled scan publish stale health during the 250 ms window.
+        auditRefreshGeneration &+= 1
+        let generation = auditRefreshGeneration
         debounceTask = Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: Self.debounceNanoseconds)
             guard !Task.isCancelled else { return }
-            self?.reloadNow()
+            guard let self else { return }
+            self.reloadCachedStateNow()
+            await self.refreshAuditHealthOffMain(generation: generation)
         }
     }
 
@@ -538,6 +640,8 @@ public final class StateWatcher: ObservableObject {
         if locksDirSource != nil {
             urls += [
                 paths.tickLockFile,
+                paths.destructiveAuditLockFile,
+                paths.runPublicationLockFile,
                 paths.healthLockFile,
             ]
             if secretBackend == .file { urls.append(paths.secretsLockFile) }
@@ -596,4 +700,9 @@ public final class StateWatcher: ObservableObject {
         source.resume()
         return source
     }
+}
+
+enum AuditHealthRefreshResult: Sendable {
+    case success([RunAuditFailure])
+    case verificationFailed
 }

@@ -6,6 +6,10 @@ import Foundation
 /// (`docs/ui-spec.md` §Menu bar). Deliberately UI-free: the SF Symbol
 /// mapping lives in the App target, this is only the decision.
 public enum AppHealth: String, Equatable, Sendable, CaseIterable {
+    /// A destructive repository operation may have completed without a
+    /// complete canonical audit record. This outranks running and warning:
+    /// no destructive retry is safe until the history is reconciled.
+    case critical
     /// Nothing running, nothing wrong.
     case idle
     /// At least one run is in flight — and in flight means a process is
@@ -373,8 +377,12 @@ public enum HealthDerivation {
         fullDiskAccessDenied: Bool,
         backgroundAgentEnabled: Bool?,
         lockingBroken: Bool = false,
+        destructiveAuditFailure: Bool = false,
         runLiveness: (CurrentRunState) -> CurrentRunLiveness = { _ in .live }
     ) -> AppHealth {
+        if destructiveAuditFailure {
+            return .critical
+        }
         // Ahead of the `.running` precedence, unlike every other warning
         // condition. `.running` is derived from a current-run file, and a
         // machine whose lock directory is broken is exactly the machine most

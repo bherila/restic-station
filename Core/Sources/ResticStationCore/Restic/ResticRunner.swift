@@ -120,6 +120,14 @@ public final class ResticRunner: Sendable {
         self.runner = runner
     }
 
+    /// The exact secret-free argv that ``run(_:for:onLine:onRawLine:timeout:beforeLaunch:auditBeforeLaunch:afterLaunchFailure:)``
+    /// hands to the process runner. Run-history publication uses this same
+    /// resolver so an invocation override cannot make the audit record
+    /// disagree with the child that was actually selected.
+    func redactedArgv(_ command: ResticCommand, for invocation: ResticInvocation) -> [String] {
+        [invocation.resticPathOverride ?? resticPath] + command.argv
+    }
+
     // MARK: - Running
 
     /// Runs `cmd` against `inv`'s destination(s).
@@ -140,6 +148,7 @@ public final class ResticRunner: Sendable {
         onRawLine: (@Sendable (String) -> Void)? = nil,
         timeout: TimeInterval? = nil,
         beforeLaunch: (@Sendable () throws -> Void)? = nil,
+        auditBeforeLaunch: (@Sendable () throws -> Void)? = nil,
         afterLaunchFailure: (@Sendable () -> Void)? = nil
     ) async throws -> ResticOutcome {
         try Task.checkCancellation()
@@ -161,6 +170,7 @@ public final class ResticRunner: Sendable {
             executablePath: inv.resticPathOverride,
             expectedExecutableIdentity: inv.expectedExecutableIdentity,
             beforeLaunch: beforeLaunch,
+            auditBeforeLaunch: auditBeforeLaunch,
             afterLaunchFailure: afterLaunchFailure,
             onLine: onLine,
             onRawLine: onRawLine,
@@ -194,6 +204,7 @@ public final class ResticRunner: Sendable {
         destination: Destination,
         onRawLine: (@Sendable (String) -> Void)? = nil,
         beforeLaunch: (@Sendable () throws -> Void)? = nil,
+        auditBeforeLaunch: (@Sendable () throws -> Void)? = nil,
         afterLaunchFailure: (@Sendable () -> Void)? = nil
     ) async throws -> ResticOutcome {
         let password: String
@@ -207,6 +218,17 @@ public final class ResticRunner: Sendable {
             // confirmation only after the password is available and directly
             // before Process receives the SSH argv.
             try beforeLaunch?()
+            do {
+                try auditBeforeLaunch?()
+            } catch {
+                // A capability may have been consumed, but no process has
+                // received argv yet. Restore it on this pre-spawn audit
+                // failure just as on Process.run() launch failure.
+                afterLaunchFailure?()
+                throw ResticRunnerError.launchFailed(
+                    "required destructive audit evidence could not be committed"
+                )
+            }
             result = try await runner.run(command.argv, env: nil, stdin: command.password, currentDirectory: nil, onStdoutLine: { line in
                 onRawLine?(line); let message = self.decoder.decodeLine(line); collector.append(message)
                 // No wall-clock timeout on purpose: a legitimate prune on a
@@ -365,6 +387,7 @@ public final class ResticRunner: Sendable {
         executablePath: String? = nil,
         expectedExecutableIdentity: String? = nil,
         beforeLaunch: (@Sendable () throws -> Void)? = nil,
+        auditBeforeLaunch: (@Sendable () throws -> Void)? = nil,
         afterLaunchFailure: (@Sendable () -> Void)? = nil,
         onLine: (@Sendable (ResticMessage) -> Void)?,
         onRawLine: (@Sendable (String) -> Void)?,
@@ -384,6 +407,14 @@ public final class ResticRunner: Sendable {
         // receives the argv. A failed secret read or executable revalidation
         // must leave confirmation retryable.
         try beforeLaunch?()
+        do {
+            try auditBeforeLaunch?()
+        } catch {
+            afterLaunchFailure?()
+            throw ResticRunnerError.launchFailed(
+                "required destructive audit evidence could not be committed"
+            )
+        }
         let argv = [resolvedExecutablePath] + cmd.argv
         let collector = MessageCollector()
         let decoder = self.decoder

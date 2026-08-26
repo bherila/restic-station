@@ -528,6 +528,16 @@ private func currentRun(percentDone: Double, phase: String = "backing-up-primary
         ) == .running)
     }
 
+    @Test func destructiveAuditFailureIsCriticalEvenWhileRunning() {
+        #expect(HealthDerivation.appHealth(
+            setHealths: [health(running: true, failed: true, stale: true)],
+            runsInFlight: [currentRun(percentDone: 0.5)],
+            fullDiskAccessDenied: true,
+            backgroundAgentEnabled: false,
+            destructiveAuditFailure: true
+        ) == .critical)
+    }
+
     @Test func runInFlightForADeletedSetStillCountsAsRunning() {
         #expect(HealthDerivation.appHealth(
             setHealths: [],

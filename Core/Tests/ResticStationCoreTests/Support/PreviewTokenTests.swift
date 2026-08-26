@@ -91,6 +91,10 @@ struct PreviewTokenStoreTests {
 
         _ = try store.consume(token.value)
         #expect(throws: PreviewTokenError.alreadyUsed) { try store.token(token.value) }
+        try store.restore(token.value, matching: token)
+        #expect(try store.token(token.value) == token)
+        _ = try store.consume(token.value)
+        #expect(throws: PreviewTokenError.alreadyUsed) { try store.token(token.value) }
 
         let maintenance = try store.issueMaintenancePrune(
             machineId: "example-machine",

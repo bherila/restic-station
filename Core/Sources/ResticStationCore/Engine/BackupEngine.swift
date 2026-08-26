@@ -153,6 +153,10 @@ public enum PruneRepositoryFailure: Equatable, Sendable {
     /// Restic may have completed, failed, or never launched; none may report
     /// success without the required locking and bookkeeping invariants.
     case infrastructure(String)
+    /// Run-history infrastructure failed for a specific destructive run.
+    /// The helper publishes `runId` as structured error data so an operator
+    /// can inspect the canonical record without parsing prose.
+    case auditInfrastructure(reason: String, runId: String)
 }
 
 // MARK: - BackupEngine
@@ -225,6 +229,7 @@ public final class BackupEngine: Sendable {
     /// supplies these unions when it constructs the engine.
     private let purgeSourcePaths: [UUID: Set<String>]
     private let purgeHostnames: [UUID: Set<String>]
+    private let logWriterFactory: @Sendable (URL) throws -> LogWriter
 
     public init(
         config: AppConfig,
@@ -239,7 +244,8 @@ public final class BackupEngine: Sendable {
         purgeSourcePaths: [UUID: Set<String>] = [:],
         purgeHostnames: [UUID: Set<String>] = [:],
         machineId: String = MachineIdentity.generate(),
-        previewTokens: PreviewTokenStore? = nil
+        previewTokens: PreviewTokenStore? = nil,
+        logWriterFactory: (@Sendable (URL) throws -> LogWriter)? = nil
     ) {
         self.config = config
         self.paths = paths
@@ -254,6 +260,9 @@ public final class BackupEngine: Sendable {
         self.previewTokens = previewTokens ?? PreviewTokenStore(paths: paths, now: now)
         self.purgeSourcePaths = purgeSourcePaths
         self.purgeHostnames = purgeHostnames
+        self.logWriterFactory = logWriterFactory ?? { url in
+            try LogWriter(url: url, now: now)
+        }
     }
 
     // MARK: - runSet
@@ -370,8 +379,10 @@ public final class BackupEngine: Sendable {
         switch backupResult {
         case .completed(let child):
             backup = child
-        case .infrastructureFailure(let reason):
+        case .deferred(let reason):
             return .infrastructureFailure(reason: reason)
+        case .infrastructureFailure(let failure):
+            return .infrastructureFailure(reason: failure.reason)
         }
         children.append(backup.child)
         let groupId = backup.child.runId
@@ -503,6 +514,9 @@ public final class BackupEngine: Sendable {
             switch copyResult {
             case .completed(let child):
                 copy = child
+            case .deferred(let reason):
+                infrastructureFailures.append("secondary \"\(secondary.label)\": \(reason)")
+                continue
             case .infrastructureFailure(let reason):
                 infrastructureFailures.append("secondary \"\(secondary.label)\": \(reason)")
                 continue
@@ -538,6 +552,8 @@ public final class BackupEngine: Sendable {
                 }
             case .infrastructureFailure(let reason):
                 infrastructureFailures.append("secondary \"\(secondary.label)\": \(reason)")
+            case .deferred:
+                break
             case .notRequired:
                 break
             }
@@ -558,6 +574,8 @@ public final class BackupEngine: Sendable {
             }
         case .infrastructureFailure(let reason):
             infrastructureFailures.append("primary \"\(primary.label)\": \(reason)")
+        case .deferred:
+            break
         case .notRequired:
             break
         }
@@ -656,8 +674,10 @@ public final class BackupEngine: Sendable {
         switch primaryCheckResult {
         case .completed(let child):
             primaryCheck = child
-        case .infrastructureFailure(let reason):
+        case .deferred(let reason):
             return .infrastructureFailure(reason: reason)
+        case .infrastructureFailure(let failure):
+            return .infrastructureFailure(reason: failure.reason)
         }
         var statuses = [primaryCheck.child.status]
         var infrastructureFailures: [String] = []
@@ -704,6 +724,10 @@ public final class BackupEngine: Sendable {
                             )
                         }
                     case .infrastructureFailure(let reason):
+                        infrastructureFailures.append(
+                            "secondary \"\(secondary.label)\": \(reason)"
+                        )
+                    case .deferred(let reason):
                         infrastructureFailures.append(
                             "secondary \"\(secondary.label)\": \(reason)"
                         )
@@ -807,21 +831,51 @@ public final class BackupEngine: Sendable {
         // exit path (T09 step 8 — "clear current-run, release lock").
         defer { try? stateStore.clearCurrentRun(setId: set.id) }
 
+        // One manual retention request is one destructive transaction across
+        // the primary and every eligible mirror. Holding the machine-wide
+        // gate for the full pass prevents another helper from entering after
+        // the primary has already been pruned and turning a partial request
+        // into an apparent success.
+        do {
+            try paths.ensureDirectories()
+        } catch {
+            return .infrastructureFailure(
+                reason: "run history unusable — could not prepare the destructive audit gate: \(error)",
+                operationMayHaveRun: false
+            )
+        }
+        let destructiveAuditGate = FileLock(
+            path: paths.destructiveAuditLockFile,
+            trustedRoot: paths.root
+        )
+        switch destructiveAuditGate.acquire() {
+        case .acquired:
+            break
+        case .busy:
+            return .skipped
+        case .failed(let failure):
+            return .infrastructureFailure(reason: failure.description, operationMayHaveRun: false)
+        }
+        defer { destructiveAuditGate.release() }
+
         let primaryPruneResult = await forgetChild(
             destination: primary,
             policy: retention,
             setId: set.id,
             trigger: .manual,
             groupId: nil,
-            expectedExecutableIdentity: expectedExecutableIdentity
+            expectedExecutableIdentity: expectedExecutableIdentity,
+            callerHoldsDestructiveAuditGate: true
         )
         let primaryPrune: ChildRun
         switch primaryPruneResult {
         case .completed(let child):
             primaryPrune = child
-        case .infrastructureFailure(let reason):
+        case .deferred:
+            return .skipped
+        case .infrastructureFailure(let failure):
             return .infrastructureFailure(
-                reason: reason,
+                reason: failure.reason,
                 operationMayHaveRun: false
             )
         case .notRequired:
@@ -857,20 +911,23 @@ public final class BackupEngine: Sendable {
                 setId: set.id,
                 trigger: .manual,
                 groupId: groupId,
-                expectedExecutableIdentity: expectedExecutableIdentity
+                expectedExecutableIdentity: expectedExecutableIdentity,
+                callerHoldsDestructiveAuditGate: true
             ) {
             case .completed(let prune):
                 if let reason = prune.infrastructureFailureReason {
                     return .infrastructureFailure(reason: reason, operationMayHaveRun: true)
                 }
                 statuses.append(prune.child.status)
-            case .infrastructureFailure(let reason):
+            case .infrastructureFailure(let failure):
                 return .infrastructureFailure(
-                    reason: reason,
+                    reason: failure.reason,
                     // The primary prune, and possibly earlier mirrors, have
                     // already executed by the time this later record fails.
                     operationMayHaveRun: true
                 )
+            case .deferred:
+                return .completed(Self.worstStatus(statuses))
             case .notRequired:
                 // The public guard above already requires a non-empty policy.
                 continue
@@ -1022,11 +1079,19 @@ public final class BackupEngine: Sendable {
             switch pruneResult {
             case .completed(let child):
                 prune = child
-            case .infrastructureFailure(let reason):
-                return .failed(.infrastructure(reason))
+            case .deferred:
+                return .skipped(.busy)
+            case .infrastructureFailure(let failure):
+                if let runId = failure.auditRunId {
+                    return .failed(.auditInfrastructure(reason: failure.reason, runId: runId))
+                }
+                return .failed(.infrastructure(failure.reason))
             }
-            if let reason = prune.infrastructureFailureReason {
-                return .failed(.infrastructure(reason))
+            if let failure = prune.infrastructureFailure {
+                if let runId = failure.auditRunId {
+                    return .failed(.auditInfrastructure(reason: failure.reason, runId: runId))
+                }
+                return .failed(.infrastructure(failure.reason))
             }
             switch prune.preflightFailure {
             case .previewChanged:
@@ -1113,11 +1178,19 @@ public final class BackupEngine: Sendable {
         switch pruneResult {
         case .completed(let child):
             prune = child
-        case .infrastructureFailure(let reason):
-            return .failed(.infrastructure(reason))
+        case .deferred:
+            return .skipped(.busy)
+        case .infrastructureFailure(let failure):
+            if let runId = failure.auditRunId {
+                return .failed(.auditInfrastructure(reason: failure.reason, runId: runId))
+            }
+            return .failed(.infrastructure(failure.reason))
         }
-        if let reason = prune.infrastructureFailureReason {
-            return .failed(.infrastructure(reason))
+        if let failure = prune.infrastructureFailure {
+            if let runId = failure.auditRunId {
+                return .failed(.auditInfrastructure(reason: failure.reason, runId: runId))
+            }
+            return .failed(.infrastructure(failure.reason))
         }
         switch prune.preflightFailure {
         case .previewChanged:
@@ -1499,6 +1572,59 @@ public final class BackupEngine: Sendable {
 
         guard await secretsAvailable(for: destinations) else { throw PurgeApplyError.unavailable }
 
+        // Acquire the machine-wide destructive gate before the final live
+        // repository observations, not merely before spending the token.
+        // Sets may share a repository; without this boundary another helper
+        // could mutate it after validation but before this apply launches.
+        // Holding it across the complete multi-destination apply also
+        // prevents another destructive helper from entering between children.
+        // Contention is retryable and leaves the reviewed token intact.
+        do {
+            try paths.ensureDirectories()
+        } catch {
+            throw PurgeApplyError.lockUnusable(String(describing: error))
+        }
+        let destructiveAuditGate = FileLock(
+            path: paths.destructiveAuditLockFile,
+            trustedRoot: paths.root
+        )
+        switch destructiveAuditGate.acquire() {
+        case .acquired:
+            break
+        case .busy:
+            throw PurgeApplyError.busy
+        case .failed(let failure):
+            throw PurgeApplyError.lockUnusable(String(describing: failure))
+        }
+        defer { destructiveAuditGate.release() }
+
+        // A gate holder that has not launched anything must not make an
+        // abandoned record with a recycled PID look active to health scans.
+        // Verify immediately after acquisition, before potentially slow
+        // repository revalidation queries, and keep the existing
+        // performChild check as the final launch-boundary defense.
+        do {
+            if let unresolved = try runStore.unresolvedAuditFailures(
+                callerHoldsDestructiveAuditGate: true
+            ).first {
+                let reason = "operation_completed_audit_failed — destructive run "
+                    + "\(unresolved.runId) has unresolved \(unresolved.reason.rawValue) audit evidence; "
+                    + "inspect and reconcile run history before retrying"
+                throw PurgeApplyError.auditFailure(
+                    reason: reason,
+                    operationMayHaveRun: false,
+                    runId: unresolved.runId
+                )
+            }
+        } catch let error as PurgeApplyError {
+            throw error
+        } catch {
+            throw PurgeApplyError.infrastructureFailure(
+                reason: "run history unusable — could not verify destructive audit history: \(error)",
+                operationMayHaveRun: false
+            )
+        }
+
         var plans: [(destination: Destination, plan: PurgePlan)] = []
         for destination in destinations.sorted(by: { $0.id.uuidString < $1.id.uuidString }) {
             let plan = try await currentPurgePlan(
@@ -1522,8 +1648,16 @@ public final class BackupEngine: Sendable {
             throw PurgeApplyError.unavailable
         }
 
+        let restorePurgeToken: @Sendable () -> Void = { [previewTokens, preview] in
+            // A failed restore intentionally leaves the token consumed. A
+            // destructive retry is safe only when the store can prove it
+            // restored this exact capability.
+            try? previewTokens.restore(token, matching: preview)
+        }
+
         var children: [SetRunChild] = []
         var resolvedGroupId = groupId
+        var isFirstPurgeChild = true
         for (destination, plan) in plans {
             guard !plan.matched.isEmpty else {
                 // Nothing to rewrite. Advancing the watermark is only correct
@@ -1548,6 +1682,7 @@ public final class BackupEngine: Sendable {
                 }
                 continue
             }
+            let restoreAfterLaunchFailure = isFirstPurgeChild ? restorePurgeToken : nil
             let purgeResult = await purgeChild(
                 destination: destination,
                 snapshotIDs: plan.matched.map(\.id),
@@ -1555,22 +1690,65 @@ public final class BackupEngine: Sendable {
                 setId: set.id,
                 trigger: trigger,
                 groupId: resolvedGroupId,
-                executable: executable
+                executable: executable,
+                callerHoldsDestructiveAuditGate: true,
+                afterLaunchFailure: restoreAfterLaunchFailure
             )
+            let wasFirstPurgeChild = isFirstPurgeChild
+            isFirstPurgeChild = false
             let purge: ChildRun
             switch purgeResult {
             case .completed(let child):
                 purge = child
-            case .infrastructureFailure(let reason):
+            case .deferred(let reason):
+                if children.isEmpty {
+                    restorePurgeToken()
+                    throw PurgeApplyError.busy
+                }
                 throw PurgeApplyError.infrastructureFailure(
                     reason: reason,
+                    operationMayHaveRun: true
+                )
+            case .infrastructureFailure(let failure):
+                if wasFirstPurgeChild { restorePurgeToken() }
+                if let runId = failure.auditRunId {
+                    throw PurgeApplyError.auditFailure(
+                        reason: failure.reason,
+                        operationMayHaveRun: !children.isEmpty,
+                        runId: runId
+                    )
+                }
+                throw PurgeApplyError.infrastructureFailure(
+                    reason: failure.reason,
                     operationMayHaveRun: !children.isEmpty
                 )
             }
-            children.append(purge.child)
-            if let reason = purge.infrastructureFailureReason {
+            if wasFirstPurgeChild,
+               purge.outcome == nil,
+               purge.infrastructureFailureReason == nil {
+                // Secret/executable preflight and Process.run launch
+                // failures are all before a child can mutate the repository.
+                // The latter also invokes `afterLaunchFailure`; restoring
+                // twice is harmless because the second exact-match attempt
+                // fails closed once `usedAt` is already nil.
+                restorePurgeToken()
                 throw PurgeApplyError.infrastructureFailure(
-                    reason: reason,
+                    reason: purge.preflightFailure?.message
+                        ?? "the first purge process could not be launched",
+                    operationMayHaveRun: false
+                )
+            }
+            children.append(purge.child)
+            if let failure = purge.infrastructureFailure {
+                if let runId = failure.auditRunId {
+                    throw PurgeApplyError.auditFailure(
+                        reason: failure.reason,
+                        operationMayHaveRun: true,
+                        runId: runId
+                    )
+                }
+                throw PurgeApplyError.infrastructureFailure(
+                    reason: failure.reason,
                     operationMayHaveRun: true
                 )
             }
@@ -1647,7 +1825,9 @@ public final class BackupEngine: Sendable {
         setId: UUID,
         trigger: RunTrigger,
         groupId: String?,
-        executable: ResticRunner.MaintenanceExecutable
+        executable: ResticRunner.MaintenanceExecutable,
+        callerHoldsDestructiveAuditGate: Bool = false,
+        afterLaunchFailure: (@Sendable () -> Void)? = nil
     ) async -> RecordedChildResult {
         let fullIDByShortID = Dictionary(
             snapshotIDs.map { (String($0.prefix(8)), $0) },
@@ -1683,6 +1863,8 @@ public final class BackupEngine: Sendable {
                 expectedExecutableIdentity: executable.identity
             ),
             streamProgress: false,
+            afterLaunchFailure: afterLaunchFailure,
+            callerHoldsDestructiveAuditGate: callerHoldsDestructiveAuditGate,
             purgeSnapshotRewrites: { outcome in
                 Dictionary(uniqueKeysWithValues: parseRewrite(outcome.rawOutput).snapshots.compactMap { rewrite in
                     guard let oldID = fullIDByShortID[rewrite.shortID], let newID = rewrite.newSnapshotShortID else {
@@ -1802,9 +1984,11 @@ public final class BackupEngine: Sendable {
         switch restoreResult {
         case .completed(let child):
             restore = child
-        case .infrastructureFailure(let reason):
+        case .deferred(let reason):
+            return .infrastructureFailure(reason: reason, operationMayHaveRun: false)
+        case .infrastructureFailure(let failure):
             return .infrastructureFailure(
-                reason: reason,
+                reason: failure.reason,
                 operationMayHaveRun: false
             )
         }
@@ -1867,9 +2051,11 @@ public final class BackupEngine: Sendable {
         switch initResult {
         case .completed(let child):
             initRun = child
-        case .infrastructureFailure(let reason):
+        case .deferred(let reason):
+            return .infrastructureFailure(reason: reason, operationMayHaveRun: false)
+        case .infrastructureFailure(let failure):
             return .infrastructureFailure(
-                reason: reason,
+                reason: failure.reason,
                 operationMayHaveRun: false
             )
         }
@@ -1908,7 +2094,8 @@ public final class BackupEngine: Sendable {
         /// before spawning, so a binary replaced after authorization — the
         /// window spans every earlier destination in a multi-destination
         /// prune — never receives `forget --prune`.
-        expectedExecutableIdentity: String? = nil
+        expectedExecutableIdentity: String? = nil,
+        callerHoldsDestructiveAuditGate: Bool = false
     ) async -> RetentionChildResult {
         guard let policy, !policy.isEmpty else {
             return .notRequired
@@ -1925,10 +2112,13 @@ public final class BackupEngine: Sendable {
                 destination: destination,
                 expectedExecutableIdentity: expectedExecutableIdentity
             ),
-            streamProgress: false
+            streamProgress: false,
+            callerHoldsDestructiveAuditGate: callerHoldsDestructiveAuditGate
         ) {
         case .completed(let child):
             return .completed(child)
+        case .deferred(let reason):
+            return .deferred(reason)
         case .infrastructureFailure(let reason):
             return .infrastructureFailure(reason)
         }
@@ -1945,7 +2135,21 @@ public final class BackupEngine: Sendable {
         /// The child may have completed and its terminal metadata may exist,
         /// while the append-only index write failed. Every caller must
         /// surface that as machine infrastructure failure, never success.
-        let infrastructureFailureReason: String?
+        let infrastructureFailure: ChildInfrastructureFailure?
+
+        var infrastructureFailureReason: String? {
+            infrastructureFailure?.reason
+        }
+    }
+
+    private struct ChildInfrastructureFailure {
+        let reason: String
+        let auditRunId: String?
+
+        init(_ reason: String, auditRunId: String? = nil) {
+            self.reason = reason
+            self.auditRunId = auditRunId
+        }
     }
 
     /// A command either obtained a durable run record before launch or was
@@ -1954,13 +2158,17 @@ public final class BackupEngine: Sendable {
     /// ordinary skip or as an intentionally absent retention operation.
     private enum RecordedChildResult {
         case completed(ChildRun)
-        case infrastructureFailure(String)
+        /// Expected machine-wide destructive-gate contention. Nothing was
+        /// recorded or launched, so callers may safely defer and retry.
+        case deferred(String)
+        case infrastructureFailure(ChildInfrastructureFailure)
     }
 
     private enum RetentionChildResult {
         case notRequired
         case completed(ChildRun)
-        case infrastructureFailure(String)
+        case deferred(String)
+        case infrastructureFailure(ChildInfrastructureFailure)
     }
 
     private enum PreflightFailure: Sendable {
@@ -2031,8 +2239,57 @@ public final class BackupEngine: Sendable {
         beforeLaunch: (@Sendable () throws -> Void)? = nil,
         afterLaunchFailure: (@Sendable () -> Void)? = nil,
         downgradeSuccessToWarning: (@Sendable (ResticOutcome) -> Bool)? = nil,
+        callerHoldsDestructiveAuditGate: Bool = false,
         purgeSnapshotRewrites: (@Sendable (ResticOutcome) -> [String: String]?)? = nil
     ) async -> RecordedChildResult {
+        let destructiveAuditGate: FileLock?
+        if kind.isDestructive && !callerHoldsDestructiveAuditGate {
+            do {
+                try paths.ensureDirectories()
+            } catch {
+                let reason = "run history unusable — could not prepare the destructive audit gate: \(error)"
+                logWarning("BackupEngine: \(reason)")
+                return .infrastructureFailure(ChildInfrastructureFailure(reason))
+            }
+            let gate = FileLock(path: paths.destructiveAuditLockFile, trustedRoot: paths.root)
+            switch gate.acquire() {
+            case .acquired:
+                destructiveAuditGate = gate
+            case .busy:
+                let reason = "destructive audit gate busy — another destructive operation is running"
+                logWarning("BackupEngine: \(reason)")
+                return .deferred(reason)
+            case .failed(let failure):
+                let reason = "run history unusable — destructive audit gate unusable: \(failure)"
+                logWarning("BackupEngine: \(reason)")
+                return .infrastructureFailure(ChildInfrastructureFailure(reason))
+            }
+        } else {
+            destructiveAuditGate = nil
+        }
+        defer { destructiveAuditGate?.release() }
+
+        if kind.isDestructive {
+            do {
+                if let unresolved = try runStore.unresolvedAuditFailures(
+                    callerHoldsDestructiveAuditGate: true
+                ).first {
+                    let reason = "operation_completed_audit_failed — destructive run "
+                        + "\(unresolved.runId) has unresolved \(unresolved.reason.rawValue) audit evidence; "
+                        + "inspect and reconcile run history before retrying"
+                    logWarning("BackupEngine: \(reason)")
+                    return .infrastructureFailure(ChildInfrastructureFailure(
+                        reason,
+                        auditRunId: unresolved.runId
+                    ))
+                }
+            } catch {
+                let reason = "run history unusable — could not verify destructive audit history: \(error)"
+                logWarning("BackupEngine: \(reason)")
+                return .infrastructureFailure(ChildInfrastructureFailure(reason))
+            }
+        }
+
         var run: ActiveRun
         do {
             run = try runStore.begin(
@@ -2045,14 +2302,28 @@ public final class BackupEngine: Sendable {
         } catch {
             let reason = "run history unusable — could not create a \(kind.rawValue) run record: \(error)"
             logWarning("BackupEngine: \(reason)")
-            return .infrastructureFailure(reason)
+            return .infrastructureFailure(ChildInfrastructureFailure(reason))
         }
-        // Reproduces the exact spawned command line: `ResticRunner` prepends
-        // the binary path from the same config value. Secrets never appear
-        // in argv (`ResticCommand`'s invariant 1), so this is safe to persist.
-        run.argvRedacted = remoteCommand?.argv ?? ([config.resticPath].compactMap { $0 } + command.argv)
+        // Reproduces the exact spawned command line, including an invocation
+        // override selected by a validated maintenance request. Secrets never
+        // appear in argv (`ResticCommand`'s invariant 1), so this is safe to
+        // persist.
+        run.argvRedacted = remoteCommand?.passwordStdinArgv
+            ?? restic.redactedArgv(command, for: invocation)
 
-        let logWriter = try? LogWriter(url: paths.runLogFile(runId: run.runId), now: now)
+        let logWriter: LogWriter?
+        do {
+            logWriter = try logWriterFactory(paths.runLogFile(runId: run.runId))
+        } catch {
+            if kind.isDestructive {
+                let reason = "run history unusable — could not open the required destructive audit log "
+                    + "for run \(run.runId): \(error)"
+                let finishFailure = finish(run, status: .failed, errorSummary: reason)
+                logWarning("BackupEngine: \(reason)")
+                return .infrastructureFailure(ChildInfrastructureFailure(finishFailure ?? reason))
+            }
+            logWriter = nil
+        }
         defer { logWriter?.close() }
         logWriter?.appendLine("$ \(run.argvRedacted.joined(separator: " "))")
 
@@ -2070,7 +2341,7 @@ public final class BackupEngine: Sendable {
                         child: SetRunChild(runId: run.runId, kind: kind, destId: destination.id, status: .skipped),
                         outcome: nil,
                         preflightFailure: failure,
-                        infrastructureFailureReason: nil
+                        infrastructureFailure: nil
                     ))
                 } catch {
                     logWarning("BackupEngine: could not discard unavailable preflight run \(run.runId): \(error)")
@@ -2081,7 +2352,7 @@ public final class BackupEngine: Sendable {
                 child: SetRunChild(runId: run.runId, kind: kind, destId: destination.id, status: .failed),
                 outcome: nil,
                 preflightFailure: failure,
-                infrastructureFailureReason: infrastructureFailure
+                infrastructureFailure: infrastructureFailure.map { ChildInfrastructureFailure($0) }
             ))
         }
 
@@ -2090,19 +2361,39 @@ public final class BackupEngine: Sendable {
         }
 
         let result: ExecuteResult
+        let auditRun = run
+        let destructiveLaunchState = DestructiveLaunchState()
+        let auditBeforeLaunch: (@Sendable () throws -> Void)?
+        if kind.isDestructive {
+            auditBeforeLaunch = { [runStore, auditRun, destructiveLaunchState] in
+                try runStore.markDestructiveLaunchAuthorized(auditRun)
+                destructiveLaunchState.markAuthorized()
+            }
+        } else {
+            auditBeforeLaunch = nil
+        }
         if let remoteCommand {
             result = await spawnRemote(
                 remoteCommand,
                 destination: destination,
                 logWriter: logWriter,
                 beforeLaunch: beforeLaunch,
+                auditBeforeLaunch: auditBeforeLaunch,
                 afterLaunchFailure: afterLaunchFailure
             )
         } else {
-            result = await execute(command, invocation: invocation, logWriter: logWriter, reporter: streamProgress ? reporter : nil, beforeLaunch: beforeLaunch, afterLaunchFailure: afterLaunchFailure)
+            result = await execute(
+                command,
+                invocation: invocation,
+                logWriter: logWriter,
+                reporter: streamProgress ? reporter : nil,
+                beforeLaunch: beforeLaunch,
+                auditBeforeLaunch: auditBeforeLaunch,
+                afterLaunchFailure: afterLaunchFailure
+            )
         }
 
-        if case .didNotRun(_, let launchPreflightFailure?) = result {
+        if case .didNotRun(_, let launchPreflightFailure?, _) = result {
             if case .previewUnavailable = launchPreflightFailure {
                 do {
                     try runStore.discardUnstarted(run)
@@ -2110,7 +2401,7 @@ public final class BackupEngine: Sendable {
                         child: SetRunChild(runId: run.runId, kind: kind, destId: destination.id, status: .skipped),
                         outcome: nil,
                         preflightFailure: launchPreflightFailure,
-                        infrastructureFailureReason: nil
+                        infrastructureFailure: nil
                     ))
                 } catch {
                     logWarning("BackupEngine: could not discard unavailable launch preflight run \(run.runId): \(error)")
@@ -2125,7 +2416,7 @@ public final class BackupEngine: Sendable {
                 child: SetRunChild(runId: run.runId, kind: kind, destId: destination.id, status: .failed),
                 outcome: nil,
                 preflightFailure: launchPreflightFailure,
-                infrastructureFailureReason: infrastructureFailure
+                infrastructureFailure: infrastructureFailure.map { ChildInfrastructureFailure($0) }
             ))
         }
 
@@ -2134,10 +2425,16 @@ public final class BackupEngine: Sendable {
         var stats: BackupSummary?
         var exitCode: Int32?
 
+        var auditFailureReason: RunAuditFailureReason? = nil
         switch result {
-        case .didNotRun(let reason, _):
+        case .didNotRun(let reason, _, let operationMayHaveRun):
             status = .failed
-            errorSummary = reason
+            if operationMayHaveRun, destructiveLaunchState.wasAuthorized {
+                auditFailureReason = .repositoryOutcomeUnknown
+                errorSummary = "operation_completed_audit_failed — repository outcome unknown: \(reason)"
+            } else {
+                errorSummary = reason
+            }
         case .ranToCompletion(let outcome):
             exitCode = outcome.exitCode
             stats = Self.summary(in: outcome.messages)
@@ -2170,13 +2467,24 @@ public final class BackupEngine: Sendable {
             stats: stats,
             errorSummary: errorSummary,
             resticExitCode: exitCode,
-            purgeSnapshotRewrites: rewrites
+            purgeSnapshotRewrites: rewrites,
+            auditFailureReason: auditFailureReason,
+            launchWasAuthorized: destructiveLaunchState.wasAuthorized
         )
+        let auditCondition = auditFailureReason.map { reason in
+            "operation_completed_audit_failed — destructive run \(run.runId) has unresolved \(reason.rawValue) audit evidence"
+        }
+        let childInfrastructureFailure = (infrastructureFailure ?? auditCondition).map {
+            ChildInfrastructureFailure(
+                $0,
+                auditRunId: kind.isDestructive ? run.runId : nil
+            )
+        }
         return .completed(ChildRun(
             child: SetRunChild(runId: run.runId, kind: kind, destId: destination.id, status: status),
             outcome: result.outcome,
             preflightFailure: nil,
-            infrastructureFailureReason: infrastructureFailure
+            infrastructureFailure: childInfrastructureFailure
         ))
     }
 
@@ -2185,7 +2493,11 @@ public final class BackupEngine: Sendable {
         case ranToCompletion(ResticOutcome)
         /// restic produced no outcome at all (launch failure, timeout,
         /// secret read failure mid-run, cancellation).
-        case didNotRun(reason: String, preflightFailure: PreflightFailure? = nil)
+        case didNotRun(
+            reason: String,
+            preflightFailure: PreflightFailure? = nil,
+            operationMayHaveRun: Bool = false
+        )
 
         var outcome: ResticOutcome? {
             if case .ranToCompletion(let outcome) = self { return outcome }
@@ -2204,6 +2516,7 @@ public final class BackupEngine: Sendable {
         logWriter: LogWriter?,
         reporter: ProgressReporter?,
         beforeLaunch: (@Sendable () throws -> Void)? = nil,
+        auditBeforeLaunch: (@Sendable () throws -> Void)? = nil,
         afterLaunchFailure: (@Sendable () -> Void)? = nil
     ) async -> ExecuteResult {
         let first = await spawn(
@@ -2212,6 +2525,7 @@ public final class BackupEngine: Sendable {
             logWriter: logWriter,
             reporter: reporter,
             beforeLaunch: beforeLaunch,
+            auditBeforeLaunch: auditBeforeLaunch,
             afterLaunchFailure: afterLaunchFailure
         )
         guard case .ranToCompletion(let outcome) = first, outcome.status == .repoLocked else {
@@ -2243,6 +2557,7 @@ public final class BackupEngine: Sendable {
         logWriter: LogWriter?,
         reporter: ProgressReporter?,
         beforeLaunch: (@Sendable () throws -> Void)? = nil,
+        auditBeforeLaunch: (@Sendable () throws -> Void)? = nil,
         afterLaunchFailure: (@Sendable () -> Void)? = nil
     ) async -> ExecuteResult {
         do {
@@ -2257,6 +2572,7 @@ public final class BackupEngine: Sendable {
                     logWriter?.appendLine(line)
                 },
                 beforeLaunch: beforeLaunch,
+                auditBeforeLaunch: auditBeforeLaunch,
                 afterLaunchFailure: afterLaunchFailure
             )
             return .ranToCompletion(outcome)
@@ -2266,10 +2582,16 @@ public final class BackupEngine: Sendable {
             return .didNotRun(reason: failure.message, preflightFailure: failure)
         } catch let error as ResticRunnerError {
             logWriter?.appendLine("restic did not run: \(error.description)")
-            return .didNotRun(reason: error.userFacingMessage)
+            return .didNotRun(
+                reason: error.userFacingMessage,
+                operationMayHaveRun: error == .timedOut
+            )
         } catch {
             logWriter?.appendLine("restic did not run: \(error)")
-            return .didNotRun(reason: "The operation did not complete. Open the run log for details.")
+            return .didNotRun(
+                reason: "The operation did not complete. Open the run log for details.",
+                operationMayHaveRun: true
+            )
         }
     }
 
@@ -2278,6 +2600,7 @@ public final class BackupEngine: Sendable {
         destination: Destination,
         logWriter: LogWriter?,
         beforeLaunch: (@Sendable () throws -> Void)? = nil,
+        auditBeforeLaunch: (@Sendable () throws -> Void)? = nil,
         afterLaunchFailure: (@Sendable () -> Void)? = nil
     ) async -> ExecuteResult {
         do {
@@ -2286,6 +2609,7 @@ public final class BackupEngine: Sendable {
                 destination: destination,
                 onRawLine: { logWriter?.appendLine($0) },
                 beforeLaunch: beforeLaunch,
+                auditBeforeLaunch: auditBeforeLaunch,
                 afterLaunchFailure: afterLaunchFailure
             ))
         } catch let error as PreviewTokenError {
@@ -2294,10 +2618,16 @@ public final class BackupEngine: Sendable {
             return .didNotRun(reason: failure.message, preflightFailure: failure)
         } catch let error as ResticRunnerError {
             logWriter?.appendLine("remote maintenance did not run: \(error.description)")
-            return .didNotRun(reason: error.userFacingMessage)
+            return .didNotRun(
+                reason: error.userFacingMessage,
+                operationMayHaveRun: error == .timedOut
+            )
         } catch {
             logWriter?.appendLine("remote maintenance did not run")
-            return .didNotRun(reason: "Remote maintenance could not start. Check SSH and the remote restic installation.")
+            return .didNotRun(
+                reason: "Remote maintenance could not start. Check SSH and the remote restic installation.",
+                operationMayHaveRun: true
+            )
         }
     }
 
@@ -2309,7 +2639,9 @@ public final class BackupEngine: Sendable {
         stats: BackupSummary? = nil,
         errorSummary: String? = nil,
         resticExitCode: Int32? = nil,
-        purgeSnapshotRewrites: [String: String]? = nil
+        purgeSnapshotRewrites: [String: String]? = nil,
+        auditFailureReason: RunAuditFailureReason? = nil,
+        launchWasAuthorized: Bool = false
     ) -> String? {
         do {
             try runStore.finish(
@@ -2318,11 +2650,15 @@ public final class BackupEngine: Sendable {
                 stats: stats,
                 errorSummary: errorSummary,
                 resticExitCode: resticExitCode,
-                purgeSnapshotRewrites: purgeSnapshotRewrites
+                purgeSnapshotRewrites: purgeSnapshotRewrites,
+                auditFailureReason: auditFailureReason
             )
             return nil
         } catch {
-            let reason = "run history unusable — could not index run \(run.runId): \(error)"
+            let prefix = run.kind.isDestructive && launchWasAuthorized
+                ? "operation_completed_audit_failed — "
+                : "run history unusable — "
+            let reason = prefix + "could not commit terminal audit evidence for run \(run.runId): \(error)"
             logWarning("BackupEngine: \(reason)")
             return reason
         }
@@ -2471,6 +2807,8 @@ public final class BackupEngine: Sendable {
         case .lockUnusable(let detail):
             return detail
         case .infrastructureFailure(let reason, _):
+            return reason
+        case .auditFailure(let reason, _, _):
             return reason
         case .token(.storeUnusable(let detail)):
             return "preview-token store unusable — \(detail)"
@@ -2656,6 +2994,23 @@ public final class BackupEngine: Sendable {
 
 /// Throttled writer for `state/current-run-<setId>.json`.
 ///
+/// In-memory evidence that the pre-spawn audit commit succeeded. Canonical
+/// metadata remains authoritative after the process exits; this state exists
+/// only so losing that metadata during terminal commit cannot make the same
+/// invocation forget that repository mutation may already have occurred.
+private final class DestructiveLaunchState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var authorized = false
+
+    var wasAuthorized: Bool {
+        lock.withLock { authorized }
+    }
+
+    func markAuthorized() {
+        lock.withLock { authorized = true }
+    }
+}
+
 /// One instance per child run: the throttle window is per phase, so the
 /// first `status` line of every phase lands immediately and the UI never
 /// waits for progress to appear. An independent timer refreshes only the

@@ -233,6 +233,8 @@ struct AppPathsEnvTests {
         #expect(paths.locksDir.path == "\(rootPath)/locks")
         #expect(paths.lockHealthProbeDir.path == "\(rootPath)/locks/.health")
         #expect(paths.tickLockFile.path == "\(rootPath)/locks/tick.lock")
+        #expect(paths.destructiveAuditLockFile.path == "\(rootPath)/locks/destructive-audit.lock")
+        #expect(paths.runPublicationLockFile.path == "\(rootPath)/locks/run-publication.lock")
         #expect(paths.setLockFile(setId: setId).path == "\(rootPath)/locks/set-\(setId.uuidString).lock")
         #expect(paths.mountsDir(destId: destId).path == "\(rootPath)/mounts/\(destId.uuidString)")
     }
@@ -297,6 +299,8 @@ struct AppPathsEnvTests {
                 paths.locksDir.path,
                 paths.lockHealthProbeDir.path,
                 paths.tickLockFile.path,
+                paths.destructiveAuditLockFile.path,
+                paths.runPublicationLockFile.path,
                 paths.setLockFile(setId: setId).path,
                 paths.mountsDir(destId: destId).path,
             ]
@@ -327,6 +331,8 @@ struct AppPathsEnvTests {
             "locks",
             "locks/.health",
             "locks/tick.lock",
+            "locks/destructive-audit.lock",
+            "locks/run-publication.lock",
             "locks/set-\(setId.uuidString).lock",
             "mounts/\(destId.uuidString)",
         ])

@@ -289,6 +289,13 @@ struct MaintenancePrune: AsyncParsableCommand, JSONRenderable {
                 setId: setId,
                 destinationId: destination.id
             )
+        case .failed(.auditInfrastructure(let reason, let runId)):
+            throw Self.infrastructureFailure(
+                reason: reason,
+                setId: setId,
+                destinationId: destination.id,
+                runId: runId
+            )
         }
     }
 
@@ -298,12 +305,23 @@ struct MaintenancePrune: AsyncParsableCommand, JSONRenderable {
     static func infrastructureFailure(
         reason: String,
         setId: UUID,
-        destinationId: UUID
+        destinationId: UUID,
+        runId: String? = nil
     ) -> CLIFailure {
-        CLIFailure(
-            code: .internalError,
-            message: "Prune could not complete safely: \(reason). Check the Restic Station data directory and run a new reclaim preview.",
-            details: CLIErrorDetails(setId: setId, destinationId: destinationId)
+        let auditFailed = reason.hasPrefix("operation_completed_audit_failed")
+        let guidance = auditFailed
+            ? "Inspect the repository and reconcile run history before requesting any new reclaim."
+            : "Check the Restic Station data directory and run a new reclaim preview."
+        return CLIFailure(
+            code: auditFailed
+                ? .operationCompletedAuditFailed
+                : .internalError,
+            message: "Prune could not complete safely: \(reason). \(guidance)",
+            details: CLIErrorDetails(
+                setId: setId,
+                destinationId: destinationId,
+                runId: runId
+            )
         )
     }
 }

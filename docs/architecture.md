@@ -159,7 +159,7 @@ State — not config — is the right XDG base dir for `root`: `config.json` is 
 | `state/current-run-<setId>.json` | live progress plus an independent 30-second awake-time heartbeat (deleted on completion) |
 | `state/repo-status-<destId>.json` | reachability + last-synced info per destination |
 | `state/fda-check.json` | result of the helper's Full Disk Access probe |
-| `locks/tick.lock`, `locks/set-<setId>.lock` | operation-exclusion flock files (see `scheduling.md`) |
+| `locks/tick.lock`, `locks/destructive-audit.lock`, `locks/run-publication.lock`, `locks/set-<setId>.lock` | operation-exclusion and run-publication flock files (see `scheduling.md`) |
 | `locks/health.lock` | stable inode used only by the live `flock(2)` health probe |
 | `state/health.lock`, `runs/health.lock` | stable health-only inodes that verify `flock(2)` on separately mounted state/run filesystems |
 | `locks/.health/`, `state/.health/`, `runs/.health/` | owner-only scratch directories for fresh create/remove probes on each possibly distinct filesystem |

@@ -1069,6 +1069,10 @@ grep -q "could not acquire the tick lock" "$OUT_FILE" \
     || fail "tick did not say which lock it could not use: $(cat "$OUT_FILE")"
 ok "tick exits non-zero and names the lock, instead of exiting 0 like a busy tick"
 
+# Break the audit gate too. Its verifier runs before the shared lock-health
+# probe; status must still emit the documented StatusReport rather than a
+# generic internal-error envelope when that early acquisition fails.
+mkdir -p "$BROKEN_LOCKS/locks/destructive-audit.lock"
 RESTIC_STATION_DATA_DIR="$BROKEN_LOCKS" run_helper_split status --json
 [[ "$RC" -ne 0 ]] \
     || fail "status --json exited 0 on a machine that cannot take a lock"
