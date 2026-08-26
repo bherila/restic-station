@@ -51,13 +51,15 @@ struct MenuBarView: View {
 
             Menu("Back Up Now") {
                 ForEach(model.setHealths) { health in
+                    let reason = model.backUpNowUnavailableReason(setId: health.setId)
                     Button(health.name) {
                         model.backUpNow(setId: health.setId)
                     }
-                    .disabled(model.isBusy(setId: health.setId))
+                    .disabled(reason != nil)
+                    .help(reason ?? "Back up \(health.name) now.")
                 }
             }
-            .disabled(model.setHealths.isEmpty || model.scheduleStateFailure != nil)
+            .disabled(model.setHealths.isEmpty)
 
             Divider()
 

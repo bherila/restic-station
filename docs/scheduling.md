@@ -361,7 +361,7 @@ The operation-exclusion locks use `flock(2)` `LOCK_EX | LOCK_NB` on files under 
 | `health.lock` | a live health probe | exercise the backing filesystem's actual `flock(2)` support without contending with production work |
 | `state/health.lock`, `runs/health.lock` | a live health probe | exercise `flock(2)` on state/run filesystems when they are separate mounts |
 | `secrets.lock` | any secret-store mutation | serialize file-backend read-modify-write and keychain capture/update/conditional rollback across app and helper CLI |
-| `state/schedule-state.lock` | a schedule-state mutation | serialize schedule timestamps, check cursors, and purge watermarks across sets |
+| `state/schedule-state.lock` | a schedule-state mutation; for purge, the trusted read through rewrite completion and watermark commit | serialize schedule timestamps, check cursors, and purge watermarks across sets; bind destructive state evidence through use |
 | `state/preview-tokens.lock` | a preview-token mutation | preserve single-use destructive capabilities across sets |
 | `runs/index.jsonl.lock` | a run-index append | keep append ordering and records intact across sets |
 
@@ -390,7 +390,7 @@ For every destination: `stale ⟺ now − lastSyncedAt > stalenessWarningDays` (
 
 The app is macOS-only; on Linux the helper is the whole product.
 
-The app never computes schedules. It renders `schedule-state.json` + `repo-status-*.json` + `nextDue()` (calling ScheduleMath for display only), registers/unregisters the LaunchAgent, and invokes the helper for manual actions. A schedule-state integrity failure makes the menu-bar glyph critical, names the recovery requirement in both menu and window, and disables **Back Up Now** until the canonical file is explicitly repaired:
+The app never computes schedules. It renders `schedule-state.json` + `repo-status-*.json` + `nextDue()` (calling ScheduleMath for display only), registers/unregisters the LaunchAgent, and invokes the helper for manual actions. A schedule-state integrity failure makes the menu-bar glyph critical, names the recovery requirement in both menu and window, and disables **every** Back Up Now entry point until the canonical file is explicitly repaired. `AppModel.backUpNow` repeats that guard so a missed or future view cannot spawn the helper:
 - `Back Up Now` → `restic-station-helper run-set --set <uuid>`
 - kick a tick early (after config edits) → `launchctl kickstart gui/<uid>/net.herila.ResticStation.helper`
 

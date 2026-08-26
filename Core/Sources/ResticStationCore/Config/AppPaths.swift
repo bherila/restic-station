@@ -200,6 +200,13 @@ public struct AppPaths: Equatable, Sendable {
         stateDir.appendingPathComponent("schedule-state.json", isDirectory: false)
     }
 
+    /// Monotonic evidence that this installation has published the
+    /// checksummed schedule-state envelope. Once present, an unversioned
+    /// canonical document is a downgrade/corruption, not legacy input.
+    public var scheduleStateVersionMarkerFile: URL {
+        stateDir.appendingPathComponent("schedule-state.version-1", isDirectory: false)
+    }
+
     /// `state/current-run-<setId>.json` — live progress of an in-flight run
     /// (deleted on completion).
     public func currentRunFile(setId: UUID) -> URL {

@@ -1553,18 +1553,20 @@ public final class BackupEngine: Sendable {
         trigger: RunTrigger,
         groupId: String?
     ) async throws -> PurgeRunResult {
-        // The watermark is required both to decide automatic work and to
-        // acknowledge any successful manual rewrite afterward. Refuse before
-        // token consumption or repository queries if the canonical state is
-        // already untrustworthy.
+        // Bind the watermark evidence through repository validation, every
+        // destructive launch, and the matching durable acknowledgement. The
+        // schedule-state lock is process-wide (unlike the per-set lock), so a
+        // different set cannot replace the shared document in that window.
+        let scheduleStateLease: LockedScheduleState
         do {
-            _ = try trustedScheduleState()
+            scheduleStateLease = try stateStore.lockScheduleState()
         } catch {
             throw PurgeApplyError.infrastructureFailure(
                 reason: "schedule state unusable before purge — \(error)",
                 operationMayHaveRun: false
             )
         }
+        defer { scheduleStateLease.release() }
 
         let preview: PreviewToken
         do {
@@ -1704,7 +1706,8 @@ public final class BackupEngine: Sendable {
                         setId: set.id,
                         destinationId: destination.id,
                         patterns: preview.patterns,
-                        operationMayHaveRun: !children.isEmpty
+                        operationMayHaveRun: !children.isEmpty,
+                        scheduleStateLease: scheduleStateLease
                     )
                 } else {
                     logWarning(
@@ -1791,7 +1794,8 @@ public final class BackupEngine: Sendable {
                     setId: set.id,
                     destinationId: destination.id,
                     patterns: preview.patterns,
-                    operationMayHaveRun: true
+                    operationMayHaveRun: true,
+                    scheduleStateLease: scheduleStateLease
                 )
             }
         }
@@ -2836,10 +2840,11 @@ public final class BackupEngine: Sendable {
         setId: UUID,
         destinationId: UUID,
         patterns: [String],
-        operationMayHaveRun: Bool
+        operationMayHaveRun: Bool,
+        scheduleStateLease: LockedScheduleState
     ) throws {
         do {
-            try updateScheduleState(setId: setId) { state in
+            _ = try scheduleStateLease.update(setId: setId) { state in
                 var applied = state.appliedPurgeExcludes[destinationId] ?? []
                 for pattern in patterns where !applied.contains(pattern) {
                     applied.append(pattern)

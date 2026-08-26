@@ -328,7 +328,51 @@ struct StateStoreTests {
         )
         #expect(object["version"] as? Int == ScheduleState.currentVersion)
         #expect((object["checksum"] as? String)?.count == 64)
+        #expect(try Data(contentsOf: store.paths.scheduleStateVersionMarkerFile) == Data("1\n".utf8))
         #expect(store.readScheduleState()?.sets[setId]?.checkSliceCursor == 5)
+    }
+
+    @Test("a migrated schedule state cannot be downgraded by stripping its envelope")
+    func strippedVersionedEnvelopeFailsClosed() throws {
+        let (store, root) = makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let setId = UUID()
+        try store.updateScheduleState(setId: setId) { state in
+            state.appliedPurgeExcludes[UUID()] = ["private/**"]
+        }
+
+        var object = try #require(
+            JSONSerialization.jsonObject(with: Data(contentsOf: store.paths.scheduleStateFile))
+                as? [String: Any]
+        )
+        object.removeValue(forKey: "version")
+        object.removeValue(forKey: "checksum")
+        let stripped = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+        try stripped.write(to: store.paths.scheduleStateFile)
+
+        guard case .corrupt(let failure) = store.readScheduleStateResult() else {
+            Issue.record("a stripped v1 envelope was accepted as legacy state")
+            return
+        }
+        #expect(failure.reason == .versionDowngrade)
+        #expect(try Data(contentsOf: store.paths.scheduleStateFile) == stripped)
+        #expect(throws: StateStoreError.self) {
+            try store.updateScheduleState(setId: setId) { $0.checkSliceCursor = 1 }
+        }
+    }
+
+    @Test("a versioned schedule state without its durable migration marker fails closed")
+    func missingVersionMarkerFailsClosed() throws {
+        let (store, root) = makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try store.updateScheduleState(setId: UUID()) { $0.checkSliceCursor = 1 }
+        try FileManager.default.removeItem(at: store.paths.scheduleStateVersionMarkerFile)
+
+        guard case .corrupt(let failure) = store.readScheduleStateResult() else {
+            Issue.record("versioned state without its migration marker was accepted")
+            return
+        }
+        #expect(failure.reason == .versionMarkerMissing)
     }
 
     @Test("a checksum mismatch is quarantined and cannot be overwritten")
@@ -415,6 +459,41 @@ struct StateStoreTests {
         #expect(values.isSymbolicLink == true)
     }
 
+    @Test("FIFO schedule and recovery paths are rejected without blocking")
+    func scheduleStateFIFOsDoNotBlock() throws {
+        let (store, root) = makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try store.paths.ensureDirectories()
+        try #require(store.paths.scheduleStateFile.path.withCString { mkfifo($0, 0o600) } == 0)
+
+        let started = Date()
+        guard case .corrupt(let failure) = store.readScheduleStateResult() else {
+            Issue.record("FIFO canonical schedule state was accepted")
+            return
+        }
+        #expect(Date().timeIntervalSince(started) < 1)
+        #expect(failure.reason == .unsafeFile(reason: "not a regular file"))
+
+        try FileManager.default.removeItem(at: store.paths.scheduleStateFile)
+        let corrupt = Data("bad schedule {{{".utf8)
+        try corrupt.write(to: store.paths.scheduleStateFile)
+        guard case .corrupt(let firstFailure) = store.readScheduleStateResult() else {
+            Issue.record("corrupt bytes were not classified")
+            return
+        }
+        let recovery = URL(fileURLWithPath: try #require(firstFailure.quarantinePath))
+        try FileManager.default.removeItem(at: recovery)
+        try #require(recovery.path.withCString { mkfifo($0, 0o600) } == 0)
+
+        let recoveryStarted = Date()
+        guard case .corrupt(let secondFailure) = store.readScheduleStateResult() else {
+            Issue.record("corrupt bytes with a FIFO recovery path were not classified")
+            return
+        }
+        #expect(Date().timeIntervalSince(recoveryStarted) < 1)
+        #expect(try Data(contentsOf: URL(fileURLWithPath: #require(secondFailure.quarantinePath))) == corrupt)
+    }
+
     @Test("schedule-state publication reports each durability boundary failure")
     func scheduleStateDurabilityFaults() throws {
         for point in [
@@ -441,6 +520,28 @@ struct StateStoreTests {
             } else {
                 #expect(after == before)
             }
+        }
+    }
+
+    @Test("the monotonic migration marker commits before any v1 envelope")
+    func scheduleStateMarkerDurabilityFaults() throws {
+        for point in [
+            ScheduleStateFaultInjector.Point.firstSync,
+            .rename,
+            .secondSync,
+        ] {
+            let root = FileManager.default.temporaryDirectory
+                .appendingPathComponent("restic-station-marker-fault-\(UUID().uuidString)", isDirectory: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let paths = AppPaths(root: root)
+            let injector = ScheduleStateFaultInjector(point)
+            let store = StateStore(paths: paths, fileOperations: injector.operations())
+
+            #expect(throws: StateStoreError.self) {
+                try store.updateScheduleState(setId: UUID()) { $0.checkSliceCursor = 1 }
+            }
+            #expect(!FileManager.default.fileExists(atPath: paths.scheduleStateFile.path))
+            #expect(StateStore(paths: paths).readScheduleStateResult() == .missing)
         }
     }
 

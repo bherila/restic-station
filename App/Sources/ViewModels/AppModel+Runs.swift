@@ -90,6 +90,9 @@ extension AppModel {
     /// its `help(_:)` — "what failed, why, one next step"
     /// (`docs/ui-spec.md` §Copy/tone rules).
     func backUpNowUnavailableReason(setId: UUID) -> String? {
+        if let failure = scheduleStateFailure {
+            return "Backups are paused until schedule state is recovered. \(failure.recoveryMessage)"
+        }
         guard isBusy(setId: setId) else { return nil }
         let name = setName(for: setId)
         if let run = stateWatcher.currentRuns[setId], runStore.liveness(ofCurrentRun: run) == .stalled {

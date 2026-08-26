@@ -3895,22 +3895,21 @@ struct BackupEngineTests {
         #expect(!env.resticArgvs.contains { $0.contains("copy") && $0.contains(failing.repoURL) })
     }
 
-    @Test("automatic purge: a successful rewrite without a durable watermark is infrastructure failure")
-    func automaticPurgeWatermarkFailureIsInfrastructureFailure() async throws {
+    @Test("automatic purge holds schedule-state evidence through launch and watermark commit")
+    func automaticPurgeBindsScheduleStateThroughWatermark() async throws {
         let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]
         let hostnames = [Self.setId: Set(["example-mac.local"])]
         let paths = Box<AppPaths?>(nil)
+        let sawContendedScheduleStateLock = Box(false)
         let env = Self.makeEnv(
             script: [], retention: nil, purgeExcludes: ["build/**"], reachableSecondaries: [],
             onSpawn: { argv in
                 guard argv.contains("rewrite"),
                       !argv.contains("--dry-run"),
                       let paths = paths.value else { return }
-                try? FileManager.default.removeItem(at: paths.scheduleStateLockFile)
-                try? FileManager.default.createDirectory(
-                    at: paths.scheduleStateLockFile,
-                    withIntermediateDirectories: true
-                )
+                let contender = FileLock(path: paths.scheduleStateLockFile, trustedRoot: paths.root)
+                sawContendedScheduleStateLock.value = contender.acquire() == .busy
+                contender.release()
             },
             purgeSourcePaths: sourcePaths,
             purgeHostnames: hostnames
@@ -3946,12 +3945,17 @@ struct BackupEngineTests {
 
         let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
 
-        guard case .infrastructureFailure(let reason) = outcome else {
-            Issue.record("a lost purge watermark must fail the scheduled tick: \(outcome)")
+        guard case .completed(let status, _, _) = outcome else {
+            Issue.record("the bound purge should complete: \(outcome)")
             return
         }
-        #expect(reason.contains("purge watermark"))
+        #expect(status == .success)
+        #expect(sawContendedScheduleStateLock.value)
         #expect(env.entries(kind: .purge).first?.status == .success)
+        #expect(
+            env.stateStore.readScheduleState()?.sets[Self.setId]?
+                .appliedPurgeExcludes[env.primary.id] == env.set.purgeExcludes
+        )
     }
 
     @Test("row purge 2: a stale secondary whose purge fails is never copied or marked applied")

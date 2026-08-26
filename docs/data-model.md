@@ -459,12 +459,22 @@ and checksum above are abbreviated for readability. A successful mutation is
 acknowledged only after the new file and its directory entry cross the crash-
 durability boundary.
 
+`state/schedule-state.version-1` is the owner-only monotonic migration marker.
+It is durably published before the first version-1 envelope. While the
+canonical file exists, the marker makes an unversioned document a detected
+downgrade rather than legacy input; conversely, a versioned document without
+the marker fails closed. A crash between marker and envelope publication can
+require explicit recovery, but cannot silently discard checksum protection.
+
 `lastBackupStart` is the *start* time of the last **attempted** scheduled backup (success or failure) — due-computation keys off attempts, so a failing set retries at its next slot, not every tick. Manual runs also update it (a manual backup satisfies the schedule). `checkSliceCursor` is the `n` most recently used in `--read-data-subset=n/t`. `appliedPurgeExcludes` records, per destination UUID, only patterns whose `rewrite --forget` child succeeded. Removing a pattern never removes it from this watermark: history cannot be restored, and a smaller list must not trigger a pointless rewrite.
 
-An absent file is a new, empty schedule. A legacy unversioned document remains
-readable and is upgraded to version 1 on its next mutation. Everything else
+An absent file is a new, empty schedule. Before the monotonic marker exists, a
+legacy unversioned document remains readable and is upgraded to version 1 on
+its next mutation. After migration, stripping `version` and `checksum` is a
+recovery failure rather than a route back to unchecked legacy decoding. Everything else
 fails closed: malformed JSON or UUID keys, a checksum mismatch, an unsupported
-version, an oversized document, an I/O error, a symlink, or a non-regular or
+version, missing/unsafe migration evidence, an oversized document, an I/O
+error, a symlink, FIFO, or another non-regular or
 foreign-owned canonical file. Readable untrusted bytes are copied exactly to
 `schedule-state.corrupt-<sha256>.json`; the canonical file remains untouched
 as the sentinel that prevents an accidental empty-state rewrite. Repeated
@@ -560,7 +570,7 @@ The tick clears it: `recoverInterrupted()` returns the `setId` alongside the
 
 ## Versioning & migration
 
-`AppConfig.currentVersion` is **3**. Loader behavior: version > current → refuse with a clear error ("config written by a newer Restic Station"); version < current → run the in-code migration chain, then persist. Regenerable state/run caches carry no version field and tolerate decode failure. The exception is `state/schedule-state.json`, whose current envelope version is **1** and whose checksum protects destructive purge bookkeeping. Legacy unversioned schedule state is accepted and upgraded on mutation; malformed, tampered, or newer-version state is preserved and makes schedule mutations, `status`, and the app fail unhealthy until explicit recovery. `machine.json` versions independently (`MachineConfig.currentVersion`, currently 1).
+`AppConfig.currentVersion` is **3**. Loader behavior: version > current → refuse with a clear error ("config written by a newer Restic Station"); version < current → run the in-code migration chain, then persist. Regenerable state/run caches carry no version field and tolerate decode failure. The exception is `state/schedule-state.json`, whose current envelope version is **1** and whose checksum protects destructive purge bookkeeping. Legacy unversioned schedule state is accepted only before `state/schedule-state.version-1` is durably published and is upgraded on mutation; malformed, downgraded, tampered, or newer-version state is preserved and makes schedule mutations, `status`, and the app fail unhealthy until explicit recovery. `machine.json` versions independently (`MachineConfig.currentVersion`, currently 1).
 
 ### v1 → v2
 

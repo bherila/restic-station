@@ -634,12 +634,14 @@ assert_migration() {
 # than a manual `run-set`, which dispatches with a different trigger.
 wind_schedule_back() {
     local set_id="$1" step="$2" file="$DATA_DIR/state/schedule-state.json"
+    local marker="$DATA_DIR/state/schedule-state.version-1"
     # Fails loudly THROUGH fail() on every path, labelled with the caller's
     # step. A missing file, a missing set entry, or a renamed field must not
     # quietly wind nothing back — and must not abort as a bare nonzero under
     # `set -e` either, which would skip fail()'s index/state dump and let the
     # EXIT trap delete the evidence before anyone can look at it.
     [[ -f "$file" ]] || fail "$step" "wind_schedule_back: no schedule-state.json at $file"
+    [[ -f "$marker" ]] || fail "$step" "wind_schedule_back: no migration marker at $marker"
     local wind_out
     if ! wind_out="$(python3 - "$file" "$set_id" 2>&1 <<'WIND'
 import json, sys
@@ -656,9 +658,11 @@ entry = sets[set_id]
 if "lastBackupStart" not in entry:
     sys.exit(f"no lastBackupStart in schedule-state entry: {sorted(entry)}")
 entry["lastBackupStart"] = "2020-01-01T00:00:00Z"
-# This test-only time travel cannot truthfully retain the v1 checksum. Write
-# the supported legacy shape instead; the tick must accept it and upgrade it
-# under the schedule-state lock before launching restic.
+# This test-only time travel cannot truthfully retain the v1 checksum. The
+# shell removes the companion migration marker immediately afterward, rolling
+# the whole fixture back to the supported pre-migration legacy shape. The tick
+# must durably recreate both marker and envelope under the schedule-state lock
+# before launching restic.
 state.pop("version", None)
 state.pop("checksum", None)
 with open(path, "w") as handle:
@@ -667,6 +671,7 @@ WIND
     )"; then
         fail "$step" "wind_schedule_back: ${wind_out:-python3 failed with no output}"
     fi
+    rm -f "$marker"
 }
 
 assert_retention() {
@@ -736,6 +741,8 @@ assert_retention() {
         and (.checksum | type == "string" and test("^[0-9a-f]{64}$"))
     ' "$DATA_DIR/state/schedule-state.json" >/dev/null \
         || fail "$step" "the scheduled mutation did not upgrade legacy schedule state to a checksummed v1 envelope"
+    [[ "$(cat "$DATA_DIR/state/schedule-state.version-1")" == "1" ]] \
+        || fail "$step" "the scheduled mutation did not durably recreate the version-1 migration marker"
 
     local scheduled_after
     # Whitespace-tolerant: `jq -c` emits `"trigger":"scheduled"` while the

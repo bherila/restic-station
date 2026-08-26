@@ -155,6 +155,7 @@ State — not config — is the right XDG base dir for `root`: `config.json` is 
 | `runs/<runId>/log.txt` | full streamed log of the run |
 | `runs/index.jsonl` | append-only, one summary JSON line per finished run |
 | `state/schedule-state.json` | last-start times + check-slice cursors per set |
+| `state/schedule-state.version-1` | owner-only monotonic evidence that schedule state has migrated to its checksummed v1 envelope |
 | `state/preview-tokens.json` | owner-only (`0600`) short-lived destructive-preview capabilities; never copied into runs or logs |
 | `state/current-run-<setId>.json` | live progress plus an independent 30-second awake-time heartbeat (deleted on completion) |
 | `state/repo-status-<destId>.json` | reachability + last-synced info per destination |

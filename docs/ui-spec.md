@@ -10,7 +10,7 @@ This spec fixes **information architecture, controls, states, and copy**. Visual
 - Window title "Restic Station". Min size ~ 900×560.
 - `AppModel` (ObservableObject, injected via environment) owns: `AppConfig` (via ConfigStore), live state (via StateWatcher), and helper invocation. All mutations go config-edit → save → (if schedule-relevant) kickstart tick.
 - If `config.json` changes while the app is open, retain the current in-memory config and show a global "Settings changed on disk" banner with **Reload Settings**. Saving an editor whose edit-start fingerprint no longer matches is refused; explicit reload adopts the latest valid file but does not bless already-open stale drafts.
-- If `schedule-state.json` exists but fails its schema, checksum, or safe-file checks, show a global red **Schedule state needs recovery** banner. Its help text names the unchanged canonical path and exact-byte recovery copy. The menu bar shows the same critical reason and disables **Back Up Now** until explicit repair.
+- If `schedule-state.json` exists but fails its schema, checksum, monotonic migration marker, or safe-file checks, show a global red **Schedule state needs recovery** banner. Its help text names the unchanged canonical path and exact-byte recovery copy. Every **Back Up Now** control (menu bar, Runs toolbar, Backup Sets context menu, and Restore suggestion) shows the same unavailability reason and stays disabled until explicit repair; the model action itself enforces the same guard.
 
 ## Menu bar (`MenuBarExtra`, style `.menu`, `isInserted:` bound to `showMenuBarIcon`)
 

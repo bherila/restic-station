@@ -345,6 +345,8 @@ public struct FdaCheckResult: Codable, Equatable, Sendable {
 public enum ScheduleStateReadFailureReason: Equatable, Sendable, CustomStringConvertible {
     case malformedDocument
     case checksumMismatch
+    case versionDowngrade
+    case versionMarkerMissing
     case unsupportedVersion(found: Int, current: Int)
     case unsafeFile(reason: String)
     case ioFailure(operation: String, errno: Int32)
@@ -356,6 +358,10 @@ public enum ScheduleStateReadFailureReason: Equatable, Sendable, CustomStringCon
             return "the document is malformed"
         case .checksumMismatch:
             return "the checksum does not match the schedule payload"
+        case .versionDowngrade:
+            return "the versioned schedule-state envelope was stripped after migration"
+        case .versionMarkerMissing:
+            return "the versioned schedule state is missing its durable migration marker"
         case .unsupportedVersion(let found, let current):
             return "the document version is \(found), but this build supports version \(current)"
         case .unsafeFile(let reason):
@@ -567,6 +573,14 @@ public struct StateStore: Sendable {
                     guard !probe.hasChecksum else {
                         return .corrupt(scheduleStateFailure(reason: .malformedDocument, bytes: data))
                     }
+                    switch readScheduleStateVersionMarker() {
+                    case .missing:
+                        break
+                    case .present:
+                        return .corrupt(scheduleStateFailure(reason: .versionDowngrade, bytes: data))
+                    case .failed(let reason):
+                        return .corrupt(scheduleStateFailure(reason: reason, bytes: data))
+                    }
                     // Legacy v0: no checksum existed. Preserve compatibility,
                     // then upgrade under the mutation lock on the next write.
                     return .valid(try decoder.decode(ScheduleState.self, from: data))
@@ -576,6 +590,14 @@ public struct StateStore: Sendable {
                         reason: .unsupportedVersion(found: version, current: ScheduleState.currentVersion),
                         bytes: data
                     ))
+                }
+                switch readScheduleStateVersionMarker() {
+                case .present:
+                    break
+                case .missing:
+                    return .corrupt(scheduleStateFailure(reason: .versionMarkerMissing, bytes: data))
+                case .failed(let reason):
+                    return .corrupt(scheduleStateFailure(reason: reason, bytes: data))
                 }
                 let document = try decoder.decode(ScheduleStateDocument.self, from: data)
                 let checksum = try Self.scheduleStateChecksum(document.state)
@@ -619,7 +641,12 @@ public struct StateStore: Sendable {
         defer { _ = fileOperations.close(directoryFD) }
 
         let filename = paths.scheduleStateFile.lastPathComponent
-        let fd = fileOperations.openAt(directoryFD, filename, O_RDONLY | O_CLOEXEC | O_NOFOLLOW, 0)
+        let fd = fileOperations.openAt(
+            directoryFD,
+            filename,
+            O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW,
+            0
+        )
         guard fd >= 0 else {
             let code = errno
             return code == ENOENT
@@ -669,6 +696,85 @@ public struct StateStore: Sendable {
         return .bytes(data)
     }
 
+    private enum ScheduleStateVersionMarkerRead {
+        case missing
+        case present
+        case failed(ScheduleStateReadFailureReason)
+    }
+
+    private static let scheduleStateVersionMarkerBytes = Data("1\n".utf8)
+
+    /// Reads the monotonic migration marker without ever blocking on a
+    /// hostile FIFO. The filename is version-specific, while the tiny body
+    /// catches truncated or substituted regular files.
+    private func readScheduleStateVersionMarker() -> ScheduleStateVersionMarkerRead {
+        let directoryFD = fileOperations.openAt(
+            AT_FDCWD,
+            paths.stateDir.path,
+            O_RDONLY | O_DIRECTORY | O_CLOEXEC,
+            0
+        )
+        guard directoryFD >= 0 else {
+            let code = errno
+            return code == ENOENT
+                ? .missing
+                : .failed(.ioFailure(operation: "open state directory for version marker", errno: code))
+        }
+        defer { _ = fileOperations.close(directoryFD) }
+
+        let fd = fileOperations.openAt(
+            directoryFD,
+            paths.scheduleStateVersionMarkerFile.lastPathComponent,
+            O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW,
+            0
+        )
+        guard fd >= 0 else {
+            let code = errno
+            return code == ENOENT
+                ? .missing
+                : .failed(.ioFailure(operation: "open schedule state version marker", errno: code))
+        }
+        defer { _ = fileOperations.close(fd) }
+
+        var info = stat()
+        guard fileOperations.stat(fd, &info) == 0 else {
+            return .failed(.ioFailure(operation: "fstat schedule state version marker", errno: errno))
+        }
+        guard (info.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG) else {
+            return .failed(.unsafeFile(reason: "schedule state version marker is not a regular file"))
+        }
+        guard info.st_uid == geteuid() else {
+            return .failed(.unsafeFile(
+                reason: "schedule state version marker is owned by uid \(info.st_uid), expected \(geteuid())"
+            ))
+        }
+        guard info.st_mode & 0o077 == 0 else {
+            return .failed(.unsafeFile(reason: "schedule state version marker is accessible by other users"))
+        }
+        guard Int64(info.st_size) == Int64(Self.scheduleStateVersionMarkerBytes.count) else {
+            return .failed(.unsafeFile(reason: "schedule state version marker has invalid contents"))
+        }
+
+        var bytes = Data()
+        var buffer = [UInt8](repeating: 0, count: Self.scheduleStateVersionMarkerBytes.count + 1)
+        while bytes.count <= Self.scheduleStateVersionMarkerBytes.count {
+            let count = buffer.withUnsafeMutableBytes { raw -> Int in
+                guard let base = raw.baseAddress else { return 0 }
+                return fileOperations.read(fd, base, raw.count)
+            }
+            if count < 0 {
+                let code = errno
+                if code == EINTR { continue }
+                return .failed(.ioFailure(operation: "read schedule state version marker", errno: code))
+            }
+            if count == 0 { break }
+            bytes.append(contentsOf: buffer.prefix(count))
+        }
+        return bytes == Self.scheduleStateVersionMarkerBytes
+            ? .present
+            : .failed(.unsafeFile(reason: "schedule state version marker has invalid contents"))
+    }
+
     private func scheduleStateFailure(
         reason: ScheduleStateReadFailureReason,
         bytes: Data?
@@ -704,9 +810,11 @@ public struct StateStore: Sendable {
         readScheduleStateResult().state
     }
 
-    /// How long to retry for the schedule-state lock before giving up. The
-    /// critical section is a decode, one dictionary mutation and an atomic
-    /// write, so real contention is measured in milliseconds.
+    /// How long to retry for the schedule-state lock before giving up. Most
+    /// critical sections are a decode, one dictionary mutation and an atomic
+    /// write. A purge deliberately keeps the same evidence-bound lease
+    /// through rewrite completion and its watermark commit; another helper
+    /// times out safely instead of running from state that purge may change.
     private static let stateLockTimeout: Duration = .seconds(5)
     private static let stateLockPollInterval: UInt32 = 20_000  // 20ms
 
@@ -715,7 +823,8 @@ public struct StateStore: Sendable {
     /// result back atomically.
     ///
     /// Held under ``AppPaths/scheduleStateLockFile`` for the whole
-    /// read-modify-write. The write itself was always atomic, but atomicity
+    /// read-modify-write (or, for purge, through destructive use and durable
+    /// acknowledgement). The write itself was always atomic, but atomicity
     /// is not isolation: `schedule-state.json` is one document shared by
     /// every set, while the only other lock is per-set. A scheduled tick for
     /// set A and a manual operation on set B run in different processes,
@@ -731,11 +840,7 @@ public struct StateStore: Sendable {
     /// being scheduled to release, so waiters spin to the timeout. A test that
     /// did exactly that turned a 0.3s case into a 50s one on a two-core runner
     /// and stalled the whole suite behind it.
-    @discardableResult
-    public func updateScheduleState(
-        setId: UUID,
-        mutate: (inout SetScheduleState) -> Void
-    ) throws -> ScheduleState {
+    func lockScheduleState() throws -> LockedScheduleState {
         try paths.ensureDirectories()
         let lock = FileLock(path: paths.scheduleStateLockFile, trustedRoot: paths.root)
         let clock = ContinuousClock()
@@ -760,8 +865,6 @@ public struct StateStore: Sendable {
             }
             break
         }
-        defer { lock.release() }
-
         var state: ScheduleState
         switch readScheduleStateResult() {
         case .missing:
@@ -769,13 +872,20 @@ public struct StateStore: Sendable {
         case .valid(let loaded):
             state = loaded
         case .corrupt(let failure):
+            lock.release()
             throw StateStoreError.scheduleStateCorrupt(failure)
         }
-        var entry = state.sets[setId] ?? SetScheduleState()
-        mutate(&entry)
-        state.sets[setId] = entry
-        try writeScheduleState(state)
-        return state
+        return LockedScheduleState(store: self, lock: lock, state: state)
+    }
+
+    @discardableResult
+    public func updateScheduleState(
+        setId: UUID,
+        mutate: (inout SetScheduleState) -> Void
+    ) throws -> ScheduleState {
+        let locked = try lockScheduleState()
+        defer { locked.release() }
+        return try locked.update(setId: setId, mutate: mutate)
     }
 
     // MARK: - current-run-<setId>.json
@@ -868,7 +978,8 @@ public struct StateStore: Sendable {
         SHA256Digest.hex(try makeEncoder().encode(state))
     }
 
-    private func writeScheduleState(_ state: ScheduleState) throws {
+    fileprivate func writeScheduleState(_ state: ScheduleState) throws {
+        try ensureScheduleStateVersionMarker()
         let document = try ScheduleStateDocument(state: state)
         let data = try Self.makeEncoder().encode(document)
         try writeDurably(
@@ -877,6 +988,28 @@ public struct StateStore: Sendable {
             tempName: paths.scheduleStateFile.lastPathComponent + ".tmp",
             postNotification: true
         )
+    }
+
+    /// The marker commits before the first v1 envelope. A crash between the
+    /// two publications can stop scheduling, but can never make an already
+    /// migrated state look like unchecked legacy input.
+    private func ensureScheduleStateVersionMarker() throws {
+        switch readScheduleStateVersionMarker() {
+        case .present:
+            return
+        case .missing:
+            try writeDurably(
+                Self.scheduleStateVersionMarkerBytes,
+                to: paths.scheduleStateVersionMarkerFile,
+                tempName: paths.scheduleStateVersionMarkerFile.lastPathComponent + ".tmp",
+                postNotification: false
+            )
+        case .failed(let reason):
+            throw StateStoreError.scheduleStateCorrupt(ScheduleStateReadFailure(
+                reason: reason,
+                canonicalPath: paths.scheduleStateFile.path
+            ))
+        }
     }
 
     /// Retains the exact untrusted bytes under a content-addressed filename.
@@ -916,7 +1049,7 @@ public struct StateStore: Sendable {
         let fd = fileOperations.openAt(
             directoryFD,
             url.lastPathComponent,
-            O_RDONLY | O_CLOEXEC | O_NOFOLLOW,
+            O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW,
             0
         )
         guard fd >= 0 else { return false }
@@ -1143,6 +1276,45 @@ public struct StateStore: Sendable {
             )
         }
         return decoder
+    }
+}
+
+/// Exclusive, process-wide authority over the schedule-state document.
+/// Destructive purge keeps this lease from its trusted read through restic
+/// completion and the watermark commit, so another helper cannot invalidate
+/// the evidence between validation, use, and acknowledgement.
+final class LockedScheduleState {
+    private let store: StateStore
+    private let lock: FileLock
+    private var isHeld = true
+    private(set) var state: ScheduleState
+
+    fileprivate init(store: StateStore, lock: FileLock, state: ScheduleState) {
+        self.store = store
+        self.lock = lock
+        self.state = state
+    }
+
+    func update(
+        setId: UUID,
+        mutate: (inout SetScheduleState) -> Void
+    ) throws -> ScheduleState {
+        precondition(isHeld, "schedule-state lease used after release")
+        var entry = state.sets[setId] ?? SetScheduleState()
+        mutate(&entry)
+        state.sets[setId] = entry
+        try store.writeScheduleState(state)
+        return state
+    }
+
+    func release() {
+        guard isHeld else { return }
+        isHeld = false
+        lock.release()
+    }
+
+    deinit {
+        release()
     }
 }
 

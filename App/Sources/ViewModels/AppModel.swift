@@ -735,7 +735,10 @@ final class AppModel: ObservableObject {
     /// Fire-and-forget: progress arrives through `StateWatcher`, and only the
     /// final outcome line is recorded here.
     func backUpNow(setId: UUID) {
-        guard !isBusy(setId: setId) else { return }
+        // This is the process-wide guard, not merely presentation state: any
+        // current or future UI entry point must fail closed while destructive
+        // schedule bookkeeping needs recovery.
+        guard backUpNowUnavailableReason(setId: setId) == nil else { return }
         let setName = config.sets.first { $0.id == setId }?.name ?? "backup set"
         pendingActionSetIds.insert(setId)
         Task { [helper] in

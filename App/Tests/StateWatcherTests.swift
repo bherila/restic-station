@@ -129,6 +129,11 @@ struct StateWatcherTests {
         let model = AppModel(paths: paths)
         #expect(model.scheduleStateFailure != nil)
         #expect(model.appHealth == .critical)
+        let setId = UUID()
+        let unavailable = try #require(model.backUpNowUnavailableReason(setId: setId))
+        #expect(unavailable.contains("Backups are paused until schedule state is recovered"))
+        model.backUpNow(setId: setId)
+        #expect(model.pendingActionSetIds.isEmpty, "the model guard must protect every present and future UI entry point")
 
         // Recovery is explicit: replacing the canonical bytes with a valid
         // legacy document is accepted; no reader silently deletes the bad
