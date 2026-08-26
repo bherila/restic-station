@@ -219,7 +219,7 @@ private func setRunStoreTestErrno(_ value: Int32) {
 
     @Test("purge recovery evidence is bound into the independently verified index projection")
     func purgeRecoveryEvidenceTamperingBreaksAuditProjection() throws {
-        for mutatedField in ["purgePatterns", "purgeRepositoryId"] {
+        for mutatedField in ["purgePatterns", "purgeRepositoryId", "purgeSnapshotRewrites"] {
             let paths = makePaths()
             defer { cleanup(paths) }
             let store = RunStore(paths: paths, now: { Date() })
@@ -233,7 +233,12 @@ private func setRunStoreTestErrno(_ value: Int32) {
             run.purgePatterns = ["build/**", ".cache/**"]
             run.purgeRepositoryId = "repository-a"
             try store.markDestructiveLaunchAuthorized(run)
-            try store.finish(run, status: .success, resticExitCode: 0)
+            try store.finish(
+                run,
+                status: .success,
+                resticExitCode: 0,
+                purgeSnapshotRewrites: ["old-snapshot": "new-snap"]
+            )
 
             let projection = try #require(store.recentRuns(limit: 1).first)
             #expect(projection.purgeEvidenceDigest != nil)
@@ -242,8 +247,10 @@ private func setRunStoreTestErrno(_ value: Int32) {
             var tampered = try store.metadata(runId: run.runId)
             if mutatedField == "purgePatterns" {
                 tampered.purgePatterns = ["build/**", "changed/**"]
-            } else {
+            } else if mutatedField == "purgeRepositoryId" {
                 tampered.purgeRepositoryId = "repository-b"
+            } else {
+                tampered.purgeSnapshotRewrites = ["old-snapshot": "changed"]
             }
             try writeRawMetadata(tampered, paths: paths)
 

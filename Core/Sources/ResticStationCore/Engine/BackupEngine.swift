@@ -1689,12 +1689,24 @@ public final class BackupEngine: Sendable {
         // watermark. The plan binds the current snapshot attribution to the
         // token; its restic config id binds any recovered terminal evidence
         // to the repository that was actually rewritten.
-        var plans: [(destination: Destination, plan: PurgePlan, repositoryId: String)] = []
+        var plans: [(
+            destination: Destination,
+            plan: PurgePlan,
+            repositoryId: String,
+            destinationSecretEnv: [String: String]
+        )] = []
         for destination in pendingDestinations.sorted(by: { $0.id.uuidString < $1.id.uuidString }) {
+            let destinationSecretEnv: [String: String]
+            do {
+                destinationSecretEnv = try await restic.maintenanceSecretEnvironment(for: destination)
+            } catch {
+                throw PurgeApplyError.unavailable
+            }
             let current = try await currentPurgePlan(
                 set: set,
                 destination: destination,
                 patterns: pendingPatternsByDestination[destination.id] ?? [],
+                destinationSecretEnv: destinationSecretEnv,
                 executable: executable
             )
             guard let tokenDestination = preview.destinations.first(where: {
@@ -1702,7 +1714,7 @@ public final class BackupEngine: Sendable {
             }), tokenDestination.snapshotIDs.sorted() == current.plan.matched.map(\.id).sorted() else {
                 throw PurgeApplyError.tokenDoesNotMatchCurrentPlan
             }
-            plans.append((destination, current.plan, current.repositoryId))
+            plans.append((destination, current.plan, current.repositoryId, destinationSecretEnv))
         }
 
         // `rewrite --forget` publishes terminal run metadata before the
@@ -1720,6 +1732,14 @@ public final class BackupEngine: Sendable {
                 pendingPatternsByDestination: pendingPatternsByDestination,
                 repositoryIdsByDestination: Dictionary(
                     uniqueKeysWithValues: plans.map { ($0.destination.id, $0.repositoryId) }
+                ),
+                liveSnapshotIdsByDestination: Dictionary(
+                    uniqueKeysWithValues: plans.map {
+                        (
+                            $0.destination.id,
+                            Set(($0.plan.matched + $0.plan.unattributed).map(\.id))
+                        )
+                    }
                 )
             )
         } catch {
@@ -1788,7 +1808,7 @@ public final class BackupEngine: Sendable {
         var children: [SetRunChild] = []
         var resolvedGroupId = groupId
         var isFirstPurgeChild = true
-        for (destination, plan, repositoryId) in plans {
+        for (destination, plan, repositoryId, destinationSecretEnv) in plans {
             guard !plan.matched.isEmpty else {
                 // Nothing to rewrite. Advancing the watermark is only correct
                 // when the repository genuinely holds nothing this machine
@@ -1819,6 +1839,7 @@ public final class BackupEngine: Sendable {
                 snapshotIDs: plan.matched.map(\.id),
                 patterns: plan.patterns,
                 repositoryId: repositoryId,
+                destinationSecretEnv: destinationSecretEnv,
                 setId: set.id,
                 trigger: trigger,
                 groupId: resolvedGroupId,
@@ -1914,6 +1935,7 @@ public final class BackupEngine: Sendable {
         set: BackupSet,
         destination: Destination,
         patterns: [String],
+        destinationSecretEnv: [String: String],
         executable: ResticRunner.MaintenanceExecutable
     ) async throws -> (plan: PurgePlan, repositoryId: String) {
         let probe = await reachability.probe(
@@ -1923,31 +1945,18 @@ public final class BackupEngine: Sendable {
         guard probe == .reachable else {
             throw PurgeApplyError.destinationOffline(destinationId: destination.id)
         }
-        let repositoryConfigOutcome: ResticOutcome
-        do {
-            repositoryConfigOutcome = try await restic.run(
-                .catConfig(repo: destination.repoURL),
-                for: ResticInvocation(
-                    destination: destination,
-                    expectedExecutableIdentity: executable.identity
-                )
-            )
-        } catch {
-            throw PurgeApplyError.unavailable
-        }
-        guard repositoryConfigOutcome.status == .success,
-              let repositoryConfig = try? parseRepositoryConfig(
-                  Data(repositoryConfigOutcome.rawOutput.utf8)
-              ),
-              !repositoryConfig.id.isEmpty else {
-            throw PurgeApplyError.unavailable
-        }
+        let repositoryId = try await purgeRepositoryId(
+            destination: destination,
+            destinationSecretEnv: destinationSecretEnv,
+            executable: executable
+        )
         let outcome: ResticOutcome
         do {
             outcome = try await restic.run(
                 .snapshots(repo: destination.repoURL),
                 for: ResticInvocation(
                     destination: destination,
+                    destinationSecretEnv: destinationSecretEnv,
                     expectedExecutableIdentity: executable.identity
                 )
             )
@@ -1966,8 +1975,34 @@ public final class BackupEngine: Sendable {
                 hostnames: hostnames(for: set),
                 patterns: patterns
             ),
-            repositoryId: repositoryConfig.id
+            repositoryId: repositoryId
         )
+    }
+
+    private func purgeRepositoryId(
+        destination: Destination,
+        destinationSecretEnv: [String: String],
+        executable: ResticRunner.MaintenanceExecutable
+    ) async throws -> String {
+        let outcome: ResticOutcome
+        do {
+            outcome = try await restic.run(
+                .catConfig(repo: destination.repoURL),
+                for: ResticInvocation(
+                    destination: destination,
+                    destinationSecretEnv: destinationSecretEnv,
+                    expectedExecutableIdentity: executable.identity
+                )
+            )
+        } catch {
+            throw PurgeApplyError.unavailable
+        }
+        guard outcome.status == .success,
+              let config = try? parseRepositoryConfig(Data(outcome.rawOutput.utf8)),
+              !config.id.isEmpty else {
+            throw PurgeApplyError.unavailable
+        }
+        return config.id
     }
 
     /// The only `rewrite --forget` call site.  It receives explicit ids from
@@ -1978,6 +2013,7 @@ public final class BackupEngine: Sendable {
         snapshotIDs: [String],
         patterns: [String],
         repositoryId: String,
+        destinationSecretEnv: [String: String],
         setId: UUID,
         trigger: RunTrigger,
         groupId: String?,
@@ -2016,20 +2052,46 @@ public final class BackupEngine: Sendable {
             // path the golden argv tests and `docs/restic-cli.md` describe.
             invocation: ResticInvocation(
                 destination: destination,
+                destinationSecretEnv: destinationSecretEnv,
                 expectedExecutableIdentity: executable.identity
             ),
             streamProgress: false,
+            launchPreflight: { [weak self] in
+                guard let self else {
+                    throw ResticRunnerError.launchFailed(
+                        "the repository could not be revalidated at purge launch"
+                    )
+                }
+                let launchRepositoryId: String
+                do {
+                    launchRepositoryId = try await self.purgeRepositoryId(
+                        destination: destination,
+                        destinationSecretEnv: destinationSecretEnv,
+                        executable: executable
+                    )
+                } catch {
+                    throw ResticRunnerError.launchFailed(
+                        "the repository could not be revalidated at purge launch"
+                    )
+                }
+                guard launchRepositoryId == repositoryId else {
+                    throw ResticRunnerError.launchFailed(
+                        "the repository changed after purge validation"
+                    )
+                }
+            },
             afterLaunchFailure: afterLaunchFailure,
             callerHoldsDestructiveAuditGate: callerHoldsDestructiveAuditGate,
             purgePatterns: patterns,
             purgeRepositoryId: repositoryId,
             purgeSnapshotRewrites: { outcome in
-                Dictionary(uniqueKeysWithValues: parseRewrite(outcome.rawOutput).snapshots.compactMap { rewrite in
-                    guard let oldID = fullIDByShortID[rewrite.shortID], let newID = rewrite.newSnapshotShortID else {
-                        return nil
-                    }
-                    return (oldID, newID)
-                })
+                var rewrites: [String: String] = [:]
+                for rewrite in parseRewrite(outcome.rawOutput).snapshots {
+                    guard let oldID = fullIDByShortID[rewrite.shortID],
+                          let newID = rewrite.newSnapshotShortID else { return nil }
+                    guard rewrites.updateValue(newID, forKey: oldID) == nil else { return nil }
+                }
+                return rewrites.count == snapshotIDs.count ? rewrites : nil
             }
         )
     }
@@ -2051,7 +2113,8 @@ public final class BackupEngine: Sendable {
     private func successfulPurgePatterns(
         setId: UUID,
         pendingPatternsByDestination: [UUID: [String]],
-        repositoryIdsByDestination: [UUID: String]
+        repositoryIdsByDestination: [UUID: String],
+        liveSnapshotIdsByDestination: [UUID: Set<String>]
     ) throws -> [UUID: Set<String>] {
         var result: [UUID: Set<String>] = [:]
         for entry in try runStore.recentRuns(setId: setId, limit: Int.max)
@@ -2077,6 +2140,23 @@ public final class BackupEngine: Sendable {
                 )
             }
             guard recordedRepositoryId == repositoryIdsByDestination[entry.destId] else {
+                continue
+            }
+            guard let rewrites = metadata.purgeSnapshotRewrites,
+                  !rewrites.isEmpty else {
+                throw RunStoreError.discardUnsafe(
+                    path: paths.runMetadataFile(runId: entry.runId).path
+                )
+            }
+            let liveIds = liveSnapshotIdsByDestination[entry.destId] ?? []
+            let oldIdsAreAbsent = rewrites.keys.allSatisfy { !liveIds.contains($0) }
+            let everyNewIdIsPresentExactlyOnce = rewrites.values.allSatisfy { shortId in
+                liveIds.lazy.filter { $0.hasPrefix(shortId) }.prefix(2).count == 1
+            }
+            guard oldIdsAreAbsent, everyNewIdIsPresentExactlyOnce else {
+                // A repository restored to a pre-purge generation can keep
+                // its config id. Its old snapshots are live work, not
+                // authority to repair the missing schedule watermark.
                 continue
             }
             result[entry.destId, default: []].formUnion(patterns)
@@ -2112,10 +2192,17 @@ public final class BackupEngine: Sendable {
         guard let executable = restic.maintenanceExecutable() else {
             throw PurgeApplyError.resticUnavailable
         }
+        let destinationSecretEnv: [String: String]
+        do {
+            destinationSecretEnv = try await restic.maintenanceSecretEnvironment(for: destination)
+        } catch {
+            throw PurgeApplyError.unavailable
+        }
         let current = try await currentPurgePlan(
             set: set,
             destination: destination,
             patterns: patterns,
+            destinationSecretEnv: destinationSecretEnv,
             executable: executable
         )
         let token: PreviewToken
@@ -2453,6 +2540,7 @@ public final class BackupEngine: Sendable {
         remoteCommand: RemoteResticCommand? = nil,
         preflightPhase: String? = nil,
         preflight: (@Sendable (LogWriter?) async -> PreflightFailure?)? = nil,
+        launchPreflight: (@Sendable () async throws -> Void)? = nil,
         beforeLaunch: (@Sendable () throws -> Void)? = nil,
         afterLaunchFailure: (@Sendable () -> Void)? = nil,
         downgradeSuccessToWarning: (@Sendable (ResticOutcome) -> Bool)? = nil,
@@ -2608,6 +2696,7 @@ public final class BackupEngine: Sendable {
                 invocation: invocation,
                 logWriter: logWriter,
                 reporter: streamProgress ? reporter : nil,
+                launchPreflight: launchPreflight,
                 beforeLaunch: beforeLaunch,
                 auditBeforeLaunch: auditBeforeLaunch,
                 afterLaunchFailure: afterLaunchFailure
@@ -2641,7 +2730,7 @@ public final class BackupEngine: Sendable {
             ))
         }
 
-        let status: RunStatus
+        var status: RunStatus
         var errorSummary: String?
         var stats: BackupSummary?
         var exitCode: Int32?
@@ -2684,6 +2773,15 @@ public final class BackupEngine: Sendable {
             rewrites = purgeSnapshotRewrites?(outcome)
         } else {
             rewrites = nil
+        }
+        if kind == .purge, status == .success, rewrites == nil {
+            // A successful exit with an incomplete rewrite transcript does
+            // not prove which launch-authorized snapshots now exist. Keep a
+            // durable indeterminate audit failure so neither watermark
+            // recovery nor a second destructive launch can guess.
+            status = .failed
+            auditFailureReason = .repositoryOutcomeUnknown
+            errorSummary = "operation_completed_audit_failed — purge rewrite mapping is incomplete"
         }
         let infrastructureFailure = finish(
             run,
@@ -2739,6 +2837,7 @@ public final class BackupEngine: Sendable {
         invocation: ResticInvocation,
         logWriter: LogWriter?,
         reporter: ProgressReporter?,
+        launchPreflight: (@Sendable () async throws -> Void)? = nil,
         beforeLaunch: (@Sendable () throws -> Void)? = nil,
         auditBeforeLaunch: (@Sendable () throws -> Void)? = nil,
         afterLaunchFailure: (@Sendable () -> Void)? = nil
@@ -2748,6 +2847,7 @@ public final class BackupEngine: Sendable {
             invocation: invocation,
             logWriter: logWriter,
             reporter: reporter,
+            launchPreflight: launchPreflight,
             beforeLaunch: beforeLaunch,
             auditBeforeLaunch: auditBeforeLaunch,
             afterLaunchFailure: afterLaunchFailure
@@ -2772,7 +2872,13 @@ public final class BackupEngine: Sendable {
             reporter: nil
         )
         logWriter?.appendLine("retrying after unlock (attempt 2 of 2)")
-        return await spawn(command, invocation: invocation, logWriter: logWriter, reporter: reporter)
+        return await spawn(
+            command,
+            invocation: invocation,
+            logWriter: logWriter,
+            reporter: reporter,
+            launchPreflight: launchPreflight
+        )
     }
 
     private func spawn(
@@ -2780,6 +2886,7 @@ public final class BackupEngine: Sendable {
         invocation: ResticInvocation,
         logWriter: LogWriter?,
         reporter: ProgressReporter?,
+        launchPreflight: (@Sendable () async throws -> Void)? = nil,
         beforeLaunch: (@Sendable () throws -> Void)? = nil,
         auditBeforeLaunch: (@Sendable () throws -> Void)? = nil,
         afterLaunchFailure: (@Sendable () -> Void)? = nil
@@ -2795,6 +2902,7 @@ public final class BackupEngine: Sendable {
                 onRawLine: { line in
                     logWriter?.appendLine(line)
                 },
+                launchPreflight: launchPreflight,
                 beforeLaunch: beforeLaunch,
                 auditBeforeLaunch: auditBeforeLaunch,
                 afterLaunchFailure: afterLaunchFailure

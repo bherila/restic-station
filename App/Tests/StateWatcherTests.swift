@@ -186,6 +186,48 @@ struct StateWatcherTests {
         #expect(watcher.scheduleStateFailure?.reason == .malformedDocument)
     }
 
+    @Test("in-place migration-marker damage reaches the app without an unrelated directory event")
+    func inPlaceScheduleStateMarkerDamageTriggersReload() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-marker-in-place-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = AppPaths(root: root)
+        try paths.ensureDirectories()
+        let stateStore = StateStore(paths: paths)
+        try stateStore.updateScheduleState(setId: UUID()) { _ in }
+
+        let watcher = StateWatcher(
+            paths: paths,
+            runStore: RunStore(paths: paths),
+            stateStore: stateStore
+        )
+        watcher.start()
+        defer { watcher.stop() }
+        #expect(watcher.scheduleState != nil)
+        #expect(watcher.scheduleStateFailure == nil)
+        try await Task.sleep(nanoseconds: 750_000_000)
+        #expect(watcher.scheduleStateFailure == nil)
+
+        // Keep the marker's directory entry and inode unchanged. The parent
+        // state/ source cannot observe this write; only the direct marker
+        // vnode source can drive the fail-closed reload.
+        let handle = try FileHandle(forWritingTo: paths.scheduleStateVersionMarkerFile)
+        try handle.truncate(atOffset: 0)
+        try handle.write(contentsOf: Data("2\n".utf8))
+        try handle.close()
+
+        for _ in 0..<40 {
+            if watcher.scheduleStateFailure != nil { break }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        #expect(watcher.scheduleState == nil)
+        guard case .unsafeFile(let reason)? = watcher.scheduleStateFailure?.reason else {
+            Issue.record("expected unsafe migration marker, got \(String(describing: watcher.scheduleStateFailure))")
+            return
+        }
+        #expect(reason.contains("version marker has invalid contents"))
+    }
+
     @Test("explicit reload retries a previously suppressed recovery copy")
     func explicitReloadRetriesScheduleStateRecoveryCopy() throws {
         let root = FileManager.default.temporaryDirectory

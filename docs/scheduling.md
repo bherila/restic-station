@@ -359,11 +359,17 @@ and a crash loses its visible rename, the next apply holds both the
 destructive-audit gate and the schedule-state lease, revalidates the token's
 snapshot attribution, reads the live restic repository config id, verifies the
 complete run history, and restores only the exact `purgePatterns` whose
-launch-bound `purgeRepositoryId` matches that live repository. It consumes the
+launch-bound `purgeRepositoryId` matches that live repository **and** whose
+recorded old-to-new snapshot mapping matches the live post-rewrite generation
+(every old id absent, every new id present exactly once). The repository id is
+queried again inside the runner immediately before the synchronous
+executable/token/audit/spawn boundary; a replacement in the earlier planning
+window refuses launch and restores a first-child token. Recovery consumes the
 stale token and does not rewrite the repository again. Evidence from a replaced
-repository is ignored so the replacement receives its own rewrite; malformed,
-incomplete, identity-less legacy, or only partially matching history cannot
-authorize the recovery shortcut.
+repository or a same-id repository restored to a pre-purge generation is
+ignored so the live history receives its own rewrite; malformed, incomplete,
+identity-less legacy, or only partially matching history cannot authorize the
+recovery shortcut.
 
 ## Locking
 

@@ -122,10 +122,10 @@ public struct RunIndexEntry: Codable, Equatable, Sendable {
     public var filesChanged: Int?
     public var dataAdded: Int?
     public var errorSummary: String?
-    /// SHA-256 binding of a purge's launch-authorized repository id and
-    /// exact pattern sequence. Audit verification recomputes this from the
-    /// canonical metadata so neither recovery field can change independently
-    /// while the index projection still appears valid.
+    /// SHA-256 binding of a purge's repository id, exact pattern sequence,
+    /// and terminal old-to-new snapshot mapping. Audit verification
+    /// recomputes this from canonical metadata so no field used for
+    /// watermark recovery can change independently of the index projection.
     public var purgeEvidenceDigest: String?
 
     public init(
@@ -386,11 +386,20 @@ public struct RunMetadata: Codable, Equatable, Sendable {
               let purgePatterns,
               let purgeRepositoryId else { return nil }
 
-        var bytes = Data("restic-station-purge-evidence-v1:".utf8)
+        var bytes = Data("restic-station-purge-evidence-v2:".utf8)
         for component in [purgeRepositoryId] + purgePatterns {
             let componentBytes = Data(component.utf8)
             bytes.append(Data("\(componentBytes.count):".utf8))
             bytes.append(componentBytes)
+        }
+        let rewrites = purgeSnapshotRewrites ?? [:]
+        bytes.append(Data("rewrites:\(rewrites.count):".utf8))
+        for (oldId, newId) in rewrites.sorted(by: { $0.key < $1.key }) {
+            for component in [oldId, newId] {
+                let componentBytes = Data(component.utf8)
+                bytes.append(Data("\(componentBytes.count):".utf8))
+                bytes.append(componentBytes)
+            }
         }
         return SHA256Digest.hex(bytes)
     }
