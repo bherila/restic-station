@@ -1,6 +1,54 @@
 import ResticStationCore
 import SwiftUI
 
+/// Pure projection for retention affordance copy. Keeping the predicate and
+/// its promise in one testable seam prevents the UI from claiming scheduled
+/// cleanup when the engine has manual apply contained, the set is disabled on
+/// this machine, no policy exists, or launchd is not running ticks.
+enum RetentionPresentation {
+    static let agentDisabledExplanation =
+        "Applying retention manually is unavailable in this build, and the background agent "
+        + "is not running, so cleanup will not happen on a schedule. Back Up Now still "
+        + "applies the retention policy after it backs up. "
+        + ManualRetentionApplyAvailability.failedBackupRecovery
+        + " To resume scheduled cleanup, enable the background agent in "
+        + "Settings ▸ Permissions."
+
+    static func applyHelp(
+        hasPolicy: Bool,
+        runsOnThisMachine: Bool,
+        backgroundAgentRunsTicks: Bool
+    ) -> String {
+        if !runsOnThisMachine {
+            return "This backup set does not run on this machine, so retention cannot be applied here."
+        }
+        if !hasPolicy {
+            return "This backup set has no retention policy, so nothing is ever removed — "
+                + "backup runs included. Add one in Backup Sets ▸ Retention and each "
+                + "successful backup run will clean up."
+        }
+        if !ManualRetentionApplyAvailability.isEnabled {
+            return backgroundAgentRunsTicks
+                ? ManualRetentionApplyAvailability.reason
+                : agentDisabledExplanation
+        }
+        return "Runs the retention policy. It permanently deletes snapshots the policy no longer keeps."
+    }
+
+    static func containmentNotice(
+        hasPolicy: Bool,
+        runsOnThisMachine: Bool,
+        backgroundAgentRunsTicks: Bool
+    ) -> String? {
+        guard !ManualRetentionApplyAvailability.isEnabled, hasPolicy, runsOnThisMachine else {
+            return nil
+        }
+        return backgroundAgentRunsTicks
+            ? ManualRetentionApplyAvailability.reason
+            : agentDisabledExplanation
+    }
+}
+
 /// Retention (`docs/ui-spec.md` §Maintenance): the set's policy, a
 /// **Preview cleanup** that renders `forget --dry-run` as a keep/remove
 /// table, **Apply retention now**, and a retention-independent **Reclaim
@@ -52,52 +100,16 @@ struct RetentionSection: View {
         model.launchd.isEnabled
     }
 
-    /// Said once, used by both the caption and the button's help. They sit
-    /// on the same screen, so a reader can see both at once — the first
-    /// version of this fixed the caption alone and left the tooltip
-    /// asserting the opposite.
-    private static let agentDisabledExplanation =
-        "Applying retention manually is unavailable in this build, and the background agent "
-        + "is not running, so cleanup will not happen on a schedule. Back Up Now still "
-        + "applies the retention policy after it backs up. "
-        + ManualRetentionApplyAvailability.failedBackupRecovery
-        + " To resume scheduled cleanup, enable the background agent in "
-        + "Settings ▸ Permissions."
-
-    /// What to say about retention when manual apply is contained: the
-    /// promise of scheduled cleanup only holds if a tick will happen.
-    private var containmentExplanation: String {
-        backgroundAgentRunsTicks
-            ? ManualRetentionApplyAvailability.reason
-            : Self.agentDisabledExplanation
-    }
-
     private var canApplyRetention: Bool {
         ManualRetentionApplyAvailability.isEnabled
     }
 
     private var applyRetentionHelp: String {
-        // Machine scope first. Containment's explanation promises that
-        // backup runs will do the work instead, and for a set this machine
-        // does not run, none here ever will — so the more fundamental fact
-        // has to win.
-        if !runsOnThisMachine {
-            return "This backup set does not run on this machine, so retention cannot be applied here."
-        }
-        if !hasPolicy {
-            // Deliberately does not say "to enable cleanup": adding a policy
-            // leaves this button disabled, because manual apply is contained.
-            // Promising otherwise sends the operator to Backup Sets expecting
-            // this control to light up.
-            // Unconditionally true: whether runs *happen* depends on the
-            // operator and the agent, but any successful backup run cleans
-            // up. Do not promise scheduling here — the agent may be off.
-            return "This backup set has no retention policy, so nothing is ever removed — "
-                + "backup runs included. Add one in Backup Sets ▸ Retention and each "
-                + "successful backup run will clean up."
-        }
-        if !canApplyRetention { return containmentExplanation }
-        return "Runs the retention policy. It permanently deletes snapshots the policy no longer keeps."
+        RetentionPresentation.applyHelp(
+            hasPolicy: hasPolicy,
+            runsOnThisMachine: runsOnThisMachine,
+            backgroundAgentRunsTicks: backgroundAgentRunsTicks
+        )
     }
 
     private var hasICloudRepository: Bool {
@@ -227,22 +239,22 @@ struct RetentionSection: View {
             // this is the one screen an operator reads about retention — so
             // it must not assert a schedule that Settings ▸ Permissions is
             // simultaneously reporting as off.
-            if !canApplyRetention, hasPolicy, runsOnThisMachine, !backgroundAgentRunsTicks {
-                Label(Self.agentDisabledExplanation, systemImage: "exclamationmark.triangle")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
-                    .fixedSize(horizontal: false, vertical: true)
-            } else if !canApplyRetention, hasPolicy, runsOnThisMachine {
-                // Visible, not just a tooltip on a disabled button: the
-                // operator needs to know retention is still happening on
-                // schedule, or they will reasonably assume it stopped.
-                Label(
-                    ManualRetentionApplyAvailability.reason,
-                    systemImage: "clock.badge.checkmark"
-                )  // agent-enabled branch: the schedule promise holds here
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
+            if let notice = RetentionPresentation.containmentNotice(
+                hasPolicy: hasPolicy,
+                runsOnThisMachine: runsOnThisMachine,
+                backgroundAgentRunsTicks: backgroundAgentRunsTicks
+            ) {
+                if backgroundAgentRunsTicks {
+                    Label(notice, systemImage: "clock.badge.checkmark")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    Label(notice, systemImage: "exclamationmark.triangle")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
             if hasICloudRepository {
                 Label(

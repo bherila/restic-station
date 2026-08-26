@@ -4,6 +4,16 @@ Three layers: unit tests (portable Core plus macOS app wiring), an integration s
 
 ## Layer 1 — unit tests (`swift test --package-path Core`; app tests through `xcodebuild test`)
 
+App tests include focused projection contracts for non-UI state machines:
+restic discovery-to-badge mapping, Full Disk Access evidence provenance and
+staleness, destination-status priority, onboarding, run-history naming, and
+the user-visible copy derived from those states. Retention affordance tests
+also bind its cleanup promises to the engine gate, policy, per-machine set
+scope, and background-agent state. These complement the
+generation/race coverage in `StateWatcherTests` and
+`AppModelMachineOverrideTests`; they do not require a SwiftUI rendering
+harness.
+
 ### Framework: Swift Testing (not XCTest)
 Core and app unit tests use **Swift Testing** (`import Testing`, `@Test`, `#expect`/`#require`, parameterized `@Test(arguments:)` for the table-driven suites) — never XCTest. Core tests run through SwiftPM on macOS and Linux; app tests run through the Xcode-generated `Restic StationTests` target on macOS. Keep portable business logic in Core, but cover app-owned state transitions and wiring in the app target instead of relying on compilation alone.
 
