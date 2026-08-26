@@ -88,4 +88,81 @@ struct LockingHealthClassificationTests {
     func tablesAreDisjoint() {
         #expect(Set(Self.machineWideOperations).isDisjoint(with: Set(Self.diagnosticOperations)))
     }
+
+    // MARK: - Producer binding
+
+    // The rows above pin the classifier against synthetic `LockFailure`s;
+    // these bind the rows to the *producers*, by driving the real probe code
+    // paths into failure and classifying what they actually emit. A renamed
+    // operation string in `FileLock` now fails here instead of silently
+    // falling through `classifyHealthArtifactFailure` to `.diagnostic`
+    // while the synthetic table keeps passing on the old spelling.
+    //
+    // "flock" is the one machine-wide row with no portably drivable
+    // producer: its failure arm needs the syscall itself to fail (an
+    // flock-less filesystem), which no temp-directory setup can simulate.
+    // It stays table-only, pinned additionally by the contention tests in
+    // FileLockTests exercising the surrounding switch.
+
+    private func makeTempDirectory() throws -> URL {
+        let directory = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("lh-producer-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(
+            at: directory, withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        return directory
+    }
+
+    @Test(
+        "probeActualCreation's real failure classifies machine-wide",
+        .enabled(if: canInjectPermissionFaults, "root can create in mode-0500 directories")
+    )
+    func actualCreationProbeFailureIsBoundToItsRow() throws {
+        let directory = try makeTempDirectory()
+        defer {
+            chmod(directory.path, 0o700)
+            try? FileManager.default.removeItem(at: directory)
+        }
+        try #require(chmod(directory.path, 0o500) == 0)
+
+        let failure = try #require(
+            FileLock.probeActualCreation(in: directory),
+            "an unwritable directory must fail the creation probe"
+        )
+        #expect(Self.machineWideOperations.contains(failure.operation),
+                "producer emitted \(failure.operation), which has no machine-wide row")
+        #expect(LockingHealth.classifyHealthArtifactFailure(failure).scope == .machine)
+    }
+
+    @Test(
+        "ensureDirectory's real creation failure classifies machine-wide",
+        .enabled(if: canInjectPermissionFaults, "root can create in mode-0500 directories")
+    )
+    func ensureDirectoryCreateFailureIsBoundToItsRow() throws {
+        let root = try makeTempDirectory()
+        defer {
+            chmod(root.appendingPathComponent("parent").path, 0o700)
+            try? FileManager.default.removeItem(at: root)
+        }
+        let parent = root.appendingPathComponent("parent")
+        try FileManager.default.createDirectory(
+            at: parent, withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        try #require(chmod(parent.path, 0o500) == 0)
+
+        let failure = try #require(
+            FileLock.ensureDirectory(
+                parent.appendingPathComponent("locks"),
+                parent: parent,
+                trustedRoot: root,
+                mode: 0o700
+            ),
+            "creation under an unwritable parent must fail"
+        )
+        #expect(Self.machineWideOperations.contains(failure.operation),
+                "producer emitted \(failure.operation), which has no machine-wide row")
+        #expect(LockingHealth.classifyHealthArtifactFailure(failure).scope == .machine)
+    }
 }
