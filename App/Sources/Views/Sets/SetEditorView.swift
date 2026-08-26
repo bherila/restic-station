@@ -1,6 +1,18 @@
 import ResticStationCore
 import SwiftUI
 
+enum SetEditorSaveState {
+    static func hasUnsavedChanges(
+        persisted: BackupSet?,
+        draft: BackupSet,
+        pendingSecretRollbacks: [AppModel.DestinationSecretsRollback]
+    ) -> Bool {
+        persisted != draft || pendingSecretRollbacks.contains {
+            $0.transaction.password != nil || $0.transaction.secretEnv != nil
+        }
+    }
+}
+
 /// The set editor (`docs/ui-spec.md` §Backup Sets, **Set editor**): name,
 /// sources, excludes, purge excludes, schedule, staleness warning, retention, integrity
 /// checks, destinations.
@@ -208,7 +220,11 @@ struct SetEditorView: View {
     }
 
     private var hasUnsavedChanges: Bool {
-        persisted != draft
+        SetEditorSaveState.hasUnsavedChanges(
+            persisted: persisted,
+            draft: draft,
+            pendingSecretRollbacks: pendingSecretRollbacks
+        )
     }
 
     private func revert() async {

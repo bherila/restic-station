@@ -801,6 +801,54 @@ struct AppModelMachineOverrideTests {
         #expect(try await secrets.password(destId: destinationId) == "original-password")
     }
 
+    @Test("a credential-only destination edit makes the parent set saveable")
+    func credentialOnlyDestinationEditIsUnsavedWork() {
+        let destinationId = UUID()
+        let set = BackupSet(
+            id: UUID(),
+            name: "Projects",
+            sources: ["/Users/example/Projects"],
+            excludes: [],
+            schedule: .daily(hour: 2, minute: 30),
+            retention: nil,
+            checkPolicy: nil,
+            stalenessWarningDays: 14,
+            destinations: [
+                Destination(
+                    id: destinationId,
+                    label: "Mirror",
+                    repoURL: "/Volumes/mirror/projects.restic",
+                    isPrimary: true
+                )
+            ]
+        )
+        let credentialChange = AppModel.DestinationSecretsRollback(
+            transaction: DestinationSecretRollback(
+                destId: destinationId,
+                password: SecretRollbackChange(installed: "rotated", previous: "old"),
+                secretEnv: nil
+            )
+        )
+        let noSecretChange = AppModel.DestinationSecretsRollback(
+            transaction: DestinationSecretRollback(
+                destId: destinationId,
+                password: nil,
+                secretEnv: nil
+            )
+        )
+
+        #expect(SetEditorSaveState.hasUnsavedChanges(
+            persisted: set,
+            draft: set,
+            pendingSecretRollbacks: [credentialChange]
+        ))
+        #expect(!SetEditorSaveState.hasUnsavedChanges(
+            persisted: set,
+            draft: set,
+            pendingSecretRollbacks: [noSecretChange]
+        ))
+    }
+
     @Test("config preflight failures never advise unlocking the keychain")
     func destinationSecretFailureCopyDistinguishesConfigAndKeychain() {
         let configMessage = SetsCopy.destinationSecretFailureMessage(
