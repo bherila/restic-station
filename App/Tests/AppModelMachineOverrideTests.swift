@@ -1232,6 +1232,58 @@ struct AppModelMachineOverrideTests {
         model.endSecretEditorSession(olderSession)
     }
 
+    @Test("queued retries wait for a torn-down editor's in-flight mutation")
+    func queuedRetryWaitsForInFlightMutationAfterEditorTeardown() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-secret-inflight-teardown-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let destinationId = UUID()
+        let sessionId = UUID()
+        let secrets = CheckpointingSecretStore(passwords: [destinationId: "original-password"])
+        let model = AppModel(paths: AppPaths(root: root), secretStoreFactory: { secrets })
+        model.beginSecretEditorSession(sessionId)
+        let older = try await model.storeDestinationSecrets(
+            destId: destinationId,
+            password: "older-abandoned-password",
+            secretEnv: nil,
+            ifConfigUnchangedFrom: model.configFingerprint
+        )
+        model.retainPendingSecretRollbacks([older])
+
+        await secrets.pauseNextPasswordWrite()
+        let newerWrite = Task { @MainActor in
+            try await model.storeDestinationSecrets(
+                destId: destinationId,
+                password: "newer-in-flight-password",
+                secretEnv: nil,
+                ifConfigUnchangedFrom: model.configFingerprint,
+                editorSessionId: sessionId
+            )
+        }
+        for _ in 0..<40 {
+            if await secrets.passwordWriteIsPaused() { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        #expect(await secrets.passwordWriteIsPaused())
+
+        model.endSecretEditorSession(sessionId)
+        model.retryPendingSecretRollbacks()
+        #expect(model.pendingSecretRollbackTask == nil)
+        #expect(model.pendingSecretRollbackBatches.flatMap { $0 }.contains { $0.sequence == older.sequence })
+
+        await secrets.resumePausedPasswordWrite()
+        _ = try await newerWrite.value
+        for _ in 0..<80 {
+            if model.pendingSecretRollbackBatches.isEmpty { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+
+        #expect(model.pendingSecretRollbackBatches.isEmpty)
+        #expect(model.pendingSecretRollbackError == nil)
+        #expect(try await secrets.password(destId: destinationId) == "original-password")
+    }
+
     @Test("an older explicit revert drains a newer queued mutation")
     func explicitRevertDrainsNewerQueuedMutation() async throws {
         let root = FileManager.default.temporaryDirectory
@@ -1337,6 +1389,88 @@ struct AppModelMachineOverrideTests {
         #expect(olderRemaining.isEmpty)
         #expect(model.pendingSecretRollbackBatches.isEmpty)
         #expect(try await secrets.password(destId: destinationId) == "original-password")
+        model.endSecretEditorSession(olderSession)
+    }
+
+    @Test("an explicit revert preserves every queued field owned by a newer live editor")
+    func explicitRevertPreservesMixedQueuedTransactionBehindLiveEditor() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-secret-mixed-queued-live-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let destinationId = UUID()
+        let olderSession = UUID()
+        let queuedSession = UUID()
+        let liveSession = UUID()
+        let secrets = CheckpointingSecretStore(
+            passwords: [destinationId: "original-password"],
+            secretEnvironments: [destinationId: ["TOKEN": "original"]]
+        )
+        let model = AppModel(paths: AppPaths(root: root), secretStoreFactory: { secrets })
+
+        model.beginSecretEditorSession(olderSession)
+        let older = try await model.storeDestinationSecrets(
+            destId: destinationId,
+            password: "older-password",
+            secretEnv: nil,
+            ifConfigUnchangedFrom: model.configFingerprint,
+            editorSessionId: olderSession
+        )
+        #expect(model.claimEditorSecretRollback(older, sessionId: olderSession))
+
+        model.beginSecretEditorSession(queuedSession)
+        let queued = try await model.storeDestinationSecrets(
+            destId: destinationId,
+            password: "queued-password",
+            secretEnv: ["TOKEN": "queued"],
+            ifConfigUnchangedFrom: model.configFingerprint,
+            editorSessionId: queuedSession
+        )
+        #expect(model.claimEditorSecretRollback(queued, sessionId: queuedSession))
+        model.endSecretEditorSession(queuedSession, claimedRollbacks: [queued])
+
+        model.beginSecretEditorSession(liveSession)
+        let live = try await model.storeDestinationSecrets(
+            destId: destinationId,
+            password: nil,
+            secretEnv: ["TOKEN": "live"],
+            ifConfigUnchangedFrom: model.configFingerprint,
+            editorSessionId: liveSession
+        )
+        #expect(model.claimEditorSecretRollback(live, sessionId: liveSession))
+
+        var olderRemaining = [older]
+        do {
+            _ = try await model.restoreDestinationSecrets(
+                olderRemaining,
+                editorSessionId: olderSession,
+                onProgress: { olderRemaining = $0 }
+            )
+            Issue.record("expected the mixed queued transaction to remain behind the live environment edit")
+        } catch AppModelError.newerSecretEditorMutation {
+            // Expected: neither field in the queued transaction was consumed.
+        }
+        #expect(model.pendingSecretRollbackBatches.flatMap { $0 }.contains { $0.sequence == queued.sequence })
+        #expect(try await secrets.password(destId: destinationId) == "queued-password")
+        #expect(try await secrets.secretEnv(destId: destinationId) == ["TOKEN": "live"])
+
+        var liveRemaining = [live]
+        _ = try await model.restoreDestinationSecrets(
+            liveRemaining,
+            editorSessionId: liveSession,
+            onProgress: { liveRemaining = $0 }
+        )
+        model.endSecretEditorSession(liveSession)
+        _ = try await model.restoreDestinationSecrets(
+            olderRemaining,
+            editorSessionId: olderSession,
+            onProgress: { olderRemaining = $0 }
+        )
+
+        #expect(olderRemaining.isEmpty)
+        #expect(model.pendingSecretRollbackBatches.isEmpty)
+        #expect(try await secrets.password(destId: destinationId) == "original-password")
+        #expect(try await secrets.secretEnv(destId: destinationId) == ["TOKEN": "original"])
         model.endSecretEditorSession(olderSession)
     }
 
@@ -1485,6 +1619,38 @@ struct AppModelMachineOverrideTests {
         #expect(prefillFinished)
         #expect(loaded.password == "original-password")
         model.endSecretEditorSession(sessionId)
+    }
+
+    @Test("destination prefill drains an overlapping rollback queued behind another editor")
+    func destinationPrefillDrainsQueuedRollback() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-secret-queued-prefill-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let destinationId = UUID()
+        let survivingSession = UUID()
+        let secrets = CheckpointingSecretStore(
+            passwords: [destinationId: "original-password"],
+            secretEnvironments: [destinationId: ["TOKEN": "original"]]
+        )
+        let model = AppModel(paths: AppPaths(root: root), secretStoreFactory: { secrets })
+        model.beginSecretEditorSession(survivingSession)
+        let abandoned = try await model.storeDestinationSecrets(
+            destId: destinationId,
+            password: "abandoned-password",
+            secretEnv: ["TOKEN": "abandoned"],
+            ifConfigUnchangedFrom: model.configFingerprint
+        )
+        model.retainPendingSecretRollbacks([abandoned])
+
+        #expect(model.pendingSecretRollbackTask == nil)
+        #expect(model.pendingSecretRollbackBatches.count == 1)
+        let loaded = await model.loadDestinationSecrets(destId: destinationId)
+
+        #expect(loaded.password == "original-password")
+        #expect(loaded.secretEnv == ["TOKEN": "original"])
+        #expect(model.pendingSecretRollbackBatches.isEmpty)
+        model.endSecretEditorSession(survivingSession)
     }
 
     @Test("committing the same credential retires an older abandoned rollback")

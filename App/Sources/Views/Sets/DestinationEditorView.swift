@@ -45,6 +45,12 @@ struct DestinationEditorView: View {
     @State private var accessKeyID: String = ""
     @State private var secretAccessKey: String = ""
     @State private var secretEnvRows: [EnvRow] = []
+    /// Baselines captured after queued rollback reconciliation. Existing
+    /// credentials are written only when the user actually changes them, so
+    /// a value temporarily owned by another editor can never be copied into
+    /// this draft by an unrelated save.
+    @State private var loadedPassword: String?
+    @State private var loadedSecretEnv: [String: String]?
     /// `true` once the existing keychain items have been read (or there were
     /// none to read). Until then an empty field means "unknown", not "clear
     /// it" — see `secretEnvToWrite`.
@@ -487,7 +493,18 @@ struct DestinationEditorView: View {
         if env.isEmpty && !secretsLoaded {
             return nil
         }
+        if !isNew, env == loadedSecretEnv {
+            return nil
+        }
         return env
+    }
+
+    private var passwordToWrite: String? {
+        guard !password.isEmpty else { return nil }
+        if !isNew, secretsLoaded, password == loadedPassword {
+            return nil
+        }
+        return password
     }
 
     private var needsInitialization: Bool {
@@ -641,7 +658,7 @@ struct DestinationEditorView: View {
         do {
             secretsRollback = try await model.storeDestinationSecrets(
                 destId: destination.id,
-                password: password.isEmpty ? nil : password,
+                password: passwordToWrite,
                 secretEnv: secretEnvToWrite,
                 ifConfigUnchangedFrom: configFingerprint,
                 editorSessionId: secretEditorSessionID
@@ -748,6 +765,8 @@ struct DestinationEditorView: View {
         }
 
         let secrets = await model.loadDestinationSecrets(destId: draft.id)
+        loadedPassword = secrets.password
+        loadedSecretEnv = secrets.secretEnv
         if let existing = secrets.password {
             password = existing
         } else {
