@@ -1714,6 +1714,20 @@ public final class BackupEngine: Sendable {
             }), tokenDestination.snapshotIDs.sorted() == current.plan.matched.map(\.id).sorted() else {
                 throw PurgeApplyError.tokenDoesNotMatchCurrentPlan
             }
+            guard !current.plan.matched.isEmpty || current.plan.unattributed.isEmpty else {
+                // A token may legitimately bind an empty match for one
+                // destination when another destination has work. If the
+                // repository is not actually empty, however, attribution
+                // declined every snapshot and no rewrite could ever apply
+                // the reviewed patterns. Refuse during the all-destination
+                // read-only planning pass, before consuming the token or
+                // launching any earlier destination.
+                throw PurgeApplyError.infrastructureFailure(
+                    reason: "purge attribution declined all \(current.plan.unattributed.count) "
+                        + "repository snapshots for \"\(destination.label)\"",
+                    operationMayHaveRun: false
+                )
+            }
             let snapshotIDs = current.plan.matched.map(\.id)
             guard Self.hasUnambiguousRewriteTranscriptIDs(snapshotIDs) else {
                 // `restic rewrite` reports old snapshot ids through an
@@ -1823,27 +1837,16 @@ public final class BackupEngine: Sendable {
         var isFirstPurgeChild = true
         for (destination, plan, repositoryId, destinationSecretEnv) in plans {
             guard !plan.matched.isEmpty else {
-                // Nothing to rewrite. Advancing the watermark is only correct
-                // when the repository genuinely holds nothing this machine
-                // may purge. If snapshots WERE declined, the empty match is
-                // evidence attribution is wrong — and advancing here would
-                // record the purge as applied, permanently, with no rewrite
-                // ever run and no error shown. Leave it pending and say so.
-                if plan.unattributed.isEmpty {
-                    try markPurgePatternsApplied(
-                        setId: set.id,
-                        destinationId: destination.id,
-                        patterns: plan.patterns,
-                        operationMayHaveRun: !children.isEmpty,
-                        scheduleStateLease: scheduleStateLease
-                    )
-                } else {
-                    logWarning(
-                        "BackupEngine: purge of \"\(destination.label)\" matched none of "
-                            + "\(plan.unattributed.count) snapshot(s) in the repository — leaving the "
-                            + "patterns pending rather than recording them as applied"
-                    )
-                }
+                // The planning pass already refused a non-empty repository
+                // whose snapshots were all declined. This is therefore a
+                // proven empty repository and has nothing to rewrite.
+                try markPurgePatternsApplied(
+                    setId: set.id,
+                    destinationId: destination.id,
+                    patterns: plan.patterns,
+                    operationMayHaveRun: !children.isEmpty,
+                    scheduleStateLease: scheduleStateLease
+                )
                 continue
             }
             let restoreAfterLaunchFailure = isFirstPurgeChild ? restorePurgeToken : nil
@@ -2148,13 +2151,22 @@ public final class BackupEngine: Sendable {
             purgePatterns: patterns,
             purgeRepositoryId: repositoryId,
             purgeSnapshotRewrites: { outcome in
-                var rewrites: [String: String] = [:]
-                for rewrite in parseRewrite(outcome.rawOutput).snapshots {
+                let parsed = parseRewrite(outcome.rawOutput)
+                guard let modifiedCount = parsed.modifiedCount else { return nil }
+                var changedRewrites: [String: String] = [:]
+                for rewrite in parsed.snapshots {
                     guard let oldID = fullIDByShortID[rewrite.shortID],
                           let newID = rewrite.newSnapshotShortID else { return nil }
-                    guard rewrites.updateValue(newID, forKey: oldID) == nil else { return nil }
+                    guard changedRewrites.updateValue(newID, forKey: oldID) == nil else { return nil }
                 }
-                return rewrites.count == snapshotIDs.count ? rewrites : nil
+                guard changedRewrites.count == modifiedCount else { return nil }
+                // Restic omits per-snapshot output for a selected snapshot
+                // that already satisfies the rewrite. Preserve complete
+                // generation evidence by representing that legitimate no-op
+                // as old full id -> its unchanged short id.
+                return Dictionary(uniqueKeysWithValues: snapshotIDs.map { oldID in
+                    (oldID, changedRewrites[oldID] ?? String(oldID.prefix(8)))
+                })
             }
         )
     }
@@ -2213,11 +2225,15 @@ public final class BackupEngine: Sendable {
                 )
             }
             let liveIds = liveSnapshotIdsByDestination[entry.destId] ?? []
-            let oldIdsAreAbsent = rewrites.keys.allSatisfy { !liveIds.contains($0) }
-            let everyNewIdIsPresentExactlyOnce = rewrites.values.allSatisfy { shortId in
-                liveIds.lazy.filter { $0.hasPrefix(shortId) }.prefix(2).count == 1
+            let generationMatches = rewrites.allSatisfy { oldId, newShortId in
+                if newShortId == String(oldId.prefix(8)) {
+                    // A selected no-op remains present under its original id.
+                    return liveIds.contains(oldId)
+                }
+                return !liveIds.contains(oldId)
+                    && liveIds.lazy.filter { $0.hasPrefix(newShortId) }.prefix(2).count == 1
             }
-            guard oldIdsAreAbsent, everyNewIdIsPresentExactlyOnce else {
+            guard generationMatches else {
                 // A repository restored to a pre-purge generation can keep
                 // its config id. Its old snapshots are live work, not
                 // authority to repair the missing schedule watermark.

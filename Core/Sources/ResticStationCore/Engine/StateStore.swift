@@ -669,7 +669,17 @@ public struct StateStore: Sendable {
     ) -> ScheduleStateClassification {
         switch readScheduleStateBytes() {
         case .missing:
-            return .result(.missing)
+            // The marker is part of this capability boundary even when the
+            // canonical document is absent. A valid marker followed by a
+            // crash before first-envelope publication is still logically
+            // missing, but an unsafe marker must never be hidden by that
+            // same crash window.
+            switch readScheduleStateVersionMarker() {
+            case .missing, .present:
+                return .result(.missing)
+            case .failed(let reason):
+                return .result(.corrupt(scheduleStateFailure(reason: reason, bytes: nil)))
+            }
         case .failed(let reason):
             return .result(.corrupt(scheduleStateFailure(reason: reason, bytes: nil)))
         case .bytes(let data):

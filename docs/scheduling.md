@@ -341,12 +341,13 @@ unpurged secondary would leave its old snapshots alongside the primary's
 rewritten replacements, so it is never allowed. The per-destination pattern
 watermark advances only after that destination's purge child succeeds, or
 when the plan matched nothing **and** nothing was declined — an empty
-repository has nothing to rewrite. It deliberately does not advance when the
-plan matched nothing while snapshots *were* declined: that combination is
-evidence attribution is wrong, and recording the patterns as applied would
-skip the rewrite permanently, silently, and with a success-shaped outcome.
-The engine logs the decline instead. A removed pattern stays recorded and is
-never used to trigger a rewrite.
+repository has nothing to rewrite. A plan that matched nothing while snapshots
+*were* declined instead fails the complete apply during its all-destination
+read-only planning pass, before token consumption or any rewrite/copy launch:
+that combination is evidence attribution is wrong, and recording the patterns
+as applied would skip the rewrite permanently while continuing with a
+success-shaped outcome. A removed pattern stays recorded and is never used to
+trigger a rewrite.
 
 The pending-pattern observation is revalidated after acquiring the shared
 schedule-state lease. Each destination is narrowed to the preview patterns it
@@ -360,9 +361,10 @@ destructive-audit gate and the schedule-state lease, revalidates the token's
 snapshot attribution, reads the live restic repository config id, verifies the
 complete run history, and restores only the exact `purgePatterns` whose
 launch-bound `purgeRepositoryId` matches that live repository **and** whose
-recorded old-to-new snapshot mapping matches the live post-rewrite generation
-(every old id absent, every new id present exactly once). The repository id is
-queried again inside the runner immediately before the synchronous
+recorded old-to-result snapshot mapping matches the live post-rewrite generation
+(a rewritten old id is absent and its new id is present exactly once; a
+legitimate no-op maps to its own short id and remains present). The repository
+id is queried again inside the runner immediately before the synchronous
 executable/token/audit/spawn boundary, and the complete repository snapshot-id
 set is re-listed there and compared with the generation observed during token
 revalidation. A replacement or stale-host backup in the earlier planning

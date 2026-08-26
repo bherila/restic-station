@@ -749,6 +749,34 @@ struct StateStoreTests {
         #expect(try Data(contentsOf: URL(fileURLWithPath: #require(secondFailure.quarantinePath))) == corrupt)
     }
 
+    @Test("an unsafe migration marker fails closed when canonical state is absent")
+    func scheduleStateMarkerFIFOWithoutCanonicalFailsClosed() throws {
+        let (store, root) = makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try store.paths.ensureDirectories()
+        try #require(
+            store.paths.scheduleStateVersionMarkerFile.path.withCString { mkfifo($0, 0o600) } == 0
+        )
+
+        let started = Date()
+        guard case .corrupt(let failure) = store.readScheduleStateResult() else {
+            Issue.record("FIFO migration marker was hidden by the missing canonical state")
+            return
+        }
+        #expect(Date().timeIntervalSince(started) < 1)
+        #expect(
+            failure.reason == .unsafeFile(
+                reason: "schedule state version marker is not a regular file"
+            )
+        )
+        #expect(failure.quarantinePath == nil)
+        #expect(!FileManager.default.fileExists(atPath: store.paths.scheduleStateFile.path))
+        #expect(throws: StateStoreError.self) {
+            try store.updateScheduleState(setId: UUID()) { $0.checkSliceCursor = 1 }
+        }
+        #expect(!FileManager.default.fileExists(atPath: store.paths.scheduleStateFile.path))
+    }
+
     @Test("schedule-state publication reports each durability boundary failure")
     func scheduleStateDurabilityFaults() throws {
         for point in [
