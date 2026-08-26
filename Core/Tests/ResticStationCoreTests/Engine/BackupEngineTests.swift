@@ -3927,12 +3927,14 @@ struct BackupEngineTests {
             .split(separator: "\n")
             .map(String.init)
         let destinations = [env.primary, secondary]
-        env.fake.script = destinations.flatMap { destination in
-            Self.resticCall(
+        var script: [FakeProcessRunner.Expectation] = []
+        for destination in destinations {
+            script += Self.resticCall(
                 ["-r", destination.repoURL, "snapshots", "--json"],
                 dest: destination.id,
                 stdoutLines: [snapshotsJSON]
-            ) + Self.resticCall(
+            )
+            script += Self.resticCall(
                 Self.rewriteArgv(
                     destination.repoURL,
                     snapshotIDs: snapshots.map(\.id),
@@ -3942,24 +3944,30 @@ struct BackupEngineTests {
                 dest: destination.id,
                 stdoutLines: dryRun
             )
-        } + Self.repositoryConfigCall(
+        }
+        script += Self.repositoryConfigCall(
             env.primary.repoURL,
             dest: env.primary.id
-        ) + Self.resticCall(
+        )
+        script += Self.resticCall(
             ["-r", env.primary.repoURL, "snapshots", "--json"],
             dest: env.primary.id,
             stdoutLines: [snapshotsJSON]
-        ) + Self.repositoryConfigCall(
+        )
+        script += Self.repositoryConfigCall(
             secondary.repoURL,
             dest: secondary.id
-        ) + Self.resticCall(
+        )
+        script += Self.resticCall(
             ["-r", secondary.repoURL, "snapshots", "--json"],
             dest: secondary.id,
             stdoutLines: [snapshotsJSON]
-        ) + Self.repositoryConfigCall(
+        )
+        script += Self.repositoryConfigCall(
             env.primary.repoURL,
             dest: env.primary.id
-        ) + Self.resticCall(
+        )
+        script += Self.resticCall(
             Self.rewriteArgv(
                 env.primary.repoURL,
                 snapshotIDs: snapshots.map(\.id),
@@ -3967,10 +3975,12 @@ struct BackupEngineTests {
             ),
             dest: env.primary.id,
             stdoutLines: rewrite
-        ) + Self.repositoryConfigCall(
+        )
+        script += Self.repositoryConfigCall(
             secondary.repoURL,
             dest: secondary.id
-        ) + Self.resticCall(
+        )
+        script += Self.resticCall(
             Self.rewriteArgv(
                 secondary.repoURL,
                 snapshotIDs: snapshots.map(\.id),
@@ -3979,6 +3989,7 @@ struct BackupEngineTests {
             dest: secondary.id,
             stdoutLines: rewrite
         )
+        env.fake.script = script
 
         let session = try await env.engine.previewPurgeSession(
             set: env.set,
