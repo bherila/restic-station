@@ -1011,6 +1011,50 @@ struct AppModelMachineOverrideTests {
         #expect(try await secrets.password(destId: destinationId) == "original-password")
     }
 
+    @Test("overlapping editors unwind by mutation order rather than teardown order")
+    func overlappingEditorsRestoreInGlobalMutationOrder() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-secret-global-order-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let destinationId = UUID()
+        let olderSession = UUID()
+        let newerSession = UUID()
+        let secrets = CheckpointingSecretStore(passwords: [destinationId: "original-password"])
+        let model = AppModel(paths: AppPaths(root: root), secretStoreFactory: { secrets })
+        model.beginSecretEditorSession(olderSession)
+        let older = try await model.storeDestinationSecrets(
+            destId: destinationId,
+            password: "older-editor-password",
+            secretEnv: nil,
+            ifConfigUnchangedFrom: model.configFingerprint,
+            editorSessionId: olderSession
+        )
+        #expect(model.claimEditorSecretRollback(older, sessionId: olderSession))
+
+        model.beginSecretEditorSession(newerSession)
+        let newer = try await model.storeDestinationSecrets(
+            destId: destinationId,
+            password: "newer-editor-password",
+            secretEnv: nil,
+            ifConfigUnchangedFrom: model.configFingerprint,
+            editorSessionId: newerSession
+        )
+        #expect(model.claimEditorSecretRollback(newer, sessionId: newerSession))
+
+        // Close in the opposite order from the mutations. The model must
+        // still unwind newer -> older -> original.
+        model.endSecretEditorSession(newerSession, claimedRollbacks: [newer])
+        model.endSecretEditorSession(olderSession, claimedRollbacks: [older])
+        for _ in 0..<80 {
+            if model.pendingSecretRollbackBatches.isEmpty { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+
+        #expect(model.pendingSecretRollbackBatches.isEmpty)
+        #expect(try await secrets.password(destId: destinationId) == "original-password")
+    }
+
     @Test("an older rollback waits until a live editor registers its newer transaction")
     func abandonedRollbackWaitsForActiveEditor() async throws {
         let root = FileManager.default.temporaryDirectory
@@ -1197,6 +1241,51 @@ struct AppModelMachineOverrideTests {
         #expect(model.pendingSecretRollbackError == nil)
         model.endSecretEditorSession(sessionId)
         #expect(try await secrets.password(destId: destinationId) == "retained-password")
+    }
+
+    @Test("a newer commit retires rollback tokens still owned by another editor")
+    func committedCredentialRetiresLiveEditorRollback() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-secret-live-owner-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let destinationId = UUID()
+        let olderSession = UUID()
+        let newerSession = UUID()
+        let secrets = CheckpointingSecretStore(passwords: [destinationId: "original-password"])
+        let model = AppModel(paths: AppPaths(root: root), secretStoreFactory: { secrets })
+        model.beginSecretEditorSession(olderSession)
+        let older = try await model.storeDestinationSecrets(
+            destId: destinationId,
+            password: "committed-password",
+            secretEnv: nil,
+            ifConfigUnchangedFrom: model.configFingerprint,
+            editorSessionId: olderSession
+        )
+        #expect(model.claimEditorSecretRollback(older, sessionId: olderSession))
+
+        model.beginSecretEditorSession(newerSession)
+        let committed = try await model.storeDestinationSecrets(
+            destId: destinationId,
+            password: "committed-password",
+            secretEnv: nil,
+            ifConfigUnchangedFrom: model.configFingerprint,
+            editorSessionId: newerSession
+        )
+        #expect(model.claimEditorSecretRollback(committed, sessionId: newerSession))
+        model.retirePendingSecretRollbackFields(committedBy: [committed])
+        model.endSecretEditorSession(newerSession)
+
+        // The older view still hands its stale value token to the model, but
+        // the newer commit cutoff makes it ineligible before any secret I/O.
+        model.endSecretEditorSession(olderSession, claimedRollbacks: [older])
+        for _ in 0..<40 {
+            if model.pendingSecretRollbackBatches.isEmpty { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+
+        #expect(model.pendingSecretRollbackBatches.isEmpty)
+        #expect(try await secrets.password(destId: destinationId) == "committed-password")
     }
 
     @Test("credential restoration failure changes process-wide app health")

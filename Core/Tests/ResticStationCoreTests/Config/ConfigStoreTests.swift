@@ -226,6 +226,18 @@ import Testing
         #expect(snapshot.fingerprint == store.fileFingerprint())
     }
 
+    @Test("rollback artifact preservation failure remains an uncertain commit")
+    func rollbackArtifactPreservationFailureIsUncertain() {
+        let error = ConfigStoreError.rollbackArtifactPreservationFailed(
+            errno: 13,
+            artifactMayRemainAt: "/tmp/config.json.tmp"
+        )
+
+        #expect(error.commitMayBeUncertain)
+        #expect(error.isRevisionConflict)
+        #expect(error.description.contains("commit state remains uncertain"))
+    }
+
     @Test("revision preflight classifies raw config read failures")
     func unchangedRevisionWrapsConfigReadFailure() async throws {
         let (store, root) = makeStore()

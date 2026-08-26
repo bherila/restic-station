@@ -270,6 +270,20 @@ struct DestinationTable: View {
                 )
                 persistedWholeDraft = true
             } catch {
+                if let storeError = error as? ConfigStoreError,
+                   storeError.commitMayBeUncertain {
+                    // The whole draft may be live. Keep its credential edits
+                    // installed and prevent any older/view-owned rollback
+                    // from undoing them until the operator reconciles config.
+                    model.retirePendingSecretRollbackFields(
+                        committedBy: pendingSecretRollbacks
+                    )
+                    pendingSecretRollbacks.removeAll()
+                    removalError = "The destination removal's installed revision could not be determined "
+                        + "(\(error)). Credential changes were left in place. Reload settings and verify "
+                        + "the destination before running a backup."
+                    return
+                }
                 removalError = SetsCopy.fieldMessage(for: error).message
                 return
             }
@@ -278,6 +292,9 @@ struct DestinationTable: View {
         if persistedWholeDraft {
             // saveSet wrote every destination in the parent draft, not just
             // the removal, so every retained secret edit is committed too.
+            model.retirePendingSecretRollbackFields(
+                committedBy: pendingSecretRollbacks
+            )
             pendingSecretRollbacks.removeAll()
         } else {
             // The removed destination no longer participates in a future

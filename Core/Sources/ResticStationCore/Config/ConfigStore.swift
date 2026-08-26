@@ -766,8 +766,9 @@ enum AtomicFile {
         let preserve = renameX(from: source, to: recovery, flags: UInt32(RENAME_EXCL))
         guard preserve == 0 else {
             let preserveErrno = errno
-            throw ConfigStoreError.renameFailed(
-                errno: preserveErrno, from: source.path, to: recovery.path
+            throw ConfigStoreError.rollbackArtifactPreservationFailed(
+                errno: preserveErrno,
+                artifactMayRemainAt: source.path
             )
         }
         return recovery
@@ -781,6 +782,7 @@ public enum ConfigStoreError: Error, Equatable, Sendable, CustomStringConvertibl
     case readFailed(path: String, reason: String)
     case replacementRollbackFailed(errno: Int32, candidateMayBeInstalledAt: String)
     case rollbackArtifactPreserved(path: String)
+    case rollbackArtifactPreservationFailed(errno: Int32, artifactMayRemainAt: String)
     case changedOnDisk
     case writeLockBusy(path: String)
     case writeLockUnusable(LockFailure)
@@ -798,6 +800,10 @@ public enum ConfigStoreError: Error, Equatable, Sendable, CustomStringConvertibl
             return "config.json save recovery could not determine or restore the live revision; "
                 + "an uncertain rollback artifact "
                 + "was preserved at \(path); reload settings and reconcile that file before saving"
+        case .rollbackArtifactPreservationFailed(let errno, let path):
+            return "config.json save recovery could not preserve a rollback artifact (errno \(errno)); "
+                + "the commit state remains uncertain and an artifact may remain at \(path); "
+                + "reload settings and reconcile before saving"
         case .changedOnDisk:
             return "config.json changed on disk; reload the latest settings before saving"
         case .writeLockBusy(let path):
@@ -807,12 +813,12 @@ public enum ConfigStoreError: Error, Equatable, Sendable, CustomStringConvertibl
         }
     }
 
-    /// Both cases mean the caller's edit revision lost to an external
-    /// writer and should expose the same reload affordance. The preservation
-    /// case carries extra recovery information but is still a CAS refusal.
+    /// These cases mean the caller's edit revision lost to an external
+    /// writer or recovery could not prove otherwise, and should expose the
+    /// same reload affordance.
     public var isRevisionConflict: Bool {
         switch self {
-        case .changedOnDisk, .rollbackArtifactPreserved:
+        case .changedOnDisk, .rollbackArtifactPreserved, .rollbackArtifactPreservationFailed:
             return true
         default:
             return false
@@ -823,7 +829,8 @@ public enum ConfigStoreError: Error, Equatable, Sendable, CustomStringConvertibl
     /// must inspect the live config before undoing any related side effect.
     public var commitMayBeUncertain: Bool {
         switch self {
-        case .replacementRollbackFailed, .rollbackArtifactPreserved:
+        case .replacementRollbackFailed, .rollbackArtifactPreserved,
+             .rollbackArtifactPreservationFailed:
             return true
         default:
             return false

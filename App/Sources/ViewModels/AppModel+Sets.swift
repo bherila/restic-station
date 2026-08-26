@@ -15,13 +15,14 @@ extension AppModel {
 
     struct DestinationSecretsRollback: Sendable {
         let transaction: DestinationSecretRollback
+        let sequence: UInt64
 
         var destId: UUID { transaction.destId }
-    }
 
-    private struct CommittedSecretFields {
-        var password = false
-        var secretEnv = false
+        init(transaction: DestinationSecretRollback, sequence: UInt64 = 0) {
+            self.transaction = transaction
+            self.sequence = sequence
+        }
     }
 
     // MARK: - Collaborators
@@ -167,7 +168,11 @@ extension AppModel {
                         secretEnv: secretEnv
                     )
                 )
-                let snapshot = DestinationSecretsRollback(transaction: transaction)
+                nextSecretRollbackSequence &+= 1
+                let snapshot = DestinationSecretsRollback(
+                    transaction: transaction,
+                    sequence: nextSecretRollbackSequence
+                )
                 rollback = snapshot
                 return snapshot
             }
@@ -208,9 +213,9 @@ extension AppModel {
         claimedRollbacks: [DestinationSecretsRollback] = []
     ) {
         activeSecretEditorSessions.remove(sessionId)
-        // Claimed tokens precede any still-parked async mutation from this
-        // session. Keep them in one chronological batch so reverse-order
-        // restoration always unwinds newest -> oldest.
+        // Keep claimed and still-parked mutations together for ownership;
+        // each token's global sequence, not this array's insertion order,
+        // determines the eventual rollback order.
         let stranded = unclaimedSecretEditorRollbacks.removeValue(forKey: sessionId) ?? []
         retainPendingSecretRollbacks(claimedRollbacks + stranded)
         // A queued abandoned-session rollback is deliberately paused while
@@ -296,15 +301,21 @@ extension AppModel {
         using store: any SecretStore,
         onProgress: (([DestinationSecretsRollback]) -> Void)? = nil
     ) async throws -> Bool {
-        var remaining = rollbacks.map(\.transaction)
+        let eligibleRollbacks = rollbacks.compactMap(rollbackWithUncommittedFields)
+        onProgress?(eligibleRollbacks)
+        var remaining = eligibleRollbacks.map(\.transaction)
+        let sequences = eligibleRollbacks.map(\.sequence)
         var passwordConflicts: Set<UUID> = []
         var secretEnvConflicts: Set<UUID> = []
         var allRestored = true
 
         func publishProgress() {
-            onProgress?(remaining.compactMap { transaction in
+            onProgress?(remaining.enumerated().compactMap { index, transaction in
                 guard transaction.password != nil || transaction.secretEnv != nil else { return nil }
-                return DestinationSecretsRollback(transaction: transaction)
+                return DestinationSecretsRollback(
+                    transaction: transaction,
+                    sequence: sequences[index]
+                )
             })
         }
 
@@ -384,44 +395,61 @@ extension AppModel {
     }
 
     /// A successful config commit — or an uncertain commit whose credentials
-    /// are deliberately left installed for reconciliation — makes each field
-    /// changed by that editor authoritative. Retire matching fields from
-    /// older, model-owned rollback batches even when the new edit wrote the
-    /// same value: value-based rollback conflict detection cannot distinguish
-    /// "still abandoned" from "explicitly retained" in that case.
+    /// are deliberately left installed for reconciliation — establishes a
+    /// per-field sequence cutoff. That cutoff also protects rollback tokens
+    /// still owned by other live views: if they are later reverted or queued
+    /// during teardown, restoreDestinationSecrets filters them before I/O.
     func retirePendingSecretRollbackFields(
         committedBy rollbacks: [DestinationSecretsRollback]
     ) {
-        var committed: [UUID: CommittedSecretFields] = [:]
         for rollback in rollbacks {
-            var fields = committed[rollback.destId] ?? CommittedSecretFields()
-            fields.password = fields.password || rollback.transaction.password != nil
-            fields.secretEnv = fields.secretEnv || rollback.transaction.secretEnv != nil
-            committed[rollback.destId] = fields
-        }
-        guard !committed.isEmpty else { return }
-
-        pendingSecretRollbackBatches = pendingSecretRollbackBatches.compactMap { batch in
-            let remaining = batch.compactMap { rollback -> DestinationSecretsRollback? in
-                guard let fields = committed[rollback.destId] else { return rollback }
-                let transaction = rollback.transaction
-                let password = fields.password ? nil : transaction.password
-                let secretEnv = fields.secretEnv ? nil : transaction.secretEnv
-                guard password != nil || secretEnv != nil else { return nil }
-                return DestinationSecretsRollback(
-                    transaction: DestinationSecretRollback(
-                        destId: transaction.destId,
-                        password: password,
-                        secretEnv: secretEnv,
-                        previousSecretEnvRaw: secretEnv == nil ? nil : transaction.previousSecretEnvRaw
-                    )
+            if rollback.transaction.password != nil {
+                committedPasswordRollbackSequence[rollback.destId] = max(
+                    committedPasswordRollbackSequence[rollback.destId] ?? 0,
+                    rollback.sequence
                 )
             }
+            if rollback.transaction.secretEnv != nil {
+                committedSecretEnvRollbackSequence[rollback.destId] = max(
+                    committedSecretEnvRollbackSequence[rollback.destId] ?? 0,
+                    rollback.sequence
+                )
+            }
+        }
+
+        pendingSecretRollbackBatches = pendingSecretRollbackBatches.compactMap { batch in
+            let remaining = batch.compactMap(rollbackWithUncommittedFields)
             return remaining.isEmpty ? nil : remaining
         }
         if pendingSecretRollbackBatches.isEmpty {
             pendingSecretRollbackError = nil
         }
+    }
+
+    private func rollbackWithUncommittedFields(
+        _ rollback: DestinationSecretsRollback
+    ) -> DestinationSecretsRollback? {
+        let transaction = rollback.transaction
+        let passwordCommitted = transaction.password != nil
+            && committedPasswordRollbackSequence[rollback.destId].map {
+                rollback.sequence <= $0
+            } == true
+        let secretEnvCommitted = transaction.secretEnv != nil
+            && committedSecretEnvRollbackSequence[rollback.destId].map {
+                rollback.sequence <= $0
+            } == true
+        let password = passwordCommitted ? nil : transaction.password
+        let secretEnv = secretEnvCommitted ? nil : transaction.secretEnv
+        guard password != nil || secretEnv != nil else { return nil }
+        return DestinationSecretsRollback(
+            transaction: DestinationSecretRollback(
+                destId: transaction.destId,
+                password: password,
+                secretEnv: secretEnv,
+                previousSecretEnvRaw: secretEnv == nil ? nil : transaction.previousSecretEnvRaw
+            ),
+            sequence: rollback.sequence
+        )
     }
 
     func retryPendingSecretRollbacks() {
@@ -435,33 +463,57 @@ extension AppModel {
         pendingSecretRollbackTask = Task { @MainActor [weak self] in
             guard let self else { return }
             defer { self.pendingSecretRollbackTask = nil }
-            // Sessions can overlap after a failed restoration. Unwind the
-            // newest session first so a chain old -> A -> B returns through
-            // B -> A before the older A -> old transaction is evaluated.
+            // Editor teardown order is unrelated to mutation order. Pick one
+            // globally newest transaction at a time so interleaved sessions
+            // unwind B -> A -> old even when their windows close in any order.
             while !self.pendingSecretRollbackBatches.isEmpty {
-                let batchIndex = self.pendingSecretRollbackBatches.count - 1
-                let batch = self.pendingSecretRollbackBatches[batchIndex]
-                var remaining = batch
+                guard let location = self.pendingSecretRollbackBatches.indices
+                    .flatMap({ batchIndex in
+                        self.pendingSecretRollbackBatches[batchIndex].indices.map { rollbackIndex in
+                            (batchIndex, rollbackIndex)
+                        }
+                    })
+                    .max(by: { lhs, rhs in
+                        self.pendingSecretRollbackBatches[lhs.0][lhs.1].sequence
+                            < self.pendingSecretRollbackBatches[rhs.0][rhs.1].sequence
+                    }) else { break }
+                let (batchIndex, rollbackIndex) = location
+                guard let rollback = self.rollbackWithUncommittedFields(
+                    self.pendingSecretRollbackBatches[batchIndex][rollbackIndex]
+                ) else {
+                    self.pendingSecretRollbackBatches[batchIndex].remove(at: rollbackIndex)
+                    if self.pendingSecretRollbackBatches[batchIndex].isEmpty {
+                        self.pendingSecretRollbackBatches.remove(at: batchIndex)
+                    }
+                    continue
+                }
+                self.pendingSecretRollbackBatches[batchIndex][rollbackIndex] = rollback
+                var remaining = [rollback]
                 do {
                     _ = try await self.restoreDestinationSecrets(
-                        batch,
+                        [rollback],
                         onProgress: { progress in
                             remaining = progress
-                            if batchIndex >= self.pendingSecretRollbackBatches.count {
-                                self.pendingSecretRollbackBatches = [progress]
+                            guard batchIndex < self.pendingSecretRollbackBatches.count,
+                                  rollbackIndex < self.pendingSecretRollbackBatches[batchIndex].count else {
+                                return
+                            }
+                            if let checkpoint = progress.first {
+                                self.pendingSecretRollbackBatches[batchIndex][rollbackIndex] = checkpoint
                             } else {
-                                self.pendingSecretRollbackBatches[batchIndex] = progress
+                                self.pendingSecretRollbackBatches[batchIndex].remove(at: rollbackIndex)
                             }
                         }
                     )
-                    if batchIndex < self.pendingSecretRollbackBatches.count {
+                    if batchIndex < self.pendingSecretRollbackBatches.count,
+                       self.pendingSecretRollbackBatches[batchIndex].isEmpty {
                         self.pendingSecretRollbackBatches.remove(at: batchIndex)
                     }
                 } catch {
-                    if batchIndex >= self.pendingSecretRollbackBatches.count {
-                        self.pendingSecretRollbackBatches = [remaining]
-                    } else {
-                        self.pendingSecretRollbackBatches[batchIndex] = remaining
+                    if batchIndex < self.pendingSecretRollbackBatches.count,
+                       rollbackIndex < self.pendingSecretRollbackBatches[batchIndex].count,
+                       let checkpoint = remaining.first {
+                        self.pendingSecretRollbackBatches[batchIndex][rollbackIndex] = checkpoint
                     }
                     self.pendingSecretRollbackError =
                         "Some destination credentials could not be restored (\(error)). "

@@ -112,6 +112,12 @@ final class AppModel: ObservableObject {
     /// its parent editor session is still alive.
     var activeSecretEditorSessions: Set<UUID> = []
     var unclaimedSecretEditorRollbacks: [UUID: [DestinationSecretsRollback]] = [:]
+    /// Global mutation order, independent of which SwiftUI editor happens to
+    /// disappear first. Rollback and commit cutoffs use these sequence values
+    /// to preserve cross-window credential causality.
+    var nextSecretRollbackSequence: UInt64 = 0
+    var committedPasswordRollbackSequence: [UUID: UInt64] = [:]
+    var committedSecretEnvRollbackSequence: [UUID: UInt64] = [:]
     /// Monotonic request identity for reloads that leave the main actor while
     /// waiting on config.lock. Only the newest request may publish state.
     private var configReloadGeneration: UInt64 = 0
