@@ -120,6 +120,12 @@ final class AppModel: ObservableObject {
     /// This closes the interval before a completed transaction can be parked
     /// as a rollback token; explicit older Reverts must wait for these too.
     var inFlightSecretEditorMutations: [UUID: [UUID: SecretEditorMutationIntent]] = [:]
+    /// Rollbacks removed from the pending queue for targeted/explicit
+    /// restoration remain visible here across the backend await. Without
+    /// this ownership, another editor could overtake the dequeued link while
+    /// both operations contend for secrets.lock.
+    var inFlightSecretRollbackRestorations: [UInt64: DestinationSecretsRollback] = [:]
+    var inFlightSecretRollbackWaiters: [CheckedContinuation<Void, Never>] = []
     /// Global mutation order, independent of which SwiftUI editor happens to
     /// disappear first. Rollback and commit cutoffs use these sequence values
     /// to preserve cross-window credential causality.
@@ -473,13 +479,19 @@ final class AppModel: ObservableObject {
             machine = refreshedMachine
             config = snapshot.config
             configFingerprint = snapshot.fingerprint
-            configReloadRequired = false
-            configChangedOnDisk = false
+            // snapshot() intentionally returns an unmigrated legacy config
+            // when config.lock is structurally unavailable. Keep writes
+            // blocked until a later reload can actually install the current
+            // schema; repairing the lock alone need not change the file hash.
+            configReloadRequired = snapshot.config.version < AppConfig.currentVersion
+            configChangedOnDisk = configReloadRequired
             configLoadError = machineLoadError
             resolvedConfig = snapshot.config.resolved(for: refreshedMachine).config
             addressableConfig = snapshot.config.addressable(for: refreshedMachine)
             stateWatcher.updateConfiguredSetIds(Set(resolvedConfig.sets.map(\.id)))
-            lastConfigError = nil
+            lastConfigError = configReloadRequired
+                ? "Settings still use an older schema because config.lock could not be used. Repair the lock, then reload settings."
+                : nil
             recomputeDerivedState()
 
             if ConfigDiff.isScheduleRelevantChange(from: previous, to: snapshot.config) {

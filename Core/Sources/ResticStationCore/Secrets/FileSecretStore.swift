@@ -56,7 +56,10 @@ public struct FileSecretStore: SecretStore {
 
     /// Bumped only if the on-disk shape changes. A file whose `version` is
     /// newer than this is refused rather than silently misread.
-    static let currentVersion = 1
+    // Version 2 adds persistent per-field mutation generations. Older
+    // helpers must reject it instead of accepting version 1 and silently
+    // stripping those rollback identities on their next write.
+    static let currentVersion = 2
 
     /// How long a writer waits for `locks/secrets.lock` before giving up.
     /// Generous: the critical section is a small read-modify-write, and the

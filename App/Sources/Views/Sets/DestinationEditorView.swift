@@ -628,6 +628,11 @@ struct DestinationEditorView: View {
     private func commitDraft() async -> DestinationCommit? {
         message = nil
 
+        guard isNew || secretsLoaded else {
+            message = .error("Credentials are still being reconciled. Wait for them to load before saving this destination.")
+            return nil
+        }
+
         let label = draft.label.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !label.isEmpty else {
             message = .error("Give this destination a label — it is how it is named everywhere else.")
@@ -764,7 +769,14 @@ struct DestinationEditorView: View {
             return
         }
 
-        let secrets = await model.loadDestinationSecrets(destId: draft.id)
+        let secrets: (password: String?, secretEnv: [String: String])
+        do {
+            secrets = try await model.loadDestinationSecrets(destId: draft.id)
+        } catch {
+            secretsNote = "Stored credentials could not be safely reconciled."
+            message = .error("Credentials could not be loaded safely (\(error)). Retry after resolving the credential restoration warning.")
+            return
+        }
         loadedPassword = secrets.password
         loadedSecretEnv = secrets.secretEnv
         if let existing = secrets.password {

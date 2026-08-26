@@ -157,6 +157,7 @@ extension AppModel {
         if let pendingSecretRollbackTask {
             await pendingSecretRollbackTask.value
         }
+        await waitForInFlightSecretRollbackRestorations()
         let store = try makeSecretStore()
         let update = DestinationSecretUpdate(
             destId: destId,
@@ -369,6 +370,7 @@ extension AppModel {
             (claimedSecretEditorRollbacks[otherSession] ?? [])
                 + (unclaimedSecretEditorRollbacks[otherSession] ?? [])
         }.compactMap(rollbackWithUncommittedFields)
+            + inFlightSecretRollbackRestorations.values.compactMap(rollbackWithUncommittedFields)
 
         return requested.contains { older in
             live.contains { newer in
@@ -423,17 +425,7 @@ extension AppModel {
         let requested = requestedRollbacks.compactMap(rollbackWithUncommittedFields)
         guard !requested.isEmpty else { return }
 
-        while let queued = pendingSecretRollbackBatches
-            .flatMap({ $0 })
-            .compactMap(rollbackWithUncommittedFields)
-            .filter({ newer in
-                requested.contains { older in
-                    guard newer.destId == older.destId,
-                          newer.sequence > older.sequence else { return false }
-                    return (newer.transaction.password != nil && older.transaction.password != nil)
-                        || (newer.transaction.secretEnv != nil && older.transaction.secretEnv != nil)
-                }
-            })
+        while let queued = queuedSecretRollbackDependencies(newerThan: requested)
             .max(by: { $0.sequence < $1.sequence }) {
             // A queued transaction can span more fields than the older chain
             // that selected it. Do not consume any field while a newer live
@@ -441,20 +433,7 @@ extension AppModel {
             if hasNewerLiveSecretRollback(than: [queued], excluding: sessionId) {
                 throw AppModelError.newerSecretEditorMutation
             }
-            removePendingSecretRollback(sequence: queued.sequence)
-            var remaining = [queued]
-            do {
-                _ = try await restoreDestinationSecrets(
-                    [queued],
-                    onProgress: { remaining = $0 }
-                )
-            } catch {
-                pendingSecretRollbackBatches.append(remaining)
-                pendingSecretRollbackError =
-                    "Some destination credentials could not be restored (\(error)). "
-                    + "Backups may use credentials from an abandoned edit until restoration succeeds."
-                throw error
-            }
+            try await restoreDequeuedSecretRollback(queued)
         }
         if pendingSecretRollbackBatches.isEmpty {
             pendingSecretRollbackError = nil
@@ -475,23 +454,100 @@ extension AppModel {
             if hasNewerLiveSecretRollback(than: [queued]) {
                 throw AppModelError.newerSecretEditorMutation
             }
-            removePendingSecretRollback(sequence: queued.sequence)
-            var remaining = [queued]
-            do {
-                _ = try await restoreDestinationSecrets(
-                    [queued],
-                    onProgress: { remaining = $0 }
-                )
-            } catch {
-                pendingSecretRollbackBatches.append(remaining)
-                pendingSecretRollbackError =
-                    "Some destination credentials could not be restored (\(error)). "
-                    + "Backups may use credentials from an abandoned edit until restoration succeeds."
-                throw error
-            }
+            try await restoreDequeuedSecretRollback(queued)
         }
         if pendingSecretRollbackBatches.isEmpty {
             pendingSecretRollbackError = nil
+        }
+    }
+
+    /// Computes the transitive queued chain. A password-only request can
+    /// reach a mixed password/environment token, which in turn depends on a
+    /// still-newer environment-only token; every such successor must unwind
+    /// first even though it does not overlap the original request directly.
+    private func queuedSecretRollbackDependencies(
+        newerThan requested: [DestinationSecretsRollback]
+    ) -> [DestinationSecretsRollback] {
+        let queued = pendingSecretRollbackBatches
+            .flatMap({ $0 })
+            .compactMap(rollbackWithUncommittedFields)
+        var closure = requested
+        var included = Set(requested.map(\.sequence))
+        var addedDependency = true
+        while addedDependency {
+            addedDependency = false
+            for candidate in queued where !included.contains(candidate.sequence) {
+                let followsChain = closure.contains { older in
+                    candidate.destId == older.destId
+                        && candidate.sequence > older.sequence
+                        && secretRollbackFieldsOverlap(candidate, older)
+                }
+                if followsChain {
+                    closure.append(candidate)
+                    included.insert(candidate.sequence)
+                    addedDependency = true
+                }
+            }
+        }
+        return queued.filter { included.contains($0.sequence) }
+    }
+
+    private func secretRollbackFieldsOverlap(
+        _ lhs: DestinationSecretsRollback,
+        _ rhs: DestinationSecretsRollback
+    ) -> Bool {
+        (lhs.transaction.password != nil && rhs.transaction.password != nil)
+            || (lhs.transaction.secretEnv != nil && rhs.transaction.secretEnv != nil)
+    }
+
+    /// Transfers one queued token into an explicit in-flight registry before
+    /// removing it from the pending queue, keeping its ownership visible over
+    /// the secrets.lock await. On failure the latest field checkpoint returns
+    /// to the pending queue before that in-flight marker is released.
+    private func restoreDequeuedSecretRollback(
+        _ rollback: DestinationSecretsRollback
+    ) async throws {
+        inFlightSecretRollbackRestorations[rollback.sequence] = rollback
+        removePendingSecretRollback(sequence: rollback.sequence)
+        var remaining = [rollback]
+        do {
+            _ = try await restoreDestinationSecrets(
+                [rollback],
+                onProgress: { progress in
+                    remaining = progress
+                    if let checkpoint = progress.first {
+                        self.inFlightSecretRollbackRestorations[rollback.sequence] = checkpoint
+                    }
+                }
+            )
+            finishDequeuedSecretRollback(sequence: rollback.sequence, resumeRetries: true)
+        } catch {
+            if !remaining.isEmpty {
+                pendingSecretRollbackBatches.append(remaining)
+            }
+            pendingSecretRollbackError =
+                "Some destination credentials could not be restored (\(error)). "
+                + "Backups may use credentials from an abandoned edit until restoration succeeds."
+            finishDequeuedSecretRollback(sequence: rollback.sequence, resumeRetries: false)
+            throw error
+        }
+    }
+
+    private func waitForInFlightSecretRollbackRestorations() async {
+        guard !inFlightSecretRollbackRestorations.isEmpty else { return }
+        await withCheckedContinuation { continuation in
+            inFlightSecretRollbackWaiters.append(continuation)
+        }
+    }
+
+    private func finishDequeuedSecretRollback(sequence: UInt64, resumeRetries: Bool) {
+        inFlightSecretRollbackRestorations.removeValue(forKey: sequence)
+        guard inFlightSecretRollbackRestorations.isEmpty else { return }
+        let waiters = inFlightSecretRollbackWaiters
+        inFlightSecretRollbackWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+        if resumeRetries {
+            retryPendingSecretRollbacks()
         }
     }
 
@@ -706,7 +762,8 @@ extension AppModel {
         // Once the editor ends, endSecretEditorSession() resumes newest-first
         // processing with every transaction registered in one place.
         guard activeSecretEditorSessions.isEmpty,
-              inFlightSecretEditorMutations.isEmpty else { return }
+              inFlightSecretEditorMutations.isEmpty,
+              inFlightSecretRollbackRestorations.isEmpty else { return }
         pendingSecretRollbackError = nil
         pendingSecretRollbackTask = Task { @MainActor [weak self] in
             guard let self else { return }
@@ -776,17 +833,18 @@ extension AppModel {
     /// Reads back what the destination editor needs to pre-fill. A missing
     /// password is not an error here (a destination can exist before its
     /// password was ever stored) — the caller shows "leave blank to keep".
-    func loadDestinationSecrets(destId: UUID) async -> (password: String?, secretEnv: [String: String]) {
+    func loadDestinationSecrets(destId: UUID) async throws -> (password: String?, secretEnv: [String: String]) {
         // A rollback which was already in flight when this editor opened may
         // still own the value currently in the backend. Prefill only after it
         // settles, matching the serialization used by credential writes.
         if let pendingSecretRollbackTask {
             await pendingSecretRollbackTask.value
         }
+        await waitForInFlightSecretRollbackRestorations()
         // A closed editor can leave a batch queued rather than running while
         // another set editor is open. Reconcile this destination explicitly
         // so its abandoned value is never copied into the surviving draft.
-        try? await drainQueuedSecretRollbacks(forDestination: destId)
+        try await drainQueuedSecretRollbacks(forDestination: destId)
         guard let store = self.secrets else { return (nil, [:]) }
         let password = try? await store.password(destId: destId)
         let env = (try? await store.secretEnv(destId: destId)) ?? [:]

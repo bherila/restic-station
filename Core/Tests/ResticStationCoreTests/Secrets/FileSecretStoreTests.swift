@@ -161,6 +161,28 @@ struct FileSecretStoreTests {
         #expect(restoredSecrets[account] == malformedRaw)
     }
 
+    @Test("a version-1 file is readable and upgrades before generation metadata is persisted")
+    func legacyFileUpgradesWhenMutationGenerationsAreWritten() async throws {
+        let (store, root) = Self.makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let legacy: [String: Any] = [
+            "version": 1,
+            "secrets": [SecretAccount.password(Self.destId): "legacy-password"],
+        ]
+        try JSONSerialization.data(withJSONObject: legacy).write(to: store.fileURL)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: store.fileURL.path)
+
+        try await store.setPassword("current-password", destId: Self.destId)
+
+        let upgraded = try #require(
+            JSONSerialization.jsonObject(with: Data(contentsOf: store.fileURL)) as? [String: Any]
+        )
+        #expect(upgraded["version"] as? Int == 2)
+        let generations = try #require(upgraded["generations"] as? [String: String])
+        #expect(generations[SecretAccount.password(Self.destId)] != nil)
+    }
+
     // MARK: - Permissions at creation
 
     @Test("the secrets file is created 0600 and its directory 0700, at creation time")
