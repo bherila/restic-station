@@ -288,6 +288,39 @@ private func setRunStoreTestErrno(_ value: Int32) {
         #expect(index.isEmpty)
     }
 
+    @Test("begin persists every newly created history-directory ancestor before publication")
+    func beginSyncsNewHistoryAncestors() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+        let live = RunStoreFileOperations.live
+        let syncCalls = Box(0)
+        let callsBeforePublication = Box(0)
+        let operations = RunStoreFileOperations(
+            openAt: live.openAt,
+            write: live.write,
+            sync: { fd in
+                syncCalls.value += 1
+                return live.sync(fd)
+            },
+            renameAt: live.renameAt,
+            unlinkAt: live.unlinkAt
+        )
+        let store = RunStore(
+            paths: paths,
+            now: { Date() },
+            initialPublicationHook: { _ in
+                callsBeforePublication.value = syncCalls.value
+            },
+            fileOperations: operations
+        )
+
+        _ = try store.begin(kind: .backup, setId: UUID(), destId: UUID(), trigger: .manual)
+
+        // runs/, the data root, and the pre-existing temporary parent are
+        // synced bottom-up before the initial metadata hook can run.
+        #expect(callsBeforePublication.value >= 3)
+    }
+
     @Test("durable writes retry EINTR and complete every short write")
     func durableWritesCompleteShortWritesAndRetryEINTR() throws {
         let paths = makePaths()
@@ -509,6 +542,125 @@ private func setRunStoreTestErrno(_ value: Int32) {
         #expect(history.count == 1)
         #expect(history.first?.runId == run.runId)
         #expect(try store.unresolvedAuditFailures().isEmpty)
+    }
+
+    @Test("recovery removes an incomplete index tail before publishing its replacement")
+    func recoveryRepairsPartialIndexTail() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+        let store = RunStore(paths: paths, now: { Date() })
+        let run = try store.begin(kind: .prune, setId: UUID(), destId: UUID(), trigger: .manual)
+        try store.markDestructiveLaunchAuthorized(run)
+        try FileManager.default.createDirectory(
+            at: paths.runsIndexLockFile,
+            withIntermediateDirectories: true
+        )
+        #expect(throws: (any Error).self) {
+            try store.finish(run, status: .success, resticExitCode: 0)
+        }
+        try FileManager.default.removeItem(at: paths.runsIndexLockFile)
+        try Data("{\"runId\":\"unterminated".utf8).write(to: paths.runsIndexFile)
+
+        #expect(try store.recoverInterrupted().isEmpty)
+        #expect(try store.metadata(runId: run.runId).indexPublicationPending == nil)
+        #expect(try store.recentRuns(limit: 10).map(\.runId) == [run.runId])
+        #expect(try store.unresolvedAuditFailures().isEmpty)
+        #expect(try Data(contentsOf: paths.runsIndexFile).last == 0x0A)
+    }
+
+    @Test("legacy recovery commits a pending marker before attempting its missing index append")
+    func legacyRecoveryMarksPendingBeforeAppend() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+        let liveStore = RunStore(paths: paths, now: { Date() })
+        let run = try liveStore.begin(kind: .backup, setId: UUID(), destId: UUID(), trigger: .manual)
+        try liveStore.finish(run, status: .success, resticExitCode: 0)
+        try FileManager.default.removeItem(at: paths.runsIndexFile)
+
+        let live = RunStoreFileOperations.live
+        let indexFD = Box<Int32?>(nil)
+        let operations = RunStoreFileOperations(
+            openAt: { directory, name, flags, mode in
+                let fd = live.openAt(directory, name, flags, mode)
+                if name == paths.runsIndexFile.lastPathComponent {
+                    indexFD.value = fd
+                }
+                return fd
+            },
+            write: { fd, buffer, count in
+                if fd == indexFD.value {
+                    setRunStoreTestErrno(ENOSPC)
+                    return -1
+                }
+                return live.write(fd, buffer, count)
+            },
+            sync: live.sync,
+            renameAt: live.renameAt,
+            unlinkAt: live.unlinkAt
+        )
+        let recoveringStore = RunStore(
+            paths: paths,
+            now: { Date() },
+            initialPublicationHook: { _ in },
+            fileOperations: operations
+        )
+
+        #expect(throws: RunStoreError.self) {
+            try recoveringStore.recoverInterrupted()
+        }
+        #expect(try recoveringStore.metadata(runId: run.runId).indexPublicationPending == true)
+    }
+
+    @Test("repairing an older projection cannot replace the latest run")
+    func repairedHistoryRemainsChronological() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+        let clock = Box(Date(timeIntervalSince1970: 2_000_000_000))
+        let store = RunStore(paths: paths, now: { clock.value })
+        let setId = UUID()
+        let destId = UUID()
+
+        let older = try store.begin(kind: .backup, setId: setId, destId: destId, trigger: .manual)
+        try store.finish(older, status: .success, resticExitCode: 0)
+        clock.value = clock.value.addingTimeInterval(60)
+        let newer = try store.begin(kind: .backup, setId: setId, destId: destId, trigger: .manual)
+        try store.finish(newer, status: .failed, resticExitCode: 1)
+
+        let physicalLines = try String(contentsOf: paths.runsIndexFile, encoding: .utf8)
+            .split(separator: "\n")
+        #expect(physicalLines.count == 2)
+        try Data((String(physicalLines[1]) + "\n").utf8).write(to: paths.runsIndexFile)
+
+        #expect(try store.recoverInterrupted().isEmpty)
+        let history = try store.recentRuns(setId: setId, limit: 10)
+        #expect(history.map(\.runId) == [newer.runId, older.runId])
+        #expect(try store.lastRun(setId: setId, kind: .backup)?.runId == newer.runId)
+        #expect(try store.lastRun(setId: setId, kind: .backup)?.status == .failed)
+    }
+
+    @Test("recovery publishes one corrective projection for stale non-destructive history")
+    func recoveryCorrectsNonDestructiveProjection() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+        let store = RunStore(paths: paths, now: { Date() })
+        let run = try store.begin(kind: .backup, setId: UUID(), destId: UUID(), trigger: .manual)
+        try store.finish(run, status: .success, resticExitCode: 0)
+
+        var rolledBack = try store.metadata(runId: run.runId)
+        rolledBack.status = .running
+        rolledBack.end = nil
+        rolledBack.resticExitCode = nil
+        rolledBack.pid = 999_999
+        try writeRawMetadata(rolledBack, paths: paths)
+
+        #expect(try store.recoverInterrupted().map(\.runId) == [run.runId])
+        #expect(try store.recoverInterrupted().isEmpty)
+        let history = try store.recentRuns(limit: 10)
+        #expect(history.count == 1)
+        #expect(history.first?.runId == run.runId)
+        #expect(history.first?.status == .failed)
+        #expect(history.first?.errorSummary == "interrupted")
+        #expect(try store.lastRun(setId: run.setId, kind: .backup)?.status == .failed)
     }
 
     @Test("terminal destructive metadata missing from the index is an audit failure")

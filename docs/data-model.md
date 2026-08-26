@@ -298,11 +298,11 @@ Secret-env item is optional (absent for local/sftp destinations without credenti
 {"runId":"20260726T205704Z-backup-6f9619ff","kind":"backup","setId":"6F9619FF-...","destId":"0A1B2C3D-...","status":"success","start":"2026-07-26T20:57:04Z","end":"2026-07-26T20:58:11Z","trigger":"scheduled","snapshotId":"f391ba97c096...","filesNew":3,"filesChanged":1,"dataAdded":67860,"errorSummary":null}
 ```
 
-`kind`: `backup` | `copy` | `check` | `prune` | `purge` | `restore` | `init`. A scheduled set run produces **multiple** index lines: one `backup` (primary), an optional `purge` per destination with newly added `purgeExcludes`, one `copy` per attempted secondary, one `prune` per repo where retention ran. They share a `groupId` field (= the backup's runId) so the UI can nest them. Each append uses a complete-write loop that retries `EINTR`, then `fsync`s the index before releasing `index.jsonl.lock`; creation of the first index also syncs the `runs/` directory entry.
+`kind`: `backup` | `copy` | `check` | `prune` | `purge` | `restore` | `init`. A scheduled set run produces **multiple** index lines: one `backup` (primary), an optional `purge` per destination with newly added `purgeExcludes`, one `copy` per attempted secondary, one `prune` per repo where retention ran. They share a `groupId` field (= the backup's runId) so the UI can nest them. Each append uses a complete-write loop that retries `EINTR`, then `fsync`s the index before releasing `index.jsonl.lock`; creation of the first index also syncs the `runs/` directory entry. Before appending, an unterminated corrupt tail from an interrupted prior write is truncated to the last complete line (or a complete newline-less JSON record is terminated), so a recovery line cannot be concatenated onto corrupt JSON. History readers take the last decodable projection for each run and order runs by canonical start time; an older repaired record therefore cannot masquerade as the latest run.
 
 ## runs/<runId>/metadata.json — `RunMetadata`
 
-Superset of the index line, plus: `pid`, `resticExitCode`, `argvRedacted` (argv with env not included), `stats` (full decoded summary message where applicable), `groupId`, `destructiveAuditContractVersion`, `destructiveLaunchAuthorizedAt`, `auditFailureReason`, and the optional two-phase marker `indexPublicationPending`. A successful `purge` run additionally carries `purgeSnapshotRewrites`, an old full snapshot id → new snapshot id mapping. It is an audit record only: older run records continue to name their historical snapshot ids. Written once at start (`status: "running"`, no `end`) and atomically rewritten on completion. The temp file is completely written, `fsync`ed, and renamed with `renameat(2)` against a held directory descriptor; the containing directory is then `fsync`ed before success is reported. A newly created run directory is likewise made durable in `runs/` before `begin` returns.
+Superset of the index line, plus: `pid`, `resticExitCode`, `argvRedacted` (argv with env not included), `stats` (full decoded summary message where applicable), `groupId`, `destructiveAuditContractVersion`, `destructiveLaunchAuthorizedAt`, `auditFailureReason`, and the optional two-phase marker `indexPublicationPending`. A successful `purge` run additionally carries `purgeSnapshotRewrites`, an old full snapshot id → new snapshot id mapping. It is an audit record only: older run records continue to name their historical snapshot ids. Written once at start (`status: "running"`, no `end`) and atomically rewritten on completion. The temp file is completely written, `fsync`ed, and renamed with `renameat(2)` against a held directory descriptor; the containing directory is then `fsync`ed before success is reported. A newly created run directory is likewise made durable in `runs/` before `begin` returns. On a fresh hierarchy, every newly created `runs/`/data-root ancestor entry and the first pre-existing parent are synced bottom-up before initial run publication, so a later crash cannot lose the entire canonical history path.
 
 ### Normative destructive-operation audit contract
 
@@ -382,7 +382,10 @@ both succeed.
 Reconciliation runs on helper recovery and explicit history repair. It is
 idempotent. It may append one missing index projection for terminal canonical
 metadata and may convert a dead, still-running non-destructive record to the
-existing `failed/interrupted` outcome. A dead destructive record carrying a
+existing `failed/interrupted` outcome. If a non-destructive run already has a
+stale divergent projection, recovery appends one corrective canonical
+projection; logical history takes that last projection without displaying a
+duplicate. A dead destructive record carrying a
 launch marker must instead retain
 `auditFailureReason: launched_without_terminal_metadata`; reconciliation may
 index that condition but must not invent a repository result or clear the
@@ -397,8 +400,11 @@ rewritten with the marker cleared. A crash or surfaced sync error at any point
 therefore leaves either running launch evidence, a terminal record whose index
 is absent, or a terminal pending marker. Verification treats the pending marker
 as `terminal_metadata_missing_index` even when a full but not-yet-confirmed line
-is visible. Recovery appends only when no decoded projection exists and clears
-the marker only when exactly one projection equals `metadata.indexEntry`.
+is visible. Recovery first commits the pending marker even for legacy terminal
+records, repairs an incomplete physical tail before appending, and clears the
+marker only after the canonical projection has been synced. Destructive
+duplicates or divergence remain critical; non-destructive divergence receives
+one idempotent corrective projection as described above.
 
 Verification requires every run directory's canonical `metadata.json` to be
 readable and decodable. It fails closed on missing or corrupt canonical

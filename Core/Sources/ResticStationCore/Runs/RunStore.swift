@@ -269,7 +269,16 @@ public struct RunStore: Sendable {
         trigger: RunTrigger,
         groupId: String? = nil
     ) throws -> ActiveRun {
+        let directorySyncChain = missingDirectorySyncChain(to: paths.runsDir)
         try paths.ensureDirectories()
+        // `ensureDirectories()` may have created several ancestors at once.
+        // Persist every new directory entry, bottom-up, before any operation
+        // can reach its launch boundary. Syncing only `runs/` would still let
+        // a crash lose `runs/`, the data root, or another newly-created
+        // ancestor from its parent directory.
+        for directory in directorySyncChain {
+            try syncDirectory(directory)
+        }
 
         // A verifier must never observe the directory between mkdir and its
         // first metadata commit. The separate publication lock also lets two
@@ -489,12 +498,18 @@ public struct RunStore: Sendable {
             guard let metadata = try? decoder.decode(RunMetadata.self, from: data) else { continue }
             if metadata.status != .running {
                 // Canonical metadata wins. Repair only a wholly absent
-                // projection; duplicates or divergence remain explicit audit
-                // failures that an automatic pass must not guess through.
+                // destructive projection; duplicates or divergence remain an
+                // explicit destructive audit failure. Non-destructive history
+                // can publish a corrective last projection safely.
                 let projections = indexedByRunId[metadata.runId, default: []]
                 var projectionIsDurable = false
                 if projections.isEmpty {
-                    let projection = metadata.indexEntry
+                    var pending = metadata
+                    if pending.indexPublicationPending != true {
+                        pending.indexPublicationPending = true
+                        try writeMetadataAtomic(pending)
+                    }
+                    let projection = pending.indexEntry
                     try appendIndexEntry(projection)
                     indexedByRunId[metadata.runId] = [projection]
                     projectionIsDurable = true
@@ -506,9 +521,27 @@ public struct RunStore: Sendable {
                         try syncExistingIndex()
                     }
                     projectionIsDurable = true
+                } else if !metadata.kind.isDestructive {
+                    if projections.last == metadata.indexEntry {
+                        if metadata.indexPublicationPending == true {
+                            try syncExistingIndex()
+                        }
+                        projectionIsDurable = true
+                    } else {
+                        var pending = metadata
+                        if pending.indexPublicationPending != true {
+                            pending.indexPublicationPending = true
+                            try writeMetadataAtomic(pending)
+                        }
+                        let projection = pending.indexEntry
+                        try appendIndexEntry(projection)
+                        indexedByRunId[metadata.runId, default: []].append(projection)
+                        projectionIsDurable = true
+                    }
                 }
-                if metadata.indexPublicationPending == true,
-                   projectionIsDurable {
+                if projectionIsDurable,
+                   (metadata.indexPublicationPending == true || projections.isEmpty
+                       || (!metadata.kind.isDestructive && projections.last != metadata.indexEntry)) {
                     var reconciled = metadata
                     reconciled.indexPublicationPending = nil
                     try writeMetadataAtomic(reconciled)
@@ -539,6 +572,15 @@ public struct RunStore: Sendable {
                 projectionIsDurable = true
             } else if projections == [updated.indexEntry] {
                 try syncExistingIndex()
+                projectionIsDurable = true
+            } else if !updated.kind.isDestructive {
+                if projections.last == updated.indexEntry {
+                    try syncExistingIndex()
+                } else {
+                    let projection = updated.indexEntry
+                    try appendIndexEntry(projection)
+                    indexedByRunId[updated.runId, default: []].append(projection)
+                }
                 projectionIsDurable = true
             }
             if projectionIsDurable {
@@ -627,14 +669,14 @@ public struct RunStore: Sendable {
     /// shared, unfiltered window by busier sets' more numerous newer runs.
     /// `runs list --set` (T27, issue #29 finding 3) depends on this order.
     public func recentRuns(setId: UUID? = nil, limit: Int) throws -> [RunIndexEntry] {
-        let entries = try readIndexEntries()
+        let entries = try logicalIndexEntries()
         let scoped = setId.map { id in entries.filter { $0.setId == id } } ?? entries
         return Array(scoped.reversed().prefix(max(limit, 0)))
     }
 
     /// Most recent index entry for `setId`/`kind`, or `nil` if none.
     public func lastRun(setId: UUID, kind: RunKind) throws -> RunIndexEntry? {
-        let entries = try readIndexEntries()
+        let entries = try logicalIndexEntries()
         for entry in entries.reversed() where entry.setId == setId && entry.kind == kind {
             return entry
         }
@@ -845,6 +887,25 @@ public struct RunStore: Sendable {
         return decodeIndexEntries(data)
     }
 
+    /// Returns one logical projection per run, ordered by canonical start
+    /// time. A corrective recovery projection is physically appended after
+    /// the stale line it supersedes; taking the last projection per run keeps
+    /// history truthful without hiding duplicate destructive projections from
+    /// `unresolvedAuditFailures()`, which reads the raw entries independently.
+    private func logicalIndexEntries() throws -> [RunIndexEntry] {
+        let physical = try readIndexEntries()
+        var latestByRunId: [String: (offset: Int, entry: RunIndexEntry)] = [:]
+        for (offset, entry) in physical.enumerated() {
+            latestByRunId[entry.runId] = (offset, entry)
+        }
+        return latestByRunId.values.sorted {
+            if $0.entry.start != $1.entry.start {
+                return $0.entry.start < $1.entry.start
+            }
+            return $0.offset < $1.offset
+        }.map(\.entry)
+    }
+
     private func decodeIndexEntries(_ data: Data?) -> [RunIndexEntry] {
         guard let data else { return [] }
         let indexFile = paths.runsIndexFile
@@ -1035,7 +1096,7 @@ public struct RunStore: Sendable {
         let fd = fileOperations.openAt(
             runsDirectoryFD,
             paths.runsIndexFile.lastPathComponent,
-            O_CREAT | O_WRONLY | O_APPEND | O_CLOEXEC | O_NOFOLLOW,
+            O_CREAT | O_RDWR | O_APPEND | O_CLOEXEC | O_NOFOLLOW,
             0o644
         )
         guard fd >= 0 else {
@@ -1044,6 +1105,7 @@ public struct RunStore: Sendable {
         }
         defer { closeFileDescriptor(fd) }
 
+        try repairIncompleteIndexTail(fd: fd, path: indexPath)
         try writeAll(line, to: fd, path: indexPath, indexWrite: true)
         if fileOperations.sync(fd) != 0 {
             let code = errno
@@ -1118,6 +1180,60 @@ public struct RunStore: Sendable {
             )
         }
         return fd
+    }
+
+    /// Captures the directories whose entries will be created by
+    /// `ensureDirectories()`, followed by the first existing ancestor. After
+    /// creation, syncing this chain in returned order persists every path
+    /// component from the new leaf back into stable storage.
+    private func missingDirectorySyncChain(to leaf: URL) -> [URL] {
+        var missing: [URL] = []
+        var cursor = leaf.standardizedFileURL
+        let fileManager = FileManager.default
+        while !fileManager.fileExists(atPath: cursor.path) {
+            missing.append(cursor)
+            let parent = cursor.deletingLastPathComponent()
+            guard parent.path != cursor.path else { break }
+            cursor = parent
+        }
+        if !missing.isEmpty, missing.last?.path != cursor.path {
+            missing.append(cursor)
+        }
+        return missing
+    }
+
+    /// An interrupted append can leave an unterminated fragment. Appending
+    /// directly after it would concatenate the repair line onto corrupt JSON.
+    /// Preserve a complete newline-less final record by terminating it;
+    /// otherwise truncate only the invalid tail back to the last newline.
+    private func repairIncompleteIndexTail(fd: Int32, path: String) throws {
+        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: false)
+        let data: Data
+        do {
+            data = try handle.readToEnd() ?? Data()
+        } catch {
+            throw RunStoreError.indexAppendFailed(errno: EIO, path: path)
+        }
+        guard !data.isEmpty, data.last != 0x0A else { return }
+
+        let suffixStart = data.lastIndex(of: 0x0A).map { data.index(after: $0) } ?? data.startIndex
+        let suffix = Data(data[suffixStart...])
+        if (try? ConfigStore.makeDecoder().decode(RunIndexEntry.self, from: suffix)) != nil {
+            try writeAll(Data([0x0A]), to: fd, path: path, indexWrite: true)
+            return
+        }
+
+        let validLength = off_t(data.lastIndex(of: 0x0A).map { data.distance(from: data.startIndex, to: $0) + 1 } ?? 0)
+        #if canImport(Darwin)
+        let result = Darwin.ftruncate(fd, validLength)
+        #elseif canImport(Glibc)
+        let result = Glibc.ftruncate(fd, validLength)
+        #elseif canImport(Musl)
+        let result = Musl.ftruncate(fd, validLength)
+        #endif
+        if result != 0 {
+            throw RunStoreError.indexAppendFailed(errno: errno, path: path)
+        }
     }
 
     private func syncDirectory(_ directory: URL) throws {
