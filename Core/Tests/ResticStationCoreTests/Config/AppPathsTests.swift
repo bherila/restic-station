@@ -483,6 +483,57 @@ struct AppPathsEnvTests {
         try paths.ensureDirectories { syncedPaths.append($0.standardizedFileURL.path) }
 
         #expect(syncedPaths == [
+            base.path,
+            base.deletingLastPathComponent().path,
+            firstAncestor.path,
+            base.path,
+            secondAncestor.path,
+            firstAncestor.path,
+            root.path,
+            secondAncestor.path,
+            paths.runsDir.path,
+            paths.stateDir.path,
+            paths.locksDir.path,
+            root.path,
+        ])
+    }
+
+    @Test("directory setup retries durability after mkdir became visible")
+    func ensureDirectoriesResyncsVisibleBoundaryAfterFailedParentSync() throws {
+        let fileManager = FileManager.default
+        let base = fileManager.temporaryDirectory
+            .appendingPathComponent("restic-station-durability-retry-\(UUID().uuidString)", isDirectory: true)
+        defer { try? fileManager.removeItem(at: base) }
+        try fileManager.createDirectory(at: base, withIntermediateDirectories: true)
+
+        let firstAncestor = base.appendingPathComponent("shared", isDirectory: true)
+        let secondAncestor = firstAncestor.appendingPathComponent("state", isDirectory: true)
+        let root = secondAncestor.appendingPathComponent("restic-station", isDirectory: true)
+        let paths = AppPaths(root: root)
+        var baseSyncCount = 0
+        var firstAttemptFailed = false
+
+        do {
+            try paths.ensureDirectories { directory in
+                if directory.standardizedFileURL.path == base.path {
+                    baseSyncCount += 1
+                    if baseSyncCount == 2 {
+                        throw CocoaError(.fileWriteUnknown)
+                    }
+                }
+            }
+        } catch {
+            firstAttemptFailed = true
+        }
+        #expect(firstAttemptFailed)
+        #expect(baseSyncCount == 2)
+        #expect(fileManager.fileExists(atPath: firstAncestor.path))
+        #expect(!fileManager.fileExists(atPath: secondAncestor.path))
+
+        var retrySyncs: [String] = []
+        try paths.ensureDirectories { retrySyncs.append($0.standardizedFileURL.path) }
+
+        #expect(retrySyncs == [
             firstAncestor.path,
             base.path,
             secondAncestor.path,

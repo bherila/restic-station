@@ -378,10 +378,14 @@ public struct AppPaths: Equatable, Sendable {
                     throw error
                 }
             }
-            try syncDirectory(root)
-            if parent.path != root.path {
-                try syncDirectory(parent)
-            }
+        }
+        // Confirm this boundary on every successful call, not only after the
+        // mkdir we happened to observe. A prior call may have made the entry
+        // visible and then failed its fsync; visibility alone is not proof
+        // that a destructive run's history root will survive power loss.
+        try syncDirectory(root)
+        if parent.path != root.path {
+            try syncDirectory(parent)
         }
         // All three directories own flock inodes, so another uid must never
         // be able to create or replace entries in them. `state/` additionally
@@ -396,13 +400,11 @@ public struct AppPaths: Equatable, Sendable {
         // pre-existing 755 dir staying 755), and the protection that matters
         // is per-file: the token index is 0600 and refuses to load if it is
         // not. This narrows the exposure without overriding that choice.
-        var createdProtectedDirectory = false
         for (directory, tightenExisting) in [
             (runsDir, false),
             (stateDir, true),
             (locksDir, false),
         ] {
-            let wasMissing = !fileManager.fileExists(atPath: directory.path)
             if let failure = FileLock.ensureDirectory(
                 directory,
                 parent: root,
@@ -412,16 +414,11 @@ public struct AppPaths: Equatable, Sendable {
             ) {
                 throw failure
             }
-            if wasMissing {
-                // Persist the new directory inode now; one root sync after
-                // the loop persists all of their entries together.
-                try syncDirectory(directory)
-                createdProtectedDirectory = true
-            }
+            // Retry durability even when the entry was already visible: a
+            // previous invocation may have failed between mkdir and fsync.
+            try syncDirectory(directory)
         }
-        if createdProtectedDirectory {
-            try syncDirectory(root)
-        }
+        try syncDirectory(root)
     }
 
     /// Creates a missing path one component at a time and commits both the
@@ -438,6 +435,15 @@ public struct AppPaths: Equatable, Sendable {
             let parent = cursor.deletingLastPathComponent()
             guard parent.path != cursor.path else { break }
             cursor = parent
+        }
+
+        // `cursor` is the first visible boundary. It may be a directory this
+        // operation created before an fsync failure on an earlier call, so
+        // confirm both its inode and the directory entry that owns it.
+        try syncDirectory(cursor)
+        let boundaryParent = cursor.deletingLastPathComponent()
+        if boundaryParent.path != cursor.path {
+            try syncDirectory(boundaryParent)
         }
 
         for component in missing.reversed() {
