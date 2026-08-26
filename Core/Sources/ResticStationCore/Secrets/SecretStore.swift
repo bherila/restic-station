@@ -93,6 +93,20 @@ public protocol SecretStore: Sendable {
     func secretEnv(destId: UUID) async throws -> [String: String]
     func deleteSecretEnv(destId: UUID) async throws
 
+    /// Captures the previous managed fields and installs their replacements.
+    /// Production backends do both atomically under their shared mutation
+    /// lock. `nil` means that field is outside the update.
+    func updateDestinationSecrets(_ update: DestinationSecretUpdate) async throws -> DestinationSecretRollback
+
+    /// Restores editor-written values only while they are still current.
+    /// Production backends implement the comparison and restoration under
+    /// their shared mutation lock, so a newer CLI write can never be
+    /// overwritten by a stale UI rollback.
+    @discardableResult
+    func restoreDestinationSecretsIfCurrent(
+        _ rollback: DestinationSecretRollback
+    ) async throws -> DestinationSecretRestoreResult
+
     // MARK: Password command
 
     /// The exact command restic is configured to run via
@@ -128,6 +142,167 @@ public protocol SecretStore: Sendable {
 extension SecretStore {
     /// Most backends need nothing.
     public var passwordCommandEnvironment: [String: String] { [:] }
+
+    public func updateDestinationSecrets(
+        _ update: DestinationSecretUpdate
+    ) async throws -> DestinationSecretRollback {
+        let previousPassword: String?
+        if update.password != nil {
+            do {
+                previousPassword = try await password(destId: update.destId)
+            } catch SecretStoreError.itemNotFound {
+                previousPassword = nil
+            }
+        } else {
+            previousPassword = nil
+        }
+        let previousEnv = update.secretEnv == nil
+            ? nil
+            : try await secretEnv(destId: update.destId)
+        let rollback = DestinationSecretRollback(
+            destId: update.destId,
+            password: update.password.map {
+                SecretRollbackChange(installed: Optional($0), previous: previousPassword)
+            },
+            secretEnv: update.secretEnv.map {
+                SecretRollbackChange(installed: $0, previous: previousEnv ?? [:])
+            }
+        )
+        if let password = update.password {
+            try await setPassword(password, destId: update.destId)
+        }
+        if let env = update.secretEnv {
+            if env.isEmpty {
+                try await deleteSecretEnv(destId: update.destId)
+            } else {
+                try await setSecretEnv(env, destId: update.destId)
+            }
+        }
+        return rollback
+    }
+
+    /// Test/minimal-store fallback. Production stores override this with a
+    /// single locked transaction; actors used by clients still get the same
+    /// comparison semantics without needing storage-specific plumbing.
+    public func restoreDestinationSecretsIfCurrent(
+        _ rollback: DestinationSecretRollback
+    ) async throws -> DestinationSecretRestoreResult {
+        var passwordRestored: Bool?
+        if let change = rollback.password {
+            let current: String?
+            do {
+                current = try await password(destId: rollback.destId)
+            } catch SecretStoreError.itemNotFound {
+                current = nil
+            }
+            passwordRestored = current == change.installed
+        }
+        var secretEnvRestored: Bool?
+        if let change = rollback.secretEnv {
+            secretEnvRestored = try await secretEnv(destId: rollback.destId) == change.installed
+        }
+        if passwordRestored == true, let change = rollback.password {
+            if let previous = change.previous {
+                try await setPassword(previous, destId: rollback.destId)
+            } else {
+                try await deletePassword(destId: rollback.destId)
+            }
+        }
+        if secretEnvRestored == true, let change = rollback.secretEnv {
+            if change.previous.isEmpty {
+                try await deleteSecretEnv(destId: rollback.destId)
+            } else {
+                try await setSecretEnv(change.previous, destId: rollback.destId)
+            }
+        }
+        return DestinationSecretRestoreResult(
+            passwordRestored: passwordRestored,
+            secretEnvRestored: secretEnvRestored
+        )
+    }
+}
+
+public struct SecretRollbackChange<Value: Equatable & Sendable>: Equatable, Sendable {
+    public let installed: Value
+    public let previous: Value
+
+    public init(installed: Value, previous: Value) {
+        self.installed = installed
+        self.previous = previous
+    }
+}
+
+/// Persistent identity for one managed-field mutation. Production stores
+/// advance this token even when a writer installs the same value (or deletes
+/// an already-absent value), closing the ABA hole that value comparison alone
+/// leaves across app/helper processes.
+public struct SecretRollbackGeneration: Equatable, Sendable {
+    public let installed: String
+    public let previous: String?
+
+    public init(installed: String, previous: String?) {
+        self.installed = installed
+        self.previous = previous
+    }
+}
+
+public struct DestinationSecretRollback: Equatable, Sendable {
+    public let destId: UUID
+    public let password: SecretRollbackChange<String?>?
+    public let secretEnv: SecretRollbackChange<[String: String]>?
+    /// Exact pre-edit blob for production backends. This lets an explicit
+    /// valid replacement repair malformed legacy/manual JSON while an
+    /// abandoned editor can still restore those original bytes verbatim.
+    public let previousSecretEnvRaw: String?
+    public let passwordGeneration: SecretRollbackGeneration?
+    public let secretEnvGeneration: SecretRollbackGeneration?
+
+    public init(
+        destId: UUID,
+        password: SecretRollbackChange<String?>?,
+        secretEnv: SecretRollbackChange<[String: String]>?,
+        previousSecretEnvRaw: String? = nil,
+        passwordGeneration: SecretRollbackGeneration? = nil,
+        secretEnvGeneration: SecretRollbackGeneration? = nil
+    ) {
+        self.destId = destId
+        self.password = password
+        self.secretEnv = secretEnv
+        self.previousSecretEnvRaw = previousSecretEnvRaw
+        self.passwordGeneration = passwordGeneration
+        self.secretEnvGeneration = secretEnvGeneration
+    }
+}
+
+/// Per-field outcome of a conditional editor rollback. `nil` means the
+/// editor did not manage that field; `false` means a newer mutation won and
+/// was deliberately preserved. Keeping the fields separate lets an
+/// unchanged environment roll back even when a helper replaced the password
+/// (and vice versa).
+public struct DestinationSecretRestoreResult: Equatable, Sendable {
+    public let passwordRestored: Bool?
+    public let secretEnvRestored: Bool?
+
+    public init(passwordRestored: Bool?, secretEnvRestored: Bool?) {
+        self.passwordRestored = passwordRestored
+        self.secretEnvRestored = secretEnvRestored
+    }
+
+    public var allRestored: Bool {
+        passwordRestored != false && secretEnvRestored != false
+    }
+}
+
+public struct DestinationSecretUpdate: Equatable, Sendable {
+    public let destId: UUID
+    public let password: String?
+    public let secretEnv: [String: String]?
+
+    public init(destId: UUID, password: String?, secretEnv: [String: String]?) {
+        self.destId = destId
+        self.password = password
+        self.secretEnv = secretEnv
+    }
 }
 
 // MARK: - Account naming

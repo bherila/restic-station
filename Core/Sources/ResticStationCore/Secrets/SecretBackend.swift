@@ -153,7 +153,7 @@ public enum SecretStoreFactory {
         switch try SecretBackend.resolve(environment: environment) {
         case .keychain:
             #if os(macOS)
-            return KeychainSecretStore(runner: runner)
+            return KeychainSecretStore(runner: runner, paths: paths)
             #else
             throw SecretStoreError.backendFailed(
                 "\(SecretBackend.environmentKey)=keychain is only available on macOS — "

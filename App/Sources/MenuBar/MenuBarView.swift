@@ -21,6 +21,15 @@ struct MenuBarView: View {
 
     var body: some View {
         Group {
+            if let error = model.pendingSecretRollbackError {
+                Text("Credential restoration needs attention")
+                    .help(error)
+                Button("Retry Credential Restoration") {
+                    model.retryPendingSecretRollbacks()
+                }
+                Divider()
+            }
+
             if model.setHealths.isEmpty {
                 Text("No backup sets yet")
             } else {

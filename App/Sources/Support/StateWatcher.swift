@@ -54,6 +54,14 @@ public final class StateWatcher: ObservableObject {
     /// change under `locks/`. A lock failure can prevent all other writes,
     /// so the lock directory needs its own event source.
     @Published public private(set) var lockingFailure: LockingHealthFailure?
+    /// Byte fingerprint of the currently visible `config.json`, or a stable
+    /// sentinel for absence/unreadability. AppModel compares this with the
+    /// revision its editors loaded; StateWatcher never decodes the config.
+    @Published public private(set) var configFileFingerprint: String
+    /// Advances on every observed config revision, even when the bytes later
+    /// return to an earlier fingerprint. AppModel uses this ABA-safe identity
+    /// to reject reload results overtaken by B -> A replacement sequences.
+    @Published public private(set) var configFileRevision: UInt64 = 0
 
     private let paths: AppPaths
     private let runStore: RunStore
@@ -94,6 +102,10 @@ public final class StateWatcher: ObservableObject {
     /// reopening — see `attemptReopen(_:)`. This is what lets the watcher
     /// survive the directory being deleted and recreated without polling.
     private var rootDirSource: DispatchSourceFileSystemObject?
+    /// Direct vnode source catches in-place writes and chmod changes that do
+    /// not modify the root directory entry. The root source discovers first
+    /// creation and atomic replacement, then this source is reconciled.
+    private var configFileSource: DispatchSourceFileSystemObject?
 
     /// Directories whose watch source is currently unavailable because the
     /// directory didn't exist at the last open attempt (typically: deleted
@@ -153,6 +165,7 @@ public final class StateWatcher: ObservableObject {
         self.stateStore = stateStore
         self.secretBackend = secretBackend
         self.configuredSetIds = configuredSetIds
+        self.configFileFingerprint = ConfigStore(paths: paths).fileFingerprint()
     }
 
     /// Deterministic audit-loader seam for ordering tests. Production always
@@ -171,6 +184,7 @@ public final class StateWatcher: ObservableObject {
         self.stateStore = stateStore
         self.secretBackend = secretBackend
         self.configuredSetIds = configuredSetIds
+        self.configFileFingerprint = ConfigStore(paths: paths).fileFingerprint()
     }
 
     public func updateConfiguredSetIds(_ ids: Set<UUID>) {
@@ -190,6 +204,7 @@ public final class StateWatcher: ObservableObject {
         runsDirSource?.cancel()
         locksDirSource?.cancel()
         lockFileSources.values.forEach { $0.cancel() }
+        configFileSource?.cancel()
         rootDirSource?.cancel()
         rootParentDirSource?.cancel()
         rootGrandparentDirSource?.cancel()
@@ -265,6 +280,8 @@ public final class StateWatcher: ObservableObject {
         locksDirSource = nil
         lockFileSources.values.forEach { $0.cancel() }
         lockFileSources.removeAll()
+        configFileSource?.cancel()
+        configFileSource = nil
         rootDirSource?.cancel()
         rootDirSource = nil
         rootParentDirSource?.cancel()
@@ -292,12 +309,20 @@ public final class StateWatcher: ObservableObject {
     /// deliberately separate because it may contend on a lock and traverse
     /// every run; filesystem-triggered callers perform that scan detached.
     private func reloadCachedStateNow() {
+        let observedConfigFingerprint = ConfigStore(paths: paths).fileFingerprint()
+        if configFileFingerprint != observedConfigFingerprint {
+            configFileFingerprint = observedConfigFingerprint
+            configFileRevision &+= 1
+        }
         lockingFailure = LockingHealth.probe(
             paths: paths,
             configuredSetIds: configuredSetIds,
             secretBackend: secretBackend
         )
-        if isRunning { refreshLockFileSources() }
+        if isRunning {
+            refreshConfigFileSource()
+            refreshLockFileSources()
+        }
         scheduleState = stateStore.readScheduleState()
         fdaCheck = stateStore.readFdaCheck()
 
@@ -566,6 +591,8 @@ public final class StateWatcher: ObservableObject {
         }
         lockFileSources.values.forEach { $0.cancel() }
         lockFileSources.removeAll()
+        configFileSource?.cancel()
+        configFileSource = nil
     }
 
     /// A watched subdirectory (`state/`, `runs/`, or `locks/`) was deleted or
@@ -640,11 +667,12 @@ public final class StateWatcher: ObservableObject {
         if locksDirSource != nil {
             urls += [
                 paths.tickLockFile,
+                paths.configLockFile,
                 paths.destructiveAuditLockFile,
                 paths.runPublicationLockFile,
                 paths.healthLockFile,
             ]
-            if secretBackend == .file { urls.append(paths.secretsLockFile) }
+            urls.append(paths.secretsLockFile)
             urls += configuredSetIds.map { paths.setLockFile(setId: $0) }
         }
         if stateDirSource != nil {
@@ -672,6 +700,37 @@ public final class StateWatcher: ObservableObject {
                 lockFileSources[key] = source
             }
         }
+    }
+
+    private func refreshConfigFileSource() {
+        guard rootDirSource != nil else {
+            configFileSource?.cancel()
+            configFileSource = nil
+            return
+        }
+        guard configFileSource == nil else { return }
+
+        let fd = open(paths.configFile.path, O_EVTONLY | O_NOFOLLOW | O_CLOEXEC)
+        guard fd >= 0 else { return }
+        let source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fd,
+            eventMask: [.write, .attrib, .delete, .rename],
+            queue: watchQueue
+        )
+        source.setEventHandler { [weak self] in
+            guard let self else { return }
+            let invalidated = source.data.contains(.delete) || source.data.contains(.rename)
+            MainActor.assumeIsolated {
+                if invalidated {
+                    self.configFileSource?.cancel()
+                    self.configFileSource = nil
+                }
+                self.scheduleDebouncedReload()
+            }
+        }
+        source.setCancelHandler { close(fd) }
+        configFileSource = source
+        source.resume()
     }
 
     private func makeLockFileSource(

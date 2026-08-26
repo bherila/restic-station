@@ -41,6 +41,9 @@ struct SettingsRootView: View {
         // Sized for the Permissions pane, which carries the longest
         // explanatory copy; the others simply get room to breathe.
         .frame(width: 620, height: 520)
+        .safeAreaInset(edge: .top, spacing: 0) {
+            AppAlertBanners()
+        }
         // The `Settings` scene injects only `AppModel` and `LaunchdManager`
         // (`ResticStationApp.swift`); panes that render live on-disk state
         // take the watcher from the model that already owns it.

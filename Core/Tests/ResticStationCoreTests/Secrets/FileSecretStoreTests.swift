@@ -68,6 +68,121 @@ struct FileSecretStoreTests {
         return info.st_uid
     }
 
+    @Test("conditional rollback preserves a newer password and restores the unchanged environment")
+    func conditionalRollbackRestoresFieldsIndependently() async throws {
+        let (store, root) = Self.makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        try await store.setPassword("editor-password", destId: Self.destId)
+        try await store.setSecretEnv(["TOKEN": "editor"], destId: Self.destId)
+        let rollback = DestinationSecretRollback(
+            destId: Self.destId,
+            password: SecretRollbackChange(
+                installed: "editor-password",
+                previous: "original-password"
+            ),
+            secretEnv: SecretRollbackChange(
+                installed: ["TOKEN": "editor"],
+                previous: ["TOKEN": "original"]
+            )
+        )
+        try await store.setPassword("newer-helper-password", destId: Self.destId)
+
+        let result = try await store.restoreDestinationSecretsIfCurrent(rollback)
+
+        #expect(result.passwordRestored == false)
+        #expect(result.secretEnvRestored == true)
+        #expect(!result.allRestored)
+        #expect(try await store.password(destId: Self.destId) == "newer-helper-password")
+        #expect(try await store.secretEnv(destId: Self.destId) == ["TOKEN": "original"])
+    }
+
+    @Test("conditional rollback preserves same-value writes from another process")
+    func conditionalRollbackUsesPersistentGenerations() async throws {
+        let (store, root) = Self.makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        try await store.setPassword("original-password", destId: Self.destId)
+        try await store.setSecretEnv(["TOKEN": "original"], destId: Self.destId)
+        let rollback = try await store.updateDestinationSecrets(
+            DestinationSecretUpdate(
+                destId: Self.destId,
+                password: "editor-password",
+                secretEnv: [:]
+            )
+        )
+
+        // These helper-style mutations are value-identical to the app's
+        // installation, including deletion of an already-absent env item.
+        try await store.setPassword("editor-password", destId: Self.destId)
+        try await store.deleteSecretEnv(destId: Self.destId)
+
+        let result = try await store.restoreDestinationSecretsIfCurrent(rollback)
+
+        #expect(result.passwordRestored == false)
+        #expect(result.secretEnvRestored == false)
+        #expect(try await store.password(destId: Self.destId) == "editor-password")
+        #expect(try await store.secretEnv(destId: Self.destId).isEmpty)
+    }
+
+    @Test("a valid environment edit can replace and roll back a malformed secrets-file blob")
+    func malformedEnvironmentCanBeRepairedAndRestored() async throws {
+        let (store, root) = Self.makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try await store.setPassword("password", destId: Self.destId)
+
+        let account = SecretAccount.secretEnv(Self.destId)
+        let malformedRaw = "{not-json"
+        let document: [String: Any] = [
+            "version": 1,
+            "secrets": [
+                SecretAccount.password(Self.destId): "password",
+                account: malformedRaw,
+            ],
+        ]
+        try JSONSerialization.data(withJSONObject: document).write(to: store.fileURL)
+
+        let rollback = try await store.updateDestinationSecrets(
+            DestinationSecretUpdate(
+                destId: Self.destId,
+                password: nil,
+                secretEnv: ["TOKEN": "repaired"]
+            )
+        )
+        #expect(rollback.previousSecretEnvRaw == malformedRaw)
+        #expect(try await store.secretEnv(destId: Self.destId) == ["TOKEN": "repaired"])
+
+        let result = try await store.restoreDestinationSecretsIfCurrent(rollback)
+        let restoredDocument = try #require(
+            JSONSerialization.jsonObject(with: Data(contentsOf: store.fileURL)) as? [String: Any]
+        )
+        let restoredSecrets = try #require(restoredDocument["secrets"] as? [String: String])
+        #expect(result.secretEnvRestored == true)
+        #expect(restoredSecrets[account] == malformedRaw)
+    }
+
+    @Test("a version-1 file is readable and upgrades before generation metadata is persisted")
+    func legacyFileUpgradesWhenMutationGenerationsAreWritten() async throws {
+        let (store, root) = Self.makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let legacy: [String: Any] = [
+            "version": 1,
+            "secrets": [SecretAccount.password(Self.destId): "legacy-password"],
+        ]
+        try JSONSerialization.data(withJSONObject: legacy).write(to: store.fileURL)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: store.fileURL.path)
+
+        try await store.setPassword("current-password", destId: Self.destId)
+
+        let upgraded = try #require(
+            JSONSerialization.jsonObject(with: Data(contentsOf: store.fileURL)) as? [String: Any]
+        )
+        #expect(upgraded["version"] as? Int == 2)
+        let generations = try #require(upgraded["generations"] as? [String: String])
+        #expect(generations[SecretAccount.password(Self.destId)] != nil)
+    }
+
     // MARK: - Permissions at creation
 
     @Test("the secrets file is created 0600 and its directory 0700, at creation time")

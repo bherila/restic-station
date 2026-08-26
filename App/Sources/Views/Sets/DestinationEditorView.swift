@@ -24,6 +24,9 @@ struct DestinationEditorView: View {
     @Environment(\.dismiss) private var dismiss
 
     @Binding var set: BackupSet
+    @Binding var configFingerprint: String
+    @Binding var pendingSecretRollbacks: [AppModel.DestinationSecretsRollback]
+    private let secretEditorSessionID: UUID
     private let isNew: Bool
 
     // Config-backed fields.
@@ -42,6 +45,12 @@ struct DestinationEditorView: View {
     @State private var accessKeyID: String = ""
     @State private var secretAccessKey: String = ""
     @State private var secretEnvRows: [EnvRow] = []
+    /// Baselines captured after queued rollback reconciliation. Existing
+    /// credentials are written only when the user actually changes them, so
+    /// a value temporarily owned by another editor can never be copied into
+    /// this draft by an unrelated save.
+    @State private var loadedPassword: String?
+    @State private var loadedSecretEnv: [String: String]?
     /// `true` once the existing keychain items have been read (or there were
     /// none to read). Until then an empty field means "unknown", not "clear
     /// it" — see `secretEnvToWrite`.
@@ -54,8 +63,18 @@ struct DestinationEditorView: View {
     @State private var message: EditorMessage?
     @State private var showingMachineOverrides = false
 
-    init(set: Binding<BackupSet>, initialDestination destination: Destination, isNew: Bool) {
+    init(
+        set: Binding<BackupSet>,
+        configFingerprint: Binding<String>,
+        pendingSecretRollbacks: Binding<[AppModel.DestinationSecretsRollback]>,
+        secretEditorSessionID: UUID,
+        initialDestination destination: Destination,
+        isNew: Bool
+    ) {
         _set = set
+        _configFingerprint = configFingerprint
+        _pendingSecretRollbacks = pendingSecretRollbacks
+        self.secretEditorSessionID = secretEditorSessionID
         self.isNew = isNew
         _draft = State(initialValue: destination)
 
@@ -474,7 +493,18 @@ struct DestinationEditorView: View {
         if env.isEmpty && !secretsLoaded {
             return nil
         }
+        if !isNew, env == loadedSecretEnv {
+            return nil
+        }
         return env
+    }
+
+    private var passwordToWrite: String? {
+        guard !password.isEmpty else { return nil }
+        if !isNew, secretsLoaded, password == loadedPassword {
+            return nil
+        }
+        return password
     }
 
     private var needsInitialization: Bool {
@@ -544,7 +574,8 @@ struct DestinationEditorView: View {
         Task {
             busy = .saving
             defer { busy = nil }
-            if await commitDraft() != nil {
+            if let committed = await commitDraft() {
+                pendingSecretRollbacks.append(committed.secretsRollback)
                 dismiss()
             }
         }
@@ -555,8 +586,8 @@ struct DestinationEditorView: View {
             busy = .testing
             defer { busy = nil }
             probe = nil
-            guard let updated = await commitDraft(), persistSet(updated) else { return }
-            probe = await model.probeDestination(setId: updated.id, destId: draft.id)
+            guard let committed = await commitDraft(), await persistSet(committed) else { return }
+            probe = await model.probeDestination(setId: committed.updated.id, destId: draft.id)
         }
     }
 
@@ -564,8 +595,8 @@ struct DestinationEditorView: View {
         Task {
             busy = .testingRemoteMaintenance
             defer { busy = nil }
-            guard let updated = await commitDraft(), persistSet(updated) else { return }
-            switch await model.testRemoteMaintenance(setId: updated.id, destId: draft.id) {
+            guard let committed = await commitDraft(), await persistSet(committed) else { return }
+            switch await model.testRemoteMaintenance(setId: committed.updated.id, destId: draft.id) {
             case .available(let text):
                 message = .success(text)
             case .failed(let text):
@@ -578,8 +609,8 @@ struct DestinationEditorView: View {
         Task {
             busy = .initializing
             defer { busy = nil }
-            guard let updated = await commitDraft(), persistSet(updated) else { return }
-            switch await model.initializeRepository(setId: updated.id, destId: draft.id) {
+            guard let committed = await commitDraft(), await persistSet(committed) else { return }
+            switch await model.initializeRepository(setId: committed.updated.id, destId: draft.id) {
             case .initialized(let text):
                 message = .success(text)
                 probe = .reachable(text)
@@ -594,8 +625,13 @@ struct DestinationEditorView: View {
     /// not have to read it back through the binding, which is not guaranteed
     /// to reflect the write within the same update), or `nil` with `message`
     /// set when anything refused.
-    private func commitDraft() async -> BackupSet? {
+    private func commitDraft() async -> DestinationCommit? {
         message = nil
+
+        guard isNew || secretsLoaded else {
+            message = .error("Credentials are still being reconciled. Wait for them to load before saving this destination.")
+            return nil
+        }
 
         let label = draft.label.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !label.isEmpty else {
@@ -623,19 +659,30 @@ struct DestinationEditorView: View {
         destination.repoURL = repoURL
         destination.nonSecretEnv = assembledNonSecretEnv
 
+        let secretsRollback: AppModel.DestinationSecretsRollback
         do {
-            try await model.storeDestinationSecrets(
+            secretsRollback = try await model.storeDestinationSecrets(
                 destId: destination.id,
-                password: password.isEmpty ? nil : password,
-                secretEnv: secretEnvToWrite
+                password: passwordToWrite,
+                secretEnv: secretEnvToWrite,
+                ifConfigUnchangedFrom: configFingerprint,
+                editorSessionId: secretEditorSessionID
             )
+            guard model.claimEditorSecretRollback(
+                secretsRollback,
+                sessionId: secretEditorSessionID
+            ) else {
+                message = .error("This backup-set editor closed before its credential change finished. "
+                    + "The previous credentials are being restored.")
+                return nil
+            }
         } catch {
-            message = .error("The keychain items for this destination could not be written "
-                + "(\(error)). Unlock your login keychain, then try again.")
+            message = .error(SetsCopy.destinationSecretFailureMessage(for: error))
             return nil
         }
 
-        var updated = self.set
+        let original = self.set
+        var updated = original
         if let index = updated.destinations.firstIndex(where: { $0.id == destination.id }) {
             updated.destinations[index] = destination
         } else {
@@ -650,17 +697,60 @@ struct DestinationEditorView: View {
 
         draft = destination
         set = updated
-        return updated
+        return DestinationCommit(
+            original: original,
+            updated: updated,
+            secretsRollback: secretsRollback
+        )
     }
 
     /// Persists the whole set so the helper can see this destination. Any
     /// validation failure is the *set's* (no sources yet, for example) and is
     /// reported here with that context.
-    private func persistSet(_ updated: BackupSet) -> Bool {
+    private func persistSet(_ committed: DestinationCommit) async -> Bool {
         do {
-            try model.saveSet(updated)
+            configFingerprint = try model.saveSet(
+                committed.updated,
+                ifUnchangedFrom: configFingerprint
+            )
+            // This write persisted the entire parent draft, including any
+            // earlier destination edits, so every retained keychain change
+            // now has matching config bytes.
+            model.retirePendingSecretRollbackFields(
+                committedBy: pendingSecretRollbacks + [committed.secretsRollback]
+            )
+            pendingSecretRollbacks.removeAll()
             return true
         } catch {
+            if let storeError = error as? ConfigStoreError,
+               storeError.commitMayBeUncertain {
+                // The candidate may be live but unreadable. Do not restore
+                // credentials that candidate might already reference.
+                model.retirePendingSecretRollbackFields(
+                    committedBy: pendingSecretRollbacks + [committed.secretsRollback]
+                )
+                pendingSecretRollbacks.removeAll()
+                message = .error("The backup set's installed revision could not be determined (\(error)). "
+                    + "Its credential changes were left in place. Reload settings and verify this destination "
+                    + "before running a backup.")
+                return false
+            }
+            // commitDraft already merged the destination into the parent
+            // binding. Since no config write committed it, put that binding
+            // back alongside the secrets so a later parent Save cannot pair
+            // the edited URL/environment with restored credentials.
+            set = committed.original
+            do {
+                try await model.restoreDestinationSecrets(
+                    committed.secretsRollback,
+                    editorSessionId: secretEditorSessionID
+                )
+            } catch let rollbackError {
+                message = .error("The backup set could not be saved (\(error)), and the previous keychain "
+                    + "values could not be restored (\(rollbackError)). Re-open this destination and "
+                    + "verify its credentials before running a backup.")
+                return false
+            }
             let mapped = SetsCopy.fieldMessage(for: error)
             message = .error(mapped.message
                 + " Testing and initializing save the backup set first, because the background "
@@ -679,7 +769,19 @@ struct DestinationEditorView: View {
             return
         }
 
-        let secrets = await model.loadDestinationSecrets(destId: draft.id)
+        let secrets: (password: String?, secretEnv: [String: String])
+        do {
+            secrets = try await model.loadDestinationSecrets(
+                destId: draft.id,
+                editorSessionId: secretEditorSessionID
+            )
+        } catch {
+            secretsNote = "Stored credentials could not be safely reconciled."
+            message = .error("Credentials could not be loaded safely (\(error)). Retry after resolving the credential restoration warning.")
+            return
+        }
+        loadedPassword = secrets.password
+        loadedSecretEnv = secrets.secretEnv
         if let existing = secrets.password {
             password = existing
         } else {
@@ -701,6 +803,12 @@ struct DestinationEditorView: View {
     private enum EditorMessage: Equatable {
         case error(String)
         case success(String)
+    }
+
+    private struct DestinationCommit {
+        let original: BackupSet
+        let updated: BackupSet
+        let secretsRollback: AppModel.DestinationSecretsRollback
     }
 
     enum BusyKind: Equatable {

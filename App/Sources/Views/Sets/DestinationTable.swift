@@ -20,6 +20,10 @@ struct DestinationTable: View {
     @EnvironmentObject private var model: AppModel
 
     @Binding var set: BackupSet
+    @Binding var configFingerprint: String
+    @Binding var pendingSecretRollbacks: [AppModel.DestinationSecretsRollback]
+    let secretEditorSessionID: UUID
+    let mutationsDisabled: Bool
     let errorMessage: String?
 
     @State private var sheet: DestinationSheetTarget?
@@ -56,6 +60,7 @@ struct DestinationTable: View {
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         }
+        .disabled(mutationsDisabled)
     }
 
     /// The sheet and the three confirmations hang off this row rather than
@@ -69,6 +74,9 @@ struct DestinationTable: View {
         .sheet(item: $sheet) { target in
             DestinationEditorView(
                 set: $set,
+                configFingerprint: $configFingerprint,
+                pendingSecretRollbacks: $pendingSecretRollbacks,
+                secretEditorSessionID: secretEditorSessionID,
                 initialDestination: destination(for: target),
                 isNew: target.isNew
             )
@@ -238,6 +246,11 @@ struct DestinationTable: View {
     private func remove(_ destination: Destination) {
         pendingRemoval = nil
         removalError = nil
+        guard !mutationsDisabled else {
+            removalError = "The previous credentials are still being restored. "
+                + "Wait for restoration to finish before changing destinations."
+            return
+        }
 
         var updated = set
         updated.destinations.removeAll { $0.id == destination.id }
@@ -248,15 +261,47 @@ struct DestinationTable: View {
         // primary destination, instead of a confusing failure right here.
         let isPersisted = model.config.sets.contains { $0.id == set.id }
         let staysValid = updated.destinations.contains(where: \.isPrimary)
+        var persistedWholeDraft = false
         if isPersisted && staysValid {
             do {
-                try model.saveSet(updated)
+                configFingerprint = try model.saveSet(
+                    updated,
+                    ifUnchangedFrom: configFingerprint
+                )
+                persistedWholeDraft = true
             } catch {
+                if let storeError = error as? ConfigStoreError,
+                   storeError.commitMayBeUncertain {
+                    // The whole draft may be live. Keep its credential edits
+                    // installed and prevent any older/view-owned rollback
+                    // from undoing them until the operator reconciles config.
+                    model.retirePendingSecretRollbackFields(
+                        committedBy: pendingSecretRollbacks
+                    )
+                    pendingSecretRollbacks.removeAll()
+                    removalError = "The destination removal's installed revision could not be determined "
+                        + "(\(error)). Credential changes were left in place. Reload settings and verify "
+                        + "the destination before running a backup."
+                    return
+                }
                 removalError = SetsCopy.fieldMessage(for: error).message
                 return
             }
         }
         set = updated
+        if persistedWholeDraft {
+            // saveSet wrote every destination in the parent draft, not just
+            // the removal, so every retained secret edit is committed too.
+            model.retirePendingSecretRollbackFields(
+                committedBy: pendingSecretRollbacks
+            )
+            pendingSecretRollbacks.removeAll()
+        } else {
+            // The removed destination no longer participates in a future
+            // config save. Its deletion is the intended secret outcome, so
+            // an editor rollback must not recreate those items later.
+            pendingSecretRollbacks.removeAll { $0.destId == destination.id }
+        }
 
         Task { await model.deleteDestinationSecrets(destId: destination.id) }
     }

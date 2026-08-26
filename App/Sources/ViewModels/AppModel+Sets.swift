@@ -13,6 +13,18 @@ import ResticStationCore
 /// before it touches disk; nothing here bypasses it.
 extension AppModel {
 
+    struct DestinationSecretsRollback: Sendable {
+        let transaction: DestinationSecretRollback
+        let sequence: UInt64
+
+        var destId: UUID { transaction.destId }
+
+        init(transaction: DestinationSecretRollback, sequence: UInt64 = 0) {
+            self.transaction = transaction
+            self.sequence = sequence
+        }
+    }
+
     // MARK: - Collaborators
 
     /// The secret store this app writes destination passwords into — the
@@ -33,11 +45,7 @@ extension AppModel {
     /// unrecognised — deliberately a hard error rather than a silent
     /// fallback to the wrong store.
     func makeSecretStore() throws -> any SecretStore {
-        try SecretStoreFactory.make(
-            paths: paths,
-            runner: DefaultProcessRunner(),
-            helperExecutablePath: HelperInvoker.helperURL.path
-        )
+        try secretStoreFactory()
     }
 
     /// `makeSecretStore()` for the call sites that can only degrade (reading
@@ -53,14 +61,18 @@ extension AppModel {
     /// Inserts or replaces `set` and saves. Throws `ConfigError` when the
     /// resulting config is invalid, which the editor maps to an inline field
     /// message.
-    func saveSet(_ set: BackupSet) throws {
+    @discardableResult
+    func saveSet(
+        _ set: BackupSet,
+        ifUnchangedFrom expectedFingerprint: String? = nil
+    ) throws -> String {
         var draft = config
         if let index = draft.sets.firstIndex(where: { $0.id == set.id }) {
             draft.sets[index] = set
         } else {
             draft.sets.append(set)
         }
-        try saveConfig(draft)
+        return try saveConfig(draft, ifUnchangedFrom: expectedFingerprint)
     }
 
     /// Deletes a set's configuration. Per the confirmation copy
@@ -127,32 +139,767 @@ extension AppModel {
     /// items). A `nil` argument means "leave what is there alone": an empty
     /// password field on an existing destination keeps the stored password
     /// rather than clobbering it.
+    @discardableResult
     func storeDestinationSecrets(
         destId: UUID,
         password: String?,
-        secretEnv: [String: String]?
-    ) async throws {
-        let store = try makeSecretStore()
-        if let password, !password.isEmpty {
-            try await store.setPassword(password, destId: destId)
+        secretEnv: [String: String]?,
+        ifConfigUnchangedFrom expectedFingerprint: String,
+        editorSessionId: UUID? = nil
+    ) async throws -> DestinationSecretsRollback {
+        if let configLoadError {
+            throw AppModelError.configUnreadable(configLoadError)
         }
-        if let secretEnv {
-            if secretEnv.isEmpty {
-                try await store.deleteSecretEnv(destId: destId)
-            } else {
-                try await store.setSecretEnv(secretEnv, destId: destId)
+        // A retry that was already running when this editor opened owns the
+        // older side of the credential chain. Let it finish before the newer
+        // mutation can compete for secrets.lock; retries that have not yet
+        // started are held by activeSecretEditorSessions below.
+        if let pendingSecretRollbackTask {
+            await pendingSecretRollbackTask.value
+        }
+        await waitForInFlightSecretRollbackRestorations()
+        let store = try makeSecretStore()
+        let update = DestinationSecretUpdate(
+            destId: destId,
+            password: password?.isEmpty == false ? password : nil,
+            secretEnv: secretEnv
+        )
+        let mutationIntentId: UUID?
+        if let editorSessionId, update.password != nil || update.secretEnv != nil {
+            mutationIntentId = registerSecretEditorMutation(
+                update,
+                sessionId: editorSessionId
+            )
+        } else {
+            mutationIntentId = nil
+        }
+        defer {
+            if let editorSessionId, let mutationIntentId {
+                unregisterSecretEditorMutation(mutationIntentId, sessionId: editorSessionId)
             }
+        }
+        var rollback: DestinationSecretsRollback?
+        do {
+            let snapshot = try await configStore.withUnchangedRevision(from: expectedFingerprint) {
+                let transaction = try await store.updateDestinationSecrets(update)
+                nextSecretRollbackSequence &+= 1
+                let snapshot = DestinationSecretsRollback(
+                    transaction: transaction,
+                    sequence: nextSecretRollbackSequence
+                )
+                rollback = snapshot
+                return snapshot
+            }
+            if let editorSessionId {
+                parkEditorSecretRollback(snapshot, sessionId: editorSessionId)
+            }
+            return snapshot
+        } catch {
+            if let rollback {
+                var remaining = [rollback]
+                do {
+                    _ = try await restoreDestinationSecrets(
+                        [rollback],
+                        using: store,
+                        onProgress: { remaining = $0 }
+                    )
+                } catch let rollbackError {
+                    retainPendingSecretRollbacks(remaining)
+                    throw AppModelError.secretRollbackFailed(
+                        original: "\(error)", rollback: "\(rollbackError)"
+                    )
+                }
+            }
+            if let storeError = error as? ConfigStoreError,
+               storeError.isRevisionConflict {
+                noteConfigChangedOnDisk()
+            }
+            throw error
+        }
+    }
+
+    func beginSecretEditorSession(_ sessionId: UUID) {
+        activeSecretEditorSessions.insert(sessionId)
+    }
+
+    func endSecretEditorSession(
+        _ sessionId: UUID,
+        claimedRollbacks: [DestinationSecretsRollback] = []
+    ) {
+        activeSecretEditorSessions.remove(sessionId)
+        claimedSecretEditorRollbacks.removeValue(forKey: sessionId)
+        // Keep claimed and still-parked mutations together for ownership;
+        // each token's global sequence, not this array's insertion order,
+        // determines the eventual rollback order.
+        let stranded = unclaimedSecretEditorRollbacks.removeValue(forKey: sessionId) ?? []
+        retainPendingSecretRollbacks(claimedRollbacks + stranded)
+        // A queued abandoned-session rollback is deliberately paused while
+        // any editor can still produce a newer rollback. Resume it once the
+        // last editor has synchronously transferred its ownership here.
+        retryPendingSecretRollbacks()
+    }
+
+    /// Claims the rollback parked before an async keychain write returned to
+    /// SwiftUI. Main-actor serialization makes claim + local append atomic
+    /// with respect to the parent editor's `onDisappear`.
+    func claimEditorSecretRollback(
+        _ rollback: DestinationSecretsRollback,
+        sessionId: UUID
+    ) -> Bool {
+        guard activeSecretEditorSessions.contains(sessionId),
+              var parked = unclaimedSecretEditorRollbacks[sessionId],
+              let index = parked.firstIndex(where: { $0.sequence == rollback.sequence }) else {
+            return false
+        }
+        parked.remove(at: index)
+        if parked.isEmpty {
+            unclaimedSecretEditorRollbacks.removeValue(forKey: sessionId)
+        } else {
+            unclaimedSecretEditorRollbacks[sessionId] = parked
+        }
+        claimedSecretEditorRollbacks[sessionId, default: []].append(rollback)
+        return true
+    }
+
+    private func parkEditorSecretRollback(
+        _ rollback: DestinationSecretsRollback,
+        sessionId: UUID
+    ) {
+        guard activeSecretEditorSessions.contains(sessionId) else {
+            retainPendingSecretRollbacks([rollback])
+            return
+        }
+        unclaimedSecretEditorRollbacks[sessionId, default: []].append(rollback)
+    }
+
+    /// Restores the exact fields the editor changed when the subsequent
+    /// config CAS refuses. Fields the editor left alone are not touched.
+    @discardableResult
+    func restoreDestinationSecrets(
+        _ rollback: DestinationSecretsRollback,
+        editorSessionId: UUID? = nil
+    ) async throws -> Bool {
+        var remaining = [rollback]
+        do {
+            return try await restoreDestinationSecrets(
+                [rollback],
+                editorSessionId: editorSessionId,
+                onProgress: { remaining = $0 }
+            )
+        } catch {
+            if let editorSessionId {
+                removeClaimedSecretRollbacks(
+                    withSequences: Set(remaining.map(\.sequence)),
+                    sessionId: editorSessionId
+                )
+            }
+            retainPendingSecretRollbacks(remaining)
+            throw error
+        }
+    }
+
+    /// Rolls a sequence of edits back in reverse order. Editing the same
+    /// destination twice produces a chain of snapshots, so restoring in
+    /// insertion order would stop at the value installed by the first edit
+    /// instead of returning to the value that preceded the editor session.
+    @discardableResult
+    func restoreDestinationSecrets(
+        _ rollbacks: [DestinationSecretsRollback],
+        editorSessionId: UUID? = nil,
+        onProgress: (([DestinationSecretsRollback]) -> Void)? = nil
+    ) async throws -> Bool {
+        if let editorSessionId {
+            if let pendingSecretRollbackTask {
+                await pendingSecretRollbackTask.value
+            }
+            // Do not consume an intermediate queued link while an even newer
+            // live editor still owns the installed value. That editor must
+            // restore first or the queued chain would be misclassified as an
+            // external conflict and discarded.
+            if hasNewerLiveSecretRollback(than: rollbacks, excluding: editorSessionId) {
+                throw AppModelError.newerSecretEditorMutation
+            }
+            try await drainQueuedSecretRollbacks(
+                newerThan: rollbacks,
+                excluding: editorSessionId
+            )
+            if hasNewerLiveSecretRollback(than: rollbacks, excluding: editorSessionId) {
+                throw AppModelError.newerSecretEditorMutation
+            }
+        }
+        let store = try makeSecretStore()
+        return try await restoreDestinationSecrets(
+            rollbacks,
+            using: store,
+            onProgress: { progress in
+                if let editorSessionId {
+                    self.replaceClaimedSecretRollbacks(
+                        rollbacks,
+                        with: progress,
+                        sessionId: editorSessionId
+                    )
+                }
+                onProgress?(progress)
+            }
+        )
+    }
+
+    private func hasNewerLiveSecretRollback(
+        than rollbacks: [DestinationSecretsRollback],
+        excluding sessionId: UUID? = nil
+    ) -> Bool {
+        let requested = rollbacks.compactMap(rollbackWithUncommittedFields)
+        guard !requested.isEmpty else { return false }
+        let inFlight = inFlightSecretEditorMutations
+            .filter { sessionId == nil || $0.key != sessionId }
+            .flatMap { $0.value.values }
+        if requested.contains(where: { older in
+            inFlight.contains { mutation in
+                guard mutation.destId == older.destId else { return false }
+                return (mutation.changesPassword && older.transaction.password != nil)
+                    || (mutation.changesSecretEnv && older.transaction.secretEnv != nil)
+            }
+        }) {
+            return true
+        }
+        var otherSessions = activeSecretEditorSessions
+        if let sessionId {
+            otherSessions.remove(sessionId)
+        }
+        let live = otherSessions.flatMap { otherSession in
+            (claimedSecretEditorRollbacks[otherSession] ?? [])
+                + (unclaimedSecretEditorRollbacks[otherSession] ?? [])
+        }.compactMap(rollbackWithUncommittedFields)
+            + inFlightSecretRollbackRestorations.values.compactMap(rollbackWithUncommittedFields)
+
+        return requested.contains { older in
+            live.contains { newer in
+                guard newer.destId == older.destId,
+                      newer.sequence > older.sequence else { return false }
+                let overlapsPassword = older.transaction.password != nil
+                    && newer.transaction.password != nil
+                let overlapsSecretEnv = older.transaction.secretEnv != nil
+                    && newer.transaction.secretEnv != nil
+                return overlapsPassword || overlapsSecretEnv
+            }
+        }
+    }
+
+    private func registerSecretEditorMutation(
+        _ update: DestinationSecretUpdate,
+        sessionId: UUID
+    ) -> UUID {
+        let mutationId = UUID()
+        inFlightSecretEditorMutations[sessionId, default: [:]][mutationId] =
+            SecretEditorMutationIntent(
+                destId: update.destId,
+                changesPassword: update.password != nil,
+                changesSecretEnv: update.secretEnv != nil
+            )
+        return mutationId
+    }
+
+    private func unregisterSecretEditorMutation(_ mutationId: UUID, sessionId: UUID) {
+        guard var mutations = inFlightSecretEditorMutations[sessionId] else { return }
+        mutations.removeValue(forKey: mutationId)
+        if mutations.isEmpty {
+            inFlightSecretEditorMutations.removeValue(forKey: sessionId)
+        } else {
+            inFlightSecretEditorMutations[sessionId] = mutations
+        }
+        // The editor can disappear while its backend write is suspended. In
+        // that case endSecretEditorSession deliberately leaves older retries
+        // paused until this final pre-transaction ownership marker is gone.
+        retryPendingSecretRollbacks()
+    }
+
+    /// An explicit Revert remains usable when a newer editor has already
+    /// closed. Drain the causally newer queued transitions first, one global
+    /// sequence at a time, then let the caller restore its older view-owned
+    /// chain. The current editor stays active so unrelated background retry
+    /// work remains paused.
+    private func drainQueuedSecretRollbacks(
+        newerThan requestedRollbacks: [DestinationSecretsRollback],
+        excluding sessionId: UUID
+    ) async throws {
+        let requested = requestedRollbacks.compactMap(rollbackWithUncommittedFields)
+        guard !requested.isEmpty else { return }
+
+        while let queued = queuedSecretRollbackDependencies(newerThan: requested)
+            .max(by: { $0.sequence < $1.sequence }) {
+            // A queued transaction can span more fields than the older chain
+            // that selected it. Do not consume any field while a newer live
+            // editor owns another field in that same transaction.
+            if hasNewerLiveSecretRollback(than: [queued], excluding: sessionId) {
+                throw AppModelError.newerSecretEditorMutation
+            }
+            try await restoreDequeuedSecretRollback(queued)
+        }
+        if pendingSecretRollbackBatches.isEmpty {
+            pendingSecretRollbackError = nil
+        }
+    }
+
+    /// An editor must not pre-fill credentials from an abandoned edit. Drain
+    /// queued transitions for this destination newest-first before reading;
+    /// unlike the background retry this targeted reconciliation is safe while
+    /// an unrelated editor session is alive. A newer live owner still blocks
+    /// the drain so its value is never mistaken for abandoned state.
+    private func drainQueuedSecretRollbacks(forDestination destId: UUID) async throws {
+        while let queued = pendingSecretRollbackBatches
+            .flatMap({ $0 })
+            .compactMap(rollbackWithUncommittedFields)
+            .filter({ $0.destId == destId })
+            .max(by: { $0.sequence < $1.sequence }) {
+            if hasNewerLiveSecretRollback(than: [queued]) {
+                throw AppModelError.newerSecretEditorMutation
+            }
+            try await restoreDequeuedSecretRollback(queued)
+        }
+        if pendingSecretRollbackBatches.isEmpty {
+            pendingSecretRollbackError = nil
+        }
+    }
+
+    /// Computes the transitive queued chain. A password-only request can
+    /// reach a mixed password/environment token, which in turn depends on a
+    /// still-newer environment-only token; every such successor must unwind
+    /// first even though it does not overlap the original request directly.
+    private func queuedSecretRollbackDependencies(
+        newerThan requested: [DestinationSecretsRollback]
+    ) -> [DestinationSecretsRollback] {
+        let queued = pendingSecretRollbackBatches
+            .flatMap({ $0 })
+            .compactMap(rollbackWithUncommittedFields)
+        var closure = requested
+        var included = Set(requested.map(\.sequence))
+        var addedDependency = true
+        while addedDependency {
+            addedDependency = false
+            for candidate in queued where !included.contains(candidate.sequence) {
+                let followsChain = closure.contains { older in
+                    candidate.destId == older.destId
+                        && candidate.sequence > older.sequence
+                        && secretRollbackFieldsOverlap(candidate, older)
+                }
+                if followsChain {
+                    closure.append(candidate)
+                    included.insert(candidate.sequence)
+                    addedDependency = true
+                }
+            }
+        }
+        return queued.filter { included.contains($0.sequence) }
+    }
+
+    private func secretRollbackFieldsOverlap(
+        _ lhs: DestinationSecretsRollback,
+        _ rhs: DestinationSecretsRollback
+    ) -> Bool {
+        (lhs.transaction.password != nil && rhs.transaction.password != nil)
+            || (lhs.transaction.secretEnv != nil && rhs.transaction.secretEnv != nil)
+    }
+
+    /// Transfers one queued token into an explicit in-flight registry before
+    /// removing it from the pending queue, keeping its ownership visible over
+    /// the secrets.lock await. On failure the latest field checkpoint returns
+    /// to the pending queue before that in-flight marker is released.
+    private func restoreDequeuedSecretRollback(
+        _ rollback: DestinationSecretsRollback
+    ) async throws {
+        inFlightSecretRollbackRestorations[rollback.sequence] = rollback
+        removePendingSecretRollback(sequence: rollback.sequence)
+        var remaining = [rollback]
+        do {
+            _ = try await restoreDestinationSecrets(
+                [rollback],
+                onProgress: { progress in
+                    remaining = progress
+                    if let checkpoint = progress.first {
+                        self.inFlightSecretRollbackRestorations[rollback.sequence] = checkpoint
+                    }
+                }
+            )
+            finishDequeuedSecretRollback(sequence: rollback.sequence, resumeRetries: true)
+        } catch {
+            if !remaining.isEmpty {
+                pendingSecretRollbackBatches.append(remaining)
+            }
+            pendingSecretRollbackError =
+                "Some destination credentials could not be restored (\(error)). "
+                + "Backups may use credentials from an abandoned edit until restoration succeeds."
+            finishDequeuedSecretRollback(sequence: rollback.sequence, resumeRetries: false)
+            throw error
+        }
+    }
+
+    private func waitForInFlightSecretRollbackRestorations() async {
+        guard !inFlightSecretRollbackRestorations.isEmpty else { return }
+        await withCheckedContinuation { continuation in
+            inFlightSecretRollbackWaiters.append(continuation)
+        }
+    }
+
+    private func finishDequeuedSecretRollback(sequence: UInt64, resumeRetries: Bool) {
+        inFlightSecretRollbackRestorations.removeValue(forKey: sequence)
+        guard inFlightSecretRollbackRestorations.isEmpty else { return }
+        let waiters = inFlightSecretRollbackWaiters
+        inFlightSecretRollbackWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+        if resumeRetries {
+            retryPendingSecretRollbacks()
+        }
+    }
+
+    private func removePendingSecretRollback(sequence: UInt64) {
+        pendingSecretRollbackBatches = pendingSecretRollbackBatches.compactMap { batch in
+            let remaining = batch.filter { $0.sequence != sequence }
+            return remaining.isEmpty ? nil : remaining
+        }
+    }
+
+    private func replaceClaimedSecretRollbacks(
+        _ originals: [DestinationSecretsRollback],
+        with progress: [DestinationSecretsRollback],
+        sessionId: UUID
+    ) {
+        let sequences = Set(originals.map(\.sequence))
+        removeClaimedSecretRollbacks(withSequences: sequences, sessionId: sessionId)
+        guard !progress.isEmpty else { return }
+        claimedSecretEditorRollbacks[sessionId, default: []].append(contentsOf: progress)
+    }
+
+    private func removeClaimedSecretRollbacks(
+        withSequences sequences: Set<UInt64>,
+        sessionId: UUID
+    ) {
+        guard var claimed = claimedSecretEditorRollbacks[sessionId] else { return }
+        claimed.removeAll { sequences.contains($0.sequence) }
+        if claimed.isEmpty {
+            claimedSecretEditorRollbacks.removeValue(forKey: sessionId)
+        } else {
+            claimedSecretEditorRollbacks[sessionId] = claimed
+        }
+    }
+
+    /// Restores one field at a time and publishes the remaining tokens after
+    /// every completed field. Keychain operations cannot atomically update
+    /// two separate items; this checkpoint makes a retry continue with only
+    /// the field that failed instead of misclassifying the already-restored
+    /// field as an external conflict and abandoning its older rollback chain.
+    private func restoreDestinationSecrets(
+        _ rollbacks: [DestinationSecretsRollback],
+        using store: any SecretStore,
+        onProgress: (([DestinationSecretsRollback]) -> Void)? = nil
+    ) async throws -> Bool {
+        let eligibleRollbacks = rollbacks.compactMap(rollbackWithUncommittedFields)
+        onProgress?(eligibleRollbacks)
+        var remaining = eligibleRollbacks.map(\.transaction)
+        let sequences = eligibleRollbacks.map(\.sequence)
+        var passwordConflicts: Set<UUID> = []
+        var secretEnvConflicts: Set<UUID> = []
+        var allRestored = true
+
+        func publishProgress() {
+            onProgress?(remaining.enumerated().compactMap { index, transaction in
+                guard transaction.password != nil || transaction.secretEnv != nil else { return nil }
+                return DestinationSecretsRollback(
+                    transaction: transaction,
+                    sequence: sequences[index]
+                )
+            })
+        }
+
+        for index in remaining.indices.reversed() {
+            let destId = remaining[index].destId
+
+            if let password = remaining[index].password {
+                if passwordConflicts.contains(destId) {
+                    remaining[index] = DestinationSecretRollback(
+                        destId: destId,
+                        password: nil,
+                        secretEnv: remaining[index].secretEnv,
+                        previousSecretEnvRaw: remaining[index].previousSecretEnvRaw,
+                        secretEnvGeneration: remaining[index].secretEnvGeneration
+                    )
+                    publishProgress()
+                } else {
+                    let result = try await store.restoreDestinationSecretsIfCurrent(
+                        DestinationSecretRollback(
+                            destId: destId,
+                            password: password,
+                            secretEnv: nil,
+                            passwordGeneration: remaining[index].passwordGeneration
+                        )
+                    )
+                    remaining[index] = DestinationSecretRollback(
+                        destId: destId,
+                        password: nil,
+                        secretEnv: remaining[index].secretEnv,
+                        previousSecretEnvRaw: remaining[index].previousSecretEnvRaw,
+                        secretEnvGeneration: remaining[index].secretEnvGeneration
+                    )
+                    if result.passwordRestored == false {
+                        passwordConflicts.insert(destId)
+                        allRestored = false
+                    }
+                    publishProgress()
+                }
+            }
+
+            if let secretEnv = remaining[index].secretEnv {
+                if secretEnvConflicts.contains(destId) {
+                    remaining[index] = DestinationSecretRollback(
+                        destId: destId,
+                        password: remaining[index].password,
+                        secretEnv: nil,
+                        previousSecretEnvRaw: nil,
+                        passwordGeneration: remaining[index].passwordGeneration
+                    )
+                    publishProgress()
+                } else {
+                    let result = try await store.restoreDestinationSecretsIfCurrent(
+                        DestinationSecretRollback(
+                            destId: destId,
+                            password: nil,
+                            secretEnv: secretEnv,
+                            previousSecretEnvRaw: remaining[index].previousSecretEnvRaw,
+                            secretEnvGeneration: remaining[index].secretEnvGeneration
+                        )
+                    )
+                    remaining[index] = DestinationSecretRollback(
+                        destId: destId,
+                        password: remaining[index].password,
+                        secretEnv: nil,
+                        previousSecretEnvRaw: nil,
+                        passwordGeneration: remaining[index].passwordGeneration
+                    )
+                    if result.secretEnvRestored == false {
+                        secretEnvConflicts.insert(destId)
+                        allRestored = false
+                    }
+                    publishProgress()
+                }
+            }
+        }
+        return allRestored
+    }
+
+    /// Transfers rollback ownership out of a disappearing view before its
+    /// `@State` is destroyed. No secret is written to disk: the tokens stay
+    /// in the process that already held them and a global banner offers an
+    /// explicit retry if the backend remains unavailable.
+    func retainPendingSecretRollbacks(_ rollbacks: [DestinationSecretsRollback]) {
+        guard !rollbacks.isEmpty else { return }
+        pendingSecretRollbackBatches.append(rollbacks)
+        retryPendingSecretRollbacks()
+    }
+
+    /// A successful config commit — or an uncertain commit whose credentials
+    /// are deliberately left installed for reconciliation — establishes a
+    /// per-field sequence cutoff. That cutoff also protects rollback tokens
+    /// still owned by other live views: if they are later reverted or queued
+    /// during teardown, restoreDestinationSecrets filters them before I/O.
+    func retirePendingSecretRollbackFields(
+        committedBy rollbacks: [DestinationSecretsRollback]
+    ) {
+        for rollback in rollbacks {
+            if rollback.transaction.password != nil {
+                committedPasswordRollbackSequence[rollback.destId] = max(
+                    committedPasswordRollbackSequence[rollback.destId] ?? 0,
+                    rollback.sequence
+                )
+            }
+            if rollback.transaction.secretEnv != nil {
+                committedSecretEnvRollbackSequence[rollback.destId] = max(
+                    committedSecretEnvRollbackSequence[rollback.destId] ?? 0,
+                    rollback.sequence
+                )
+            }
+        }
+
+        pendingSecretRollbackBatches = pendingSecretRollbackBatches.compactMap { batch in
+            let remaining = batch.compactMap(rollbackWithUncommittedFields)
+            return remaining.isEmpty ? nil : remaining
+        }
+        if pendingSecretRollbackBatches.isEmpty {
+            pendingSecretRollbackError = nil
+        }
+    }
+
+    private func rollbackWithUncommittedFields(
+        _ rollback: DestinationSecretsRollback
+    ) -> DestinationSecretsRollback? {
+        let transaction = rollback.transaction
+        let passwordCommitted = transaction.password != nil
+            && committedPasswordRollbackSequence[rollback.destId].map {
+                rollback.sequence <= $0
+            } == true
+        let secretEnvCommitted = transaction.secretEnv != nil
+            && committedSecretEnvRollbackSequence[rollback.destId].map {
+                rollback.sequence <= $0
+            } == true
+        let password = passwordCommitted ? nil : transaction.password
+        let secretEnv = secretEnvCommitted ? nil : transaction.secretEnv
+        guard password != nil || secretEnv != nil else { return nil }
+        return DestinationSecretsRollback(
+            transaction: DestinationSecretRollback(
+                destId: transaction.destId,
+                password: password,
+                secretEnv: secretEnv,
+                previousSecretEnvRaw: secretEnv == nil ? nil : transaction.previousSecretEnvRaw,
+                passwordGeneration: password == nil ? nil : transaction.passwordGeneration,
+                secretEnvGeneration: secretEnv == nil ? nil : transaction.secretEnvGeneration
+            ),
+            sequence: rollback.sequence
+        )
+    }
+
+    func retryPendingSecretRollbacks() {
+        guard pendingSecretRollbackTask == nil else { return }
+        // Do not unwind an older abandoned edit while a live editor may be
+        // between changing the keychain and parking/claiming its rollback.
+        // Once the editor ends, endSecretEditorSession() resumes newest-first
+        // processing with every transaction registered in one place.
+        guard activeSecretEditorSessions.isEmpty,
+              inFlightSecretEditorMutations.isEmpty,
+              inFlightSecretRollbackRestorations.isEmpty else { return }
+        pendingSecretRollbackError = nil
+        pendingSecretRollbackTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.pendingSecretRollbackTask = nil }
+            // Editor teardown order is unrelated to mutation order. Pick one
+            // globally newest transaction at a time so interleaved sessions
+            // unwind B -> A -> old even when their windows close in any order.
+            while !self.pendingSecretRollbackBatches.isEmpty {
+                guard let location = self.pendingSecretRollbackBatches.indices
+                    .flatMap({ batchIndex in
+                        self.pendingSecretRollbackBatches[batchIndex].indices.map { rollbackIndex in
+                            (batchIndex, rollbackIndex)
+                        }
+                    })
+                    .max(by: { lhs, rhs in
+                        self.pendingSecretRollbackBatches[lhs.0][lhs.1].sequence
+                            < self.pendingSecretRollbackBatches[rhs.0][rhs.1].sequence
+                    }) else { break }
+                let (batchIndex, rollbackIndex) = location
+                guard let rollback = self.rollbackWithUncommittedFields(
+                    self.pendingSecretRollbackBatches[batchIndex][rollbackIndex]
+                ) else {
+                    self.pendingSecretRollbackBatches[batchIndex].remove(at: rollbackIndex)
+                    if self.pendingSecretRollbackBatches[batchIndex].isEmpty {
+                        self.pendingSecretRollbackBatches.remove(at: batchIndex)
+                    }
+                    continue
+                }
+                self.pendingSecretRollbackBatches[batchIndex][rollbackIndex] = rollback
+                var remaining = [rollback]
+                do {
+                    _ = try await self.restoreDestinationSecrets(
+                        [rollback],
+                        onProgress: { progress in
+                            remaining = progress
+                            guard batchIndex < self.pendingSecretRollbackBatches.count,
+                                  rollbackIndex < self.pendingSecretRollbackBatches[batchIndex].count else {
+                                return
+                            }
+                            if let checkpoint = progress.first {
+                                self.pendingSecretRollbackBatches[batchIndex][rollbackIndex] = checkpoint
+                            } else {
+                                self.pendingSecretRollbackBatches[batchIndex].remove(at: rollbackIndex)
+                            }
+                        }
+                    )
+                    if batchIndex < self.pendingSecretRollbackBatches.count,
+                       self.pendingSecretRollbackBatches[batchIndex].isEmpty {
+                        self.pendingSecretRollbackBatches.remove(at: batchIndex)
+                    }
+                } catch {
+                    if batchIndex < self.pendingSecretRollbackBatches.count,
+                       rollbackIndex < self.pendingSecretRollbackBatches[batchIndex].count,
+                       let checkpoint = remaining.first {
+                        self.pendingSecretRollbackBatches[batchIndex][rollbackIndex] = checkpoint
+                    }
+                    self.pendingSecretRollbackError =
+                        "Some destination credentials could not be restored (\(error)). "
+                        + "Backups may use credentials from an abandoned edit until restoration succeeds."
+                    return
+                }
+            }
+            self.pendingSecretRollbackError = nil
         }
     }
 
     /// Reads back what the destination editor needs to pre-fill. A missing
     /// password is not an error here (a destination can exist before its
     /// password was ever stored) — the caller shows "leave blank to keep".
-    func loadDestinationSecrets(destId: UUID) async -> (password: String?, secretEnv: [String: String]) {
+    func loadDestinationSecrets(
+        destId: UUID,
+        editorSessionId: UUID? = nil
+    ) async throws -> (password: String?, secretEnv: [String: String]) {
+        // A rollback which was already in flight when this editor opened may
+        // still own the value currently in the backend. Prefill only after it
+        // settles, matching the serialization used by credential writes.
+        if let pendingSecretRollbackTask {
+            await pendingSecretRollbackTask.value
+        }
+        await waitForInFlightSecretRollbackRestorations()
+        guard !hasOtherLiveSecretEditorOwnership(
+            destId: destId,
+            excluding: editorSessionId
+        ) else {
+            throw AppModelError.newerSecretEditorMutation
+        }
+        // A closed editor can leave a batch queued rather than running while
+        // another set editor is open. Reconcile this destination explicitly
+        // so its abandoned value is never copied into the surviving draft.
+        try await drainQueuedSecretRollbacks(forDestination: destId)
+        guard !hasOtherLiveSecretEditorOwnership(
+            destId: destId,
+            excluding: editorSessionId
+        ) else {
+            throw AppModelError.newerSecretEditorMutation
+        }
         guard let store = self.secrets else { return (nil, [:]) }
         let password = try? await store.password(destId: destId)
         let env = (try? await store.secretEnv(destId: destId)) ?? [:]
+        // Reads leave the main actor. If another editor acquired ownership or
+        // closed and queued its rollback during either backend await, these
+        // values are not a stable baseline and must not enable Save.
+        let queuedDuringRead = pendingSecretRollbackBatches
+            .flatMap({ $0 })
+            .compactMap(rollbackWithUncommittedFields)
+            .contains { $0.destId == destId }
+        guard !queuedDuringRead,
+              !hasOtherLiveSecretEditorOwnership(
+                destId: destId,
+                excluding: editorSessionId
+              ) else {
+            throw AppModelError.newerSecretEditorMutation
+        }
         return (password, env)
+    }
+
+    private func hasOtherLiveSecretEditorOwnership(
+        destId: UUID,
+        excluding sessionId: UUID?
+    ) -> Bool {
+        let hasInFlightMutation = inFlightSecretEditorMutations.contains { session, mutations in
+            (sessionId == nil || session != sessionId)
+                && mutations.values.contains { $0.destId == destId }
+        }
+        if hasInFlightMutation { return true }
+
+        var otherSessions = activeSecretEditorSessions
+        if let sessionId {
+            otherSessions.remove(sessionId)
+        }
+        return otherSessions.contains { session in
+            ((claimedSecretEditorRollbacks[session] ?? [])
+                + (unclaimedSecretEditorRollbacks[session] ?? []))
+                .compactMap(rollbackWithUncommittedFields)
+                .contains { $0.destId == destId }
+        }
     }
 
     /// Both stored secrets for a destination, as promised by the remove

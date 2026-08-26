@@ -56,12 +56,15 @@ public struct FileSecretStore: SecretStore {
 
     /// Bumped only if the on-disk shape changes. A file whose `version` is
     /// newer than this is refused rather than silently misread.
-    static let currentVersion = 1
+    // Version 2 adds persistent per-field mutation generations. Older
+    // helpers must reject it instead of accepting version 1 and silently
+    // stripping those rollback identities on their next write.
+    static let currentVersion = 2
 
     /// How long a writer waits for `locks/secrets.lock` before giving up.
     /// Generous: the critical section is a small read-modify-write, and the
     /// only realistic contender is another `secret` invocation.
-    static let lockTimeout: TimeInterval = 10
+    static let lockTimeout: Duration = .seconds(10)
     private static let lockPollNanoseconds: UInt64 = 25_000_000
 
     public let backend = SecretBackend.file
@@ -142,7 +145,9 @@ public struct FileSecretStore: SecretStore {
 
     public func setPassword(_ password: String, destId: UUID) async throws {
         try await mutate { document in
-            document.secrets[SecretAccount.password(destId)] = password
+            let account = SecretAccount.password(destId)
+            document.generations[account] = UUID().uuidString
+            document.secrets[account] = password
         }
     }
 
@@ -155,7 +160,9 @@ public struct FileSecretStore: SecretStore {
 
     public func deletePassword(destId: UUID) async throws {
         try await mutate { document in
-            document.secrets.removeValue(forKey: SecretAccount.password(destId))
+            let account = SecretAccount.password(destId)
+            document.generations[account] = UUID().uuidString
+            document.secrets.removeValue(forKey: account)
         }
     }
 
@@ -164,7 +171,9 @@ public struct FileSecretStore: SecretStore {
     public func setSecretEnv(_ env: [String: String], destId: UUID) async throws {
         let json = try SecretEnvBlob.encode(env)
         try await mutate { document in
-            document.secrets[SecretAccount.secretEnv(destId)] = json
+            let account = SecretAccount.secretEnv(destId)
+            document.generations[account] = UUID().uuidString
+            document.secrets[account] = json
         }
     }
 
@@ -179,7 +188,110 @@ public struct FileSecretStore: SecretStore {
 
     public func deleteSecretEnv(destId: UUID) async throws {
         try await mutate { document in
-            document.secrets.removeValue(forKey: SecretAccount.secretEnv(destId))
+            let account = SecretAccount.secretEnv(destId)
+            document.generations[account] = UUID().uuidString
+            document.secrets.removeValue(forKey: account)
+        }
+    }
+
+    public func updateDestinationSecrets(
+        _ update: DestinationSecretUpdate
+    ) async throws -> DestinationSecretRollback {
+        try await withWriteLock {
+            var document = try load()
+            let passwordAccount = SecretAccount.password(update.destId)
+            let envAccount = SecretAccount.secretEnv(update.destId)
+            let previousPassword = update.password == nil ? nil : document.secrets[passwordAccount]
+            let previousEnvRaw = update.secretEnv == nil ? nil : document.secrets[envAccount]
+            let previousPasswordGeneration = update.password == nil ? nil : document.generations[passwordAccount]
+            let previousEnvGeneration = update.secretEnv == nil ? nil : document.generations[envAccount]
+            let installedPasswordGeneration = update.password.map { _ in UUID().uuidString }
+            let installedEnvGeneration = update.secretEnv.map { _ in UUID().uuidString }
+            let previousEnv = update.secretEnv == nil
+                ? nil
+                : previousEnvRaw.flatMap { try? SecretEnvBlob.decode($0) } ?? [:]
+            let rollback = DestinationSecretRollback(
+                destId: update.destId,
+                password: update.password.map {
+                    SecretRollbackChange(installed: Optional($0), previous: previousPassword)
+                },
+                secretEnv: update.secretEnv.map {
+                    SecretRollbackChange(installed: $0, previous: previousEnv ?? [:])
+                },
+                previousSecretEnvRaw: previousEnvRaw,
+                passwordGeneration: installedPasswordGeneration.map {
+                    SecretRollbackGeneration(installed: $0, previous: previousPasswordGeneration)
+                },
+                secretEnvGeneration: installedEnvGeneration.map {
+                    SecretRollbackGeneration(installed: $0, previous: previousEnvGeneration)
+                }
+            )
+            guard update.password != nil || update.secretEnv != nil else { return rollback }
+            if let password = update.password {
+                document.generations[passwordAccount] = installedPasswordGeneration
+                document.secrets[passwordAccount] = password
+            }
+            if let env = update.secretEnv {
+                document.generations[envAccount] = installedEnvGeneration
+                document.secrets[envAccount] = env.isEmpty ? nil : try SecretEnvBlob.encode(env)
+            }
+            document.version = Self.currentVersion
+            try store(document)
+            return rollback
+        }
+    }
+
+    public func restoreDestinationSecretsIfCurrent(
+        _ rollback: DestinationSecretRollback
+    ) async throws -> DestinationSecretRestoreResult {
+        try await withWriteLock {
+            var document = try load()
+            let passwordAccount = SecretAccount.password(rollback.destId)
+            let envAccount = SecretAccount.secretEnv(rollback.destId)
+            let passwordRestored = rollback.password.map { change in
+                if let generation = rollback.passwordGeneration {
+                    return document.generations[passwordAccount] == generation.installed
+                }
+                return document.secrets[passwordAccount] == change.installed
+            }
+            let secretEnvRestored: Bool?
+            if let change = rollback.secretEnv {
+                if let generation = rollback.secretEnvGeneration {
+                    secretEnvRestored = document.generations[envAccount] == generation.installed
+                } else if let currentRaw = document.secrets[envAccount] {
+                    secretEnvRestored = (try? SecretEnvBlob.decode(currentRaw)) == change.installed
+                } else {
+                    secretEnvRestored = change.installed.isEmpty
+                }
+            } else {
+                secretEnvRestored = nil
+            }
+            if passwordRestored == true, let change = rollback.password {
+                document.secrets[passwordAccount] = change.previous
+                if let generation = rollback.passwordGeneration {
+                    document.generations[passwordAccount] = generation.previous
+                }
+            }
+            if secretEnvRestored == true, let change = rollback.secretEnv {
+                if let previousRaw = rollback.previousSecretEnvRaw {
+                    document.secrets[envAccount] = previousRaw
+                } else {
+                    document.secrets[envAccount] = change.previous.isEmpty
+                        ? nil
+                        : try SecretEnvBlob.encode(change.previous)
+                }
+                if let generation = rollback.secretEnvGeneration {
+                    document.generations[envAccount] = generation.previous
+                }
+            }
+            if passwordRestored == true || secretEnvRestored == true {
+                document.version = Self.currentVersion
+                try store(document)
+            }
+            return DestinationSecretRestoreResult(
+                passwordRestored: passwordRestored,
+                secretEnvRestored: secretEnvRestored
+            )
         }
     }
 
@@ -282,17 +394,35 @@ public struct FileSecretStore: SecretStore {
 
     // MARK: - Document
 
-    /// The on-disk shape:
-    /// `{"version":1,"secrets":{"<uuid>":"…","<uuid>-env":"{…}"}}` —
-    /// deliberately mirroring the keychain account naming so the two
-    /// backends stay structurally comparable.
+    /// The on-disk shape contains `secrets` plus a parallel, non-secret
+    /// `generations` dictionary. Both use the same `<uuid>` / `<uuid>-env`
+    /// keys as the keychain backend; missing generations decode as empty for
+    /// compatibility with files written before conditional rollback needed
+    /// persistent cross-process mutation identity.
     struct Document: Codable, Equatable {
         var version: Int
         var secrets: [String: String]
+        var generations: [String: String]
 
-        init(version: Int = FileSecretStore.currentVersion, secrets: [String: String] = [:]) {
+        init(
+            version: Int = FileSecretStore.currentVersion,
+            secrets: [String: String] = [:],
+            generations: [String: String] = [:]
+        ) {
             self.version = version
             self.secrets = secrets
+            self.generations = generations
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case version, secrets, generations
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            version = try container.decode(Int.self, forKey: .version)
+            secrets = try container.decode([String: String].self, forKey: .secrets)
+            generations = try container.decodeIfPresent([String: String].self, forKey: .generations) ?? [:]
         }
     }
 
@@ -393,21 +523,22 @@ public struct FileSecretStore: SecretStore {
         }
     }
 
-    private func withWriteLock(_ body: () throws -> Void) async throws {
+    private func withWriteLock<T>(_ body: () throws -> T) async throws -> T {
         // `store` repeats the check inside the lock so it remains safe if it
         // is ever called from another write path. Keep this pre-lock check to
         // create the lock directory, but report a degraded mode only once.
         try prepareDirectories(reportWarnings: false)
         let lock = FileLock(path: lockFileURL, trustedRoot: paths.root)
-        let deadline = Date().addingTimeInterval(Self.lockTimeout)
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: Self.lockTimeout)
         while true {
             switch lock.acquire() {
             case .acquired:
                 break
             case .busy:
-                guard Date() < deadline else {
+                guard clock.now < deadline else {
                     throw SecretStoreError.backendFailed(
-                        "timed out after \(Int(Self.lockTimeout))s waiting for the secrets lock at "
+                        "timed out after 10s waiting for the secrets lock at "
                             + "\(lockFileURL.path). Another Restic Station process may be stuck; "
                             + "check for running restic-station-helper processes."
                     )
@@ -424,7 +555,7 @@ public struct FileSecretStore: SecretStore {
             break
         }
         defer { lock.release() }
-        try body()
+        return try body()
     }
 
     /// temp file (`O_EXCL`, `0600`) → `fsync` → `rename(2)`.

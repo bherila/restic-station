@@ -102,6 +102,40 @@ private final class ReplacementAuditLoader: @unchecked Sendable {
 @Suite("StateWatcher lock health", .serialized)
 @MainActor
 struct StateWatcherTests {
+    @Test("keychain secret-lock metadata changes refresh administrative health")
+    func keychainSecretLockMetadataRefreshesHealth() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-keychain-lock-watcher-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = AppPaths(root: root)
+        try paths.ensureDirectories()
+        let secretLock = FileLock(path: paths.secretsLockFile, trustedRoot: root)
+        #expect(secretLock.acquire() == .acquired)
+        secretLock.release()
+
+        let watcher = StateWatcher(
+            paths: paths,
+            runStore: RunStore(paths: paths),
+            stateStore: StateStore(paths: paths),
+            secretBackend: .keychain
+        )
+        watcher.start()
+        defer { watcher.stop() }
+        #expect(watcher.lockingFailure == nil)
+
+        // chmod changes only the child vnode, not locks/. The direct source
+        // for secrets.lock must trigger the health refresh for keychain too.
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o000], ofItemAtPath: paths.secretsLockFile.path
+        )
+        for _ in 0..<40 {
+            if watcher.lockingFailure?.path == paths.secretsLockFile.path { break }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        #expect(watcher.lockingFailure?.scope == .administrative)
+        #expect(watcher.lockingFailure?.path == paths.secretsLockFile.path)
+    }
+
     @Test("replacing the data-root parent rebinds the entire watch hierarchy")
     func rootParentReplacementRebindsHierarchy() async throws {
         let container = FileManager.default.temporaryDirectory
@@ -642,5 +676,35 @@ struct StateWatcherTests {
 
         #expect(!recorder.observations.isEmpty)
         #expect(recorder.observations.allSatisfy { !$0 })
+    }
+
+    @Test("atomic config replacement publishes the new file fingerprint")
+    func configReplacementPublishesFingerprint() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-config-watcher-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let paths = AppPaths(root: root)
+        let store = ConfigStore(paths: paths)
+        try store.save(AppConfig(showMenuBarIcon: true))
+
+        let watcher = StateWatcher(
+            paths: paths,
+            runStore: RunStore(paths: paths),
+            stateStore: StateStore(paths: paths)
+        )
+        watcher.start()
+        defer { watcher.stop() }
+        let original = watcher.configFileFingerprint
+
+        try store.save(AppConfig(showMenuBarIcon: false))
+        let replacement = store.fileFingerprint()
+        #expect(replacement != original)
+
+        for _ in 0..<40 {
+            if watcher.configFileFingerprint == replacement { break }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        #expect(watcher.configFileFingerprint == replacement)
     }
 }

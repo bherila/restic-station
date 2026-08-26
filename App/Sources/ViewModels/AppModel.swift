@@ -3,6 +3,12 @@ import Combine
 import Foundation
 import ResticStationCore
 
+enum UncertainConfigCommitOutcome: Equatable {
+    case candidateInstalled(fingerprint: String)
+    case differentRevisionInstalled
+    case unreadable
+}
+
 /// The object every screen builds on (`docs/ui-spec.md` §Shell): it owns the
 /// loaded `AppConfig`, the live on-disk state (`StateWatcher`), the launchd
 /// registration (`LaunchdManager`), helper invocation (`HelperInvoker`), and
@@ -37,6 +43,15 @@ final class AppModel: ObservableObject {
     /// Read-only to views; edits go through `saveConfig(_:)` /
     /// `updateConfig(_:)`.
     @Published private(set) var config: AppConfig
+    /// Byte revision of `config.json` from which ``config`` was decoded.
+    /// Every editor carries this token back to its save; it advances only
+    /// after a successful save or an explicit reload.
+    @Published private(set) var configFingerprint: String
+    /// A watcher observed a different on-disk revision. The in-memory value
+    /// is deliberately retained until the operator reloads, so an open draft
+    /// cannot silently change underneath them and its old token still fails
+    /// compare-and-swap.
+    @Published private(set) var configChangedOnDisk = false
     /// **What this machine backs up** (`ResolvedConfig.Scope.scheduling`):
     /// overrides applied, sets and destinations this machine does not run
     /// removed, `resticPath` filled in from `machine.json`.
@@ -63,6 +78,10 @@ final class AppModel: ObservableObject {
     /// overwriting a config we failed to understand would destroy the user's
     /// backup definitions.
     @Published private(set) var configLoadError: String?
+    /// True only when config.json itself failed to load or reload. Kept
+    /// separate from the combined operator-facing error, which can also
+    /// contain a machine.json failure that Reload Settings cannot repair.
+    private var configReloadRequired: Bool
     /// Non-`nil` when `machine.json` exists but could not be read. Tracked
     /// separately from `configLoadError` because it blocks a *different*
     /// write: `machine` is only a generated fallback while this is set, so
@@ -71,6 +90,51 @@ final class AppModel: ObservableObject {
     @Published private(set) var machineLoadError: String?
     /// Last save/validation failure, for surfacing in the UI.
     @Published private(set) var lastConfigError: String?
+
+    /// A set editor can disappear because the window closed or the sidebar
+    /// changed, without getting an opportunity to await its secret rollback.
+    /// The model takes ownership of those tokens before the view is torn
+    /// down and surfaces any failed retry in every surviving app scene.
+    @Published var pendingSecretRollbackError: String? {
+        didSet {
+            guard oldValue != pendingSecretRollbackError else { return }
+            recomputeDerivedState()
+        }
+    }
+
+    /// Each inner array is one editor session and must be unwound in reverse
+    /// order. Keeping batches separate lets a failed older session remain
+    /// queued while a later disappearing editor is unwound first.
+    var pendingSecretRollbackBatches: [[DestinationSecretsRollback]] = []
+    var pendingSecretRollbackTask: Task<Void, Never>?
+    /// Rollbacks produced by an async destination save are parked here before
+    /// control returns to SwiftUI. The view claims them synchronously only if
+    /// its parent editor session is still alive.
+    var activeSecretEditorSessions: Set<UUID> = []
+    var unclaimedSecretEditorRollbacks: [UUID: [DestinationSecretsRollback]] = [:]
+    /// Claimed tokens remain indexed here while SwiftUI owns the matching
+    /// value copies, so one editor can detect a newer live mutation before
+    /// attempting an out-of-order explicit Revert.
+    var claimedSecretEditorRollbacks: [UUID: [DestinationSecretsRollback]] = [:]
+    /// Field ownership registered before an editor awaits the secret backend.
+    /// This closes the interval before a completed transaction can be parked
+    /// as a rollback token; explicit older Reverts must wait for these too.
+    var inFlightSecretEditorMutations: [UUID: [UUID: SecretEditorMutationIntent]] = [:]
+    /// Rollbacks removed from the pending queue for targeted/explicit
+    /// restoration remain visible here across the backend await. Without
+    /// this ownership, another editor could overtake the dequeued link while
+    /// both operations contend for secrets.lock.
+    var inFlightSecretRollbackRestorations: [UInt64: DestinationSecretsRollback] = [:]
+    var inFlightSecretRollbackWaiters: [CheckedContinuation<Void, Never>] = []
+    /// Global mutation order, independent of which SwiftUI editor happens to
+    /// disappear first. Rollback and commit cutoffs use these sequence values
+    /// to preserve cross-window credential causality.
+    var nextSecretRollbackSequence: UInt64 = 0
+    var committedPasswordRollbackSequence: [UUID: UInt64] = [:]
+    var committedSecretEnvRollbackSequence: [UUID: UInt64] = [:]
+    /// Monotonic request identity for reloads that leave the main actor while
+    /// waiting on config.lock. Only the newest request may publish state.
+    private var configReloadGeneration: UInt64 = 0
 
     /// One entry per configured set, in config order.
     @Published private(set) var setHealths: [SetHealth] = []
@@ -103,6 +167,12 @@ final class AppModel: ObservableObject {
     let stateWatcher: StateWatcher
     let launchd: LaunchdManager
     let helper: HelperInvoker
+    let configSnapshotLoader: @Sendable () async throws -> ConfigSnapshot
+    let configRevisionLoader: @Sendable () async throws -> String
+    /// Injectable only so transaction tests can deterministically race a
+    /// secret mutation with a raw fleet replacement. Production builds use
+    /// the same factory as the helper.
+    let secretStoreFactory: () throws -> any SecretStore
 
     /// The minimum restic the docs require (`docs/restic-cli.md` §version).
     static let minimumResticVersion = "0.17.0"
@@ -123,11 +193,15 @@ final class AppModel: ObservableObject {
         paths: AppPaths = .default(),
         launchd: LaunchdManager? = nil,
         helper: HelperInvoker = HelperInvoker(),
+        secretStoreFactory: (() throws -> any SecretStore)? = nil,
+        configSnapshotLoader: (@Sendable () async throws -> ConfigSnapshot)? = nil,
+        configRevisionLoader: (@Sendable () async throws -> String)? = nil,
         calendar: Calendar = .autoupdatingCurrent,
         now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.paths = paths
-        self.configStore = ConfigStore(paths: paths)
+        let configStore = ConfigStore(paths: paths)
+        self.configStore = configStore
         self.machineStore = MachineStore(paths: paths)
         self.stateStore = StateStore(paths: paths)
         self.runStore = RunStore(paths: paths)
@@ -138,6 +212,19 @@ final class AppModel: ObservableObject {
         )
         self.launchd = launchd ?? LaunchdManager()
         self.helper = helper
+        self.configSnapshotLoader = configSnapshotLoader ?? {
+            try await configStore.snapshotAsync()
+        }
+        self.configRevisionLoader = configRevisionLoader ?? {
+            try await configStore.currentFileFingerprintAsync()
+        }
+        self.secretStoreFactory = secretStoreFactory ?? {
+            try SecretStoreFactory.make(
+                paths: paths,
+                runner: DefaultProcessRunner(),
+                helperExecutablePath: HelperInvoker.helperURL.path
+            )
+        }
         self.calendar = calendar
         self.now = now
 
@@ -152,14 +239,25 @@ final class AppModel: ObservableObject {
         // *read* until every stored property is initialized, and the machine
         // branch below needs to append to whatever the config branch found.
         var loadFailures: [String] = []
+        var configReloadRequired = false
 
         let loadedConfig: AppConfig
+        let loadedConfigFingerprint: String
         do {
-            loadedConfig = try configStore.load()
+            // Startup is main-actor isolated, so it must never enter the
+            // config lock's bounded polling loop. Atomic replacement makes
+            // this immediate whole-file read safe as an initial view; a
+            // legacy schema is migrated asynchronously from start().
+            let snapshot = try configStore.reconciliationSnapshot()
+            loadedConfig = snapshot.config
+            loadedConfigFingerprint = snapshot.fingerprint
+            configReloadRequired = snapshot.config.version < AppConfig.currentVersion
         } catch {
             // A default, empty config keeps the UI alive and explainable;
             // `configLoadError` blocks writes so nothing is clobbered.
             loadedConfig = AppConfig()
+            loadedConfigFingerprint = configStore.fileFingerprint()
+            configReloadRequired = true
             loadFailures.append(Self.describe(configLoadFailure: error, path: paths.configFile.path))
         }
 
@@ -183,9 +281,11 @@ final class AppModel: ObservableObject {
         }
 
         self.configLoadError = loadFailures.isEmpty ? nil : loadFailures.joined(separator: "\n\n")
+        self.configReloadRequired = configReloadRequired
 
         self.machine = loadedMachine
         self.config = loadedConfig
+        self.configFingerprint = loadedConfigFingerprint
         self.resolvedConfig = loadedConfig.resolved(for: loadedMachine).config
         self.addressableConfig = loadedConfig.addressable(for: loadedMachine)
         stateWatcher.updateConfiguredSetIds(Set(resolvedConfig.sets.map(\.id)))
@@ -219,6 +319,9 @@ final class AppModel: ObservableObject {
                 self.recomputeDerivedState()
             }
         }
+        if configReloadRequired {
+            Task { await reloadConfigFromDisk() }
+        }
         Task { await refreshResticInfo() }
     }
 
@@ -245,21 +348,63 @@ final class AppModel: ObservableObject {
     /// Validates, persists, and — when the change can affect what the next
     /// tick does — asks launchd to run one now instead of within
     /// `StartInterval`.
-    func saveConfig(_ newConfig: AppConfig) throws {
+    @discardableResult
+    func saveConfig(
+        _ newConfig: AppConfig,
+        ifUnchangedFrom expectedFingerprint: String? = nil
+    ) throws -> String {
         if let configLoadError {
             throw AppModelError.configUnreadable(configLoadError)
         }
+        if configReloadRequired {
+            throw AppModelError.configUnreadable(
+                "Settings are still being migrated. Wait for Reload Settings to finish before saving."
+            )
+        }
+        let editFingerprint = expectedFingerprint ?? configFingerprint
+        let installedFingerprint: String
         do {
             try newConfig.validate()
-            try configStore.save(newConfig)
+            installedFingerprint = try configStore.save(
+                newConfig,
+                ifUnchangedFrom: editFingerprint
+            )
         } catch {
-            lastConfigError = "\(error)"
-            throw error
+            if let storeError = error as? ConfigStoreError,
+               storeError.commitMayBeUncertain {
+                switch reconcileUncertainConfigCommit(candidate: newConfig) {
+                case .candidateInstalled(let fingerprint):
+                    // Recovery failed noisily, but the exact candidate is
+                    // live. Adopt it so callers commit their paired secret
+                    // mutations instead of rolling them back underneath it.
+                    installedFingerprint = fingerprint
+                case .differentRevisionInstalled:
+                    configChangedOnDisk = true
+                    lastConfigError = "\(ConfigStoreError.changedOnDisk)"
+                    throw ConfigStoreError.changedOnDisk
+                case .unreadable:
+                    lastConfigError = "\(error)"
+                    throw error
+                }
+            } else {
+                if let storeError = error as? ConfigStoreError,
+                   storeError.isRevisionConflict {
+                    configChangedOnDisk = true
+                }
+                lastConfigError = "\(error)"
+                throw error
+            }
         }
 
         let previous = config
         let previousResticPath = resticPath
+        // Any reload that left the main actor before this successful save
+        // began is now stale, even if its snapshot and disk revalidation
+        // matched each other. It must not publish over this newer model state.
+        configReloadGeneration &+= 1
         config = newConfig
+        configFingerprint = installedFingerprint
+        configChangedOnDisk = false
         resolvedConfig = newConfig.resolved(for: machine).config
         addressableConfig = newConfig.addressable(for: machine)
         stateWatcher.updateConfiguredSetIds(Set(resolvedConfig.sets.map(\.id)))
@@ -272,6 +417,101 @@ final class AppModel: ObservableObject {
         if previousResticPath != resticPath {
             Task { await refreshResticInfo() }
         }
+        return installedFingerprint
+    }
+
+    /// Read back the live bytes after a failed atomic-replacement recovery
+    /// without waiting on config.lock on the main actor.
+    /// A semantic candidate match is enough: ConfigStore's encoder is stable,
+    /// while an external writer may have serialized equivalent JSON bytes.
+    func reconcileUncertainConfigCommit(candidate: AppConfig) -> UncertainConfigCommitOutcome {
+        do {
+            let snapshot = try configStore.reconciliationSnapshot()
+            if snapshot.config == candidate {
+                return .candidateInstalled(fingerprint: snapshot.fingerprint)
+            }
+            return .differentRevisionInstalled
+        } catch {
+            return .unreadable
+        }
+    }
+
+    /// Adopts the latest valid on-disk configuration after the watcher has
+    /// surfaced a replacement. A failed reload retains the last understood
+    /// config and blocks every save, so corrupt fleet-sync output cannot be
+    /// overwritten by an open window.
+    func reloadConfigFromDisk() async {
+        configReloadGeneration &+= 1
+        let requestGeneration = configReloadGeneration
+        let watcherRevisionAtStart = stateWatcher.configFileRevision
+        do {
+            let snapshot = try await configSnapshotLoader()
+            guard requestGeneration == configReloadGeneration else { return }
+            let liveFingerprint = try await configRevisionLoader()
+            guard requestGeneration == configReloadGeneration else { return }
+            guard liveFingerprint == snapshot.fingerprint,
+                  stateWatcher.configFileRevision == watcherRevisionAtStart else {
+                configChangedOnDisk = true
+                lastConfigError = "Settings changed again while Reload Settings was reading them. Reload again."
+                return
+            }
+            let previous = config
+            let previousResticPath = resticPath
+
+            // snapshot() may migrate a legacy top-level resticPath into
+            // machine.json. Resolve the migrated config against the machine
+            // bytes *after* that write, while retaining an in-memory machine
+            // and an explicit diagnostic if the refreshed file is invalid.
+            let refreshedMachine: MachineConfig
+            do {
+                refreshedMachine = try machineStore.load()
+                machineLoadError = nil
+            } catch {
+                refreshedMachine = machine
+                machineLoadError = Self.describe(
+                    machineLoadFailure: error,
+                    path: paths.machineFile.path
+                )
+            }
+
+            machine = refreshedMachine
+            config = snapshot.config
+            configFingerprint = snapshot.fingerprint
+            // snapshot() intentionally returns an unmigrated legacy config
+            // when config.lock is structurally unavailable. Keep writes
+            // blocked until a later reload can actually install the current
+            // schema; repairing the lock alone need not change the file hash.
+            configReloadRequired = snapshot.config.version < AppConfig.currentVersion
+            configChangedOnDisk = configReloadRequired
+            configLoadError = machineLoadError
+            resolvedConfig = snapshot.config.resolved(for: refreshedMachine).config
+            addressableConfig = snapshot.config.addressable(for: refreshedMachine)
+            stateWatcher.updateConfiguredSetIds(Set(resolvedConfig.sets.map(\.id)))
+            lastConfigError = configReloadRequired
+                ? "Settings still use an older schema because config.lock could not be used. Repair the lock, then reload settings."
+                : nil
+            recomputeDerivedState()
+
+            if ConfigDiff.isScheduleRelevantChange(from: previous, to: snapshot.config) {
+                launchd.kickstartTick()
+            }
+            if previousResticPath != resticPath {
+                Task { await refreshResticInfo() }
+            }
+        } catch {
+            guard requestGeneration == configReloadGeneration else { return }
+            let detail = Self.describe(configLoadFailure: error, path: paths.configFile.path)
+            configLoadError = [detail, machineLoadError].compactMap { $0 }.joined(separator: "\n\n")
+            configReloadRequired = true
+            configChangedOnDisk = true
+            lastConfigError = "Reload failed: \(error)"
+        }
+    }
+
+    /// Makes the global reload affordance visible when an editor's stale
+    /// preflight notices a replacement before the watcher publishes it.
+    func noteConfigChangedOnDisk() {
+        configChangedOnDisk = true
     }
 
     /// Persists an edit to `machine.json` — the host-local half of the
@@ -402,7 +642,7 @@ final class AppModel: ObservableObject {
             visibleSince: paths.configurationVisibleSince(),
             runLiveness: runLiveness
         )
-        appHealth = HealthDerivation.appHealth(
+        let derivedHealth = HealthDerivation.appHealth(
             setHealths: setHealths,
             runsInFlight: Array(stateWatcher.currentRuns.values),
             // Only a *definite* denial is a warning: a missing
@@ -421,6 +661,23 @@ final class AppModel: ObservableObject {
                 || stateWatcher.auditVerificationFailed,
             runLiveness: runLiveness
         )
+        // A failed abandoned-edit rollback can leave scheduled backups using
+        // credentials that do not match config. Keep the menu-bar glyph red
+        // only for destructive-audit failures, otherwise make this warning
+        // visible even when no app window survives.
+        appHealth = Self.health(
+            derivedHealth,
+            pendingSecretRollbackError: pendingSecretRollbackError
+        )
+    }
+
+    static func health(
+        _ derivedHealth: AppHealth,
+        pendingSecretRollbackError: String?
+    ) -> AppHealth {
+        pendingSecretRollbackError == nil || derivedHealth == .critical
+            ? derivedHealth
+            : .warning
     }
 
     /// `StateWatcher` and `LaunchdManager` are nested `ObservableObject`s;
@@ -444,6 +701,21 @@ final class AppModel: ObservableObject {
                 }
                 .store(in: &cancellables)
         }
+
+        stateWatcher.$configFileFingerprint
+            .removeDuplicates()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] observedFingerprint in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    // A failed reload must retain the only production reload
+                    // affordance even if fleet sync restores the exact bytes
+                    // already represented by `configFingerprint`.
+                    self.configChangedOnDisk = self.configReloadRequired
+                        || observedFingerprint != self.configFingerprint
+                }
+            }
+            .store(in: &cancellables)
     }
 
     // MARK: - Actions
@@ -528,6 +800,12 @@ final class AppModel: ObservableObject {
     }
 }
 
+struct SecretEditorMutationIntent {
+    let destId: UUID
+    let changesPassword: Bool
+    let changesSecretEnv: Bool
+}
+
 // MARK: - ResticStatus
 
 /// The four states `docs/ui-spec.md` §Settings asks the restic chip to show.
@@ -577,6 +855,8 @@ struct HelperMessage: Equatable, Sendable, Identifiable {
 enum AppModelError: LocalizedError {
     case configUnreadable(String)
     case machineUnreadable(String)
+    case secretRollbackFailed(original: String, rollback: String)
+    case newerSecretEditorMutation
 
     var errorDescription: String? {
         switch self {
@@ -585,6 +865,13 @@ enum AppModelError: LocalizedError {
         case .machineUnreadable(let detail):
             return "Restic Station cannot save this machine's settings while machine.json is unreadable — "
                 + "writing it now would replace this machine's identity with a generated one.\n\n\(detail)"
+        case .secretRollbackFailed(let original, let rollback):
+            return "The destination save failed (\(original)), and its previous keychain values could not "
+                + "be restored (\(rollback)). Re-open the destination and verify its credentials before "
+                + "running a backup."
+        case .newerSecretEditorMutation:
+            return "A newer credential edit is still open or awaiting restoration. Finish or close the "
+                + "newer edit, or close this editor so Restic Station can restore credentials in order."
         }
     }
 }

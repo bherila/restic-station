@@ -15,17 +15,22 @@ struct BackupSetsRootView: View {
 
     @State private var selection: UUID?
     @State private var editorTarget: SetEditorTarget?
-    /// A set created by the toolbar's "+" but not yet saved: it is not in
-    /// `config` until the editor's Save succeeds (a set needs a source and a
-    /// primary destination before `AppConfig.validate()` will accept it).
-    @State private var pendingNewSet: BackupSet?
 
     var body: some View {
         NavigationStack {
             SetListView(
                 selection: $selection,
                 onCreate: createSet,
-                onEdit: { setId in editorTarget = SetEditorTarget(id: setId, isNew: false) }
+                onEdit: { setId in
+                    guard let set = model.config.sets.first(where: { $0.id == setId }) else {
+                        return
+                    }
+                    editorTarget = SetEditorTarget(
+                        initialSet: set,
+                        isNew: false,
+                        configFingerprint: model.configFingerprint
+                    )
+                }
             )
             .navigationDestination(item: $editorTarget) { target in
                 editor(for: target)
@@ -39,33 +44,45 @@ struct BackupSetsRootView: View {
 
     @ViewBuilder
     private func editor(for target: SetEditorTarget) -> some View {
-        if target.isNew, let pendingNewSet, pendingNewSet.id == target.id {
-            SetEditorView(initialSet: pendingNewSet, isNew: true)
-        } else if let set = model.config.sets.first(where: { $0.id == target.id }) {
-            SetEditorView(initialSet: set, isNew: false)
-        } else {
-            ContentUnavailableView(
-                "This backup set was deleted",
-                systemImage: "externaldrive.badge.questionmark",
-                description: Text("Go back to the list to pick another one.")
-            )
-        }
+        SetEditorView(
+            initialSet: target.initialSet,
+            isNew: target.isNew,
+            configFingerprint: target.configFingerprint
+        )
     }
 
     private func createSet() {
         let draft = model.newSetTemplate()
-        pendingNewSet = draft
-        editorTarget = SetEditorTarget(id: draft.id, isNew: true)
+        editorTarget = SetEditorTarget(
+            initialSet: draft,
+            isNew: true,
+            configFingerprint: model.configFingerprint
+        )
     }
 }
 
 // MARK: - SetEditorTarget
 
-/// What the editor is editing. A new set is identified by id like any other,
-/// but its draft lives in `BackupSetsRootView.pendingNewSet` until it is
-/// saved — `navigationDestination(item:)` needs a `Hashable` value, and
-/// `BackupSet` deliberately is not one.
+/// Captures the draft and its revision in one main-actor turn. The manual
+/// Hashable conformance intentionally keys navigation identity on the scalar
+/// revision metadata; BackupSet itself remains a value model without an
+/// artificial Hashable requirement.
 struct SetEditorTarget: Identifiable, Hashable, Sendable {
-    let id: UUID
+    let initialSet: BackupSet
     let isNew: Bool
+    let configFingerprint: String
+
+    var id: UUID { initialSet.id }
+
+    static func == (lhs: SetEditorTarget, rhs: SetEditorTarget) -> Bool {
+        lhs.id == rhs.id
+            && lhs.isNew == rhs.isNew
+            && lhs.configFingerprint == rhs.configFingerprint
+    }
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
+        hasher.combine(isNew)
+        hasher.combine(configFingerprint)
+    }
 }

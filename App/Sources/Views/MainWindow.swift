@@ -9,6 +9,7 @@ import SwiftUI
 /// `Settings` scene (⌘,) via `SettingsLink`, rather than being a fifth
 /// detail pane: one settings surface, reachable two ways.
 struct MainWindow: View {
+    @EnvironmentObject private var model: AppModel
     @SceneStorage("sidebarSelection") private var storedSelection: String?
     /// Optional because that is the shape `List` single-selection takes;
     /// the detail pane falls back to Backup Sets if it is ever cleared.
@@ -36,6 +37,9 @@ struct MainWindow: View {
                 .frame(minWidth: 640, minHeight: 480)
         }
         .navigationTitle("Restic Station")
+        .safeAreaInset(edge: .top, spacing: 0) {
+            AppAlertBanners()
+        }
         // ui-spec: min size ~900×560.
         .frame(minWidth: 900, minHeight: 560)
         .onAppear {
@@ -60,6 +64,70 @@ struct MainWindow: View {
         case .maintenance:
             MaintenanceRootView()
         }
+    }
+}
+
+/// Process-wide safety alerts shared by every window scene. Keeping this as
+/// one view prevents Settings from silently losing a warning merely because
+/// the main window was closed.
+struct AppAlertBanners: View {
+    @EnvironmentObject private var model: AppModel
+
+    var body: some View {
+        VStack(spacing: 0) {
+            if model.configChangedOnDisk {
+                ConfigChangeBanner()
+            }
+            if let error = model.pendingSecretRollbackError {
+                SecretRollbackBanner(message: error)
+            }
+        }
+    }
+}
+
+struct SecretRollbackBanner: View {
+    @EnvironmentObject private var model: AppModel
+    let message: String
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "key.fill")
+                .foregroundStyle(.red)
+            Text(message)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 12)
+            Button("Retry Restoration") {
+                model.retryPendingSecretRollbacks()
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 9)
+        .background(.bar)
+        .overlay(alignment: .bottom) { Divider() }
+    }
+}
+
+/// A fleet-sync or CLI replacement is never silently folded into an open
+/// editor. The operator chooses when to reload; stale drafts retain their
+/// original fingerprint and will still be refused if saved afterward.
+struct ConfigChangeBanner: View {
+    @EnvironmentObject private var model: AppModel
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.yellow)
+            Text("Settings changed on disk. Reload before saving to avoid overwriting those changes.")
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 12)
+            Button("Reload Settings") {
+                Task { await model.reloadConfigFromDisk() }
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 9)
+        .background(.bar)
+        .overlay(alignment: .bottom) { Divider() }
     }
 }
 

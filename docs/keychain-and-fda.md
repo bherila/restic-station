@@ -38,7 +38,9 @@ Keychain item ACLs are per-code-identity. An item created through the Security f
 
 `-T /usr/bin/security` places the Apple-signed `security` tool in the item's trusted-application list **at creation time**, so all future reads are prompt-free, from any context, regardless of how the app itself is signed. `-U` updates an existing item's value (note: `-U` does not modify an existing item's ACL — ACLs are fixed at creation; if an item was ever created without `-T`, delete and re-add).
 
-Items (see data-model.md): service `restic-station`, account `<dest-uuid>` (repo password) and `<dest-uuid>-env` (JSON dict of secret env vars, e.g. S3 keys — restic's password-command mechanism can't deliver those, so `ResticRunner` reads the blob itself and injects real env vars).
+Items (see data-model.md): service `restic-station`, account `<dest-uuid>` (repo password) and `<dest-uuid>-env` (JSON dict of secret env vars, e.g. S3 keys — restic's password-command mechanism can't deliver those, so `ResticRunner` reads the blob itself and injects real env vars). Production writes also advance non-secret companion accounts named `<account>-generation`. Conditional editor rollback compares that persistent random identity, not only the value, so a later helper write of the same password (or deletion of an already-absent environment) is still recognized as newer and preserved.
+
+Every production keychain mutation also holds `locks/secrets.lock`. This is what makes an app editor's capture/update and conditional rollback one transaction with the helper's `secret set`, `set-env`, and `rm` commands: a stale editor rollback compares the current values while holding the same lock and leaves a newer CLI mutation untouched. Ordinary reads take no lock because each keychain item lookup is already atomic.
 
 ### Accepted tradeoff (document, don't "fix")
 Passing `-w <password>` puts the secret in `security`'s argv, momentarily visible in `ps` on the local machine. Alternatives (interactive `-w` prompt) don't work programmatically. For a single-user local machine this is acceptable; note it in code comments and README.
@@ -118,15 +120,19 @@ The target Linux host is headless: no desktop session, no D-Bus user bus, no key
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "secrets": {
     "<uuid-lowercased>": "the repository password",
     "<uuid-lowercased>-env": "{\"AWS_ACCESS_KEY_ID\":\"…\"}"
+  },
+  "generations": {
+    "<uuid-lowercased>": "a non-secret random mutation identity",
+    "<uuid-lowercased>-env": "a non-secret random mutation identity"
   }
 }
 ```
 
-Deliberately mirrors the keychain account naming (`SecretAccount`), so a destination's storage key is the same string on both platforms and the two backends stay comparable. A `version` newer than this build understands is refused rather than overwritten.
+Deliberately mirrors the keychain account naming (`SecretAccount`), so a destination's storage key is the same string on both platforms and the two backends stay comparable. Format 2 adds `generations`; current readers remain compatible with legacy format-1 files where that member is absent and upgrade them on the next mutation. Its values carry no secret material; they distinguish same-value cross-process writes for conditional editor rollback. A `version` newer than this build understands is refused rather than overwritten.
 
 ### Threat model
 
@@ -160,7 +166,7 @@ Root being outside the secrecy boundary does **not** mean a root-run helper acce
 
 ### Concurrency
 
-A tick and an interactive `secret set` can run at the same time. Every read-modify-write takes `locks/secrets.lock` (the existing `FileLock`, `flock(2)`, released by the kernel on process death) with a 10 s timeout, so a concurrent `secret set` cannot lose the other writer's entry. A structurally unusable mutation lock is a typed, non-retryable infrastructure failure rather than temporary secret unavailability. Reads take **no** lock: `rename(2)` is atomic, so a reader always sees one complete generation of the file.
+A tick and an interactive `secret set` can run at the same time. Every read-modify-write takes `locks/secrets.lock` (the existing `FileLock`, `flock(2)`, released by the kernel on process death) with a 10 s timeout, so a concurrent `secret set` cannot lose the other writer's entry. Each managed field's mutation identity advances in that same atomic document replacement, including same-value writes and idempotent deletes. A structurally unusable mutation lock is a typed, non-retryable infrastructure failure rather than temporary secret unavailability. Reads take **no** lock: `rename(2)` is atomic, so a reader always sees one complete generation of the file.
 
 ### How the password reaches restic
 

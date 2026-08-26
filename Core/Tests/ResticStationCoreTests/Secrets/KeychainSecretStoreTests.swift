@@ -224,5 +224,412 @@ struct KeychainSecretStoreTests {
         }
         #expect(runner.invocations[0].argv.contains(Self.account))
     }
+
+    @Test("conditional rollback preserves a newer password and restores the unchanged environment")
+    func conditionalRollbackRestoresFieldsIndependently() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-keychain-rollback-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let installedEnv = try SecretEnvBlob.encode(["TOKEN": "editor"])
+        let runner = FakeProcessRunner(script: [
+            .init(
+                argvPrefix: ["/usr/bin/security", "find-generic-password"],
+                stdoutLines: ["newer-helper-password"]
+            ),
+            .init(
+                argvPrefix: ["/usr/bin/security", "find-generic-password"],
+                stdoutLines: [installedEnv]
+            ),
+            .init(argvPrefix: ["/usr/bin/security", "add-generic-password"], exitCode: 0),
+        ])
+        let client = KeychainSecretStore(runner: runner, paths: AppPaths(root: root))
+        let rollback = DestinationSecretRollback(
+            destId: Self.destId,
+            password: SecretRollbackChange(
+                installed: "editor-password",
+                previous: "original-password"
+            ),
+            secretEnv: SecretRollbackChange(
+                installed: ["TOKEN": "editor"],
+                previous: ["TOKEN": "original"]
+            )
+        )
+
+        let result = try await client.restoreDestinationSecretsIfCurrent(rollback)
+
+        #expect(result.passwordRestored == false)
+        #expect(result.secretEnvRestored == true)
+        #expect(!result.allRestored)
+        #expect(runner.invocations.count == 3)
+        #expect(runner.invocations[2].argv.contains("-U"))
+        let restoredEnv = try SecretEnvBlob.decode(runner.invocations[2].argv[8])
+        #expect(restoredEnv == ["TOKEN": "original"])
+    }
+
+    @Test("conditional rollback preserves same-value writes from another process")
+    func conditionalRollbackUsesPersistentGenerations() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-keychain-generations-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let envAccount = "\(Self.account)-env"
+        let runner = StatefulKeychainRunner(items: [
+            Self.account: "original-password",
+            envAccount: try SecretEnvBlob.encode(["TOKEN": "original"]),
+        ])
+        let client = KeychainSecretStore(runner: runner, paths: AppPaths(root: root))
+        let rollback = try await client.updateDestinationSecrets(
+            DestinationSecretUpdate(
+                destId: Self.destId,
+                password: "editor-password",
+                secretEnv: [:]
+            )
+        )
+
+        // A separate helper invocation takes the same cross-process lock and
+        // advances the field identity even though the values do not change.
+        try await client.setPassword("editor-password", destId: Self.destId)
+        try await client.deleteSecretEnv(destId: Self.destId)
+        let result = try await client.restoreDestinationSecretsIfCurrent(rollback)
+
+        #expect(result.passwordRestored == false)
+        #expect(result.secretEnvRestored == false)
+        #expect(try await client.password(destId: Self.destId) == "editor-password")
+        #expect(try await client.secretEnv(destId: Self.destId).isEmpty)
+    }
+
+    @Test("failed direct password mutations restore the previous generation marker")
+    func failedDirectPasswordMutationRestoresGeneration() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-keychain-generation-failure-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let generationAccount = "\(Self.account)-generation"
+        let runner = StatefulKeychainRunner(items: [
+            Self.account: "editor-password",
+            generationAccount: "editor-generation",
+        ])
+        runner.failNextDelete(account: Self.account)
+        let client = KeychainSecretStore(runner: runner, paths: AppPaths(root: root))
+
+        await #expect(throws: SecretStoreError.backendFailed("injected delete failure")) {
+            try await client.setPassword("helper-password", destId: Self.destId)
+        }
+
+        #expect(runner.value(account: Self.account) == "editor-password")
+        #expect(runner.value(account: generationAccount) == "editor-generation")
+    }
+
+    @Test("failed direct environment deletes restore the previous generation marker")
+    func failedDirectEnvironmentDeleteRestoresGeneration() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-keychain-env-generation-failure-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let envAccount = "\(Self.account)-env"
+        let generationAccount = "\(envAccount)-generation"
+        let raw = try SecretEnvBlob.encode(["TOKEN": "editor"])
+        let runner = StatefulKeychainRunner(items: [
+            envAccount: raw,
+            generationAccount: "editor-generation",
+        ])
+        runner.failNextDelete(account: envAccount)
+        let client = KeychainSecretStore(runner: runner, paths: AppPaths(root: root))
+
+        await #expect(throws: SecretStoreError.backendFailed("injected delete failure")) {
+            try await client.deleteSecretEnv(destId: Self.destId)
+        }
+
+        #expect(runner.value(account: envAccount) == raw)
+        #expect(runner.value(account: generationAccount) == "editor-generation")
+    }
+
+    @Test("failed password update does not rewrite an untouched environment")
+    func failedPasswordUpdateRestoresOnlyStartedFields() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-keychain-partial-update-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let previousEnvRaw = try SecretEnvBlob.encode(["TOKEN": "original"])
+        let runner = FakeProcessRunner(script: [
+            .init(
+                argvPrefix: ["/usr/bin/security", "find-generic-password"],
+                stdoutLines: ["original-password"]
+            ),
+            .init(
+                argvPrefix: ["/usr/bin/security", "find-generic-password"],
+                stdoutLines: [previousEnvRaw]
+            ),
+            .init(argvPrefix: ["/usr/bin/security", "delete-generic-password"], exitCode: 0),
+            .init(
+                argvPrefix: ["/usr/bin/security", "add-generic-password"],
+                stderr: "injected password failure",
+                exitCode: 1
+            ),
+            .init(argvPrefix: ["/usr/bin/security", "delete-generic-password"], exitCode: 44),
+            .init(argvPrefix: ["/usr/bin/security", "add-generic-password"], exitCode: 0),
+        ])
+        let client = KeychainSecretStore(runner: runner)
+
+        await #expect(throws: SecretStoreError.backendFailed("injected password failure")) {
+            _ = try await client.updateDestinationSecrets(
+                DestinationSecretUpdate(
+                    destId: Self.destId,
+                    password: "new-password",
+                    secretEnv: ["TOKEN": "new"]
+                )
+            )
+        }
+
+        #expect(runner.invocations.count == 6)
+        #expect(runner.invocations.dropFirst(2).allSatisfy {
+            !$0.argv.contains("\(Self.account)-env")
+        })
+        #expect(runner.invocations[5].argv[7] == "original-password")
+    }
+
+    @Test("a failed generation write never recreates an untouched credential")
+    func failedGenerationWriteRestoresOnlyItsMarker() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-keychain-generation-stage-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let generationAccount = "\(Self.account)-generation"
+        let runner = FakeProcessRunner(script: [
+            .init(
+                argvPrefix: ["/usr/bin/security", "find-generic-password"],
+                stdoutLines: ["original-password"]
+            ),
+            .init(
+                argvPrefix: ["/usr/bin/security", "find-generic-password"],
+                stdoutLines: ["original-generation"]
+            ),
+            .init(argvPrefix: ["/usr/bin/security", "delete-generic-password"], exitCode: 0),
+            .init(
+                argvPrefix: ["/usr/bin/security", "add-generic-password"],
+                stderr: "injected generation failure",
+                exitCode: 1
+            ),
+            .init(argvPrefix: ["/usr/bin/security", "delete-generic-password"], exitCode: 44),
+            .init(argvPrefix: ["/usr/bin/security", "add-generic-password"], exitCode: 0),
+        ])
+        let client = KeychainSecretStore(runner: runner, paths: AppPaths(root: root))
+
+        await #expect(throws: SecretStoreError.backendFailed("injected generation failure")) {
+            _ = try await client.updateDestinationSecrets(
+                DestinationSecretUpdate(
+                    destId: Self.destId,
+                    password: "new-password",
+                    secretEnv: nil
+                )
+            )
+        }
+
+        #expect(runner.invocations.count == 6)
+        #expect(runner.invocations.dropFirst().allSatisfy { invocation in
+            guard let accountIndex = invocation.argv.firstIndex(of: "-a"),
+                  accountIndex + 1 < invocation.argv.count else { return false }
+            return invocation.argv[accountIndex + 1] == generationAccount
+        })
+        #expect(runner.invocations.last?.argv[7] == "original-generation")
+    }
+
+    @Test("a failed conditional replacement remains retryable without deleting the installed item")
+    func conditionalRollbackReplacementIsAtomicAndRetryable() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-keychain-retry-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = FakeProcessRunner(script: [
+            .init(
+                argvPrefix: ["/usr/bin/security", "find-generic-password"],
+                stdoutLines: ["editor-password"]
+            ),
+            .init(
+                argvPrefix: ["/usr/bin/security", "add-generic-password", "-U"],
+                stderr: "transient failure",
+                exitCode: 1
+            ),
+            .init(
+                argvPrefix: ["/usr/bin/security", "find-generic-password"],
+                stdoutLines: ["editor-password"]
+            ),
+            .init(argvPrefix: ["/usr/bin/security", "add-generic-password", "-U"], exitCode: 0),
+        ])
+        let client = KeychainSecretStore(runner: runner, paths: AppPaths(root: root))
+        let rollback = DestinationSecretRollback(
+            destId: Self.destId,
+            password: SecretRollbackChange(
+                installed: "editor-password",
+                previous: "original-password"
+            ),
+            secretEnv: nil
+        )
+
+        await #expect(throws: SecretStoreError.backendFailed("transient failure")) {
+            _ = try await client.restoreDestinationSecretsIfCurrent(rollback)
+        }
+        let result = try await client.restoreDestinationSecretsIfCurrent(rollback)
+
+        #expect(result.passwordRestored == true)
+        #expect(runner.invocations.count == 4)
+        #expect(!runner.invocations.contains { $0.argv.contains("delete-generic-password") })
+        #expect(runner.invocations[3].argv[8] == "original-password")
+    }
+
+    @Test("a valid environment edit can replace and roll back a malformed keychain blob")
+    func malformedEnvironmentCanBeRepairedAndRestored() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-keychain-malformed-env-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let validEnv = ["TOKEN": "repaired"]
+        let validRaw = try SecretEnvBlob.encode(validEnv)
+        let malformedRaw = "{not-json"
+        let runner = FakeProcessRunner(script: [
+            .init(
+                argvPrefix: ["/usr/bin/security", "find-generic-password"],
+                stdoutLines: [malformedRaw]
+            ),
+            .init(argvPrefix: ["/usr/bin/security", "delete-generic-password"], exitCode: 0),
+            .init(argvPrefix: ["/usr/bin/security", "add-generic-password"], exitCode: 0),
+            .init(
+                argvPrefix: ["/usr/bin/security", "find-generic-password"],
+                stdoutLines: [validRaw]
+            ),
+            .init(argvPrefix: ["/usr/bin/security", "add-generic-password", "-U"], exitCode: 0),
+        ])
+        let client = KeychainSecretStore(runner: runner)
+
+        let rollback = try await client.updateDestinationSecrets(
+            DestinationSecretUpdate(destId: Self.destId, password: nil, secretEnv: validEnv)
+        )
+        #expect(rollback.previousSecretEnvRaw == malformedRaw)
+        let result = try await client.restoreDestinationSecretsIfCurrent(rollback)
+
+        #expect(result.secretEnvRestored == true)
+        #expect(runner.invocations.count == 5)
+        #expect(runner.invocations[4].argv[8] == malformedRaw)
+    }
+
+    @Test("rolling back a cleared environment recreates it with the trusted ACL")
+    func clearedEnvironmentRollbackUsesTrustedCreationPath() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-keychain-cleared-env-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let previousRaw = try SecretEnvBlob.encode(["TOKEN": "original"])
+        let runner = FakeProcessRunner(script: [
+            .init(
+                argvPrefix: ["/usr/bin/security", "find-generic-password"],
+                stdoutLines: [previousRaw]
+            ),
+            .init(argvPrefix: ["/usr/bin/security", "delete-generic-password"], exitCode: 0),
+            .init(argvPrefix: ["/usr/bin/security", "find-generic-password"], exitCode: 44),
+            .init(argvPrefix: ["/usr/bin/security", "delete-generic-password"], exitCode: 44),
+            .init(argvPrefix: ["/usr/bin/security", "add-generic-password"], exitCode: 0),
+        ])
+        let client = KeychainSecretStore(runner: runner)
+        let rollback = try await client.updateDestinationSecrets(
+            DestinationSecretUpdate(destId: Self.destId, password: nil, secretEnv: [:])
+        )
+
+        let result = try await client.restoreDestinationSecretsIfCurrent(rollback)
+
+        #expect(result.secretEnvRestored == true)
+        let creationArgv = runner.invocations[4].argv
+        #expect(creationArgv.contains("-T"))
+        #expect(creationArgv.contains("/usr/bin/security"))
+        #expect(!creationArgv.contains("-U"))
+        #expect(creationArgv[7] == previousRaw)
+    }
+
+    @Test("production keychain mutations wait for the shared secrets lock")
+    func keychainMutationUsesSharedLock() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-keychain-lock-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = AppPaths(root: root)
+        try paths.ensureDirectories()
+        let heldLock = FileLock(path: paths.secretsLockFile, trustedRoot: root)
+        #expect(heldLock.acquire() == .acquired)
+
+        let runner = FakeProcessRunner(script: [
+            .init(argvPrefix: ["/usr/bin/security", "find-generic-password"], exitCode: 44),
+            .init(argvPrefix: ["/usr/bin/security", "delete-generic-password"], exitCode: 44),
+            .init(argvPrefix: ["/usr/bin/security", "add-generic-password"], exitCode: 0),
+            .init(argvPrefix: ["/usr/bin/security", "delete-generic-password"], exitCode: 44),
+        ])
+        let client = KeychainSecretStore(runner: runner, paths: paths)
+        let mutation = Task {
+            try await client.deletePassword(destId: Self.destId)
+        }
+
+        try await Task.sleep(for: .milliseconds(75))
+        #expect(runner.invocations.isEmpty)
+        heldLock.release()
+        try await mutation.value
+        #expect(runner.invocations.count == 4)
+    }
+}
+
+private final class StatefulKeychainRunner: ProcessRunning, @unchecked Sendable {
+    private let lock = NSLock()
+    private var items: [String: String]
+    private var deleteFailures: Set<String> = []
+
+    init(items: [String: String]) {
+        self.items = items
+    }
+
+    func failNextDelete(account: String) {
+        _ = withLock { deleteFailures.insert(account) }
+    }
+
+    func value(account: String) -> String? {
+        withLock { items[account] }
+    }
+
+    func run(
+        _ argv: [String],
+        env: [String: String]?,
+        stdin: Data?,
+        currentDirectory: String?,
+        onStdoutLine: (@Sendable (String) -> Void)?,
+        onStderrLine: (@Sendable (String) -> Void)?,
+        timeout: TimeInterval?
+    ) async throws -> ProcessResult {
+        withLock {
+            guard let accountFlag = argv.firstIndex(of: "-a"), accountFlag + 1 < argv.count else {
+                return ProcessResult(exitCode: 1, stdout: Data(), stderr: Data("missing account".utf8))
+            }
+            let account = argv[accountFlag + 1]
+            switch argv.dropFirst().first {
+            case "find-generic-password":
+                guard let value = items[account] else {
+                    return ProcessResult(exitCode: 44, stdout: Data(), stderr: Data())
+                }
+                return ProcessResult(exitCode: 0, stdout: Data((value + "\n").utf8), stderr: Data())
+            case "delete-generic-password":
+                if deleteFailures.remove(account) != nil {
+                    return ProcessResult(
+                        exitCode: 1,
+                        stdout: Data(),
+                        stderr: Data("injected delete failure".utf8)
+                    )
+                }
+                guard items.removeValue(forKey: account) != nil else {
+                    return ProcessResult(exitCode: 44, stdout: Data(), stderr: Data())
+                }
+                return ProcessResult(exitCode: 0, stdout: Data(), stderr: Data())
+            case "add-generic-password":
+                guard let passwordFlag = argv.firstIndex(of: "-w"), passwordFlag + 1 < argv.count else {
+                    return ProcessResult(exitCode: 1, stdout: Data(), stderr: Data("missing value".utf8))
+                }
+                items[account] = argv[passwordFlag + 1]
+                return ProcessResult(exitCode: 0, stdout: Data(), stderr: Data())
+            default:
+                return ProcessResult(exitCode: 1, stdout: Data(), stderr: Data("unsupported command".utf8))
+            }
+        }
+    }
+
+    private func withLock<T>(_ body: () -> T) -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return body()
+    }
 }
 #endif

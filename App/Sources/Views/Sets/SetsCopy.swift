@@ -260,6 +260,40 @@ enum SetsCopy {
         return (.general, (error as? LocalizedError)?.errorDescription ?? "\(error)")
     }
 
+    /// Destination-secret persistence spans a config preflight and the
+    /// selected secret backend. Keep those failures distinct: unlocking the
+    /// login keychain cannot repair an unreadable config or broken lock.
+    static func destinationSecretFailureMessage(
+        for error: Error,
+        backend: SecretBackend = .configured
+    ) -> String {
+        if let configError = error as? ConfigStoreError {
+            if configError.isRevisionConflict {
+                return "Settings changed on disk while this destination was open. "
+                    + "Reload Settings, then apply the edit again; no keychain item was changed."
+            }
+            return "Settings could not be checked safely before writing this destination "
+                + "(\(configError)). No keychain item was changed. Resolve the configuration or "
+                + "locking error, then try again."
+        }
+        if let appError = error as? AppModelError {
+            switch appError {
+            case .configUnreadable:
+                return (appError.errorDescription ?? "The configuration is unreadable.")
+                    + "\n\nNo keychain item was changed."
+            case .machineUnreadable, .secretRollbackFailed, .newerSecretEditorMutation:
+                return appError.errorDescription ?? "\(appError)"
+            }
+        }
+        if error is LockFailure {
+            return "Settings could not be checked safely before writing this destination "
+                + "(\(error)). No keychain item was changed. Resolve the configuration or "
+                + "locking error, then try again."
+        }
+        return "The credentials for this destination could not be written to \(backend.displayName) "
+            + "(\(error)). \(backend.unavailableAdvice)"
+    }
+
     // MARK: - Passwords
 
     /// 32 random characters from a 64-symbol alphabet (192 bits). Generated

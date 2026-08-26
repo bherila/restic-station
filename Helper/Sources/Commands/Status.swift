@@ -784,7 +784,7 @@ struct StatusReport: Encodable {
                         + "(first detected: \(setId.uuidString.lowercased()))"
                 )
             } else if locking.scope == "administrative" {
-                lines.append("locking: SECRET CHANGES CANNOT RUN ON THIS MACHINE")
+                lines.append("locking: ADMINISTRATIVE CHANGES CANNOT RUN ON THIS MACHINE")
             } else {
                 lines.append("locking: NOTHING CAN RUN ON THIS MACHINE")
             }

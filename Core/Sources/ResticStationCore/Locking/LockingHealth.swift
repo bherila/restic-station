@@ -133,18 +133,23 @@ public enum LockingHealth {
                 diagnosticFailure = diagnosticFailure ?? classified
             }
         }
-        // The secrets lock serializes mutation only. Reads use the atomic
-        // secrets file directly, so damage here is an administrative outage,
-        // not evidence that configured backup operations cannot run.
-        let administrativeFailure: LockingHealthFailure?
-        if secretBackend == .file {
+        // Config and secrets locks serialize administrative mutation only.
+        // Reads use the atomic files directly, so damage here is not evidence
+        // that configured backup operations cannot run.
+        var administrativeFailure = FileLock(
+            path: paths.configLockFile, trustedRoot: paths.root
+        ).probe(createIfMissing: false).map {
+            LockingHealthFailure(scope: .administrative, failure: $0)
+        }
+        // Both production backends mutate under secrets.lock: the file
+        // backend protects its JSON read-modify-write, and the keychain
+        // backend protects multi-item capture/update/conditional rollback.
+        if administrativeFailure == nil {
             administrativeFailure = FileLock(
                 path: paths.secretsLockFile, trustedRoot: paths.root
             ).probe(createIfMissing: false).map {
                 LockingHealthFailure(scope: .administrative, failure: $0)
             }
-        } else {
-            administrativeFailure = nil
         }
 
         // These companion locks protect shared local state outside

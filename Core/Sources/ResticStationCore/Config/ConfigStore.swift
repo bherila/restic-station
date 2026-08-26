@@ -54,7 +54,37 @@ public struct ConfigStore: Sendable {
     /// retaken over the post-migration bytes. Migration is one-way and
     /// terminates, so the retry cannot loop.
     public func snapshot() throws -> ConfigSnapshot {
-        guard let bytes = try? Data(contentsOf: paths.configFile) else {
+        try withConfigReadLock { migrationAllowed in
+            try snapshotLocked(migrationAllowed: migrationAllowed)
+        }
+    }
+
+    /// Main-actor clients use this form so lock contention waits on a worker
+    /// rather than freezing the UI for the read lock's bounded retry period.
+    public func snapshotAsync() async throws -> ConfigSnapshot {
+        try await Task.detached { try snapshot() }.value
+    }
+
+    /// Re-reads the live revision away from an actor that must remain
+    /// responsive. Unlike ``fileFingerprint()``, failures are preserved;
+    /// unlike calling ``currentFileFingerprint()`` on the caller, ordinary
+    /// writer contention cannot block that caller's executor.
+    public func currentFileFingerprintAsync() async throws -> String {
+        try await Task.detached { try currentFileFingerprint() }.value
+    }
+
+    /// Recovery-only read after an atomic replacement has already reported
+    /// an uncertain outcome. It deliberately does not acquire config.lock:
+    /// callers need an immediate best-effort classification, never a
+    /// 60-second wait on the UI actor. Atomic replacement means one read sees
+    /// one whole file; a concurrent raw/invalid write simply decodes as
+    /// unreadable and remains uncertain.
+    public func reconciliationSnapshot() throws -> ConfigSnapshot {
+        try snapshotLocked(migrationAllowed: false)
+    }
+
+    private func snapshotLocked(migrationAllowed: Bool) throws -> ConfigSnapshot {
+        guard let bytes = try readConfigBytes() else {
             return ConfigSnapshot(bytes: Data(), fingerprint: "absent", config: AppConfig())
         }
         let decoded = try Self.makeDecoder().decode(AppConfig.self, from: bytes)
@@ -63,14 +93,21 @@ public struct ConfigStore: Sendable {
         }
         try decoded.validate()
         guard decoded.version == AppConfig.currentVersion else {
-            _ = try load()   // migrates and rewrites
+            guard migrationAllowed else {
+                return ConfigSnapshot(
+                    bytes: bytes,
+                    fingerprint: SHA256Digest.hex(bytes),
+                    config: decoded
+                )
+            }
+            _ = try loadLocked(migrationAllowed: true)   // migrates and rewrites under this lock
             return try snapshotAfterMigration()
         }
         return ConfigSnapshot(bytes: bytes, fingerprint: SHA256Digest.hex(bytes), config: decoded)
     }
 
     private func snapshotAfterMigration() throws -> ConfigSnapshot {
-        guard let bytes = try? Data(contentsOf: paths.configFile) else {
+        guard let bytes = try readConfigBytes() else {
             return ConfigSnapshot(bytes: Data(), fingerprint: "absent", config: AppConfig())
         }
         let decoded = try Self.makeDecoder().decode(AppConfig.self, from: bytes)
@@ -100,7 +137,14 @@ public struct ConfigStore: Sendable {
     /// A missing file is a valid, empty configuration (see ``load()``), so
     /// it fingerprints as a fixed sentinel rather than failing.
     public func fileFingerprint() -> String {
-        guard let data = try? Data(contentsOf: paths.configFile) else { return "absent" }
+        (try? currentFileFingerprint()) ?? "unreadable"
+    }
+
+    /// The exact on-disk revision used by compare-and-swap saves. Unlike the
+    /// convenience ``fileFingerprint()``, an unreadable existing file throws
+    /// rather than being collapsed into the same sentinel as absence.
+    public func currentFileFingerprint() throws -> String {
+        guard let data = try readConfigBytes() else { return "absent" }
         return SHA256Digest.hex(data)
     }
 
@@ -113,6 +157,17 @@ public struct ConfigStore: Sendable {
     /// is the *shared*, machine-agnostic view. Call
     /// `AppConfig.resolved(for:)` to get the effective one for this host.
     public func load() throws -> AppConfig {
+        try withConfigReadLock { migrationAllowed in
+            try loadLocked(migrationAllowed: migrationAllowed)
+        }
+    }
+
+    /// The read/validate/migrate body. A usable `config.lock` lets the caller
+    /// pass `migrationAllowed: true`; otherwise this remains a read-only load
+    /// of the original schema. Keeping migrations and ordinary readers on the
+    /// same lock as writers means a rejected Darwin exchange can never expose
+    /// its candidate to a helper between swap and rollback.
+    private func loadLocked(migrationAllowed: Bool) throws -> AppConfig {
         let fileManager = FileManager.default
         guard fileManager.fileExists(atPath: paths.configFile.path) else {
             return AppConfig()
@@ -133,6 +188,7 @@ public struct ConfigStore: Sendable {
         guard config.version < AppConfig.currentVersion else {
             return config
         }
+        guard migrationAllowed else { return config }
         let migration = migrateToCurrentVersion(config, originalBytes: data)
         // Mirrors the original single-function behavior exactly: config.json
         // is never overwritten unless the v1 backup is confirmed on disk —
@@ -141,7 +197,8 @@ public struct ConfigStore: Sendable {
             return migration.config
         }
         do {
-            try save(migration.config)
+            try migration.config.validate()
+            try persist(Self.makeEncoder().encode(migration.config))
         } catch {
             Self.warn("could not write the migrated config.json: \(error)")
         }
@@ -293,8 +350,153 @@ public struct ConfigStore: Sendable {
         try paths.ensureDirectories()
 
         let data = try Self.makeEncoder().encode(config)
+        try withConfigWriteLock {
+            try persist(data)
+        }
+    }
+
+    /// Saves only when `config.json` is still the exact byte revision the
+    /// caller began editing. Every Restic Station writer is serialized by
+    /// `locks/config.lock`. On Darwin, where the app runs, the candidate is
+    /// atomically exchanged with `config.json` and the displaced bytes are
+    /// checked, so even a non-cooperating fleet replacement cannot land in
+    /// the old check-to-rename window. Other platforms rely on the shared
+    /// lock used by the helper's supported config writers.
+    ///
+    /// - Returns: the fingerprint of the bytes installed by this save.
+    @discardableResult
+    public func save(_ config: AppConfig, ifUnchangedFrom expectedFingerprint: String) throws -> String {
+        try config.validate()
+        try paths.ensureDirectories()
+
+        let data = try Self.makeEncoder().encode(config)
+        return try withConfigWriteLock {
+            try data.write(to: tempConfigFile)
+            let installed = try AtomicFile.replaceIfMatches(
+                from: tempConfigFile,
+                to: paths.configFile,
+                expectedFingerprint: expectedFingerprint,
+                candidateFingerprint: SHA256Digest.hex(data)
+            )
+            guard installed else {
+                try? FileManager.default.removeItem(at: tempConfigFile)
+                throw ConfigStoreError.changedOnDisk
+            }
+            return SHA256Digest.hex(data)
+        }
+    }
+
+    /// Refuses an edit before it performs a related side effect outside
+    /// `config.json` (the destination editor's keychain write). The config
+    /// save still performs the authoritative atomic compare-and-swap.
+    public func assertUnchanged(from expectedFingerprint: String) throws {
+        try withConfigWriteLock {
+            guard try currentFileFingerprint() == expectedFingerprint else {
+                throw ConfigStoreError.changedOnDisk
+            }
+        }
+    }
+
+    /// Runs a related asynchronous mutation while the exact edit-start
+    /// revision remains protected by `config.lock`. A second fingerprint
+    /// check catches a raw, non-cooperating filesystem replacement during
+    /// the operation; the caller can then restore the related mutation.
+    public func withUnchangedRevision<T>(
+        from expectedFingerprint: String,
+        operation: () async throws -> T
+    ) async throws -> T {
+        try paths.ensureDirectories()
+        let lock = FileLock(path: paths.configLockFile, trustedRoot: paths.root)
+        switch lock.acquire() {
+        case .acquired:
+            break
+        case .busy:
+            throw ConfigStoreError.writeLockBusy(path: paths.configLockFile.path)
+        case .failed(let failure):
+            throw ConfigStoreError.writeLockUnusable(failure)
+        }
+        defer { lock.release() }
+
+        guard try unchangedRevisionFingerprint() == expectedFingerprint else {
+            throw ConfigStoreError.changedOnDisk
+        }
+        let result = try await operation()
+        guard try unchangedRevisionFingerprint() == expectedFingerprint else {
+            throw ConfigStoreError.changedOnDisk
+        }
+        return result
+    }
+
+    /// Turns raw Foundation I/O failures into a configuration-domain error
+    /// before callers enter their secret-backend fallback copy.
+    private func unchangedRevisionFingerprint() throws -> String {
+        do {
+            return try currentFileFingerprint()
+        } catch let error as ConfigStoreError {
+            throw error
+        } catch {
+            throw ConfigStoreError.readFailed(path: paths.configFile.path, reason: "\(error)")
+        }
+    }
+
+    private func persist(_ data: Data) throws {
         try data.write(to: tempConfigFile)
         try AtomicFile.rename(from: tempConfigFile, to: paths.configFile)
+    }
+
+    private func readConfigBytes() throws -> Data? {
+        guard FileManager.default.fileExists(atPath: paths.configFile.path) else {
+            return nil
+        }
+        return try Data(contentsOf: paths.configFile)
+    }
+
+    private func withConfigWriteLock<T>(_ body: () throws -> T) throws -> T {
+        let lock = FileLock(path: paths.configLockFile, trustedRoot: paths.root)
+        switch lock.acquire() {
+        case .acquired:
+            defer { lock.release() }
+            return try body()
+        case .busy:
+            throw ConfigStoreError.writeLockBusy(path: paths.configLockFile.path)
+        case .failed(let failure):
+            throw ConfigStoreError.writeLockUnusable(failure)
+        }
+    }
+
+    /// Readers wait out ordinary writer contention, so a keychain-backed
+    /// destination edit cannot turn a valid config into a transient helper
+    /// outage and none can observe Darwin's exchange/rollback window. A
+    /// structurally unusable lock falls back to a strictly non-migrating
+    /// read: backups remain readable, but no schema side effect can run
+    /// without the administrative lock.
+    private func withConfigReadLock<T>(_ body: (Bool) throws -> T) throws -> T {
+        // A pre-lock release legitimately has no locks/ directory yet. Give
+        // the normal upgrade path a chance to establish it before deciding
+        // that migration is unavailable. A real setup failure still falls
+        // back to a strictly read-only load below.
+        do {
+            try paths.ensureDirectories()
+        } catch {
+            return try body(false)
+        }
+        let lock = FileLock(path: paths.configLockFile, trustedRoot: paths.root)
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(60))
+        while true {
+            switch lock.acquire() {
+            case .acquired:
+                defer { lock.release() }
+                return try body(true)
+            case .busy:
+                guard clock.now < deadline else {
+                    throw ConfigStoreError.writeLockBusy(path: paths.configLockFile.path)
+                }
+                usleep(20_000)
+            case .failed:
+                return try body(false)
+            }
+        }
     }
 
     // MARK: - Encoding
@@ -372,16 +574,266 @@ enum AtomicFile {
             throw ConfigStoreError.renameFailed(errno: renameErrno, from: fromPath, to: toPath)
         }
     }
+
+    /// Atomically installs `source` only when `destination` is the revision
+    /// the caller edited. Darwin's `RENAME_SWAP` supplies the missing atomic
+    /// boundary: the bytes displaced by the swap are the exact bytes that
+    /// were present when the candidate became visible. A mismatch is rolled
+    /// back with exclusive renames so a later raw replacement always wins.
+    static func replaceIfMatches(
+        from source: URL,
+        to destination: URL,
+        expectedFingerprint: String,
+        candidateFingerprint: String
+    ) throws -> Bool {
+        #if canImport(Darwin)
+        if expectedFingerprint == "absent" {
+            let result = renameX(from: source, to: destination, flags: UInt32(RENAME_EXCL))
+            if result == 0 { return true }
+            let failure = errno
+            if failure == EEXIST { return false }
+            throw ConfigStoreError.renameFailed(
+                errno: failure, from: source.path, to: destination.path
+            )
+        }
+
+        let swap = renameX(from: source, to: destination, flags: UInt32(RENAME_SWAP))
+        if swap != 0 {
+            let failure = errno
+            if failure == ENOENT { return false }
+            throw ConfigStoreError.renameFailed(
+                errno: failure, from: source.path, to: destination.path
+            )
+        }
+
+        let displacedFingerprint: String
+        do {
+            displacedFingerprint = SHA256Digest.hex(try Data(contentsOf: source))
+        } catch {
+            _ = try rollbackCandidateIfCurrent(
+                displaced: source,
+                destination: destination,
+                candidateFingerprint: candidateFingerprint
+            )
+            throw error
+        }
+
+        guard displacedFingerprint != expectedFingerprint else {
+            try? FileManager.default.removeItem(at: source)
+            return true
+        }
+
+        _ = try rollbackCandidateIfCurrent(
+            displaced: source,
+            destination: destination,
+            candidateFingerprint: candidateFingerprint
+        )
+        return false
+        #else
+        // The Linux helper's supported writers all use `config.lock`.
+        // Linux has renameat2(RENAME_EXCHANGE), but Swift's Glibc/Musl
+        // overlays do not expose it consistently across supported builders.
+        let actual = if FileManager.default.fileExists(atPath: destination.path) {
+            SHA256Digest.hex(try Data(contentsOf: destination))
+        } else {
+            "absent"
+        }
+        guard actual == expectedFingerprint else { return false }
+        try rename(from: source, to: destination)
+        return true
+        #endif
+    }
+
+    #if canImport(Darwin)
+    private static func renameX(from source: URL, to destination: URL, flags: UInt32) -> Int32 {
+        source.path.withCString { fromC in
+            destination.path.withCString { toC in
+                Darwin.renamex_np(fromC, toC, flags)
+            }
+        }
+    }
+
+    /// Refuses an exchanged candidate without ever swapping a newer raw
+    /// replacement back out of `config.json`. The live name is first moved
+    /// to a private sibling. If it is our candidate, the displaced revision
+    /// is restored with `RENAME_EXCL`; if it is an external replacement,
+    /// that exact newer file is restored instead. A writer that lands in the
+    /// short name-vacant interval wins because every restore is exclusive.
+    ///
+    /// Internal for the Darwin race regression: tests can begin from the
+    /// exact post-exchange state without a timing-dependent syscall hook.
+    @discardableResult
+    static func rollbackCandidateIfCurrent(
+        displaced source: URL,
+        destination: URL,
+        candidateFingerprint: String
+    ) throws -> Bool {
+        let evacuated = destination.deletingLastPathComponent().appendingPathComponent(
+            destination.lastPathComponent + ".rollback-live-" + UUID().uuidString + ".json",
+            isDirectory: false
+        )
+        let evacuate = renameX(from: destination, to: evacuated, flags: UInt32(RENAME_EXCL))
+        guard evacuate == 0 else {
+            let evacuateErrno = errno
+            if evacuateErrno == ENOENT {
+                // A raw writer removed the candidate. Absence is itself a
+                // valid external revision; never resurrect displaced bytes
+                // over that later deletion.
+                try? FileManager.default.removeItem(at: source)
+                return false
+            }
+            throw ConfigStoreError.replacementRollbackFailed(
+                errno: evacuateErrno, candidateMayBeInstalledAt: destination.path
+            )
+        }
+
+        let evacuatedIsCandidate: Bool
+        do {
+            evacuatedIsCandidate = SHA256Digest.hex(try Data(contentsOf: evacuated))
+                == candidateFingerprint
+        } catch {
+            // We cannot classify these bytes, so put the exact file that was
+            // live back without overwriting a writer that arrived meanwhile.
+            let restore = renameX(from: evacuated, to: destination, flags: UInt32(RENAME_EXCL))
+            if restore == 0 {
+                let recovery = try preserveRollbackArtifact(from: source, beside: destination)
+                throw ConfigStoreError.rollbackArtifactPreserved(path: recovery.path)
+            }
+            if errno == EEXIST {
+                try? FileManager.default.removeItem(at: evacuated)
+                try? FileManager.default.removeItem(at: source)
+                return false
+            }
+            // config.json is still absent and the bytes that were live are
+            // stranded at `evacuated`. The original read error no longer
+            // describes the commit state; surface the preserved location as
+            // uncertain so paired side effects are not rolled back blindly.
+            throw ConfigStoreError.rollbackArtifactPreserved(path: evacuated.path)
+        }
+
+        let revisionToRestore = evacuatedIsCandidate ? source : evacuated
+        let restore = renameX(
+            from: revisionToRestore,
+            to: destination,
+            flags: UInt32(RENAME_EXCL)
+        )
+        if restore == 0 {
+            if evacuatedIsCandidate {
+                try? FileManager.default.removeItem(at: evacuated)
+            } else {
+                // The replacement that arrived before rollback is live
+                // again; the older displaced revision is no longer needed.
+                try? FileManager.default.removeItem(at: source)
+            }
+            return evacuatedIsCandidate
+        }
+
+        let restoreErrno = errno
+        if restoreErrno == EEXIST {
+            // A still-newer raw writer won the vacant-name race. Never
+            // overwrite it with either the candidate or an older revision.
+            try? FileManager.default.removeItem(at: evacuated)
+            try? FileManager.default.removeItem(at: source)
+            return false
+        }
+
+        // No safe live-name mutation remains. Preserve the non-candidate
+        // bytes under a unique recovery name and report the exact path.
+        if evacuatedIsCandidate {
+            try? FileManager.default.removeItem(at: evacuated)
+            let recovery = try preserveRollbackArtifact(from: source, beside: destination)
+            throw ConfigStoreError.rollbackArtifactPreserved(path: recovery.path)
+        }
+        let recovery = evacuated
+        if FileManager.default.fileExists(atPath: source.path) {
+            _ = try? preserveRollbackArtifact(from: source, beside: destination)
+        }
+        throw ConfigStoreError.rollbackArtifactPreserved(path: recovery.path)
+    }
+
+    /// Moves an artifact out of the fixed `.tmp` path without replacing
+    /// anything. The caller has already discovered that it cannot safely
+    /// discard these bytes; a unique sibling survives this failed save and
+    /// cannot be overwritten by the next ordinary attempt.
+    private static func preserveRollbackArtifact(
+        from source: URL,
+        beside destination: URL
+    ) throws -> URL {
+        let recovery = destination.deletingLastPathComponent().appendingPathComponent(
+            destination.lastPathComponent + ".rollback-" + UUID().uuidString + ".json",
+            isDirectory: false
+        )
+        let preserve = renameX(from: source, to: recovery, flags: UInt32(RENAME_EXCL))
+        guard preserve == 0 else {
+            let preserveErrno = errno
+            throw ConfigStoreError.rollbackArtifactPreservationFailed(
+                errno: preserveErrno,
+                artifactMayRemainAt: source.path
+            )
+        }
+        return recovery
+    }
+    #endif
 }
 
 /// Low-level failures from `ConfigStore.save(_:)`'s atomic rename step.
 public enum ConfigStoreError: Error, Equatable, Sendable, CustomStringConvertible {
     case renameFailed(errno: Int32, from: String, to: String)
+    case readFailed(path: String, reason: String)
+    case replacementRollbackFailed(errno: Int32, candidateMayBeInstalledAt: String)
+    case rollbackArtifactPreserved(path: String)
+    case rollbackArtifactPreservationFailed(errno: Int32, artifactMayRemainAt: String)
+    case changedOnDisk
+    case writeLockBusy(path: String)
+    case writeLockUnusable(LockFailure)
 
     public var description: String {
         switch self {
         case .renameFailed(let errno, let from, let to):
             return "rename(\(from), \(to)) failed: errno \(errno)"
+        case .readFailed(let path, let reason):
+            return "could not read \(path) while verifying its revision: \(reason)"
+        case .replacementRollbackFailed(let errno, let path):
+            return "could not roll back a refused config replacement (errno \(errno)); "
+                + "the uncommitted candidate may be installed at \(path)"
+        case .rollbackArtifactPreserved(let path):
+            return "config.json save recovery could not determine or restore the live revision; "
+                + "an uncertain rollback artifact "
+                + "was preserved at \(path); reload settings and reconcile that file before saving"
+        case .rollbackArtifactPreservationFailed(let errno, let path):
+            return "config.json save recovery could not preserve a rollback artifact (errno \(errno)); "
+                + "the commit state remains uncertain and an artifact may remain at \(path); "
+                + "reload settings and reconcile before saving"
+        case .changedOnDisk:
+            return "config.json changed on disk; reload the latest settings before saving"
+        case .writeLockBusy(let path):
+            return "another process is changing config.json (lock busy: \(path)); reload and try again"
+        case .writeLockUnusable(let failure):
+            return "cannot safely lock config.json for writing: \(failure)"
+        }
+    }
+
+    /// These cases mean the caller's edit revision lost to an external
+    /// writer or recovery could not prove otherwise, and should expose the
+    /// same reload affordance.
+    public var isRevisionConflict: Bool {
+        switch self {
+        case .changedOnDisk, .rollbackArtifactPreserved, .rollbackArtifactPreservationFailed:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// The save failed after a Darwin exchange entered recovery, so callers
+    /// must inspect the live config before undoing any related side effect.
+    public var commitMayBeUncertain: Bool {
+        switch self {
+        case .replacementRollbackFailed, .rollbackArtifactPreserved,
+             .rollbackArtifactPreservationFailed:
+            return true
+        default:
+            return false
         }
     }
 }
