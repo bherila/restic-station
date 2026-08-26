@@ -1850,6 +1850,7 @@ public final class BackupEngine: Sendable {
             let purgeResult = await purgeChild(
                 destination: destination,
                 snapshotIDs: plan.matched.map(\.id),
+                repositorySnapshotIDs: Set((plan.matched + plan.unattributed).map(\.id)),
                 patterns: plan.patterns,
                 repositoryId: repositoryId,
                 destinationSecretEnv: destinationSecretEnv,
@@ -2018,6 +2019,31 @@ public final class BackupEngine: Sendable {
         return config.id
     }
 
+    private func purgeSnapshotIDs(
+        destination: Destination,
+        destinationSecretEnv: [String: String],
+        executable: ResticRunner.MaintenanceExecutable
+    ) async throws -> Set<String> {
+        let outcome: ResticOutcome
+        do {
+            outcome = try await restic.run(
+                .snapshots(repo: destination.repoURL),
+                for: ResticInvocation(
+                    destination: destination,
+                    destinationSecretEnv: destinationSecretEnv,
+                    expectedExecutableIdentity: executable.identity
+                )
+            )
+        } catch {
+            throw PurgeApplyError.unavailable
+        }
+        guard outcome.status == .success,
+              let snapshots = try? parseSnapshots(Data(outcome.rawOutput.utf8)) else {
+            throw PurgeApplyError.unavailable
+        }
+        return Set(snapshots.map(\.id))
+    }
+
     private static func hasUnambiguousRewriteTranscriptIDs(_ snapshotIDs: [String]) -> Bool {
         let transcriptIDs = snapshotIDs.map { String($0.prefix(8)) }
         return transcriptIDs.allSatisfy { $0.count == 8 }
@@ -2030,6 +2056,7 @@ public final class BackupEngine: Sendable {
     private func purgeChild(
         destination: Destination,
         snapshotIDs: [String],
+        repositorySnapshotIDs: Set<String>,
         patterns: [String],
         repositoryId: String,
         destinationSecretEnv: [String: String],
@@ -2098,6 +2125,23 @@ public final class BackupEngine: Sendable {
                         "the repository changed after purge validation"
                     )
                 }
+                let launchSnapshotIDs: Set<String>
+                do {
+                    launchSnapshotIDs = try await self.purgeSnapshotIDs(
+                        destination: destination,
+                        destinationSecretEnv: destinationSecretEnv,
+                        executable: executable
+                    )
+                } catch {
+                    throw ResticRunnerError.launchFailed(
+                        "the repository snapshots could not be revalidated at purge launch"
+                    )
+                }
+                guard launchSnapshotIDs == repositorySnapshotIDs else {
+                    throw ResticRunnerError.launchFailed(
+                        "the repository snapshots changed after purge validation"
+                    )
+                }
             },
             afterLaunchFailure: afterLaunchFailure,
             callerHoldsDestructiveAuditGate: callerHoldsDestructiveAuditGate,
@@ -2145,7 +2189,8 @@ public final class BackupEngine: Sendable {
                   metadata.kind == .purge,
                   metadata.setId == setId,
                   metadata.destId == entry.destId,
-                  metadata.status == .success else {
+                  metadata.status == .success,
+                  metadata.indexEntry == entry else {
                 throw RunStoreError.discardUnsafe(
                     path: paths.runMetadataFile(runId: entry.runId).path
                 )

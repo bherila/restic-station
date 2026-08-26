@@ -363,9 +363,14 @@ launch-bound `purgeRepositoryId` matches that live repository **and** whose
 recorded old-to-new snapshot mapping matches the live post-rewrite generation
 (every old id absent, every new id present exactly once). The repository id is
 queried again inside the runner immediately before the synchronous
-executable/token/audit/spawn boundary; a replacement in the earlier planning
-window refuses launch and restores a first-child token. The full snapshot ids
-selected for every destination must also have unique eight-character prefixes,
+executable/token/audit/spawn boundary, and the complete repository snapshot-id
+set is re-listed there and compared with the generation observed during token
+revalidation. A replacement or stale-host backup in the earlier planning
+window refuses launch and restores a first-child token. Watermark recovery
+likewise rechecks that canonical purge metadata still reproduces the exact
+verified index projection, including its purge-evidence digest, at the point
+that evidence is consumed. The full snapshot ids selected for every destination
+must also have unique eight-character prefixes,
 because those prefixes are the only old-id keys in restic's rewrite transcript;
 ambiguity refuses before token consumption or destructive launch. Recovery
 consumes the stale token and does not rewrite the repository again. Evidence
