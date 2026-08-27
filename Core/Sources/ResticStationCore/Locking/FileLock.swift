@@ -598,6 +598,23 @@ public final class FileLock: @unchecked Sendable {
         // Callers holding safety-authoritative state pass
         // `tightenExisting: false` for exactly that reason: with no automatic
         // repair there is no interval in which evidence can be destroyed.
+        // Order matters: a mode can be *both* restrictive and exposed (`0333`
+        // is owner-write-only and world-writable at once). Only the exposure
+        // branch carries the trusted-copy warning, and on the `Tick` path this
+        // is the operator's only message, so exposure is diagnosed first —
+        // its `chmod` repairs the restrictive half too.
+        if let guidance = unsafeExistingGuidance, !createdDirectory, info.st_mode & 0o022 != 0 {
+            return LockFailure(
+                path: directoryPath,
+                operation: "protected directory writable by other users "
+                    + "(mode \(String(info.st_mode & 0o777, radix: 8))) — not repaired "
+                    + "automatically, because that would erase the evidence; after confirming no "
+                    + "other user has written to it, run chmod \(String(mode, radix: 8)) "
+                    + "\(ShellQuoting.quoteIfNeeded(directoryPath)). \(guidance)",
+                errnoValue: 0
+            )
+        }
+
         // Not repairing an existing mode means a *restrictive* one is no
         // longer normalised either, and `0500` (no owner write) or `0600` (no
         // owner search) leaves the directory unusable — locks and temp files
@@ -611,18 +628,6 @@ public final class FileLock: @unchecked Sendable {
                     + "\(String(info.st_mode & 0o777, radix: 8)) denies the owner access it "
                     + "needs — it is not repaired automatically; run chmod "
                     + "\(String(mode, radix: 8)) \(ShellQuoting.quoteIfNeeded(directoryPath))",
-                errnoValue: 0
-            )
-        }
-
-        if let guidance = unsafeExistingGuidance, !createdDirectory, info.st_mode & 0o022 != 0 {
-            return LockFailure(
-                path: directoryPath,
-                operation: "protected directory writable by other users "
-                    + "(mode \(String(info.st_mode & 0o777, radix: 8))) — not repaired "
-                    + "automatically, because that would erase the evidence; after confirming no "
-                    + "other user has written to it, run chmod \(String(mode, radix: 8)) "
-                    + "\(ShellQuoting.quoteIfNeeded(directoryPath)). \(guidance)",
                 errnoValue: 0
             )
         }

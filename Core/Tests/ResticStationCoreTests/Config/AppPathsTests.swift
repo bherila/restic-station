@@ -433,7 +433,9 @@ struct AppPathsEnvTests {
     /// installs over a privacy nit — and repairing it is what reintroduces the
     /// window this whole guard closes, since a refusal cannot be atomic with a
     /// later `fchmodat`. `state/` therefore behaves like `runs/` and `locks/`:
-    /// left alone and reported by live health.
+    /// left alone — and, like theirs, not surfaced by health either, since
+    /// `verifyDirectory` rejects only group/world write. Accepted, not
+    /// reported.
     @Test("a pre-existing 0755 state/ is left alone, neither refused nor tightened")
     func ensureDirectoriesLeavesABenignStateDirectoryAlone() throws {
         let (paths, root) = makeTempPaths()
@@ -456,6 +458,44 @@ struct AppPathsEnvTests {
     /// no longer normalised either, and `0500`/`0600` leave the directory
     /// unusable — locks and temp files cannot be created, and valid state
     /// reads as corrupt. Refuse rather than accept a broken tree.
+    /// A mode can be both restrictive and exposed at once — `0333` is
+    /// owner-write-only *and* world-writable. Only the exposure branch carries
+    /// the trusted-copy warning, and on the `Tick` path this is the operator's
+    /// only message, so an ordering that let the restrictive branch win would
+    /// let someone chmod and restart without ever learning another uid may
+    /// have swapped in a checksum-valid forged watermark.
+    @Test("a mode that is both restrictive and exposed is diagnosed as the exposure")
+    func ensureDirectoriesPrefersTheExposureDiagnosis() throws {
+        // All keep owner execute, so the directory opens on both platforms
+        // and the *ordering* is what the assertion exercises — not Darwin's
+        // `O_SEARCH` refusing before either branch runs.
+        for mode in [mode_t(0o333), mode_t(0o533), mode_t(0o133)] {
+            let (paths, root) = makeTempPaths()
+            defer {
+                try? FileManager.default.setAttributes(
+                    [.posixPermissions: NSNumber(value: mode_t(0o700))],
+                    ofItemAtPath: paths.stateDir.path
+                )
+                try? FileManager.default.removeItem(at: root)
+            }
+            try paths.ensureDirectories()
+            try FileManager.default.setAttributes(
+                [.posixPermissions: NSNumber(value: mode)],
+                ofItemAtPath: paths.stateDir.path
+            )
+
+            do {
+                try paths.ensureDirectories()
+                Issue.record("mode \(String(mode, radix: 8)) must refuse")
+            } catch {
+                let text = "\(error)"
+                let label = "mode \(String(mode, radix: 8))"
+                #expect(text.contains("writable by other users"), "\(label)")
+                #expect(text.contains("against a trusted copy"), "\(label)")
+            }
+        }
+    }
+
     /// `0500` keeps owner search, so the directory opens on both platforms and
     /// the mode check is what refuses it — the case that pins the guidance.
     @Test("a pre-existing 0500 state/ refuses setup and names the chmod")

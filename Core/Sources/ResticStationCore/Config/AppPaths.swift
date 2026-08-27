@@ -433,10 +433,13 @@ public struct AppPaths: Equatable, Sendable {
         // both refuses *and* repairs still has an interval in which a widen
         // lands after the check and is erased by the chmod. Not repairing at
         // all removes the interval rather than narrowing it. Benign widening
-        // (`0755`) is therefore left in place and reported by live health,
-        // exactly as `runs/` and `locks/` already are — the protection that
-        // matters inside `state/` is per-file anyway, and a newly created
-        // directory is still pinned to `0700`.
+        // (`0755`) is therefore left in place, exactly as it is for `runs/`
+        // and `locks/` — and, like theirs, *not* surfaced by live health
+        // either, since `FileLock.verifyDirectory` rejects only group/world
+        // write. It is accepted rather than reported: a listable directory
+        // exposes nothing another uid can act on, and the protection that
+        // matters inside `state/` is per-file. A newly created directory is
+        // still pinned to `0700`.
         //
         // Because `Tick` exits at this call, the refusal must also carry the
         // trusted-copy guidance the schedule-state reader would have given;
