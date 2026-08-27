@@ -122,7 +122,8 @@ executable replacement, malformed reply, or failed query fails closed. Exit 0
 then proves only that those exact operands arrived: another host can still add
 a primary snapshot at any later instant, and the CLI exposes no transaction
 that spans both repositories. A bounded copy therefore never advances the
-mirror's `lastSyncedAt` and never runs mirror retention.
+mirror's `lastSyncedAt` and never runs retention on either the mirror or the
+primary.
 
 ### snapshots
 ```

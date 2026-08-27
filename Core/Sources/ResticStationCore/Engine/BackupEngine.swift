@@ -645,24 +645,34 @@ public final class BackupEngine: Sendable {
         }
 
         // ── Step 8: retention on the primary ────────────────────────────
-        switch await forgetChild(
-            destination: primary,
-            policy: set.retention,
-            setId: set.id,
-            trigger: trigger,
-            groupId: groupId
-        ) {
-        case .completed(let prune):
-            children.append(prune.child)
-            if let reason = prune.infrastructureFailureReason {
+        // The same cross-repository gap that prevents a bounded copy from
+        // authorizing mirror retention also prevents it from authorizing
+        // primary retention. A peer snapshot omitted from the bounded copy
+        // must remain on the primary until the next purge/copy cycle.
+        if primaryPurgeSnapshotPrefixes.isEmpty {
+            switch await forgetChild(
+                destination: primary,
+                policy: set.retention,
+                setId: set.id,
+                trigger: trigger,
+                groupId: groupId
+            ) {
+            case .completed(let prune):
+                children.append(prune.child)
+                if let reason = prune.infrastructureFailureReason {
+                    infrastructureFailures.append("primary \"\(primary.label)\": \(reason)")
+                }
+            case .infrastructureFailure(let reason):
                 infrastructureFailures.append("primary \"\(primary.label)\": \(reason)")
+            case .deferred:
+                break
+            case .notRequired:
+                break
             }
-        case .infrastructureFailure(let reason):
-            infrastructureFailures.append("primary \"\(primary.label)\": \(reason)")
-        case .deferred:
-            break
-        case .notRequired:
-            break
+        } else {
+            logWarning(
+                "BackupEngine: bounded primary generation — withholding primary retention"
+            )
         }
 
         // ── Step 9: current-run cleared and lock released by the defers ─

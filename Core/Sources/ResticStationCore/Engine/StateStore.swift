@@ -796,7 +796,7 @@ public struct StateStore: Sendable {
         let directoryFD = fileOperations.openAt(
             AT_FDCWD,
             paths.stateDir.path,
-            O_RDONLY | O_DIRECTORY | O_CLOEXEC,
+            O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW,
             0
         )
         guard directoryFD >= 0 else {
@@ -878,7 +878,7 @@ public struct StateStore: Sendable {
         let directoryFD = fileOperations.openAt(
             AT_FDCWD,
             paths.stateDir.path,
-            O_RDONLY | O_DIRECTORY | O_CLOEXEC,
+            O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW,
             0
         )
         guard directoryFD >= 0 else {

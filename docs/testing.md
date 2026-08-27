@@ -88,6 +88,8 @@ Model limits, deliberately: crashes replay at seam-call boundaries against the r
 The recovery regressions include duplicate result-prefix history where one
 colliding result was deleted and replaced by an unrelated snapshot; that
 history cannot repair the watermark or suppress the required rewrite.
+Directory-level symlink coverage proves schedule-state reads refuse before
+following `state/`, complementing the existing canonical-file symlink test.
 
 ## Layer 2 — integration script (`scripts/integration-test.sh`)
 

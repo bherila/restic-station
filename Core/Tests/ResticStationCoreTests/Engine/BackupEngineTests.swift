@@ -4133,7 +4133,6 @@ struct BackupEngineTests {
                 dest: secondary.id,
                 from: env.primary.id
             )
-            + Self.resticCall(Self.forgetArgv(env.primary.repoURL), dest: env.primary.id)
 
         let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
 
@@ -4159,7 +4158,6 @@ struct BackupEngineTests {
                 from: env.primary.repoURL,
                 snapshotIDs: copiedSnapshotIDs
             ),
-            [Self.resticPath] + Self.forgetArgv(env.primary.repoURL),
         ]
         #expect(env.resticArgvs == expectedArgvs)
         #expect(copyExcludedLateSnapshot.value)
@@ -4168,9 +4166,10 @@ struct BackupEngineTests {
             return
         }
         #expect(status == .success)
-        #expect(children.map(\.kind) == [.backup, .purge, .purge, .copy, .prune])
+        #expect(children.map(\.kind) == [.backup, .purge, .purge, .copy])
         #expect(env.repoStatus(secondary)?.lastSyncedAt == nil)
         #expect(!env.resticArgvs.contains([Self.resticPath] + Self.forgetArgv(secondary.repoURL)))
+        #expect(!env.resticArgvs.contains([Self.resticPath] + Self.forgetArgv(env.primary.repoURL)))
         let applied = env.stateStore.readScheduleState()?.sets[Self.setId]?.appliedPurgeExcludes
         #expect(applied?[env.primary.id] == env.set.purgeExcludes)
         #expect(applied?[secondary.id] == env.set.purgeExcludes)
@@ -4463,8 +4462,6 @@ struct BackupEngineTests {
             ),
             dest: healthy.id,
             from: env.primary.id
-        ) + Self.resticCall(
-            Self.forgetArgv(env.primary.repoURL), dest: env.primary.id
         )
 
         let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
@@ -4480,7 +4477,7 @@ struct BackupEngineTests {
             snapshotIDs: copySnapshotIDs
         )))
         #expect(!env.resticArgvs.contains([Self.resticPath] + Self.forgetArgv(healthy.repoURL)))
-        #expect(env.resticArgvs.contains([Self.resticPath] + Self.forgetArgv(env.primary.repoURL)))
+        #expect(!env.resticArgvs.contains([Self.resticPath] + Self.forgetArgv(env.primary.repoURL)))
         #expect(!env.resticArgvs.contains { $0.contains("copy") && $0.contains(failing.repoURL) })
     }
 

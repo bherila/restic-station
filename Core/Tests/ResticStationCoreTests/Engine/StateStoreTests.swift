@@ -812,6 +812,38 @@ struct StateStoreTests {
         #expect(values.isSymbolicLink == true)
     }
 
+    @Test("a symlink at the schedule-state directory is never followed")
+    func scheduleStateDirectorySymlinkFailsClosed() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-state-dir-symlink-\(UUID().uuidString)")
+        let paths = AppPaths(root: root)
+        let outside = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-state-dir-target-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: outside)
+        }
+        try FileManager.default.createSymbolicLink(
+            at: paths.stateDir,
+            withDestinationURL: outside
+        )
+        let store = StateStore(paths: paths)
+
+        guard case .corrupt(let failure) = store.readScheduleStateResult() else {
+            Issue.record("a symlinked state directory was accepted as empty state")
+            return
+        }
+        guard case .ioFailure(let operation, _) = failure.reason else {
+            Issue.record("state-directory symlink refusal was misclassified: \(failure.reason)")
+            return
+        }
+        #expect(operation == "open state directory")
+        #expect(failure.quarantinePath == nil)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: outside.path).isEmpty)
+    }
+
     @Test("FIFO schedule and recovery paths are rejected without blocking")
     func scheduleStateFIFOsDoNotBlock() throws {
         let (store, root) = makeStore()

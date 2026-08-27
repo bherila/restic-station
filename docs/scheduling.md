@@ -313,7 +313,9 @@ snapshot a permanent omission. The fixed order is:
    as bounded copy operands; because no cross-repository transaction can
    exclude a later primary commit, a bounded copy never advances mirror
    freshness and never authorizes mirror retention;
-5. run primary retention last.
+5. run primary retention last only for an unbounded copy generation. A bounded
+   generation withholds retention on both mirrors and the primary because a
+   peer snapshot omitted from copy must remain recoverable at the source.
 
 **Attribution** decides which snapshots a purge is allowed to touch, and is
 therefore normative. A repository-wide `snapshots --json` listing is filtered

@@ -300,7 +300,32 @@ Secret-env item is optional (absent for local/sftp destinations without credenti
 {"runId":"20260726T205704Z-backup-6f9619ff","kind":"backup","setId":"6F9619FF-...","destId":"0A1B2C3D-...","status":"success","start":"2026-07-26T20:57:04Z","end":"2026-07-26T20:58:11Z","trigger":"scheduled","snapshotId":"f391ba97c096...","filesNew":3,"filesChanged":1,"dataAdded":67860,"errorSummary":null,"purgeEvidenceDigest":null}
 ```
 
-`kind`: `backup` | `copy` | `check` | `prune` | `purge` | `restore` | `init`. A scheduled set run produces **multiple** index lines: one `backup` (primary), an optional `purge` per destination with newly added `purgeExcludes`, one `copy` per attempted secondary, one `prune` per repo where retention ran. They share a `groupId` field (= the backup's runId) so the UI can nest them. A purge whose launch carries recovery evidence also projects `purgeEvidenceDigest`, a SHA-256 binding over a versioned, length-framed sequence of its repository config id, exact purge patterns, and sorted terminal old-to-new snapshot mapping; other and legacy records encode it as `null`. Audit verification recomputes this digest from canonical metadata, so changing any recovery field without the independently published index line is an audit mismatch and cannot authorize a watermark shortcut. Each append uses a complete-write loop that retries `EINTR`, then `fsync`s the index (also retrying `EINTR`) before releasing `index.jsonl.lock`; creation of the first index also syncs the `runs/` directory entry. Before appending, the writer reads only the final byte in the normal newline-terminated case. An unterminated corrupt tail triggers a bounded backward scan and is truncated to the last complete line (or a complete newline-less JSON record is terminated), so a recovery line cannot be concatenated onto corrupt JSON without making every normal append reread the full history. Recovery performs that repair before decoding its index snapshot, so a torn multibyte UTF-8 scalar cannot hide or duplicate the valid prefix. Decoding happens independently at byte-line boundaries, preserving valid records on either side of a newline-terminated line with invalid UTF-8. History readers take the last decodable projection for each run and order runs by canonical start time; an older repaired record therefore cannot masquerade as the latest run.
+`kind`: `backup` | `copy` | `check` | `prune` | `purge` | `restore` | `init`.
+A scheduled set run produces **multiple** index lines: one `backup` (primary),
+one `purge` per applicable destination whenever active `purgeExcludes` exist
+(including recurring no-op validation), one `copy` per attempted secondary,
+and one `prune` per repo where retention ran. They share a `groupId` field (=
+the backup's runId) so the UI can nest them. A purge whose launch carries
+recovery evidence also projects `purgeEvidenceDigest`, a SHA-256 binding over
+a versioned, length-framed sequence of its repository config id, exact purge
+patterns, and sorted terminal old-to-new snapshot mapping; other and legacy
+records encode it as `null`. Audit verification recomputes this digest from
+canonical metadata, so changing any recovery field without the independently
+published index line is an audit mismatch and cannot authorize a watermark
+shortcut. Each append uses a complete-write loop that retries `EINTR`, then
+`fsync`s the index (also retrying `EINTR`) before releasing `index.jsonl.lock`;
+creation of the first index also syncs the `runs/` directory entry. Before
+appending, the writer reads only the final byte in the normal newline-terminated
+case. An unterminated corrupt tail triggers a bounded backward scan and is
+truncated to the last complete line (or a complete newline-less JSON record is
+terminated), so a recovery line cannot be concatenated onto corrupt JSON
+without making every normal append reread the full history. Recovery performs
+that repair before decoding its index snapshot, so a torn multibyte UTF-8
+scalar cannot hide or duplicate the valid prefix. Decoding happens
+independently at byte-line boundaries, preserving valid records on either side
+of a newline-terminated line with invalid UTF-8. History readers take the last
+decodable projection for each run and order runs by canonical start time; an
+older repaired record therefore cannot masquerade as the latest run.
 
 ## runs/<runId>/metadata.json — `RunMetadata`
 
