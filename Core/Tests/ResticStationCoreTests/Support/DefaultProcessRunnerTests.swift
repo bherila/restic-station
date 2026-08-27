@@ -176,9 +176,16 @@ struct DefaultProcessRunnerTests {
         #endif
     }
 
-    @Test("throws ProcessRunnerError.timeout and stops a long-running process via SIGINT")
+    /// The elapsed bound is the half of this test that earns its name.
+    /// `#expect(throws:)` alone passes just as happily when the deadline is
+    /// reported on schedule and the child then runs to completion regardless
+    /// — which is exactly the failure #114 was about. Returning within a few
+    /// seconds of a 0.3 s deadline can only mean SIGINT actually reached
+    /// `sleep`, since the SIGKILL escalation is 10 s behind it.
+    @Test("throws ProcessRunnerError.timeout and stops a long-running process via SIGINT", .timeLimit(.minutes(1)))
     func timeoutSendsSIGINT() async throws {
         let runner = DefaultProcessRunner()
+        let started = Date()
 
         await #expect(throws: ProcessRunnerError.timeout) {
             _ = try await runner.run(
@@ -190,6 +197,9 @@ struct DefaultProcessRunnerTests {
                 timeout: 0.3
             )
         }
+
+        let elapsed = Date().timeIntervalSince(started)
+        #expect(elapsed < 5, "returned after \(elapsed)s; SIGINT did not reach the child")
     }
 }
 

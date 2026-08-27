@@ -50,6 +50,39 @@ struct ProcessLifetimeTests {
         #expect(elapsed < 20, "returned after \(elapsed)s; the child was waited out rather than stopped at the deadline")
     }
 
+    /// The SIGKILL escalation, covered on its own. A child that *ignores*
+    /// SIGINT can only be ended by the escalation behind it, so this is the
+    /// one test that fails if the escalation is silently skipped.
+    ///
+    /// It is the case the `linux` CI job caught: the stop sequence gated
+    /// every signal on `Foundation.Process.isRunning`, and where that flag
+    /// misreports a live child as finished, both SIGINT and SIGKILL become
+    /// no-ops. `run` still threw `.timeout` exactly on schedule while the
+    /// child ran to completion — a deadline enforced in name only, with the
+    /// set lock held throughout. Liveness is now judged by this file's own
+    /// termination latch, which is also the flag that proves the pid has not
+    /// been reaped and therefore cannot have been reused.
+    @Test("the SIGKILL escalation reaches a child that ignores SIGINT", .timeLimit(.minutes(2)))
+    func killEscalationReachesChildIgnoringSIGINT() async throws {
+        let runner = DefaultProcessRunner()
+        let started = Date()
+
+        await #expect(throws: ProcessRunnerError.timeout) {
+            _ = try await runner.run(
+                ["/bin/sh", "-c", "trap '' INT; sleep 45"],
+                env: nil,
+                stdin: nil,
+                currentDirectory: nil,
+                onStdoutLine: nil,
+                onStderrLine: nil,
+                timeout: 2
+            )
+        }
+
+        let elapsed = Date().timeIntervalSince(started)
+        #expect(elapsed < 25, "returned after \(elapsed)s; only SIGKILL can end this child, and it never arrived")
+    }
+
     /// The mirror image: the deadline fires and the direct child is stopped,
     /// but a descendant still holds the inherited stdout/stderr write ends.
     /// Draining "until EOF" then outlasts the deadline by the descendant's

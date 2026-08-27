@@ -55,16 +55,35 @@ POSIX behaviour a double would have to invent: `DefaultProcessRunnerTests`
 descendant holding the inherited pipe ends must not outlast it). Both use only
 `/bin/sh`, present on macOS and in the `swift:6.1` Linux container.
 
-`ProcessLifetimeTests` runs for ~40 s in total and that is load-bearing, not
+`ProcessLifetimeTests` takes ~25 s wall-clock and that is load-bearing, not
 waste: each test starts a 45 s child and asserts an elapsed-time bound that
-separates "the deadline was enforced" from "the child was waited out". Shortening
-the children below the 10 s SIGKILL grace plus the 10 s post-stop drain grace
-would make both tests pass against the defect they exist to catch. The bounds are
-deliberately loose for the same reason they are meaningful — they must not become
-timing flakes on a loaded CI runner. Note that the first test observes ~13 s, not
-~2 s: SIGINT reaches only the direct child, and a shell defers it while waiting
-on `sleep`, so nothing stops until SIGKILL. That is the process-group half of
-#114, still open.
+separates "the deadline was enforced" from "the child was waited out".
+Shortening the children below the 10 s SIGKILL grace plus the 10 s post-stop
+drain grace would make every one of them pass against the defect they exist to
+catch. The bounds are deliberately loose for the same reason they are
+meaningful — they must not become timing flakes on a loaded CI runner. Note
+that the first test observes ~12 s, not ~2 s: SIGINT reaches only the direct
+child, and a shell defers it while waiting on `sleep`, so nothing stops until
+SIGKILL. That is the process-group half of #114, still open.
+
+**An elapsed bound is not optional on a timeout test.** `#expect(throws:)`
+alone passes identically whether the deadline stopped the child or was merely
+*reported* on schedule while the child ran to completion — and the second is
+the #114 defect itself. `timeoutSendsSIGINT` asserted only the throw and so
+could not distinguish them; it is plausible it had been passing vacuously on
+Linux for some time. It now bounds elapsed time too, which is what makes its
+name ("stops a long-running process via SIGINT") an assertion rather than a
+claim.
+
+`killEscalationReachesChildIgnoringSIGINT` covers the escalation on its own,
+with a child that ignores SIGINT so only SIGKILL can end it. That is the case
+the `linux` job caught while #114 was in review: the stop sequence gated every
+signal on `Foundation.Process.isRunning`, and where that flag misreports a live
+child as finished, SIGINT *and* SIGKILL both become no-ops — `run` threw
+`.timeout` exactly on schedule while the child ran its full 45 s with the set
+lock held. macOS never showed it. Liveness is now judged by the runner's own
+termination latch instead, which doubles as proof the pid has not been reaped
+and so cannot have been reused.
 
 ### Fixture conventions
 `Core/Tests/ResticStationCoreTests/Fixtures/` — restic output fixtures are copied verbatim from `docs/fixtures/` (captured from restic 0.18.1; see restic-cli.md). Load via `Bundle.module` (declare `resources: [.copy("Fixtures")]` in Package.swift). Every parser has a test decoding its fixture; NDJSON parsers additionally get a partial-line-buffering test (feed the fixture in random-sized chunks, expect identical parse) and an unknown-`message_type` tolerance test.

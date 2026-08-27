@@ -215,7 +215,7 @@ public struct DefaultProcessRunner: ProcessRunning {
                             return
                         }
                         await timeoutFlag.trigger()
-                        await Self.stopAfterGracePeriod(processBox)
+                        await Self.stopAfterGracePeriod(processBox, terminated: terminationSignal)
                     }
                     await group.next()
                     group.cancelAll()
@@ -238,9 +238,13 @@ public struct DefaultProcessRunner: ProcessRunning {
             cancellationFlag.mark()
             // Synchronous part first so the signal lands immediately; the
             // grace period + SIGKILL run detached (this closure cannot await).
-            Self.sendSignal(SIGINT, to: processBox.process)
+            Self.sendSignal(SIGINT, to: processBox, unlessTerminated: terminationSignal)
             Task.detached {
-                await Self.stopAfterGracePeriod(processBox, sendInitialInterrupt: false)
+                await Self.stopAfterGracePeriod(
+                    processBox,
+                    terminated: terminationSignal,
+                    sendInitialInterrupt: false
+                )
             }
         }
 
@@ -256,18 +260,53 @@ public struct DefaultProcessRunner: ProcessRunning {
 
     /// SIGINT (optional — already sent by the cancellation handler), then up
     /// to 10 s of grace, then SIGKILL.
-    private static func stopAfterGracePeriod(_ box: ProcessBox, sendInitialInterrupt: Bool = true) async {
+    ///
+    /// The grace is a wall-clock deadline, not a count of nominal sleeps: a
+    /// loaded cooperative pool stretches each 100 ms sleep, and summing the
+    /// requested durations would then escalate to SIGKILL long before ten
+    /// real seconds of grace had passed.
+    private static func stopAfterGracePeriod(
+        _ box: ProcessBox,
+        terminated: TerminationSignal,
+        sendInitialInterrupt: Bool = true
+    ) async {
         if sendInitialInterrupt {
-            sendSignal(SIGINT, to: box.process)
+            sendSignal(SIGINT, to: box, unlessTerminated: terminated)
         }
-        var waited: TimeInterval = 0
-        while box.process.isRunning && waited < 10 {
-            try? await Task.sleep(nanoseconds: 100_000_000)
-            waited += 0.1
+        let graceEnds = Date().addingTimeInterval(10)
+        while !terminated.hasFired && Date() < graceEnds {
+            do {
+                try await Task.sleep(nanoseconds: 100_000_000)
+            } catch {
+                // Cancelled. Stop waiting out the grace and escalate now;
+                // `sendSignal` still refuses to signal a terminated child.
+                break
+            }
         }
-        if box.process.isRunning {
-            sendSignal(SIGKILL, to: box.process)
-        }
+        sendSignal(SIGKILL, to: box, unlessTerminated: terminated)
+    }
+
+    /// Signals the child unless it is already known to have terminated.
+    ///
+    /// The liveness guard is **our own** termination latch, never
+    /// `Process.isRunning`. Foundation's flag is bookkeeping we have already
+    /// learned not to trust on Linux — the same distrust that makes this file
+    /// observe exit through `terminationHandler` and never `waitUntilExit()`.
+    /// A guard that wrongly reads "not running" silently swallows both SIGINT
+    /// and SIGKILL, which leaves the deadline enforced in name only: `run`
+    /// throws `.timeout` on schedule while the child keeps going and the
+    /// caller keeps holding the set lock.
+    ///
+    /// A latch that has not fired means Foundation has not reaped the child,
+    /// so the pid is still ours and cannot have been reused. Signalling a
+    /// not-yet-reaped zombie is harmless.
+    private static func sendSignal(
+        _ signal: Int32,
+        to box: ProcessBox,
+        unlessTerminated terminated: TerminationSignal
+    ) {
+        guard !terminated.hasFired else { return }
+        kill(box.process.processIdentifier, signal)
     }
 
     /// How long a timed-out or cancelled run keeps draining its pipes after
@@ -306,11 +345,6 @@ public struct DefaultProcessRunner: ProcessRunning {
                 resumer.resume(with: (Data(), Data()))
             }
         }
-    }
-
-    private static func sendSignal(_ signal: Int32, to process: Process) {
-        guard process.isRunning else { return }
-        kill(process.processIdentifier, signal)
     }
 
     /// Reads a pipe to EOF on a background dispatch queue (never blocks the
@@ -363,9 +397,10 @@ private struct PipeBox: @unchecked Sendable {
 }
 
 /// Same reasoning as `PipeBox`: `Process` is not `Sendable`, but the only
-/// members touched across concurrency domains here are `isRunning`,
-/// `processIdentifier` and signal delivery, which are safe to read from the
-/// cancellation handler while the launching task awaits the process.
+/// member touched across concurrency domains here is `processIdentifier`,
+/// which is safe to read from the cancellation handler while the launching
+/// task awaits the process. Liveness is deliberately *not* read from
+/// `Process` — see `sendSignal(_:to:unlessTerminated:)`.
 private struct ProcessBox: @unchecked Sendable {
     let process: Process
 }
@@ -424,6 +459,12 @@ private final class TerminationSignal: @unchecked Sendable {
     private let lock = NSLock()
     private var fired = false
     private var continuations: [CheckedContinuation<Void, Never>] = []
+
+    var hasFired: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return fired
+    }
 
     func fire() {
         lock.lock()
