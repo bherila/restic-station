@@ -316,8 +316,28 @@ permanently and mirrors read as stale forever.
 **What this deliberately does not chase.** A peer host still on an older
 config can write a snapshot containing the pattern after this host's watermark
 is set. That snapshot is attributable here only when the set names the peer in
-`machines`, and either way the peer heals it from its own watermark when it
-picks up the shared config. Under-purging is recoverable; over-purging is not.
+`machines`. On any destination the peer itself owns, it heals the snapshot from
+its own watermark once it picks up the shared config. Under-purging is
+recoverable; over-purging is not.
+
+**One case the peer cannot heal, and neither can this host.** A mirror scoped
+away from the peer by `machines` is reachable by the peer's *snapshots* but not
+by its *purge*. Host A applies rule R everywhere it owns and satisfies its
+watermark. Peer B, still stale, writes matching snapshot S to the shared
+primary. A's next run has no pending patterns, so its copy is unbounded —
+plain `restic copy --from-repo`, no explicit ids — and ferries S to A's mirror
+M. B then upgrades and rewrites S on the primary, but B has M disabled and
+never purges it; A will not either, because its watermark records R as applied
+and manual apply narrows by that same watermark and refuses a token with no
+pending pair. S stays on M until ordinary retention forgets it.
+
+This is still the under-purge direction and violates none of the invariants
+below, so it is accepted rather than chased: closing it means either an
+unbounded rewrite scan per tick (the cost this gating exists to avoid) or
+letting a host purge a destination it was configured not to touch. The remedy
+is manual and external — `restic forget` against the mirror, or briefly
+enabling M for a host that can purge it. Keeping the fleet's config in lockstep
+avoids the window entirely.
 
 A lost watermark is likewise recoverable by construction: the pattern reads as
 pending again, the next run re-runs the rewrite, restic reports a no-op (see
