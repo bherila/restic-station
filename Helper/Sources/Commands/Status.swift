@@ -135,9 +135,9 @@ struct Status: AsyncParsableCommand, JSONRenderable {
             scheduleState = nil
         case .valid(let state):
             scheduleState = state
-        case .corrupt:
+        case .corrupt(let failure):
             throw CLIFailure.stateUnreadable(
-                "could not read schedule state (\(paths.scheduleStateFile.path)); it was left unchanged"
+                failure.recoveryMessage
             )
         }
 

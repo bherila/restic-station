@@ -293,7 +293,8 @@ grep -qi 'not a valid machine id' "$OUT_FILE" \
 ok "config show rejects an invalid --machine slug instead of silently resolving nothing"
 
 # ─────────────────────────────────────────────────────────────────────────
-# 4. status --json fixture scenarios: healthy, in-flight, failed, stale.
+# 4. status --json fixture scenarios: healthy, corrupt state, in-flight,
+#    failed, stale.
 # ─────────────────────────────────────────────────────────────────────────
 log "4. status --json against fixture state directories"
 
@@ -354,6 +355,47 @@ jq -e '
     and .health == (if .scheduler.healthy == false then "warning" else "idle" end)
 ' "$OUT_FILE" >/dev/null || fail "healthy fixture was not healthy apart from an independently reported scheduler finding"
 ok "healthy fixture: backup state is idle; exit reflects the host scheduler"
+
+# --- corrupt schedule state: an existing bad document is not "never run". ---
+CORRUPT_SCHEDULE="$WORK/status-corrupt-schedule"
+make_status_fixture "$CORRUPT_SCHEDULE"
+printf '%s' 'not schedule json {{{' > "$CORRUPT_SCHEDULE/state/schedule-state.json"
+RESTIC_STATION_DATA_DIR="$CORRUPT_SCHEDULE" run_helper_split status --json
+expect_rc 1
+jq -e '
+    .schemaVersion == 1
+    and .ok == false
+    and .error.code == "internal_error"
+    and (.error.message | contains("schedule state is unreadable"))
+    and (.error.message | contains("canonical file left unchanged"))
+' "$OUT_FILE" >/dev/null || fail "corrupt schedule state did not produce the structured unhealthy status error"
+[[ ! -s "$ERR_FILE" ]] || fail "status --json wrote schedule-state diagnostics outside its JSON envelope"
+[[ "$(cat "$CORRUPT_SCHEDULE/state/schedule-state.json")" == 'not schedule json {{{' ]] \
+    || fail "status --json changed the corrupt canonical schedule state"
+recovery_copies=("$CORRUPT_SCHEDULE"/state/schedule-state.corrupt-*.json)
+[[ "${#recovery_copies[@]}" -eq 1 && -f "${recovery_copies[0]}" ]] \
+    || fail "status --json did not publish exactly one content-addressed schedule-state recovery copy"
+cmp -s "$CORRUPT_SCHEDULE/state/schedule-state.json" "${recovery_copies[0]}" \
+    || fail "the schedule-state recovery copy is not byte-identical to the canonical input"
+ok "corrupt schedule state: status --json exits 1, preserves canonical bytes, and names recovery"
+
+# Tick must validate the safety-authoritative watermark before every healthy
+# early return. An empty scheduling view used to exit 0 before reading these
+# exact corrupt bytes, making a broken host look healthy indefinitely.
+TICK_CORRUPT_NO_SETS="$WORK/tick-corrupt-no-sets"
+make_status_fixture "$TICK_CORRUPT_NO_SETS"
+jq '.sets = []' "$TICK_CORRUPT_NO_SETS/config.json" \
+    > "$TICK_CORRUPT_NO_SETS/config.json.tmp"
+mv "$TICK_CORRUPT_NO_SETS/config.json.tmp" "$TICK_CORRUPT_NO_SETS/config.json"
+printf '%s' 'tick corrupt schedule json {{{' \
+    > "$TICK_CORRUPT_NO_SETS/state/schedule-state.json"
+RESTIC_STATION_DATA_DIR="$TICK_CORRUPT_NO_SETS" run_helper tick
+expect_rc 1
+grep -q 'schedule state is unreadable' "$OUT_FILE" \
+    || fail "tick did not diagnose corrupt schedule state before the empty-set return"
+grep -q 'no backup sets' "$OUT_FILE" \
+    && fail "tick reached the empty-set success path with corrupt schedule state"
+ok "tick safety gate: corrupt schedule state fails before the empty-set success path"
 
 # --- first backup grace: fresh config stays quiet; old never-run config warns. ---
 FIRST_BACKUP_FRESH="$WORK/status-first-backup-fresh"

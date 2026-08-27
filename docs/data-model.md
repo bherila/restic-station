@@ -1,6 +1,6 @@
 # Data model
 
-All persisted JSON uses `JSONEncoder` with `.sortedKeys` + `.prettyPrinted` (except JSONL lines: compact, one per line) and ISO 8601 dates (`.iso8601` with fractional seconds encoder/decoder). All writes are atomic: write to a temp file in the same directory, then `rename(2)` over the target.
+All persisted JSON uses `JSONEncoder` with `.sortedKeys` + `.prettyPrinted` (except JSONL lines: compact, one per line) and ISO 8601 dates (`.iso8601` with fractional seconds encoder/decoder). All writes are atomic: write to a temp file in the same directory, then `rename(2)` over the target. Safety-authoritative schedule state additionally completes the temp write, `fsync`s it, renames through a held directory descriptor, and `fsync`s the directory before reporting success.
 
 Two files hold configuration, and the split matters:
 
@@ -297,14 +297,45 @@ Secret-env item is optional (absent for local/sftp destinations without credenti
 ## runs/index.jsonl — one compact line per finished run
 
 ```json
-{"runId":"20260726T205704Z-backup-6f9619ff","kind":"backup","setId":"6F9619FF-...","destId":"0A1B2C3D-...","status":"success","start":"2026-07-26T20:57:04Z","end":"2026-07-26T20:58:11Z","trigger":"scheduled","snapshotId":"f391ba97c096...","filesNew":3,"filesChanged":1,"dataAdded":67860,"errorSummary":null}
+{"runId":"20260726T205704Z-backup-6f9619ff","kind":"backup","setId":"6F9619FF-...","destId":"0A1B2C3D-...","status":"success","start":"2026-07-26T20:57:04Z","end":"2026-07-26T20:58:11Z","trigger":"scheduled","snapshotId":"f391ba97c096...","filesNew":3,"filesChanged":1,"dataAdded":67860,"errorSummary":null,"purgeEvidenceDigest":null}
 ```
 
-`kind`: `backup` | `copy` | `check` | `prune` | `purge` | `restore` | `init`. A scheduled set run produces **multiple** index lines: one `backup` (primary), an optional `purge` per destination with newly added `purgeExcludes`, one `copy` per attempted secondary, one `prune` per repo where retention ran. They share a `groupId` field (= the backup's runId) so the UI can nest them. Each append uses a complete-write loop that retries `EINTR`, then `fsync`s the index (also retrying `EINTR`) before releasing `index.jsonl.lock`; creation of the first index also syncs the `runs/` directory entry. Before appending, the writer reads only the final byte in the normal newline-terminated case. An unterminated corrupt tail triggers a bounded backward scan and is truncated to the last complete line (or a complete newline-less JSON record is terminated), so a recovery line cannot be concatenated onto corrupt JSON without making every normal append reread the full history. Recovery performs that repair before decoding its index snapshot, so a torn multibyte UTF-8 scalar cannot hide or duplicate the valid prefix. Decoding happens independently at byte-line boundaries, preserving valid records on either side of a newline-terminated line with invalid UTF-8. History readers take the last decodable projection for each run and order runs by canonical start time; an older repaired record therefore cannot masquerade as the latest run.
+`kind`: `backup` | `copy` | `check` | `prune` | `purge` | `restore` | `init`.
+A scheduled set run produces **multiple** index lines: one `backup` (primary),
+one `purge` per applicable destination whenever active `purgeExcludes` exist
+(one per destination whose watermark still has that pattern pending), one
+`copy` per attempted secondary,
+and one `prune` per repo where retention ran. They share a `groupId` field (=
+the backup's runId) so the UI can nest them. A purge whose launch carries
+recovery evidence also projects `purgeEvidenceDigest`, a SHA-256 binding over
+a versioned, length-framed sequence of its repository config id, exact purge
+patterns, and sorted terminal old-to-new snapshot mapping; other and legacy
+records encode it as `null`. Audit verification recomputes this digest from
+canonical metadata, so changing any recovery field without the independently
+published index line is an audit mismatch and cannot authorize a watermark
+shortcut. Each append uses a complete-write loop that retries `EINTR`, then
+`fsync`s the index (also retrying `EINTR`) before releasing `index.jsonl.lock`;
+creation of the first index also syncs the `runs/` directory entry. Before
+appending, the writer reads only the final byte in the normal newline-terminated
+case. An unterminated corrupt tail triggers a bounded backward scan and is
+truncated to the last complete line (or a complete newline-less JSON record is
+terminated), so a recovery line cannot be concatenated onto corrupt JSON
+without making every normal append reread the full history. Recovery performs
+that repair before decoding its index snapshot, so a torn multibyte UTF-8
+scalar cannot hide or duplicate the valid prefix. Decoding happens
+independently at byte-line boundaries, preserving valid records on either side
+of a newline-terminated line with invalid UTF-8. History readers take the last
+decodable projection for each run and order runs by canonical start time; an
+older repaired record therefore cannot masquerade as the latest run.
 
 ## runs/<runId>/metadata.json — `RunMetadata`
 
-Superset of the index line, plus: `pid`, `resticExitCode`, `argvRedacted` (argv with env not included), `stats` (full decoded summary message where applicable), `groupId`, `destructiveAuditContractVersion`, `destructiveLaunchAuthorizedAt`, `auditFailureReason`, the optional two-phase marker `indexPublicationPending`, and `publicationDurabilityContractVersion`. A successful `purge` run additionally carries `purgeSnapshotRewrites`, an old full snapshot id → new snapshot id mapping. It is an audit record only: older run records continue to name their historical snapshot ids. Written once at start (`status: "running"`, no `end`) and atomically rewritten on completion. The temp file is completely written, `fsync`ed, and renamed with `renameat(2)` against a held directory descriptor; the containing directory is then `fsync`ed before success is reported. A newly created run directory is likewise made durable in `runs/` before `begin` returns. On a fresh hierarchy, every newly created `runs/`/data-root ancestor entry and the first pre-existing parent are synced bottom-up before initial run publication, so a later crash cannot lose the entire canonical history path. `begin` also confirms `runs/`, the data root, and its parent when a scheduler setup path created them first. If initial publication fails, removing its fresh directory and discarding a safely unstarted run both sync `runs/` before reporting success; a cleanup sync failure is surfaced as indeterminate instead of claiming a durable rollback.
+Canonical superset of the index data, plus: `pid`, `resticExitCode`, `argvRedacted` (argv with env not included), `stats` (full decoded summary message where applicable), `destructiveAuditContractVersion`, `destructiveLaunchAuthorizedAt`, `auditFailureReason`, the optional two-phase marker `indexPublicationPending`, and `publicationDurabilityContractVersion`. The index's `purgeEvidenceDigest` is recomputed from the canonical source fields rather than duplicated here. A purge launch additionally binds its exact `purgePatterns` and the live restic config id as `purgeRepositoryId`; a successful purge carries `purgeSnapshotRewrites`, a complete launch-time repository generation mapping from every old full snapshot id to its resulting short id. Restic omits per-snapshot output for a selected snapshot that is already a no-op, so that entry maps the old full id to its own unchanged short id; unattributed snapshots receive the same identity representation without entering the destructive argv. An exit-0 rewrite whose modified count and changed mappings cannot establish this complete result is recorded as `repository_outcome_unknown` and blocks another destructive launch. The mapping is an audit record of what a destructive rewrite actually did. It is **not** consumed as authority to advance a watermark: a lost watermark heals by re-running the pending rewrite, which restic reports as a no-op. The recovery fields remain bound into `purgeEvidenceDigest` so terminal evidence stays tamper-evident. Metadata is written once at start (`status: "running"`, no `end`) and atomically rewritten on completion. The temp file is completely written, `fsync`ed, and renamed with `renameat(2)` against a held directory descriptor; the containing directory is then `fsync`ed before success is reported. A newly created run directory is likewise made durable in `runs/` before `begin` returns. On a fresh hierarchy, every newly created `runs/`/data-root ancestor entry and the first pre-existing parent are synced bottom-up before initial run publication, so a later crash cannot lose the entire canonical history path. `begin` also confirms `runs/`, the data root, and its parent when a scheduler setup path created them first. If initial publication fails, removing its fresh directory and discarding a safely unstarted run both sync `runs/` before reporting success; a cleanup sync failure is surfaced as indeterminate instead of claiming a durable rollback.
+
+Purge result prefixes must be unique across the complete mapping. A duplicate
+cannot become terminal recovery authority: current output is classified as
+`repository_outcome_unknown`, and recovery ignores ambiguous legacy history
+and executes the live purge plan.
 
 ### Normative destructive-operation audit contract
 
@@ -438,6 +469,8 @@ creating a filesystem event.
 
 ```json
 {
+  "version": 1,
+  "checksum": "<64 lowercase hex SHA-256>",
   "sets": {
     "6F9619FF-...": {
       "lastBackupStart": "2026-07-26T20:57:04Z",
@@ -451,7 +484,61 @@ creating a filesystem event.
 }
 ```
 
-`lastBackupStart` is the *start* time of the last **attempted** scheduled backup (success or failure) — due-computation keys off attempts, so a failing set retries at its next slot, not every tick. Manual runs also update it (a manual backup satisfies the schedule). `checkSliceCursor` is the `n` most recently used in `--read-data-subset=n/t`. `appliedPurgeExcludes` records, per destination UUID, only patterns whose `rewrite --forget` child succeeded. Removing a pattern never removes it from this watermark: history cannot be restored, and a smaller list must not trigger a pointless rewrite.
+The checksum covers the canonical sorted-key encoding of the logical
+`{"sets": ...}` payload, not the envelope's textual field order. The UUIDs
+and checksum above are abbreviated for readability. A successful mutation is
+acknowledged only after the new file and its directory entry cross the crash-
+durability boundary.
+
+`state/schedule-state.version-1` is the owner-only monotonic migration marker.
+It is durably published before the first version-1 envelope. While the
+canonical file exists, the marker makes an unversioned document a detected
+downgrade rather than legacy input; conversely, a versioned document without
+the marker fails closed. Both marker and canonical temp inodes are descriptor-
+`fchmod`ed and verified as owner-owned regular files with mode `0600` before
+publication, independent of the invoking process's umask. The marker is
+validated even when the canonical file is absent: a missing or valid marker
+with no envelope is the recoverable pre-publication state, while an unsafe or
+unreadable marker is corrupt state and fails health/mutations closed. A
+lock-free reader that observes the marker/document mismatch possible during the first migration
+reacquires `schedule-state.lock` and rereads both files as one stable
+generation; it never quarantines that healthy publication window. A crash
+between marker and envelope publication can require explicit recovery, but
+cannot silently discard checksum protection.
+
+`lastBackupStart` is the *start* time of the last **attempted** scheduled backup (success or failure) — due-computation keys off attempts, so a failing set retries at its next slot, not every tick. Manual runs also update it (a manual backup satisfies the schedule). `checkSliceCursor` is the `n` most recently used in `--read-data-subset=n/t`. `appliedPurgeExcludes` records, per destination UUID, only patterns whose `rewrite --forget` child succeeded — or, for a destination whose repository is observed empty during the all-destination planning pass, whose plan had nothing to rewrite. Removing a pattern never removes it from this historical watermark. It narrows **both** manual and scheduled apply: a scheduled backup purges only the patterns this destination's watermark does not already record, and skips the purge phase once every active pattern is recorded. That is sound because a purge pattern is also a forward backup exclude (`BackupSet.effectiveBackupExcludes`), so an applied rule cannot reappear in a snapshot this host writes later; see `docs/scheduling.md` §Purge-exclusion ordering for the multi-host case it deliberately does not chase. The watermark is never inferred from historical run records — a lost one is re-established by re-running the pending rewrite, which restic reports as a no-op. Reads and prospective writes share the same 64 MiB encoded-document limit. The complete v1 envelope is encoded and size-checked before either the monotonic migration marker or canonical document is published, so upgrading a near-limit legacy document cannot strand it behind a marker that makes the unchanged legacy bytes look downgraded.
+
+An absent file is a new, empty schedule. Before the monotonic marker exists, a
+legacy unversioned document remains readable and is upgraded to version 1 on
+its next mutation. After migration, stripping `version` and `checksum` is a
+recovery failure rather than a route back to unchecked legacy decoding. Everything else
+fails closed: malformed JSON or UUID keys, a checksum mismatch, an unsupported
+version, missing/unsafe migration evidence, an oversized document, an I/O
+error, a symlink, FIFO, or another non-regular or
+foreign-owned canonical file. Readable untrusted bytes are copied exactly to
+`schedule-state.corrupt-<sha256>.json`; the canonical file remains untouched
+as the sentinel that prevents an accidental empty-state rewrite. Repeated
+reads reuse the same content-addressed recovery copy. If recovery-copy
+publication fails, a long-lived watcher remembers the canonical byte
+fingerprint and does not retry that write for events generated by its own temp
+inode; changed canonical bytes receive a new fingerprint and a fresh attempt.
+An explicit app reload clears only this event-feedback suppression and retries
+the same content-addressed recovery copy, so repaired permissions, quota, or
+free space take effect without an app restart.
+
+Recovery is deliberately an operator action: stop Restic Station's scheduler
+and any manual run, inspect the canonical and recovery-copy bytes, then replace
+the canonical path with a valid document that preserves every trustworthy
+timestamp, cursor, and purge watermark. Run `restic-station-helper status
+--json` before restarting scheduling. Deleting the canonical file is accepted
+only as an explicit decision to discard all of that bookkeeping; it is never
+performed automatically. A missing or unsafe migration marker is a two-file
+recovery: after verifying the v1 envelope and checksum, recreate the owner-only
+marker with exact bytes `1\n` and mode `0600`, or restore both files from a
+trusted copy. Replacing only the canonical JSON cannot repair marker damage.
+Marker safety is classified before canonical version compatibility, so a
+newer-version document cannot hide a missing or unsafe marker that also needs
+operator repair.
 
 ## state/repo-status-<destId>.json
 
@@ -535,7 +622,7 @@ The tick clears it: `recoverInterrupted()` returns the `setId` alongside the
 
 ## Versioning & migration
 
-`AppConfig.currentVersion` is **3**. Loader behavior: version > current → refuse with a clear error ("config written by a newer Restic Station"); version < current → run the in-code migration chain, then persist. State/run files carry no version field — they are regenerable caches/history; on decode failure, skip the record and log, never crash. The exception is `state/schedule-state.json`: it contains destructive purge bookkeeping, so a corrupt or unreadable existing file is preserved and makes schedule mutations and `status` fail unhealthy until explicit recovery is designed. `machine.json` versions independently (`MachineConfig.currentVersion`, currently 1).
+`AppConfig.currentVersion` is **3**. Loader behavior: version > current → refuse with a clear error ("config written by a newer Restic Station"); version < current → run the in-code migration chain, then persist. Regenerable state/run caches carry no version field and tolerate decode failure. The exception is `state/schedule-state.json`, whose current envelope version is **1** and whose checksum protects destructive purge bookkeeping. Legacy unversioned schedule state is accepted only before `state/schedule-state.version-1` is durably published and is upgraded on mutation; malformed, downgraded, tampered, or newer-version state is preserved and makes schedule mutations, `status`, and the app fail unhealthy until explicit recovery. `machine.json` versions independently (`MachineConfig.currentVersion`, currently 1).
 
 ### v1 → v2
 
@@ -631,7 +718,7 @@ Never a secret: `nonSecretEnv` is exactly `Destination.nonSecretEnv` (never the 
 
 ### `status --json`
 
-Reads recorded state (`state/schedule-state.json`, `state/current-run-*.json`, `state/repo-status-*.json`, `runs/index.jsonl`) and performs the same live locking probe as the app — no restic invocation. A corrupt or unreadable existing schedule-state file is not treated as an empty schedule: `status` returns a structured state-unreadable failure and leaves the file in place. The lock probe may create dedicated owner-only `health.lock` inodes in `locks/`, `state/`, and `runs/` so it exercises `flock(2)` on each possibly distinct filesystem, and creates then removes a uniquely named scratch inode inside health-only `.health/` directories on all three filesystems to catch quota or full-filesystem failures; it never creates operation locks. Normal operation setup does not create or depend on any health scratch directory. It inspects set locks only for sets in this machine's resolved configuration, so persistent orphaned names do not create false outages. When readable state is available, `health` reuses `HealthDerivation.appHealth` verbatim (`Core/Sources/ResticStationCore/Support/HealthDerivation.swift`), so the CLI and the app's menu bar use the same warning derivation.
+Reads recorded state (`state/schedule-state.json`, `state/current-run-*.json`, `state/repo-status-*.json`, `runs/index.jsonl`) and performs the same live locking probe as the app — no restic invocation. A corrupt or unreadable existing schedule-state file is not treated as an empty schedule: `status` returns a structured state-unreadable failure, identifies any exact-byte recovery copy, and leaves the canonical file in place. The lock probe may create dedicated owner-only `health.lock` inodes in `locks/`, `state/`, and `runs/` so it exercises `flock(2)` on each possibly distinct filesystem, and creates then removes a uniquely named scratch inode inside health-only `.health/` directories on all three filesystems to catch quota or full-filesystem failures; it never creates operation locks. Normal operation setup does not create or depend on any health scratch directory. It inspects set locks only for sets in this machine's resolved configuration, so persistent orphaned names do not create false outages. When readable state is available, `health` reuses `HealthDerivation.appHealth` verbatim (`Core/Sources/ResticStationCore/Support/HealthDerivation.swift`), so the CLI and the app's menu bar use the same warning derivation.
 
 It also inspects the platform scheduler: the same `SystemdTimerManager` used by `timer status` on Linux, and `launchctl print gui/$UID/net.herila.ResticStation.helper` on macOS. See `scheduling.md` §`status` and the scheduler. Only a definite `false` contributes a warning; a failed probe reports `healthy: null`.
 

@@ -67,6 +67,19 @@ struct ResticCommandTests {
         #expect(cmd.fromRepoURL == Self.repo)
     }
 
+    @Test("copy appends an exact purge output generation")
+    func copyExactSnapshotGeneration() {
+        let cmd = ResticCommand.copy(
+            toRepo: Self.secondary,
+            fromRepo: Self.repo,
+            snapshotIDs: ["14a53542", "3ca2e0a5"]
+        )
+        #expect(cmd.argv == [
+            "-r", Self.secondary, "copy", "--from-repo", Self.repo,
+            "14a53542", "3ca2e0a5",
+        ])
+    }
+
     // MARK: - Read-only queries
 
     @Test("snapshots")

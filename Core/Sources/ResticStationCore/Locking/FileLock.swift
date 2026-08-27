@@ -80,6 +80,12 @@ public enum LockAcquireResult: Equatable, Sendable {
 public final class FileLock: @unchecked Sendable {
     public let path: URL
     private let trustedRoot: URL?
+    /// When present, the lock filename is resolved through this retained
+    /// descriptor instead of re-walking the pathname on every `acquire()`.
+    /// The lock inode is then, by construction, the one reachable through the
+    /// same directory generation the holder writes into — there is no second
+    /// lookup to bind, and therefore nothing to re-check.
+    private let directory: DirectoryHandle?
     private var fd: Int32 = -1
 
     /// Directory descriptors are traversal capabilities, not directory
@@ -107,6 +113,19 @@ public final class FileLock: @unchecked Sendable {
     public init(path: URL, trustedRoot: URL? = nil) {
         self.path = path
         self.trustedRoot = trustedRoot
+        self.directory = nil
+    }
+
+    /// Locks `name` inside an already-open, already-verified directory.
+    ///
+    /// Prefer this wherever the caller also reads or writes other entries in
+    /// that directory under the lock: sharing one descriptor is what makes
+    /// "the lock protects the tree I am writing into" a structural property
+    /// rather than an assumption. See ``DirectoryHandle``.
+    public init(name: String, in directory: DirectoryHandle) {
+        self.path = directory.path.appendingPathComponent(name)
+        self.trustedRoot = nil
+        self.directory = directory
     }
 
     /// Opens (creating if necessary) and attempts a non-blocking exclusive
@@ -131,7 +150,18 @@ public final class FileLock: @unchecked Sendable {
         if fd < 0 {
             let flags = O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC
             let opened: Int32
-            switch Self.openLock(path: path, trustedRoot: trustedRoot, flags: flags) {
+            let route: Result<Int32, LockFailure>
+            if let directory {
+                route = Self.openLock(
+                    name: path.lastPathComponent,
+                    parentFD: directory.descriptor,
+                    path: path,
+                    flags: flags
+                )
+            } else {
+                route = Self.openLock(path: path, trustedRoot: trustedRoot, flags: flags)
+            }
+            switch route {
             case .success(let descriptor):
                 opened = descriptor
             case .failure(let failure):
@@ -209,8 +239,19 @@ public final class FileLock: @unchecked Sendable {
             return .failure(failure)
         }
         defer { close(parentFD) }
+        return openLock(name: path.lastPathComponent, parentFD: parentFD, path: path, flags: flags)
+    }
 
-        let (opened, openError) = path.lastPathComponent.withCString { name -> (Int32, Int32) in
+    /// Resolves the lock filename against an already-verified parent
+    /// descriptor. Shared by the pathname route (which opens and closes that
+    /// parent) and the ``DirectoryHandle`` route (which retains it).
+    private static func openLock(
+        name lockName: String,
+        parentFD: Int32,
+        path: URL,
+        flags: Int32
+    ) -> Result<Int32, LockFailure> {
+        let (opened, openError) = lockName.withCString { name -> (Int32, Int32) in
             // On Darwin/APFS, simultaneous first-time `openat(O_CREAT)`
             // calls for the same basename can transiently return ENOENT even
             // though the already-open parent descriptor is valid and there
@@ -232,6 +273,20 @@ public final class FileLock: @unchecked Sendable {
             return .failure(LockFailure(path: path.path, operation: "open", errnoValue: openError))
         }
         return .success(opened)
+    }
+
+    /// Opens and verifies a directory exactly as a lock's parent is opened,
+    /// and hands the descriptor to a caller that intends to **retain** it.
+    ///
+    /// `DirectoryHandle` is the only caller: it exists so a component can
+    /// resolve every later name through one directory generation instead of
+    /// re-walking the pathname. Kept here so there is a single implementation
+    /// of the directory security policy.
+    static func openVerifiedDirectory(
+        _ directory: URL,
+        trustedRoot: URL?
+    ) -> Result<Int32, LockFailure> {
+        openDirectory(directory, trustedRoot: trustedRoot)
     }
 
     /// Opens `directory` without following symlinks and verifies its owner

@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import CryptoKit
 import ResticStationCore
 import Testing
 @testable import Restic_Station
@@ -102,6 +103,173 @@ private final class ReplacementAuditLoader: @unchecked Sendable {
 @Suite("StateWatcher lock health", .serialized)
 @MainActor
 struct StateWatcherTests {
+    @Test("schedule-state corruption is published, quarantined, and cleared only by explicit recovery")
+    func scheduleStateCorruptionPublishesRecoveryState() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-schedule-state-watcher-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = AppPaths(root: root)
+        try paths.ensureDirectories()
+        let corrupt = Data("not schedule json {{{".utf8)
+        try corrupt.write(to: paths.scheduleStateFile)
+
+        let watcher = StateWatcher(
+            paths: paths,
+            runStore: RunStore(paths: paths),
+            stateStore: StateStore(paths: paths)
+        )
+        watcher.reloadNow()
+
+        #expect(watcher.scheduleState == nil)
+        let failure = try #require(watcher.scheduleStateFailure)
+        #expect(failure.reason == .malformedDocument)
+        #expect(failure.contentFingerprint != nil)
+        #expect(try Data(contentsOf: URL(fileURLWithPath: #require(failure.quarantinePath))) == corrupt)
+
+        // The same published failure must drive the process-wide app glyph
+        // red even with no configured sets and no main window.
+        let model = AppModel(paths: paths)
+        #expect(model.scheduleStateFailure != nil)
+        #expect(model.appHealth == .critical)
+        let setId = UUID()
+        let unavailable = try #require(model.backUpNowUnavailableReason(setId: setId))
+        #expect(unavailable.contains("Backups are paused until schedule state is recovered"))
+        model.backUpNow(setId: setId)
+        #expect(model.pendingActionSetIds.isEmpty, "the model guard must protect every present and future UI entry point")
+
+        // Recovery is explicit: replacing the canonical bytes with a valid
+        // legacy document is accepted; no reader silently deletes the bad
+        // file or invents empty state.
+        try Data("{\"sets\":{}}".utf8).write(to: paths.scheduleStateFile)
+        watcher.reloadNow()
+        #expect(watcher.scheduleState == ScheduleState())
+        #expect(watcher.scheduleStateFailure == nil)
+    }
+
+    @Test("in-place schedule-state corruption reaches the app without an unrelated directory event")
+    func inPlaceScheduleStateCorruptionTriggersReload() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-schedule-in-place-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = AppPaths(root: root)
+        try paths.ensureDirectories()
+        try Data("{\"sets\":{}}".utf8).write(to: paths.scheduleStateFile)
+
+        let watcher = StateWatcher(
+            paths: paths,
+            runStore: RunStore(paths: paths),
+            stateStore: StateStore(paths: paths)
+        )
+        watcher.start()
+        defer { watcher.stop() }
+        #expect(watcher.scheduleState == ScheduleState())
+        #expect(watcher.scheduleStateFailure == nil)
+        // Let start-up directory creation and health-probe events drain;
+        // otherwise one of those unrelated events could mask a missing
+        // direct file watch by reloading after the corruption below.
+        try await Task.sleep(nanoseconds: 750_000_000)
+        #expect(watcher.scheduleStateFailure == nil)
+
+        // FileHandle truncation/writing keeps the same directory entry and
+        // inode. Only the direct schedule-state vnode source can observe it;
+        // the parent state/ source receives no child-entry event.
+        let handle = try FileHandle(forWritingTo: paths.scheduleStateFile)
+        try handle.truncate(atOffset: 0)
+        try handle.write(contentsOf: Data("corrupt in place {{{".utf8))
+        try handle.close()
+
+        for _ in 0..<40 {
+            if watcher.scheduleStateFailure != nil { break }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        #expect(watcher.scheduleState == nil)
+        #expect(watcher.scheduleStateFailure?.reason == .malformedDocument)
+    }
+
+    @Test("in-place migration-marker damage reaches the app without an unrelated directory event")
+    func inPlaceScheduleStateMarkerDamageTriggersReload() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-marker-in-place-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = AppPaths(root: root)
+        try paths.ensureDirectories()
+        let stateStore = StateStore(paths: paths)
+        try stateStore.updateScheduleState(setId: UUID()) { _ in }
+
+        let watcher = StateWatcher(
+            paths: paths,
+            runStore: RunStore(paths: paths),
+            stateStore: stateStore
+        )
+        watcher.start()
+        defer { watcher.stop() }
+        #expect(watcher.scheduleState != nil)
+        #expect(watcher.scheduleStateFailure == nil)
+        try await Task.sleep(nanoseconds: 750_000_000)
+        #expect(watcher.scheduleStateFailure == nil)
+
+        // Keep the marker's directory entry and inode unchanged. The parent
+        // state/ source cannot observe this write; only the direct marker
+        // vnode source can drive the fail-closed reload.
+        let handle = try FileHandle(forWritingTo: paths.scheduleStateVersionMarkerFile)
+        try handle.truncate(atOffset: 0)
+        try handle.write(contentsOf: Data("2\n".utf8))
+        try handle.close()
+
+        for _ in 0..<40 {
+            if watcher.scheduleStateFailure != nil { break }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        #expect(watcher.scheduleState == nil)
+        guard case .unsafeFile(let reason)? = watcher.scheduleStateFailure?.reason else {
+            Issue.record("expected unsafe migration marker, got \(String(describing: watcher.scheduleStateFailure))")
+            return
+        }
+        #expect(reason.contains("version marker has invalid contents"))
+    }
+
+    @Test("explicit reload retries a previously suppressed recovery copy")
+    func explicitReloadRetriesScheduleStateRecoveryCopy() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-recovery-retry-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = AppPaths(root: root)
+        try paths.ensureDirectories()
+        let corrupt = Data("retry this corrupt schedule state {{{".utf8)
+        try corrupt.write(to: paths.scheduleStateFile)
+        let fingerprint = SHA256.hash(data: corrupt)
+            .map { String(format: "%02x", $0) }
+            .joined()
+        let recovery = paths.stateDir.appendingPathComponent(
+            "schedule-state.corrupt-\(fingerprint).json",
+            isDirectory: false
+        )
+        // A directory at the content-addressed target makes the first atomic
+        // rename fail without depending on this test process's permissions.
+        try FileManager.default.createDirectory(at: recovery, withIntermediateDirectories: false)
+
+        let watcher = StateWatcher(
+            paths: paths,
+            runStore: RunStore(paths: paths),
+            stateStore: StateStore(paths: paths)
+        )
+        watcher.reloadNow()
+        let firstFailure = try #require(watcher.scheduleStateFailure)
+        #expect(firstFailure.contentFingerprint == fingerprint)
+        #expect(firstFailure.quarantineWriteFailed)
+        #expect(firstFailure.quarantinePath == nil)
+
+        // External repair removes the obstacle without changing the corrupt
+        // canonical bytes. An explicit reload must retry immediately rather
+        // than retaining event-feedback suppression until app restart.
+        try FileManager.default.removeItem(at: recovery)
+        watcher.reloadNow()
+        let retriedFailure = try #require(watcher.scheduleStateFailure)
+        #expect(!retriedFailure.quarantineWriteFailed)
+        #expect(retriedFailure.quarantinePath == recovery.path)
+        #expect(try Data(contentsOf: recovery) == corrupt)
+    }
+
     @Test("keychain secret-lock metadata changes refresh administrative health")
     func keychainSecretLockMetadataRefreshesHealth() async throws {
         let root = FileManager.default.temporaryDirectory

@@ -41,7 +41,7 @@ Secrets: macOS login Keychain (service "restic-station")
 
 - The helper is short-lived per invocation, except while a backup/copy/check runs (the process lives until the work finishes — this may exceed the 120 s `StartInterval`; overlapping ticks are prevented by locks, see `scheduling.md`).
 - Long restic operations stream NDJSON progress; the helper writes throttled progress snapshots to `state/` (≤ 1 write per 1–2 s) and appends every line to the run log.
-- The app is purely reactive: it reads `state/` and `runs/` and performs the shared live lock-health probe, watching `state/`, `runs/`, `locks/`, and `config.json` for changes via `DispatchSource` watchers plus a best-effort `DistributedNotificationCenter` nudge posted by the helper after each state write. Notifications are lossy by design; the filesystem watchers are the source of truth. A changed `config.json` is surfaced for explicit reload rather than silently replacing an open editor's draft.
+- The app is purely reactive: it reads `state/` and `runs/` and performs the shared live lock-health probe, watching `state/`, `runs/`, `locks/`, `config.json`, and both safety-authoritative schedule-state files for changes via `DispatchSource` watchers plus a best-effort `DistributedNotificationCenter` nudge posted by the helper after each state write. Direct file sources for `config.json`, `schedule-state.json`, and `schedule-state.version-1` catch in-place writes or permission changes that their parent directory sources cannot see; the directory sources discover creation and atomic replacement and then reconcile those direct sources. Notifications are lossy by design; the filesystem watchers are the source of truth. A changed `config.json` is surfaced for explicit reload rather than silently replacing an open editor's draft.
 
 ## Dependency injection rule (testability)
 
@@ -155,6 +155,7 @@ State — not config — is the right XDG base dir for `root`: `config.json` is 
 | `runs/<runId>/log.txt` | full streamed log of the run |
 | `runs/index.jsonl` | append-only, one summary JSON line per finished run |
 | `state/schedule-state.json` | last-start times + check-slice cursors per set |
+| `state/schedule-state.version-1` | owner-only monotonic evidence that schedule state has migrated to its checksummed v1 envelope |
 | `state/preview-tokens.json` | owner-only (`0600`) short-lived destructive-preview capabilities; never copied into runs or logs |
 | `state/current-run-<setId>.json` | live progress plus an independent 30-second awake-time heartbeat (deleted on completion) |
 | `state/repo-status-<destId>.json` | reachability + last-synced info per destination |

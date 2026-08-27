@@ -96,13 +96,19 @@ public struct ResticCommand: Equatable, Sendable {
         return ResticCommand(argv: argv, repoURL: repo)
     }
 
-    /// `restic -r <secondaryRepo> copy --from-repo <primaryRepo>`
+    /// `restic -r <secondaryRepo> copy --from-repo <primaryRepo> [<snapshotID>...]`
     ///
     /// Direction: `-r` is the DESTINATION, `--from-repo` is the SOURCE
     /// (restic-cli.md §copy). No `--json` — `copy` has no JSON mode in 0.18.
-    public static func copy(toRepo: String, fromRepo: String) -> ResticCommand {
-        ResticCommand(
-            argv: ["-r", toRepo, "copy", "--from-repo", fromRepo],
+    public static func copy(
+        toRepo: String,
+        fromRepo: String,
+        snapshotIDs: [String] = []
+    ) -> ResticCommand {
+        var argv = ["-r", toRepo, "copy", "--from-repo", fromRepo]
+        argv.append(contentsOf: snapshotIDs)
+        return ResticCommand(
+            argv: argv,
             repoURL: toRepo,
             fromRepoURL: fromRepo
         )

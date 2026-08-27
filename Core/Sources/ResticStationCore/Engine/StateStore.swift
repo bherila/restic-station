@@ -13,6 +13,10 @@ import Musl
 /// `state/schedule-state.json` — see `docs/data-model.md`
 /// §state/schedule-state.json. Keyed by `BackupSet.id`.
 public struct ScheduleState: Codable, Equatable, Sendable {
+    /// Current on-disk envelope version. Legacy documents without a version
+    /// remain readable and are upgraded on their next successful mutation.
+    public static let currentVersion = 1
+
     public var sets: [UUID: SetScheduleState]
 
     public init(sets: [UUID: SetScheduleState] = [:]) {
@@ -29,16 +33,19 @@ public struct ScheduleState: Codable, Equatable, Sendable {
     /// the dynamic-key container on both sides.
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        guard container.contains(.sets) else {
-            self.sets = [:]
-            return
-        }
         let setsContainer = try container.nestedContainer(keyedBy: DynamicCodingKey.self, forKey: .sets)
         var result: [UUID: SetScheduleState] = [:]
         for key in setsContainer.allKeys {
-            // Unknown/malformed keys are skipped, not fatal — state files
-            // are regenerable caches (docs/data-model.md §Versioning).
-            guard let id = UUID(uuidString: key.stringValue) else { continue }
+            // Unlike regenerable state, this dictionary contains destructive
+            // purge watermarks. Silently dropping one malformed key would
+            // turn corruption into permission to run a rewrite again.
+            guard let id = UUID(uuidString: key.stringValue) else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: key,
+                    in: setsContainer,
+                    debugDescription: "Schedule-state set key is not a UUID: \(key.stringValue)"
+                )
+            }
             result[id] = try setsContainer.decode(SetScheduleState.self, forKey: key)
         }
         self.sets = result
@@ -48,7 +55,7 @@ public struct ScheduleState: Codable, Equatable, Sendable {
         var container = encoder.container(keyedBy: CodingKeys.self)
         var setsContainer = container.nestedContainer(keyedBy: DynamicCodingKey.self, forKey: .sets)
         for (id, value) in sets {
-            guard let key = DynamicCodingKey(stringValue: id.uuidString) else { continue }
+            let key = DynamicCodingKey(stringValue: id.uuidString)!
             try setsContainer.encode(value, forKey: key)
         }
     }
@@ -71,12 +78,9 @@ public struct SetScheduleState: Codable, Equatable, Sendable {
     /// ("every 4th check", `docs/scheduling.md` §Check scheduling). `nil`
     /// before any check has succeeded.
     ///
-    /// Added by T09 (`BackupEngine.runCheck`) — the rotation rule needs a
-    /// counter and `docs/data-model.md` §schedule-state.json documents no
-    /// field for it. Optional, so a `schedule-state.json` written by an
-    /// earlier build (which has no `checkCount` key) still decodes: state
-    /// files carry no version and are regenerable caches
-    /// (`docs/data-model.md` §Versioning & migration).
+    /// Added by T09 (`BackupEngine.runCheck`). Optional so a legacy
+    /// unversioned `schedule-state.json` written before `checkCount` existed
+    /// still decodes and can be upgraded to the checksummed envelope.
     public var checkCount: Int?
     /// Per destination, the purge patterns that have already been rewritten
     /// out of that repository. Removing a pattern deliberately does not
@@ -115,7 +119,13 @@ public struct SetScheduleState: Codable, Equatable, Sendable {
         let nested = try container.nestedContainer(keyedBy: DynamicCodingKey.self, forKey: .appliedPurgeExcludes)
         var values: [UUID: [String]] = [:]
         for key in nested.allKeys {
-            guard let id = UUID(uuidString: key.stringValue) else { continue }
+            guard let id = UUID(uuidString: key.stringValue) else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: key,
+                    in: nested,
+                    debugDescription: "Schedule-state destination key is not a UUID: \(key.stringValue)"
+                )
+            }
             values[id] = try nested.decode([String].self, forKey: key)
         }
         appliedPurgeExcludes = values
@@ -130,9 +140,81 @@ public struct SetScheduleState: Codable, Equatable, Sendable {
         try container.encode(checkCount, forKey: .checkCount)
         var nested = container.nestedContainer(keyedBy: DynamicCodingKey.self, forKey: .appliedPurgeExcludes)
         for (id, patterns) in appliedPurgeExcludes {
-            guard let key = DynamicCodingKey(stringValue: id.uuidString) else { continue }
+            let key = DynamicCodingKey(stringValue: id.uuidString)!
             try nested.encode(patterns, forKey: key)
         }
+    }
+}
+
+/// Versioned, checksummed representation of ``ScheduleState``. The digest is
+/// over the canonical encoding of the logical state (`{"sets": ...}`), so
+/// it is independent of envelope field order and identical on macOS/Linux.
+private struct ScheduleStateDocument: Codable {
+    let version: Int
+    let checksum: String
+    let sets: [UUID: SetScheduleState]
+
+    init(state: ScheduleState) throws {
+        version = ScheduleState.currentVersion
+        checksum = try StateStore.scheduleStateChecksum(state)
+        sets = state.sets
+    }
+
+    var state: ScheduleState { ScheduleState(sets: sets) }
+
+    private enum CodingKeys: String, CodingKey {
+        case version, checksum, sets
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        version = try container.decode(Int.self, forKey: .version)
+        checksum = try container.decode(String.self, forKey: .checksum)
+        let nested = try container.nestedContainer(keyedBy: DynamicCodingKey.self, forKey: .sets)
+        var decoded: [UUID: SetScheduleState] = [:]
+        for key in nested.allKeys {
+            guard let id = UUID(uuidString: key.stringValue) else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: key,
+                    in: nested,
+                    debugDescription: "Schedule-state set key is not a UUID: \(key.stringValue)"
+                )
+            }
+            decoded[id] = try nested.decode(SetScheduleState.self, forKey: key)
+        }
+        sets = decoded
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(version, forKey: .version)
+        try container.encode(checksum, forKey: .checksum)
+        var nested = container.nestedContainer(keyedBy: DynamicCodingKey.self, forKey: .sets)
+        for (id, entry) in sets {
+            try nested.encode(entry, forKey: DynamicCodingKey(stringValue: id.uuidString)!)
+        }
+    }
+}
+
+private struct ScheduleStateVersionProbe: Decodable {
+    let version: Int?
+    let hasChecksum: Bool
+
+    private enum CodingKeys: String, CodingKey {
+        case version, checksum
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        if container.contains(.version) {
+            // An explicit null is not a legacy marker. Requiring an integer
+            // prevents a damaged envelope from bypassing checksum validation
+            // by changing its version field to null.
+            version = try container.decode(Int.self, forKey: .version)
+        } else {
+            version = nil
+        }
+        hasChecksum = container.contains(.checksum)
     }
 }
 
@@ -260,13 +342,111 @@ public struct FdaCheckResult: Codable, Equatable, Sendable {
 
 // MARK: - StateStoreError
 
+public enum ScheduleStateReadFailureReason: Equatable, Sendable, CustomStringConvertible {
+    case malformedDocument
+    case checksumMismatch
+    case versionDowngrade
+    case versionMarkerMissing
+    case unsupportedVersion(found: Int, current: Int)
+    case unsafeFile(reason: String)
+    case ioFailure(operation: String, errno: Int32)
+    case tooLarge(bytes: Int64, limit: Int64)
+
+    public var description: String {
+        switch self {
+        case .malformedDocument:
+            return "the document is malformed"
+        case .checksumMismatch:
+            return "the checksum does not match the schedule payload"
+        case .versionDowngrade:
+            return "the versioned schedule-state envelope was stripped after migration"
+        case .versionMarkerMissing:
+            return "the versioned schedule state is missing its durable migration marker"
+        case .unsupportedVersion(let found, let current):
+            return "the document version is \(found), but this build supports version \(current)"
+        case .unsafeFile(let reason):
+            return "the canonical path is unsafe: \(reason)"
+        case .ioFailure(let operation, let code):
+            return "\(operation) failed with errno \(code)"
+        case .tooLarge(let bytes, let limit):
+            return "the document is \(bytes) bytes; the safety limit is \(limit) bytes"
+        }
+    }
+}
+
+/// Evidence retained when an existing schedule document cannot be trusted.
+/// The canonical path is deliberately left in place as a fail-closed
+/// sentinel; when bytes were readable, an immutable-by-name recovery copy is
+/// also published beside it using the raw-byte SHA-256.
+public struct ScheduleStateReadFailure: Equatable, Sendable, CustomStringConvertible {
+    public let reason: ScheduleStateReadFailureReason
+    public let canonicalPath: String
+    /// SHA-256 of the exact canonical bytes, when those bytes were readable.
+    /// Long-lived observers use it to avoid retrying a failed recovery-copy
+    /// publication in response to the temp-file events generated by that
+    /// same failed attempt.
+    public let contentFingerprint: String?
+    public let quarantinePath: String?
+    public let quarantineWriteFailed: Bool
+
+    public init(
+        reason: ScheduleStateReadFailureReason,
+        canonicalPath: String,
+        contentFingerprint: String? = nil,
+        quarantinePath: String? = nil,
+        quarantineWriteFailed: Bool = false
+    ) {
+        self.reason = reason
+        self.canonicalPath = canonicalPath
+        self.contentFingerprint = contentFingerprint
+        self.quarantinePath = quarantinePath
+        self.quarantineWriteFailed = quarantineWriteFailed
+    }
+
+    public var description: String {
+        var message = "schedule state is unreadable: \(reason); canonical file left unchanged at \(canonicalPath)"
+        if let quarantinePath {
+            message += "; recovery copy: \(quarantinePath)"
+        } else if quarantineWriteFailed {
+            message += "; writing a recovery copy also failed"
+        }
+        return message
+    }
+
+    public var recoveryMessage: String {
+        let markerFailure: Bool
+        switch reason {
+        case .versionMarkerMissing:
+            markerFailure = true
+        case .unsafeFile(let detail):
+            markerFailure = detail.contains("schedule state version marker")
+        case .ioFailure(let operation, _):
+            markerFailure = operation.contains("schedule state version marker")
+        default:
+            markerFailure = false
+        }
+
+        if markerFailure {
+            return description
+                + ". Stop Restic Station and inspect both the canonical document and its version marker. "
+                + "After verifying the v1 envelope and checksum, repair the owner-only marker as exactly `1\\n` "
+                + "with mode 0600, or replace both files from a trusted recovery copy. Replacing only the canonical "
+                + "JSON cannot repair a missing or unsafe marker."
+        }
+
+        return description
+            + ". Stop Restic Station, inspect the preserved bytes, then explicitly replace the canonical file "
+            + "with a valid document. Deleting it accepts loss of schedule, check, and purge-watermark bookkeeping."
+    }
+}
+
 /// The outcome of reading the schedule state. Unlike the other regenerable
 /// state files, this document holds destructive purge bookkeeping, so a
 /// corrupt existing file must never be mistaken for an absent one.
 public enum ScheduleStateReadResult: Equatable, Sendable {
     case missing
     case valid(ScheduleState)
-    case corrupt
+    case corrupt(ScheduleStateReadFailure)
 
     public var state: ScheduleState? {
         guard case .valid(let state) = self else { return nil }
@@ -275,6 +455,7 @@ public enum ScheduleStateReadResult: Equatable, Sendable {
 }
 
 public enum StateStoreError: Error, Equatable, Sendable, CustomStringConvertible {
+    case durableWriteFailed(operation: String, errno: Int32, path: String)
     case renameFailed(errno: Int32, from: String, to: String)
     /// The schedule-state lock could not be used at all — distinct from
     /// ``scheduleStateLockTimeout``, which means a peer genuinely held it
@@ -283,30 +464,121 @@ public enum StateStoreError: Error, Equatable, Sendable, CustomStringConvertible
     /// `schedule-state.json`'s companion lock could not be acquired within
     /// the bounded retry window.
     case scheduleStateLockTimeout(path: String)
-    case scheduleStateCorrupt(path: String)
+    case scheduleStateCorrupt(ScheduleStateReadFailure)
+    case scheduleStateWriteTooLarge(bytes: Int64, limit: Int64, path: String)
 
     public var description: String {
         switch self {
+        case .durableWriteFailed(let operation, let code, let path):
+            return "\(operation) failed for \(path): errno \(code)"
         case .renameFailed(let errno, let from, let to):
             return "rename(\(from), \(to)) failed: errno \(errno)"
         case .scheduleStateLockTimeout(let path):
             return "timed out waiting for schedule state lock \(path)"
         case .lockUnusable(let failure):
             return "schedule-state lock unusable: \(failure)"
-        case .scheduleStateCorrupt(let path):
-            return "schedule state is corrupt and was left unchanged: \(path)"
+        case .scheduleStateCorrupt(let failure):
+            return failure.recoveryMessage
+        case .scheduleStateWriteTooLarge(let bytes, let limit, let path):
+            return "refusing to publish schedule state at \(path): encoded document is "
+                + "\(bytes) bytes; the safety limit is \(limit) bytes"
         }
     }
+}
+
+/// Narrow POSIX seam for schedule-state durability fault injection.
+struct StateStoreFileOperations: @unchecked Sendable {
+    let openAt: @Sendable (Int32, String, Int32, mode_t) -> Int32
+    let read: @Sendable (Int32, UnsafeMutableRawPointer, Int) -> Int
+    let write: @Sendable (Int32, UnsafeRawPointer, Int) -> Int
+    let sync: @Sendable (Int32) -> Int32
+    let stat: @Sendable (Int32, UnsafeMutablePointer<stat>) -> Int32
+    let setMode: @Sendable (Int32, mode_t) -> Int32
+    let renameAt: @Sendable (Int32, String, Int32, String) -> Int32
+    let unlinkAt: @Sendable (Int32, String) -> Int32
+    let close: @Sendable (Int32) -> Int32
+
+    static let live = StateStoreFileOperations(
+        openAt: { directory, name, flags, mode in
+            name.withCString { openat(directory, $0, flags, mode) }
+        },
+        read: { fd, buffer, count in
+            #if canImport(Darwin)
+            Darwin.read(fd, buffer, count)
+            #elseif canImport(Glibc)
+            Glibc.read(fd, buffer, count)
+            #elseif canImport(Musl)
+            Musl.read(fd, buffer, count)
+            #endif
+        },
+        write: { fd, buffer, count in
+            #if canImport(Darwin)
+            Darwin.write(fd, buffer, count)
+            #elseif canImport(Glibc)
+            Glibc.write(fd, buffer, count)
+            #elseif canImport(Musl)
+            Musl.write(fd, buffer, count)
+            #endif
+        },
+        sync: { fd in
+            #if canImport(Darwin)
+            Darwin.fsync(fd)
+            #elseif canImport(Glibc)
+            Glibc.fsync(fd)
+            #elseif canImport(Musl)
+            Musl.fsync(fd)
+            #endif
+        },
+        stat: { fd, info in
+            #if canImport(Darwin)
+            Darwin.fstat(fd, info)
+            #elseif canImport(Glibc)
+            Glibc.fstat(fd, info)
+            #elseif canImport(Musl)
+            Musl.fstat(fd, info)
+            #endif
+        },
+        setMode: { fd, mode in
+            #if canImport(Darwin)
+            Darwin.fchmod(fd, mode)
+            #elseif canImport(Glibc)
+            Glibc.fchmod(fd, mode)
+            #elseif canImport(Musl)
+            Musl.fchmod(fd, mode)
+            #endif
+        },
+        renameAt: { oldDirectory, oldName, newDirectory, newName in
+            oldName.withCString { oldNamePointer in
+                newName.withCString { newNamePointer in
+                    renameat(oldDirectory, oldNamePointer, newDirectory, newNamePointer)
+                }
+            }
+        },
+        unlinkAt: { directory, name in
+            name.withCString { unlinkat(directory, $0, 0) }
+        },
+        close: { fd in
+            #if canImport(Darwin)
+            Darwin.close(fd)
+            #elseif canImport(Glibc)
+            Glibc.close(fd)
+            #elseif canImport(Musl)
+            Musl.close(fd)
+            #endif
+        }
+    )
 }
 
 // MARK: - StateStore
 
 /// Typed read/write access to the four `state/` files described in
 /// `docs/data-model.md`. Writes are atomic (temp file + `rename(2)`, same
-/// convention as `ConfigStore.save(_:)`). Most reads tolerate missing or
-/// corrupt files as regenerable cache. Schedule state is the exception: it
-/// contains purge bookkeeping, so its typed read result distinguishes a
-/// missing file from a corrupt existing one and mutations fail closed.
+/// convention as `ConfigStore.save(_:)`). Schedule-state publication also
+/// fsyncs the complete temp file and containing directory. Most reads
+/// tolerate missing or corrupt files as regenerable cache. Schedule state is
+/// the exception: it contains purge bookkeeping, so its typed read result
+/// distinguishes a missing file from a corrupt existing one and mutations
+/// fail closed.
 ///
 /// After every write (including `clearCurrentRun`, which deletes a file),
 /// posts the best-effort `DistributedNotificationCenter` nudge described in
@@ -314,27 +586,478 @@ public enum StateStoreError: Error, Equatable, Sendable, CustomStringConvertible
 /// remains the source of truth on every platform.
 public struct StateStore: Sendable {
     public let paths: AppPaths
+    private let fileOperations: StateStoreFileOperations
+    private let maximumScheduleStateBytes: Int64
+
+    private static let defaultMaximumScheduleStateBytes: Int64 = 64 * 1_024 * 1_024
 
     public init(paths: AppPaths) {
         self.paths = paths
+        fileOperations = .live
+        maximumScheduleStateBytes = Self.defaultMaximumScheduleStateBytes
+    }
+
+    init(
+        paths: AppPaths,
+        fileOperations: StateStoreFileOperations,
+        maximumScheduleStateBytes: Int64 = StateStore.defaultMaximumScheduleStateBytes
+    ) {
+        self.paths = paths
+        self.fileOperations = fileOperations
+        self.maximumScheduleStateBytes = maximumScheduleStateBytes
     }
 
     // MARK: - schedule-state.json
 
-    public func readScheduleStateResult() -> ScheduleStateReadResult {
-        let url = paths.scheduleStateFile
+    /// Reads and validates the safety-authoritative schedule document.
+    ///
+    /// `suppressedRecoveryCopyFingerprint` is for long-lived event watchers:
+    /// after recovery-copy publication failed for those exact bytes, the
+    /// watcher can classify them again without creating another temp inode
+    /// whose directory event would feed the same failure back into itself.
+    public func readScheduleStateResult(
+        suppressingRecoveryCopyFor suppressedRecoveryCopyFingerprint: String? = nil
+    ) -> ScheduleStateReadResult {
+        let directory: DirectoryHandle
+        switch openStateDirectory() {
+        case .opened(let handle):
+            directory = handle
+        case .missing:
+            return .missing
+        case .failed(let reason):
+            return .corrupt(ScheduleStateReadFailure(
+                reason: reason,
+                canonicalPath: paths.scheduleStateFile.path
+            ))
+        }
+
+        switch classifyScheduleState(
+            suppressingRecoveryCopyFor: suppressedRecoveryCopyFingerprint,
+            generationIsStable: false,
+            in: directory.descriptor
+        ) {
+        case .result(let result):
+            return result
+        case .generationMismatch:
+            break
+        }
+
+        // A marker/document mismatch can be the small publication window of
+        // the first legacy -> v1 mutation. The writer owns this same lock, so
+        // re-reading beneath it binds both files to one stable generation and
+        // prevents a healthy migration from being quarantined as downgrade.
+        let lock: FileLock
         do {
-            let data = try Data(contentsOf: url)
-            guard let state = try? Self.makeDecoder().decode(ScheduleState.self, from: data) else {
-                return .corrupt
-            }
-            return .valid(state)
+            lock = try acquireScheduleStateLock(in: directory)
+        } catch StateStoreError.scheduleStateLockTimeout {
+            return .corrupt(ScheduleStateReadFailure(
+                reason: .ioFailure(operation: "wait for stable schedule-state generation", errno: EBUSY),
+                canonicalPath: paths.scheduleStateFile.path
+            ))
+        } catch StateStoreError.lockUnusable(let failure) {
+            return .corrupt(ScheduleStateReadFailure(
+                reason: .ioFailure(
+                    operation: "lock stable schedule-state generation: \(failure.operation)",
+                    errno: failure.errnoValue
+                ),
+                canonicalPath: paths.scheduleStateFile.path
+            ))
         } catch {
-            let nsError = error as NSError
-            return nsError.domain == NSCocoaErrorDomain
-                && (nsError.code == NSFileNoSuchFileError || nsError.code == NSFileReadNoSuchFileError)
+            return .corrupt(ScheduleStateReadFailure(
+                reason: .ioFailure(operation: "lock stable schedule-state generation", errno: EIO),
+                canonicalPath: paths.scheduleStateFile.path
+            ))
+        }
+        defer { lock.release() }
+
+        switch classifyScheduleState(
+            suppressingRecoveryCopyFor: suppressedRecoveryCopyFingerprint,
+            generationIsStable: true,
+            in: directory.descriptor
+        ) {
+        case .result(let result):
+            return result
+        case .generationMismatch(let reason, let bytes):
+            return .corrupt(scheduleStateFailure(
+                reason: reason,
+                bytes: bytes,
+                suppressingRecoveryCopyFor: suppressedRecoveryCopyFingerprint,
+                in: directory.descriptor
+            ))
+        }
+    }
+
+    private enum StateDirectoryOpen {
+        case opened(DirectoryHandle)
+        case missing
+        case failed(ScheduleStateReadFailureReason)
+    }
+
+    /// Opens `state/` **once** and retains the descriptor.
+    ///
+    /// Every schedule-state name — canonical document, migration marker,
+    /// recovery copy, durable temp, and the companion lock — is then resolved
+    /// through this one descriptor. Between two pathname opens the directory
+    /// can be renamed and recreated; between two uses of one descriptor it
+    /// cannot, which is what binds a lease's evidence to the tree it writes
+    /// into rather than re-checking it "recently" (`AGENTS.md` §Safety 1).
+    ///
+    /// Opened through `fileOperations` rather than `DirectoryHandle.open`, so
+    /// the injectable syscall seam still governs this open; the handle adopts
+    /// the verified descriptor and owns closing it.
+    private func openStateDirectory() -> StateDirectoryOpen {
+        let descriptor = fileOperations.openAt(
+            AT_FDCWD,
+            paths.stateDir.path,
+            O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW,
+            0
+        )
+        guard descriptor >= 0 else {
+            let code = errno
+            return code == ENOENT
                 ? .missing
-                : .corrupt
+                : .failed(.ioFailure(operation: "open state directory", errno: code))
+        }
+        var info = stat()
+        guard fileOperations.stat(descriptor, &info) == 0 else {
+            let code = errno
+            _ = fileOperations.close(descriptor)
+            return .failed(.ioFailure(operation: "fstat state directory", errno: code))
+        }
+        guard (info.st_mode & mode_t(S_IFMT)) == mode_t(S_IFDIR) else {
+            _ = fileOperations.close(descriptor)
+            return .failed(.unsafeFile(reason: "state directory is not a directory"))
+        }
+        guard info.st_uid == geteuid() else {
+            _ = fileOperations.close(descriptor)
+            return .failed(.unsafeFile(
+                reason: "state directory owned by uid \(info.st_uid), expected \(geteuid())"
+            ))
+        }
+        return .opened(DirectoryHandle.adopting(descriptor: descriptor, path: paths.stateDir))
+    }
+
+    private enum ScheduleStateClassification {
+        case result(ScheduleStateReadResult)
+        case generationMismatch(ScheduleStateReadFailureReason, Data)
+    }
+
+    private func classifyScheduleState(
+        suppressingRecoveryCopyFor suppressedRecoveryCopyFingerprint: String?,
+        generationIsStable: Bool,
+        in directoryFD: Int32
+    ) -> ScheduleStateClassification {
+        switch readScheduleStateBytes(in: directoryFD) {
+        case .missing:
+            // The marker is part of this capability boundary even when the
+            // canonical document is absent. A valid marker followed by a
+            // crash before first-envelope publication is still logically
+            // missing, but an unsafe marker must never be hidden by that
+            // same crash window.
+            switch readScheduleStateVersionMarker(in: directoryFD) {
+            case .missing, .present:
+                return .result(.missing)
+            case .failed(let reason):
+                return .result(.corrupt(scheduleStateFailure(reason: reason, bytes: nil, in: directoryFD)))
+            }
+        case .failed(let reason):
+            return .result(.corrupt(scheduleStateFailure(reason: reason, bytes: nil, in: directoryFD)))
+        case .bytes(let data):
+            do {
+                let decoder = Self.makeDecoder()
+                let probe = try decoder.decode(ScheduleStateVersionProbe.self, from: data)
+                guard let version = probe.version else {
+                    guard !probe.hasChecksum else {
+                        return .result(.corrupt(scheduleStateFailure(
+                            reason: .malformedDocument,
+                            bytes: data,
+                            suppressingRecoveryCopyFor: suppressedRecoveryCopyFingerprint,
+                            in: directoryFD
+                        )))
+                    }
+                    switch readScheduleStateVersionMarker(in: directoryFD) {
+                    case .missing:
+                        break
+                    case .present:
+                        if !generationIsStable {
+                            return .generationMismatch(.versionDowngrade, data)
+                        }
+                        return .result(.corrupt(scheduleStateFailure(
+                            reason: .versionDowngrade,
+                            bytes: data,
+                            suppressingRecoveryCopyFor: suppressedRecoveryCopyFingerprint,
+                            in: directoryFD
+                        )))
+                    case .failed(let reason):
+                        return .result(.corrupt(scheduleStateFailure(
+                            reason: reason,
+                            bytes: data,
+                            suppressingRecoveryCopyFor: suppressedRecoveryCopyFingerprint,
+                            in: directoryFD
+                        )))
+                    }
+                    // Legacy v0: no checksum existed. Preserve compatibility,
+                    // then upgrade under the mutation lock on the next write.
+                    return .result(.valid(try decoder.decode(ScheduleState.self, from: data)))
+                }
+                // The marker is an independent part of the recovery
+                // capability. Classify it before version compatibility so a
+                // newer canonical document cannot hide a second repair the
+                // operator must perform.
+                switch readScheduleStateVersionMarker(in: directoryFD) {
+                case .present:
+                    break
+                case .missing:
+                    if !generationIsStable {
+                        return .generationMismatch(.versionMarkerMissing, data)
+                    }
+                    return .result(.corrupt(scheduleStateFailure(
+                        reason: .versionMarkerMissing,
+                        bytes: data,
+                        suppressingRecoveryCopyFor: suppressedRecoveryCopyFingerprint,
+                            in: directoryFD
+                    )))
+                case .failed(let reason):
+                    return .result(.corrupt(scheduleStateFailure(
+                        reason: reason,
+                        bytes: data,
+                        suppressingRecoveryCopyFor: suppressedRecoveryCopyFingerprint,
+                            in: directoryFD
+                    )))
+                }
+                guard version == ScheduleState.currentVersion else {
+                    return .result(.corrupt(scheduleStateFailure(
+                        reason: .unsupportedVersion(found: version, current: ScheduleState.currentVersion),
+                        bytes: data,
+                        suppressingRecoveryCopyFor: suppressedRecoveryCopyFingerprint,
+                            in: directoryFD
+                    )))
+                }
+                let document = try decoder.decode(ScheduleStateDocument.self, from: data)
+                let checksum = try Self.scheduleStateChecksum(document.state)
+                guard document.checksum.count == 64,
+                      document.checksum.allSatisfy({ $0.isHexDigit && !$0.isUppercase }),
+                      document.checksum == checksum else {
+                    return .result(.corrupt(scheduleStateFailure(
+                        reason: .checksumMismatch,
+                        bytes: data,
+                        suppressingRecoveryCopyFor: suppressedRecoveryCopyFingerprint,
+                            in: directoryFD
+                    )))
+                }
+                return .result(.valid(document.state))
+            } catch {
+                return .result(.corrupt(scheduleStateFailure(
+                    reason: .malformedDocument,
+                    bytes: data,
+                    suppressingRecoveryCopyFor: suppressedRecoveryCopyFingerprint,
+                            in: directoryFD
+                )))
+            }
+        }
+    }
+
+    private enum ScheduleStateBytesRead {
+        case missing
+        case bytes(Data)
+        case failed(ScheduleStateReadFailureReason)
+    }
+
+    /// Opens the owner-controlled state directory and canonical file without
+    /// following a symlink. A schedule document is authority for destructive
+    /// bookkeeping, so unlike regenerable caches it must be a regular file
+    /// owned by the effective uid.
+    /// Reads through the caller's retained `state/` descriptor, so the
+    /// document, the migration marker, the lock and every later durable write
+    /// resolve in one directory generation.
+    private func readScheduleStateBytes(in directoryFD: Int32) -> ScheduleStateBytesRead {
+        let filename = paths.scheduleStateFile.lastPathComponent
+        let fd = fileOperations.openAt(
+            directoryFD,
+            filename,
+            O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW,
+            0
+        )
+        guard fd >= 0 else {
+            let code = errno
+            return code == ENOENT
+                ? .missing
+                : .failed(.ioFailure(operation: "open schedule state", errno: code))
+        }
+        defer { _ = fileOperations.close(fd) }
+
+        var info = stat()
+        guard fileOperations.stat(fd, &info) == 0 else {
+            return .failed(.ioFailure(operation: "fstat schedule state", errno: errno))
+        }
+        guard (info.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG) else {
+            return .failed(.unsafeFile(reason: "not a regular file"))
+        }
+        guard info.st_uid == geteuid() else {
+            return .failed(.unsafeFile(reason: "owned by uid \(info.st_uid), expected \(geteuid())"))
+        }
+        // The envelope checksum is unkeyed, so it authenticates nothing an
+        // editor could not recompute. A canonical file another user can write
+        // is therefore forged purge bookkeeping — a fabricated
+        // `appliedPurgeExcludes` suppresses a required rewrite, which is the
+        // dangerous direction of the watermark asymmetry
+        // (`docs/scheduling.md` §Purge safety invariants). A transiently
+        // widened mode (a recursive chmod that also exposed `state/`) must
+        // not be consumed even after the directory is re-tightened.
+        //
+        // Only the *write* bits are refused, not `0o077`: a pre-v1 release
+        // could publish `0644` under a permissive umask, and refusing to read
+        // an install's own state would be a worse failure than the exposure
+        // that mode represents.
+        guard info.st_mode & 0o022 == 0 else {
+            return .failed(.unsafeFile(
+                reason: "writable by other users (mode \(String(info.st_mode & 0o777, radix: 8)))"
+            ))
+        }
+        let fileSize = Int64(info.st_size)
+        guard fileSize >= 0,
+              fileSize <= maximumScheduleStateBytes else {
+            return .failed(.tooLarge(bytes: fileSize, limit: maximumScheduleStateBytes))
+        }
+
+        var data = Data()
+        data.reserveCapacity(Int(fileSize))
+        var buffer = [UInt8](repeating: 0, count: 64 * 1_024)
+        while true {
+            let count = buffer.withUnsafeMutableBytes { raw -> Int in
+                guard let base = raw.baseAddress else { return 0 }
+                return fileOperations.read(fd, base, raw.count)
+            }
+            if count < 0 {
+                let code = errno
+                if code == EINTR { continue }
+                return .failed(.ioFailure(operation: "read schedule state", errno: code))
+            }
+            if count == 0 { break }
+            guard Int64(data.count + count) <= maximumScheduleStateBytes else {
+                return .failed(.tooLarge(
+                    bytes: Int64(data.count + count),
+                    limit: maximumScheduleStateBytes
+                ))
+            }
+            data.append(contentsOf: buffer.prefix(count))
+        }
+        return .bytes(data)
+    }
+
+    private enum ScheduleStateVersionMarkerRead {
+        case missing
+        case present
+        case failed(ScheduleStateReadFailureReason)
+    }
+
+    private static let scheduleStateVersionMarkerBytes = Data("1\n".utf8)
+
+    /// Reads the monotonic migration marker without ever blocking on a
+    /// hostile FIFO. The filename is version-specific, while the tiny body
+    /// catches truncated or substituted regular files.
+    private func readScheduleStateVersionMarker(in directoryFD: Int32) -> ScheduleStateVersionMarkerRead {
+        let fd = fileOperations.openAt(
+            directoryFD,
+            paths.scheduleStateVersionMarkerFile.lastPathComponent,
+            O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW,
+            0
+        )
+        guard fd >= 0 else {
+            let code = errno
+            return code == ENOENT
+                ? .missing
+                : .failed(.ioFailure(operation: "open schedule state version marker", errno: code))
+        }
+        defer { _ = fileOperations.close(fd) }
+
+        var info = stat()
+        guard fileOperations.stat(fd, &info) == 0 else {
+            return .failed(.ioFailure(operation: "fstat schedule state version marker", errno: errno))
+        }
+        guard (info.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG) else {
+            return .failed(.unsafeFile(reason: "schedule state version marker is not a regular file"))
+        }
+        guard info.st_uid == geteuid() else {
+            return .failed(.unsafeFile(
+                reason: "schedule state version marker is owned by uid \(info.st_uid), expected \(geteuid())"
+            ))
+        }
+        guard info.st_mode & 0o077 == 0 else {
+            return .failed(.unsafeFile(reason: "schedule state version marker is accessible by other users"))
+        }
+        guard Int64(info.st_size) == Int64(Self.scheduleStateVersionMarkerBytes.count) else {
+            return .failed(.unsafeFile(reason: "schedule state version marker has invalid contents"))
+        }
+
+        var bytes = Data()
+        var buffer = [UInt8](repeating: 0, count: Self.scheduleStateVersionMarkerBytes.count + 1)
+        while bytes.count <= Self.scheduleStateVersionMarkerBytes.count {
+            let count = buffer.withUnsafeMutableBytes { raw -> Int in
+                guard let base = raw.baseAddress else { return 0 }
+                return fileOperations.read(fd, base, raw.count)
+            }
+            if count < 0 {
+                let code = errno
+                if code == EINTR { continue }
+                return .failed(.ioFailure(operation: "read schedule state version marker", errno: code))
+            }
+            if count == 0 { break }
+            bytes.append(contentsOf: buffer.prefix(count))
+        }
+        return bytes == Self.scheduleStateVersionMarkerBytes
+            ? .present
+            : .failed(.unsafeFile(reason: "schedule state version marker has invalid contents"))
+    }
+
+    private func scheduleStateFailure(
+        reason: ScheduleStateReadFailureReason,
+        bytes: Data?,
+        suppressingRecoveryCopyFor suppressedRecoveryCopyFingerprint: String? = nil,
+        in directoryFD: Int32
+    ) -> ScheduleStateReadFailure {
+        guard let bytes else {
+            return ScheduleStateReadFailure(reason: reason, canonicalPath: paths.scheduleStateFile.path)
+        }
+        let fingerprint = SHA256Digest.hex(bytes)
+        let quarantine = paths.stateDir.appendingPathComponent(
+            "schedule-state.corrupt-\(fingerprint).json",
+            isDirectory: false
+        )
+        // A rename may have succeeded even when its following directory
+        // fsync reported indeterminate durability. A later read can safely
+        // recognize the exact owner-owned bytes without writing again.
+        if existingOwnedRegularFile(at: quarantine, equals: bytes, in: directoryFD) {
+            return ScheduleStateReadFailure(
+                reason: reason,
+                canonicalPath: paths.scheduleStateFile.path,
+                contentFingerprint: fingerprint,
+                quarantinePath: quarantine.path
+            )
+        }
+        if fingerprint == suppressedRecoveryCopyFingerprint {
+            return ScheduleStateReadFailure(
+                reason: reason,
+                canonicalPath: paths.scheduleStateFile.path,
+                contentFingerprint: fingerprint,
+                quarantineWriteFailed: true
+            )
+        }
+        do {
+            try preserveScheduleStateQuarantine(bytes, at: quarantine, in: directoryFD)
+            return ScheduleStateReadFailure(
+                reason: reason,
+                canonicalPath: paths.scheduleStateFile.path,
+                contentFingerprint: fingerprint,
+                quarantinePath: quarantine.path
+            )
+        } catch {
+            return ScheduleStateReadFailure(
+                reason: reason,
+                canonicalPath: paths.scheduleStateFile.path,
+                contentFingerprint: fingerprint,
+                quarantineWriteFailed: true
+            )
         }
     }
 
@@ -345,9 +1068,11 @@ public struct StateStore: Sendable {
         readScheduleStateResult().state
     }
 
-    /// How long to retry for the schedule-state lock before giving up. The
-    /// critical section is a decode, one dictionary mutation and an atomic
-    /// write, so real contention is measured in milliseconds.
+    /// How long to retry for the schedule-state lock before giving up. Most
+    /// critical sections are a decode, one dictionary mutation and an atomic
+    /// write. A purge deliberately keeps the same evidence-bound lease
+    /// through rewrite completion and its watermark commit; another helper
+    /// times out safely instead of running from state that purge may change.
     private static let stateLockTimeout: Duration = .seconds(5)
     private static let stateLockPollInterval: UInt32 = 20_000  // 20ms
 
@@ -356,7 +1081,8 @@ public struct StateStore: Sendable {
     /// result back atomically.
     ///
     /// Held under ``AppPaths/scheduleStateLockFile`` for the whole
-    /// read-modify-write. The write itself was always atomic, but atomicity
+    /// read-modify-write (or, for purge, through destructive use and durable
+    /// acknowledgement). The write itself was always atomic, but atomicity
     /// is not isolation: `schedule-state.json` is one document shared by
     /// every set, while the only other lock is per-set. A scheduled tick for
     /// set A and a manual operation on set B run in different processes,
@@ -372,13 +1098,36 @@ public struct StateStore: Sendable {
     /// being scheduled to release, so waiters spin to the timeout. A test that
     /// did exactly that turned a 0.3s case into a 50s one on a two-core runner
     /// and stalled the whole suite behind it.
-    @discardableResult
-    public func updateScheduleState(
-        setId: UUID,
-        mutate: (inout SetScheduleState) -> Void
-    ) throws -> ScheduleState {
+    /// Opens `state/`, creating it first if a mutation needs it.
+    private func openStateDirectoryForWriting() throws -> DirectoryHandle {
         try paths.ensureDirectories()
-        let lock = FileLock(path: paths.scheduleStateLockFile, trustedRoot: paths.root)
+        switch openStateDirectory() {
+        case .opened(let handle):
+            return handle
+        case .missing:
+            throw StateStoreError.durableWriteFailed(
+                operation: "open state directory",
+                errno: ENOENT,
+                path: paths.stateDir.path
+            )
+        case .failed(let reason):
+            throw StateStoreError.scheduleStateCorrupt(ScheduleStateReadFailure(
+                reason: reason,
+                canonicalPath: paths.scheduleStateFile.path
+            ))
+        }
+    }
+
+    /// Takes the companion lock **inside** the caller's already-open `state/`
+    /// directory, so the locked inode and every file the holder subsequently
+    /// reads or publishes are resolved through one descriptor. A `state/`
+    /// renamed and recreated mid-lease therefore cannot receive this lease's
+    /// writes while its lock still protects the retired tree.
+    private func acquireScheduleStateLock(in directory: DirectoryHandle) throws -> FileLock {
+        let lock = FileLock(
+            name: paths.scheduleStateLockFile.lastPathComponent,
+            in: directory
+        )
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: Self.stateLockTimeout)
         // Only contention is worth waiting out. Polling a lock that failed
@@ -401,22 +1150,48 @@ public struct StateStore: Sendable {
             }
             break
         }
-        defer { lock.release() }
+        return lock
+    }
 
+    func lockScheduleState() throws -> LockedScheduleState {
+        let directory = try openStateDirectoryForWriting()
+        let lock = try acquireScheduleStateLock(in: directory)
         var state: ScheduleState
-        switch readScheduleStateResult() {
+        let readResult: ScheduleStateReadResult
+        switch classifyScheduleState(
+            suppressingRecoveryCopyFor: nil,
+            generationIsStable: true,
+            in: directory.descriptor
+        ) {
+        case .result(let result):
+            readResult = result
+        case .generationMismatch(let reason, let bytes):
+            readResult = .corrupt(scheduleStateFailure(
+                reason: reason,
+                bytes: bytes,
+                in: directory.descriptor
+            ))
+        }
+        switch readResult {
         case .missing:
             state = ScheduleState()
         case .valid(let loaded):
             state = loaded
-        case .corrupt:
-            throw StateStoreError.scheduleStateCorrupt(path: paths.scheduleStateFile.path)
+        case .corrupt(let failure):
+            lock.release()
+            throw StateStoreError.scheduleStateCorrupt(failure)
         }
-        var entry = state.sets[setId] ?? SetScheduleState()
-        mutate(&entry)
-        state.sets[setId] = entry
-        try write(state, to: paths.scheduleStateFile)
-        return state
+        return LockedScheduleState(store: self, lock: lock, directory: directory, state: state)
+    }
+
+    @discardableResult
+    public func updateScheduleState(
+        setId: UUID,
+        mutate: (inout SetScheduleState) -> Void
+    ) throws -> ScheduleState {
+        let locked = try lockScheduleState()
+        defer { locked.release() }
+        return try locked.update(setId: setId, mutate: mutate)
     }
 
     // MARK: - current-run-<setId>.json
@@ -505,6 +1280,267 @@ public struct StateStore: Sendable {
 
     // MARK: - Generic read/write
 
+    fileprivate static func scheduleStateChecksum(_ state: ScheduleState) throws -> String {
+        SHA256Digest.hex(try makeEncoder().encode(state))
+    }
+
+    fileprivate func writeScheduleState(_ state: ScheduleState, in directoryFD: Int32) throws {
+        let document = try ScheduleStateDocument(state: state)
+        let data = try Self.makeEncoder().encode(document)
+        guard Int64(data.count) <= maximumScheduleStateBytes else {
+            // Validate the complete prospective envelope before publishing
+            // the monotonic migration marker. Otherwise a legacy document
+            // that fits the read limit could be stranded behind a v1 marker
+            // when its envelope does not fit.
+            throw StateStoreError.scheduleStateWriteTooLarge(
+                bytes: Int64(data.count),
+                limit: maximumScheduleStateBytes,
+                path: paths.scheduleStateFile.path
+            )
+        }
+        try ensureScheduleStateVersionMarker(in: directoryFD)
+        try writeDurably(
+            data,
+            to: paths.scheduleStateFile,
+            tempName: paths.scheduleStateFile.lastPathComponent + ".tmp",
+            in: directoryFD,
+            postNotification: true
+        )
+    }
+
+    /// The marker commits before the first v1 envelope. A crash between the
+    /// two publications can stop scheduling, but can never make an already
+    /// migrated state look like unchecked legacy input.
+    private func ensureScheduleStateVersionMarker(in directoryFD: Int32) throws {
+        switch readScheduleStateVersionMarker(in: directoryFD) {
+        case .present:
+            return
+        case .missing:
+            try writeDurably(
+                Self.scheduleStateVersionMarkerBytes,
+                to: paths.scheduleStateVersionMarkerFile,
+                tempName: paths.scheduleStateVersionMarkerFile.lastPathComponent + ".tmp",
+                in: directoryFD,
+                postNotification: false
+            )
+        case .failed(let reason):
+            throw StateStoreError.scheduleStateCorrupt(ScheduleStateReadFailure(
+                reason: reason,
+                canonicalPath: paths.scheduleStateFile.path
+            ))
+        }
+    }
+
+    /// Retains the exact untrusted bytes under a content-addressed filename.
+    /// The canonical file remains untouched and therefore continues to block
+    /// mutations until an operator explicitly replaces it with valid state.
+    private func preserveScheduleStateQuarantine(
+        _ data: Data,
+        at url: URL,
+        in directoryFD: Int32
+    ) throws {
+        // Repeated health/status reads of the same bad canonical bytes must
+        // not turn into repeated durable writes. The name binds the SHA-256,
+        // and equality verifies that an existing name still holds those
+        // exact bytes before it is reused.
+        if existingOwnedRegularFile(at: url, equals: data, in: directoryFD) {
+            return
+        }
+        try writeDurably(
+            data,
+            to: url,
+            tempName: url.lastPathComponent + ".tmp-\(UUID().uuidString)",
+            in: directoryFD,
+            postNotification: false
+        )
+    }
+
+    /// Descriptor-based equality check for an existing recovery copy. The
+    /// state watcher performs a second read after the first copy's directory
+    /// event; avoiding another rename stops that event from feeding itself.
+    /// `O_NOFOLLOW` and descriptor metadata checks keep that optimization
+    /// from trusting a symlink or foreign/non-regular inode.
+    private func existingOwnedRegularFile(
+        at url: URL,
+        equals expected: Data,
+        in directoryFD: Int32
+    ) -> Bool {
+        let fd = fileOperations.openAt(
+            directoryFD,
+            url.lastPathComponent,
+            O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW,
+            0
+        )
+        guard fd >= 0 else { return false }
+        defer { _ = fileOperations.close(fd) }
+
+        var info = stat()
+        guard fileOperations.stat(fd, &info) == 0,
+              (info.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG),
+              info.st_uid == geteuid(),
+              Int64(info.st_size) == Int64(expected.count) else {
+            return false
+        }
+
+        var offset = 0
+        var buffer = [UInt8](repeating: 0, count: 64 * 1_024)
+        while offset < expected.count {
+            let requested = min(buffer.count, expected.count - offset)
+            let count = buffer.withUnsafeMutableBytes { raw -> Int in
+                guard let base = raw.baseAddress else { return 0 }
+                return fileOperations.read(fd, base, requested)
+            }
+            if count < 0 {
+                if errno == EINTR { continue }
+                return false
+            }
+            guard count > 0,
+                  expected[offset..<(offset + count)].elementsEqual(buffer.prefix(count)) else {
+                return false
+            }
+            offset += count
+        }
+
+        // Reject a file that grew after fstat even when its prefix matched.
+        let trailing = buffer.withUnsafeMutableBytes { raw -> Int in
+            guard let base = raw.baseAddress else { return 0 }
+            return fileOperations.read(fd, base, 1)
+        }
+        return trailing == 0
+    }
+
+    /// Complete write + file fsync + descriptor-relative rename + directory
+    /// fsync. Returning success means both bytes and directory entry crossed
+    /// the durability boundary; an fsync failure is never reported as a
+    /// successful schedule mutation.
+    /// Publishes `data` through the caller's retained `state/` descriptor.
+    ///
+    /// It deliberately does **not** re-resolve the directory by pathname or
+    /// call `ensureDirectories()`. Both would let a `state/` renamed and
+    /// recreated mid-lease receive this write while the lease's lock still
+    /// protects the retired tree — a second helper could then take the
+    /// replacement lock and run a concurrent `rewrite --forget`.
+    private func writeDurably(
+        _ data: Data,
+        to url: URL,
+        tempName: String,
+        in directoryFD: Int32,
+        postNotification shouldPostNotification: Bool
+    ) throws {
+        let directory = url.deletingLastPathComponent()
+        if fileOperations.unlinkAt(directoryFD, tempName) != 0 {
+            let code = errno
+            if code != ENOENT {
+                throw StateStoreError.durableWriteFailed(
+                    operation: "unlink stale state temp",
+                    errno: code,
+                    path: directory.appendingPathComponent(tempName).path
+                )
+            }
+        }
+        let tempPath = directory.appendingPathComponent(tempName).path
+        let tempFD = fileOperations.openAt(
+            directoryFD,
+            tempName,
+            O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC | O_NOFOLLOW,
+            0o600
+        )
+        guard tempFD >= 0 else {
+            throw StateStoreError.durableWriteFailed(
+                operation: "open state temp",
+                errno: errno,
+                path: tempPath
+            )
+        }
+
+        do {
+            try secureOwnerOnlyTemp(fd: tempFD, path: tempPath)
+            try writeAll(data, to: tempFD, path: tempPath)
+            try sync(tempFD, operation: "fsync state temp", path: tempPath)
+        } catch {
+            _ = fileOperations.close(tempFD)
+            _ = fileOperations.unlinkAt(directoryFD, tempName)
+            throw error
+        }
+        if fileOperations.close(tempFD) != 0 {
+            let code = errno
+            _ = fileOperations.unlinkAt(directoryFD, tempName)
+            throw StateStoreError.durableWriteFailed(
+                operation: "close state temp",
+                errno: code,
+                path: tempPath
+            )
+        }
+
+        let targetName = url.lastPathComponent
+        guard fileOperations.renameAt(directoryFD, tempName, directoryFD, targetName) == 0 else {
+            let code = errno
+            _ = fileOperations.unlinkAt(directoryFD, tempName)
+            throw StateStoreError.renameFailed(errno: code, from: tempPath, to: url.path)
+        }
+        try sync(directoryFD, operation: "fsync state directory", path: directory.path)
+        if shouldPostNotification {
+            postStateChangedNotification()
+        }
+    }
+
+    /// Creation mode is still filtered by the caller's umask. Pin and verify
+    /// the authority-bearing temp inode through its already-trusted
+    /// descriptor before any bytes are written or the inode is published.
+    private func secureOwnerOnlyTemp(fd: Int32, path: String) throws {
+        guard fileOperations.setMode(fd, 0o600) == 0 else {
+            throw StateStoreError.durableWriteFailed(
+                operation: "fchmod state temp",
+                errno: errno,
+                path: path
+            )
+        }
+        var info = stat()
+        guard fileOperations.stat(fd, &info) == 0 else {
+            throw StateStoreError.durableWriteFailed(
+                operation: "fstat state temp after fchmod",
+                errno: errno,
+                path: path
+            )
+        }
+        guard (info.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG),
+              info.st_uid == geteuid(),
+              info.st_mode & 0o7777 == 0o600 else {
+            throw StateStoreError.durableWriteFailed(
+                operation: "verify owner-only state temp",
+                errno: EPERM,
+                path: path
+            )
+        }
+    }
+
+    private func writeAll(_ data: Data, to fd: Int32, path: String) throws {
+        var offset = 0
+        try data.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress else { return }
+            while offset < raw.count {
+                let count = fileOperations.write(fd, base.advanced(by: offset), raw.count - offset)
+                if count < 0 {
+                    let code = errno
+                    if code == EINTR { continue }
+                    throw StateStoreError.durableWriteFailed(operation: "write", errno: code, path: path)
+                }
+                guard count > 0 else {
+                    throw StateStoreError.durableWriteFailed(operation: "write", errno: EIO, path: path)
+                }
+                offset += count
+            }
+        }
+    }
+
+    private func sync(_ fd: Int32, operation: String, path: String) throws {
+        while fileOperations.sync(fd) != 0 {
+            let code = errno
+            if code == EINTR { continue }
+            throw StateStoreError.durableWriteFailed(operation: operation, errno: code, path: path)
+        }
+    }
+
     private func read<T: Decodable>(_ type: T.Type, from url: URL) -> T? {
         guard let data = try? Data(contentsOf: url) else { return nil }
         return try? Self.makeDecoder().decode(T.self, from: data)
@@ -582,6 +1618,55 @@ public struct StateStore: Sendable {
             )
         }
         return decoder
+    }
+}
+
+/// Exclusive, process-wide authority over the schedule-state document.
+/// Destructive purge keeps this lease from its trusted read through restic
+/// completion and the watermark commit, so another helper cannot invalidate
+/// the evidence between validation, use, and acknowledgement.
+final class LockedScheduleState {
+    private let store: StateStore
+    private let lock: FileLock
+    /// The `state/` generation this lease is bound to. The lock lives in this
+    /// directory and every write goes back through the same descriptor, so a
+    /// lease can never publish into a tree its lock does not protect.
+    private let directory: DirectoryHandle
+    private var isHeld = true
+    private(set) var state: ScheduleState
+
+    fileprivate init(
+        store: StateStore,
+        lock: FileLock,
+        directory: DirectoryHandle,
+        state: ScheduleState
+    ) {
+        self.store = store
+        self.lock = lock
+        self.directory = directory
+        self.state = state
+    }
+
+    func update(
+        setId: UUID,
+        mutate: (inout SetScheduleState) -> Void
+    ) throws -> ScheduleState {
+        precondition(isHeld, "schedule-state lease used after release")
+        var entry = state.sets[setId] ?? SetScheduleState()
+        mutate(&entry)
+        state.sets[setId] = entry
+        try store.writeScheduleState(state, in: directory.descriptor)
+        return state
+    }
+
+    func release() {
+        guard isHeld else { return }
+        isHeld = false
+        lock.release()
+    }
+
+    deinit {
+        release()
     }
 }
 

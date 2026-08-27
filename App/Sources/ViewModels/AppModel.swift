@@ -582,6 +582,12 @@ final class AppModel: ObservableObject {
         resolvedConfig.resticPath
     }
 
+    /// The preserved fail-closed schedule-state diagnosis, surfaced by both
+    /// window and menu-bar UI. `nil` also covers a legitimately absent file.
+    var scheduleStateFailure: ScheduleStateReadFailure? {
+        stateWatcher.scheduleStateFailure
+    }
+
     /// `saveConfig` over an inout draft, for call sites that only want to
     /// flip one field.
     func updateConfig(_ mutate: (inout AppConfig) -> Void) throws {
@@ -657,8 +663,12 @@ final class AppModel: ObservableObject {
             // prevent the state/run writes that drive every other refresh,
             // so the menu bar must not depend on those writes to turn red.
             lockingBroken: stateWatcher.lockingFailure != nil,
+            // Schedule state includes destructive purge watermarks. Losing
+            // or distrusting it is the same critical safety class as an
+            // unresolved destructive run audit, and outranks active work.
             destructiveAuditFailure: !stateWatcher.auditFailures.isEmpty
-                || stateWatcher.auditVerificationFailed,
+                || stateWatcher.auditVerificationFailed
+                || stateWatcher.scheduleStateFailure != nil,
             runLiveness: runLiveness
         )
         // A failed abandoned-edit rollback can leave scheduled backups using
@@ -725,7 +735,10 @@ final class AppModel: ObservableObject {
     /// Fire-and-forget: progress arrives through `StateWatcher`, and only the
     /// final outcome line is recorded here.
     func backUpNow(setId: UUID) {
-        guard !isBusy(setId: setId) else { return }
+        // This is the process-wide guard, not merely presentation state: any
+        // current or future UI entry point must fail closed while destructive
+        // schedule bookkeeping needs recovery.
+        guard backUpNowUnavailableReason(setId: setId) == nil else { return }
         let setName = config.sets.first { $0.id == setId }?.name ?? "backup set"
         pendingActionSetIds.insert(setId)
         Task { [helper] in

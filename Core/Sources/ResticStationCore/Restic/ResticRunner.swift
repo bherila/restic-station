@@ -120,7 +120,7 @@ public final class ResticRunner: Sendable {
         self.runner = runner
     }
 
-    /// The exact secret-free argv that ``run(_:for:onLine:onRawLine:timeout:beforeLaunch:auditBeforeLaunch:afterLaunchFailure:)``
+    /// The exact secret-free argv that ``run(_:for:onLine:onRawLine:timeout:launchPreflight:beforeLaunch:auditBeforeLaunch:afterLaunchFailure:)``
     /// hands to the process runner. Run-history publication uses this same
     /// resolver so an invocation override cannot make the audit record
     /// disagree with the child that was actually selected.
@@ -147,6 +147,7 @@ public final class ResticRunner: Sendable {
         onLine: (@Sendable (ResticMessage) -> Void)? = nil,
         onRawLine: (@Sendable (String) -> Void)? = nil,
         timeout: TimeInterval? = nil,
+        launchPreflight: (@Sendable () async throws -> Void)? = nil,
         beforeLaunch: (@Sendable () throws -> Void)? = nil,
         auditBeforeLaunch: (@Sendable () throws -> Void)? = nil,
         afterLaunchFailure: (@Sendable () -> Void)? = nil
@@ -169,6 +170,7 @@ public final class ResticRunner: Sendable {
             env: env,
             executablePath: inv.resticPathOverride,
             expectedExecutableIdentity: inv.expectedExecutableIdentity,
+            launchPreflight: launchPreflight,
             beforeLaunch: beforeLaunch,
             auditBeforeLaunch: auditBeforeLaunch,
             afterLaunchFailure: afterLaunchFailure,
@@ -287,6 +289,13 @@ public final class ResticRunner: Sendable {
         maintenanceExecutable(path: resticPath)
     }
 
+    /// Captures the secret environment used by a maintenance plan so every
+    /// later repository query and the destructive child can reuse one
+    /// credential/addressing snapshot instead of rereading mutable secrets.
+    func maintenanceSecretEnvironment(for destination: Destination) async throws -> [String: String] {
+        try await secretEnv(for: destination)
+    }
+
     /// The identity as of *right now*, hashed rather than recalled. Used
     /// only where the answer authorizes a destructive launch; see
     /// ``ExecutableIdentityCache``.
@@ -386,6 +395,7 @@ public final class ResticRunner: Sendable {
         env: [String: String],
         executablePath: String? = nil,
         expectedExecutableIdentity: String? = nil,
+        launchPreflight: (@Sendable () async throws -> Void)? = nil,
         beforeLaunch: (@Sendable () throws -> Void)? = nil,
         auditBeforeLaunch: (@Sendable () throws -> Void)? = nil,
         afterLaunchFailure: (@Sendable () -> Void)? = nil,
@@ -394,6 +404,17 @@ public final class ResticRunner: Sendable {
         timeout: TimeInterval?
     ) async throws -> ResticOutcome {
         let resolvedExecutablePath = executablePath ?? resticPath
+        // Repository evidence is expensive and asynchronous, so destructive
+        // callers obtain it here: after secrets/environment preparation but
+        // directly before the synchronous executable/token/audit/spawn
+        // boundary. A failure is still pre-spawn and restores any capability
+        // the caller consumed before entering the runner.
+        do {
+            try await launchPreflight?()
+        } catch {
+            afterLaunchFailure?()
+            throw error
+        }
         // `revalidated…`, not the cached accessor: the whole point of this
         // check is that the bytes on disk may have changed since the
         // preview, and a metadata-keyed cache cannot see an in-place

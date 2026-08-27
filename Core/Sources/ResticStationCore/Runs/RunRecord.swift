@@ -122,6 +122,11 @@ public struct RunIndexEntry: Codable, Equatable, Sendable {
     public var filesChanged: Int?
     public var dataAdded: Int?
     public var errorSummary: String?
+    /// SHA-256 binding of a purge's repository id, exact pattern sequence,
+    /// and terminal old-to-new snapshot mapping. Audit verification
+    /// recomputes this from canonical metadata so no field used for
+    /// watermark recovery can change independently of the index projection.
+    public var purgeEvidenceDigest: String?
 
     public init(
         runId: String,
@@ -137,7 +142,8 @@ public struct RunIndexEntry: Codable, Equatable, Sendable {
         filesNew: Int?,
         filesChanged: Int?,
         dataAdded: Int?,
-        errorSummary: String?
+        errorSummary: String?,
+        purgeEvidenceDigest: String? = nil
     ) {
         self.runId = runId
         self.kind = kind
@@ -153,11 +159,13 @@ public struct RunIndexEntry: Codable, Equatable, Sendable {
         self.filesChanged = filesChanged
         self.dataAdded = dataAdded
         self.errorSummary = errorSummary
+        self.purgeEvidenceDigest = purgeEvidenceDigest
     }
 
     private enum CodingKeys: String, CodingKey {
         case runId, kind, setId, destId, groupId, status, start, end, trigger
         case snapshotId, filesNew, filesChanged, dataAdded, errorSummary
+        case purgeEvidenceDigest
     }
 
     // Explicit `null` for nil optionals rather than omitting the key — see
@@ -178,6 +186,7 @@ public struct RunIndexEntry: Codable, Equatable, Sendable {
         try container.encode(filesChanged, forKey: .filesChanged)
         try container.encode(dataAdded, forKey: .dataAdded)
         try container.encode(errorSummary, forKey: .errorSummary)
+        try container.encode(purgeEvidenceDigest, forKey: .purgeEvidenceDigest)
     }
 }
 
@@ -211,10 +220,20 @@ public struct RunMetadata: Codable, Equatable, Sendable {
     /// Full decoded summary message where applicable (e.g. a `backup` or
     /// `copy` run). `nil` for kinds with no such summary (e.g. `prune`).
     public var stats: BackupSummary?
-    /// Old full snapshot id → new snapshot id reported by `restic rewrite
-    /// --forget`. Present only for successful/partially successful purge
-    /// runs; historical run records deliberately remain untouched.
+    /// Every launch-time repository snapshot's old full id → resulting short
+    /// id after `restic rewrite --forget`. A selected no-op or unattributed
+    /// snapshot maps to its own unchanged short id. Present only for
+    /// successful/partially successful purge runs; historical run records
+    /// deliberately remain untouched.
     public var purgeSnapshotRewrites: [String: String]?
+    /// Exact exclusion patterns bound to a purge launch. A terminal success
+    /// is durable evidence that these patterns completed for this run's
+    /// destination, even if the later schedule watermark commit was lost.
+    public var purgePatterns: [String]?
+    /// Restic repository config id read during apply-time revalidation and
+    /// bound to the purge launch. Watermark recovery may trust terminal
+    /// purge evidence only when this id still matches the live repository.
+    public var purgeRepositoryId: String?
     /// Version of the destructive audit contract understood when this run
     /// was created. A current-version destructive run with no launch marker
     /// is known to be safely pre-launch; a markerless pre-contract running
@@ -259,6 +278,8 @@ public struct RunMetadata: Codable, Equatable, Sendable {
         errorSummary: String?,
         stats: BackupSummary?,
         purgeSnapshotRewrites: [String: String]? = nil,
+        purgePatterns: [String]? = nil,
+        purgeRepositoryId: String? = nil,
         destructiveAuditContractVersion: Int? = nil,
         destructiveLaunchAuthorizedAt: Date? = nil,
         auditFailureReason: RunAuditFailureReason? = nil,
@@ -284,6 +305,8 @@ public struct RunMetadata: Codable, Equatable, Sendable {
         self.errorSummary = errorSummary
         self.stats = stats
         self.purgeSnapshotRewrites = purgeSnapshotRewrites
+        self.purgePatterns = purgePatterns
+        self.purgeRepositoryId = purgeRepositoryId
         self.destructiveAuditContractVersion = destructiveAuditContractVersion
         self.destructiveLaunchAuthorizedAt = destructiveLaunchAuthorizedAt
         self.auditFailureReason = auditFailureReason
@@ -295,6 +318,7 @@ public struct RunMetadata: Codable, Equatable, Sendable {
         case runId, kind, setId, destId, groupId, status, trigger, start, end
         case pid, resticExitCode, argvRedacted
         case snapshotId, filesNew, filesChanged, dataAdded, errorSummary, stats, purgeSnapshotRewrites
+        case purgePatterns, purgeRepositoryId
         case destructiveAuditContractVersion, destructiveLaunchAuthorizedAt
         case auditFailureReason, indexPublicationPending, publicationDurabilityContractVersion
     }
@@ -321,6 +345,8 @@ public struct RunMetadata: Codable, Equatable, Sendable {
         try container.encode(errorSummary, forKey: .errorSummary)
         try container.encode(stats, forKey: .stats)
         try container.encode(purgeSnapshotRewrites, forKey: .purgeSnapshotRewrites)
+        try container.encode(purgePatterns, forKey: .purgePatterns)
+        try container.encode(purgeRepositoryId, forKey: .purgeRepositoryId)
         try container.encode(destructiveAuditContractVersion, forKey: .destructiveAuditContractVersion)
         try container.encode(destructiveLaunchAuthorizedAt, forKey: .destructiveLaunchAuthorizedAt)
         try container.encode(auditFailureReason, forKey: .auditFailureReason)
@@ -349,7 +375,34 @@ public struct RunMetadata: Codable, Equatable, Sendable {
             filesNew: filesNew,
             filesChanged: filesChanged,
             dataAdded: dataAdded,
-            errorSummary: errorSummary
+            errorSummary: errorSummary,
+            purgeEvidenceDigest: purgeEvidenceDigest
         )
+    }
+
+    /// Length framing makes the binding unambiguous without depending on
+    /// JSON encoder details. The domain prefix permits a future format to
+    /// coexist without reinterpreting an existing digest.
+    private var purgeEvidenceDigest: String? {
+        guard kind == .purge,
+              let purgePatterns,
+              let purgeRepositoryId else { return nil }
+
+        var bytes = Data("restic-station-purge-evidence-v2:".utf8)
+        for component in [purgeRepositoryId] + purgePatterns {
+            let componentBytes = Data(component.utf8)
+            bytes.append(Data("\(componentBytes.count):".utf8))
+            bytes.append(componentBytes)
+        }
+        let rewrites = purgeSnapshotRewrites ?? [:]
+        bytes.append(Data("rewrites:\(rewrites.count):".utf8))
+        for (oldId, newId) in rewrites.sorted(by: { $0.key < $1.key }) {
+            for component in [oldId, newId] {
+                let componentBytes = Data(component.utf8)
+                bytes.append(Data("\(componentBytes.count):".utf8))
+                bytes.append(componentBytes)
+            }
+        }
+        return SHA256Digest.hex(bytes)
     }
 }

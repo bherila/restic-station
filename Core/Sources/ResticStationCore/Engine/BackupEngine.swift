@@ -406,11 +406,23 @@ public final class BackupEngine: Sendable {
         // copied anywhere. A failed primary purge terminates the group: a
         // copy would otherwise propagate rewritten snapshots while leaving
         // their originals on an unpurged mirror.
-        let primaryPurgePatterns = pendingPurgePatterns(
-            setId: set.id,
-            set: set,
-            destinationId: primary.id
-        )
+        // Only rules this destination has not already had applied. See
+        // `pendingPurgePatterns` for why the watermark is sufficient
+        // authority to skip, and `docs/scheduling.md` §Purge for the
+        // multi-host case it deliberately does not chase.
+        let primaryPurgePatterns: [String]
+        do {
+            primaryPurgePatterns = try pendingPurgePatterns(
+                setId: set.id,
+                set: set,
+                destinationId: primary.id
+            )
+        } catch {
+            let reason = "schedule state unusable before purge — \(error)"
+            logWarning("BackupEngine: \(reason)")
+            return .infrastructureFailure(reason: reason)
+        }
+        var primaryPurgeSnapshotPrefixes: [String] = []
         if !primaryPurgePatterns.isEmpty {
             do {
                 let purge = try await runAutomaticPurge(
@@ -429,6 +441,13 @@ public final class BackupEngine: Sendable {
                     }
                     return .completed(status: .failed, groupId: groupId, children: children)
                 }
+                guard let snapshotIDs = purge.snapshotIDsByDestination[primary.id],
+                      !snapshotIDs.isEmpty else {
+                    return .infrastructureFailure(
+                        reason: "primary purge did not produce a copy-bound snapshot generation"
+                    )
+                }
+                primaryPurgeSnapshotPrefixes = snapshotIDs
             } catch {
                 logWarning(
                     "BackupEngine: could not purge primary \"\(primary.label)\" before mirroring: \(error)"
@@ -444,6 +463,9 @@ public final class BackupEngine: Sendable {
                 return .completed(status: .failed, groupId: groupId, children: children)
             }
         }
+
+        var primaryPurgeFullSnapshotIDs: [String]?
+        var boundedCopyExecutable: ResticRunner.MaintenanceExecutable?
 
         // ── Step 7: secondaries, in config order ────────────────────────
         for secondary in set.destinations where !secondary.isPrimary {
@@ -464,11 +486,18 @@ public final class BackupEngine: Sendable {
             // would retain its old snapshots alongside the primary's rewritten
             // replacements. A failed purge skips only this secondary; another
             // mirror can still make a safe copy.
-            let secondaryPurgePatterns = pendingPurgePatterns(
-                setId: set.id,
-                set: set,
-                destinationId: secondary.id
-            )
+            let secondaryPurgePatterns: [String]
+            do {
+                secondaryPurgePatterns = try pendingPurgePatterns(
+                    setId: set.id,
+                    set: set,
+                    destinationId: secondary.id
+                )
+            } catch {
+                let reason = "schedule state unusable before purge — \(error)"
+                logWarning("BackupEngine: \(reason)")
+                return .infrastructureFailure(reason: reason)
+            }
             if !secondaryPurgePatterns.isEmpty {
                 do {
                     let purge = try await runAutomaticPurge(
@@ -498,6 +527,42 @@ public final class BackupEngine: Sendable {
                 }
             }
 
+            let copySnapshotIDs: [String]
+            if primaryPurgeSnapshotPrefixes.isEmpty {
+                copySnapshotIDs = []
+            } else if let resolved = primaryPurgeFullSnapshotIDs {
+                copySnapshotIDs = resolved
+            } else {
+                do {
+                    guard let executable = restic.maintenanceExecutable() else {
+                        throw PurgeApplyError.resticUnavailable
+                    }
+                    let secretEnv = try await restic.maintenanceSecretEnvironment(for: primary)
+                    let liveSnapshotIDs = try await purgeSnapshotIDs(
+                        destination: primary,
+                        destinationSecretEnv: secretEnv,
+                        executable: executable
+                    )
+                    guard let resolved = Self.resolveFullSnapshotIDs(
+                        forPrefixes: primaryPurgeSnapshotPrefixes,
+                        in: liveSnapshotIDs
+                    ) else {
+                        throw PurgeApplyError.infrastructureFailure(
+                            reason: "the bounded primary generation cannot be resolved to full snapshot ids",
+                            operationMayHaveRun: false
+                        )
+                    }
+                    primaryPurgeFullSnapshotIDs = resolved
+                    boundedCopyExecutable = executable
+                    copySnapshotIDs = resolved
+                } catch {
+                    let reason = "could not bind the bounded primary generation before copy — \(error)"
+                    logWarning("BackupEngine: \(reason) for \"\(secondary.label)\"")
+                    infrastructureFailures.append("secondary \"\(secondary.label)\": \(reason)")
+                    continue
+                }
+            }
+
             let copyResult = await performChild(
                 kind: .copy,
                 setId: set.id,
@@ -506,8 +571,16 @@ public final class BackupEngine: Sendable {
                 groupId: groupId,
                 phase: "copying-\(secondary.id.uuidString)",
                 // `-r` is the DESTINATION, `--from-repo` is the SOURCE.
-                command: .copy(toRepo: secondary.repoURL, fromRepo: primary.repoURL),
-                invocation: ResticInvocation(destination: secondary, fromDestination: primary),
+                command: .copy(
+                    toRepo: secondary.repoURL,
+                    fromRepo: primary.repoURL,
+                    snapshotIDs: copySnapshotIDs
+                ),
+                invocation: ResticInvocation(
+                    destination: secondary,
+                    fromDestination: primary,
+                    expectedExecutableIdentity: boundedCopyExecutable?.identity
+                ),
                 streamProgress: false
             )
             let copy: ChildRun
@@ -536,6 +609,20 @@ public final class BackupEngine: Sendable {
                 )
                 continue
             }
+
+            // No Restic CLI transaction can bind a primary observation
+            // through destructive retention on another repository. A bounded
+            // copy therefore proves only that these exact, full snapshot ids
+            // arrived. It never claims that the mirror caught up and never
+            // authorizes mirror retention; a peer may add another primary
+            // snapshot at any point after the ids were resolved.
+            if !primaryPurgeSnapshotPrefixes.isEmpty {
+                logWarning(
+                    "BackupEngine: bounded copy to \"\(secondary.label)\" completed — "
+                        + "withholding sync marker and mirror retention"
+                )
+                continue
+            }
             markSynced(secondary)
 
             switch await forgetChild(
@@ -560,24 +647,34 @@ public final class BackupEngine: Sendable {
         }
 
         // ── Step 8: retention on the primary ────────────────────────────
-        switch await forgetChild(
-            destination: primary,
-            policy: set.retention,
-            setId: set.id,
-            trigger: trigger,
-            groupId: groupId
-        ) {
-        case .completed(let prune):
-            children.append(prune.child)
-            if let reason = prune.infrastructureFailureReason {
+        // The same cross-repository gap that prevents a bounded copy from
+        // authorizing mirror retention also prevents it from authorizing
+        // primary retention. A peer snapshot omitted from the bounded copy
+        // must remain on the primary until the next purge/copy cycle.
+        if primaryPurgeSnapshotPrefixes.isEmpty {
+            switch await forgetChild(
+                destination: primary,
+                policy: set.retention,
+                setId: set.id,
+                trigger: trigger,
+                groupId: groupId
+            ) {
+            case .completed(let prune):
+                children.append(prune.child)
+                if let reason = prune.infrastructureFailureReason {
+                    infrastructureFailures.append("primary \"\(primary.label)\": \(reason)")
+                }
+            case .infrastructureFailure(let reason):
                 infrastructureFailures.append("primary \"\(primary.label)\": \(reason)")
+            case .deferred:
+                break
+            case .notRequired:
+                break
             }
-        case .infrastructureFailure(let reason):
-            infrastructureFailures.append("primary \"\(primary.label)\": \(reason)")
-        case .deferred:
-            break
-        case .notRequired:
-            break
+        } else {
+            logWarning(
+                "BackupEngine: bounded primary generation — withholding primary retention"
+            )
         }
 
         // ── Step 9: current-run cleared and lock released by the defers ─
@@ -637,8 +734,11 @@ public final class BackupEngine: Sendable {
         defer { try? stateStore.clearCurrentRun(setId: set.id) }
 
         // Attempt semantics, exactly like `lastBackupStart`.
+        let updatedScheduleState: ScheduleState
         do {
-            try updateScheduleState(setId: set.id) { $0.lastCheckStart = self.now() }
+            updatedScheduleState = try updateScheduleState(setId: set.id) {
+                $0.lastCheckStart = self.now()
+            }
         } catch {
             let reason = "schedule state unusable — \(error)"
             recordInfrastructureFailure(
@@ -652,7 +752,7 @@ public final class BackupEngine: Sendable {
         }
 
         let totalSlices = set.checkPolicy?.readDataSubsetSlices ?? Self.defaultCheckSlices
-        let previousState = stateStore.readScheduleState()?.sets[set.id]
+        let previousState = updatedScheduleState.sets[set.id]
         let slice = ScheduleMath.nextCheckSlice(
             cursor: previousState?.checkSliceCursor ?? 0,
             totalSlices: totalSlices
@@ -1319,6 +1419,15 @@ public final class BackupEngine: Sendable {
         } catch {
             return PurgePlanResult(plan: emptyPlan, status: .failed, message: "could not parse snapshots: \(error)")
         }
+        let incomplete = Self.incompleteSnapshotIDs(snapshots)
+        guard incomplete.isEmpty else {
+            return PurgePlanResult(
+                plan: emptyPlan,
+                status: .failed,
+                message: "repository reported \(incomplete.count) snapshot id(s) that are not "
+                    + "complete restic hashes; refusing to plan a rewrite over them"
+            )
+        }
 
         let plan = PurgePlan(
             destinationId: destination.id,
@@ -1534,8 +1643,23 @@ public final class BackupEngine: Sendable {
         destinations: [Destination],
         token: String,
         trigger: RunTrigger,
-        groupId: String?
+        groupId: String?,
     ) async throws -> PurgeRunResult {
+        // Bind the watermark evidence through repository validation, every
+        // destructive launch, and the matching durable acknowledgement. The
+        // schedule-state lock is process-wide (unlike the per-set lock), so a
+        // different set cannot replace the shared document in that window.
+        let scheduleStateLease: LockedScheduleState
+        do {
+            scheduleStateLease = try stateStore.lockScheduleState()
+        } catch {
+            throw PurgeApplyError.infrastructureFailure(
+                reason: "schedule state unusable before purge — \(error)",
+                operationMayHaveRun: false
+            )
+        }
+        defer { scheduleStateLease.release() }
+
         let preview: PreviewToken
         do {
             preview = try previewTokens.token(token)
@@ -1573,7 +1697,30 @@ public final class BackupEngine: Sendable {
             throw PurgeApplyError.tokenDoesNotMatchCurrentPlan
         }
 
-        guard await secretsAvailable(for: destinations) else { throw PurgeApplyError.unavailable }
+        // Both manual and scheduled apply narrow the previewed patterns to
+        // each destination's still-pending subset, read beneath the held
+        // lease. Divergent primary/mirror progress therefore neither repeats
+        // completed work nor invalidates work another destination still owes.
+        var pendingPatternsByDestination: [UUID: [String]] = [:]
+        for destination in destinations {
+            let applied = Set(
+                scheduleStateLease.state.sets[set.id]?
+                    .appliedPurgeExcludes[destination.id] ?? []
+            )
+            pendingPatternsByDestination[destination.id] = preview.patterns.filter {
+                !applied.contains($0)
+            }
+        }
+        let pendingDestinations = destinations.filter {
+            !(pendingPatternsByDestination[$0.id] ?? []).isEmpty
+        }
+        guard !pendingDestinations.isEmpty else {
+            throw PurgeApplyError.tokenDoesNotMatchCurrentPlan
+        }
+
+        guard await secretsAvailable(for: pendingDestinations) else {
+            throw PurgeApplyError.unavailable
+        }
 
         // Acquire the machine-wide destructive gate before the final live
         // repository observations, not merely before spending the token.
@@ -1628,20 +1775,76 @@ public final class BackupEngine: Sendable {
             )
         }
 
-        var plans: [(destination: Destination, plan: PurgePlan)] = []
-        for destination in destinations.sorted(by: { $0.id.uuidString < $1.id.uuidString }) {
-            let plan = try await currentPurgePlan(
+        // Re-read each repository before history can satisfy a missing
+        // watermark. The plan binds the current snapshot attribution to the
+        // token; its restic config id binds any recovered terminal evidence
+        // to the repository that was actually rewritten.
+        var plans: [(
+            destination: Destination,
+            plan: PurgePlan,
+            repositoryId: String,
+            destinationSecretEnv: [String: String]
+        )] = []
+        for destination in pendingDestinations.sorted(by: { $0.id.uuidString < $1.id.uuidString }) {
+            let destinationSecretEnv: [String: String]
+            do {
+                destinationSecretEnv = try await restic.maintenanceSecretEnvironment(for: destination)
+            } catch {
+                throw PurgeApplyError.unavailable
+            }
+            let current = try await currentPurgePlan(
                 set: set,
                 destination: destination,
-                patterns: preview.patterns,
+                patterns: pendingPatternsByDestination[destination.id] ?? [],
+                destinationSecretEnv: destinationSecretEnv,
                 executable: executable
             )
-            guard let tokenDestination = preview.destinations.first(where: { $0.destinationId == destination.id }),
-                  tokenDestination.snapshotIDs.sorted() == plan.matched.map(\.id).sorted() else {
+            guard let tokenDestination = preview.destinations.first(where: {
+                $0.destinationId == destination.id
+            }), tokenDestination.snapshotIDs.sorted() == current.plan.matched.map(\.id).sorted() else {
                 throw PurgeApplyError.tokenDoesNotMatchCurrentPlan
             }
-            plans.append((destination, plan))
+            guard !current.plan.matched.isEmpty || current.plan.unattributed.isEmpty else {
+                // A token may legitimately bind an empty match for one
+                // destination when another destination has work. If the
+                // repository is not actually empty, however, attribution
+                // declined every snapshot and no rewrite could ever apply
+                // the reviewed patterns. Refuse during the all-destination
+                // read-only planning pass, before consuming the token or
+                // launching any earlier destination.
+                throw PurgeApplyError.infrastructureFailure(
+                    reason: "purge attribution declined all \(current.plan.unattributed.count) "
+                        + "repository snapshots for \"\(destination.label)\"",
+                    operationMayHaveRun: false
+                )
+            }
+            let repositorySnapshotIDs = (current.plan.matched + current.plan.unattributed).map(\.id)
+            guard Self.hasUnambiguousRewriteTranscriptIDs(repositorySnapshotIDs) else {
+                // `restic rewrite` reports old snapshot ids through an
+                // eight-character human transcript. The terminal mapping also
+                // carries unchanged unattributed ids, so a collision anywhere
+                // in the complete launch generation would make the output
+                // ambiguous only after destructive work. Refuse while every
+                // destination is still in the read-only planning pass, before
+                // the capability is consumed or any rewrite launches.
+                throw PurgeApplyError.infrastructureFailure(
+                    reason: "purge repository generation has ambiguous restic transcript prefixes",
+                    operationMayHaveRun: false
+                )
+            }
+            plans.append((destination, current.plan, current.repositoryId, destinationSecretEnv))
         }
+
+        // A crash between the durable `rewrite --forget` metadata and the
+        // schedule watermark rename loses only the watermark. That is
+        // recoverable by construction: the next run finds the pattern still
+        // pending, re-runs the rewrite, restic reports a no-op, and the
+        // watermark is re-established (see `pendingPurgePatterns`, and the
+        // `rewrite` summary contract in docs/restic-cli.md). Reconstructing
+        // the watermark by *inferring* it from historical run records instead
+        // was strictly more dangerous — it derives authority rather than
+        // observing it — for the sole benefit of skipping one idempotent
+        // restic invocation.
 
         do {
             _ = try previewTokens.consume(token)
@@ -1659,37 +1862,32 @@ public final class BackupEngine: Sendable {
         }
 
         var children: [SetRunChild] = []
+        var snapshotIDsByDestination: [UUID: [String]] = [:]
         var resolvedGroupId = groupId
         var isFirstPurgeChild = true
-        for (destination, plan) in plans {
+        for (destination, plan, repositoryId, destinationSecretEnv) in plans {
             guard !plan.matched.isEmpty else {
-                // Nothing to rewrite. Advancing the watermark is only correct
-                // when the repository genuinely holds nothing this machine
-                // may purge. If snapshots WERE declined, the empty match is
-                // evidence attribution is wrong — and advancing here would
-                // record the purge as applied, permanently, with no rewrite
-                // ever run and no error shown. Leave it pending and say so.
-                if plan.unattributed.isEmpty {
-                    try markPurgePatternsApplied(
-                        setId: set.id,
-                        destinationId: destination.id,
-                        patterns: preview.patterns,
-                        operationMayHaveRun: !children.isEmpty
-                    )
-                } else {
-                    logWarning(
-                        "BackupEngine: purge of \"\(destination.label)\" matched none of "
-                            + "\(plan.unattributed.count) snapshot(s) in the repository — leaving the "
-                            + "patterns pending rather than recording them as applied"
-                    )
-                }
+                // The planning pass already refused a non-empty repository
+                // whose snapshots were all declined. This is therefore a
+                // proven empty repository and has nothing to rewrite.
+                try markPurgePatternsApplied(
+                    setId: set.id,
+                    destinationId: destination.id,
+                    patterns: plan.patterns,
+                    operationMayHaveRun: !children.isEmpty,
+                    scheduleStateLease: scheduleStateLease
+                )
+                snapshotIDsByDestination[destination.id] = []
                 continue
             }
             let restoreAfterLaunchFailure = isFirstPurgeChild ? restorePurgeToken : nil
             let purgeResult = await purgeChild(
                 destination: destination,
                 snapshotIDs: plan.matched.map(\.id),
-                patterns: preview.patterns,
+                repositorySnapshotIDs: Set((plan.matched + plan.unattributed).map(\.id)),
+                patterns: plan.patterns,
+                repositoryId: repositoryId,
+                destinationSecretEnv: destinationSecretEnv,
                 setId: set.id,
                 trigger: trigger,
                 groupId: resolvedGroupId,
@@ -1757,15 +1955,44 @@ public final class BackupEngine: Sendable {
             }
             if resolvedGroupId == nil { resolvedGroupId = purge.child.runId }
             if purge.child.status == .success {
+                let rewrites: [String: String]
+                do {
+                    guard let recorded = try runStore.metadata(runId: purge.child.runId)
+                        .purgeSnapshotRewrites,
+                          !recorded.isEmpty else {
+                        throw RunStoreError.discardUnsafe(
+                            path: paths.runMetadataFile(runId: purge.child.runId).path
+                        )
+                    }
+                    rewrites = recorded
+                } catch {
+                    throw PurgeApplyError.infrastructureFailure(
+                        reason: "could not read the purge output generation — \(error)",
+                        operationMayHaveRun: true
+                    )
+                }
+                let outputSnapshotIDs = rewrites.values.sorted()
+                guard Set(outputSnapshotIDs).count == outputSnapshotIDs.count else {
+                    throw PurgeApplyError.infrastructureFailure(
+                        reason: "the purge output generation contains ambiguous snapshot ids",
+                        operationMayHaveRun: true
+                    )
+                }
+                snapshotIDsByDestination[destination.id] = outputSnapshotIDs
                 try markPurgePatternsApplied(
                     setId: set.id,
                     destinationId: destination.id,
-                    patterns: preview.patterns,
-                    operationMayHaveRun: true
+                    patterns: plan.patterns,
+                    operationMayHaveRun: true,
+                    scheduleStateLease: scheduleStateLease
                 )
             }
         }
-        return PurgeRunResult(status: Self.worstStatus(children.map(\.status)), children: children)
+        return PurgeRunResult(
+            status: Self.worstStatus(children.map(\.status)),
+            children: children,
+            snapshotIDsByDestination: snapshotIDsByDestination
+        )
     }
 
     /// Obtains a fresh attributed plan for token validation.  It is purposely
@@ -1784,8 +2011,9 @@ public final class BackupEngine: Sendable {
         set: BackupSet,
         destination: Destination,
         patterns: [String],
+        destinationSecretEnv: [String: String],
         executable: ResticRunner.MaintenanceExecutable
-    ) async throws -> PurgePlan {
+    ) async throws -> (plan: PurgePlan, repositoryId: String) {
         let probe = await reachability.probe(
             destination,
             expectedExecutableIdentity: executable.identity
@@ -1793,29 +2021,177 @@ public final class BackupEngine: Sendable {
         guard probe == .reachable else {
             throw PurgeApplyError.destinationOffline(destinationId: destination.id)
         }
+        let repositoryId = try await purgeRepositoryId(
+            destination: destination,
+            destinationSecretEnv: destinationSecretEnv,
+            executable: executable
+        )
         let outcome: ResticOutcome
         do {
             outcome = try await restic.run(
                 .snapshots(repo: destination.repoURL),
                 for: ResticInvocation(
                     destination: destination,
+                    destinationSecretEnv: destinationSecretEnv,
                     expectedExecutableIdentity: executable.identity
                 )
             )
         } catch {
             throw PurgeApplyError.unavailable
         }
-        guard outcome.status == .success,
-              let snapshots = try? parseSnapshots(Data(outcome.rawOutput.utf8)) else {
+        guard outcome.status == .success else {
             throw PurgeApplyError.unavailable
         }
-        return PurgePlan(
-            destinationId: destination.id,
-            snapshots: snapshots,
-            sourcePaths: sourcePaths(for: set),
-            hostnames: hostnames(for: set),
-            patterns: patterns
+        let snapshots: [Snapshot]
+        do {
+            snapshots = try parseSnapshots(Data(outcome.rawOutput.utf8))
+        } catch {
+            throw PurgeApplyError.infrastructureFailure(
+                reason: "repository snapshot evidence is malformed — \(error)",
+                operationMayHaveRun: false
+            )
+        }
+        let incompleteIDs = Self.incompleteSnapshotIDs(snapshots)
+        guard incompleteIDs.isEmpty else {
+            throw PurgeApplyError.infrastructureFailure(
+                reason: "repository reported \(incompleteIDs.count) snapshot id(s) that are not "
+                    + "complete restic hashes; refusing to bind them to a destructive launch",
+                operationMayHaveRun: false
+            )
+        }
+        return (
+            plan: PurgePlan(
+                destinationId: destination.id,
+                snapshots: snapshots,
+                sourcePaths: sourcePaths(for: set),
+                hostnames: hostnames(for: set),
+                patterns: patterns
+            ),
+            repositoryId: repositoryId
         )
+    }
+
+    private func purgeRepositoryId(
+        destination: Destination,
+        destinationSecretEnv: [String: String],
+        executable: ResticRunner.MaintenanceExecutable
+    ) async throws -> String {
+        let outcome: ResticOutcome
+        do {
+            outcome = try await restic.run(
+                .catConfig(repo: destination.repoURL),
+                for: ResticInvocation(
+                    destination: destination,
+                    destinationSecretEnv: destinationSecretEnv,
+                    expectedExecutableIdentity: executable.identity
+                )
+            )
+        } catch {
+            throw PurgeApplyError.unavailable
+        }
+        guard outcome.status == .success else {
+            throw PurgeApplyError.unavailable
+        }
+        let config: RepositoryConfig
+        do {
+            config = try parseRepositoryConfig(Data(outcome.rawOutput.utf8))
+        } catch {
+            throw PurgeApplyError.infrastructureFailure(
+                reason: "repository identity evidence is malformed — \(error)",
+                operationMayHaveRun: false
+            )
+        }
+        guard !config.id.isEmpty else {
+            throw PurgeApplyError.infrastructureFailure(
+                reason: "repository identity evidence has an empty id",
+                operationMayHaveRun: false
+            )
+        }
+        return config.id
+    }
+
+    private func purgeSnapshotIDs(
+        destination: Destination,
+        destinationSecretEnv: [String: String],
+        executable: ResticRunner.MaintenanceExecutable
+    ) async throws -> Set<String> {
+        let outcome: ResticOutcome
+        do {
+            outcome = try await restic.run(
+                .snapshots(repo: destination.repoURL),
+                for: ResticInvocation(
+                    destination: destination,
+                    destinationSecretEnv: destinationSecretEnv,
+                    expectedExecutableIdentity: executable.identity
+                )
+            )
+        } catch {
+            throw PurgeApplyError.unavailable
+        }
+        guard outcome.status == .success else {
+            throw PurgeApplyError.unavailable
+        }
+        let snapshots: [Snapshot]
+        do {
+            snapshots = try parseSnapshots(Data(outcome.rawOutput.utf8))
+        } catch {
+            throw PurgeApplyError.infrastructureFailure(
+                reason: "repository snapshot evidence is malformed — \(error)",
+                operationMayHaveRun: false
+            )
+        }
+        let incompleteIDs = Self.incompleteSnapshotIDs(snapshots)
+        guard incompleteIDs.isEmpty else {
+            throw PurgeApplyError.infrastructureFailure(
+                reason: "repository reported \(incompleteIDs.count) snapshot id(s) that are not "
+                    + "complete restic hashes; refusing to bind them to a destructive launch",
+                operationMayHaveRun: false
+            )
+        }
+        return Set(snapshots.map(\.id))
+    }
+
+    /// A complete restic snapshot id: 64 lowercase hex characters.
+    ///
+    /// Enforces the first purge invariant (`docs/scheduling.md` §Purge safety
+    /// invariants). To restic a short id is a *selector*, not an identity: a
+    /// truncated or otherwise non-hash value reaching `rewrite --forget`
+    /// could match a snapshot the confirmation token never bound. Structural
+    /// JSON validity does not imply a semantically valid id, so every id is
+    /// checked before token consumption or destructive launch.
+    static func isCompleteSnapshotID(_ id: String) -> Bool {
+        let bytes = id.utf8
+        guard bytes.count == 64 else { return false }
+        return bytes.allSatisfy { byte in
+            (byte >= UInt8(ascii: "0") && byte <= UInt8(ascii: "9"))
+                || (byte >= UInt8(ascii: "a") && byte <= UInt8(ascii: "f"))
+        }
+    }
+
+    /// The ids restic could not have produced, for a fail-closed message.
+    static func incompleteSnapshotIDs(_ snapshots: [Snapshot]) -> [String] {
+        snapshots.map(\.id).filter { !isCompleteSnapshotID($0) }
+    }
+
+    private static func hasUnambiguousRewriteTranscriptIDs(_ snapshotIDs: [String]) -> Bool {
+        let transcriptIDs = snapshotIDs.map { String($0.prefix(8)) }
+        return transcriptIDs.allSatisfy { $0.count == 8 }
+            && Set(transcriptIDs).count == snapshotIDs.count
+    }
+
+    private static func resolveFullSnapshotIDs(
+        forPrefixes prefixes: [String],
+        in liveSnapshotIDs: Set<String>
+    ) -> [String]? {
+        guard hasUnambiguousRewriteTranscriptIDs(prefixes) else { return nil }
+        var resolved: [String] = []
+        resolved.reserveCapacity(prefixes.count)
+        for prefix in prefixes {
+            let matches = liveSnapshotIDs.lazy.filter { $0.hasPrefix(prefix) }.prefix(2)
+            guard matches.count == 1, let fullID = matches.first else { return nil }
+            resolved.append(fullID)
+        }
+        return Set(resolved).count == resolved.count ? resolved : nil
     }
 
     /// The only `rewrite --forget` call site.  It receives explicit ids from
@@ -1824,7 +2200,10 @@ public final class BackupEngine: Sendable {
     private func purgeChild(
         destination: Destination,
         snapshotIDs: [String],
+        repositorySnapshotIDs: Set<String>,
         patterns: [String],
+        repositoryId: String,
+        destinationSecretEnv: [String: String],
         setId: UUID,
         trigger: RunTrigger,
         groupId: String?,
@@ -1863,25 +2242,151 @@ public final class BackupEngine: Sendable {
             // path the golden argv tests and `docs/restic-cli.md` describe.
             invocation: ResticInvocation(
                 destination: destination,
+                destinationSecretEnv: destinationSecretEnv,
                 expectedExecutableIdentity: executable.identity
             ),
             streamProgress: false,
+            launchPreflight: { [weak self] in
+                guard let self else {
+                    throw ResticRunnerError.launchFailed(
+                        "the repository could not be revalidated at purge launch"
+                    )
+                }
+                let launchRepositoryId: String
+                do {
+                    launchRepositoryId = try await self.purgeRepositoryId(
+                        destination: destination,
+                        destinationSecretEnv: destinationSecretEnv,
+                        executable: executable
+                    )
+                } catch let error as PurgeApplyError {
+                    if case .infrastructureFailure = error { throw error }
+                    throw PurgeApplyError.infrastructureFailure(
+                        reason: "the repository could not be revalidated at purge launch — \(error)",
+                        operationMayHaveRun: false
+                    )
+                } catch {
+                    throw PurgeApplyError.infrastructureFailure(
+                        reason: "the repository could not be revalidated at purge launch — \(error)",
+                        operationMayHaveRun: false
+                    )
+                }
+                guard launchRepositoryId == repositoryId else {
+                    throw PurgeApplyError.infrastructureFailure(
+                        reason: "the repository changed after purge validation",
+                        operationMayHaveRun: false
+                    )
+                }
+                let launchSnapshotIDs: Set<String>
+                do {
+                    launchSnapshotIDs = try await self.purgeSnapshotIDs(
+                        destination: destination,
+                        destinationSecretEnv: destinationSecretEnv,
+                        executable: executable
+                    )
+                } catch let error as PurgeApplyError {
+                    if case .infrastructureFailure = error { throw error }
+                    throw PurgeApplyError.infrastructureFailure(
+                        reason: "the repository snapshots could not be revalidated at purge launch — \(error)",
+                        operationMayHaveRun: false
+                    )
+                } catch {
+                    throw PurgeApplyError.infrastructureFailure(
+                        reason: "the repository snapshots could not be revalidated at purge launch — \(error)",
+                        operationMayHaveRun: false
+                    )
+                }
+                guard launchSnapshotIDs == repositorySnapshotIDs else {
+                    throw PurgeApplyError.infrastructureFailure(
+                        reason: "the repository snapshots changed after purge validation",
+                        operationMayHaveRun: false
+                    )
+                }
+            },
             afterLaunchFailure: afterLaunchFailure,
             callerHoldsDestructiveAuditGate: callerHoldsDestructiveAuditGate,
+            purgePatterns: patterns,
+            purgeRepositoryId: repositoryId,
             purgeSnapshotRewrites: { outcome in
-                Dictionary(uniqueKeysWithValues: parseRewrite(outcome.rawOutput).snapshots.compactMap { rewrite in
-                    guard let oldID = fullIDByShortID[rewrite.shortID], let newID = rewrite.newSnapshotShortID else {
-                        return nil
-                    }
-                    return (oldID, newID)
+                let parsed = parseRewrite(outcome.rawOutput)
+                // An unreadable transcript is not evidence that nothing
+                // happened, so it fails closed. An explicit no-op *is*
+                // evidence, and is the ordinary outcome of re-running an
+                // already-applied purge rule against an unchanged repository.
+                let modifiedCount: Int
+                switch parsed.summary {
+                case .modified(let count): modifiedCount = count
+                case .nothingModified: modifiedCount = 0
+                case .unrecognized: return nil
+                }
+                var changedRewrites: [String: String] = [:]
+                for rewrite in parsed.snapshots {
+                    guard let oldID = fullIDByShortID[rewrite.shortID],
+                          let newID = rewrite.newSnapshotShortID else { return nil }
+                    guard changedRewrites.updateValue(newID, forKey: oldID) == nil else { return nil }
+                }
+                guard changedRewrites.count == modifiedCount else { return nil }
+                // Preserve the complete repository generation, not only the
+                // selected snapshots: a selected no-op and every unattributed
+                // snapshot map to their unchanged short ids. Recovery can
+                // therefore reject additions that were never covered by this
+                // launch instead of accepting a matching subset.
+                let completeRewrites = Dictionary(uniqueKeysWithValues: repositorySnapshotIDs.map { oldID in
+                    (oldID, changedRewrites[oldID] ?? String(oldID.prefix(8)))
                 })
+                guard Set(completeRewrites.values).count == completeRewrites.count else {
+                    return nil
+                }
+                return completeRewrites
             }
         )
     }
 
-    private func pendingPurgePatterns(setId: UUID, set: BackupSet, destinationId: UUID) -> [String] {
-        let applied = stateStore.readScheduleState()?.sets[setId]?.appliedPurgeExcludes[destinationId] ?? []
+    /// The patterns in `set.purgeExcludes` that this destination's durable
+    /// watermark does not already record as applied.
+    ///
+    /// **Why a watermark is sufficient authority to skip.** A purge pattern
+    /// is also a *forward* backup exclude: `backup` receives
+    /// `BackupSet.effectiveBackupExcludes`, which is `excludes` followed by
+    /// `purgeExcludes`. Once a rule has been applied retroactively, no
+    /// snapshot this host writes afterwards can contain it, so the rewrite is
+    /// a one-time historical cleanup and not an obligation to re-run on every
+    /// tick. Re-running it unconditionally costs a full repository rewrite
+    /// scan per scheduled run — unaffordable on a remote backend — and
+    /// permanently withholds retention, because every purge produces a
+    /// bounded generation and a bounded generation withholds `forget`.
+    ///
+    /// **What it deliberately does not chase.** A peer host still on an older
+    /// config can write a snapshot containing the pattern after this host's
+    /// watermark is set. That snapshot is attributable to this host only when
+    /// the set names the peer in `machines`; either way the peer heals it from
+    /// its own watermark when it picks up the shared config.
+    /// `docs/scheduling.md` §Purge dispositions this: under-purging is
+    /// recoverable, over-purging is not.
+    ///
+    /// **Fails closed.** Unreadable or malformed schedule state throws rather
+    /// than reading as "nothing applied yet" — the latter silently re-arms a
+    /// destructive `rewrite --forget` on every run (issue #113).
+    private func pendingPurgePatterns(
+        setId: UUID,
+        set: BackupSet,
+        destinationId: UUID
+    ) throws -> [String] {
+        let applied = Set(
+            try trustedScheduleState().sets[setId]?.appliedPurgeExcludes[destinationId] ?? []
+        )
         return set.purgeExcludes.filter { !applied.contains($0) }
+    }
+
+    private func trustedScheduleState() throws -> ScheduleState {
+        switch stateStore.readScheduleStateResult() {
+        case .missing:
+            return ScheduleState()
+        case .valid(let state):
+            return state
+        case .corrupt(let failure):
+            throw StateStoreError.scheduleStateCorrupt(failure)
+        }
     }
 
     /// Mints a local token from a fresh plan and consumes it through the same
@@ -1901,10 +2406,17 @@ public final class BackupEngine: Sendable {
         guard let executable = restic.maintenanceExecutable() else {
             throw PurgeApplyError.resticUnavailable
         }
-        let plan = try await currentPurgePlan(
+        let destinationSecretEnv: [String: String]
+        do {
+            destinationSecretEnv = try await restic.maintenanceSecretEnvironment(for: destination)
+        } catch {
+            throw PurgeApplyError.unavailable
+        }
+        let current = try await currentPurgePlan(
             set: set,
             destination: destination,
             patterns: patterns,
+            destinationSecretEnv: destinationSecretEnv,
             executable: executable
         )
         let token: PreviewToken
@@ -1912,7 +2424,10 @@ public final class BackupEngine: Sendable {
             token = try previewTokens.issue(
                 machineId: machineId,
                 setId: set.id,
-                destinations: [PreviewTokenDestination(destinationId: destination.id, snapshotIDs: plan.matched.map(\.id))],
+                destinations: [PreviewTokenDestination(
+                    destinationId: destination.id,
+                    snapshotIDs: current.plan.matched.map(\.id)
+                )],
                 config: config,
                 patterns: patterns,
                 executableIdentity: executable.identity
@@ -1927,7 +2442,7 @@ public final class BackupEngine: Sendable {
             destinations: [destination],
             token: token.value,
             trigger: trigger,
-            groupId: groupId
+            groupId: groupId,
         )
     }
 
@@ -2239,10 +2754,13 @@ public final class BackupEngine: Sendable {
         remoteCommand: RemoteResticCommand? = nil,
         preflightPhase: String? = nil,
         preflight: (@Sendable (LogWriter?) async -> PreflightFailure?)? = nil,
+        launchPreflight: (@Sendable () async throws -> Void)? = nil,
         beforeLaunch: (@Sendable () throws -> Void)? = nil,
         afterLaunchFailure: (@Sendable () -> Void)? = nil,
         downgradeSuccessToWarning: (@Sendable (ResticOutcome) -> Bool)? = nil,
         callerHoldsDestructiveAuditGate: Bool = false,
+        purgePatterns: [String]? = nil,
+        purgeRepositoryId: String? = nil,
         purgeSnapshotRewrites: (@Sendable (ResticOutcome) -> [String: String]?)? = nil
     ) async -> RecordedChildResult {
         let destructiveAuditGate: FileLock?
@@ -2313,6 +2831,8 @@ public final class BackupEngine: Sendable {
         // persist.
         run.argvRedacted = remoteCommand?.passwordStdinArgv
             ?? restic.redactedArgv(command, for: invocation)
+        run.purgePatterns = purgePatterns
+        run.purgeRepositoryId = purgeRepositoryId
 
         let logWriter: LogWriter?
         do {
@@ -2390,6 +2910,7 @@ public final class BackupEngine: Sendable {
                 invocation: invocation,
                 logWriter: logWriter,
                 reporter: streamProgress ? reporter : nil,
+                launchPreflight: launchPreflight,
                 beforeLaunch: beforeLaunch,
                 auditBeforeLaunch: auditBeforeLaunch,
                 afterLaunchFailure: afterLaunchFailure
@@ -2423,7 +2944,7 @@ public final class BackupEngine: Sendable {
             ))
         }
 
-        let status: RunStatus
+        var status: RunStatus
         var errorSummary: String?
         var stats: BackupSummary?
         var exitCode: Int32?
@@ -2467,6 +2988,15 @@ public final class BackupEngine: Sendable {
         } else {
             rewrites = nil
         }
+        if kind == .purge, status == .success, rewrites == nil {
+            // A successful exit with an incomplete rewrite transcript does
+            // not prove which launch-authorized snapshots now exist. Keep a
+            // durable indeterminate audit failure so neither watermark
+            // recovery nor a second destructive launch can guess.
+            status = .failed
+            auditFailureReason = .repositoryOutcomeUnknown
+            errorSummary = "operation_completed_audit_failed — purge rewrite mapping is incomplete"
+        }
         let infrastructureFailure = finish(
             run,
             status: status,
@@ -2486,10 +3016,17 @@ public final class BackupEngine: Sendable {
                 auditRunId: kind.isDestructive ? run.runId : nil
             )
         }
+        let executionPreflightFailure: PreflightFailure?
+        if case .didNotRun(let reason, let preflightFailure, let operationMayHaveRun) = result,
+           !operationMayHaveRun {
+            executionPreflightFailure = preflightFailure ?? .reason(reason)
+        } else {
+            executionPreflightFailure = nil
+        }
         return .completed(ChildRun(
             child: SetRunChild(runId: run.runId, kind: kind, destId: destination.id, status: status),
             outcome: result.outcome,
-            preflightFailure: nil,
+            preflightFailure: executionPreflightFailure,
             infrastructureFailure: childInfrastructureFailure
         ))
     }
@@ -2521,6 +3058,7 @@ public final class BackupEngine: Sendable {
         invocation: ResticInvocation,
         logWriter: LogWriter?,
         reporter: ProgressReporter?,
+        launchPreflight: (@Sendable () async throws -> Void)? = nil,
         beforeLaunch: (@Sendable () throws -> Void)? = nil,
         auditBeforeLaunch: (@Sendable () throws -> Void)? = nil,
         afterLaunchFailure: (@Sendable () -> Void)? = nil
@@ -2530,6 +3068,7 @@ public final class BackupEngine: Sendable {
             invocation: invocation,
             logWriter: logWriter,
             reporter: reporter,
+            launchPreflight: launchPreflight,
             beforeLaunch: beforeLaunch,
             auditBeforeLaunch: auditBeforeLaunch,
             afterLaunchFailure: afterLaunchFailure
@@ -2554,7 +3093,13 @@ public final class BackupEngine: Sendable {
             reporter: nil
         )
         logWriter?.appendLine("retrying after unlock (attempt 2 of 2)")
-        return await spawn(command, invocation: invocation, logWriter: logWriter, reporter: reporter)
+        return await spawn(
+            command,
+            invocation: invocation,
+            logWriter: logWriter,
+            reporter: reporter,
+            launchPreflight: launchPreflight
+        )
     }
 
     private func spawn(
@@ -2562,6 +3107,7 @@ public final class BackupEngine: Sendable {
         invocation: ResticInvocation,
         logWriter: LogWriter?,
         reporter: ProgressReporter?,
+        launchPreflight: (@Sendable () async throws -> Void)? = nil,
         beforeLaunch: (@Sendable () throws -> Void)? = nil,
         auditBeforeLaunch: (@Sendable () throws -> Void)? = nil,
         afterLaunchFailure: (@Sendable () -> Void)? = nil
@@ -2577,6 +3123,7 @@ public final class BackupEngine: Sendable {
                 onRawLine: { line in
                     logWriter?.appendLine(line)
                 },
+                launchPreflight: launchPreflight,
                 beforeLaunch: beforeLaunch,
                 auditBeforeLaunch: auditBeforeLaunch,
                 afterLaunchFailure: afterLaunchFailure
@@ -2592,6 +3139,12 @@ public final class BackupEngine: Sendable {
                 reason: error.userFacingMessage,
                 operationMayHaveRun: error == .timedOut
             )
+        } catch let error as PurgeApplyError {
+            logWriter?.appendLine("restic did not run: \(error)")
+            if case .infrastructureFailure(let reason, let operationMayHaveRun) = error {
+                return .didNotRun(reason: reason, operationMayHaveRun: operationMayHaveRun)
+            }
+            return .didNotRun(reason: "purge launch preflight failed — \(error)")
         } catch {
             logWriter?.appendLine("restic did not run: \(error)")
             return .didNotRun(
@@ -2774,10 +3327,11 @@ public final class BackupEngine: Sendable {
         )
     }
 
+    @discardableResult
     private func updateScheduleState(
         setId: UUID,
         mutate: (inout SetScheduleState) -> Void
-    ) throws {
+    ) throws -> ScheduleState {
         try stateStore.updateScheduleState(setId: setId, mutate: mutate)
     }
 
@@ -2789,10 +3343,11 @@ public final class BackupEngine: Sendable {
         setId: UUID,
         destinationId: UUID,
         patterns: [String],
-        operationMayHaveRun: Bool
+        operationMayHaveRun: Bool,
+        scheduleStateLease: LockedScheduleState
     ) throws {
         do {
-            try updateScheduleState(setId: setId) { state in
+            _ = try scheduleStateLease.update(setId: setId) { state in
                 var applied = state.appliedPurgeExcludes[destinationId] ?? []
                 for pattern in patterns where !applied.contains(pattern) {
                     applied.append(pattern)

@@ -10,20 +10,22 @@ This spec fixes **information architecture, controls, states, and copy**. Visual
 - Window title "Restic Station". Min size ~ 900×560.
 - `AppModel` (ObservableObject, injected via environment) owns: `AppConfig` (via ConfigStore), live state (via StateWatcher), and helper invocation. All mutations go config-edit → save → (if schedule-relevant) kickstart tick.
 - If `config.json` changes while the app is open, retain the current in-memory config and show a global "Settings changed on disk" banner with **Reload Settings**. Saving an editor whose edit-start fingerprint no longer matches is refused; explicit reload adopts the latest valid file but does not bless already-open stale drafts.
+- If `schedule-state.json` exists but fails its schema, checksum, monotonic migration marker, or safe-file checks, show a global red **Schedule state needs recovery** banner. Its help text names the unchanged canonical path and exact-byte recovery copy. Every **Back Up Now** control (menu bar, Runs toolbar, Backup Sets context menu, and Restore suggestion) shows the same unavailability reason and stays disabled until explicit repair; the model action itself enforces the same guard.
 
 ## Menu bar (`MenuBarExtra`, style `.menu`, `isInserted:` bound to `showMenuBarIcon`)
 
 Icon (template, SF Symbols):
-- Critical: `externaldrive.badge.xmark` (an unresolved destructive-operation audit failure; outranks running and warning)
+- Critical: `externaldrive.badge.xmark` (an unresolved destructive-operation audit failure or schedule-state integrity failure; outranks running and warning)
 - Idle/healthy: `externaldrive.badge.checkmark`
 - Running: `externaldrive.badge.timemachine` (any run in flight)
 - Warning: `externaldrive.badge.exclamationmark` (last run of any set failed, OR any destination stale, OR a first backup is overdue, OR FDA/agent problem)
 
 Menu content (top to bottom):
-1. One line per set (disabled item): `"<SetName> — <relative last backup> <✓|⚠|✕>"`, e.g. "Projects — 2 hours ago ✓". Never run: "Projects — never backed up".
-2. If a run is in flight: `"Backing up <SetName>… 42%"` (disabled, updates on menu reopen — NSMenu items don't live-update reliably while open; accepted).
-3. Divider. `Back Up Now ▸` submenu with one item per set (disabled while that set is running/busy).
-4. Divider. `Open Restic Station` (activates app, opens main window), `Quit Restic Station`.
+1. If schedule state needs recovery, a disabled `"Schedule state needs recovery"` line whose help text contains the preserved paths, then a divider.
+2. One line per set (disabled item): `"<SetName> — <relative last backup> <✓|⚠|✕>"`, e.g. "Projects — 2 hours ago ✓". Never run: "Projects — never backed up".
+3. If a run is in flight: `"Backing up <SetName>… 42%"` (disabled, updates on menu reopen — NSMenu items don't live-update reliably while open; accepted).
+4. Divider. `Back Up Now ▸` submenu with one item per set (disabled while that set is running/busy or schedule state needs recovery).
+5. Divider. `Open Restic Station` (activates app, opens main window), `Quit Restic Station`.
 
 Quitting the app does NOT stop scheduled backups (they're launchd's job) — the Quit item's tooltip/help says so.
 

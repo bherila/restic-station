@@ -226,6 +226,7 @@ struct AppPathsEnvTests {
         #expect(paths.runLogFile(runId: "r1").path == "\(rootPath)/runs/r1/log.txt")
         #expect(paths.stateDir.path == "\(rootPath)/state")
         #expect(paths.scheduleStateFile.path == "\(rootPath)/state/schedule-state.json")
+        #expect(paths.scheduleStateVersionMarkerFile.path == "\(rootPath)/state/schedule-state.version-1")
         #expect(paths.currentRunFile(setId: setId).path == "\(rootPath)/state/current-run-\(setId.uuidString).json")
         #expect(paths.repoStatusFile(destId: destId).path == "\(rootPath)/state/repo-status-\(destId.uuidString).json")
         #expect(paths.fdaCheckFile.path == "\(rootPath)/state/fda-check.json")
@@ -293,6 +294,7 @@ struct AppPathsEnvTests {
                 paths.runLogFile(runId: "r1").path,
                 paths.stateDir.path,
                 paths.scheduleStateFile.path,
+                paths.scheduleStateVersionMarkerFile.path,
                 paths.currentRunFile(setId: setId).path,
                 paths.repoStatusFile(destId: destId).path,
                 paths.fdaCheckFile.path,
@@ -326,6 +328,7 @@ struct AppPathsEnvTests {
             "runs/r1/log.txt",
             "state",
             "state/schedule-state.json",
+            "state/schedule-state.version-1",
             "state/current-run-\(setId.uuidString).json",
             "state/repo-status-\(destId.uuidString).json",
             "state/fda-check.json",

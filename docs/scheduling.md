@@ -167,6 +167,13 @@ from `state/schedule-state.json` and `runs/index.jsonl`. Exits 0 when
 scheduled backups really will happen and 1 otherwise, so it works as a health
 check.
 
+An existing but unreadable or checksum-invalid `schedule-state.json` is never
+reported as "never run". It is preserved, copied byte-for-byte to the
+content-addressed recovery path named in the error when readable, and makes
+`timer status`/`status --json` unhealthy until an operator replaces the
+canonical file. This prevents lost purge watermarks from silently authorizing
+a second rewrite.
+
 The last thing it prints is the verdict it exits on, so the exit code never
 has to be inferred from the evidence above it:
 
@@ -187,6 +194,7 @@ up", not "does a unit file exist":
 | `notActive` | not firing now |
 | `lingerDisabled` | systemd kills this user's units at logout — the single most common silent stop on a headless box |
 | `configUnreadable` | `config.json` will not parse, so every tick exits 1 |
+| `scheduleStateUnreadable` | schedule/check/purge bookkeeping failed integrity or safe-file validation, so every tick exits 1 until explicit recovery |
 | `dataDirectoryMismatch` | the unit pins a *different* data directory than this command reads — the timer is fine, and ticks somewhere else |
 | `dataDirectoryUnpinned` | the unit pins none, so the tick re-derives it from the user manager's environment (a unit written before #48) |
 
@@ -238,14 +246,15 @@ scheduling information.
 
 ```
 1. acquire locks/tick.lock (flock LOCK_EX|LOCK_NB); busy → exit 0 silently (previous tick still evaluating/running)
-2. load config; if no config or no sets → exit 0
-3. recover: for any runs/<id>/metadata.json with status "running" whose pid is dead → rewrite as "failed" (message "interrupted")
-4. now = Date()
-5. for each set (sequentially, config order):
+2. recover: for any runs/<id>/metadata.json with status "running" whose pid is dead → rewrite as "failed" (message "interrupted")
+3. validate schedule-state.json; any unsafe or corrupt existing state → exit 1
+4. load config; if no config or no sets → exit 0; if no usable restic → explain and exit 0
+5. now = Date()
+6. for each set (sequentially, config order):
      if isDue(schedule, lastBackupStart, now) → BackupEngine.runSet(set, trigger: .scheduled)
      if checkPolicy.enabled && checkIsDue(lastCheckStart, now) → BackupEngine.runCheck(set)
-6. for each destination of each set: if last probe older than 30 min → Reachability.probe → write repo-status state
-7. release tick.lock; exit 0
+7. for each destination of each set: if last probe older than 30 min → Reachability.probe → write repo-status state
+8. release tick.lock; exit 0
 ```
 
 Sets run **sequentially** within a tick (restic saturates I/O; parallel sets thrash). The tick holds `tick.lock` for the whole duration including long backups; that is intentional — the per-set lock (below) exists so `Back Up Now` from the app still works for *other* sets while a scheduled run is in flight.
@@ -288,16 +297,81 @@ Rules (anacron semantics):
 
 ## Purge-exclusion ordering
 
-When a set has a `purgeExcludes` pattern absent from a destination's
-`appliedPurgeExcludes` state, the next successful backup run adds a purge
-phase. The fixed order is:
+When a set has `purgeExcludes` this destination's `appliedPurgeExcludes`
+watermark does not already record, a successful scheduled backup run adds a
+purge phase for the still-pending patterns. Once every pattern is recorded,
+the purge phase is skipped.
+
+**Why the watermark is sufficient authority to skip.** A purge pattern is also
+a *forward* exclude: `backup` receives `BackupSet.effectiveBackupExcludes`,
+which is `excludes` followed by `purgeExcludes`. After a rule has been applied
+retroactively, no snapshot this host writes afterwards can contain it, so the
+rewrite is a one-time historical cleanup rather than an obligation to re-run
+every tick. Re-running it unconditionally costs a full repository rewrite scan
+per scheduled run and — because every purge yields a *bounded* generation, and
+a bounded generation withholds `markSynced` and retention — leaves a
+purge-enabled set with no reachable clean run: retention and prune stop
+permanently and mirrors read as stale forever.
+
+**What this deliberately does not chase.** A peer host still on an older
+config can write a snapshot containing the pattern after this host's watermark
+is set. That snapshot is attributable here only when the set names the peer in
+`machines`, and either way the peer heals it from its own watermark when it
+picks up the shared config. Under-purging is recoverable; over-purging is not.
+
+A lost watermark is likewise recoverable by construction: the pattern reads as
+pending again, the next run re-runs the rewrite, restic reports a no-op (see
+`docs/restic-cli.md` §rewrite), and the watermark is re-established. Nothing
+infers a watermark from historical run records.
+
+The fixed order is:
 
 1. back up the primary with the effective forward excludes;
-2. purge the primary with `rewrite --forget` over newly attributed snapshot
-   ids;
-3. for each reachable secondary, purge it first when stale, then copy from
-   the primary;
-4. run ordinary retention only where its existing freshness rules permit it.
+2. purge the primary with `rewrite --forget` over its currently attributed
+   snapshot ids, for the patterns its watermark does not already record;
+3. for each reachable secondary, revalidate and purge it first, then copy only
+   the exact primary snapshot generation produced by step 2;
+4. resolve the purge outputs to exact full primary snapshot ids and use those
+   as bounded copy operands; because no cross-repository transaction can
+   exclude a later primary commit, a bounded copy never advances mirror
+   freshness and never authorizes mirror retention;
+5. run primary retention last only for an unbounded copy generation. A bounded
+   generation withholds retention on both mirrors and the primary because a
+   peer snapshot omitted from copy must remain recoverable at the source.
+
+### Purge safety invariants
+
+These are the terminating conditions for a purge review: a change that keeps
+all four is safe, and a residual race that cannot violate one of them is
+bookkeeping, not danger. State which one a new mechanism protects, rather than
+adding another layer of revalidation.
+
+1. **Destructive commands name explicit full snapshot ids.** `rewrite
+   --forget` never runs against "whatever is in the repository": the ids are
+   resolved and revalidated at the spawn boundary. A snapshot that appears
+   after the observation is therefore absent from the operands — it is not
+   silently included.
+2. **A bounded generation withholds retention.** When the copy operands are
+   pinned to a specific generation, neither mirror nor primary `forget` runs,
+   because a peer snapshot omitted from the copy must stay recoverable at the
+   source. Retention resuming is the signal that a run was unbounded.
+3. **The watermark is asymmetric.** Losing one costs a single idempotent
+   `rewrite --forget` that restic reports as a no-op. *Fabricating* one skips
+   real work permanently. So a watermark may only be written from evidence
+   observed in this run — a terminal successful purge child, or a plan proven
+   to have nothing to rewrite because the repository was observed empty during
+   the all-destination planning pass (the case at the end of this section).
+   It is never inferred from historical run records, and a lost one is left to
+   heal by re-running rather than reconstructed.
+4. **Evidence is bound to the thing that consumes it.** Schedule-state reads,
+   the companion lock, and every durable publication resolve through one
+   retained `state/` descriptor; repository identity is re-read inside the
+   runner at the spawn boundary. A check that is merely *recent* is not
+   binding (`AGENTS.md` §Safety 1).
+
+Under-purging is recoverable; over-purging is not. Where those trade against
+each other, refuse or repeat work rather than widening what a destructive
+command may touch.
 
 **Attribution** decides which snapshots a purge is allowed to touch, and is
 therefore normative. A repository-wide `snapshots --json` listing is filtered
@@ -332,12 +406,64 @@ unpurged secondary would leave its old snapshots alongside the primary's
 rewritten replacements, so it is never allowed. The per-destination pattern
 watermark advances only after that destination's purge child succeeds, or
 when the plan matched nothing **and** nothing was declined — an empty
-repository has nothing to rewrite. It deliberately does not advance when the
-plan matched nothing while snapshots *were* declined: that combination is
-evidence attribution is wrong, and recording the patterns as applied would
-skip the rewrite permanently, silently, and with a success-shaped outcome.
-The engine logs the decline instead. A removed pattern stays recorded and is
-never used to trigger a rewrite.
+repository has nothing to rewrite. A plan that matched nothing while snapshots
+*were* declined instead fails the complete apply during its all-destination
+read-only planning pass, before token consumption or any rewrite/copy launch:
+that combination is evidence attribution is wrong, and recording the patterns
+as applied would create a false success-shaped outcome. A removed pattern
+stays recorded as history, but only currently configured patterns are
+revalidated.
+
+Both manual and scheduled apply narrow each destination to the preview
+patterns absent from its watermark, read beneath the held schedule-state
+lease, and refuse a token with no pending pair. Divergent primary/mirror
+progress therefore neither repeats completed work nor invalidates work another
+destination still owes.
+
+Terminal successful purge metadata is durably committed before the watermark.
+If the watermark's directory fsync then fails and a crash loses its visible
+rename, the pattern simply reads as pending on the next run and the rewrite
+re-runs as a no-op. Reconstructing the watermark by inferring it from
+historical run records was removed: it derived authority instead of observing
+it, for the sole benefit of skipping one idempotent restic invocation.
+
+The repository id is queried inside the runner immediately before the
+synchronous executable/token/audit/spawn boundary, and the complete repository
+snapshot-id set is re-listed there and compared with the generation observed
+during token revalidation. Malformed identity or snapshot JSON retains an explicit
+infrastructure reason instead of being collapsed into secret unavailability. A
+replacement or stale-host backup in the earlier planning window refuses launch
+and restores a first-child token. Every full snapshot id in each destination's
+complete launch generation — selected or unattributed — must also have a
+unique eight-character prefix,
+because those prefixes are the only old-id keys in restic's rewrite transcript;
+ambiguity refuses before token consumption or destructive launch.
+
+No run history of any shape can stand in for the watermark. Run records carry
+purge metadata as **audit evidence only**: a pattern stays pending until this
+host observes that destination's own terminal success, so evidence from a
+replaced repository, from a same-id repository restored to a pre-purge
+generation, or from a malformed, incomplete, or only partially matching record
+cannot suppress the rewrite — it re-runs as a no-op and re-establishes the
+watermark. That retained metadata is still bound into the independently
+verified index projection, so tampering with the recorded patterns, repository
+id, or snapshot mapping stays detectable at audit time.
+
+There is no Restic CLI transaction that can hold the repository lock across
+the separate attribution query and `rewrite --forget` spawn. The remaining
+cross-host race is contained by the terminal rewrite metadata: it maps every
+full snapshot id in the launch-time repository generation to its resulting
+short id, including identity mappings for legitimate no-ops and unattributed
+snapshots. Scheduled `copy` passes exactly those result ids as operands. A
+snapshot created after the launch observation is absent from the copy argv. It
+carries the forward excludes if this host wrote it, and is a peer's snapshot
+otherwise — see the multi-host disposition above. Before copying, Restic Station resolves each output
+prefix to exactly one live full snapshot id and supplies the full ids as copy
+operands; an absent or ambiguous result fails closed. No later primary query
+can bind evidence atomically through retention on a different repository, so a
+successful bounded copy deliberately withholds both `lastSyncedAt` and mirror
+retention. Prefix ambiguity fails before rewrite instead of becoming a
+post-mutation audit failure or widening the copy.
 
 ## Locking
 
@@ -353,7 +479,7 @@ The operation-exclusion locks use `flock(2)` `LOCK_EX | LOCK_NB` on files under 
 | `health.lock` | a live health probe | exercise the backing filesystem's actual `flock(2)` support without contending with production work |
 | `state/health.lock`, `runs/health.lock` | a live health probe | exercise `flock(2)` on state/run filesystems when they are separate mounts |
 | `secrets.lock` | any secret-store mutation | serialize file-backend read-modify-write and keychain capture/update/conditional rollback across app and helper CLI |
-| `state/schedule-state.lock` | a schedule-state mutation | serialize schedule timestamps, check cursors, and purge watermarks across sets |
+| `state/schedule-state.lock` | a schedule-state mutation; for purge, the trusted read through rewrite completion and watermark commit | serialize schedule timestamps, check cursors, and purge watermarks across sets; bind destructive state evidence through use |
 | `state/preview-tokens.lock` | a preview-token mutation | preserve single-use destructive capabilities across sets |
 | `runs/index.jsonl.lock` | a run-index append | keep append ordering and records intact across sets |
 
@@ -382,7 +508,7 @@ For every destination: `stale ⟺ now − lastSyncedAt > stalenessWarningDays` (
 
 The app is macOS-only; on Linux the helper is the whole product.
 
-The app never computes schedules. It renders `schedule-state.json` + `repo-status-*.json` + `nextDue()` (calling ScheduleMath for display only), registers/unregisters the LaunchAgent, and invokes the helper for manual actions:
+The app never computes schedules. It renders `schedule-state.json` + `repo-status-*.json` + `nextDue()` (calling ScheduleMath for display only), registers/unregisters the LaunchAgent, and invokes the helper for manual actions. A schedule-state integrity failure makes the menu-bar glyph critical, names the recovery requirement in both menu and window, and disables **every** Back Up Now entry point until the canonical file is explicitly repaired. `AppModel.backUpNow` repeats that guard so a missed or future view cannot spawn the helper:
 - `Back Up Now` → `restic-station-helper run-set --set <uuid>`
 - kick a tick early (after config edits) → `launchctl kickstart gui/<uid>/net.herila.ResticStation.helper`
 

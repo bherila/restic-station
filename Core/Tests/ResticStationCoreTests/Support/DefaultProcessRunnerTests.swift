@@ -147,7 +147,6 @@ struct DefaultProcessRunnerTests {
     func cancellationStopsProcess() async throws {
         let runner = DefaultProcessRunner()
 
-        let started = Date()
         let task = Task {
             try await runner.run(
                 ["/bin/sleep", "30"],
@@ -159,6 +158,7 @@ struct DefaultProcessRunnerTests {
             )
         }
         try await Task.sleep(nanoseconds: 300_000_000)
+        let cancelledAt = Date()
         task.cancel()
 
         await #expect(throws: CancellationError.self) {
@@ -170,9 +170,9 @@ struct DefaultProcessRunnerTests {
         // through to the 10 s grace + SIGKILL fallback; only assert that the
         // fallback actually terminated it. Production only runs on macOS.
         #if os(macOS)
-        #expect(Date().timeIntervalSince(started) < 5)
+        #expect(Date().timeIntervalSince(cancelledAt) < 5)
         #else
-        #expect(Date().timeIntervalSince(started) < 15)
+        #expect(Date().timeIntervalSince(cancelledAt) < 15)
         #endif
     }
 

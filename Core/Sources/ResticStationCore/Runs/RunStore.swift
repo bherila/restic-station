@@ -9,8 +9,8 @@ import Musl
 #endif
 
 /// A run that has been started (`RunStore.begin(...)`) but not yet finished.
-/// Value type — the caller holds it, optionally fills in `argvRedacted`
-/// once the restic command line is known, and passes it back to
+/// Value type — the caller holds it, optionally fills in launch-bound
+/// evidence once the restic command line is known, and passes it back to
 /// `RunStore.finish(_:...)`.
 public struct ActiveRun: Equatable, Sendable {
     public let runId: String
@@ -25,6 +25,12 @@ public struct ActiveRun: Equatable, Sendable {
     /// sets it — `RunStore.begin(...)` doesn't know the restic command
     /// line yet, only `finish(_:...)` needs the final value.
     public var argvRedacted: [String]
+    /// Exact purge exclusions authorized for this destructive launch. This
+    /// is nil for every non-purge run and for legacy purge records.
+    public var purgePatterns: [String]?
+    /// Exact restic repository config id observed during apply validation.
+    /// Launch-bound with `purgePatterns`; nil for non-purge and legacy runs.
+    public var purgeRepositoryId: String?
 }
 
 /// The one field audit verification may inspect without trusting the rest of
@@ -357,7 +363,9 @@ public struct RunStore: Sendable {
             groupId: resolvedGroupId,
             start: start,
             pid: pid,
-            argvRedacted: []
+            argvRedacted: [],
+            purgePatterns: nil,
+            purgeRepositoryId: nil
         )
     }
 
@@ -385,13 +393,19 @@ public struct RunStore: Sendable {
         // replace the record with one that falsely claims no launch occurred.
         let destructiveLaunchAuthorizedAt: Date?
         let destructiveAuditContractVersion: Int?
+        let purgePatterns: [String]?
+        let purgeRepositoryId: String?
         if run.kind.isDestructive {
             let canonical = try metadata(runId: run.runId)
             destructiveLaunchAuthorizedAt = canonical.destructiveLaunchAuthorizedAt
             destructiveAuditContractVersion = canonical.destructiveAuditContractVersion
+            purgePatterns = canonical.purgePatterns
+            purgeRepositoryId = canonical.purgeRepositoryId
         } else {
             destructiveLaunchAuthorizedAt = nil
             destructiveAuditContractVersion = nil
+            purgePatterns = nil
+            purgeRepositoryId = nil
         }
         var metadata = RunMetadata(
             runId: run.runId,
@@ -413,6 +427,8 @@ public struct RunStore: Sendable {
             errorSummary: errorSummary,
             stats: stats,
             purgeSnapshotRewrites: purgeSnapshotRewrites,
+            purgePatterns: purgePatterns,
+            purgeRepositoryId: purgeRepositoryId,
             destructiveAuditContractVersion: destructiveAuditContractVersion,
             destructiveLaunchAuthorizedAt: destructiveLaunchAuthorizedAt,
             auditFailureReason: auditFailureReason,
@@ -440,6 +456,8 @@ public struct RunStore: Sendable {
         }
         existing.destructiveLaunchAuthorizedAt = now()
         existing.argvRedacted = run.argvRedacted
+        existing.purgePatterns = run.purgePatterns
+        existing.purgeRepositoryId = run.purgeRepositoryId
         try writeMetadataAtomic(existing)
     }
 

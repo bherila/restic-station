@@ -21,6 +21,12 @@ struct MenuBarView: View {
 
     var body: some View {
         Group {
+            if let failure = model.scheduleStateFailure {
+                Text("Schedule state needs recovery")
+                    .help(failure.recoveryMessage)
+                Divider()
+            }
+
             if let error = model.pendingSecretRollbackError {
                 Text("Credential restoration needs attention")
                     .help(error)
@@ -45,10 +51,12 @@ struct MenuBarView: View {
 
             Menu("Back Up Now") {
                 ForEach(model.setHealths) { health in
+                    let reason = model.backUpNowUnavailableReason(setId: health.setId)
                     Button(health.name) {
                         model.backUpNow(setId: health.setId)
                     }
-                    .disabled(model.isBusy(setId: health.setId))
+                    .disabled(reason != nil)
+                    .help(reason ?? "Back up \(health.name) now.")
                 }
             }
             .disabled(model.setHealths.isEmpty)

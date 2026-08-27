@@ -178,9 +178,11 @@ struct SetListView: View {
     @ViewBuilder
     private func contextMenu(for ids: Set<UUID>) -> some View {
         if let id = ids.first, let set = model.config.sets.first(where: { $0.id == id }) {
+            let backupUnavailableReason = model.backUpNowUnavailableReason(setId: id)
             Button("Edit…") { onEdit(id) }
             Button("Back Up Now") { model.backUpNow(setId: id) }
-                .disabled(model.isBusy(setId: id))
+                .disabled(backupUnavailableReason != nil)
+                .help(backupUnavailableReason ?? "Back up \(set.name) now.")
             Divider()
             Button("Delete…", role: .destructive) { pendingDeletion = set }
         }

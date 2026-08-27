@@ -176,10 +176,12 @@ struct RestoreSheet: View {
             HStack(spacing: 8) {
                 Text("Consider backing up first —")
                     .font(.callout)
+                let backupUnavailableReason = model.backUpNowUnavailableReason(setId: repository.setId)
                 Button("Back Up Now") {
                     model.backUpNow(setId: repository.setId)
                 }
-                .disabled(model.isBusy(setId: repository.setId))
+                .disabled(backupUnavailableReason != nil)
+                .help(backupUnavailableReason ?? "Back up this set before restoring.")
             }
             if let message = model.lastHelperMessage, message.setId == repository.setId {
                 Text(message.text)

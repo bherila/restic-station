@@ -2,6 +2,14 @@ import Foundation
 import Testing
 @testable import ResticStationCore
 
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#endif
+
 private final class StateStoreErrorRecorder: @unchecked Sendable {
     private let lock = NSLock()
     private var messages: [String] = []
@@ -19,12 +27,282 @@ private final class StateStoreErrorRecorder: @unchecked Sendable {
     }
 }
 
+private final class ScheduleStateFaultInjector: @unchecked Sendable {
+    enum Point {
+        case firstSync
+        case secondSync
+        case rename
+    }
+
+    private let point: Point
+    private let lock = NSLock()
+    private var syncCount = 0
+
+    init(_ point: Point) {
+        self.point = point
+    }
+
+    func operations() -> StateStoreFileOperations {
+        let live = StateStoreFileOperations.live
+        return StateStoreFileOperations(
+            openAt: live.openAt,
+            read: live.read,
+            write: live.write,
+            sync: { [self] fd in
+                lock.lock()
+                syncCount += 1
+                let call = syncCount
+                lock.unlock()
+                if (point == .firstSync && call == 1) || (point == .secondSync && call == 2) {
+                    errno = EIO
+                    return -1
+                }
+                return live.sync(fd)
+            },
+            stat: live.stat,
+            setMode: live.setMode,
+            renameAt: { [self] oldDirectory, oldName, newDirectory, newName in
+                if point == .rename {
+                    errno = EIO
+                    return -1
+                }
+                return live.renameAt(oldDirectory, oldName, newDirectory, newName)
+            },
+            unlinkAt: live.unlinkAt,
+            close: live.close
+        )
+    }
+}
+
+private final class ScheduleStateMigrationPause: @unchecked Sendable {
+    private let live = StateStoreFileOperations.live
+    private let markerPublished = DispatchSemaphore(value: 0)
+    private let resumeWriter = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var didPause = false
+
+    func operations() -> StateStoreFileOperations {
+        StateStoreFileOperations(
+            openAt: live.openAt,
+            read: live.read,
+            write: live.write,
+            sync: live.sync,
+            stat: live.stat,
+            setMode: live.setMode,
+            renameAt: { [self] oldDirectory, oldName, newDirectory, newName in
+                let result = live.renameAt(oldDirectory, oldName, newDirectory, newName)
+                guard result == 0, newName == "schedule-state.version-1" else { return result }
+                lock.lock()
+                let shouldPause = !didPause
+                didPause = true
+                lock.unlock()
+                if shouldPause {
+                    markerPublished.signal()
+                    resumeWriter.wait()
+                }
+                return result
+            },
+            unlinkAt: live.unlinkAt,
+            close: live.close
+        )
+    }
+
+    func waitUntilMarkerPublished() { markerPublished.wait() }
+    func resume() { resumeWriter.signal() }
+}
+
+private final class ScheduleStateReadRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: ScheduleStateReadResult?
+
+    func record(_ result: ScheduleStateReadResult) {
+        lock.lock()
+        stored = result
+        lock.unlock()
+    }
+
+    var result: ScheduleStateReadResult? {
+        lock.lock()
+        defer { lock.unlock() }
+        return stored
+    }
+}
+
+private final class RecoveryWriteCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    func operations() -> StateStoreFileOperations {
+        let live = StateStoreFileOperations.live
+        return StateStoreFileOperations(
+            openAt: live.openAt,
+            read: live.read,
+            write: { [self] _, _, _ in
+                lock.lock()
+                count += 1
+                lock.unlock()
+                errno = ENOSPC
+                return -1
+            },
+            sync: live.sync,
+            stat: live.stat,
+            setMode: live.setMode,
+            renameAt: live.renameAt,
+            unlinkAt: live.unlinkAt,
+            close: live.close
+        )
+    }
+
+    var writes: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return count
+    }
+}
+
 @Suite("StateStore: typed read/write for the four state/ files")
 struct StateStoreTests {
     private func makeStore() -> (store: StateStore, root: URL) {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("restic-station-statestore-test-\(UUID().uuidString)")
         return (StateStore(paths: AppPaths(root: root)), root)
+    }
+
+    // MARK: - Canonical schedule state must not be writable by other users
+
+    /// The envelope checksum is unkeyed, so it authenticates nothing an
+    /// editor could not recompute. A canonical file another user can write is
+    /// therefore forged purge bookkeeping: a fabricated
+    /// `appliedPurgeExcludes` suppresses a required rewrite, which is the
+    /// dangerous direction of the watermark asymmetry. A transiently widened
+    /// mode must not be consumed even after `state/` is re-tightened.
+    @Test("a group- or world-writable schedule-state.json is refused, not consumed")
+    func writableCanonicalScheduleStateIsRefused() throws {
+        for mode in [mode_t(0o622), mode_t(0o662), mode_t(0o666)] {
+            let (store, root) = makeStore()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let paths = AppPaths(root: root)
+            try paths.ensureDirectories()
+
+            let setId = UUID()
+            _ = try store.updateScheduleState(setId: setId) { $0.checkCount = 1 }
+            #expect(store.readScheduleState() != nil, "precondition: state reads back")
+
+            try FileManager.default.setAttributes(
+                [.posixPermissions: NSNumber(value: mode)],
+                ofItemAtPath: paths.scheduleStateFile.path
+            )
+
+            guard case .corrupt(let failure) = store.readScheduleStateResult() else {
+                Issue.record("mode \(String(mode, radix: 8)) must refuse, not read as valid or missing")
+                return
+            }
+            #expect("\(failure.reason)".contains("writable by other users"))
+        }
+    }
+
+    /// `0600` and `0644` still read. Refusing an install's own state would be
+    /// a worse failure than the exposure a readable mode represents, and a
+    /// pre-v1 release could publish `0644` under a permissive umask.
+    @Test("owner-writable schedule state still reads, including a legacy 0644 file")
+    func nonWritableCanonicalScheduleStateStillReads() throws {
+        for mode in [mode_t(0o600), mode_t(0o644)] {
+            let (store, root) = makeStore()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let paths = AppPaths(root: root)
+            try paths.ensureDirectories()
+
+            let setId = UUID()
+            _ = try store.updateScheduleState(setId: setId) { $0.checkCount = 7 }
+            try FileManager.default.setAttributes(
+                [.posixPermissions: NSNumber(value: mode)],
+                ofItemAtPath: paths.scheduleStateFile.path
+            )
+
+            guard case .valid(let state) = store.readScheduleStateResult() else {
+                Issue.record("mode \(String(mode, radix: 8)) must still read")
+                return
+            }
+            #expect(state.sets[setId]?.checkCount == 7)
+        }
+    }
+
+    // MARK: - A lease is bound to the directory generation it locked
+
+    /// The scenario the pathname-based write could not refuse: `state/` is
+    /// renamed and recreated while a lease holds `schedule-state.lock`.
+    ///
+    /// A write that re-resolved `state/` by pathname would land in the
+    /// *replacement* tree while the lease's lock still protected the retired
+    /// one — so a second helper could take the replacement lock and run a
+    /// concurrent `rewrite --forget` believing it held exclusive authority.
+    /// Holding one descriptor makes that unrepresentable: the lock and the
+    /// write resolve through the same directory inode.
+    @Test("a held lease writes into the directory its lock lives in, not a replacement at the same path")
+    func leaseWritesIntoTheDirectoryItLocked() throws {
+        let (store, root) = makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = AppPaths(root: root)
+        try paths.ensureDirectories()
+
+        let setId = UUID()
+        let lease = try store.lockScheduleState()
+        defer { lease.release() }
+
+        // Swap the pathname out from under the held lease.
+        let retired = root.appendingPathComponent("state-retired")
+        try FileManager.default.moveItem(at: paths.stateDir, to: retired)
+        try FileManager.default.createDirectory(
+            at: paths.stateDir,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+
+        _ = try lease.update(setId: setId) { $0.appliedPurgeExcludes[setId] = ["build/**"] }
+
+        // The write followed the descriptor into the retired tree...
+        let retiredDocument = retired.appendingPathComponent("schedule-state.json")
+        #expect(FileManager.default.fileExists(atPath: retiredDocument.path))
+        // ...and did NOT appear in the replacement the pathname now names.
+        #expect(!FileManager.default.fileExists(atPath: paths.scheduleStateFile.path))
+
+        // The lock the lease holds is likewise in the retired tree, so the
+        // replacement directory has no lock claiming this lease's authority.
+        #expect(FileManager.default.fileExists(
+            atPath: retired.appendingPathComponent("schedule-state.lock").path
+        ))
+    }
+
+    @Test("a directory handle reports the identity of itself and of its entries")
+    func directoryHandleReportsInodeIdentity() throws {
+        let (_, root) = makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = AppPaths(root: root)
+        try paths.ensureDirectories()
+        try Data("x".utf8).write(to: paths.stateDir.appendingPathComponent("probe"))
+
+        guard case .success(let handle) = DirectoryHandle.open(paths.stateDir, trustedRoot: root) else {
+            Issue.record("expected the state directory to open")
+            return
+        }
+        let directoryIdentity = try #require(handle.identity)
+        let entryIdentity = try #require(handle.identity(ofEntry: "probe"))
+        #expect(directoryIdentity != entryIdentity)
+        #expect(handle.identity(ofEntry: "absent") == nil)
+
+        // A replacement directory at the same pathname is a different inode,
+        // which is exactly what the handle keeps the holder away from.
+        try FileManager.default.removeItem(at: paths.stateDir)
+        try FileManager.default.createDirectory(
+            at: paths.stateDir, withIntermediateDirectories: true
+        )
+        guard case .success(let replacement) = DirectoryHandle.open(paths.stateDir, trustedRoot: root) else {
+            Issue.record("expected the replacement directory to open")
+            return
+        }
+        #expect(try #require(replacement.identity) != directoryIdentity)
+        // The original handle still names the retired inode.
+        #expect(handle.identity == directoryIdentity)
     }
 
     // MARK: - Decoding the documented literal examples (docs/data-model.md)
@@ -221,8 +499,25 @@ struct StateStoreTests {
         try garbage.write(to: store.paths.currentRunFile(setId: setId))
         try garbage.write(to: store.paths.fdaCheckFile)
 
-        #expect(store.readScheduleState() == nil)
-        #expect(store.readScheduleStateResult() == .corrupt)
+        let result = store.readScheduleStateResult()
+        guard case .corrupt(let failure) = result else {
+            Issue.record("expected corrupt schedule state, got \(result)")
+            return
+        }
+        #expect(failure.reason == .malformedDocument)
+        let quarantinePath = try #require(failure.quarantinePath)
+        #expect(try Data(contentsOf: URL(fileURLWithPath: quarantinePath)) == garbage)
+
+        // A second read reuses the content-addressed recovery copy and does
+        // not proliferate files or temp artifacts.
+        guard case .corrupt(let repeatedFailure) = store.readScheduleStateResult() else {
+            Issue.record("repeated read no longer classified corruption")
+            return
+        }
+        #expect(repeatedFailure.quarantinePath == quarantinePath)
+        let quarantines = try FileManager.default.contentsOfDirectory(atPath: store.paths.stateDir.path)
+            .filter { $0.hasPrefix("schedule-state.corrupt-") && $0.hasSuffix(".json") }
+        #expect(quarantines.count == 1)
         let before = try Data(contentsOf: store.paths.scheduleStateFile)
         #expect(throws: StateStoreError.self) {
             try store.updateScheduleState(setId: UUID()) { $0.lastBackupStart = Date() }
@@ -231,6 +526,573 @@ struct StateStoreTests {
         #expect(store.readRepoStatus(destId: destId) == nil)
         #expect(store.readCurrentRun(setId: setId) == nil)
         #expect(store.readFdaCheck() == nil)
+    }
+
+    @Test("legacy schedule state is accepted and upgraded to a checksummed envelope on mutation")
+    func legacyScheduleStateUpgradesOnMutation() throws {
+        let (store, root) = makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try store.paths.ensureDirectories()
+        let setId = UUID()
+        let legacy = """
+        {"sets":{"\(setId.uuidString)":{"checkSliceCursor":4}}}
+        """
+        try Data(legacy.utf8).write(to: store.paths.scheduleStateFile)
+
+        guard case .valid(let state) = store.readScheduleStateResult() else {
+            Issue.record("legacy schedule state was not accepted")
+            return
+        }
+        #expect(state.sets[setId]?.checkSliceCursor == 4)
+
+        try store.updateScheduleState(setId: setId) { $0.checkSliceCursor = 5 }
+        let object = try #require(
+            JSONSerialization.jsonObject(with: Data(contentsOf: store.paths.scheduleStateFile))
+                as? [String: Any]
+        )
+        #expect(object["version"] as? Int == ScheduleState.currentVersion)
+        #expect((object["checksum"] as? String)?.count == 64)
+        #expect(try Data(contentsOf: store.paths.scheduleStateVersionMarkerFile) == Data("1\n".utf8))
+        #expect(store.readScheduleState()?.sets[setId]?.checkSliceCursor == 5)
+    }
+
+    @Test("an oversized prospective envelope publishes neither marker nor canonical state")
+    func oversizedScheduleStateWriteRefusesBeforeMigrationMarker() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-state-size-\(UUID().uuidString)")
+        let paths = AppPaths(root: root)
+        let limit: Int64 = 512
+        let store = StateStore(
+            paths: paths,
+            fileOperations: .live,
+            maximumScheduleStateBytes: limit
+        )
+        try paths.ensureDirectories()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let setId = UUID()
+        let destinationId = UUID()
+        var pattern = String(repeating: "x", count: 128)
+        func legacyBytes(_ value: String) throws -> Data {
+            try StateStore.makeEncoder().encode(ScheduleState(sets: [
+                setId: SetScheduleState(appliedPurgeExcludes: [destinationId: [value]])
+            ]))
+        }
+        var legacy = try legacyBytes(pattern)
+        let targetSize = Int(limit) - 1
+        pattern += String(repeating: "x", count: targetSize - legacy.count)
+        legacy = try legacyBytes(pattern)
+        #expect(legacy.count == targetSize)
+        try legacy.write(to: paths.scheduleStateFile)
+
+        do {
+            try store.updateScheduleState(setId: setId) { $0.checkSliceCursor = 1 }
+            Issue.record("the oversized envelope must be refused before publication")
+        } catch let error as StateStoreError {
+            guard case .scheduleStateWriteTooLarge(let bytes, let reportedLimit, let path) = error else {
+                Issue.record("expected scheduleStateWriteTooLarge, got \(error)")
+                return
+            }
+            #expect(bytes > limit)
+            #expect(reportedLimit == limit)
+            #expect(path == paths.scheduleStateFile.path)
+        }
+
+        #expect(try Data(contentsOf: paths.scheduleStateFile) == legacy)
+        #expect(!FileManager.default.fileExists(atPath: paths.scheduleStateVersionMarkerFile.path))
+        guard case .valid(let state) = store.readScheduleStateResult() else {
+            Issue.record("the unchanged legacy canonical state must remain readable")
+            return
+        }
+        #expect(state.sets[setId]?.appliedPurgeExcludes[destinationId] == [pattern])
+    }
+
+    @Test("a reader binds the migration marker and canonical document under the writer lock")
+    func migrationReadWaitsForOneStableGeneration() throws {
+        let (liveStore, root) = makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try liveStore.paths.ensureDirectories()
+        let setId = UUID()
+        try Data("{\"sets\":{\"\(setId.uuidString)\":{\"checkSliceCursor\":4}}}".utf8)
+            .write(to: liveStore.paths.scheduleStateFile)
+
+        let pause = ScheduleStateMigrationPause()
+        let writer = StateStore(paths: liveStore.paths, fileOperations: pause.operations())
+        let errors = StateStoreErrorRecorder()
+        let read = ScheduleStateReadRecorder()
+        let readerFinished = DispatchSemaphore(value: 0)
+        let group = DispatchGroup()
+
+        group.enter()
+        let writerThread = Thread {
+            defer { group.leave() }
+            do {
+                try writer.updateScheduleState(setId: setId) { $0.checkSliceCursor = 5 }
+            } catch {
+                errors.record(error)
+            }
+        }
+        writerThread.start()
+        pause.waitUntilMarkerPublished()
+
+        group.enter()
+        let readerThread = Thread {
+            defer {
+                readerFinished.signal()
+                group.leave()
+            }
+            read.record(liveStore.readScheduleStateResult())
+        }
+        readerThread.start()
+
+        #expect(
+            readerFinished.wait(timeout: .now() + 0.2) == .timedOut,
+            "the reader must wait instead of quarantining the marker/legacy publication window"
+        )
+        pause.resume()
+        #expect(group.wait(timeout: .now() + 3) == .success)
+        #expect(errors.recorded.isEmpty)
+        guard case .valid(let state) = read.result else {
+            Issue.record("reader did not return the completed migration: \(String(describing: read.result))")
+            return
+        }
+        #expect(state.sets[setId]?.checkSliceCursor == 5)
+        let quarantines = try FileManager.default.contentsOfDirectory(atPath: liveStore.paths.stateDir.path)
+            .filter { $0.hasPrefix("schedule-state.corrupt-") }
+        #expect(quarantines.isEmpty)
+    }
+
+    @Test("a migrated schedule state cannot be downgraded by stripping its envelope")
+    func strippedVersionedEnvelopeFailsClosed() throws {
+        let (store, root) = makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let setId = UUID()
+        try store.updateScheduleState(setId: setId) { state in
+            state.appliedPurgeExcludes[UUID()] = ["private/**"]
+        }
+
+        var object = try #require(
+            JSONSerialization.jsonObject(with: Data(contentsOf: store.paths.scheduleStateFile))
+                as? [String: Any]
+        )
+        object.removeValue(forKey: "version")
+        object.removeValue(forKey: "checksum")
+        let stripped = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+        try stripped.write(to: store.paths.scheduleStateFile)
+
+        guard case .corrupt(let failure) = store.readScheduleStateResult() else {
+            Issue.record("a stripped v1 envelope was accepted as legacy state")
+            return
+        }
+        #expect(failure.reason == .versionDowngrade)
+        #expect(try Data(contentsOf: store.paths.scheduleStateFile) == stripped)
+        #expect(throws: StateStoreError.self) {
+            try store.updateScheduleState(setId: setId) { $0.checkSliceCursor = 1 }
+        }
+    }
+
+    @Test("a versioned schedule state without its durable migration marker fails closed")
+    func missingVersionMarkerFailsClosed() throws {
+        let (store, root) = makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try store.updateScheduleState(setId: UUID()) { $0.checkSliceCursor = 1 }
+        try FileManager.default.removeItem(at: store.paths.scheduleStateVersionMarkerFile)
+
+        guard case .corrupt(let failure) = store.readScheduleStateResult() else {
+            Issue.record("versioned state without its migration marker was accepted")
+            return
+        }
+        #expect(failure.reason == .versionMarkerMissing)
+        #expect(failure.recoveryMessage.contains("repair the owner-only marker"))
+        #expect(failure.recoveryMessage.contains("mode 0600"))
+        #expect(failure.recoveryMessage.contains("Replacing only the canonical JSON cannot repair"))
+    }
+
+    @Test("failed recovery-copy writes can be suppressed for the same canonical bytes")
+    func failedRecoveryCopyDoesNotFeedItself() throws {
+        let (liveStore, root) = makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try liveStore.paths.ensureDirectories()
+        try Data("corrupt schedule {{{".utf8).write(to: liveStore.paths.scheduleStateFile)
+        let counter = RecoveryWriteCounter()
+        let store = StateStore(paths: liveStore.paths, fileOperations: counter.operations())
+
+        guard case .corrupt(let first) = store.readScheduleStateResult() else {
+            Issue.record("first corrupt read was not classified")
+            return
+        }
+        #expect(first.quarantineWriteFailed)
+        let fingerprint = try #require(first.contentFingerprint)
+        #expect(counter.writes == 1)
+
+        guard case .corrupt(let second) = store.readScheduleStateResult(
+            suppressingRecoveryCopyFor: fingerprint
+        ) else {
+            Issue.record("suppressed corrupt read was not classified")
+            return
+        }
+        #expect(second.contentFingerprint == fingerprint)
+        #expect(second.quarantineWriteFailed)
+        #expect(counter.writes == 1, "a self-generated reload must not attempt another recovery write")
+    }
+
+    @Test("a recovery copy renamed before an indeterminate directory sync is recognized on reread")
+    func indeterminateRecoveryCopyIsRecognizedWithoutRewrite() throws {
+        let (liveStore, root) = makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try liveStore.paths.ensureDirectories()
+        let corrupt = Data("corrupt schedule after rename {{{".utf8)
+        try corrupt.write(to: liveStore.paths.scheduleStateFile)
+        let injector = ScheduleStateFaultInjector(.secondSync)
+        let store = StateStore(paths: liveStore.paths, fileOperations: injector.operations())
+
+        guard case .corrupt(let first) = store.readScheduleStateResult() else {
+            Issue.record("first corrupt read was not classified")
+            return
+        }
+        #expect(first.quarantineWriteFailed)
+        let fingerprint = try #require(first.contentFingerprint)
+
+        guard case .corrupt(let second) = store.readScheduleStateResult(
+            suppressingRecoveryCopyFor: fingerprint
+        ) else {
+            Issue.record("second corrupt read was not classified")
+            return
+        }
+        #expect(second.quarantineWriteFailed == false)
+        #expect(try Data(contentsOf: URL(fileURLWithPath: #require(second.quarantinePath))) == corrupt)
+    }
+
+    @Test("durable schedule-state temps are pinned and verified as owner-only")
+    func durableTempsIgnoreRestrictiveCreationModes() throws {
+        let (liveStore, root) = makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let live = StateStoreFileOperations.live
+        let maskedCreation = StateStoreFileOperations(
+            openAt: { directory, name, flags, mode in
+                live.openAt(directory, name, flags, flags & O_CREAT == 0 ? mode : 0)
+            },
+            read: live.read,
+            write: live.write,
+            sync: live.sync,
+            stat: live.stat,
+            setMode: live.setMode,
+            renameAt: live.renameAt,
+            unlinkAt: live.unlinkAt,
+            close: live.close
+        )
+        let store = StateStore(paths: liveStore.paths, fileOperations: maskedCreation)
+        try store.updateScheduleState(setId: UUID()) { $0.checkSliceCursor = 1 }
+
+        for path in [store.paths.scheduleStateVersionMarkerFile.path, store.paths.scheduleStateFile.path] {
+            var info = stat()
+            #expect(path.withCString { lstat($0, &info) } == 0)
+            #expect(info.st_mode & 0o7777 == 0o600)
+        }
+
+        let unverifiable = StateStoreFileOperations(
+            openAt: { directory, name, flags, mode in
+                live.openAt(directory, name, flags, flags & O_CREAT == 0 ? mode : 0)
+            },
+            read: live.read,
+            write: live.write,
+            sync: live.sync,
+            stat: live.stat,
+            setMode: { _, _ in 0 },
+            renameAt: live.renameAt,
+            unlinkAt: live.unlinkAt,
+            close: live.close
+        )
+        let otherRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-mode-verify-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: otherRoot) }
+        let unverifiableStore = StateStore(
+            paths: AppPaths(root: otherRoot),
+            fileOperations: unverifiable
+        )
+        #expect(throws: StateStoreError.self) {
+            try unverifiableStore.updateScheduleState(setId: UUID()) { $0.checkSliceCursor = 1 }
+        }
+        #expect(!FileManager.default.fileExists(
+            atPath: unverifiableStore.paths.scheduleStateVersionMarkerFile.path
+        ))
+    }
+
+    @Test("a checksum mismatch is quarantined and cannot be overwritten")
+    func checksumMismatchFailsClosed() throws {
+        let (store, root) = makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let setId = UUID()
+        try store.updateScheduleState(setId: setId) { $0.checkSliceCursor = 1 }
+
+        var object = try #require(
+            JSONSerialization.jsonObject(with: Data(contentsOf: store.paths.scheduleStateFile))
+                as? [String: Any]
+        )
+        var sets = try #require(object["sets"] as? [String: Any])
+        var entry = try #require(sets[setId.uuidString] as? [String: Any])
+        entry["checkSliceCursor"] = 99
+        sets[setId.uuidString] = entry
+        object["sets"] = sets
+        let tampered = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+        try tampered.write(to: store.paths.scheduleStateFile)
+
+        guard case .corrupt(let failure) = store.readScheduleStateResult() else {
+            Issue.record("tampered envelope was accepted")
+            return
+        }
+        #expect(failure.reason == .checksumMismatch)
+        #expect(try Data(contentsOf: URL(fileURLWithPath: #require(failure.quarantinePath))) == tampered)
+        #expect(throws: StateStoreError.self) {
+            try store.updateScheduleState(setId: setId) { $0.checkSliceCursor = 100 }
+        }
+        #expect(try Data(contentsOf: store.paths.scheduleStateFile) == tampered)
+    }
+
+    @Test("newer versions and malformed UUID keys fail closed")
+    func unsupportedAndMalformedScheduleStateFailClosed() throws {
+        for document in [
+            "{}",
+            "{\"version\":null,\"sets\":{}}",
+            "{\"checksum\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"sets\":{}}",
+            "{\"version\":999,\"checksum\":\"ignored\",\"sets\":{}}",
+            "{\"sets\":{\"not-a-uuid\":{\"checkSliceCursor\":1}}}",
+            "{\"sets\":{\"\(UUID().uuidString)\":{\"appliedPurgeExcludes\":{\"not-a-uuid\":[\"*.tmp\"]}}}}",
+        ] {
+            let (store, root) = makeStore()
+            defer { try? FileManager.default.removeItem(at: root) }
+            try store.paths.ensureDirectories()
+            try Data(document.utf8).write(to: store.paths.scheduleStateFile)
+            guard case .corrupt(let failure) = store.readScheduleStateResult() else {
+                Issue.record("unsafe schedule document was accepted: \(document)")
+                continue
+            }
+            #expect(failure.quarantinePath != nil)
+        }
+    }
+
+    @Test("a newer document cannot hide missing or unsafe marker recovery")
+    func unsupportedVersionStillClassifiesMarkerRecovery() throws {
+        let (store, root) = makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try store.paths.ensureDirectories()
+        let future = Data(
+            "{\"version\":999,\"checksum\":\"ignored\",\"sets\":{}}".utf8
+        )
+        try future.write(to: store.paths.scheduleStateFile)
+
+        guard case .corrupt(let missingMarker) = store.readScheduleStateResult() else {
+            Issue.record("the future document without a marker was accepted")
+            return
+        }
+        #expect(missingMarker.reason == .versionMarkerMissing)
+        #expect(missingMarker.recoveryMessage.contains("inspect both the canonical document and its version marker"))
+        #expect(missingMarker.recoveryMessage.contains("Replacing only the canonical JSON cannot repair"))
+
+        try Data("unsafe\n".utf8).write(to: store.paths.scheduleStateVersionMarkerFile)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: store.paths.scheduleStateVersionMarkerFile.path
+        )
+        guard case .corrupt(let unsafeMarker) = store.readScheduleStateResult() else {
+            Issue.record("the future document with an unsafe marker was accepted")
+            return
+        }
+        #expect(
+            unsafeMarker.reason == .unsafeFile(
+                reason: "schedule state version marker has invalid contents"
+            )
+        )
+        #expect(unsafeMarker.recoveryMessage.contains("Replacing only the canonical JSON cannot repair"))
+
+        try Data("1\n".utf8).write(to: store.paths.scheduleStateVersionMarkerFile)
+        guard case .corrupt(let futureVersion) = store.readScheduleStateResult() else {
+            Issue.record("the future document with a valid marker was accepted")
+            return
+        }
+        #expect(
+            futureVersion.reason == .unsupportedVersion(
+                found: 999,
+                current: ScheduleState.currentVersion
+            )
+        )
+    }
+
+    @Test("a symlink at the canonical schedule-state path is never followed")
+    func scheduleStateSymlinkFailsClosed() throws {
+        let (store, root) = makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try store.paths.ensureDirectories()
+        let target = root.appendingPathComponent("outside-schedule.json")
+        let targetBytes = Data("{\"sets\":{}}".utf8)
+        try targetBytes.write(to: target)
+        try FileManager.default.createSymbolicLink(
+            at: store.paths.scheduleStateFile,
+            withDestinationURL: target
+        )
+
+        guard case .corrupt(let failure) = store.readScheduleStateResult() else {
+            Issue.record("canonical symlink was followed")
+            return
+        }
+        guard case .ioFailure(let operation, _) = failure.reason else {
+            Issue.record("symlink refusal was misclassified: \(failure.reason)")
+            return
+        }
+        #expect(operation == "open schedule state")
+        #expect(failure.quarantinePath == nil, "unread bytes cannot be claimed as preserved")
+        #expect(throws: StateStoreError.self) {
+            try store.updateScheduleState(setId: UUID()) { $0.checkSliceCursor = 1 }
+        }
+        #expect(try Data(contentsOf: target) == targetBytes)
+        let values = try store.paths.scheduleStateFile.resourceValues(forKeys: [.isSymbolicLinkKey])
+        #expect(values.isSymbolicLink == true)
+    }
+
+    @Test("a symlink at the schedule-state directory is never followed")
+    func scheduleStateDirectorySymlinkFailsClosed() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-state-dir-symlink-\(UUID().uuidString)")
+        let paths = AppPaths(root: root)
+        let outside = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-state-dir-target-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: outside)
+        }
+        try FileManager.default.createSymbolicLink(
+            at: paths.stateDir,
+            withDestinationURL: outside
+        )
+        let store = StateStore(paths: paths)
+
+        guard case .corrupt(let failure) = store.readScheduleStateResult() else {
+            Issue.record("a symlinked state directory was accepted as empty state")
+            return
+        }
+        guard case .ioFailure(let operation, _) = failure.reason else {
+            Issue.record("state-directory symlink refusal was misclassified: \(failure.reason)")
+            return
+        }
+        #expect(operation == "open state directory")
+        #expect(failure.quarantinePath == nil)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: outside.path).isEmpty)
+    }
+
+    @Test("FIFO schedule and recovery paths are rejected without blocking")
+    func scheduleStateFIFOsDoNotBlock() throws {
+        let (store, root) = makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try store.paths.ensureDirectories()
+        try #require(store.paths.scheduleStateFile.path.withCString { mkfifo($0, 0o600) } == 0)
+
+        let started = Date()
+        guard case .corrupt(let failure) = store.readScheduleStateResult() else {
+            Issue.record("FIFO canonical schedule state was accepted")
+            return
+        }
+        #expect(Date().timeIntervalSince(started) < 1)
+        #expect(failure.reason == .unsafeFile(reason: "not a regular file"))
+
+        try FileManager.default.removeItem(at: store.paths.scheduleStateFile)
+        let corrupt = Data("bad schedule {{{".utf8)
+        try corrupt.write(to: store.paths.scheduleStateFile)
+        guard case .corrupt(let firstFailure) = store.readScheduleStateResult() else {
+            Issue.record("corrupt bytes were not classified")
+            return
+        }
+        let recovery = URL(fileURLWithPath: try #require(firstFailure.quarantinePath))
+        try FileManager.default.removeItem(at: recovery)
+        try #require(recovery.path.withCString { mkfifo($0, 0o600) } == 0)
+
+        let recoveryStarted = Date()
+        guard case .corrupt(let secondFailure) = store.readScheduleStateResult() else {
+            Issue.record("corrupt bytes with a FIFO recovery path were not classified")
+            return
+        }
+        #expect(Date().timeIntervalSince(recoveryStarted) < 1)
+        #expect(try Data(contentsOf: URL(fileURLWithPath: #require(secondFailure.quarantinePath))) == corrupt)
+    }
+
+    @Test("an unsafe migration marker fails closed when canonical state is absent")
+    func scheduleStateMarkerFIFOWithoutCanonicalFailsClosed() throws {
+        let (store, root) = makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try store.paths.ensureDirectories()
+        try #require(
+            store.paths.scheduleStateVersionMarkerFile.path.withCString { mkfifo($0, 0o600) } == 0
+        )
+
+        let started = Date()
+        guard case .corrupt(let failure) = store.readScheduleStateResult() else {
+            Issue.record("FIFO migration marker was hidden by the missing canonical state")
+            return
+        }
+        #expect(Date().timeIntervalSince(started) < 1)
+        #expect(
+            failure.reason == .unsafeFile(
+                reason: "schedule state version marker is not a regular file"
+            )
+        )
+        #expect(failure.quarantinePath == nil)
+        #expect(!FileManager.default.fileExists(atPath: store.paths.scheduleStateFile.path))
+        #expect(throws: StateStoreError.self) {
+            try store.updateScheduleState(setId: UUID()) { $0.checkSliceCursor = 1 }
+        }
+        #expect(!FileManager.default.fileExists(atPath: store.paths.scheduleStateFile.path))
+    }
+
+    @Test("schedule-state publication reports each durability boundary failure")
+    func scheduleStateDurabilityFaults() throws {
+        for point in [
+            ScheduleStateFaultInjector.Point.firstSync,
+            .rename,
+            .secondSync,
+        ] {
+            let (liveStore, root) = makeStore()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let setId = UUID()
+            try liveStore.updateScheduleState(setId: setId) { $0.checkSliceCursor = 1 }
+            let before = try Data(contentsOf: liveStore.paths.scheduleStateFile)
+            let fault = ScheduleStateFaultInjector(point)
+            let failingStore = StateStore(paths: liveStore.paths, fileOperations: fault.operations())
+
+            #expect(throws: StateStoreError.self) {
+                try failingStore.updateScheduleState(setId: setId) { $0.checkSliceCursor = 2 }
+            }
+            let after = try Data(contentsOf: liveStore.paths.scheduleStateFile)
+            if point == .secondSync {
+                // rename completed, but absence of directory durability is
+                // still reported rather than acknowledged as success.
+                #expect(after != before)
+            } else {
+                #expect(after == before)
+            }
+        }
+    }
+
+    @Test("the monotonic migration marker commits before any v1 envelope")
+    func scheduleStateMarkerDurabilityFaults() throws {
+        for point in [
+            ScheduleStateFaultInjector.Point.firstSync,
+            .rename,
+            .secondSync,
+        ] {
+            let root = FileManager.default.temporaryDirectory
+                .appendingPathComponent("restic-station-marker-fault-\(UUID().uuidString)", isDirectory: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let paths = AppPaths(root: root)
+            let injector = ScheduleStateFaultInjector(point)
+            let store = StateStore(paths: paths, fileOperations: injector.operations())
+
+            #expect(throws: StateStoreError.self) {
+                try store.updateScheduleState(setId: UUID()) { $0.checkSliceCursor = 1 }
+            }
+            #expect(!FileManager.default.fileExists(atPath: paths.scheduleStateFile.path))
+            #expect(StateStore(paths: paths).readScheduleStateResult() == .missing)
+        }
     }
 
     // MARK: - Atomic writes leave no temp files

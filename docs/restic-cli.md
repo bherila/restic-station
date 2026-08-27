@@ -104,9 +104,9 @@ Each backup passes `BackupSet.effectiveBackupExcludes`: `excludes` followed by `
 
 ### copy (mirror primary → secondary)
 ```
-restic -r <secondaryRepo> copy --from-repo <primaryRepo>
+restic -r <secondaryRepo> copy --from-repo <primaryRepo> [<snapshotID>...]
 ```
-Direction: **`-r` is the DESTINATION, `--from-repo` is the SOURCE.** Env: destination password via `RESTIC_PASSWORD_COMMAND`, source via `RESTIC_FROM_PASSWORD_COMMAND`. No snapshot IDs = copy all snapshots not yet present (dedup via the `original` field restic stamps on copied snapshots). `copy` has **no `--json`** in 0.18 — output is human text (`copy.txt`):
+Direction: **`-r` is the DESTINATION, `--from-repo` is the SOURCE.** Env: destination password via `RESTIC_PASSWORD_COMMAND`, source via `RESTIC_FROM_PASSWORD_COMMAND`. With active `purgeExcludes`, scheduled mirroring always supplies the exact resulting snapshot ids from the primary purge's complete launch-generation mapping. A snapshot created after that purge process starts is therefore not copied under stale purge authority. With no purge rules, no snapshot IDs means copy all snapshots not yet present (dedup via the `original` field restic stamps on copied snapshots). `copy` has **no `--json`** in 0.18 — output is human text (`copy.txt`):
 ```
 snapshot e9ffc5cb of [/Users/user/example/src] at 2026-07-26 16:57:04…
   copy started, this may take a while...
@@ -114,6 +114,16 @@ snapshot e9ffc5cb of [/Users/user/example/src] at 2026-07-26 16:57:04…
 snapshot a231ccb7 saved
 ```
 A fully-caught-up copy prints nothing (`copy-noop.txt` is empty) and exits 0. Parse nothing — record the raw log; success = exit 0. Count copied snapshots by counting `snapshot .* saved` lines if wanted for stats.
+
+Before a bounded copy, Restic Station pins one executable, resolves every
+terminal purge-output prefix against `snapshots --json`, and supplies the
+resulting full snapshot ids as operands. An absent or ambiguous resolution,
+executable replacement, malformed reply, or failed query fails closed. Exit 0
+then proves only that those exact operands arrived: another host can still add
+a primary snapshot at any later instant, and the CLI exposes no transaction
+that spans both repositories. A bounded copy therefore never advances the
+mirror's `lastSyncedAt` and never runs retention on either the mirror or the
+primary.
 
 ### snapshots
 ```
@@ -132,6 +142,29 @@ changing the repository (`rewrite-dry-run.txt`); `--forget` replaces the old
 snapshots and forgets them (`rewrite-forget.txt`). `--forget` does not reclaim
 pack space — only a later repository-wide `prune` does. Exit 0 means the
 requested rewrite completed (including a no-op); nonzero is a restic failure.
+
+**Summary lines.** `rewrite` ends with exactly one summary, and a parser must
+keep the counted, no-op, and unrecognized cases distinct:
+
+| Transcript | Fixture | Meaning |
+|---|---|---|
+| `modified N snapshots` | `rewrite-forget.txt` | `--forget` changed N snapshots |
+| `would modify N snapshots` | `rewrite-dry-run.txt` | `--dry-run` would change N |
+| `no snapshots were modified` | `rewrite-noop.txt` | `--forget` changed nothing |
+| `no snapshots would be modified` | `rewrite-dry-run-noop.txt` | `--dry-run` would change nothing |
+| *(none of the above)* | — | the transcript does not describe the outcome |
+
+restic **never** prints `modified 0 snapshots`; the zero case has its own
+wording. Re-running an already-applied `--forget` is therefore a *successful*
+run whose summary shares no words with the counted form, and it is the
+ordinary outcome of every purge rule after its first application. A parser
+that recognizes only the counted form reads that success as an unreadable
+transcript. The no-op transcripts still print the `snapshot <id> of [...]`
+headers for the snapshots restic examined, with no `saved new snapshot` line,
+and **the header order is not stable between runs** — never assert on it.
+
+An unrecognized summary must fail closed: absence of a summary is not
+evidence that nothing happened.
 
 ### prune
 ```

@@ -23,6 +23,81 @@ struct PurgePlanTests {
         return String(decoding: data, as: UTF8.self)
     }
 
+    /// restic normalizes the paths it records; config.json keeps the
+    /// operator's string verbatim. Comparing them raw made `/a//b` and `/a/b`
+    /// unequal, so every snapshot fell into `unattributed` and purge silently
+    /// did nothing — visible in `purge preview`, silent on the scheduled path.
+    @Test("attribution ignores redundant and trailing path separators")
+    func attributionNormalizesSeparators() {
+        let doubled = snapshot(id: "aaaaaaaaaaaaaaaa", paths: ["/Users/bwh/Projects"], hostname: "studio-mac")
+        let plan = PurgePlan(
+            destinationId: Self.destinationId,
+            snapshots: [doubled],
+            // The spellings an operator or a $TMPDIR-built path actually produces.
+            sourcePaths: ["/Users//bwh/Projects/"],
+            hostnames: ["studio-mac"],
+            patterns: ["build/**"]
+        )
+        #expect(plan.matched.map(\.id) == [doubled.id])
+        #expect(plan.unattributed.isEmpty)
+    }
+
+    @Test("attribution still rejects a genuinely different path")
+    func attributionRejectsDifferentPathDespiteNormalization() {
+        let other = snapshot(id: "bbbbbbbbbbbbbbbb", paths: ["/Users/bwh/Secrets"], hostname: "studio-mac")
+        let plan = PurgePlan(
+            destinationId: Self.destinationId,
+            snapshots: [other],
+            sourcePaths: ["/Users//bwh/Projects/"],
+            hostnames: ["studio-mac"],
+            patterns: ["build/**"]
+        )
+        #expect(plan.matched.isEmpty)
+        #expect(plan.unattributed.map(\.id) == [other.id])
+    }
+
+    @Test("path normalization is lexical and leaves root, dots and symlink-ish names alone")
+    func normalizationIsPurelyLexical() {
+        #expect(PurgePlan.normalizedForComparison("/") == "/")
+        #expect(PurgePlan.normalizedForComparison("//") == "/")
+        #expect(PurgePlan.normalizedForComparison("/a//b") == "/a/b")
+        #expect(PurgePlan.normalizedForComparison("/a/b/") == "/a/b")
+        #expect(PurgePlan.normalizedForComparison("/a///b////") == "/a/b")
+        #expect(PurgePlan.normalizedForComparison("/a/b") == "/a/b")
+        // `.`/`..` are deliberately NOT resolved: doing so lexically is wrong
+        // across symlinks, and this type must not touch the filesystem.
+        #expect(PurgePlan.normalizedForComparison("/a/./b") == "/a/./b")
+        #expect(PurgePlan.normalizedForComparison("/a/../b") == "/a/../b")
+        // A path with no separators at all is returned unchanged.
+        #expect(PurgePlan.normalizedForComparison("relative") == "relative")
+        #expect(PurgePlan.normalizedForComparison("") == "")
+    }
+
+    /// Purge invariant 1 (`docs/scheduling.md` §Purge safety invariants):
+    /// destructive commands name explicit **full** snapshot ids. To restic a
+    /// short id is a selector, not an identity, so a truncated value reaching
+    /// `rewrite --forget` could match a snapshot the token never bound.
+    /// Structural JSON validity does not imply a semantically valid id.
+    @Test("only a complete 64-character lowercase hex id counts as a snapshot id")
+    func completeSnapshotIDValidation() {
+        let valid = String(repeating: "a", count: 58) + "0123f5"
+        #expect(BackupEngine.isCompleteSnapshotID(valid))
+        #expect(BackupEngine.isCompleteSnapshotID(String(repeating: "0", count: 64)))
+
+        // Truncated — the transcript prefix restic prints, not an identity.
+        #expect(!BackupEngine.isCompleteSnapshotID(String(valid.prefix(8))))
+        #expect(!BackupEngine.isCompleteSnapshotID(String(valid.prefix(63))))
+        #expect(!BackupEngine.isCompleteSnapshotID(valid + "a"))
+        #expect(!BackupEngine.isCompleteSnapshotID(""))
+        // Uppercase hex: restic does not emit it, so it is not a known id.
+        #expect(!BackupEngine.isCompleteSnapshotID(String(repeating: "A", count: 64)))
+        // Non-hex of the right length, including a shell-significant one.
+        #expect(!BackupEngine.isCompleteSnapshotID(String(repeating: "g", count: 64)))
+        #expect(!BackupEngine.isCompleteSnapshotID(String(repeating: "-", count: 64)))
+        // Right byte count but multi-byte scalars must not pass as 64 hex.
+        #expect(!BackupEngine.isCompleteSnapshotID(String(repeating: "é", count: 32)))
+    }
+
     @Test("requires both source-subset and known-hostname attribution")
     func attribution() {
         let good = snapshot(id: "aaaaaaaaaaaaaaaa", paths: ["/Users/bwh/Projects"], hostname: "studio-mac")

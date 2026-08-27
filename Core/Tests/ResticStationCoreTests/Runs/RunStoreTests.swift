@@ -175,6 +175,91 @@ private func setRunStoreTestErrno(_ value: Int32) {
         #expect(entry.groupId == run.runId)
     }
 
+    @Test("purge patterns and repository identity are launch-bound, terminal, and legacy-compatible")
+    func purgePatternsRoundTripThroughAuditMetadata() throws {
+        let paths = makePaths()
+        defer { cleanup(paths) }
+        let store = RunStore(paths: paths, now: { Date() })
+        var run = try store.begin(
+            kind: .purge,
+            setId: UUID(),
+            destId: UUID(),
+            trigger: .scheduled
+        )
+        run.argvRedacted = ["restic", "rewrite", "--forget", "snapshot"]
+        run.purgePatterns = ["build/**", ".cache/**"]
+        run.purgeRepositoryId = "repository-a"
+
+        #expect(try store.metadata(runId: run.runId).purgePatterns == nil)
+        #expect(try store.metadata(runId: run.runId).purgeRepositoryId == nil)
+        try store.markDestructiveLaunchAuthorized(run)
+        #expect(try store.metadata(runId: run.runId).purgePatterns == run.purgePatterns)
+        #expect(try store.metadata(runId: run.runId).purgeRepositoryId == run.purgeRepositoryId)
+        let launchedPatterns = run.purgePatterns
+        let launchedRepositoryId = run.purgeRepositoryId
+        run.purgePatterns = ["mutated-after-launch/**"]
+        run.purgeRepositoryId = "repository-b"
+        try store.finish(run, status: .success, resticExitCode: 0)
+        let final = try store.metadata(runId: run.runId)
+        #expect(final.purgePatterns == launchedPatterns)
+        #expect(final.purgeRepositoryId == launchedRepositoryId)
+
+        var object = try #require(
+            JSONSerialization.jsonObject(
+                with: ConfigStore.makeEncoder().encode(final)
+            ) as? [String: Any]
+        )
+        object.removeValue(forKey: "purgePatterns")
+        object.removeValue(forKey: "purgeRepositoryId")
+        let legacyBytes = try JSONSerialization.data(withJSONObject: object)
+        let legacy = try ConfigStore.makeDecoder().decode(RunMetadata.self, from: legacyBytes)
+        #expect(legacy.purgePatterns == nil)
+        #expect(legacy.purgeRepositoryId == nil)
+    }
+
+    @Test("purge recovery evidence is bound into the independently verified index projection")
+    func purgeRecoveryEvidenceTamperingBreaksAuditProjection() throws {
+        for mutatedField in ["purgePatterns", "purgeRepositoryId", "purgeSnapshotRewrites"] {
+            let paths = makePaths()
+            defer { cleanup(paths) }
+            let store = RunStore(paths: paths, now: { Date() })
+            var run = try store.begin(
+                kind: .purge,
+                setId: UUID(),
+                destId: UUID(),
+                trigger: .manual
+            )
+            run.argvRedacted = ["restic", "rewrite", "--forget", "snapshot"]
+            run.purgePatterns = ["build/**", ".cache/**"]
+            run.purgeRepositoryId = "repository-a"
+            try store.markDestructiveLaunchAuthorized(run)
+            try store.finish(
+                run,
+                status: .success,
+                resticExitCode: 0,
+                purgeSnapshotRewrites: ["old-snapshot": "new-snap"]
+            )
+
+            let projection = try #require(store.recentRuns(limit: 1).first)
+            #expect(projection.purgeEvidenceDigest != nil)
+            #expect(try store.unresolvedAuditFailures().isEmpty)
+
+            var tampered = try store.metadata(runId: run.runId)
+            if mutatedField == "purgePatterns" {
+                tampered.purgePatterns = ["build/**", "changed/**"]
+            } else if mutatedField == "purgeRepositoryId" {
+                tampered.purgeRepositoryId = "repository-b"
+            } else {
+                tampered.purgeSnapshotRewrites = ["old-snapshot": "changed"]
+            }
+            try writeRawMetadata(tampered, paths: paths)
+
+            let failure = try #require(store.unresolvedAuditFailures().first)
+            #expect(failure.runId == run.runId)
+            #expect(failure.reason == .terminalMetadataIndexMismatch)
+        }
+    }
+
     @Test func groupIdPropagatesAcrossRunsInAGroup() throws {
         let paths = makePaths()
         defer { cleanup(paths) }
