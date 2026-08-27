@@ -59,10 +59,12 @@ public protocol ProcessRunning: Sendable {
     /// when `env` is non-nil. `onStdoutLine` receives each complete
     /// newline-terminated line as it arrives (for NDJSON streaming).
     /// Throws ProcessRunnerError.timeout after sending SIGINT (then SIGKILL
-    /// after a 10 s grace period) if `timeout` elapses.
+    /// after a 10 s grace period) if `timeout` elapses. The deadline races
+    /// process *termination*, never pipe EOF (#114).
     func run(
         _ argv: [String],
         env: [String: String]?,
+        stdin: Data?,
         currentDirectory: String?,
         onStdoutLine: (@Sendable (String) -> Void)?,
         onStderrLine: (@Sendable (String) -> Void)?,
@@ -71,7 +73,7 @@ public protocol ProcessRunning: Sendable {
 }
 ```
 
-The production implementation (`DefaultProcessRunner`) wraps `Process` + pipes. Tests inject `FakeProcessRunner` (see `testing.md`). `KeychainSecretStore`, `ResticRunner`, and `Reachability` all take a `ProcessRunning` in their initializers. Secret storage itself is behind the `SecretStore` protocol (`KeychainSecretStore` on macOS, `FileSecretStore` elsewhere — see `keychain-and-fda.md`); `ResticRunner` and `BackupEngine` take `any SecretStore`, not a concrete backend.
+The production implementation (`DefaultProcessRunner`) wraps `Process` + pipes. Its deadline races the child's termination, not the end of its output: a child that closes stdout and stderr while continuing to run would otherwise cancel its own deadline and be waited out indefinitely with the set lock held. Once the child is gone — or has been told to go and did not — the readers get a bounded grace and are then told to stop, so a descendant that inherited the pipe write ends (`ssh` for the sftp backend, a password command) cannot extend the call by holding them open. **That bound is unconditional, including on the success path.** An `ssh` master with `ControlPersist` outlives its client by design, and a run whose child exited before its deadline would otherwise return a descendant's whole lifetime later — reporting *success*, since the deadline never fired. Only the drain after the child's own exit is bounded; the run still waits as long as its child runs. A transcript cut short by that bound is **not** flagged as incomplete (#150). In practice the cut cannot reach the child's own output — restic writes before it exits, leaving at most one pipe buffer to drain in microseconds against a ten-second grace — so only a descendant's later traffic is lost. Where a cut does reach a destructive transcript it fails closed, since an unparseable `rewrite` summary forces `operation_completed_audit_failed`; a cut *backup* transcript is weaker, reading as success with absent stats rather than as unverified. The readers are interruptible rather than abandoned, and both are awaited to completion, so no `onStdoutLine`/`onStderrLine` callback outlives the call — callers close the run's `LogWriter` on that same return path. Signalling reaches only the direct child today; the process-group half of #114 is still open. Tests inject `FakeProcessRunner` (see `testing.md`). `KeychainSecretStore`, `ResticRunner`, and `Reachability` all take a `ProcessRunning` in their initializers. Secret storage itself is behind the `SecretStore` protocol (`KeychainSecretStore` on macOS, `FileSecretStore` elsewhere — see `keychain-and-fda.md`); `ResticRunner` and `BackupEngine` take `any SecretStore`, not a concrete backend.
 
 ## restic discovery
 

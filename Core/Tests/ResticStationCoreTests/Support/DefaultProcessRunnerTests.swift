@@ -176,13 +176,28 @@ struct DefaultProcessRunnerTests {
         #endif
     }
 
-    @Test("throws ProcessRunnerError.timeout and stops a long-running process via SIGINT")
-    func timeoutSendsSIGINT() async throws {
-        let runner = DefaultProcessRunner()
+    /// The elapsed bound is the half of this test that earns its name.
+    /// `#expect(throws:)` alone passes just as happily when the deadline is
+    /// reported on schedule and the child then runs to completion regardless
+    /// — which is exactly the failure #114 was about, and this assertion had
+    /// been missing long enough that it is plausible the test was passing
+    /// vacuously on Linux.
+    ///
+    /// The bound admits the SIGKILL escalation rather than requiring SIGINT
+    /// to have worked. Whether SIGINT reaches a child is not portable: on the
+    /// `linux` CI job this same case returns only after the escalation
+    /// (measured 10.34 s against production graces), because an ignored
+    /// disposition is inherited across `exec` there while macOS's Foundation
+    /// resets it. Asserting the mechanism would assert a platform; the
+    /// contract is that the deadline is enforced within a bound.
+    @Test("throws ProcessRunnerError.timeout and stops a long-running process", .timeLimit(.minutes(1)))
+    func timeoutStopsTheProcess() async throws {
+        let runner = DefaultProcessRunner(terminationGrace: 1, drainGrace: 1)
+        let started = Date()
 
         await #expect(throws: ProcessRunnerError.timeout) {
             _ = try await runner.run(
-                ["/bin/sleep", "30"],
+                ["/bin/sleep", "60"],
                 env: nil,
                 currentDirectory: nil,
                 onStdoutLine: nil,
@@ -190,6 +205,9 @@ struct DefaultProcessRunnerTests {
                 timeout: 0.3
             )
         }
+
+        let elapsed = Date().timeIntervalSince(started)
+        #expect(elapsed < 10, "returned after \(elapsed)s; the child was waited out rather than stopped")
     }
 }
 

@@ -46,6 +46,100 @@ Secrets are injected as a `FakeSecretStore`, not scripted as `/usr/bin/security`
 
 `scripts/secret-cli-test.sh` is the Layer-2 test for secrets: it drives the real helper binary with `RESTIC_STATION_SECRET_BACKEND=file`, asserts `secrets.json` is `0600`, asserts `print-password` returns the exact bytes with `cmp`/`od`, and (when restic is on PATH) runs a real backup and then greps the whole data directory to prove the password reached no log, run record or state file.
 
+### Real-subprocess exceptions to FakeProcessRunner
+
+Two suites deliberately spawn real processes, because what they assert *is* the
+POSIX behaviour a double would have to invent: `DefaultProcessRunnerTests`
+(stdin/EOF handling, SIGPIPE disposition inheritance) and `ProcessLifetimeTests`
+(#114 — the deadline must race process termination rather than pipe EOF, and a
+descendant holding the inherited pipe ends must not outlast it). Between them they use only `/bin/sh`,
+`/bin/echo` and `/bin/sleep`, all present on macOS and in the `swift:6.1`
+Linux container.
+
+`ProcessLifetimeTests` asserts that a run with a deadline always returns
+within a bound. It does **not** assert which signal ended the child, because
+that is not portable — see below — and a test that pins the mechanism pins a
+platform. The engine's actual requirement is that a deadline cannot be
+outlasted while the set lock is held.
+
+The stop sequence is up to four waits deep in the worst case (deadline →
+SIGINT grace → termination bound → drain grace), so at the production 10 s
+graces one assertion costs 30 s+, and a bound loose enough to survive that
+stops distinguishing "the deadline was enforced" from "the child was waited
+out". `DefaultProcessRunner` therefore takes its two graces as an internal
+initializer parameter; these tests pass 1 s and finish in ~3 s with bounds
+that are tight enough to mean something. `stopSequenceGracesAreTenSecondsInProduction`
+guards the seam, so shrinking graces for tests cannot quietly become the
+shipped values. The children sleep 60 s, far longer than any bound, so
+"waited the child out" can never pass.
+
+**An elapsed bound is not optional on a timeout test.** `#expect(throws:)`
+alone passes identically whether the deadline stopped the child or was merely
+*reported* on schedule while the child ran to completion — and the second is
+the #114 defect itself. `timeoutStopsTheProcess` (formerly
+`timeoutSendsSIGINT`) asserted only the throw and so could not distinguish
+them; it is plausible it had been passing vacuously on Linux for some time.
+
+**A fixed sleep before an action is a race, not a wait.**
+`cancellingDeliversSIGINT` cancelled 0.5 s after spawning a child that
+installs a SIGINT trap. That is fine on a dev Mac and lost on CI: a spawn
+slower than the delay let the signal arrive before the trap existed, and the
+test then failed for a reason unrelated to its contract. It now waits for the
+child to write a "trap armed" file and cancels only after it appears —
+faster (0.12 s, no fixed sleep) as well as deterministic. Prefer waiting on
+an observable state change over a delay chosen to be "long enough".
+
+**The suite's own speed changed a flake rate (#116).** `posix_spawn`
+intermittently fails with `EFAULT` under concurrent spawn load. Shrinking the
+stop-sequence graces took the Core suite from ~24 s to ~5 s, which packed the
+same 936 tests into a fifth of the wall clock and took that flake from roughly
+1 run in 25 to **4 in 20** — measured, not estimated. The trigger is density,
+not the new tests: skipping `ProcessLifetimeTests` entirely left the rate
+unchanged at 4/20. `DefaultProcessRunner` now retries a spawn up to three
+times when it fails with `EFAULT` or `EAGAIN`, which took it to **0 failures
+in 65 runs**. Matching the errno takes two forms, because the platforms differ:
+Darwin throws `NSPOSIXErrorDomain` directly, while swift-corelibs-foundation
+reports `NSCocoaErrorDomain`/`fileReadUnknown` and buries the errno under
+`NSUnderlyingErrorKey`. Matching only the POSIX domain made the retry dead code
+on Linux — and made its boundary test pass there while proving nothing, since
+the test built errors Linux never throws for a spawn failure. Retrying is safe specifically because POSIX guarantees no child
+exists when `posix_spawn` reports an error, so it cannot double-spawn a
+destructive command; `onlyTransientSpawnFailuresAreRetried` pins the boundary
+so a real `ENOENT` or `EACCES` still fails on the first attempt.
+
+**Signal delivery to children is not portable, and CI is the only place that
+shows it.** On the `linux` job, a child does not stop on SIGINT and is ended
+by the SIGKILL escalation behind it — an ignored disposition is inherited
+across `exec` there, while macOS's Foundation resets child dispositions (cf.
+the same divergence behind `SIGPIPEGuard`'s no-op handler). One further
+Linux-only observation came out of #114 and is recorded in #149 alongside it: a
+`/bin/sh -c` child's termination is not observed after SIGKILL the way a
+direct `/bin/sleep` child's is. None of it is visible from a green macOS run.
+
+**An elapsed bound is necessary and not sufficient.** Two independent reviews
+of #147 built the same counterexample: delete the runner's entire kill path,
+and every elapsed-bound test still passed, because the bounded give-up
+satisfies the bounds on its own — leaving eight children running. A timeout
+test must therefore assert *liveness* too. `deadlineEndsTheChild` does it
+portably, by having the child append to a file on a loop and requiring that
+file to stop growing; a pid probe would not work, since `kill(pid, 0)`
+succeeds against a zombie and a child ended on Linux may not be reaped
+promptly (#149). `descendantCannotExtendARunWhoseChildExited` covers the
+interleaving every other test structurally cannot reach — the child exits
+*before* the deadline, so no stop sequence runs, and an unbounded drain then
+returns **success** a descendant's lifetime late. It is macOS-gated because
+its *precondition* is unreachable on Linux, not merely its mechanism: there
+a `/bin/sh -c` child's termination is not observed while a descendant lives
+(#149), so the deadline fires and the run ends as a bounded `.timeout`
+instead. A bound loose enough to pass on Linux would also pass with the fix
+reverted, which is worse than not running the test there.
+
+One thing the Linux runs did settle: `deadlineEndsTheChild` passes there. So
+SIGKILL genuinely reaches and ends the child on Linux — it is only the
+*observation* of that death that does not arrive, which narrows #149 from
+"the signal may not be landing" to "the signal lands and corelibs does not
+report it".
+
 ### Fixture conventions
 `Core/Tests/ResticStationCoreTests/Fixtures/` — restic output fixtures are copied verbatim from `docs/fixtures/` (captured from restic 0.18.1; see restic-cli.md). Load via `Bundle.module` (declare `resources: [.copy("Fixtures")]` in Package.swift). Every parser has a test decoding its fixture; NDJSON parsers additionally get a partial-line-buffering test (feed the fixture in random-sized chunks, expect identical parse) and an unknown-`message_type` tolerance test.
 
