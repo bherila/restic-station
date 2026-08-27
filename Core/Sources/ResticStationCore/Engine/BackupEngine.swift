@@ -1419,6 +1419,15 @@ public final class BackupEngine: Sendable {
         } catch {
             return PurgePlanResult(plan: emptyPlan, status: .failed, message: "could not parse snapshots: \(error)")
         }
+        let incomplete = Self.incompleteSnapshotIDs(snapshots)
+        guard incomplete.isEmpty else {
+            return PurgePlanResult(
+                plan: emptyPlan,
+                status: .failed,
+                message: "repository reported \(incomplete.count) snapshot id(s) that are not "
+                    + "complete restic hashes; refusing to plan a rewrite over them"
+            )
+        }
 
         let plan = PurgePlan(
             destinationId: destination.id,
@@ -2042,6 +2051,14 @@ public final class BackupEngine: Sendable {
                 operationMayHaveRun: false
             )
         }
+        let incompleteIDs = Self.incompleteSnapshotIDs(snapshots)
+        guard incompleteIDs.isEmpty else {
+            throw PurgeApplyError.infrastructureFailure(
+                reason: "repository reported \(incompleteIDs.count) snapshot id(s) that are not "
+                    + "complete restic hashes; refusing to bind them to a destructive launch",
+                operationMayHaveRun: false
+            )
+        }
         return (
             plan: PurgePlan(
                 destinationId: destination.id,
@@ -2123,7 +2140,37 @@ public final class BackupEngine: Sendable {
                 operationMayHaveRun: false
             )
         }
+        let incompleteIDs = Self.incompleteSnapshotIDs(snapshots)
+        guard incompleteIDs.isEmpty else {
+            throw PurgeApplyError.infrastructureFailure(
+                reason: "repository reported \(incompleteIDs.count) snapshot id(s) that are not "
+                    + "complete restic hashes; refusing to bind them to a destructive launch",
+                operationMayHaveRun: false
+            )
+        }
         return Set(snapshots.map(\.id))
+    }
+
+    /// A complete restic snapshot id: 64 lowercase hex characters.
+    ///
+    /// Enforces the first purge invariant (`docs/scheduling.md` §Purge safety
+    /// invariants). To restic a short id is a *selector*, not an identity: a
+    /// truncated or otherwise non-hash value reaching `rewrite --forget`
+    /// could match a snapshot the confirmation token never bound. Structural
+    /// JSON validity does not imply a semantically valid id, so every id is
+    /// checked before token consumption or destructive launch.
+    static func isCompleteSnapshotID(_ id: String) -> Bool {
+        let bytes = id.utf8
+        guard bytes.count == 64 else { return false }
+        return bytes.allSatisfy { byte in
+            (byte >= UInt8(ascii: "0") && byte <= UInt8(ascii: "9"))
+                || (byte >= UInt8(ascii: "a") && byte <= UInt8(ascii: "f"))
+        }
+    }
+
+    /// The ids restic could not have produced, for a fail-closed message.
+    static func incompleteSnapshotIDs(_ snapshots: [Snapshot]) -> [String] {
+        snapshots.map(\.id).filter { !isCompleteSnapshotID($0) }
     }
 
     private static func hasUnambiguousRewriteTranscriptIDs(_ snapshotIDs: [String]) -> Bool {

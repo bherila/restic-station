@@ -357,9 +357,12 @@ adding another layer of revalidation.
    source. Retention resuming is the signal that a run was unbounded.
 3. **The watermark is asymmetric.** Losing one costs a single idempotent
    `rewrite --forget` that restic reports as a no-op. *Fabricating* one skips
-   real work permanently. So a watermark may only be written from observed
-   terminal success, never inferred from historical evidence, and a lost one
-   is left to heal by re-running.
+   real work permanently. So a watermark may only be written from evidence
+   observed in this run — a terminal successful purge child, or a plan proven
+   to have nothing to rewrite because the repository was observed empty during
+   the all-destination planning pass (the case at the end of this section).
+   It is never inferred from historical run records, and a lost one is left to
+   heal by re-running rather than reconstructed.
 4. **Evidence is bound to the thing that consumes it.** Schedule-state reads,
    the companion lock, and every durable publication resolve through one
    retained `state/` descriptor; repository identity is re-read inside the

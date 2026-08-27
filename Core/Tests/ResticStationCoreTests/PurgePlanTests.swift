@@ -73,6 +73,31 @@ struct PurgePlanTests {
         #expect(PurgePlan.normalizedForComparison("") == "")
     }
 
+    /// Purge invariant 1 (`docs/scheduling.md` §Purge safety invariants):
+    /// destructive commands name explicit **full** snapshot ids. To restic a
+    /// short id is a selector, not an identity, so a truncated value reaching
+    /// `rewrite --forget` could match a snapshot the token never bound.
+    /// Structural JSON validity does not imply a semantically valid id.
+    @Test("only a complete 64-character lowercase hex id counts as a snapshot id")
+    func completeSnapshotIDValidation() {
+        let valid = String(repeating: "a", count: 58) + "0123f5"
+        #expect(BackupEngine.isCompleteSnapshotID(valid))
+        #expect(BackupEngine.isCompleteSnapshotID(String(repeating: "0", count: 64)))
+
+        // Truncated — the transcript prefix restic prints, not an identity.
+        #expect(!BackupEngine.isCompleteSnapshotID(String(valid.prefix(8))))
+        #expect(!BackupEngine.isCompleteSnapshotID(String(valid.prefix(63))))
+        #expect(!BackupEngine.isCompleteSnapshotID(valid + "a"))
+        #expect(!BackupEngine.isCompleteSnapshotID(""))
+        // Uppercase hex: restic does not emit it, so it is not a known id.
+        #expect(!BackupEngine.isCompleteSnapshotID(String(repeating: "A", count: 64)))
+        // Non-hex of the right length, including a shell-significant one.
+        #expect(!BackupEngine.isCompleteSnapshotID(String(repeating: "g", count: 64)))
+        #expect(!BackupEngine.isCompleteSnapshotID(String(repeating: "-", count: 64)))
+        // Right byte count but multi-byte scalars must not pass as 64 hex.
+        #expect(!BackupEngine.isCompleteSnapshotID(String(repeating: "é", count: 32)))
+    }
+
     @Test("requires both source-subset and known-hostname attribution")
     func attribution() {
         let good = snapshot(id: "aaaaaaaaaaaaaaaa", paths: ["/Users/bwh/Projects"], hostname: "studio-mac")

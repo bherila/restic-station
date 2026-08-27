@@ -896,6 +896,24 @@ public struct StateStore: Sendable {
         guard info.st_uid == geteuid() else {
             return .failed(.unsafeFile(reason: "owned by uid \(info.st_uid), expected \(geteuid())"))
         }
+        // The envelope checksum is unkeyed, so it authenticates nothing an
+        // editor could not recompute. A canonical file another user can write
+        // is therefore forged purge bookkeeping — a fabricated
+        // `appliedPurgeExcludes` suppresses a required rewrite, which is the
+        // dangerous direction of the watermark asymmetry
+        // (`docs/scheduling.md` §Purge safety invariants). A transiently
+        // widened mode (a recursive chmod that also exposed `state/`) must
+        // not be consumed even after the directory is re-tightened.
+        //
+        // Only the *write* bits are refused, not `0o077`: a pre-v1 release
+        // could publish `0644` under a permissive umask, and refusing to read
+        // an install's own state would be a worse failure than the exposure
+        // that mode represents.
+        guard info.st_mode & 0o022 == 0 else {
+            return .failed(.unsafeFile(
+                reason: "writable by other users (mode \(String(info.st_mode & 0o777, radix: 8)))"
+            ))
+        }
         let fileSize = Int64(info.st_size)
         guard fileSize >= 0,
               fileSize <= maximumScheduleStateBytes else {

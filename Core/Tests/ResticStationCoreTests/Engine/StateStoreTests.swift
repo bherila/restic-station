@@ -168,6 +168,65 @@ struct StateStoreTests {
         return (StateStore(paths: AppPaths(root: root)), root)
     }
 
+    // MARK: - Canonical schedule state must not be writable by other users
+
+    /// The envelope checksum is unkeyed, so it authenticates nothing an
+    /// editor could not recompute. A canonical file another user can write is
+    /// therefore forged purge bookkeeping: a fabricated
+    /// `appliedPurgeExcludes` suppresses a required rewrite, which is the
+    /// dangerous direction of the watermark asymmetry. A transiently widened
+    /// mode must not be consumed even after `state/` is re-tightened.
+    @Test("a group- or world-writable schedule-state.json is refused, not consumed")
+    func writableCanonicalScheduleStateIsRefused() throws {
+        for mode in [mode_t(0o622), mode_t(0o662), mode_t(0o666)] {
+            let (store, root) = makeStore()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let paths = AppPaths(root: root)
+            try paths.ensureDirectories()
+
+            let setId = UUID()
+            _ = try store.updateScheduleState(setId: setId) { $0.checkCount = 1 }
+            #expect(store.readScheduleState() != nil, "precondition: state reads back")
+
+            try FileManager.default.setAttributes(
+                [.posixPermissions: NSNumber(value: mode)],
+                ofItemAtPath: paths.scheduleStateFile.path
+            )
+
+            guard case .corrupt(let failure) = store.readScheduleStateResult() else {
+                Issue.record("mode \(String(mode, radix: 8)) must refuse, not read as valid or missing")
+                return
+            }
+            #expect("\(failure.reason)".contains("writable by other users"))
+        }
+    }
+
+    /// `0600` and `0644` still read. Refusing an install's own state would be
+    /// a worse failure than the exposure a readable mode represents, and a
+    /// pre-v1 release could publish `0644` under a permissive umask.
+    @Test("owner-writable schedule state still reads, including a legacy 0644 file")
+    func nonWritableCanonicalScheduleStateStillReads() throws {
+        for mode in [mode_t(0o600), mode_t(0o644)] {
+            let (store, root) = makeStore()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let paths = AppPaths(root: root)
+            try paths.ensureDirectories()
+
+            let setId = UUID()
+            _ = try store.updateScheduleState(setId: setId) { $0.checkCount = 7 }
+            try FileManager.default.setAttributes(
+                [.posixPermissions: NSNumber(value: mode)],
+                ofItemAtPath: paths.scheduleStateFile.path
+            )
+
+            guard case .valid(let state) = store.readScheduleStateResult() else {
+                Issue.record("mode \(String(mode, radix: 8)) must still read")
+                return
+            }
+            #expect(state.sets[setId]?.checkCount == 7)
+        }
+    }
+
     // MARK: - A lease is bound to the directory generation it locked
 
     /// The scenario the pathname-based write could not refuse: `state/` is
