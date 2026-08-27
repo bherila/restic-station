@@ -339,6 +339,37 @@ The fixed order is:
    generation withholds retention on both mirrors and the primary because a
    peer snapshot omitted from copy must remain recoverable at the source.
 
+### Purge safety invariants
+
+These are the terminating conditions for a purge review: a change that keeps
+all four is safe, and a residual race that cannot violate one of them is
+bookkeeping, not danger. State which one a new mechanism protects, rather than
+adding another layer of revalidation.
+
+1. **Destructive commands name explicit full snapshot ids.** `rewrite
+   --forget` never runs against "whatever is in the repository": the ids are
+   resolved and revalidated at the spawn boundary. A snapshot that appears
+   after the observation is therefore absent from the operands — it is not
+   silently included.
+2. **A bounded generation withholds retention.** When the copy operands are
+   pinned to a specific generation, neither mirror nor primary `forget` runs,
+   because a peer snapshot omitted from the copy must stay recoverable at the
+   source. Retention resuming is the signal that a run was unbounded.
+3. **The watermark is asymmetric.** Losing one costs a single idempotent
+   `rewrite --forget` that restic reports as a no-op. *Fabricating* one skips
+   real work permanently. So a watermark may only be written from observed
+   terminal success, never inferred from historical evidence, and a lost one
+   is left to heal by re-running.
+4. **Evidence is bound to the thing that consumes it.** Schedule-state reads,
+   the companion lock, and every durable publication resolve through one
+   retained `state/` descriptor; repository identity is re-read inside the
+   runner at the spawn boundary. A check that is merely *recent* is not
+   binding (`AGENTS.md` §Safety 1).
+
+Under-purging is recoverable; over-purging is not. Where those trade against
+each other, refuse or repeat work rather than widening what a destructive
+command may touch.
+
 **Attribution** decides which snapshots a purge is allowed to touch, and is
 therefore normative. A repository-wide `snapshots --json` listing is filtered
 in Swift; a snapshot is attributed to the set when **both** hold:
