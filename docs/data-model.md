@@ -505,6 +505,9 @@ performed automatically. A missing or unsafe migration marker is a two-file
 recovery: after verifying the v1 envelope and checksum, recreate the owner-only
 marker with exact bytes `1\n` and mode `0600`, or restore both files from a
 trusted copy. Replacing only the canonical JSON cannot repair marker damage.
+Marker safety is classified before canonical version compatibility, so a
+newer-version document cannot hide a missing or unsafe marker that also needs
+operator repair.
 
 ## state/repo-status-<destId>.json
 

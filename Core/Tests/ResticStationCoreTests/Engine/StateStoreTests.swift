@@ -734,6 +734,53 @@ struct StateStoreTests {
         }
     }
 
+    @Test("a newer document cannot hide missing or unsafe marker recovery")
+    func unsupportedVersionStillClassifiesMarkerRecovery() throws {
+        let (store, root) = makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try store.paths.ensureDirectories()
+        let future = Data(
+            "{\"version\":999,\"checksum\":\"ignored\",\"sets\":{}}".utf8
+        )
+        try future.write(to: store.paths.scheduleStateFile)
+
+        guard case .corrupt(let missingMarker) = store.readScheduleStateResult() else {
+            Issue.record("the future document without a marker was accepted")
+            return
+        }
+        #expect(missingMarker.reason == .versionMarkerMissing)
+        #expect(missingMarker.recoveryMessage.contains("inspect both the canonical document and its version marker"))
+        #expect(missingMarker.recoveryMessage.contains("Replacing only the canonical JSON cannot repair"))
+
+        try Data("unsafe\n".utf8).write(to: store.paths.scheduleStateVersionMarkerFile)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: store.paths.scheduleStateVersionMarkerFile.path
+        )
+        guard case .corrupt(let unsafeMarker) = store.readScheduleStateResult() else {
+            Issue.record("the future document with an unsafe marker was accepted")
+            return
+        }
+        #expect(
+            unsafeMarker.reason == .unsafeFile(
+                reason: "schedule state version marker has invalid contents"
+            )
+        )
+        #expect(unsafeMarker.recoveryMessage.contains("Replacing only the canonical JSON cannot repair"))
+
+        try Data("1\n".utf8).write(to: store.paths.scheduleStateVersionMarkerFile)
+        guard case .corrupt(let futureVersion) = store.readScheduleStateResult() else {
+            Issue.record("the future document with a valid marker was accepted")
+            return
+        }
+        #expect(
+            futureVersion.reason == .unsupportedVersion(
+                found: 999,
+                current: ScheduleState.currentVersion
+            )
+        )
+    }
+
     @Test("a symlink at the canonical schedule-state path is never followed")
     func scheduleStateSymlinkFailsClosed() throws {
         let (store, root) = makeStore()

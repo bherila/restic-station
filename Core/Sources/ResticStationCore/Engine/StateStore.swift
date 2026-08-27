@@ -730,13 +730,10 @@ public struct StateStore: Sendable {
                     // then upgrade under the mutation lock on the next write.
                     return .result(.valid(try decoder.decode(ScheduleState.self, from: data)))
                 }
-                guard version == ScheduleState.currentVersion else {
-                    return .result(.corrupt(scheduleStateFailure(
-                        reason: .unsupportedVersion(found: version, current: ScheduleState.currentVersion),
-                        bytes: data,
-                        suppressingRecoveryCopyFor: suppressedRecoveryCopyFingerprint
-                    )))
-                }
+                // The marker is an independent part of the recovery
+                // capability. Classify it before version compatibility so a
+                // newer canonical document cannot hide a second repair the
+                // operator must perform.
                 switch readScheduleStateVersionMarker() {
                 case .present:
                     break
@@ -752,6 +749,13 @@ public struct StateStore: Sendable {
                 case .failed(let reason):
                     return .result(.corrupt(scheduleStateFailure(
                         reason: reason,
+                        bytes: data,
+                        suppressingRecoveryCopyFor: suppressedRecoveryCopyFingerprint
+                    )))
+                }
+                guard version == ScheduleState.currentVersion else {
+                    return .result(.corrupt(scheduleStateFailure(
+                        reason: .unsupportedVersion(found: version, current: ScheduleState.currentVersion),
                         bytes: data,
                         suppressingRecoveryCopyFor: suppressedRecoveryCopyFingerprint
                     )))
