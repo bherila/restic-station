@@ -226,7 +226,14 @@ struct ReachabilityTests {
         let reachability = Self.makeReachability(fake, secrets: secrets)
 
         let result = await reachability.probe(dest)
-        #expect(result == .offline(reason: "no password stored for this destination"))
+        // `.needsAttention`, not `.offline`: `probe-repo` publishes an
+        // offline probe as `ok: true` at exit 3, which tells a headless
+        // caller to try later — wrong for a destination whose remedy is
+        // `secret set` (#96).
+        #expect(result == .needsAttention(
+            code: .secretNotConfigured,
+            reason: "no password stored for this destination"
+        ))
         // Not the unreadable-store reason, whichever backend answered: that
         // string is on `SetsBadges`'s environmental list and would show this
         // as "Offline — try later" when the remedy is `secret set`.
@@ -251,7 +258,10 @@ struct ReachabilityTests {
         let reachability = Self.makeReachability(fake, secrets: secrets)
 
         let result = await reachability.probe(dest)
-        #expect(result == .offline(reason: "the secret store is not usable as configured"))
+        #expect(result == .needsAttention(
+            code: .secretStoreUnusable,
+            reason: "the secret store is not usable as configured"
+        ))
         // Same requirement as the no-password-stored case, for the same
         // reason: this string is persisted to `repo-status-<destId>.json`
         // and read by `SetsBadges`, whose environmental list would turn a
@@ -263,10 +273,11 @@ struct ReachabilityTests {
         // as well as the four phrases above; the App-side test owns that
         // list, but a reason that trips it here would defeat the badge
         // before the App ever sees it.
-        guard case .offline(let reason) = result else {
-            Issue.record("expected an offline probe result, got \(result)")
+        guard case .needsAttention(let code, let reason) = result else {
+            Issue.record("expected a needs-attention probe result, got \(result)")
             return
         }
+        #expect(!code.retryable, "a permanent refusal must not publish a retryable code")
         for environmental in ["volume not mounted", "timed out", "keychain locked",
                               "secret store unavailable", "could not"] {
             #expect(!reason.lowercased().contains(environmental), "reason matched \(environmental)")

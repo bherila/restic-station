@@ -371,10 +371,13 @@ enum SecretEnvBlob {
         do {
             data = try JSONEncoder().encode(env)
         } catch {
-            throw SecretStoreError.backendFailed("failed to encode secret env as JSON: \(error)")
+            // Permanent for the same reason `FileSecretStore`'s encode
+            // failure is: encoding the identical dictionary of strings is
+            // deterministic, so a retry cannot succeed.
+            throw SecretStoreError.storeUnusable("failed to encode secret env as JSON: \(error)")
         }
         guard let json = String(data: data, encoding: .utf8) else {
-            throw SecretStoreError.backendFailed("failed to encode secret env as UTF-8 JSON")
+            throw SecretStoreError.storeUnusable("failed to encode secret env as UTF-8 JSON")
         }
         return json
     }
@@ -386,7 +389,12 @@ enum SecretEnvBlob {
         do {
             return try JSONDecoder().decode([String: String].self, from: data)
         } catch {
-            throw SecretStoreError.backendFailed("failed to decode secret env JSON: \(error)")
+            // The malformed-content condition, on the *inner* blob rather
+            // than the outer document — and it reaches here from both
+            // backends, since a keychain item's value is this same JSON.
+            // Decoding the identical bytes cannot start succeeding; the
+            // stored blob has to be rewritten (#96).
+            throw SecretStoreError.storeUnusable("failed to decode secret env JSON: \(error)")
         }
     }
 }

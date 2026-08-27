@@ -82,6 +82,57 @@ struct SecretStoreConformanceTests {
         #expect(try await store.secretEnv(destId: Self.destId).isEmpty)
     }
 
+    /// The malformed-content half of #96, on the *inner* blob rather than
+    /// the outer document. Both backends decode this same JSON, so both
+    /// reach the same classification through `SecretEnvBlob.decode`.
+    @Test("a corrupt secret-env blob is permanent, not a retryable read failure")
+    func corruptSecretEnvBlobIsStoreUnusable() async throws {
+        // The shared decoder, exercised directly: it is what both
+        // `FileSecretStore.secretEnv` and `KeychainSecretStore.secretEnv`
+        // return through, and a keychain item holding this same text is
+        // corrupt in exactly the same way.
+        do {
+            _ = try SecretEnvBlob.decode("{\"A\": ")
+            Issue.record("expected a malformed secret-env blob to be refused")
+        } catch let error as SecretStoreError {
+            guard case .storeUnusable = error else {
+                Issue.record("expected .storeUnusable, got \(error)")
+                return
+            }
+            let failure = CLIFailure.classify(error)
+            #expect(failure.code == .secretStoreUnusable)
+            #expect(!failure.retryable, "decoding the identical bytes cannot start succeeding")
+        }
+
+        // And end to end through the file backend, whose outer document is
+        // perfectly valid — this is the case a `load()`-level check misses.
+        let (store, root) = Self.makeFileStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try await store.setPassword("hunter2", destId: Self.destId)
+        var document = try store.load()
+        document.secrets[SecretAccount.secretEnv(Self.destId)] = "{\"A\": "
+        // Written straight to the file at 0600 rather than through the
+        // store's own writer, which is private — and which would have no
+        // way to produce this state anyway, since `setSecretEnv` encodes.
+        let encoded = try JSONEncoder().encode(document)
+        try encoded.write(to: store.fileURL)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600], ofItemAtPath: store.fileURL.path
+        )
+
+        await #expect(throws: SecretStoreError.self) {
+            _ = try await store.secretEnv(destId: Self.destId)
+        }
+        do {
+            _ = try await store.secretEnv(destId: Self.destId)
+        } catch let error as SecretStoreError {
+            guard case .storeUnusable = error else {
+                Issue.record("expected .storeUnusable from the file backend, got \(error)")
+                return
+            }
+        }
+    }
+
     @Test("file: deletes are idempotent")
     func fileIdempotentDeletes() async throws {
         let (store, root) = Self.makeFileStore()
