@@ -225,6 +225,12 @@ preflight_jq() {
 
 setup_workspace() {
     WORK="$(mktemp -d "${TMPDIR:-/tmp}/restic-station-it.XXXXXX")"
+    # macOS $TMPDIR ends in "/", so the template above yields a "//" in the
+    # path. restic normalizes that away in the snapshot `paths` it records,
+    # while config.json keeps whatever string it was given — and purge
+    # attribution compares the two as strings. Collapsing it here keeps the
+    # harness testing purge behavior rather than that mismatch.
+    WORK="$(printf '%s' "$WORK" | sed 's:///*:/:g')"
     DATA_DIR="$WORK/data"
     INDEX_FILE="$DATA_DIR/runs/index.jsonl"
     SOURCE_DIR="$WORK/source"
@@ -775,6 +781,129 @@ assert_retention() {
     log "$step OK (manual apply refused; scheduled path pruned primary=$pcount, secondary=$scount snapshots)"
 }
 
+# A repository whose purge rule has already been applied, whose watermark is
+# then lost (state rebuilt, restored from an older copy, a fresh machine),
+# must SELF-HEAL: the next scheduled run re-runs the rewrite, restic reports a
+# real no-op, and the watermark is re-established. That self-heal is the whole
+# reason a lost watermark is merely wasteful rather than dangerous.
+#
+# It only works if the no-op transcript parses. restic words the zero case as
+# `no snapshots were modified` — never `modified 0 snapshots` (docs/restic-cli.md
+# §rewrite) — so a parser matching only the counted form turns this successful
+# rewrite into a permanent infrastructure failure that never heals. Unit
+# fixtures pin the parser; this pins the path, against real restic, because the
+# bug originally shipped green behind a scripted transcript restic never emits.
+assert_purge_noop_self_heals() {
+    local step="purge no-op self-heal (already applied, watermark lost)"
+    log "$step"
+
+    mkdir -p "$SOURCE_DIR/purgeable"
+    echo "payload that must leave history" > "$SOURCE_DIR/purgeable/drop-me.txt"
+    run_backup
+    [[ $BACKUP_RC -eq 0 ]] || fail "$step" "seed run-set exited $BACKUP_RC: $BACKUP_OUT"
+
+    # purgeExcludes is a v3 key; assert_migration has already upgraded config.
+    local patch_out
+    if ! patch_out="$(python3 - "$DATA_DIR/config.json" "$SET_ID" 2>&1 <<'PATCH'
+import json, sys
+path, set_id = sys.argv[1], sys.argv[2]
+with open(path) as handle:
+    config = json.load(handle)
+for entry in config.get("sets", []):
+    if entry.get("id") == set_id:
+        entry["purgeExcludes"] = ["*/purgeable/*"]
+        break
+else:
+    sys.exit(f"set {set_id} not found in config")
+with open(path, "w") as handle:
+    json.dump(config, handle)
+PATCH
+    )"; then
+        fail "$step" "could not add purgeExcludes: ${patch_out:-python3 failed with no output}"
+    fi
+
+    # --- apply the rule for real ------------------------------------------
+    local preview token changed rc
+    set +e
+    preview="$("$HELPER" purge preview --set "$SET_ID" --dest "$PRIMARY_DEST_ID" --json 2>&1)"
+    rc=$?
+    set -e
+    [[ $rc -eq 0 ]] || fail "$step" "purge preview exited $rc: $preview"
+    changed="$(printf '%s' "$preview" | jq -r '[.data[].changed[]] | length')"
+    [[ "$changed" -ge 1 ]] || fail "$step" "preview changed nothing; purgeExcludes did not match: $preview"
+    token="$(printf '%s' "$preview" | jq -r '[.data[].previewToken] | map(select(. != null)) | first // ""')"
+    [[ -n "$token" ]] || fail "$step" "preview minted no token: $preview"
+
+    local apply_out
+    set +e
+    apply_out="$(printf '%s' "$token" | "$HELPER" purge apply --set "$SET_ID" --preview-token-stdin --json 2>&1)"
+    rc=$?
+    set -e
+    [[ $rc -eq 0 ]] || fail "$step" "purge apply exited $rc: $apply_out"
+
+    local watermark
+    watermark="$(jq -r --arg s "$SET_ID" '.sets[$s].appliedPurgeExcludes | tostring' "$DATA_DIR/state/schedule-state.json")"
+    case "$watermark" in
+        *purgeable*) : ;;
+        *) fail "$step" "apply did not record a purge watermark: $watermark" ;;
+    esac
+
+    # A second apply is refused before touching the repository: the preview it
+    # was minted from no longer matches the plan. Pin that, so the self-heal
+    # below is unambiguously the *scheduled* path and not a stray apply.
+    local reapply
+    set +e
+    reapply="$(printf '%s' "$token" | "$HELPER" purge apply --set "$SET_ID" --preview-token-stdin --json 2>&1)"
+    rc=$?
+    set -e
+    [[ $rc -ne 0 ]] || fail "$step" "re-applying a spent preview token must be refused: $reapply"
+
+    # --- lose the watermark, then let the scheduled path heal it -----------
+    local clear_out
+    if ! clear_out="$(python3 - "$DATA_DIR/state/schedule-state.json" "$SET_ID" 2>&1 <<'CLEAR'
+import json, sys
+path, set_id = sys.argv[1], sys.argv[2]
+with open(path) as handle:
+    state = json.load(handle)
+entry = state.get("sets", {}).get(set_id)
+if entry is None:
+    sys.exit(f"no schedule-state entry for {set_id}")
+if not entry.get("appliedPurgeExcludes"):
+    sys.exit("expected a recorded watermark to clear")
+entry["appliedPurgeExcludes"] = {}
+with open(path, "w") as handle:
+    json.dump(state, handle)
+CLEAR
+    )"; then
+        fail "$step" "could not clear the watermark: ${clear_out:-python3 failed with no output}"
+    fi
+    # Drops version/checksum and the migration marker, and makes the set due.
+    wind_schedule_back "$SET_ID" "$step"
+
+    local tick_out
+    set +e
+    tick_out="$("$HELPER" tick 2>&1)"
+    rc=$?
+    set -e
+    case "$tick_out" in
+        *"could not read the purge output generation"*)
+            fail "$step" "the no-op rewrite transcript was treated as unreadable: $tick_out" ;;
+        *) : ;;
+    esac
+    [[ $rc -eq 0 ]] || fail "$step" "scheduled tick exited $rc — a no-op rewrite must self-heal: $tick_out"
+
+    local purge_line healed
+    purge_line="$(idx_select purge success "$SET_ID" "$PRIMARY_DEST_ID" "" | tail -n1)"
+    [[ -n "$purge_line" ]] || fail "$step" "no successful purge record after the healing tick: $tick_out"
+    healed="$(jq -r --arg s "$SET_ID" '.sets[$s].appliedPurgeExcludes | tostring' "$DATA_DIR/state/schedule-state.json")"
+    case "$healed" in
+        *purgeable*) : ;;
+        *) fail "$step" "the watermark was not re-established by the healing tick: $healed" ;;
+    esac
+
+    log "$step OK (applied $changed, watermark lost and self-healed via a no-op rewrite)"
+}
+
 assert_tick_noop() {
     local step="tick (nothing due)"
     log "$step"
@@ -1285,6 +1414,7 @@ main() {
     assert_run3
     assert_run4
     assert_retention
+    assert_purge_noop_self_heals
     assert_tick_noop
     assert_abandoned_run_is_not_healthy
     assert_tick_clears_wreckage_whose_metadata_is_already_terminal

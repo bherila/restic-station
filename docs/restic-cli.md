@@ -143,6 +143,29 @@ snapshots and forgets them (`rewrite-forget.txt`). `--forget` does not reclaim
 pack space — only a later repository-wide `prune` does. Exit 0 means the
 requested rewrite completed (including a no-op); nonzero is a restic failure.
 
+**Summary lines.** `rewrite` ends with exactly one summary, and a parser must
+keep the counted, no-op, and unrecognized cases distinct:
+
+| Transcript | Fixture | Meaning |
+|---|---|---|
+| `modified N snapshots` | `rewrite-forget.txt` | `--forget` changed N snapshots |
+| `would modify N snapshots` | `rewrite-dry-run.txt` | `--dry-run` would change N |
+| `no snapshots were modified` | `rewrite-noop.txt` | `--forget` changed nothing |
+| `no snapshots would be modified` | `rewrite-dry-run-noop.txt` | `--dry-run` would change nothing |
+| *(none of the above)* | — | the transcript does not describe the outcome |
+
+restic **never** prints `modified 0 snapshots`; the zero case has its own
+wording. Re-running an already-applied `--forget` is therefore a *successful*
+run whose summary shares no words with the counted form, and it is the
+ordinary outcome of every purge rule after its first application. A parser
+that recognizes only the counted form reads that success as an unreadable
+transcript. The no-op transcripts still print the `snapshot <id> of [...]`
+headers for the snapshots restic examined, with no `saved new snapshot` line,
+and **the header order is not stable between runs** — never assert on it.
+
+An unrecognized summary must fail closed: absence of a summary is not
+evidence that nothing happened.
+
 ### prune
 ```
 restic -r <repo> prune [--dry-run]

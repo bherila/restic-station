@@ -1,0 +1,7 @@
+create exclusive lock for repository
+
+snapshot f489f83e of [/tmp/restic-station-purge-fixture.JoO11C/source] at 2026-08-26 21:45:18.10361 -0700 PDT by bwh@Bens-Laptop
+
+snapshot 48b4d340 of [/tmp/restic-station-purge-fixture.JoO11C/source] at 2026-08-26 21:45:17.286995 -0700 PDT by bwh@Bens-Laptop
+
+no snapshots were modified

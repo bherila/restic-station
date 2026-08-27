@@ -2327,7 +2327,16 @@ public final class BackupEngine: Sendable {
             purgeRepositoryId: repositoryId,
             purgeSnapshotRewrites: { outcome in
                 let parsed = parseRewrite(outcome.rawOutput)
-                guard let modifiedCount = parsed.modifiedCount else { return nil }
+                // An unreadable transcript is not evidence that nothing
+                // happened, so it fails closed. An explicit no-op *is*
+                // evidence, and is the ordinary outcome of re-running an
+                // already-applied purge rule against an unchanged repository.
+                let modifiedCount: Int
+                switch parsed.summary {
+                case .modified(let count): modifiedCount = count
+                case .nothingModified: modifiedCount = 0
+                case .unrecognized: return nil
+                }
                 var changedRewrites: [String: String] = [:]
                 for rewrite in parsed.snapshots {
                     guard let oldID = fullIDByShortID[rewrite.shortID],

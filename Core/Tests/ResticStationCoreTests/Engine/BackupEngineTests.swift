@@ -4725,7 +4725,11 @@ struct BackupEngineTests {
                 patterns: env.set.purgeExcludes
             ),
             dest: Self.primaryId,
-            stdoutLines: ["modified 0 snapshots"]
+            // restic's real no-op summary. It never prints
+            // "modified 0 snapshots" — scripting that string is what hid the
+            // parser gap behind a green suite (docs/restic-cli.md: parsers
+            // MUST be written against captured fixtures).
+            stdoutLines: ["no snapshots were modified"]
         )
 
         let first = await env.engine.runSet(env.set, trigger: .scheduled)
