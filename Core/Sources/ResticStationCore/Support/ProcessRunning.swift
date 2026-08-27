@@ -319,14 +319,23 @@ public struct DefaultProcessRunner: ProcessRunning {
         if sendInitialInterrupt {
             sendSignal(SIGINT, to: box, unlessTerminated: terminated)
         }
-        let graceEnds = Date().addingTimeInterval(grace)
-        while !terminated.hasFired && Date() < graceEnds {
+        // `ContinuousClock`, not `Date`: this is an elapsed-duration bound,
+        // and a wall clock stepped backwards by NTP would extend the grace
+        // past the deadline the caller was promised, while a forward step
+        // would swallow most of it.
+        let graceEnds = ContinuousClock.now.advanced(by: .seconds(grace))
+        while !terminated.hasFired && ContinuousClock.now < graceEnds {
             do {
                 try await Task.sleep(nanoseconds: 100_000_000)
             } catch {
-                // Cancelled. Stop waiting out the grace and escalate now;
-                // `sendSignal` still refuses to signal a terminated child.
-                break
+                // Cancelled — which means the caller's cancellation handler
+                // has already started its *own* stop sequence, with a full
+                // SIGINT grace, on a task nothing cancels. Returning leaves
+                // that one to finish. Escalating here instead would fire
+                // SIGKILL immediately, cutting short the grace restic needs
+                // to remove its repository lock, which is the whole reason
+                // the sequence starts with SIGINT.
+                return
             }
         }
         sendSignal(SIGKILL, to: box, unlessTerminated: terminated)
@@ -479,19 +488,45 @@ private final class AtomicFlag: @unchecked Sendable {
 private final class TerminationSignal: @unchecked Sendable {
     /// Holds one parked continuation and guarantees a single resume,
     /// whichever of `fire()` or an expiring bound gets there first.
+    ///
+    /// It also owns that bound's sleeper, so an early termination cancels it
+    /// rather than leaving it to run out. Without that, every bounded wait
+    /// outlives its own subprocess by the whole configured timeout — up to
+    /// ten minutes on the longer query paths — and a long-lived app doing
+    /// frequent short probes accumulates one abandoned task and waiter per
+    /// call.
     private final class Waiter: @unchecked Sendable {
         private let lock = NSLock()
         private var continuation: CheckedContinuation<Void, Never>?
+        private var bound: Task<Void, Never>?
 
         init(_ continuation: CheckedContinuation<Void, Never>) {
             self.continuation = continuation
+        }
+
+        /// Hands over the sleeper enforcing this waiter's bound. Cancels it
+        /// immediately if the wait is already over — the resume can win the
+        /// race against the task even being created.
+        func attach(_ task: Task<Void, Never>) {
+            lock.lock()
+            let alreadyResumed = continuation == nil
+            if !alreadyResumed {
+                bound = task
+            }
+            lock.unlock()
+            if alreadyResumed {
+                task.cancel()
+            }
         }
 
         func resumeOnce() {
             lock.lock()
             let pending = continuation
             continuation = nil
+            let sleeper = bound
+            bound = nil
             lock.unlock()
+            sleeper?.cancel()
             pending?.resume()
         }
     }
@@ -539,13 +574,15 @@ private final class TerminationSignal: @unchecked Sendable {
             waiters.append(waiter)
             lock.unlock()
             guard let seconds else { return }
-            // Always completes, so nothing is retained past the bound. An
-            // expired waiter stays in `waiters` until `fire()` drains it,
-            // which is at most a couple of entries for one child.
-            Task.detached {
+            // Cancelled by `resumeOnce` the moment the wait ends, so a child
+            // that exits in milliseconds does not leave this running for the
+            // rest of the timeout. An expired waiter stays in `waiters` until
+            // `fire()` drains it, which is at most a couple of entries for
+            // one child.
+            waiter.attach(Task.detached {
                 try? await Task.sleep(nanoseconds: UInt64(max(0, seconds) * 1_000_000_000))
                 waiter.resumeOnce()
-            }
+            })
         }
     }
 }
