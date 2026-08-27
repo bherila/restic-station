@@ -209,39 +209,40 @@ public struct DefaultProcessRunner: ProcessRunning {
             // deadline at that instant and left the runner waiting on the
             // live child forever — holding the set lock, and finally
             // reporting the run as a success with no timeout at all (#114).
+            //
+            // Deliberately sequential rather than a task group. Every wait
+            // below is bounded once we have decided to stop the child, and a
+            // group cannot offer that: it awaits all of its children, and the
+            // termination wait is a `withCheckedContinuation` that
+            // `cancelAll()` cannot unpark. See `TerminationSignal`.
             if let timeout {
-                await withTaskGroup(of: Void.self) { group in
-                    group.addTask {
-                        await terminationSignal.wait()
-                    }
-                    group.addTask {
-                        do {
-                            try await Task.sleep(nanoseconds: UInt64(max(0, timeout) * 1_000_000_000))
-                        } catch {
-                            // Cancelled: the process already exited before the
-                            // deadline, or the caller cancelled (handled by
-                            // the cancellation handler below).
-                            return
-                        }
-                        await timeoutFlag.trigger()
-                        await Self.stopAfterGracePeriod(processBox, terminated: terminationSignal)
-                    }
-                    await group.next()
-                    group.cancelAll()
+                await terminationSignal.wait(upTo: max(0, timeout))
+                if !terminationSignal.hasFired {
+                    await timeoutFlag.trigger()
+                    await Self.stopAfterGracePeriod(processBox, terminated: terminationSignal)
+                    // A child that has now survived both SIGINT and SIGKILL
+                    // is not going to be waited into submission, and the
+                    // caller is holding a lock. Give up on a bound rather
+                    // than trade a reported deadline for a real hang.
+                    await terminationSignal.wait(upTo: Self.postStopDrainGrace)
                 }
+            } else {
+                // No deadline was asked for, so there is none to enforce: a
+                // legitimate multi-hour backup must not be abandoned.
+                await terminationSignal.wait()
             }
-            await terminationSignal.wait()
 
             let timedOut = await timeoutFlag.triggered
             guard timedOut || cancellationFlag.isSet else {
                 return (await stdoutTask.value, await stderrTask.value)
             }
-            // The stop sequence has run, so the direct child is gone and any
-            // writer still holding the inherited pipe ends is a descendant
-            // (`ssh` for the sftp backend, a password command). Waiting for
-            // *their* EOF is unbounded and would make the deadline
-            // unenforceable again by a second route, so the readers are told
-            // to stop once the grace expires.
+            // The stop sequence has run. Any writer still holding the
+            // inherited pipe ends is either a descendant (`ssh` for the sftp
+            // backend, a password command) or, in the worst case, a direct
+            // child that outlived SIGKILL. Waiting for *their* EOF is
+            // unbounded and would make the deadline unenforceable again by a
+            // second route, so the readers are told to stop once the grace
+            // expires.
             //
             // Both readers are still awaited to completion. That is what
             // keeps every `onLine` callback strictly inside the call: this
@@ -444,18 +445,42 @@ private final class AtomicFlag: @unchecked Sendable {
 
 /// One-shot latching signal bridging `Process.terminationHandler` (fired on
 /// a Foundation-internal queue) to async/await. `fire()` may happen before,
-/// during, or after `wait()`; every waiter resumes exactly once.
+/// during, or after a wait; every waiter resumes exactly once.
 ///
-/// Multiple waiters are supported deliberately. The deadline races
-/// termination inside a task group and the run then awaits termination again
-/// outside it, and `withCheckedContinuation` is not cancellable — so the
-/// racing waiter can still be parked when the second one arrives. A
-/// single-slot continuation would drop the parked one, and the task group,
-/// which awaits all of its children, would never return.
+/// `wait(upTo:)` exists because **no wait for a child may be unbounded once
+/// we have decided to stop it**. `withCheckedContinuation` cannot be
+/// cancelled, so a waiter parked on a child that outlives its stop sequence
+/// stays parked. Previously that waiter was one arm of a task group, and a
+/// task group awaits *all* of its children — so `cancelAll()` could not free
+/// it and the whole group blocked until the child exited on its own. The
+/// deadline was reported on time and the call still did not return: on the
+/// `linux` CI job, `.timeout` was thrown at 2 s and `run` returned at
+/// 45.003 s, the child's full natural lifetime, with the set lock held
+/// throughout. macOS never showed it, because there SIGKILL lands and the
+/// waiter is freed a few seconds in.
 private final class TerminationSignal: @unchecked Sendable {
+    /// Holds one parked continuation and guarantees a single resume,
+    /// whichever of `fire()` or an expiring bound gets there first.
+    private final class Waiter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var continuation: CheckedContinuation<Void, Never>?
+
+        init(_ continuation: CheckedContinuation<Void, Never>) {
+            self.continuation = continuation
+        }
+
+        func resumeOnce() {
+            lock.lock()
+            let pending = continuation
+            continuation = nil
+            lock.unlock()
+            pending?.resume()
+        }
+    }
+
     private let lock = NSLock()
     private var fired = false
-    private var continuations: [CheckedContinuation<Void, Never>] = []
+    private var waiters: [Waiter] = []
 
     var hasFired: Bool {
         lock.lock()
@@ -466,24 +491,43 @@ private final class TerminationSignal: @unchecked Sendable {
     func fire() {
         lock.lock()
         fired = true
-        let waiters = continuations
-        continuations = []
+        let pending = waiters
+        waiters = []
         lock.unlock()
-        for waiter in waiters {
-            waiter.resume()
+        for waiter in pending {
+            waiter.resumeOnce()
         }
     }
 
+    /// Waits for termination with no bound. Correct only where the caller has
+    /// asked for no deadline and is content to wait as long as the child runs.
     func wait() async {
-        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+        await wait(upTo: nil)
+    }
+
+    /// Waits for termination, giving up after `seconds` if it has not
+    /// happened. Returning does **not** imply the child is gone — callers on
+    /// this path are already failing the run and must not read
+    /// `terminationStatus`.
+    func wait(upTo seconds: TimeInterval?) async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            let waiter = Waiter(continuation)
             lock.lock()
             if fired {
                 lock.unlock()
-                cont.resume()
+                waiter.resumeOnce()
                 return
             }
-            continuations.append(cont)
+            waiters.append(waiter)
             lock.unlock()
+            guard let seconds else { return }
+            // Always completes, so nothing is retained past the bound. An
+            // expired waiter stays in `waiters` until `fire()` drains it,
+            // which is at most a couple of entries for one child.
+            Task.detached {
+                try? await Task.sleep(nanoseconds: UInt64(max(0, seconds) * 1_000_000_000))
+                waiter.resumeOnce()
+            }
         }
     }
 }
