@@ -342,6 +342,41 @@ public struct FdaCheckResult: Codable, Equatable, Sendable {
 
 // MARK: - StateStoreError
 
+/// Which path under `state/` a permission refusal names. Structured rather
+/// than spelled into free text because the operator remedy differs per
+/// subject, and because `recoveryMessage` must dispatch on it rather than
+/// substring-matching a human sentence.
+public enum UnsafeStateSubject: Equatable, Sendable {
+    case canonicalDocument
+    case versionMarker
+    case stateDirectory
+
+    public var subject: String {
+        switch self {
+        case .canonicalDocument: return "the canonical schedule-state document"
+        case .versionMarker: return "the schedule state version marker"
+        case .stateDirectory: return "the state directory"
+        }
+    }
+
+    /// The marker is refused for any group/world access; the canonical
+    /// document and the directory are refused only for *write* access.
+    fileprivate var refusal: String {
+        switch self {
+        case .versionMarker: return "accessible by other users"
+        case .canonicalDocument, .stateDirectory: return "writable by other users"
+        }
+    }
+
+    /// The mode that repairs the defect in place.
+    public var repairMode: String {
+        switch self {
+        case .canonicalDocument, .versionMarker: return "600"
+        case .stateDirectory: return "700"
+        }
+    }
+}
+
 public enum ScheduleStateReadFailureReason: Equatable, Sendable, CustomStringConvertible {
     case malformedDocument
     case checksumMismatch
@@ -349,6 +384,11 @@ public enum ScheduleStateReadFailureReason: Equatable, Sendable, CustomStringCon
     case versionMarkerMissing
     case unsupportedVersion(found: Int, current: Int)
     case unsafeFile(reason: String)
+    /// A path under `state/` carries permissions another uid could exploit.
+    /// Separate from ``unsafeFile`` because it is the one unsafe-path defect
+    /// an operator repairs in place, so it must not inherit the
+    /// replace-the-document recovery guidance.
+    case unsafeMode(subject: UnsafeStateSubject, path: String, mode: mode_t)
     case ioFailure(operation: String, errno: Int32)
     case tooLarge(bytes: Int64, limit: Int64)
 
@@ -366,6 +406,9 @@ public enum ScheduleStateReadFailureReason: Equatable, Sendable, CustomStringCon
             return "the document version is \(found), but this build supports version \(current)"
         case .unsafeFile(let reason):
             return "the canonical path is unsafe: \(reason)"
+        case .unsafeMode(let subject, let path, let mode):
+            return "\(subject.subject) at \(path) is \(subject.refusal) "
+                + "(mode \(String(mode & 0o777, radix: 8)))"
         case .ioFailure(let operation, let code):
             return "\(operation) failed with errno \(code)"
         case .tooLarge(let bytes, let limit):
@@ -414,6 +457,18 @@ public struct ScheduleStateReadFailure: Equatable, Sendable, CustomStringConvert
     }
 
     public var recoveryMessage: String {
+        // A permission defect is the only unsafe-path failure the operator
+        // repairs in place. Both branches below prescribe replacing or
+        // recreating a file; for a merely widened mode that would discard a
+        // perfectly good purge watermark to fix something `chmod` fixes.
+        if case .unsafeMode(let subject, let path, _) = reason {
+            return description
+                + ". Stop Restic Station and confirm no other user has written to "
+                + "\(subject.subject), then repair it in place with "
+                + "`chmod \(subject.repairMode) \(path)`. The contents are unchanged "
+                + "and must not be replaced or deleted for this failure."
+        }
+
         let markerFailure: Bool
         switch reason {
         case .versionMarkerMissing:
@@ -734,6 +789,27 @@ public struct StateStore: Sendable {
                 reason: "state directory owned by uid \(info.st_uid), expected \(geteuid())"
             ))
         }
+        // `FileLock.verifyDirectory` refuses a group/world-writable immediate
+        // lock parent, and `state/` *is* that parent for
+        // `schedule-state.lock`. Reads take that lock and publish quarantine
+        // copies beside the canonical document, so a reader that skipped this
+        // check would do both inside a directory another uid can rewrite —
+        // it could unlink the canonical file between our open and our lock,
+        // or swap the quarantine copy we just wrote. Refusing here keeps one
+        // policy for the directory however it is reached.
+        //
+        // Write bits only, matching `verifyDirectory`: a legacy `0755`
+        // `state/` exposes nothing another uid can act on, and refusing it
+        // would strand installs that predate the `0700` tightening in
+        // `AppPaths.ensureDirectories()`.
+        guard info.st_mode & 0o022 == 0 else {
+            _ = fileOperations.close(descriptor)
+            return .failed(.unsafeMode(
+                subject: .stateDirectory,
+                path: paths.stateDir.path,
+                mode: info.st_mode
+            ))
+        }
         return .opened(DirectoryHandle.adopting(descriptor: descriptor, path: paths.stateDir))
     }
 
@@ -910,8 +986,10 @@ public struct StateStore: Sendable {
         // an install's own state would be a worse failure than the exposure
         // that mode represents.
         guard info.st_mode & 0o022 == 0 else {
-            return .failed(.unsafeFile(
-                reason: "writable by other users (mode \(String(info.st_mode & 0o777, radix: 8)))"
+            return .failed(.unsafeMode(
+                subject: .canonicalDocument,
+                path: paths.scheduleStateFile.path,
+                mode: info.st_mode
             ))
         }
         let fileSize = Int64(info.st_size)
@@ -984,7 +1062,11 @@ public struct StateStore: Sendable {
             ))
         }
         guard info.st_mode & 0o077 == 0 else {
-            return .failed(.unsafeFile(reason: "schedule state version marker is accessible by other users"))
+            return .failed(.unsafeMode(
+                subject: .versionMarker,
+                path: paths.scheduleStateVersionMarkerFile.path,
+                mode: info.st_mode
+            ))
         }
         guard Int64(info.st_size) == Int64(Self.scheduleStateVersionMarkerBytes.count) else {
             return .failed(.unsafeFile(reason: "schedule state version marker has invalid contents"))

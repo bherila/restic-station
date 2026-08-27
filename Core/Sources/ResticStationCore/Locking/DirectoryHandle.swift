@@ -83,9 +83,18 @@ public final class DirectoryHandle: @unchecked Sendable {
     /// still want one retained generation for every later `*at(2)` call. The
     /// handle closes the descriptor on deinit; the caller must not.
     ///
-    /// The caller owns the verification in this route. Open with at least
-    /// `O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC` and check type and ownership on
-    /// the descriptor, exactly as ``open(_:trustedRoot:)`` does.
+    /// The caller owns the verification in this route, and this type cannot
+    /// enforce it. Open with at least `O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`
+    /// and, on the descriptor, refuse anything that is not a directory owned
+    /// by the effective uid, and any group- or world-writable mode — the
+    /// policy ``FileLock/verifyDirectory`` applies to an immediate lock
+    /// parent, since a directory adopted here is generally exactly that.
+    ///
+    /// Note this route deliberately does *not* reproduce
+    /// ``open(_:trustedRoot:)`` in full: there is no trusted-root chain, so
+    /// nothing here verifies the ancestors above `path`. Adopt only a
+    /// directory whose parentage the caller has already established by other
+    /// means.
     public static func adopting(descriptor: Int32, path: URL) -> DirectoryHandle {
         DirectoryHandle(path: path, descriptor: descriptor)
     }

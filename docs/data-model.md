@@ -540,6 +540,15 @@ Marker safety is classified before canonical version compatibility, so a
 newer-version document cannot hide a missing or unsafe marker that also needs
 operator repair.
 
+A **permission** defect is the exception to all of that: the bytes are intact
+and the remedy is in place. `state/`, the canonical document, and the marker
+each fail closed when another uid could write them — the marker also when
+another uid could merely read it — and the refusal names the offending path
+and the `chmod` that repairs it (`700` for the directory, `600` for either
+file). Recovery guidance for this case explicitly does *not* prescribe
+replacing or deleting the document, because doing so would discard a
+trustworthy purge watermark over a mode bit.
+
 ## state/repo-status-<destId>.json
 
 ```json

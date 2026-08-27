@@ -227,6 +227,140 @@ struct StateStoreTests {
         }
     }
 
+    // MARK: - state/ must not be group- or world-writable on the read path
+
+    /// `FileLock.verifyDirectory` already refuses a group/world-writable
+    /// immediate lock parent, and `state/` is exactly that parent for
+    /// `schedule-state.lock`. The read path opens `state/` through its own
+    /// seam, so before this guard it applied the weaker type+owner policy:
+    /// a reader would take the lock and publish quarantine copies inside a
+    /// directory another uid can rewrite.
+    @Test("a group- or world-writable state/ is refused on the read path")
+    func writableStateDirectoryIsRefused() throws {
+        for mode in [mode_t(0o722), mode_t(0o772), mode_t(0o777)] {
+            let (store, root) = makeStore()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let paths = AppPaths(root: root)
+            try paths.ensureDirectories()
+
+            let setId = UUID()
+            _ = try store.updateScheduleState(setId: setId) { $0.checkCount = 3 }
+            #expect(store.readScheduleState() != nil, "precondition: state reads back")
+
+            try FileManager.default.setAttributes(
+                [.posixPermissions: NSNumber(value: mode)],
+                ofItemAtPath: paths.stateDir.path
+            )
+
+            guard case .corrupt(let failure) = store.readScheduleStateResult() else {
+                Issue.record("state/ mode \(String(mode, radix: 8)) must refuse the read")
+                return
+            }
+            guard case .unsafeMode(let subject, let path, _) = failure.reason else {
+                Issue.record("expected an unsafeMode refusal, got \(failure.reason)")
+                return
+            }
+            #expect(subject == .stateDirectory)
+            #expect(path == paths.stateDir.path)
+        }
+    }
+
+    /// Write bits only, matching `FileLock.verifyDirectory`. A legacy `0755`
+    /// `state/` predates the `0700` tightening in `ensureDirectories()` and
+    /// exposes nothing another uid can act on; refusing it would strand an
+    /// install's own bookkeeping over a listable directory.
+    @Test("a non-writable state/ still reads, including a legacy 0755 directory")
+    func nonWritableStateDirectoryStillReads() throws {
+        for mode in [mode_t(0o700), mode_t(0o755)] {
+            let (store, root) = makeStore()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let paths = AppPaths(root: root)
+            try paths.ensureDirectories()
+
+            let setId = UUID()
+            _ = try store.updateScheduleState(setId: setId) { $0.checkCount = 9 }
+            try FileManager.default.setAttributes(
+                [.posixPermissions: NSNumber(value: mode)],
+                ofItemAtPath: paths.stateDir.path
+            )
+
+            guard case .valid(let state) = store.readScheduleStateResult() else {
+                Issue.record("state/ mode \(String(mode, radix: 8)) must still read")
+                return
+            }
+            #expect(state.sets[setId]?.checkCount == 9)
+        }
+    }
+
+    // MARK: - A permission defect is repaired in place, not by replacement
+
+    /// The generic recovery guidance prescribes replacing the canonical
+    /// document, and says deleting it accepts loss of the purge watermark.
+    /// For a widened mode that is the wrong instruction: the bytes are fine
+    /// and `chmod` fixes it, so following the generic advice would discard
+    /// real bookkeeping over a permissions problem.
+    @Test("a widened canonical mode is told to chmod, not to replace the document")
+    func permissionRecoveryNamesChmodRatherThanReplacement() throws {
+        let (store, root) = makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = AppPaths(root: root)
+        try paths.ensureDirectories()
+
+        _ = try store.updateScheduleState(setId: UUID()) { $0.checkCount = 1 }
+        try FileManager.default.setAttributes(
+            [.posixPermissions: NSNumber(value: mode_t(0o662))],
+            ofItemAtPath: paths.scheduleStateFile.path
+        )
+
+        guard case .corrupt(let failure) = store.readScheduleStateResult() else {
+            Issue.record("a group-writable canonical document must refuse")
+            return
+        }
+        let message = failure.recoveryMessage
+        #expect(message.contains("chmod 600 \(paths.scheduleStateFile.path)"))
+        #expect(message.contains("must not be replaced or deleted"))
+        // The two guidance paths this one must not fall through to.
+        #expect(!message.contains("explicitly replace the canonical file"))
+        #expect(!message.contains("Deleting it accepts loss"))
+    }
+
+    /// The marker and the directory carry their own repair target and mode,
+    /// so the advice cannot silently point at the canonical document.
+    @Test("marker and directory permission failures name their own path and mode")
+    func permissionRecoveryNamesTheOffendingPath() throws {
+        let (store, root) = makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = AppPaths(root: root)
+        try paths.ensureDirectories()
+        _ = try store.updateScheduleState(setId: UUID()) { $0.checkCount = 1 }
+
+        try FileManager.default.setAttributes(
+            [.posixPermissions: NSNumber(value: mode_t(0o644))],
+            ofItemAtPath: paths.scheduleStateVersionMarkerFile.path
+        )
+        guard case .corrupt(let markerFailure) = store.readScheduleStateResult() else {
+            Issue.record("a world-readable marker must refuse")
+            return
+        }
+        #expect(markerFailure.recoveryMessage.contains(
+            "chmod 600 \(paths.scheduleStateVersionMarkerFile.path)"
+        ))
+
+        try FileManager.default.setAttributes(
+            [.posixPermissions: NSNumber(value: mode_t(0o600))],
+            ofItemAtPath: paths.scheduleStateVersionMarkerFile.path
+        )
+        try FileManager.default.setAttributes(
+            [.posixPermissions: NSNumber(value: mode_t(0o772))],
+            ofItemAtPath: paths.stateDir.path
+        )
+        guard case .corrupt(let directoryFailure) = store.readScheduleStateResult() else {
+            Issue.record("a group-writable state/ must refuse")
+            return
+        }
+        #expect(directoryFailure.recoveryMessage.contains("chmod 700 \(paths.stateDir.path)"))
+    }
+
     // MARK: - A lease is bound to the directory generation it locked
 
     /// The scenario the pathname-based write could not refuse: `state/` is
