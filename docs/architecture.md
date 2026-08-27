@@ -59,7 +59,8 @@ public protocol ProcessRunning: Sendable {
     /// when `env` is non-nil. `onStdoutLine` receives each complete
     /// newline-terminated line as it arrives (for NDJSON streaming).
     /// Throws ProcessRunnerError.timeout after sending SIGINT (then SIGKILL
-    /// after a 10 s grace period) if `timeout` elapses.
+    /// after a 10 s grace period) if `timeout` elapses. The deadline races
+    /// process *termination*, never pipe EOF (#114).
     func run(
         _ argv: [String],
         env: [String: String]?,
@@ -71,7 +72,7 @@ public protocol ProcessRunning: Sendable {
 }
 ```
 
-The production implementation (`DefaultProcessRunner`) wraps `Process` + pipes. Tests inject `FakeProcessRunner` (see `testing.md`). `KeychainSecretStore`, `ResticRunner`, and `Reachability` all take a `ProcessRunning` in their initializers. Secret storage itself is behind the `SecretStore` protocol (`KeychainSecretStore` on macOS, `FileSecretStore` elsewhere — see `keychain-and-fda.md`); `ResticRunner` and `BackupEngine` take `any SecretStore`, not a concrete backend.
+The production implementation (`DefaultProcessRunner`) wraps `Process` + pipes. Its deadline races the child's termination, not the end of its output: a child that closes stdout and stderr while continuing to run would otherwise cancel its own deadline and be waited out indefinitely with the set lock held. Once the stop sequence has run, the two transcripts are drained for a bounded grace and then abandoned — a descendant that inherited the pipe write ends (`ssh` for the sftp backend, a password command) can hold them open for as long as it likes, and neither transcript is observable on a path that throws. Signalling reaches only the direct child today; the process-group half of #114 is still open. Tests inject `FakeProcessRunner` (see `testing.md`). `KeychainSecretStore`, `ResticRunner`, and `Reachability` all take a `ProcessRunning` in their initializers. Secret storage itself is behind the `SecretStore` protocol (`KeychainSecretStore` on macOS, `FileSecretStore` elsewhere — see `keychain-and-fda.md`); `ResticRunner` and `BackupEngine` take `any SecretStore`, not a concrete backend.
 
 ## restic discovery
 

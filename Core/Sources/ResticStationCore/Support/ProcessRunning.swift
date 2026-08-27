@@ -43,6 +43,14 @@ public protocol ProcessRunning: Sendable {
     /// Throws ProcessRunnerError.timeout after sending SIGINT (then SIGKILL
     /// after a 10 s grace period) if `timeout` elapses.
     ///
+    /// The deadline races process *termination*, never pipe EOF: a child that
+    /// closes stdout and stderr but keeps running must still be stopped
+    /// (#114). Once the stop sequence has run, the transcript is drained for
+    /// a bounded grace and then abandoned, because a descendant that
+    /// inherited the pipe ends can hold them open indefinitely. Neither
+    /// transcript is readable on that path — `run` throws instead of
+    /// returning a `ProcessResult`.
+    ///
     /// Cancelling the calling task stops the subprocess the same way (SIGINT,
     /// 10 s grace, SIGKILL) and throws `CancellationError`.
     func run(
@@ -186,11 +194,16 @@ public struct DefaultProcessRunner: ProcessRunning {
         // repository lock it holds before exiting — a cancelled run must not
         // leave a stale lock behind.
         let (outData, errData) = await withTaskCancellationHandler {
+            // The deadline races *process termination*, never pipe EOF. A
+            // child that closes stdout and stderr but keeps running hands the
+            // readers EOF immediately; racing them therefore cancelled the
+            // deadline at that instant and left the runner waiting on the
+            // live child forever — holding the set lock, and finally
+            // reporting the run as a success with no timeout at all (#114).
             if let timeout {
                 await withTaskGroup(of: Void.self) { group in
                     group.addTask {
-                        _ = await stdoutTask.value
-                        _ = await stderrTask.value
+                        await terminationSignal.wait()
                     }
                     group.addTask {
                         do {
@@ -208,11 +221,19 @@ public struct DefaultProcessRunner: ProcessRunning {
                     group.cancelAll()
                 }
             }
-
-            let out = await stdoutTask.value
-            let err = await stderrTask.value
             await terminationSignal.wait()
-            return (out, err)
+
+            let timedOut = await timeoutFlag.triggered
+            guard timedOut || cancellationFlag.isCancelled else {
+                return (await stdoutTask.value, await stderrTask.value)
+            }
+            // The stop sequence has run, so the direct child is gone and any
+            // writer still holding the inherited pipe ends is a descendant
+            // (`ssh` for the sftp backend, a password command). Waiting for
+            // *their* EOF is unbounded and would make the deadline
+            // unenforceable again by a second route. This path throws below,
+            // so the transcript is discarded either way.
+            return await Self.drainWithinGrace(stdoutTask, stderrTask)
         } onCancel: {
             cancellationFlag.mark()
             // Synchronous part first so the signal lands immediately; the
@@ -246,6 +267,44 @@ public struct DefaultProcessRunner: ProcessRunning {
         }
         if box.process.isRunning {
             sendSignal(SIGKILL, to: box.process)
+        }
+    }
+
+    /// How long a timed-out or cancelled run keeps draining its pipes after
+    /// the direct child is gone. Bytes already buffered in a 64 KiB pipe
+    /// drain in microseconds, so this is generous by orders of magnitude for
+    /// anything but a descendant that is still holding the write ends open.
+    private static let postStopDrainGrace: TimeInterval = 10
+
+    /// Awaits both pipe readers for at most `postStopDrainGrace`, returning
+    /// empty transcripts if that grace expires.
+    ///
+    /// Only ever called on a path that is about to throw. Empty rather than
+    /// partial is not a choice: `readPipeToCompletion` accumulates into a
+    /// local buffer and publishes it once at EOF, so there is no partial
+    /// buffer to hand back, and `run()` throws before any caller could read
+    /// one.
+    ///
+    /// Deliberately not a task group: a group awaits *all* of its children,
+    /// and awaiting `Task<Data, Never>.value` ignores cancellation, so the
+    /// losing arm would hold the group open for exactly as long as the wait
+    /// this bound exists to cut short. The loser here is detached and simply
+    /// completes later, when the descendant finally closes the pipe.
+    private static func drainWithinGrace(
+        _ stdoutTask: Task<Data, Never>,
+        _ stderrTask: Task<Data, Never>
+    ) async -> (Data, Data) {
+        await withCheckedContinuation { (continuation: CheckedContinuation<(Data, Data), Never>) in
+            let resumer = OnceResumer(continuation)
+            Task.detached {
+                let out = await stdoutTask.value
+                let err = await stderrTask.value
+                resumer.resume(with: (out, err))
+            }
+            Task.detached {
+                try? await Task.sleep(nanoseconds: UInt64(postStopDrainGrace * 1_000_000_000))
+                resumer.resume(with: (Data(), Data()))
+            }
         }
     }
 
@@ -314,6 +373,26 @@ private struct ProcessBox: @unchecked Sendable {
 /// Records — synchronously, from `withTaskCancellationHandler`'s handler —
 /// that the calling task was cancelled. Cannot be an `actor`: the handler is
 /// a non-async closure.
+/// Resumes a continuation exactly once, whichever of two racing detached
+/// tasks arrives first. The loser's call is a no-op rather than the fatal
+/// double-resume it would otherwise be.
+private final class OnceResumer<T: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<T, Never>?
+
+    init(_ continuation: CheckedContinuation<T, Never>) {
+        self.continuation = continuation
+    }
+
+    func resume(with value: T) {
+        lock.lock()
+        let pending = continuation
+        continuation = nil
+        lock.unlock()
+        pending?.resume(returning: value)
+    }
+}
+
 private final class CancellationFlag: @unchecked Sendable {
     private let lock = NSLock()
     private var cancelled = false
@@ -333,19 +412,28 @@ private final class CancellationFlag: @unchecked Sendable {
 
 /// One-shot latching signal bridging `Process.terminationHandler` (fired on
 /// a Foundation-internal queue) to async/await. `fire()` may happen before,
-/// during, or after `wait()`; the single waiter always resumes exactly once.
+/// during, or after `wait()`; every waiter resumes exactly once.
+///
+/// Multiple waiters are supported deliberately. The deadline races
+/// termination inside a task group and the run then awaits termination again
+/// outside it, and `withCheckedContinuation` is not cancellable — so the
+/// racing waiter can still be parked when the second one arrives. A
+/// single-slot continuation would drop the parked one, and the task group,
+/// which awaits all of its children, would never return.
 private final class TerminationSignal: @unchecked Sendable {
     private let lock = NSLock()
     private var fired = false
-    private var continuation: CheckedContinuation<Void, Never>?
+    private var continuations: [CheckedContinuation<Void, Never>] = []
 
     func fire() {
         lock.lock()
         fired = true
-        let waiter = continuation
-        continuation = nil
+        let waiters = continuations
+        continuations = []
         lock.unlock()
-        waiter?.resume()
+        for waiter in waiters {
+            waiter.resume()
+        }
     }
 
     func wait() async {
@@ -356,7 +444,7 @@ private final class TerminationSignal: @unchecked Sendable {
                 cont.resume()
                 return
             }
-            continuation = cont
+            continuations.append(cont)
             lock.unlock()
         }
     }

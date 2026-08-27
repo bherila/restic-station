@@ -46,6 +46,26 @@ Secrets are injected as a `FakeSecretStore`, not scripted as `/usr/bin/security`
 
 `scripts/secret-cli-test.sh` is the Layer-2 test for secrets: it drives the real helper binary with `RESTIC_STATION_SECRET_BACKEND=file`, asserts `secrets.json` is `0600`, asserts `print-password` returns the exact bytes with `cmp`/`od`, and (when restic is on PATH) runs a real backup and then greps the whole data directory to prove the password reached no log, run record or state file.
 
+### Real-subprocess exceptions to FakeProcessRunner
+
+Two suites deliberately spawn real processes, because what they assert *is* the
+POSIX behaviour a double would have to invent: `DefaultProcessRunnerTests`
+(stdin/EOF handling, SIGPIPE disposition inheritance) and `ProcessLifetimeTests`
+(#114 — the deadline must race process termination rather than pipe EOF, and a
+descendant holding the inherited pipe ends must not outlast it). Both use only
+`/bin/sh`, present on macOS and in the `swift:6.1` Linux container.
+
+`ProcessLifetimeTests` runs for ~40 s in total and that is load-bearing, not
+waste: each test starts a 45 s child and asserts an elapsed-time bound that
+separates "the deadline was enforced" from "the child was waited out". Shortening
+the children below the 10 s SIGKILL grace plus the 10 s post-stop drain grace
+would make both tests pass against the defect they exist to catch. The bounds are
+deliberately loose for the same reason they are meaningful — they must not become
+timing flakes on a loaded CI runner. Note that the first test observes ~13 s, not
+~2 s: SIGINT reaches only the direct child, and a shell defers it while waiting
+on `sleep`, so nothing stops until SIGKILL. That is the process-group half of
+#114, still open.
+
 ### Fixture conventions
 `Core/Tests/ResticStationCoreTests/Fixtures/` — restic output fixtures are copied verbatim from `docs/fixtures/` (captured from restic 0.18.1; see restic-cli.md). Load via `Bundle.module` (declare `resources: [.copy("Fixtures")]` in Package.swift). Every parser has a test decoding its fixture; NDJSON parsers additionally get a partial-line-buffering test (feed the fixture in random-sized chunks, expect identical parse) and an unknown-`message_type` tolerance test.
 
