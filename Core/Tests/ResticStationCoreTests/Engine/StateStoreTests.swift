@@ -168,6 +168,84 @@ struct StateStoreTests {
         return (StateStore(paths: AppPaths(root: root)), root)
     }
 
+    // MARK: - A lease is bound to the directory generation it locked
+
+    /// The scenario the pathname-based write could not refuse: `state/` is
+    /// renamed and recreated while a lease holds `schedule-state.lock`.
+    ///
+    /// A write that re-resolved `state/` by pathname would land in the
+    /// *replacement* tree while the lease's lock still protected the retired
+    /// one — so a second helper could take the replacement lock and run a
+    /// concurrent `rewrite --forget` believing it held exclusive authority.
+    /// Holding one descriptor makes that unrepresentable: the lock and the
+    /// write resolve through the same directory inode.
+    @Test("a held lease writes into the directory its lock lives in, not a replacement at the same path")
+    func leaseWritesIntoTheDirectoryItLocked() throws {
+        let (store, root) = makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = AppPaths(root: root)
+        try paths.ensureDirectories()
+
+        let setId = UUID()
+        let lease = try store.lockScheduleState()
+        defer { lease.release() }
+
+        // Swap the pathname out from under the held lease.
+        let retired = root.appendingPathComponent("state-retired")
+        try FileManager.default.moveItem(at: paths.stateDir, to: retired)
+        try FileManager.default.createDirectory(
+            at: paths.stateDir,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+
+        _ = try lease.update(setId: setId) { $0.appliedPurgeExcludes[setId] = ["build/**"] }
+
+        // The write followed the descriptor into the retired tree...
+        let retiredDocument = retired.appendingPathComponent("schedule-state.json")
+        #expect(FileManager.default.fileExists(atPath: retiredDocument.path))
+        // ...and did NOT appear in the replacement the pathname now names.
+        #expect(!FileManager.default.fileExists(atPath: paths.scheduleStateFile.path))
+
+        // The lock the lease holds is likewise in the retired tree, so the
+        // replacement directory has no lock claiming this lease's authority.
+        #expect(FileManager.default.fileExists(
+            atPath: retired.appendingPathComponent("schedule-state.lock").path
+        ))
+    }
+
+    @Test("a directory handle reports the identity of itself and of its entries")
+    func directoryHandleReportsInodeIdentity() throws {
+        let (_, root) = makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = AppPaths(root: root)
+        try paths.ensureDirectories()
+        try Data("x".utf8).write(to: paths.stateDir.appendingPathComponent("probe"))
+
+        guard case .success(let handle) = DirectoryHandle.open(paths.stateDir, trustedRoot: root) else {
+            Issue.record("expected the state directory to open")
+            return
+        }
+        let directoryIdentity = try #require(handle.identity)
+        let entryIdentity = try #require(handle.identity(ofEntry: "probe"))
+        #expect(directoryIdentity != entryIdentity)
+        #expect(handle.identity(ofEntry: "absent") == nil)
+
+        // A replacement directory at the same pathname is a different inode,
+        // which is exactly what the handle keeps the holder away from.
+        try FileManager.default.removeItem(at: paths.stateDir)
+        try FileManager.default.createDirectory(
+            at: paths.stateDir, withIntermediateDirectories: true
+        )
+        guard case .success(let replacement) = DirectoryHandle.open(paths.stateDir, trustedRoot: root) else {
+            Issue.record("expected the replacement directory to open")
+            return
+        }
+        #expect(try #require(replacement.identity) != directoryIdentity)
+        // The original handle still names the retired inode.
+        #expect(handle.identity == directoryIdentity)
+    }
+
     // MARK: - Decoding the documented literal examples (docs/data-model.md)
 
     // The doc's `"sets"`/`"destId"` examples abbreviate UUIDs with "..." for

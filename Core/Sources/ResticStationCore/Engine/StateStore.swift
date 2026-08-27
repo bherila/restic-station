@@ -618,9 +618,23 @@ public struct StateStore: Sendable {
     public func readScheduleStateResult(
         suppressingRecoveryCopyFor suppressedRecoveryCopyFingerprint: String? = nil
     ) -> ScheduleStateReadResult {
+        let directory: DirectoryHandle
+        switch openStateDirectory() {
+        case .opened(let handle):
+            directory = handle
+        case .missing:
+            return .missing
+        case .failed(let reason):
+            return .corrupt(ScheduleStateReadFailure(
+                reason: reason,
+                canonicalPath: paths.scheduleStateFile.path
+            ))
+        }
+
         switch classifyScheduleState(
             suppressingRecoveryCopyFor: suppressedRecoveryCopyFingerprint,
-            generationIsStable: false
+            generationIsStable: false,
+            in: directory.descriptor
         ) {
         case .result(let result):
             return result
@@ -634,7 +648,7 @@ public struct StateStore: Sendable {
         // prevents a healthy migration from being quarantined as downgrade.
         let lock: FileLock
         do {
-            lock = try acquireScheduleStateLock()
+            lock = try acquireScheduleStateLock(in: directory)
         } catch StateStoreError.scheduleStateLockTimeout {
             return .corrupt(ScheduleStateReadFailure(
                 reason: .ioFailure(operation: "wait for stable schedule-state generation", errno: EBUSY),
@@ -658,7 +672,8 @@ public struct StateStore: Sendable {
 
         switch classifyScheduleState(
             suppressingRecoveryCopyFor: suppressedRecoveryCopyFingerprint,
-            generationIsStable: true
+            generationIsStable: true,
+            in: directory.descriptor
         ) {
         case .result(let result):
             return result
@@ -666,9 +681,60 @@ public struct StateStore: Sendable {
             return .corrupt(scheduleStateFailure(
                 reason: reason,
                 bytes: bytes,
-                suppressingRecoveryCopyFor: suppressedRecoveryCopyFingerprint
+                suppressingRecoveryCopyFor: suppressedRecoveryCopyFingerprint,
+                in: directory.descriptor
             ))
         }
+    }
+
+    private enum StateDirectoryOpen {
+        case opened(DirectoryHandle)
+        case missing
+        case failed(ScheduleStateReadFailureReason)
+    }
+
+    /// Opens `state/` **once** and retains the descriptor.
+    ///
+    /// Every schedule-state name — canonical document, migration marker,
+    /// recovery copy, durable temp, and the companion lock — is then resolved
+    /// through this one descriptor. Between two pathname opens the directory
+    /// can be renamed and recreated; between two uses of one descriptor it
+    /// cannot, which is what binds a lease's evidence to the tree it writes
+    /// into rather than re-checking it "recently" (`AGENTS.md` §Safety 1).
+    ///
+    /// Opened through `fileOperations` rather than `DirectoryHandle.open`, so
+    /// the injectable syscall seam still governs this open; the handle adopts
+    /// the verified descriptor and owns closing it.
+    private func openStateDirectory() -> StateDirectoryOpen {
+        let descriptor = fileOperations.openAt(
+            AT_FDCWD,
+            paths.stateDir.path,
+            O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW,
+            0
+        )
+        guard descriptor >= 0 else {
+            let code = errno
+            return code == ENOENT
+                ? .missing
+                : .failed(.ioFailure(operation: "open state directory", errno: code))
+        }
+        var info = stat()
+        guard fileOperations.stat(descriptor, &info) == 0 else {
+            let code = errno
+            _ = fileOperations.close(descriptor)
+            return .failed(.ioFailure(operation: "fstat state directory", errno: code))
+        }
+        guard (info.st_mode & mode_t(S_IFMT)) == mode_t(S_IFDIR) else {
+            _ = fileOperations.close(descriptor)
+            return .failed(.unsafeFile(reason: "state directory is not a directory"))
+        }
+        guard info.st_uid == geteuid() else {
+            _ = fileOperations.close(descriptor)
+            return .failed(.unsafeFile(
+                reason: "state directory owned by uid \(info.st_uid), expected \(geteuid())"
+            ))
+        }
+        return .opened(DirectoryHandle.adopting(descriptor: descriptor, path: paths.stateDir))
     }
 
     private enum ScheduleStateClassification {
@@ -678,23 +744,24 @@ public struct StateStore: Sendable {
 
     private func classifyScheduleState(
         suppressingRecoveryCopyFor suppressedRecoveryCopyFingerprint: String?,
-        generationIsStable: Bool
+        generationIsStable: Bool,
+        in directoryFD: Int32
     ) -> ScheduleStateClassification {
-        switch readScheduleStateBytes() {
+        switch readScheduleStateBytes(in: directoryFD) {
         case .missing:
             // The marker is part of this capability boundary even when the
             // canonical document is absent. A valid marker followed by a
             // crash before first-envelope publication is still logically
             // missing, but an unsafe marker must never be hidden by that
             // same crash window.
-            switch readScheduleStateVersionMarker() {
+            switch readScheduleStateVersionMarker(in: directoryFD) {
             case .missing, .present:
                 return .result(.missing)
             case .failed(let reason):
-                return .result(.corrupt(scheduleStateFailure(reason: reason, bytes: nil)))
+                return .result(.corrupt(scheduleStateFailure(reason: reason, bytes: nil, in: directoryFD)))
             }
         case .failed(let reason):
-            return .result(.corrupt(scheduleStateFailure(reason: reason, bytes: nil)))
+            return .result(.corrupt(scheduleStateFailure(reason: reason, bytes: nil, in: directoryFD)))
         case .bytes(let data):
             do {
                 let decoder = Self.makeDecoder()
@@ -704,10 +771,11 @@ public struct StateStore: Sendable {
                         return .result(.corrupt(scheduleStateFailure(
                             reason: .malformedDocument,
                             bytes: data,
-                            suppressingRecoveryCopyFor: suppressedRecoveryCopyFingerprint
+                            suppressingRecoveryCopyFor: suppressedRecoveryCopyFingerprint,
+                            in: directoryFD
                         )))
                     }
-                    switch readScheduleStateVersionMarker() {
+                    switch readScheduleStateVersionMarker(in: directoryFD) {
                     case .missing:
                         break
                     case .present:
@@ -717,13 +785,15 @@ public struct StateStore: Sendable {
                         return .result(.corrupt(scheduleStateFailure(
                             reason: .versionDowngrade,
                             bytes: data,
-                            suppressingRecoveryCopyFor: suppressedRecoveryCopyFingerprint
+                            suppressingRecoveryCopyFor: suppressedRecoveryCopyFingerprint,
+                            in: directoryFD
                         )))
                     case .failed(let reason):
                         return .result(.corrupt(scheduleStateFailure(
                             reason: reason,
                             bytes: data,
-                            suppressingRecoveryCopyFor: suppressedRecoveryCopyFingerprint
+                            suppressingRecoveryCopyFor: suppressedRecoveryCopyFingerprint,
+                            in: directoryFD
                         )))
                     }
                     // Legacy v0: no checksum existed. Preserve compatibility,
@@ -734,7 +804,7 @@ public struct StateStore: Sendable {
                 // capability. Classify it before version compatibility so a
                 // newer canonical document cannot hide a second repair the
                 // operator must perform.
-                switch readScheduleStateVersionMarker() {
+                switch readScheduleStateVersionMarker(in: directoryFD) {
                 case .present:
                     break
                 case .missing:
@@ -744,20 +814,23 @@ public struct StateStore: Sendable {
                     return .result(.corrupt(scheduleStateFailure(
                         reason: .versionMarkerMissing,
                         bytes: data,
-                        suppressingRecoveryCopyFor: suppressedRecoveryCopyFingerprint
+                        suppressingRecoveryCopyFor: suppressedRecoveryCopyFingerprint,
+                            in: directoryFD
                     )))
                 case .failed(let reason):
                     return .result(.corrupt(scheduleStateFailure(
                         reason: reason,
                         bytes: data,
-                        suppressingRecoveryCopyFor: suppressedRecoveryCopyFingerprint
+                        suppressingRecoveryCopyFor: suppressedRecoveryCopyFingerprint,
+                            in: directoryFD
                     )))
                 }
                 guard version == ScheduleState.currentVersion else {
                     return .result(.corrupt(scheduleStateFailure(
                         reason: .unsupportedVersion(found: version, current: ScheduleState.currentVersion),
                         bytes: data,
-                        suppressingRecoveryCopyFor: suppressedRecoveryCopyFingerprint
+                        suppressingRecoveryCopyFor: suppressedRecoveryCopyFingerprint,
+                            in: directoryFD
                     )))
                 }
                 let document = try decoder.decode(ScheduleStateDocument.self, from: data)
@@ -768,7 +841,8 @@ public struct StateStore: Sendable {
                     return .result(.corrupt(scheduleStateFailure(
                         reason: .checksumMismatch,
                         bytes: data,
-                        suppressingRecoveryCopyFor: suppressedRecoveryCopyFingerprint
+                        suppressingRecoveryCopyFor: suppressedRecoveryCopyFingerprint,
+                            in: directoryFD
                     )))
                 }
                 return .result(.valid(document.state))
@@ -776,7 +850,8 @@ public struct StateStore: Sendable {
                 return .result(.corrupt(scheduleStateFailure(
                     reason: .malformedDocument,
                     bytes: data,
-                    suppressingRecoveryCopyFor: suppressedRecoveryCopyFingerprint
+                    suppressingRecoveryCopyFor: suppressedRecoveryCopyFingerprint,
+                            in: directoryFD
                 )))
             }
         }
@@ -792,21 +867,10 @@ public struct StateStore: Sendable {
     /// following a symlink. A schedule document is authority for destructive
     /// bookkeeping, so unlike regenerable caches it must be a regular file
     /// owned by the effective uid.
-    private func readScheduleStateBytes() -> ScheduleStateBytesRead {
-        let directoryFD = fileOperations.openAt(
-            AT_FDCWD,
-            paths.stateDir.path,
-            O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW,
-            0
-        )
-        guard directoryFD >= 0 else {
-            let code = errno
-            return code == ENOENT
-                ? .missing
-                : .failed(.ioFailure(operation: "open state directory", errno: code))
-        }
-        defer { _ = fileOperations.close(directoryFD) }
-
+    /// Reads through the caller's retained `state/` descriptor, so the
+    /// document, the migration marker, the lock and every later durable write
+    /// resolve in one directory generation.
+    private func readScheduleStateBytes(in directoryFD: Int32) -> ScheduleStateBytesRead {
         let filename = paths.scheduleStateFile.lastPathComponent
         let fd = fileOperations.openAt(
             directoryFD,
@@ -874,21 +938,7 @@ public struct StateStore: Sendable {
     /// Reads the monotonic migration marker without ever blocking on a
     /// hostile FIFO. The filename is version-specific, while the tiny body
     /// catches truncated or substituted regular files.
-    private func readScheduleStateVersionMarker() -> ScheduleStateVersionMarkerRead {
-        let directoryFD = fileOperations.openAt(
-            AT_FDCWD,
-            paths.stateDir.path,
-            O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW,
-            0
-        )
-        guard directoryFD >= 0 else {
-            let code = errno
-            return code == ENOENT
-                ? .missing
-                : .failed(.ioFailure(operation: "open state directory for version marker", errno: code))
-        }
-        defer { _ = fileOperations.close(directoryFD) }
-
+    private func readScheduleStateVersionMarker(in directoryFD: Int32) -> ScheduleStateVersionMarkerRead {
         let fd = fileOperations.openAt(
             directoryFD,
             paths.scheduleStateVersionMarkerFile.lastPathComponent,
@@ -945,7 +995,8 @@ public struct StateStore: Sendable {
     private func scheduleStateFailure(
         reason: ScheduleStateReadFailureReason,
         bytes: Data?,
-        suppressingRecoveryCopyFor suppressedRecoveryCopyFingerprint: String? = nil
+        suppressingRecoveryCopyFor suppressedRecoveryCopyFingerprint: String? = nil,
+        in directoryFD: Int32
     ) -> ScheduleStateReadFailure {
         guard let bytes else {
             return ScheduleStateReadFailure(reason: reason, canonicalPath: paths.scheduleStateFile.path)
@@ -958,7 +1009,7 @@ public struct StateStore: Sendable {
         // A rename may have succeeded even when its following directory
         // fsync reported indeterminate durability. A later read can safely
         // recognize the exact owner-owned bytes without writing again.
-        if existingOwnedRegularFile(at: quarantine, equals: bytes) {
+        if existingOwnedRegularFile(at: quarantine, equals: bytes, in: directoryFD) {
             return ScheduleStateReadFailure(
                 reason: reason,
                 canonicalPath: paths.scheduleStateFile.path,
@@ -975,7 +1026,7 @@ public struct StateStore: Sendable {
             )
         }
         do {
-            try preserveScheduleStateQuarantine(bytes, at: quarantine)
+            try preserveScheduleStateQuarantine(bytes, at: quarantine, in: directoryFD)
             return ScheduleStateReadFailure(
                 reason: reason,
                 canonicalPath: paths.scheduleStateFile.path,
@@ -1029,9 +1080,36 @@ public struct StateStore: Sendable {
     /// being scheduled to release, so waiters spin to the timeout. A test that
     /// did exactly that turned a 0.3s case into a 50s one on a two-core runner
     /// and stalled the whole suite behind it.
-    private func acquireScheduleStateLock() throws -> FileLock {
+    /// Opens `state/`, creating it first if a mutation needs it.
+    private func openStateDirectoryForWriting() throws -> DirectoryHandle {
         try paths.ensureDirectories()
-        let lock = FileLock(path: paths.scheduleStateLockFile, trustedRoot: paths.root)
+        switch openStateDirectory() {
+        case .opened(let handle):
+            return handle
+        case .missing:
+            throw StateStoreError.durableWriteFailed(
+                operation: "open state directory",
+                errno: ENOENT,
+                path: paths.stateDir.path
+            )
+        case .failed(let reason):
+            throw StateStoreError.scheduleStateCorrupt(ScheduleStateReadFailure(
+                reason: reason,
+                canonicalPath: paths.scheduleStateFile.path
+            ))
+        }
+    }
+
+    /// Takes the companion lock **inside** the caller's already-open `state/`
+    /// directory, so the locked inode and every file the holder subsequently
+    /// reads or publishes are resolved through one descriptor. A `state/`
+    /// renamed and recreated mid-lease therefore cannot receive this lease's
+    /// writes while its lock still protects the retired tree.
+    private func acquireScheduleStateLock(in directory: DirectoryHandle) throws -> FileLock {
+        let lock = FileLock(
+            name: paths.scheduleStateLockFile.lastPathComponent,
+            in: directory
+        )
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: Self.stateLockTimeout)
         // Only contention is worth waiting out. Polling a lock that failed
@@ -1058,17 +1136,23 @@ public struct StateStore: Sendable {
     }
 
     func lockScheduleState() throws -> LockedScheduleState {
-        let lock = try acquireScheduleStateLock()
+        let directory = try openStateDirectoryForWriting()
+        let lock = try acquireScheduleStateLock(in: directory)
         var state: ScheduleState
         let readResult: ScheduleStateReadResult
         switch classifyScheduleState(
             suppressingRecoveryCopyFor: nil,
-            generationIsStable: true
+            generationIsStable: true,
+            in: directory.descriptor
         ) {
         case .result(let result):
             readResult = result
         case .generationMismatch(let reason, let bytes):
-            readResult = .corrupt(scheduleStateFailure(reason: reason, bytes: bytes))
+            readResult = .corrupt(scheduleStateFailure(
+                reason: reason,
+                bytes: bytes,
+                in: directory.descriptor
+            ))
         }
         switch readResult {
         case .missing:
@@ -1079,7 +1163,7 @@ public struct StateStore: Sendable {
             lock.release()
             throw StateStoreError.scheduleStateCorrupt(failure)
         }
-        return LockedScheduleState(store: self, lock: lock, state: state)
+        return LockedScheduleState(store: self, lock: lock, directory: directory, state: state)
     }
 
     @discardableResult
@@ -1182,7 +1266,7 @@ public struct StateStore: Sendable {
         SHA256Digest.hex(try makeEncoder().encode(state))
     }
 
-    fileprivate func writeScheduleState(_ state: ScheduleState) throws {
+    fileprivate func writeScheduleState(_ state: ScheduleState, in directoryFD: Int32) throws {
         let document = try ScheduleStateDocument(state: state)
         let data = try Self.makeEncoder().encode(document)
         guard Int64(data.count) <= maximumScheduleStateBytes else {
@@ -1196,11 +1280,12 @@ public struct StateStore: Sendable {
                 path: paths.scheduleStateFile.path
             )
         }
-        try ensureScheduleStateVersionMarker()
+        try ensureScheduleStateVersionMarker(in: directoryFD)
         try writeDurably(
             data,
             to: paths.scheduleStateFile,
             tempName: paths.scheduleStateFile.lastPathComponent + ".tmp",
+            in: directoryFD,
             postNotification: true
         )
     }
@@ -1208,8 +1293,8 @@ public struct StateStore: Sendable {
     /// The marker commits before the first v1 envelope. A crash between the
     /// two publications can stop scheduling, but can never make an already
     /// migrated state look like unchecked legacy input.
-    private func ensureScheduleStateVersionMarker() throws {
-        switch readScheduleStateVersionMarker() {
+    private func ensureScheduleStateVersionMarker(in directoryFD: Int32) throws {
+        switch readScheduleStateVersionMarker(in: directoryFD) {
         case .present:
             return
         case .missing:
@@ -1217,6 +1302,7 @@ public struct StateStore: Sendable {
                 Self.scheduleStateVersionMarkerBytes,
                 to: paths.scheduleStateVersionMarkerFile,
                 tempName: paths.scheduleStateVersionMarkerFile.lastPathComponent + ".tmp",
+                in: directoryFD,
                 postNotification: false
             )
         case .failed(let reason):
@@ -1230,18 +1316,23 @@ public struct StateStore: Sendable {
     /// Retains the exact untrusted bytes under a content-addressed filename.
     /// The canonical file remains untouched and therefore continues to block
     /// mutations until an operator explicitly replaces it with valid state.
-    private func preserveScheduleStateQuarantine(_ data: Data, at url: URL) throws {
+    private func preserveScheduleStateQuarantine(
+        _ data: Data,
+        at url: URL,
+        in directoryFD: Int32
+    ) throws {
         // Repeated health/status reads of the same bad canonical bytes must
         // not turn into repeated durable writes. The name binds the SHA-256,
         // and equality verifies that an existing name still holds those
         // exact bytes before it is reused.
-        if existingOwnedRegularFile(at: url, equals: data) {
+        if existingOwnedRegularFile(at: url, equals: data, in: directoryFD) {
             return
         }
         try writeDurably(
             data,
             to: url,
             tempName: url.lastPathComponent + ".tmp-\(UUID().uuidString)",
+            in: directoryFD,
             postNotification: false
         )
     }
@@ -1251,16 +1342,11 @@ public struct StateStore: Sendable {
     /// event; avoiding another rename stops that event from feeding itself.
     /// `O_NOFOLLOW` and descriptor metadata checks keep that optimization
     /// from trusting a symlink or foreign/non-regular inode.
-    private func existingOwnedRegularFile(at url: URL, equals expected: Data) -> Bool {
-        let directoryFD = fileOperations.openAt(
-            AT_FDCWD,
-            url.deletingLastPathComponent().path,
-            O_RDONLY | O_DIRECTORY | O_CLOEXEC,
-            0
-        )
-        guard directoryFD >= 0 else { return false }
-        defer { _ = fileOperations.close(directoryFD) }
-
+    private func existingOwnedRegularFile(
+        at url: URL,
+        equals expected: Data,
+        in directoryFD: Int32
+    ) -> Bool {
         let fd = fileOperations.openAt(
             directoryFD,
             url.lastPathComponent,
@@ -1309,29 +1395,21 @@ public struct StateStore: Sendable {
     /// fsync. Returning success means both bytes and directory entry crossed
     /// the durability boundary; an fsync failure is never reported as a
     /// successful schedule mutation.
+    /// Publishes `data` through the caller's retained `state/` descriptor.
+    ///
+    /// It deliberately does **not** re-resolve the directory by pathname or
+    /// call `ensureDirectories()`. Both would let a `state/` renamed and
+    /// recreated mid-lease receive this write while the lease's lock still
+    /// protects the retired tree — a second helper could then take the
+    /// replacement lock and run a concurrent `rewrite --forget`.
     private func writeDurably(
         _ data: Data,
         to url: URL,
         tempName: String,
+        in directoryFD: Int32,
         postNotification shouldPostNotification: Bool
     ) throws {
-        try paths.ensureDirectories()
         let directory = url.deletingLastPathComponent()
-        let directoryFD = fileOperations.openAt(
-            AT_FDCWD,
-            directory.path,
-            O_RDONLY | O_DIRECTORY | O_CLOEXEC,
-            0
-        )
-        guard directoryFD >= 0 else {
-            throw StateStoreError.durableWriteFailed(
-                operation: "open state directory",
-                errno: errno,
-                path: directory.path
-            )
-        }
-        defer { _ = fileOperations.close(directoryFD) }
-
         if fileOperations.unlinkAt(directoryFD, tempName) != 0 {
             let code = errno
             if code != ENOENT {
@@ -1532,12 +1610,22 @@ public struct StateStore: Sendable {
 final class LockedScheduleState {
     private let store: StateStore
     private let lock: FileLock
+    /// The `state/` generation this lease is bound to. The lock lives in this
+    /// directory and every write goes back through the same descriptor, so a
+    /// lease can never publish into a tree its lock does not protect.
+    private let directory: DirectoryHandle
     private var isHeld = true
     private(set) var state: ScheduleState
 
-    fileprivate init(store: StateStore, lock: FileLock, state: ScheduleState) {
+    fileprivate init(
+        store: StateStore,
+        lock: FileLock,
+        directory: DirectoryHandle,
+        state: ScheduleState
+    ) {
         self.store = store
         self.lock = lock
+        self.directory = directory
         self.state = state
     }
 
@@ -1549,7 +1637,7 @@ final class LockedScheduleState {
         var entry = state.sets[setId] ?? SetScheduleState()
         mutate(&entry)
         state.sets[setId] = entry
-        try store.writeScheduleState(state)
+        try store.writeScheduleState(state, in: directory.descriptor)
         return state
     }
 
