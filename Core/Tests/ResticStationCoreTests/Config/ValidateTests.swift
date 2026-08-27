@@ -124,6 +124,42 @@ private func makeValidConfig() -> AppConfig {
         }
     }
 
+    /// restic records the lexically cleaned path in a snapshot, while
+    /// `PurgePlan` deliberately does not resolve `.`/`..`. The two never
+    /// compare equal, so snapshots from such a source are unattributable and
+    /// purge fails closed at run time with a message about attribution.
+    /// Refusing here makes it a configuration error instead.
+    @Test func nonCanonicalSourcePathThrows() {
+        for path in ["/srv/./data", "/srv/../srv/data", "/srv/data/..", "/."] {
+            var config = makeValidConfig()
+            config.sets[0].sources = [path]
+            #expect(throws: ConfigError.nonCanonicalSourcePath(setId: config.sets[0].id, path: path)) {
+                try config.validate()
+            }
+        }
+    }
+
+    /// Empty components stay legal: `PurgePlan` normalizes repeated and
+    /// trailing separators on both sides, so these already attribute
+    /// correctly. Refusing them would reject working configurations.
+    @Test func repeatedAndTrailingSeparatorsAreAccepted() throws {
+        for path in ["/srv//data", "/srv/data/", "/srv///data//"] {
+            var config = makeValidConfig()
+            config.sets[0].sources = [path]
+            try config.validate()
+        }
+    }
+
+    /// A dotfile is not a `.` component — the rule must not reject
+    /// `/home/me/.config`, which is an ordinary thing to back up.
+    @Test func dotfileSourcePathsAreAccepted() throws {
+        for path in ["/home/me/.config", "/srv/..data", "/srv/data.", "/srv/...."] {
+            var config = makeValidConfig()
+            config.sets[0].sources = [path]
+            try config.validate()
+        }
+    }
+
     // Invariant 4: Schedule fields in range.
 
     @Test func minute60Throws() {
@@ -289,6 +325,20 @@ private func makeValidConfig() -> AppConfig {
         config.sets[0].machines = ["linux-nas": BackupSetMachineOverride(sources: ["srv/data"])]
         #expect(throws: ConfigError.relativeOverrideSourcePath(
             setId: config.sets[0].id, machineId: "linux-nas", path: "srv/data"
+        )) {
+            try config.validate()
+        }
+    }
+
+    /// The override path re-validates what it replaces, so the `.`/`..` rule
+    /// must apply here too — otherwise a machine override is a way around it.
+    @Test func nonCanonicalOverrideSourcePathThrows() {
+        var config = makeValidConfig()
+        config.sets[0].machines = [
+            "linux-nas": BackupSetMachineOverride(sources: ["/srv/../srv/data"])
+        ]
+        #expect(throws: ConfigError.nonCanonicalOverrideSourcePath(
+            setId: config.sets[0].id, machineId: "linux-nas", path: "/srv/../srv/data"
         )) {
             try config.validate()
         }
