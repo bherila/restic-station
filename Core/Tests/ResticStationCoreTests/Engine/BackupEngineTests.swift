@@ -5206,6 +5206,97 @@ struct BackupEngineTests {
         #expect(env.resticArgvs.filter { $0.contains("rewrite") }.count == 1)
     }
 
+    @Test("watermark recovery rejects duplicate purge result prefixes")
+    func purgeRecoveryRejectsDuplicateResultPrefixes() async throws {
+        let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]
+        let hostnames = [Self.setId: Set(["example-mac.local"])]
+        let env = Self.makeEnv(
+            script: [], retention: nil, purgeExcludes: ["build/**"], reachableSecondaries: [],
+            purgeSourcePaths: sourcePaths, purgeHostnames: hostnames
+        )
+        defer { env.cleanUp() }
+        let snapshotsJSON = try FixtureLoader.string("snapshots.json")
+        let snapshots = try parseSnapshots(Data(snapshotsJSON.utf8))
+        let survivingResultID = "14a53542" + String(repeating: "a", count: 56)
+        let unrelatedID = "aaaaaaaa" + String(repeating: "b", count: 56)
+        let liveJSON = snapshotsJSON
+            .replacingOccurrences(of: snapshots[0].id, with: survivingResultID)
+            .replacingOccurrences(of: snapshots[0].shortId, with: "14a53542")
+            .replacingOccurrences(of: snapshots[1].id, with: unrelatedID)
+            .replacingOccurrences(of: snapshots[1].shortId, with: "aaaaaaaa")
+        let liveSnapshots = try parseSnapshots(Data(liveJSON.utf8))
+
+        var historical = try env.runStore.begin(
+            kind: .purge,
+            setId: Self.setId,
+            destId: Self.primaryId,
+            trigger: .scheduled
+        )
+        historical.argvRedacted = [Self.resticPath, "rewrite", "--forget"] + snapshots.map(\.id)
+        historical.purgePatterns = env.set.purgeExcludes
+        historical.purgeRepositoryId = Self.repositoryId
+        try env.runStore.markDestructiveLaunchAuthorized(historical)
+        try env.runStore.finish(
+            historical,
+            status: .success,
+            resticExitCode: 0,
+            purgeSnapshotRewrites: [
+                snapshots[0].id: "14a53542",
+                snapshots[1].id: "14a53542",
+            ]
+        )
+
+        let plan = PurgePlan(
+            destinationId: env.primary.id,
+            snapshots: liveSnapshots,
+            sourcePaths: sourcePaths[Self.setId]!,
+            hostnames: hostnames[Self.setId]!,
+            patterns: env.set.purgeExcludes
+        )
+        let token = try #require(try env.engine.issuePurgeToken(
+            set: env.set,
+            destinations: [env.primary],
+            plans: [plan],
+            executable: try env.requireResticExecutable()
+        ))
+        let rewrite = """
+        snapshot aaaaaaaa of [example-mac.local] at 2026-07-28 16:57:06 +0000 UTC by stale@host:
+        saved new snapshot cccccccc
+        removed old snapshot aaaaaaaa
+        modified 1 snapshots
+        """
+        env.fake.script = Self.repositoryConfigCall(
+            env.primary.repoURL,
+            dest: env.primary.id
+        ) + Self.resticCall(
+            ["-r", env.primary.repoURL, "snapshots", "--json"],
+            dest: env.primary.id,
+            stdoutLines: [liveJSON]
+        ) + Self.purgeLaunchValidationCalls(
+            env.primary.repoURL,
+            dest: env.primary.id,
+            snapshotsJSON: liveJSON
+        ) + Self.resticCall(
+            Self.rewriteArgv(
+                env.primary.repoURL,
+                snapshotIDs: liveSnapshots.map(\.id),
+                patterns: env.set.purgeExcludes
+            ),
+            dest: env.primary.id,
+            stdoutLines: rewrite.split(separator: "\n").map(String.init)
+        )
+
+        let result = try await env.engine.runPurge(
+            set: env.set,
+            destinations: [env.primary],
+            token: token.value
+        )
+
+        #expect(result.status == .success)
+        #expect(result.children.count == 1, "duplicate result prefixes cannot repair the watermark")
+        #expect(env.resticArgvs.filter { $0.contains("rewrite") }.count == 1)
+    }
+
     @Test("watermark recovery revalidates canonical purge evidence at its use boundary")
     func purgeRecoveryRevalidatesCanonicalEvidence() async throws {
         let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]

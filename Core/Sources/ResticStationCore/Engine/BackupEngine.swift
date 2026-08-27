@@ -2330,9 +2330,13 @@ public final class BackupEngine: Sendable {
                 // snapshot map to their unchanged short ids. Recovery can
                 // therefore reject additions that were never covered by this
                 // launch instead of accepting a matching subset.
-                return Dictionary(uniqueKeysWithValues: repositorySnapshotIDs.map { oldID in
+                let completeRewrites = Dictionary(uniqueKeysWithValues: repositorySnapshotIDs.map { oldID in
                     (oldID, changedRewrites[oldID] ?? String(oldID.prefix(8)))
                 })
+                guard Set(completeRewrites.values).count == completeRewrites.count else {
+                    return nil
+                }
+                return completeRewrites
             }
         )
     }
@@ -2379,6 +2383,12 @@ public final class BackupEngine: Sendable {
                 throw RunStoreError.discardUnsafe(
                     path: paths.runMetadataFile(runId: entry.runId).path
                 )
+            }
+            guard Set(rewrites.values).count == rewrites.count else {
+                // Two historical entries must never derive authority from
+                // the same surviving result snapshot. Ignore ambiguous
+                // history and re-run the live purge plan.
+                continue
             }
             let liveIds = liveSnapshotIdsByDestination[entry.destId] ?? []
             guard liveIds.count == rewrites.count else {
