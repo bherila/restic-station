@@ -45,11 +45,13 @@ public protocol ProcessRunning: Sendable {
     ///
     /// The deadline races process *termination*, never pipe EOF: a child that
     /// closes stdout and stderr but keeps running must still be stopped
-    /// (#114). Once the stop sequence has run, the transcript is drained for
-    /// a bounded grace and then abandoned, because a descendant that
-    /// inherited the pipe ends can hold them open indefinitely. Neither
-    /// transcript is readable on that path — `run` throws instead of
-    /// returning a `ProcessResult`.
+    /// (#114). Once the stop sequence has run, the readers get a bounded
+    /// grace and are then told to stop, so a descendant that inherited the
+    /// pipe ends cannot extend the call by holding them open. Both readers
+    /// still run to completion before `run` returns, so no `onStdoutLine` or
+    /// `onStderrLine` callback can fire after it — callers close per-run log
+    /// writers on that return. The accumulated transcripts are discarded:
+    /// `run` throws instead of returning a `ProcessResult`.
     ///
     /// Cancelling the calling task stops the subprocess the same way (SIGINT,
     /// 10 s grace, SIGKILL) and throws `CancellationError`.
@@ -168,8 +170,15 @@ public struct DefaultProcessRunner: ProcessRunning {
         // that had not started yet. Today's only stdin payload is a password,
         // far under the buffer, but the ordering costs nothing and removes
         // the whole failure class.
-        let stdoutTask = Task { await Self.readPipeToCompletion(stdoutPipe, onLine: onStdoutLine) }
-        let stderrTask = Task { await Self.readPipeToCompletion(stderrPipe, onLine: onStderrLine) }
+        // Shared with both readers so a timed-out or cancelled run can end
+        // them rather than abandon them; see `readPipeToCompletion`.
+        let readerStop = AtomicFlag()
+        let stdoutTask = Task {
+            await Self.readPipeToCompletion(stdoutPipe, onLine: onStdoutLine, stop: readerStop)
+        }
+        let stderrTask = Task {
+            await Self.readPipeToCompletion(stderrPipe, onLine: onStderrLine, stop: readerStop)
+        }
 
         if let stdin {
             // `write(contentsOf:)`, never `write(_:)`: the latter raises an
@@ -185,7 +194,7 @@ public struct DefaultProcessRunner: ProcessRunning {
         try? stdinPipe.fileHandleForWriting.close()
 
         let timeoutFlag = TimeoutFlag()
-        let cancellationFlag = CancellationFlag()
+        let cancellationFlag = AtomicFlag()
         let processBox = ProcessBox(process: process)
 
         // Task cancellation is handled with the same stop sequence as a
@@ -224,18 +233,29 @@ public struct DefaultProcessRunner: ProcessRunning {
             await terminationSignal.wait()
 
             let timedOut = await timeoutFlag.triggered
-            guard timedOut || cancellationFlag.isCancelled else {
+            guard timedOut || cancellationFlag.isSet else {
                 return (await stdoutTask.value, await stderrTask.value)
             }
             // The stop sequence has run, so the direct child is gone and any
             // writer still holding the inherited pipe ends is a descendant
             // (`ssh` for the sftp backend, a password command). Waiting for
             // *their* EOF is unbounded and would make the deadline
-            // unenforceable again by a second route. This path throws below,
-            // so the transcript is discarded either way.
-            return await Self.drainWithinGrace(stdoutTask, stderrTask)
+            // unenforceable again by a second route, so the readers are told
+            // to stop once the grace expires.
+            //
+            // Both readers are still awaited to completion. That is what
+            // keeps every `onLine` callback strictly inside the call: this
+            // path throws, and the engine closes the run's `LogWriter` on
+            // return, so a reader still delivering lines afterwards would be
+            // racing that close.
+            let stopper = Task.detached {
+                try await Task.sleep(nanoseconds: UInt64(Self.postStopDrainGrace * 1_000_000_000))
+                readerStop.set()
+            }
+            defer { stopper.cancel() }
+            return (await stdoutTask.value, await stderrTask.value)
         } onCancel: {
-            cancellationFlag.mark()
+            cancellationFlag.set()
             // Synchronous part first so the signal lands immediately; the
             // grace period + SIGKILL run detached (this closure cannot await).
             Self.sendSignal(SIGINT, to: processBox, unlessTerminated: terminationSignal)
@@ -248,7 +268,7 @@ public struct DefaultProcessRunner: ProcessRunning {
             }
         }
 
-        if cancellationFlag.isCancelled {
+        if cancellationFlag.isSet {
             throw CancellationError()
         }
         if await timeoutFlag.triggered {
@@ -309,65 +329,63 @@ public struct DefaultProcessRunner: ProcessRunning {
         kill(box.process.processIdentifier, signal)
     }
 
-    /// How long a timed-out or cancelled run keeps draining its pipes after
-    /// the direct child is gone. Bytes already buffered in a 64 KiB pipe
-    /// drain in microseconds, so this is generous by orders of magnitude for
-    /// anything but a descendant that is still holding the write ends open.
+    /// How long a timed-out or cancelled run keeps reading its pipes after
+    /// the direct child is gone, before telling the readers to stop. Bytes
+    /// already buffered in a 64 KiB pipe drain in microseconds, so this is
+    /// generous by orders of magnitude for anything but a descendant that is
+    /// still holding the write ends open.
     private static let postStopDrainGrace: TimeInterval = 10
 
-    /// Awaits both pipe readers for at most `postStopDrainGrace`, returning
-    /// empty transcripts if that grace expires.
-    ///
-    /// Only ever called on a path that is about to throw. Empty rather than
-    /// partial is not a choice: `readPipeToCompletion` accumulates into a
-    /// local buffer and publishes it once at EOF, so there is no partial
-    /// buffer to hand back, and `run()` throws before any caller could read
-    /// one.
-    ///
-    /// Deliberately not a task group: a group awaits *all* of its children,
-    /// and awaiting `Task<Data, Never>.value` ignores cancellation, so the
-    /// losing arm would hold the group open for exactly as long as the wait
-    /// this bound exists to cut short. The loser here is detached and simply
-    /// completes later, when the descendant finally closes the pipe.
-    private static func drainWithinGrace(
-        _ stdoutTask: Task<Data, Never>,
-        _ stderrTask: Task<Data, Never>
-    ) async -> (Data, Data) {
-        await withCheckedContinuation { (continuation: CheckedContinuation<(Data, Data), Never>) in
-            let resumer = OnceResumer(continuation)
-            Task.detached {
-                let out = await stdoutTask.value
-                let err = await stderrTask.value
-                resumer.resume(with: (out, err))
-            }
-            Task.detached {
-                try? await Task.sleep(nanoseconds: UInt64(postStopDrainGrace * 1_000_000_000))
-                resumer.resume(with: (Data(), Data()))
-            }
-        }
-    }
 
-    /// Reads a pipe to EOF on a background dispatch queue (never blocks the
-    /// Swift concurrency cooperative thread pool), streaming complete lines
-    /// to `onLine` as they arrive and buffering any trailing partial line to
-    /// flush once at EOF. Returns the raw accumulated bytes.
+    /// Reads a pipe on a background dispatch queue (never blocks the Swift
+    /// concurrency cooperative thread pool), streaming complete lines to
+    /// `onLine` as they arrive and buffering any trailing partial line to
+    /// flush once at the end. Returns the raw accumulated bytes.
+    ///
+    /// The wait is a short `poll(2)` rather than a blocking read, so `stop`
+    /// can end the loop even on a pipe that will never reach EOF — a
+    /// descendant that inherited the write ends can hold them open for as
+    /// long as it likes. Being interruptible is what lets a timed-out or
+    /// cancelled `run` bound its drain *and still* have both readers finish:
+    /// abandoning them instead would leak the task, its continuation and the
+    /// descriptors, and would let `onLine` keep firing after `run` had
+    /// already thrown — into, for the engine's callers, a `LogWriter` the
+    /// same return path has just closed.
     private static func readPipeToCompletion(
         _ pipe: Pipe,
-        onLine: (@Sendable (String) -> Void)?
+        onLine: (@Sendable (String) -> Void)?,
+        stop: AtomicFlag
     ) async -> Data {
         await withCheckedContinuation { (continuation: CheckedContinuation<Data, Never>) in
             let box = PipeBox(pipe: pipe)
             DispatchQueue.global(qos: .utility).async {
-                let handle = box.pipe.fileHandleForReading
+                let fd = box.pipe.fileHandleForReading.fileDescriptor
                 var accumulated = Data()
                 var lineBuffer = Data()
                 let newline = UInt8(ascii: "\n")
+                var buffer = [UInt8](repeating: 0, count: 64 * 1024)
 
-                while true {
-                    let chunk = handle.availableData
-                    if chunk.isEmpty {
-                        break
+                reading: while !stop.isSet {
+                    var poller = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+                    let ready = poll(&poller, 1, 200)
+                    if ready < 0 {
+                        if errno == EINTR { continue }
+                        break reading
                     }
+                    // Timed out with nothing readable: the only purpose of
+                    // the timeout is to get back here and re-check `stop`.
+                    if ready == 0 { continue }
+
+                    let count = buffer.withUnsafeMutableBytes { raw -> Int in
+                        read(fd, raw.baseAddress, raw.count)
+                    }
+                    if count < 0 {
+                        if errno == EINTR { continue }
+                        break reading
+                    }
+                    if count == 0 { break reading } // EOF
+
+                    let chunk = Data(buffer[0..<count])
                     accumulated.append(chunk)
                     lineBuffer.append(chunk)
 
@@ -388,10 +406,6 @@ public struct DefaultProcessRunner: ProcessRunning {
     }
 }
 
-/// `Pipe` is not `Sendable`, but it is only ever touched from one thread at
-/// a time in `readPipeToCompletion` (handed off once to the background
-/// queue and never read from concurrently elsewhere). This box lets us
-/// cross the `@Sendable` closure boundary without a data race.
 private struct PipeBox: @unchecked Sendable {
     let pipe: Pipe
 }
@@ -408,40 +422,23 @@ private struct ProcessBox: @unchecked Sendable {
 /// Records — synchronously, from `withTaskCancellationHandler`'s handler —
 /// that the calling task was cancelled. Cannot be an `actor`: the handler is
 /// a non-async closure.
-/// Resumes a continuation exactly once, whichever of two racing detached
-/// tasks arrives first. The loser's call is a no-op rather than the fatal
-/// double-resume it would otherwise be.
-private final class OnceResumer<T: Sendable>: @unchecked Sendable {
+/// A one-way boolean, safe to set from one concurrency domain and read from
+/// another. Used both for "the caller cancelled" and for "stop reading the
+/// pipes now".
+private final class AtomicFlag: @unchecked Sendable {
     private let lock = NSLock()
-    private var continuation: CheckedContinuation<T, Never>?
+    private var value = false
 
-    init(_ continuation: CheckedContinuation<T, Never>) {
-        self.continuation = continuation
-    }
-
-    func resume(with value: T) {
-        lock.lock()
-        let pending = continuation
-        continuation = nil
-        lock.unlock()
-        pending?.resume(returning: value)
-    }
-}
-
-private final class CancellationFlag: @unchecked Sendable {
-    private let lock = NSLock()
-    private var cancelled = false
-
-    var isCancelled: Bool {
+    var isSet: Bool {
         lock.lock()
         defer { lock.unlock() }
-        return cancelled
+        return value
     }
 
-    func mark() {
+    func set() {
         lock.lock()
         defer { lock.unlock() }
-        cancelled = true
+        value = true
     }
 }
 
