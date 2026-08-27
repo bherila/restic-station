@@ -106,7 +106,7 @@ let canInjectPermissionFaults = geteuid() != 0
     /// otherwise tighten, not on an earlier pathname check by the caller: a
     /// concurrent widen between the two would slip through into a silent
     /// repair, erasing evidence a downstream reader must fail closed on.
-    @Test("refusingUnsafeExisting refuses the mode of the inode it would repair")
+    @Test("unsafeExistingGuidance refuses the mode of the inode in hand, and carries the caller's guidance")
     func ensureDirectoryRefusesUnsafeExistingOnTheDescriptor() throws {
         for mode in [mode_t(0o722), mode_t(0o772), mode_t(0o777)] {
             let parent = makeDirectory()
@@ -124,10 +124,11 @@ let canInjectPermissionFaults = geteuid() != 0
 
             let failure = FileLock.ensureDirectory(
                 child, parent: parent, trustedRoot: parent, mode: 0o700,
-                tightenExisting: true, refusingUnsafeExisting: true
+                tightenExisting: false, unsafeExistingGuidance: "Extra guidance."
             )
             #expect(failure != nil, "mode \(String(mode, radix: 8)) must refuse")
             #expect(failure?.operation.contains("writable by other users") == true)
+            #expect(failure?.operation.contains("Extra guidance.") == true)
 
             let after = try FileManager.default.attributesOfItem(
                 atPath: child.path
@@ -142,7 +143,7 @@ let canInjectPermissionFaults = geteuid() != 0
     /// Without the flag the existing behaviour is unchanged: a widened
     /// directory is still repaired, which is what `runs/` and `locks/` rely on
     /// not doing and what `state/` relied on doing before this split.
-    @Test("without refusingUnsafeExisting, a widened directory is still tightened")
+    @Test("without unsafeExistingGuidance, a widened directory is still tightened")
     func ensureDirectoryStillTightensWhenNotRefusing() throws {
         let parent = makeDirectory()
         defer { try? FileManager.default.removeItem(at: parent) }
@@ -157,7 +158,7 @@ let canInjectPermissionFaults = geteuid() != 0
         )
         #expect(FileLock.ensureDirectory(
             child, parent: parent, trustedRoot: parent, mode: 0o700,
-            tightenExisting: true, refusingUnsafeExisting: false
+            tightenExisting: true, unsafeExistingGuidance: nil
         ) == nil)
 
         let after = try FileManager.default.attributesOfItem(

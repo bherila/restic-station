@@ -403,6 +403,19 @@ struct AppPathsEnvTests {
                 try paths.ensureDirectories()
             }
 
+            // `Tick` exits at this call, so this refusal is the only guidance
+            // the operator sees — it must carry what the schedule-state reader
+            // would have said, not just the chmod.
+            do {
+                try paths.ensureDirectories()
+                Issue.record("expected a refusal")
+            } catch {
+                let text = "\(error)"
+                #expect(text.contains("chmod 700"))
+                #expect(text.contains("against a trusted copy"))
+                #expect(text.contains("does not make the contents trustworthy"))
+            }
+
             // The point of refusing rather than repairing: the mode is still
             // there for the operator, and for the read that fails closed on it.
             let after = try FileManager.default.attributesOfItem(
@@ -415,11 +428,14 @@ struct AppPathsEnvTests {
         }
     }
 
-    /// Benign widening is still repaired. `0755` is listable but exposes
-    /// nothing another uid can act on, so refusing it would strand installs
-    /// over a privacy nit rather than a safety event.
-    @Test("a pre-existing 0755 state/ is still tightened, not refused")
-    func ensureDirectoriesStillTightensABenignStateDirectory() throws {
+    /// Benign widening is neither refused nor repaired. `0755` is listable but
+    /// exposes nothing another uid can act on, so refusing it would strand
+    /// installs over a privacy nit — and repairing it is what reintroduces the
+    /// window this whole guard closes, since a refusal cannot be atomic with a
+    /// later `fchmodat`. `state/` therefore behaves like `runs/` and `locks/`:
+    /// left alone and reported by live health.
+    @Test("a pre-existing 0755 state/ is left alone, neither refused nor tightened")
+    func ensureDirectoriesLeavesABenignStateDirectoryAlone() throws {
         let (paths, root) = makeTempPaths()
         defer { try? FileManager.default.removeItem(at: root) }
         try paths.ensureDirectories()
@@ -428,12 +444,26 @@ struct AppPathsEnvTests {
             [.posixPermissions: NSNumber(value: mode_t(0o755))],
             ofItemAtPath: paths.stateDir.path
         )
-        try paths.ensureDirectories()
+        try paths.ensureDirectories() // must not throw
 
         let after = try FileManager.default.attributesOfItem(
             atPath: paths.stateDir.path
         )[.posixPermissions] as? NSNumber
-        #expect(after?.uint16Value == 0o700)
+        #expect(after?.uint16Value == 0o755, "no automatic repair means no erase window")
+    }
+
+    /// A newly created `state/` is still pinned to `0700`; only *existing*
+    /// modes are left alone.
+    @Test("a freshly created state/ is still pinned to 0700")
+    func ensureDirectoriesPinsANewStateDirectory() throws {
+        let (paths, root) = makeTempPaths()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try paths.ensureDirectories()
+
+        let mode = try FileManager.default.attributesOfItem(
+            atPath: paths.stateDir.path
+        )[.posixPermissions] as? NSNumber
+        #expect(mode?.uint16Value == 0o700)
     }
 
     @Test("operation directory setup does not depend on the health scratch path")

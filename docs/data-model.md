@@ -559,14 +559,15 @@ already on disk: the envelope checksum is unkeyed, so a forged
 `appliedPurgeExcludes` verifies, and a fabricated watermark suppresses a
 required rewrite. That case keeps the inspect-and-replace guidance.
 
-That refusal is also reached before it can be erased. Setup re-tightens a
-pre-existing `state/` only when the widening is benign (`0755`), and refuses
-outright when the directory is group/world-writable, because setup runs before
-the safety-authoritative read and would otherwise repair away the evidence. The
-refusal is made **on the descriptor that would be tightened**, inside
-`FileLock.ensureDirectory`, not on a pathname check by the caller — a
-concurrent widen between an earlier `lstat` and that open would otherwise slip
-straight through into a silent repair.
+That refusal is also reached before it can be erased. Setup runs before the
+safety-authoritative read, so it refuses a group/world-writable `state/` rather
+than repairing it, and it no longer auto-tightens a pre-existing mode at all —
+a refusal cannot be atomic with a later `fchmodat`, so repairing would leave an
+interval in which a widen lands after the check and is erased by the chmod. The
+refusal is made **on the descriptor in hand**, inside
+`FileLock.ensureDirectory`, not on a pathname check by the caller. Because a
+scheduled tick exits at that call, the failure also carries the trusted-copy
+guidance the reader below would have given.
 
 A `state/` that others can write but this user cannot read (`0333`) fails the
 `O_RDONLY` open before the mode check runs, so it is diagnosed by pathname and

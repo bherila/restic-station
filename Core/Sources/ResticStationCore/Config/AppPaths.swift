@@ -428,12 +428,29 @@ public struct AppPaths: Equatable, Sendable {
         // a concurrent widen between an `lstat` here and the open there would
         // otherwise slip straight through into a silent repair.
         //
-        // Benign widening (`0755` — listable, not writable by others) is still
-        // tightened as before; it exposes nothing another uid can act on.
-        for (directory, tightenExisting, refuseUnsafe) in [
-            (runsDir, false, false),
-            (stateDir, true, true),
-            (locksDir, false, false),
+        // `state/` no longer auto-tightens an existing mode either. Refusing
+        // cannot be made atomic with a later `fchmodat`, so a directory that
+        // both refuses *and* repairs still has an interval in which a widen
+        // lands after the check and is erased by the chmod. Not repairing at
+        // all removes the interval rather than narrowing it. Benign widening
+        // (`0755`) is therefore left in place and reported by live health,
+        // exactly as `runs/` and `locks/` already are — the protection that
+        // matters inside `state/` is per-file anyway, and a newly created
+        // directory is still pinned to `0700`.
+        //
+        // Because `Tick` exits at this call, the refusal must also carry the
+        // trusted-copy guidance the schedule-state reader would have given;
+        // an operator who only chmods and restarts could otherwise admit a
+        // forged, checksum-valid watermark.
+        let stateGuidance = "Repairing the mode does not make the contents trustworthy: "
+            + "the schedule-state checksum is unkeyed, so a forged purge watermark verifies. "
+            + "Inspect \(ShellQuoting.quoteIfNeeded(scheduleStateFile.path)) against a trusted "
+            + "copy before resuming, and replace it if you cannot account for its current state."
+
+        for (directory, tightenExisting, guidance) in [
+            (runsDir, false, String?.none),
+            (stateDir, false, String?.some(stateGuidance)),
+            (locksDir, false, String?.none),
         ] {
             if let failure = FileLock.ensureDirectory(
                 directory,
@@ -441,7 +458,7 @@ public struct AppPaths: Equatable, Sendable {
                 trustedRoot: root,
                 mode: 0o700,
                 tightenExisting: tightenExisting,
-                refusingUnsafeExisting: refuseUnsafe
+                unsafeExistingGuidance: guidance
             ) {
                 throw failure
             }

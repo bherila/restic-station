@@ -518,7 +518,7 @@ public final class FileLock: @unchecked Sendable {
         trustedRoot: URL,
         mode: mode_t,
         tightenExisting: Bool = true,
-        refusingUnsafeExisting: Bool = false
+        unsafeExistingGuidance: String? = nil
     ) -> LockFailure? {
         let directoryPath = directory.standardizedFileURL.path
         guard directory.deletingLastPathComponent().standardizedFileURL.path
@@ -586,20 +586,26 @@ public final class FileLock: @unchecked Sendable {
             return LockFailure(path: directoryPath, operation: "protected directory ownership", errnoValue: 0)
         }
 
-        // Bind the safety decision to the descriptor about to be tightened,
-        // never to an earlier pathname lookup by the caller: another process
-        // can widen the directory between the two, and `tightenExisting`
-        // would then quietly erase evidence a downstream reader must fail
-        // closed on. This `info` came from `fstat(directoryFD)` above, so the
-        // mode refused here is the mode of the inode that would be repaired.
-        if refusingUnsafeExisting, !createdDirectory, info.st_mode & 0o022 != 0 {
+        // Bind the safety decision to this descriptor, never to an earlier
+        // pathname lookup by the caller: another process can widen the
+        // directory between the two. `info` came from `fstat(directoryFD)`
+        // above, so this is the mode of the inode actually in hand.
+        //
+        // Note the guarantee is only as strong as the caller's `tightenExisting`
+        // choice. Refusing here cannot be atomic with a later `fchmodat`, so a
+        // caller that both refuses *and* auto-tightens still has a window in
+        // which a widen lands after this check and is erased by that chmod.
+        // Callers holding safety-authoritative state pass
+        // `tightenExisting: false` for exactly that reason: with no automatic
+        // repair there is no interval in which evidence can be destroyed.
+        if let guidance = unsafeExistingGuidance, !createdDirectory, info.st_mode & 0o022 != 0 {
             return LockFailure(
                 path: directoryPath,
                 operation: "protected directory writable by other users "
                     + "(mode \(String(info.st_mode & 0o777, radix: 8))) — not repaired "
                     + "automatically, because that would erase the evidence; after confirming no "
                     + "other user has written to it, run chmod \(String(mode, radix: 8)) "
-                    + "\(ShellQuoting.quoteIfNeeded(directoryPath))",
+                    + "\(ShellQuoting.quoteIfNeeded(directoryPath)). \(guidance)",
                 errnoValue: 0
             )
         }
