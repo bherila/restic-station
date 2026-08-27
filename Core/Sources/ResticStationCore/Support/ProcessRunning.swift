@@ -140,6 +140,91 @@ public struct DefaultProcessRunner: ProcessRunning {
         try SIGPIPEGuard.launch(process)
     }
 
+    /// One successfully spawned child and the pipes wired to it.
+    private struct Spawned {
+        let process: Process
+        let stdout: Pipe
+        let stderr: Pipe
+        let stdin: Pipe
+    }
+
+    /// Spawn attempts before giving up (#116).
+    ///
+    /// `posix_spawn` intermittently fails with `EFAULT` under concurrent
+    /// spawn load — a spurious failure, not a real bad address, since the
+    /// same argv succeeds on the next attempt. It is safe to retry precisely
+    /// because it is a *launch* failure: POSIX guarantees no child exists
+    /// when `posix_spawn` reports an error, so a retry cannot double-spawn.
+    /// That matters here, because some of what this runner launches is
+    /// destructive.
+    ///
+    /// Retrying is the right production behaviour and not merely a test fix:
+    /// a spurious spawn failure should not fail a backup. It is measurable
+    /// because the test suite spawns hard enough to hit it — at roughly
+    /// 4 runs in 20 once this PR made the suite five times faster, against a
+    /// base rate near zero at the same concurrency spread over five times
+    /// the wall clock.
+    private static let spawnAttempts = 3
+
+    /// Fresh `Process` and pipes per attempt: a `Process` cannot be re-run,
+    /// and pipes that were handed to a failed launch are not reused.
+    private static func launchWithRetry(
+        argv: [String],
+        env: [String: String]?,
+        currentDirectory: String?,
+        terminationSignal: TerminationSignal
+    ) throws -> Spawned {
+        var lastError: Error?
+        for attempt in 1...spawnAttempts {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: argv[0])
+            process.arguments = Array(argv.dropFirst())
+            if let env {
+                process.environment = env
+            }
+            if let currentDirectory {
+                process.currentDirectoryURL = URL(fileURLWithPath: currentDirectory)
+            }
+
+            let stdoutPipe = Pipe()
+            let stderrPipe = Pipe()
+            let stdinPipe = Pipe()
+            process.standardOutput = stdoutPipe
+            process.standardError = stderrPipe
+            process.standardInput = stdinPipe
+            process.terminationHandler = { _ in
+                terminationSignal.fire()
+            }
+
+            do {
+                // Under the same lock as the SIGPIPE window, so no child is
+                // ever created while that signal is ignored and inherits it.
+                try launch(process)
+                return Spawned(
+                    process: process,
+                    stdout: stdoutPipe,
+                    stderr: stderrPipe,
+                    stdin: stdinPipe
+                )
+            } catch {
+                lastError = error
+                guard attempt < spawnAttempts, isTransientSpawnFailure(error) else {
+                    throw error
+                }
+            }
+        }
+        throw lastError ?? ProcessRunnerError.launchFailed("spawn failed with no reported error")
+    }
+
+    /// A spawn failure that says nothing about the command and everything
+    /// about the moment it was attempted. `EFAULT` is #116's signature;
+    /// `EAGAIN` is the ordinary "out of process slots right now".
+    static func isTransientSpawnFailure(_ error: Error) -> Bool {
+        let posix = error as NSError
+        guard posix.domain == NSPOSIXErrorDomain else { return false }
+        return posix.code == Int(EFAULT) || posix.code == Int(EAGAIN)
+    }
+
     public func run(
         _ argv: [String],
         env: [String: String]?,
@@ -153,23 +238,6 @@ public struct DefaultProcessRunner: ProcessRunning {
             throw ProcessRunnerError.invalidArgv
         }
 
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: argv[0])
-        process.arguments = Array(argv.dropFirst())
-        if let env {
-            process.environment = env
-        }
-        if let currentDirectory {
-            process.currentDirectoryURL = URL(fileURLWithPath: currentDirectory)
-        }
-
-        let stdoutPipe = Pipe()
-        let stderrPipe = Pipe()
-        let stdinPipe = Pipe()
-        process.standardOutput = stdoutPipe
-        process.standardError = stderrPipe
-        process.standardInput = stdinPipe
-
         // Termination is observed via `terminationHandler` (delivered on an
         // internal Foundation queue), NEVER `waitUntilExit()`: waitUntilExit
         // delivers through the spawning thread's runloop, and Swift
@@ -179,17 +247,22 @@ public struct DefaultProcessRunner: ProcessRunning {
         // killed, silently stopping all scheduled backups. The handler MUST
         // be installed before `run()` so a fast-exiting child can't race it.
         let terminationSignal = TerminationSignal()
-        process.terminationHandler = { _ in
-            terminationSignal.fire()
-        }
 
+        let spawned: Spawned
         do {
-            // Under the same lock as the SIGPIPE window, so no child is ever
-            // created while that signal is ignored and inherits it.
-            try Self.launch(process)
+            spawned = try Self.launchWithRetry(
+                argv: argv,
+                env: env,
+                currentDirectory: currentDirectory,
+                terminationSignal: terminationSignal
+            )
         } catch {
             throw ProcessRunnerError.launchFailed(String(describing: error))
         }
+        let process = spawned.process
+        let stdoutPipe = spawned.stdout
+        let stderrPipe = spawned.stderr
+        let stdinPipe = spawned.stdin
         // Plain `Task`s (not `async let`) so they can be captured by the
         // nested task-group closure below.
         //

@@ -41,6 +41,36 @@ struct ProcessLifetimeTests {
         #expect(production.drainGrace == 10)
     }
 
+    /// The retry must cover only failures that say nothing about the
+    /// command. Retrying a real one — a missing binary, a permission
+    /// refusal — would turn one honest error into three attempts at the same
+    /// wrong thing, and for a destructive command that is the wrong instinct
+    /// entirely.
+    ///
+    /// Safe to retry at all only because this is a *launch* failure: POSIX
+    /// guarantees no child exists when `posix_spawn` reports an error, so a
+    /// retry cannot double-spawn.
+    @Test("only moment-dependent spawn failures are retried")
+    func onlyTransientSpawnFailuresAreRetried() {
+        func posix(_ code: Int32) -> Error {
+            NSError(domain: NSPOSIXErrorDomain, code: Int(code))
+        }
+
+        // #116's signature, and the ordinary "no process slots right now".
+        #expect(DefaultProcessRunner.isTransientSpawnFailure(posix(EFAULT)))
+        #expect(DefaultProcessRunner.isTransientSpawnFailure(posix(EAGAIN)))
+
+        // Real answers about the command. Retrying these hides them.
+        #expect(!DefaultProcessRunner.isTransientSpawnFailure(posix(ENOENT)))
+        #expect(!DefaultProcessRunner.isTransientSpawnFailure(posix(EACCES)))
+        #expect(!DefaultProcessRunner.isTransientSpawnFailure(posix(ENOEXEC)))
+
+        // Same numeric code, different domain — not a spawn errno at all.
+        #expect(!DefaultProcessRunner.isTransientSpawnFailure(
+            NSError(domain: NSCocoaErrorDomain, code: Int(EFAULT))
+        ))
+    }
+
     /// A child that closes stdout and stderr but keeps running hands the
     /// reader tasks EOF immediately. When the deadline raced those readers it
     /// was cancelled at that instant, and the runner then waited on the live
@@ -91,9 +121,12 @@ struct ProcessLifetimeTests {
         defer { try? FileManager.default.removeItem(at: directory) }
         let ticks = directory.appendingPathComponent("ticks")
 
-        // Self-limiting at ~30 s so a regression cannot leave a process
+        // One tick per second, not ten. The loop forks a `sleep` per
+        // iteration, and this suite's spawn churn is what pushes the
+        // intermittent `posix_spawn` EFAULT of #116 from rare to routine.
+        // Self-limiting at ~60 s so a regression cannot leave a process
         // running for longer than the suite that spawned it.
-        let script = "i=0; while [ $i -lt 300 ]; do printf x >> '\(ticks.path)'; sleep 0.1; i=$((i+1)); done"
+        let script = "i=0; while [ $i -lt 60 ]; do printf x >> '\(ticks.path)'; sleep 1; i=$((i+1)); done"
 
         await #expect(throws: ProcessRunnerError.timeout) {
             _ = try await Self.runner().run(
@@ -107,14 +140,15 @@ struct ProcessLifetimeTests {
             )
         }
 
+        // Long enough that a surviving child must tick at least twice more.
         func tickCount() -> Int { (try? Data(contentsOf: ticks))?.count ?? 0 }
         let atReturn = tickCount()
-        try await Task.sleep(nanoseconds: 1_000_000_000)
-        let afterASecond = tickCount()
+        try await Task.sleep(nanoseconds: 2_500_000_000)
+        let afterWatching = tickCount()
 
         #expect(
-            afterASecond == atReturn,
-            "the child wrote \(afterASecond - atReturn) more ticks after the deadline was reported — it was abandoned, not stopped"
+            afterWatching == atReturn,
+            "the child wrote \(afterWatching - atReturn) more ticks after the deadline was reported — it was abandoned, not stopped"
         )
     }
 

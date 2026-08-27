@@ -80,6 +80,19 @@ the #114 defect itself. `timeoutStopsTheProcess` (formerly
 `timeoutSendsSIGINT`) asserted only the throw and so could not distinguish
 them; it is plausible it had been passing vacuously on Linux for some time.
 
+**The suite's own speed changed a flake rate (#116).** `posix_spawn`
+intermittently fails with `EFAULT` under concurrent spawn load. Shrinking the
+stop-sequence graces took the Core suite from ~24 s to ~5 s, which packed the
+same 936 tests into a fifth of the wall clock and took that flake from roughly
+1 run in 25 to **4 in 20** — measured, not estimated. The trigger is density,
+not the new tests: skipping `ProcessLifetimeTests` entirely left the rate
+unchanged at 4/20. `DefaultProcessRunner` now retries a spawn up to three
+times when it fails with `EFAULT` or `EAGAIN`, which took it to **0 failures
+in 45 runs**. Retrying is safe specifically because POSIX guarantees no child
+exists when `posix_spawn` reports an error, so it cannot double-spawn a
+destructive command; `onlyTransientSpawnFailuresAreRetried` pins the boundary
+so a real `ENOENT` or `EACCES` still fails on the first attempt.
+
 **Signal delivery to children is not portable, and CI is the only place that
 shows it.** On the `linux` job, a child does not stop on SIGINT and is ended
 by the SIGKILL escalation behind it — an ignored disposition is inherited
