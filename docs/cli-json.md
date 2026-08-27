@@ -68,7 +68,13 @@ Two payload notes that are easy to get wrong:
 - **`probe-repo` reports offline as a success.** `outcome: "offline"` with
   `ok: true` and exit 3. An unplugged drive is a destination's expected
   state, not a fault — an error envelope would make a sleeping NAS
-  indistinguishable from a broken config. Branch on `outcome`.
+  indistinguishable from a broken config. Branch on `outcome`. The one
+  probe failure that is *not* published this way is a secret pre-flight
+  that refused permanently: nothing is stored for the destination, or the
+  store will not be read at all. Those get the error envelope
+  (`secret_not_configured` / `secret_store_unusable`, exit 1), because
+  `ok: true` at exit 3 means "try later" and neither will ever succeed
+  unattended.
 - **`fda-check` has three states, not two.** Off macOS, `applicable` is
   `false` and `granted` is `null`. A caller must check `applicable` before
   reading `granted`, exactly as an absent `state/fda-check.json` means
@@ -112,7 +118,7 @@ never match on it. `details` is omitted entirely when empty.
 | `repository_not_initialized` | no | 1 | restic exit 10: nothing is initialized at that location. |
 | `secret_unavailable` | **yes** | 1 | The secret backend answered badly and may answer well later — a locked login keychain at a pre-login tick, a transient I/O error, a lock held by a stuck peer. Every remaining `errno` wrapper in the file backend is here, because no `errno` set is uniformly permanent. A structurally unusable `secrets.lock` is instead non-retryable `internal_error`. |
 | `secret_not_configured` | no | 1 | The backend answered "no such item": no password is stored for this destination. Run `secret set`. Also what `ResticRunner`'s pre-flight reports, so the distinction survives to the commands that actually run restic. |
-| `secret_store_unusable` | no | 1 | The store could not be consulted at all, and repeating the request cannot change that: a symlinked `secrets.json`, one that is group- or world-accessible, one owned outside the helper's trust boundary, contents that do not decode, a document written by a newer format version, a directory another user could replace entries in, or a filesystem that does not honour `chmod`. `message` carries the backend's own refusal, which names the exact `chmod`, `chown`, or move to perform. |
+| `secret_store_unusable` | no | 1 | The store could not be consulted at all, and repeating the request cannot change that: a symlinked `secrets.json`, one that is group- or world-accessible, one owned outside the helper's trust boundary, contents that do not decode (the outer document or a stored secret-env blob, on either backend), a document written by a newer format version, a directory another user could replace entries in, or a filesystem that does not honour `chmod`. `message` carries the backend's own refusal, which names the exact `chmod`, `chown`, or move to perform. Reported by every command that reads a secret, `maintenance prune`, `purge preview`/`purge apply` and `probe-repo` included — none of them may report it as retryable or as a restic failure, because restic never ran. |
 | `secret_rejected` | no | 1 | restic exit 12: the secret was read fine and restic refused it. |
 | `restic_not_found` | no | 1 | No restic binary anywhere that was searched. |
 | `restic_unsupported` | no | 1 | A restic was found and ran, but is below the minimum or is not restic. |

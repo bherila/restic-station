@@ -70,10 +70,15 @@ public enum CLIErrorCode: String, Sendable, Codable, CaseIterable, Equatable {
     case repositoryOffline = "repository_offline"
     /// restic exit 11: another restic process holds the repository lock.
     case repositoryLocked = "repository_locked"
-    /// The repository password or secret environment could not be *read* —
-    /// a locked login keychain at a pre-login tick, or a `secrets.json`
-    /// whose mode has been widened. Retryable: the same request can succeed
-    /// once the backend is available again.
+    /// The repository password or secret environment could not be *read*,
+    /// and repeating the identical request can succeed once the backend is
+    /// available again — a locked login keychain at a pre-login tick, an
+    /// I/O error, a lock held by a stuck peer.
+    ///
+    /// **Not** a `secrets.json` whose mode has been widened, which this
+    /// comment used to name: since #96 that is the non-retryable
+    /// ``secretStoreUnusable``, because no repetition of the read performs
+    /// the `chmod` the refusal names.
     case secretUnavailable = "secret_unavailable"
     /// The secret was read fine and restic rejected it (exit 12).
     ///
@@ -531,6 +536,15 @@ extension CLIFailure {
                 code: .repositoryOffline,
                 message: "The destination is offline. Reconnect it and run purge preview again.",
                 details: CLIErrorDetails(setId: setId, destinationId: destinationId)
+            )
+        case .secretStoreUnusable(let detail):
+            // Unlike `.unavailable` below, the cause here is known and the
+            // store has already named the repair, so the message carries it
+            // and the code is non-retryable (#96).
+            return CLIFailure(
+                code: .secretStoreUnusable,
+                message: bounded("The purge was refused: \(detail)"),
+                details: CLIErrorDetails(setId: setId)
             )
         case .unavailable:
             // `.unavailable` covers secret storage, the token index, and a

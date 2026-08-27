@@ -133,6 +133,10 @@ public enum PruneRepositoryResult: Equatable, Sendable {
 public enum PruneRepositorySkipReason: Equatable, Sendable {
     case busy
     case secretUnavailable
+    /// The secret store refused to be read at all. Split from
+    /// ``secretUnavailable`` because that one publishes a retryable code
+    /// and this condition is not retryable (#96).
+    case secretStoreUnusable(String)
     case staleMirror
     case previewChanged
     /// The reclaim binding outlived `PreviewTokenStore.defaultLifetime`.
@@ -1059,7 +1063,14 @@ public final class BackupEngine: Sendable {
             logWarning("BackupEngine: destination \(destination.id) is not in backup set \(set.id) — cannot prune")
             return .failed(.didNotRun)
         }
-        guard await secretsAvailable(for: [destination]) else { return .skipped(.secretUnavailable) }
+        switch await secretStoreRefusal(for: [destination]) {
+        case .none:
+            break
+        case .storeUnusable(let detail):
+            return .skipped(.secretStoreUnusable(detail))
+        case .some:
+            return .skipped(.secretUnavailable)
+        }
         let executablePath = authorization?.resticExecutablePath ?? resticExecutablePath
         let executableIdentity = authorization?.resticExecutableIdentity ?? resticExecutableIdentity
 
@@ -1224,6 +1235,12 @@ public final class BackupEngine: Sendable {
             return .failed(.offline(reason))
         case .error(let exitClass):
             return .failed(.restic(exitClass))
+        case .needsAttention(_, let reason):
+            // Not reachable in practice — the secret pre-flight above
+            // already refused anything that produces this — but spelled
+            // rather than folded into `.offline`, which publishes a
+            // retryable code.
+            return .skipped(.secretStoreUnusable(reason))
         }
 
         if dryRun {
@@ -1368,7 +1385,14 @@ public final class BackupEngine: Sendable {
         }
         defer { lock.release() }
 
-        guard await secretsAvailable(for: [destination]) else {
+        switch await secretStoreRefusal(for: [destination]) {
+        case .none:
+            break
+        case .storeUnusable(let detail):
+            // Not `.failed`, which publishes `restic_failed`: restic never
+            // ran, and the store's own message names the repair (#96).
+            return PurgePlanResult(plan: emptyPlan, status: .secretStoreUnusable, message: detail)
+        case .some:
             return PurgePlanResult(plan: emptyPlan, status: .failed, message: "secret store unavailable")
         }
 
@@ -1390,6 +1414,14 @@ public final class BackupEngine: Sendable {
                 plan: emptyPlan,
                 status: .failed,
                 message: exitClass.userFacingMessage
+            )
+        case .needsAttention(_, let reason):
+            // As above: already gated, spelled anyway so it cannot inherit
+            // a retryable status by omission.
+            return PurgePlanResult(
+                plan: emptyPlan,
+                status: .secretStoreUnusable,
+                message: reason
             )
         }
 
@@ -1531,7 +1563,7 @@ public final class BackupEngine: Sendable {
             switch result.status {
             case .empty, .ready:
                 continue
-            case .busy, .offline, .infrastructureFailure, .failed:
+            case .busy, .offline, .infrastructureFailure, .failed, .secretStoreUnusable:
                 return PurgePreviewSession(previews: previews, token: nil)
             }
         }
@@ -1718,7 +1750,12 @@ public final class BackupEngine: Sendable {
             throw PurgeApplyError.tokenDoesNotMatchCurrentPlan
         }
 
-        guard await secretsAvailable(for: pendingDestinations) else {
+        switch await secretStoreRefusal(for: pendingDestinations) {
+        case .none:
+            break
+        case .storeUnusable(let detail):
+            throw PurgeApplyError.secretStoreUnusable(detail)
+        case .some:
             throw PurgeApplyError.unavailable
         }
 
@@ -2399,7 +2436,14 @@ public final class BackupEngine: Sendable {
         trigger: RunTrigger,
         groupId: String
     ) async throws -> PurgeRunResult {
-        guard await secretsAvailable(for: [destination]) else { throw PurgeApplyError.unavailable }
+        switch await secretStoreRefusal(for: [destination]) {
+        case .none:
+            break
+        case .storeUnusable(let detail):
+            throw PurgeApplyError.secretStoreUnusable(detail)
+        case .some:
+            throw PurgeApplyError.unavailable
+        }
         // Captured before the plan query, not after it: the automatic path
         // mints and spends its own token, so the same "one binary for the
         // whole operation" rule applies here (#118).
@@ -3375,7 +3419,8 @@ public final class BackupEngine: Sendable {
             return "preview-token store unusable — \(detail)"
         case .token(.unavailable), .token(.unknown), .token(.expired),
              .token(.alreadyUsed), .tokenDoesNotMatchCurrentPlan, .busy,
-             .destinationOffline, .unavailable, .resticUnavailable:
+             .destinationOffline, .unavailable, .secretStoreUnusable,
+             .resticUnavailable:
             // Refusals and transient conditions, not broken infrastructure.
             // Enumerated (no `default`) so a new `PurgeApplyError` or
             // `PreviewTokenError` case must decide whether it is an
@@ -3402,7 +3447,7 @@ public final class BackupEngine: Sendable {
             case .reachable:
                 status.reachable = true
                 status.lastError = nil
-            case .offline, .error:
+            case .offline, .error, .needsAttention:
                 status.reachable = false
                 status.lastError = self.describe(probe)
             }
@@ -3482,6 +3527,8 @@ public final class BackupEngine: Sendable {
             return reason
         case .error(let exitClass):
             return exitClass.userFacingMessage
+        case .needsAttention(_, let reason):
+            return reason
         }
     }
 
@@ -3531,18 +3578,47 @@ public final class BackupEngine: Sendable {
     /// `.skipped` without writing a run record (`docs/architecture.md`
     /// §Error taxonomy).
     private func secretsAvailable(for destinations: [Destination]) async -> Bool {
+        await secretStoreRefusal(for: destinations) == nil
+    }
+
+    /// The first destination's secret-store failure, or `nil` if every
+    /// password read succeeded.
+    ///
+    /// Returned typed rather than as a `Bool` so a caller can tell a
+    /// permanent refusal from a locked keychain. Every caller that only
+    /// needs "did it work" keeps using ``secretsAvailable(for:)``.
+    private func secretStoreRefusal(for destinations: [Destination]) async -> SecretStoreError? {
         for destination in destinations {
             do {
                 _ = try await secrets.password(destId: destination.id)
+            } catch let error as SecretStoreError {
+                // Exhaustive, no `default:` — a new `SecretStoreError` case
+                // must be judged here rather than inheriting the retryable
+                // reading by omission (#96).
+                switch error {
+                case .storeUnusable(let detail):
+                    logWarning(
+                        "BackupEngine: \(secretStoreDescription) refused to be read for destination "
+                            + "\"\(destination.label)\" — \(detail)"
+                    )
+                case .itemNotFound, .backendFailed, .lockUnusable:
+                    logWarning(
+                        "BackupEngine: \(secretStoreDescription) could not be read for destination "
+                            + "\"\(destination.label)\" — skipping (retryable, nothing recorded)"
+                    )
+                }
+                return error
             } catch {
                 logWarning(
                     "BackupEngine: \(secretStoreDescription) could not be read for destination "
                         + "\"\(destination.label)\" — skipping (retryable, nothing recorded)"
                 )
-                return false
+                // Not a `SecretStoreError`: transient is the safe direction
+                // for the unknown, matching `ResticRunner`'s pre-flight.
+                return .backendFailed("\(error)")
             }
         }
-        return true
+        return nil
     }
 
     /// Finds the set that owns `destId` (a destination id is unique across

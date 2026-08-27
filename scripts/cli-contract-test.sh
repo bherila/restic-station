@@ -585,6 +585,12 @@ assert_success_envelope "probe-repo --json (offline)"
 jq -e '.data | .outcome == "offline" and .reachable == false and .reason != null' "$OUT_FILE" >/dev/null \
     || fail "probe-repo offline must be a success envelope with outcome=offline at exit 3, got $(jq -c . "$OUT_FILE")"
 mv "$REPO_DIR.unplugged" "$REPO_DIR"
+
+# There is deliberately no third probe-repo case here: this fixture's only
+# destination is a local path, which `Reachability` answers with a
+# `FileManager` existence check and never reads a secret for. The
+# permanent-refusal arm (`outcome` replaced by a non-retryable error
+# envelope, #96) is pinned in Swift by `ReachabilityTests` instead.
 mark_cmd "probe-repo"
 ok "probe-repo: reachable → ok/0, offline → success envelope with outcome=offline at exit 3"
 

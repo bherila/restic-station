@@ -112,6 +112,12 @@ public struct PurgePlanResult: Equatable, Sendable {
         /// query itself could not complete.
         case infrastructureFailure
         case failed
+        /// The secret store refused to be read at all, so restic never ran.
+        /// Distinct from ``failed`` because that publishes `restic_failed`,
+        /// and from ``offline`` because that publishes a retryable code —
+        /// neither is true of a store whose refusal names the `chmod` to
+        /// run (#96).
+        case secretStoreUnusable
     }
 
     public let plan: PurgePlan
@@ -213,6 +219,15 @@ public enum PurgeApplyError: Error, Equatable, Sendable {
     case auditFailure(reason: String, operationMayHaveRun: Bool, runId: String)
     case destinationOffline(destinationId: UUID)
     case unavailable
+    /// The secret store refused to be read, and repeating the identical
+    /// request cannot repair it (``SecretStoreError/storeUnusable(_:)``).
+    ///
+    /// Split from ``unavailable``, whose whole point is that it is
+    /// cause-neutral *and retryable*: it covers secret storage, the token
+    /// index, and a failed `snapshots` listing alike. That is the right
+    /// answer for all three transient causes and the wrong one here, where
+    /// the store has already told the operator what to change (#96).
+    case secretStoreUnusable(String)
     /// No restic executable could be identified, so no destructive purge
     /// capability may be minted or honoured. Distinct from ``unavailable``
     /// because the remedy is specific: restore the configured binary
