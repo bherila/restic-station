@@ -582,6 +582,29 @@ directory descriptor cannot instead be opened `O_PATH`/`O_SEARCH` as lock
 parents are: it is also the fsync target for durable publication, and Linux
 rejects `fsync(2)` on an `O_PATH` descriptor.
 
+### State-path permission invariants
+
+Four conditions, in the spirit of `docs/scheduling.md` §Purge safety
+invariants. They exist because the permission handling above was derived one
+review round at a time, each fix creating the next finding; a change that
+cannot violate one of these is bookkeeping, not danger.
+
+1. **Nothing another uid could write is trusted.** Any path under `state/`
+   that is group- or world-writable is refused before its contents are read,
+   at both the setup and read boundaries.
+2. **The refusal binds to the inode consumed**, not to a pathname, wherever a
+   descriptor can be obtained — and it must not be separated from its use by a
+   repair. Nothing that could erase the evidence may run between the two,
+   which is why an existing `state/` mode is never repaired automatically:
+   narrowing that interval is not the same as removing it.
+3. **Guidance names only the subject actually exposed.** A two-byte marker
+   defect must never send an operator at the canonical document, and a
+   foreign-owned path must never be reported as an owner-fixable mode.
+4. **Repairing a mode is never evidence the bytes are trustworthy.** The
+   envelope checksum is unkeyed, so a forged watermark verifies; wherever a
+   write exposure is refused, the guidance says so — including at whichever
+   boundary the caller actually exits from.
+
 ## state/repo-status-<destId>.json
 
 ```json
