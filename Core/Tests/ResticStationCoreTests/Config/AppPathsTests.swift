@@ -452,6 +452,66 @@ struct AppPathsEnvTests {
         #expect(after?.uint16Value == 0o755, "no automatic repair means no erase window")
     }
 
+    /// Not repairing an existing mode cuts both ways: a *restrictive* one is
+    /// no longer normalised either, and `0500`/`0600` leave the directory
+    /// unusable — locks and temp files cannot be created, and valid state
+    /// reads as corrupt. Refuse rather than accept a broken tree.
+    /// `0500` keeps owner search, so the directory opens on both platforms and
+    /// the mode check is what refuses it — the case that pins the guidance.
+    @Test("a pre-existing 0500 state/ refuses setup and names the chmod")
+    func ensureDirectoriesRefusesASearchOnlyStateDirectory() throws {
+        let (paths, root) = makeTempPaths()
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: NSNumber(value: mode_t(0o700))],
+                ofItemAtPath: paths.stateDir.path
+            )
+            try? FileManager.default.removeItem(at: root)
+        }
+        try paths.ensureDirectories()
+        try FileManager.default.setAttributes(
+            [.posixPermissions: NSNumber(value: mode_t(0o500))],
+            ofItemAtPath: paths.stateDir.path
+        )
+
+        do {
+            try paths.ensureDirectories()
+            Issue.record("0500 must refuse, not be accepted")
+        } catch {
+            let text = "\(error)"
+            #expect(text.contains("denies the owner access"))
+            #expect(text.contains("chmod 700"))
+        }
+    }
+
+    /// `0600` and `0400` drop owner search, and which layer refuses them is
+    /// platform-dependent: Darwin's `O_SEARCH` needs execute so the open
+    /// itself fails, while Linux's `O_PATH` opens regardless and the mode
+    /// check refuses. Both are refusals; the test asserts only that, because
+    /// asserting the message would encode one platform's syscall semantics.
+    @Test("a pre-existing state/ without owner search refuses setup on either platform")
+    func ensureDirectoriesRefusesAStateDirectoryWithoutOwnerSearch() throws {
+        for mode in [mode_t(0o600), mode_t(0o400)] {
+            let (paths, root) = makeTempPaths()
+            defer {
+                try? FileManager.default.setAttributes(
+                    [.posixPermissions: NSNumber(value: mode_t(0o700))],
+                    ofItemAtPath: paths.stateDir.path
+                )
+                try? FileManager.default.removeItem(at: root)
+            }
+            try paths.ensureDirectories()
+            try FileManager.default.setAttributes(
+                [.posixPermissions: NSNumber(value: mode)],
+                ofItemAtPath: paths.stateDir.path
+            )
+
+            #expect(throws: (any Error).self, "mode \(String(mode, radix: 8)) must refuse") {
+                try paths.ensureDirectories()
+            }
+        }
+    }
+
     /// A newly created `state/` is still pinned to `0700`; only *existing*
     /// modes are left alone.
     @Test("a freshly created state/ is still pinned to 0700")

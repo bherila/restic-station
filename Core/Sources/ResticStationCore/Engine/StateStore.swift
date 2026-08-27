@@ -1018,9 +1018,30 @@ public struct StateStore: Sendable {
         )
         guard fd >= 0 else {
             let code = errno
-            return code == ENOENT
-                ? .missing
-                : .failed(.ioFailure(operation: "open schedule state", errno: code))
+            if code == ENOENT { return .missing }
+            // A canonical document that denies the owner read but grants
+            // another uid write (`0220`) fails this open before the mode
+            // guard below can classify it, so the write exposure would be
+            // reported as a bare I/O error with no `chmod` and none of the
+            // inspect-and-replace warning. Descriptor-relative, like the
+            // marker: the parent descriptor is in hand.
+            if code == EACCES {
+                var info = stat()
+                let statted = paths.scheduleStateFile.lastPathComponent.withCString {
+                    fstatat(directoryFD, $0, &info, AT_SYMLINK_NOFOLLOW)
+                }
+                if statted == 0,
+                   (info.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG),
+                   info.st_uid == geteuid(),
+                   info.st_mode & 0o022 != 0 {
+                    return .failed(.unsafeMode(
+                        subject: .canonicalDocument,
+                        path: paths.scheduleStateFile.path,
+                        mode: info.st_mode
+                    ))
+                }
+            }
+            return .failed(.ioFailure(operation: "open schedule state", errno: code))
         }
         defer { _ = fileOperations.close(fd) }
 

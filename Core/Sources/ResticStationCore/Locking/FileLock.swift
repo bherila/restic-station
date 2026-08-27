@@ -598,6 +598,23 @@ public final class FileLock: @unchecked Sendable {
         // Callers holding safety-authoritative state pass
         // `tightenExisting: false` for exactly that reason: with no automatic
         // repair there is no interval in which evidence can be destroyed.
+        // Not repairing an existing mode means a *restrictive* one is no
+        // longer normalised either, and `0500` (no owner write) or `0600` (no
+        // owner search) leaves the directory unusable — locks and temp files
+        // cannot be created, and valid state reads as corrupt. Refuse those
+        // too rather than accepting a broken tree: same rule, no repair, but
+        // the operator is told which way it is wrong.
+        if unsafeExistingGuidance != nil, !createdDirectory, info.st_mode & mode != mode {
+            return LockFailure(
+                path: directoryPath,
+                operation: "protected directory mode "
+                    + "\(String(info.st_mode & 0o777, radix: 8)) denies the owner access it "
+                    + "needs — it is not repaired automatically; run chmod "
+                    + "\(String(mode, radix: 8)) \(ShellQuoting.quoteIfNeeded(directoryPath))",
+                errnoValue: 0
+            )
+        }
+
         if let guidance = unsafeExistingGuidance, !createdDirectory, info.st_mode & 0o022 != 0 {
             return LockFailure(
                 path: directoryPath,

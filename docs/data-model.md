@@ -573,9 +573,10 @@ A `state/` that others can write but this user cannot read (`0333`) fails the
 `O_RDONLY` open before the mode check runs, so it is diagnosed by pathname and
 still reported as the directory-mode refusal rather than a bare I/O error —
 unless it is also foreign-owned, which outranks mode exactly as it does on the
-descriptor path, since `chmod` is not advice that user can act on. A marker
-that denies the owner read while granting group/world access (`0066`) is
-diagnosed the same way, but descriptor-relative (`fstatat` through the retained
+descriptor path, since `chmod` is not advice that user can act on. A canonical
+document that denies the owner read while granting another uid write (`0220`)
+and a marker that denies the owner read while granting group/world access
+(`0066`) are diagnosed the same way, but descriptor-relative (`fstatat` through the retained
 `state/` descriptor), so it keeps the marker-only recovery instead of reaching
 the two-file branch that would risk the canonical document. The
 directory descriptor cannot instead be opened `O_PATH`/`O_SEARCH` as lock

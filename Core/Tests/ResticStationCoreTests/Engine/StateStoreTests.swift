@@ -412,6 +412,48 @@ struct StateStoreTests {
         #expect(!failure.recoveryMessage.contains("replace both files"))
     }
 
+    /// A canonical document that denies the owner read but grants another uid
+    /// write (`0220`) fails its open before the mode guard can classify it, so
+    /// the write exposure would surface as a bare I/O error — no `chmod`, and
+    /// none of the inspect-and-replace warning the exposure requires.
+    ///
+    /// Guarded: root reads a `0220` file regardless.
+    @Test(
+        "an owner-unreadable but writable canonical document is still a mode defect",
+        .enabled(if: canInjectPermissionFaults, "root ignores file read denial")
+    )
+    func unreadableWritableCanonicalDocumentIsClassifiedAsAModeDefect() throws {
+        let (store, root) = makeStore()
+        let paths = AppPaths(root: root)
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: NSNumber(value: mode_t(0o600))],
+                ofItemAtPath: paths.scheduleStateFile.path
+            )
+            try? FileManager.default.removeItem(at: root)
+        }
+        try paths.ensureDirectories()
+        _ = try store.updateScheduleState(setId: UUID()) { $0.checkCount = 1 }
+
+        try FileManager.default.setAttributes(
+            [.posixPermissions: NSNumber(value: mode_t(0o220))],
+            ofItemAtPath: paths.scheduleStateFile.path
+        )
+
+        guard case .corrupt(let failure) = store.readScheduleStateResult() else {
+            Issue.record("an owner-unreadable, writable canonical document must refuse")
+            return
+        }
+        guard case .unsafeMode(let subject, _, _) = failure.reason else {
+            Issue.record("expected unsafeMode, got \(failure.reason)")
+            return
+        }
+        #expect(subject == .canonicalDocument)
+        #expect(failure.recoveryMessage.contains("chmod 600"))
+        // A write exposure keeps its warning however it was reached.
+        #expect(failure.recoveryMessage.contains("Inspect the canonical document"))
+    }
+
     /// `0333` is writable by others but unreadable by us, so the `O_RDONLY`
     /// open fails `EACCES` before the mode guard can run. Without a diagnosis
     /// it surfaces as a generic I/O error whose recovery text points at
