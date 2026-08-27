@@ -21,8 +21,15 @@ public struct PurgePlan: Equatable, Sendable {
         self.destinationId = destinationId
         self.patterns = patterns
 
+        // Both sides are normalized: restic records the paths it was given
+        // after its own normalization, while config.json keeps the operator's
+        // string verbatim. Comparing them raw made `/a//b` and `/a/b` — the
+        // same directory — unequal, so every snapshot fell into
+        // `unattributed` and purge silently did nothing.
+        let comparableSources = Set(sourcePaths.map(Self.normalizedForComparison))
         let attributed = snapshots.filter { snapshot in
-            let pathsMatch = Set(snapshot.paths).isSubset(of: sourcePaths)
+            let pathsMatch = Set(snapshot.paths.map(Self.normalizedForComparison))
+                .isSubset(of: comparableSources)
             let hostnameMatches = hostnames.contains(snapshot.hostname)
                 || hostnames.contains(where: {
                     MachineIdentity.slugify($0) == MachineIdentity.slugify(snapshot.hostname)
@@ -32,6 +39,37 @@ public struct PurgePlan: Equatable, Sendable {
         let matchedIDs = Set(attributed.map(\.id))
         self.matched = attributed
         self.unattributed = snapshots.filter { !matchedIDs.contains($0.id) }
+    }
+
+    /// Lexically normalizes an absolute path so two spellings of the same
+    /// directory compare equal.
+    ///
+    /// Collapses repeated separators and strips a trailing separator. It is
+    /// deliberately **pure**: this type has no filesystem or restic
+    /// dependency, so no symlink is resolved and the disk is never consulted.
+    /// `.` and `..` are left alone for the same reason — resolving them
+    /// lexically is wrong in the presence of symlinks, and
+    /// `AppConfig.validate()` already requires absolute source paths.
+    ///
+    /// Comparison only. Never write a normalized path back to config, and
+    /// never pass one to restic: the operator's string stays authoritative.
+    static func normalizedForComparison(_ path: String) -> String {
+        var collapsed = ""
+        collapsed.reserveCapacity(path.count)
+        var previousWasSeparator = false
+        for character in path {
+            if character == "/" {
+                if previousWasSeparator { continue }
+                previousWasSeparator = true
+            } else {
+                previousWasSeparator = false
+            }
+            collapsed.append(character)
+        }
+        if collapsed.count > 1, collapsed.hasSuffix("/") {
+            collapsed.removeLast()
+        }
+        return collapsed
     }
 
     /// Convenience for pure callers that have a raw, shared `BackupSet`.

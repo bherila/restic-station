@@ -1302,6 +1302,101 @@ struct BackupEngineTests {
         #expect(command.argv == Self.backupArgv(env.primary.repoURL, excludes: expectedExcludes))
     }
 
+    /// The load-bearing half of watermark-gated purge, asserted against the
+    /// **engine's own** invocation rather than a command the test builds.
+    ///
+    /// `backupArgvCarriesPurgeExcludesAfterPlainExcludes` above constructs the
+    /// command itself, so it stays green even if `runSet` regressed to plain
+    /// `excludes`. That regression is exactly what makes gating unsound: if a
+    /// purge pattern were not also a forward exclude, every backup would
+    /// re-capture what the purge just rewrote out of history, and skipping a
+    /// purge because the watermark says "applied" would leave the pattern in
+    /// the repository forever.
+    @Test("purgeExcludes: the engine's own backup invocation carries them, so a satisfied watermark is safe")
+    func engineBackupInvocationCarriesPurgeExcludes() async throws {
+        let env = Self.makeEnv(
+            script: [],
+            retention: nil,
+            excludes: ["node_modules"],
+            purgeExcludes: ["secrets/"],
+            reachableSecondaries: []
+        )
+        defer { env.cleanUp() }
+
+        // Watermark already records the rule as applied for the primary, so
+        // the purge phase is skipped and this run is backup-only.
+        try env.stateStore.updateScheduleState(setId: env.set.id) { entry in
+            entry.appliedPurgeExcludes[Self.primaryId] = ["secrets/"]
+        }
+
+        let expectedExcludes = ["node_modules", "secrets/"]
+        env.fake.script = Self.resticCall(
+            Self.backupArgv(env.primary.repoURL, excludes: expectedExcludes),
+            dest: Self.primaryId,
+            stdoutLines: Self.backupStream()
+        )
+
+        let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
+
+        guard case .completed(let status, _, let children) = outcome else {
+            Issue.record("expected .completed, got \(outcome)")
+            return
+        }
+        #expect(status == .success)
+        // No purge child: the watermark alone gated it.
+        #expect(children.map(\.kind) == [.backup])
+        #expect(env.resticArgvs.filter { $0.contains("rewrite") }.isEmpty)
+
+        let backupArgv = try #require(env.resticArgvs.first { $0.contains("backup") })
+        #expect(backupArgv == [Self.resticPath] + Self.backupArgv(
+            env.primary.repoURL,
+            excludes: expectedExcludes
+        ))
+    }
+
+    /// Retention starvation regression.
+    ///
+    /// Every purge produces a *bounded* snapshot generation, and a bounded
+    /// generation deliberately withholds `markSynced`, mirror retention and
+    /// primary retention. When scheduled purge re-ran on every tick, a set
+    /// with any `purgeExcludes` therefore never reached a clean run: `forget`
+    /// and `prune` stopped executing permanently and mirrors read as stale
+    /// forever. Gating on the watermark restores a reachable clean run.
+    @Test("a satisfied purge watermark leaves retention running, not permanently withheld")
+    func satisfiedWatermarkLeavesRetentionRunning() async throws {
+        let env = Self.makeEnv(
+            script: [],
+            retention: RetentionPolicy(keepLast: 3),
+            purgeExcludes: ["secrets/"],
+            reachableSecondaries: []
+        )
+        defer { env.cleanUp() }
+
+        try env.stateStore.updateScheduleState(setId: env.set.id) { entry in
+            entry.appliedPurgeExcludes[Self.primaryId] = ["secrets/"]
+        }
+
+        var script = Self.resticCall(
+            Self.backupArgv(env.primary.repoURL, excludes: ["secrets/"]),
+            dest: Self.primaryId,
+            stdoutLines: Self.backupStream()
+        )
+        script += Self.resticCall(Self.forgetArgv(env.primary.repoURL), dest: Self.primaryId)
+        env.fake.script = script
+
+        let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
+
+        guard case .completed(let status, _, let children) = outcome else {
+            Issue.record("expected .completed, got \(outcome)")
+            return
+        }
+        #expect(status == .success)
+        // No purge child, and retention still ran.
+        #expect(children.map(\.kind) == [.backup, .prune])
+        #expect(env.resticArgvs.filter { $0.contains("rewrite") }.isEmpty)
+        #expect(env.resticArgvs.contains([Self.resticPath] + Self.forgetArgv(env.primary.repoURL)))
+    }
+
     // MARK: - Safety invariant: forget never targets an un-copied mirror
 
     @Test("safety: a mirror whose copy failed is never a forget target, even as the only secondary")
@@ -4554,80 +4649,19 @@ struct BackupEngineTests {
         )
     }
 
-    @Test("automatic purge does not let a concurrent watermark suppress repository revalidation")
-    func automaticPurgeIgnoresPatternAppliedDuringPlanning() async throws {
-        let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]
-        let hostnames = [Self.setId: Set(["example-mac.local"])]
-        let stateStore = Box<StateStore?>(nil)
-        let changedState = Box(false)
-        let env = Self.makeEnv(
-            script: [], retention: nil, purgeExcludes: ["build/**"], reachableSecondaries: [],
-            onSpawn: { argv in
-                guard argv.contains("snapshots"),
-                      !changedState.value,
-                      let stateStore = stateStore.value else { return }
-                changedState.value = true
-                _ = try? stateStore.updateScheduleState(setId: Self.setId) { state in
-                    state.appliedPurgeExcludes[Self.primaryId] = ["build/**"]
-                }
-            },
-            purgeSourcePaths: sourcePaths,
-            purgeHostnames: hostnames
-        )
-        stateStore.value = env.stateStore
-        defer { env.cleanUp() }
-        let snapshotsJSON = try FixtureLoader.string("snapshots.json")
-        let snapshots = try parseSnapshots(Data(snapshotsJSON.utf8))
-        let rewrite = try FixtureLoader.string("rewrite-forget.txt")
-            .replacingOccurrences(of: "09b3295c", with: snapshots[0].shortId)
-            .replacingOccurrences(of: "b2435423", with: snapshots[1].shortId)
-        env.fake.script = Self.resticCall(
-            Self.backupArgv(env.primary.repoURL, excludes: env.set.purgeExcludes),
-            dest: Self.primaryId,
-            stdoutLines: Self.backupStream()
-        ) + Self.repositoryConfigCall(
-            env.primary.repoURL,
-            dest: Self.primaryId
-        ) + Self.resticCall(
-            ["-r", env.primary.repoURL, "snapshots", "--json"],
-            dest: Self.primaryId,
-            stdoutLines: [snapshotsJSON]
-        ) + Self.repositoryConfigCall(
-            env.primary.repoURL,
-            dest: Self.primaryId
-        ) + Self.resticCall(
-            ["-r", env.primary.repoURL, "snapshots", "--json"],
-            dest: Self.primaryId,
-            stdoutLines: [snapshotsJSON]
-        ) + Self.purgeLaunchValidationCalls(
-            env.primary.repoURL,
-            dest: Self.primaryId,
-            snapshotsJSON: snapshotsJSON
-        ) + Self.resticCall(
-            Self.rewriteArgv(
-                env.primary.repoURL,
-                snapshotIDs: snapshots.map(\.id),
-                patterns: env.set.purgeExcludes
-            ),
-            dest: Self.primaryId,
-            stdoutLines: rewrite.split(separator: "\n").map(String.init)
-        )
-
-        let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
-
-        guard case .completed(let status, _, let children) = outcome else {
-            Issue.record("the repository must still be revalidated: \(outcome)")
-            return
-        }
-        #expect(status == .success)
-        #expect(children.map(\.kind) == [.backup, .purge])
-        #expect(changedState.value)
-        #expect(env.resticArgvs.filter { $0.contains("snapshots") }.count == 3)
-        #expect(env.resticArgvs.filter { $0.contains("rewrite") }.count == 1)
-    }
-
-    @Test("automatic purge repairs a lost watermark from durable terminal success")
-    func automaticPurgeReconcilesSuccessfulRunAfterWatermarkSyncFailure() async throws {
+    /// The self-heal that makes a lost watermark merely wasteful rather than
+    /// dangerous, and the reason no watermark needs to be *inferred* from run
+    /// history: the pattern is still pending, so the next run simply re-runs
+    /// the rewrite. restic reports a real no-op and the watermark is
+    /// re-established. Losing a watermark costs one idempotent restic
+    /// invocation; fabricating one from historical evidence would have cost
+    /// correctness.
+    ///
+    /// Depends on the no-op transcript parsing — see
+    /// `docs/restic-cli.md` §rewrite. `assert_purge_noop_self_heals` in
+    /// scripts/integration-test.sh pins the same path against real restic.
+    @Test("automatic purge repairs a lost watermark by re-running the rewrite as a no-op")
+    func automaticPurgeRepairsLostWatermarkByReRunningAsNoOp() async throws {
         let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]
         let hostnames = [Self.setId: Set(["example-mac.local"])]
         let fault = ArmedScheduleDirectorySyncFailure()
@@ -4755,7 +4789,7 @@ struct BackupEngineTests {
 
         let second = await env.engine.runSet(env.set, trigger: .scheduled)
         guard case .completed(let status, _, let children) = second else {
-            Issue.record("the next run must revalidate despite terminal watermark evidence: \(second)")
+            Issue.record("the next run must re-run the pending rewrite and heal the watermark: \(second)")
             return
         }
         #expect(status == .success)
@@ -4768,8 +4802,20 @@ struct BackupEngineTests {
         )
     }
 
-    @Test("watermark recovery ignores successful purge evidence from a replaced repository")
-    func purgeRecoveryBindsRepositoryIdentity() async throws {
+    // MARK: - Historical purge evidence is never authority
+    //
+    // A previous build reconstructed the purge watermark by *inferring* it
+    // from historical run records (`successfulPurgePatterns`). That derived
+    // authority instead of observing it, and produced roughly six rounds of
+    // P1 findings. It is gone: a lost watermark now heals by simply re-running
+    // the pending rewrite, which restic reports as a no-op.
+    //
+    // These cases each stage run history that the old inference would have
+    // consumed, and require the rewrite to happen anyway. They are the
+    // regression guard against re-introducing that shortcut.
+
+    @Test("historical evidence from a replaced repository never suppresses a pending rewrite")
+    func historicalEvidenceFromReplacedRepositoryDoesNotSuppressRewrite() async throws {
         let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]
         let hostnames = [Self.setId: Set(["example-mac.local"])]
         let env = Self.makeEnv(
@@ -5031,8 +5077,8 @@ struct BackupEngineTests {
         #expect(throws: Never.self) { _ = try env.engine.purgeTokenDestinationIDs(token.value) }
     }
 
-    @Test("watermark recovery rejects a pre-purge repository generation with the same config id")
-    func purgeRecoveryBindsSnapshotGeneration() async throws {
+    @Test("historical evidence from a pre-purge generation with the same config id never suppresses a pending rewrite")
+    func historicalEvidenceFromPrePurgeGenerationDoesNotSuppressRewrite() async throws {
         let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]
         let hostnames = [Self.setId: Set(["example-mac.local"])]
         let env = Self.makeEnv(
@@ -5110,8 +5156,8 @@ struct BackupEngineTests {
         #expect(env.resticArgvs.filter { $0.contains("rewrite") }.count == 1)
     }
 
-    @Test("watermark recovery rejects an attributed snapshot absent from terminal generation")
-    func purgeRecoveryRejectsExtraAttributedSnapshot() async throws {
+    @Test("historical evidence missing an attributed snapshot never suppresses a pending rewrite")
+    func historicalEvidenceMissingAttributedSnapshotDoesNotSuppressRewrite() async throws {
         let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]
         let hostnames = [Self.setId: Set(["example-mac.local"])]
         let env = Self.makeEnv(
@@ -5207,8 +5253,8 @@ struct BackupEngineTests {
         #expect(env.resticArgvs.filter { $0.contains("rewrite") }.count == 1)
     }
 
-    @Test("watermark recovery rejects duplicate purge result prefixes")
-    func purgeRecoveryRejectsDuplicateResultPrefixes() async throws {
+    @Test("historical evidence with duplicate purge result prefixes never suppresses a pending rewrite")
+    func historicalEvidenceWithDuplicatePrefixesDoesNotSuppressRewrite() async throws {
         let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]
         let hostnames = [Self.setId: Set(["example-mac.local"])]
         let env = Self.makeEnv(
@@ -5296,171 +5342,6 @@ struct BackupEngineTests {
         #expect(result.status == .success)
         #expect(result.children.count == 1, "duplicate result prefixes cannot repair the watermark")
         #expect(env.resticArgvs.filter { $0.contains("rewrite") }.count == 1)
-    }
-
-    @Test("watermark recovery revalidates canonical purge evidence at its use boundary")
-    func purgeRecoveryRevalidatesCanonicalEvidence() async throws {
-        let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]
-        let hostnames = [Self.setId: Set(["example-mac.local"])]
-        let metadataURL = Box<URL?>(nil)
-        let tampered = Box(false)
-        let env = Self.makeEnv(
-            script: [], retention: nil, purgeExcludes: ["build/**"], reachableSecondaries: [],
-            onSpawn: { argv in
-                guard argv.suffix(2) == ["cat", "config"],
-                      !tampered.value,
-                      let metadataURL = metadataURL.value,
-                      let data = try? Data(contentsOf: metadataURL),
-                      var metadata = try? ConfigStore.makeDecoder().decode(
-                          RunMetadata.self,
-                          from: data
-                      ) else { return }
-                metadata.purgePatterns = ["build/**", "tampered-after-audit/**"]
-                guard let changed = try? ConfigStore.makeEncoder().encode(metadata) else { return }
-                try? changed.write(to: metadataURL, options: .atomic)
-                tampered.value = true
-            },
-            purgeSourcePaths: sourcePaths,
-            purgeHostnames: hostnames
-        )
-        defer { env.cleanUp() }
-        let snapshotsJSON = try FixtureLoader.string("snapshots.json")
-        let snapshots = try parseSnapshots(Data(snapshotsJSON.utf8))
-        let rewrittenSnapshotsJSON = snapshotsJSON
-            .replacingOccurrences(
-                of: snapshots[0].id,
-                with: "14a53542" + String(repeating: "a", count: 56)
-            )
-            .replacingOccurrences(of: snapshots[0].shortId, with: "14a53542")
-            .replacingOccurrences(
-                of: snapshots[1].id,
-                with: "3ca2e0a5" + String(repeating: "b", count: 56)
-            )
-            .replacingOccurrences(of: snapshots[1].shortId, with: "3ca2e0a5")
-        let rewrittenSnapshots = try parseSnapshots(Data(rewrittenSnapshotsJSON.utf8))
-        var historical = try env.runStore.begin(
-            kind: .purge,
-            setId: Self.setId,
-            destId: Self.primaryId,
-            trigger: .scheduled
-        )
-        historical.argvRedacted = [Self.resticPath, "rewrite", "--forget"] + snapshots.map(\.id)
-        historical.purgePatterns = env.set.purgeExcludes
-        historical.purgeRepositoryId = Self.repositoryId
-        try env.runStore.markDestructiveLaunchAuthorized(historical)
-        try env.runStore.finish(
-            historical,
-            status: .success,
-            resticExitCode: 0,
-            purgeSnapshotRewrites: [
-                snapshots[0].id: "14a53542",
-                snapshots[1].id: "3ca2e0a5",
-            ]
-        )
-        metadataURL.value = env.paths.runMetadataFile(runId: historical.runId)
-        let plan = PurgePlan(
-            destinationId: env.primary.id,
-            snapshots: rewrittenSnapshots,
-            sourcePaths: sourcePaths[Self.setId]!,
-            hostnames: hostnames[Self.setId]!,
-            patterns: env.set.purgeExcludes
-        )
-        let token = try #require(try env.engine.issuePurgeToken(
-            set: env.set,
-            destinations: [env.primary],
-            plans: [plan],
-            executable: try env.requireResticExecutable()
-        ))
-        env.fake.script = Self.repositoryConfigCall(
-            env.primary.repoURL,
-            dest: env.primary.id
-        ) + Self.resticCall(
-            ["-r", env.primary.repoURL, "snapshots", "--json"],
-            dest: env.primary.id,
-            stdoutLines: [rewrittenSnapshotsJSON]
-        )
-
-        do {
-            _ = try await env.engine.runPurge(
-                set: env.set,
-                destinations: [env.primary],
-                token: token.value
-            )
-            Issue.record("metadata changed after audit verification must not repair the watermark")
-        } catch let error as PurgeApplyError {
-            guard case .infrastructureFailure(_, let operationMayHaveRun) = error else {
-                Issue.record("expected infrastructure failure, got \(error)")
-                return
-            }
-            #expect(!operationMayHaveRun)
-        }
-        #expect(tampered.value)
-        #expect(!env.resticArgvs.contains { $0.contains("rewrite") })
-        let applied = env.stateStore.readScheduleState()?.sets[Self.setId]?.appliedPurgeExcludes ?? [:]
-        #expect((applied[env.primary.id] ?? []).isEmpty)
-    }
-
-    @Test("legacy purge evidence without repository identity fails closed")
-    func purgeRecoveryRejectsUnboundLegacyEvidence() async throws {
-        let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]
-        let hostnames = [Self.setId: Set(["example-mac.local"])]
-        let env = Self.makeEnv(
-            script: [], retention: nil, purgeExcludes: ["build/**"], reachableSecondaries: [],
-            purgeSourcePaths: sourcePaths, purgeHostnames: hostnames
-        )
-        defer { env.cleanUp() }
-        var legacy = try env.runStore.begin(
-            kind: .purge,
-            setId: Self.setId,
-            destId: Self.primaryId,
-            trigger: .scheduled
-        )
-        legacy.argvRedacted = [Self.resticPath, "rewrite", "--forget", "snapshot"]
-        legacy.purgePatterns = env.set.purgeExcludes
-        try env.runStore.markDestructiveLaunchAuthorized(legacy)
-        try env.runStore.finish(legacy, status: .success, resticExitCode: 0)
-
-        let snapshotsJSON = try FixtureLoader.string("snapshots.json")
-        let snapshots = try parseSnapshots(Data(snapshotsJSON.utf8))
-        let plan = PurgePlan(
-            destinationId: env.primary.id,
-            snapshots: snapshots,
-            sourcePaths: sourcePaths[Self.setId]!,
-            hostnames: hostnames[Self.setId]!,
-            patterns: env.set.purgeExcludes
-        )
-        let token = try #require(try env.engine.issuePurgeToken(
-            set: env.set,
-            destinations: [env.primary],
-            plans: [plan],
-            executable: try env.requireResticExecutable()
-        ))
-        env.fake.script = Self.repositoryConfigCall(
-            env.primary.repoURL,
-            dest: env.primary.id
-        ) + Self.resticCall(
-            ["-r", env.primary.repoURL, "snapshots", "--json"],
-            dest: env.primary.id,
-            stdoutLines: [snapshotsJSON]
-        )
-
-        do {
-            _ = try await env.engine.runPurge(
-                set: env.set,
-                destinations: [env.primary],
-                token: token.value
-            )
-            Issue.record("unbound legacy recovery evidence must refuse automatic reconciliation")
-        } catch let error as PurgeApplyError {
-            guard case .infrastructureFailure(let reason, let operationMayHaveRun) = error else {
-                Issue.record("expected infrastructure failure, got \(error)")
-                return
-            }
-            #expect(reason.contains("run history unusable"))
-            #expect(!operationMayHaveRun)
-        }
-        #expect(!env.resticArgvs.contains { $0.contains("rewrite") })
-        #expect(throws: Never.self) { _ = try env.engine.purgeTokenDestinationIDs(token.value) }
     }
 
     @Test("partial terminal purge evidence cannot suppress scheduled repository revalidation")

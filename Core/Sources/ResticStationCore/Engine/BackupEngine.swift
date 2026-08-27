@@ -406,26 +406,25 @@ public final class BackupEngine: Sendable {
         // copied anywhere. A failed primary purge terminates the group: a
         // copy would otherwise propagate rewritten snapshots while leaving
         // their originals on an unpurged mirror.
-        // A purge watermark records history; it is not repository-generation
-        // evidence. Revalidate every active rule on every run so a snapshot
-        // created by another host during the previous query→rewrite gap can
-        // never be omitted permanently.
-        let primaryPurgePatterns = set.purgeExcludes
+        // Only rules this destination has not already had applied. See
+        // `pendingPurgePatterns` for why the watermark is sufficient
+        // authority to skip, and `docs/scheduling.md` §Purge for the
+        // multi-host case it deliberately does not chase.
+        let primaryPurgePatterns: [String]
+        do {
+            primaryPurgePatterns = try pendingPurgePatterns(
+                setId: set.id,
+                set: set,
+                destinationId: primary.id
+            )
+        } catch {
+            let reason = "schedule state unusable before purge — \(error)"
+            logWarning("BackupEngine: \(reason)")
+            return .infrastructureFailure(reason: reason)
+        }
         var primaryPurgeSnapshotPrefixes: [String] = []
         if !primaryPurgePatterns.isEmpty {
             do {
-                // Validate the canonical state before repository I/O. The
-                // automatic path no longer trusts the watermark to skip a
-                // purge, but corruption must still fail closed rather than
-                // be overwritten by the later audit update.
-                do {
-                    _ = try trustedScheduleState()
-                } catch {
-                    throw PurgeApplyError.infrastructureFailure(
-                        reason: "schedule state unusable before purge — \(error)",
-                        operationMayHaveRun: false
-                    )
-                }
                 let purge = try await runAutomaticPurge(
                     set: set,
                     destination: primary,
@@ -487,17 +486,20 @@ public final class BackupEngine: Sendable {
             // would retain its old snapshots alongside the primary's rewritten
             // replacements. A failed purge skips only this secondary; another
             // mirror can still make a safe copy.
-            let secondaryPurgePatterns = set.purgeExcludes
+            let secondaryPurgePatterns: [String]
+            do {
+                secondaryPurgePatterns = try pendingPurgePatterns(
+                    setId: set.id,
+                    set: set,
+                    destinationId: secondary.id
+                )
+            } catch {
+                let reason = "schedule state unusable before purge — \(error)"
+                logWarning("BackupEngine: \(reason)")
+                return .infrastructureFailure(reason: reason)
+            }
             if !secondaryPurgePatterns.isEmpty {
                 do {
-                    do {
-                        _ = try trustedScheduleState()
-                    } catch {
-                        throw PurgeApplyError.infrastructureFailure(
-                            reason: "schedule state unusable before purge — \(error)",
-                            operationMayHaveRun: false
-                        )
-                    }
                     let purge = try await runAutomaticPurge(
                         set: set,
                         destination: secondary,
@@ -1633,7 +1635,6 @@ public final class BackupEngine: Sendable {
         token: String,
         trigger: RunTrigger,
         groupId: String?,
-        revalidateAllPatterns: Bool = false
     ) async throws -> PurgeRunResult {
         // Bind the watermark evidence through repository validation, every
         // destructive launch, and the matching durable acknowledgement. The
@@ -1687,22 +1688,18 @@ public final class BackupEngine: Sendable {
             throw PurgeApplyError.tokenDoesNotMatchCurrentPlan
         }
 
-        // Manual apply retains the historical pending-pattern behavior. A
-        // scheduled apply deliberately revalidates every active pattern:
-        // the watermark cannot prove that another host did not add a new
-        // snapshot after the preceding purge query.
+        // Both manual and scheduled apply narrow the previewed patterns to
+        // each destination's still-pending subset, read beneath the held
+        // lease. Divergent primary/mirror progress therefore neither repeats
+        // completed work nor invalidates work another destination still owes.
         var pendingPatternsByDestination: [UUID: [String]] = [:]
         for destination in destinations {
-            if revalidateAllPatterns {
-                pendingPatternsByDestination[destination.id] = preview.patterns
-            } else {
-                let applied = Set(
-                    scheduleStateLease.state.sets[set.id]?
-                        .appliedPurgeExcludes[destination.id] ?? []
-                )
-                pendingPatternsByDestination[destination.id] = preview.patterns.filter {
-                    !applied.contains($0)
-                }
+            let applied = Set(
+                scheduleStateLease.state.sets[set.id]?
+                    .appliedPurgeExcludes[destination.id] ?? []
+            )
+            pendingPatternsByDestination[destination.id] = preview.patterns.filter {
+                !applied.contains($0)
             }
         }
         let pendingDestinations = destinations.filter {
@@ -1829,78 +1826,16 @@ public final class BackupEngine: Sendable {
             plans.append((destination, current.plan, current.repositoryId, destinationSecretEnv))
         }
 
-        // `rewrite --forget` publishes terminal run metadata before the
-        // schedule watermark. If the later directory fsync fails, a crash
-        // may lose that rename even though the repository mutation and its
-        // canonical audit record are durable. Reconcile that exact success
-        // while both the destructive-audit gate and schedule-state lease are
-        // held, then consume this now-stale token before returning/refusing.
-        // The audit scan above makes malformed or incomplete destructive
-        // history fail closed before it can feed this decision.
-        let successfulPatterns: [UUID: Set<String>]
-        do {
-            successfulPatterns = revalidateAllPatterns ? [:] : try successfulPurgePatterns(
-                setId: set.id,
-                pendingPatternsByDestination: pendingPatternsByDestination,
-                repositoryIdsByDestination: Dictionary(
-                    uniqueKeysWithValues: plans.map { ($0.destination.id, $0.repositoryId) }
-                ),
-                liveSnapshotIdsByDestination: Dictionary(
-                    uniqueKeysWithValues: plans.map {
-                        (
-                            $0.destination.id,
-                            Set(($0.plan.matched + $0.plan.unattributed).map(\.id))
-                        )
-                    }
-                )
-            )
-        } catch {
-            throw PurgeApplyError.infrastructureFailure(
-                reason: "run history unusable — could not reconcile purge watermark evidence: \(error)",
-                operationMayHaveRun: false
-            )
-        }
-        var reconciledAnyPattern = false
-        for destination in pendingDestinations {
-            guard let successful = successfulPatterns[destination.id] else { continue }
-            let applied = Set(
-                scheduleStateLease.state.sets[set.id]?
-                    .appliedPurgeExcludes[destination.id] ?? []
-            )
-            let recovered = (pendingPatternsByDestination[destination.id] ?? []).filter {
-                successful.contains($0) && !applied.contains($0)
-            }
-            guard !recovered.isEmpty else { continue }
-            try markPurgePatternsApplied(
-                setId: set.id,
-                destinationId: destination.id,
-                patterns: recovered,
-                operationMayHaveRun: false,
-                scheduleStateLease: scheduleStateLease
-            )
-            reconciledAnyPattern = true
-        }
-        if reconciledAnyPattern {
-            do {
-                _ = try previewTokens.consume(token)
-            } catch let error as PreviewTokenError {
-                throw PurgeApplyError.token(error)
-            } catch {
-                throw PurgeApplyError.unavailable
-            }
-            let fullyReconciled = pendingDestinations.allSatisfy { destination in
-                let applied = Set(
-                    scheduleStateLease.state.sets[set.id]?
-                        .appliedPurgeExcludes[destination.id] ?? []
-                )
-                return (pendingPatternsByDestination[destination.id] ?? [])
-                    .allSatisfy(applied.contains)
-            }
-            guard fullyReconciled else {
-                throw PurgeApplyError.tokenDoesNotMatchCurrentPlan
-            }
-            return PurgeRunResult(status: .success, children: [])
-        }
+        // A crash between the durable `rewrite --forget` metadata and the
+        // schedule watermark rename loses only the watermark. That is
+        // recoverable by construction: the next run finds the pattern still
+        // pending, re-runs the rewrite, restic reports a no-op, and the
+        // watermark is re-established (see `pendingPurgePatterns`, and the
+        // `rewrite` summary contract in docs/restic-cli.md). Reconstructing
+        // the watermark by *inferring* it from historical run records instead
+        // was strictly more dangerous — it derives authority rather than
+        // observing it — for the sole benefit of skipping one idempotent
+        // restic invocation.
 
         do {
             _ = try previewTokens.consume(token)
@@ -2360,78 +2295,40 @@ public final class BackupEngine: Sendable {
         )
     }
 
-    /// Returns only patterns bound into durable, terminal successful purge
-    /// records. The caller must first hold the destructive gate and pass
-    /// `unresolvedAuditFailures`, which verifies canonical metadata against
-    /// its index projection and refuses malformed or incomplete history.
-    private func successfulPurgePatterns(
+    /// The patterns in `set.purgeExcludes` that this destination's durable
+    /// watermark does not already record as applied.
+    ///
+    /// **Why a watermark is sufficient authority to skip.** A purge pattern
+    /// is also a *forward* backup exclude: `backup` receives
+    /// `BackupSet.effectiveBackupExcludes`, which is `excludes` followed by
+    /// `purgeExcludes`. Once a rule has been applied retroactively, no
+    /// snapshot this host writes afterwards can contain it, so the rewrite is
+    /// a one-time historical cleanup and not an obligation to re-run on every
+    /// tick. Re-running it unconditionally costs a full repository rewrite
+    /// scan per scheduled run — unaffordable on a remote backend — and
+    /// permanently withholds retention, because every purge produces a
+    /// bounded generation and a bounded generation withholds `forget`.
+    ///
+    /// **What it deliberately does not chase.** A peer host still on an older
+    /// config can write a snapshot containing the pattern after this host's
+    /// watermark is set. That snapshot is attributable to this host only when
+    /// the set names the peer in `machines`; either way the peer heals it from
+    /// its own watermark when it picks up the shared config.
+    /// `docs/scheduling.md` §Purge dispositions this: under-purging is
+    /// recoverable, over-purging is not.
+    ///
+    /// **Fails closed.** Unreadable or malformed schedule state throws rather
+    /// than reading as "nothing applied yet" — the latter silently re-arms a
+    /// destructive `rewrite --forget` on every run (issue #113).
+    private func pendingPurgePatterns(
         setId: UUID,
-        pendingPatternsByDestination: [UUID: [String]],
-        repositoryIdsByDestination: [UUID: String],
-        liveSnapshotIdsByDestination: [UUID: Set<String>]
-    ) throws -> [UUID: Set<String>] {
-        var result: [UUID: Set<String>] = [:]
-        for entry in try runStore.recentRuns(setId: setId, limit: Int.max)
-            where entry.kind == .purge
-                && entry.status == .success
-                && repositoryIdsByDestination[entry.destId] != nil {
-            let metadata = try runStore.metadata(runId: entry.runId)
-            guard metadata.runId == entry.runId,
-                  metadata.kind == .purge,
-                  metadata.setId == setId,
-                  metadata.destId == entry.destId,
-                  metadata.status == .success,
-                  metadata.indexEntry == entry else {
-                throw RunStoreError.discardUnsafe(
-                    path: paths.runMetadataFile(runId: entry.runId).path
-                )
-            }
-            guard let patterns = metadata.purgePatterns else { continue }
-            let pending = Set(pendingPatternsByDestination[entry.destId] ?? [])
-            guard !pending.isDisjoint(with: patterns) else { continue }
-            guard let recordedRepositoryId = metadata.purgeRepositoryId else {
-                throw RunStoreError.discardUnsafe(
-                    path: paths.runMetadataFile(runId: entry.runId).path
-                )
-            }
-            guard recordedRepositoryId == repositoryIdsByDestination[entry.destId] else {
-                continue
-            }
-            guard let rewrites = metadata.purgeSnapshotRewrites,
-                  !rewrites.isEmpty else {
-                throw RunStoreError.discardUnsafe(
-                    path: paths.runMetadataFile(runId: entry.runId).path
-                )
-            }
-            guard Set(rewrites.values).count == rewrites.count else {
-                // Two historical entries must never derive authority from
-                // the same surviving result snapshot. Ignore ambiguous
-                // history and re-run the live purge plan.
-                continue
-            }
-            let liveIds = liveSnapshotIdsByDestination[entry.destId] ?? []
-            guard liveIds.count == rewrites.count else {
-                // Extra snapshots were not part of the launch-authorized
-                // repository generation and cannot inherit its watermark.
-                continue
-            }
-            let generationMatches = rewrites.allSatisfy { oldId, newShortId in
-                if newShortId == String(oldId.prefix(8)) {
-                    // A selected no-op remains present under its original id.
-                    return liveIds.contains(oldId)
-                }
-                return !liveIds.contains(oldId)
-                    && liveIds.lazy.filter { $0.hasPrefix(newShortId) }.prefix(2).count == 1
-            }
-            guard generationMatches else {
-                // A repository restored to a pre-purge generation can keep
-                // its config id. Its old snapshots are live work, not
-                // authority to repair the missing schedule watermark.
-                continue
-            }
-            result[entry.destId, default: []].formUnion(patterns)
-        }
-        return result
+        set: BackupSet,
+        destinationId: UUID
+    ) throws -> [String] {
+        let applied = Set(
+            try trustedScheduleState().sets[setId]?.appliedPurgeExcludes[destinationId] ?? []
+        )
+        return set.purgeExcludes.filter { !applied.contains($0) }
     }
 
     private func trustedScheduleState() throws -> ScheduleState {
@@ -2499,7 +2396,6 @@ public final class BackupEngine: Sendable {
             token: token.value,
             trigger: trigger,
             groupId: groupId,
-            revalidateAllPatterns: true
         )
     }
 

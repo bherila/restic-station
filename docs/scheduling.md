@@ -297,16 +297,38 @@ Rules (anacron semantics):
 
 ## Purge-exclusion ordering
 
-When a set has any active `purgeExcludes`, every successful scheduled backup
-run adds a purge phase. `appliedPurgeExcludes` is durable audit history, not a
-repository-generation lock: another host can add a snapshot after one
-`snapshots` process exits and before the separate `rewrite` process starts.
-Trusting the watermark to skip future live observation would make that
-snapshot a permanent omission. The fixed order is:
+When a set has `purgeExcludes` this destination's `appliedPurgeExcludes`
+watermark does not already record, a successful scheduled backup run adds a
+purge phase for the still-pending patterns. Once every pattern is recorded,
+the purge phase is skipped.
+
+**Why the watermark is sufficient authority to skip.** A purge pattern is also
+a *forward* exclude: `backup` receives `BackupSet.effectiveBackupExcludes`,
+which is `excludes` followed by `purgeExcludes`. After a rule has been applied
+retroactively, no snapshot this host writes afterwards can contain it, so the
+rewrite is a one-time historical cleanup rather than an obligation to re-run
+every tick. Re-running it unconditionally costs a full repository rewrite scan
+per scheduled run and — because every purge yields a *bounded* generation, and
+a bounded generation withholds `markSynced` and retention — leaves a
+purge-enabled set with no reachable clean run: retention and prune stop
+permanently and mirrors read as stale forever.
+
+**What this deliberately does not chase.** A peer host still on an older
+config can write a snapshot containing the pattern after this host's watermark
+is set. That snapshot is attributable here only when the set names the peer in
+`machines`, and either way the peer heals it from its own watermark when it
+picks up the shared config. Under-purging is recoverable; over-purging is not.
+
+A lost watermark is likewise recoverable by construction: the pattern reads as
+pending again, the next run re-runs the rewrite, restic reports a no-op (see
+`docs/restic-cli.md` §rewrite), and the watermark is re-established. Nothing
+infers a watermark from historical run records.
+
+The fixed order is:
 
 1. back up the primary with the effective forward excludes;
-2. revalidate and purge the primary with `rewrite --forget` over its currently
-   attributed snapshot ids, even when every pattern is already recorded;
+2. purge the primary with `rewrite --forget` over its currently attributed
+   snapshot ids, for the patterns its watermark does not already record;
 3. for each reachable secondary, revalidate and purge it first, then copy only
    the exact primary snapshot generation produced by step 2;
 4. resolve the purge outputs to exact full primary snapshot ids and use those
@@ -358,25 +380,23 @@ as applied would create a false success-shaped outcome. A removed pattern
 stays recorded as history, but only currently configured patterns are
 revalidated.
 
-Manual token apply still narrows each destination to preview patterns absent
-from its watermark and refuses a token with no pending pair. Scheduled apply
-does not: it binds every active pattern into a fresh token and revalidates all
-of them under the shared schedule-state lease. Terminal successful purge
-metadata is durably committed before the watermark. If the watermark's
-directory fsync then fails and a crash loses its visible rename, a later
-manual apply holds both the
-destructive-audit gate and the schedule-state lease, revalidates the token's
-snapshot attribution, reads the live restic repository config id, verifies the
-complete run history, and restores only the exact `purgePatterns` whose
-launch-bound `purgeRepositoryId` matches that live repository **and** whose
-recorded complete-repository old-to-result snapshot mapping matches the live
-post-rewrite generation (the snapshot count is exact; a rewritten old id is
-absent and its new id is present exactly once; a legitimate no-op or
-unattributed snapshot maps to its own short id and remains present). The
-repository id is queried again inside the runner immediately before the synchronous
-executable/token/audit/spawn boundary, and the complete repository snapshot-id
-set is re-listed there and compared with the generation observed during token
-revalidation. Malformed identity or snapshot JSON retains an explicit
+Both manual and scheduled apply narrow each destination to the preview
+patterns absent from its watermark, read beneath the held schedule-state
+lease, and refuse a token with no pending pair. Divergent primary/mirror
+progress therefore neither repeats completed work nor invalidates work another
+destination still owes.
+
+Terminal successful purge metadata is durably committed before the watermark.
+If the watermark's directory fsync then fails and a crash loses its visible
+rename, the pattern simply reads as pending on the next run and the rewrite
+re-runs as a no-op. Reconstructing the watermark by inferring it from
+historical run records was removed: it derived authority instead of observing
+it, for the sole benefit of skipping one idempotent restic invocation.
+
+The repository id is queried inside the runner immediately before the
+synchronous executable/token/audit/spawn boundary, and the complete repository
+snapshot-id set is re-listed there and compared with the generation observed
+during token revalidation. Malformed identity or snapshot JSON retains an explicit
 infrastructure reason instead of being collapsed into secret unavailability. A
 replacement or stale-host backup in the earlier planning window refuses launch
 and restores a first-child token. Watermark recovery
@@ -400,10 +420,9 @@ cross-host race is contained by the terminal rewrite metadata: it maps every
 full snapshot id in the launch-time repository generation to its resulting
 short id, including identity mappings for legitimate no-ops and unattributed
 snapshots. Scheduled `copy` passes exactly those result ids as operands. A
-snapshot created after the launch observation is absent from the copy argv;
-because the watermark cannot suppress the next scheduled revalidation, that
-snapshot becomes attributed purge work on the next run rather than retaining
-excluded data permanently. Before copying, Restic Station resolves each output
+snapshot created after the launch observation is absent from the copy argv. It
+carries the forward excludes if this host wrote it, and is a peer's snapshot
+otherwise — see the multi-host disposition above. Before copying, Restic Station resolves each output
 prefix to exactly one live full snapshot id and supplies the full ids as copy
 operands; an absent or ambiguous result fails closed. No later primary query
 can bind evidence atomically through retention on a different repository, so a
