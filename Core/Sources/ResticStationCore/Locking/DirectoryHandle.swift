@@ -58,6 +58,21 @@ public final class DirectoryHandle: @unchecked Sendable {
         self.storedDescriptor = descriptor
     }
 
+    /// `lstat(2)` of a directory pathname, returning `nil` for anything that
+    /// is not a directory.
+    ///
+    /// **Diagnosis only.** A pathname lookup is not bound to any descriptor,
+    /// so nothing that grants authority may depend on it. It exists for the
+    /// cases where no descriptor can be obtained at all — a directory this
+    /// user cannot open — and where the only decision left is which refusal
+    /// to report.
+    static func directoryStatByPathname(_ path: String) -> stat? {
+        var info = stat()
+        guard path.withCString({ lstat($0, &info) }) == 0 else { return nil }
+        guard (info.st_mode & mode_t(S_IFMT)) == mode_t(S_IFDIR) else { return nil }
+        return info
+    }
+
     /// Opens and verifies `directory`, retaining the descriptor.
     ///
     /// - Parameter trustedRoot: the owner-controlled data-directory boundary
@@ -83,9 +98,18 @@ public final class DirectoryHandle: @unchecked Sendable {
     /// still want one retained generation for every later `*at(2)` call. The
     /// handle closes the descriptor on deinit; the caller must not.
     ///
-    /// The caller owns the verification in this route. Open with at least
-    /// `O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC` and check type and ownership on
-    /// the descriptor, exactly as ``open(_:trustedRoot:)`` does.
+    /// The caller owns the verification in this route, and this type cannot
+    /// enforce it. Open with at least `O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`
+    /// and, on the descriptor, refuse anything that is not a directory owned
+    /// by the effective uid, and any group- or world-writable mode — the
+    /// policy ``FileLock/verifyDirectory`` applies to an immediate lock
+    /// parent, since a directory adopted here is generally exactly that.
+    ///
+    /// Note this route deliberately does *not* reproduce
+    /// ``open(_:trustedRoot:)`` in full: there is no trusted-root chain, so
+    /// nothing here verifies the ancestors above `path`. Adopt only a
+    /// directory whose parentage the caller has already established by other
+    /// means.
     public static func adopting(descriptor: Int32, path: URL) -> DirectoryHandle {
         DirectoryHandle(path: path, descriptor: descriptor)
     }

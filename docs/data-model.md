@@ -540,6 +540,72 @@ Marker safety is classified before canonical version compatibility, so a
 newer-version document cannot hide a missing or unsafe marker that also needs
 operator repair.
 
+A **permission** defect is classified separately. `state/`, the canonical
+document, and the marker each fail closed when another uid could write them —
+the marker also when another uid could merely read it — and the refusal names
+the offending path and the shell-quoted `chmod` that repairs it (`700` for the
+directory, `600` for either file).
+
+Repairing the mode is not the same as trusting the bytes, and the guidance
+splits on which path was exposed. The **marker** holds only `1\n`: it carries no
+schedule or purge state and cannot alter any, so a widened marker — writable or
+merely readable — is repaired on its own and never implicates the canonical
+document. Sending an operator to replace that document for a two-byte file
+would discard trustworthy bookkeeping. The **canonical document** and **`state/`**
+are refused only for *write* exposure, so reaching that refusal means another
+uid could have written the document, directly or by swapping it through the
+directory. There `chmod` closes the exposure but proves nothing about what is
+already on disk: the envelope checksum is unkeyed, so a forged
+`appliedPurgeExcludes` verifies, and a fabricated watermark suppresses a
+required rewrite. That case keeps the inspect-and-replace guidance.
+
+That refusal is also reached before it can be erased. Setup runs before the
+safety-authoritative read, so it refuses a group/world-writable `state/` rather
+than repairing it, and it no longer auto-tightens a pre-existing mode at all —
+a refusal cannot be atomic with a later `fchmodat`, so repairing would leave an
+interval in which a widen lands after the check and is erased by the chmod. The
+refusal is made **on the descriptor in hand**, inside
+`FileLock.ensureDirectory`, not on a pathname check by the caller. Because a
+scheduled tick exits at that call, the failure also carries the trusted-copy
+guidance the reader below would have given.
+
+A `state/` that others can write but this user cannot read (`0333`) fails the
+`O_RDONLY` open before the mode check runs, so it is diagnosed by pathname and
+still reported as the directory-mode refusal rather than a bare I/O error —
+unless it is also foreign-owned, which outranks mode exactly as it does on the
+descriptor path, since `chmod` is not advice that user can act on. A canonical
+document that denies the owner read while granting another uid write (`0220`)
+and a marker that denies the owner read while granting group/world access
+(`0066`) are diagnosed the same way, but descriptor-relative (`fstatat` through the retained
+`state/` descriptor), so it keeps the marker-only recovery instead of reaching
+the two-file branch that would risk the canonical document. The
+directory descriptor cannot instead be opened `O_PATH`/`O_SEARCH` as lock
+parents are: it is also the fsync target for durable publication, and Linux
+rejects `fsync(2)` on an `O_PATH` descriptor.
+
+### State-path permission invariants
+
+Four conditions, in the spirit of `docs/scheduling.md` §Purge safety
+invariants. They exist because the permission handling above was derived one
+review round at a time, each fix creating the next finding; a change that
+cannot violate one of these is bookkeeping, not danger.
+
+1. **Nothing another uid could write is trusted.** Any path under `state/`
+   that is group- or world-writable is refused before its contents are read,
+   at both the setup and read boundaries.
+2. **The refusal binds to the inode consumed**, not to a pathname, wherever a
+   descriptor can be obtained — and it must not be separated from its use by a
+   repair. Nothing that could erase the evidence may run between the two,
+   which is why an existing `state/` mode is never repaired automatically:
+   narrowing that interval is not the same as removing it.
+3. **Guidance names only the subject actually exposed.** A two-byte marker
+   defect must never send an operator at the canonical document, and a
+   foreign-owned path must never be reported as an owner-fixable mode.
+4. **Repairing a mode is never evidence the bytes are trustworthy.** The
+   envelope checksum is unkeyed, so a forged watermark verifies; wherever a
+   write exposure is refused, the guidance says so — including at whichever
+   boundary the caller actually exits from.
+
 ## state/repo-status-<destId>.json
 
 ```json

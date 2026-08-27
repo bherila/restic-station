@@ -381,6 +381,191 @@ struct AppPathsEnvTests {
         #expect(values.isDirectory == true)
     }
 
+    /// Setup runs long before the safety-authoritative schedule-state read —
+    /// `Tick` calls `ensureDirectories()` roughly fifty lines earlier — and
+    /// `state/` is the one directory here that is re-tightened when it already
+    /// exists. Silently repairing a group/world-writable `state/` would erase
+    /// the evidence the read fails closed on, leaving a tree that looks
+    /// healthy after an exposure another uid could have written through.
+    @Test("a pre-existing group- or world-writable state/ refuses setup, evidence intact")
+    func ensureDirectoriesRefusesAWritableStateDirectory() throws {
+        for mode in [mode_t(0o722), mode_t(0o772), mode_t(0o777)] {
+            let (paths, root) = makeTempPaths()
+            defer { try? FileManager.default.removeItem(at: root) }
+            try paths.ensureDirectories()
+
+            try FileManager.default.setAttributes(
+                [.posixPermissions: NSNumber(value: mode)],
+                ofItemAtPath: paths.stateDir.path
+            )
+
+            #expect(throws: (any Error).self) {
+                try paths.ensureDirectories()
+            }
+
+            // `Tick` exits at this call, so this refusal is the only guidance
+            // the operator sees — it must carry what the schedule-state reader
+            // would have said, not just the chmod.
+            do {
+                try paths.ensureDirectories()
+                Issue.record("expected a refusal")
+            } catch {
+                let text = "\(error)"
+                #expect(text.contains("chmod 700"))
+                #expect(text.contains("against a trusted copy"))
+                #expect(text.contains("does not make the contents trustworthy"))
+            }
+
+            // The point of refusing rather than repairing: the mode is still
+            // there for the operator, and for the read that fails closed on it.
+            let after = try FileManager.default.attributesOfItem(
+                atPath: paths.stateDir.path
+            )[.posixPermissions] as? NSNumber
+            #expect(
+                after?.uint16Value == UInt16(mode),
+                "mode \(String(mode, radix: 8)) must survive the refusal, not be tightened away"
+            )
+        }
+    }
+
+    /// Benign widening is neither refused nor repaired. `0755` is listable but
+    /// exposes nothing another uid can act on, so refusing it would strand
+    /// installs over a privacy nit — and repairing it is what reintroduces the
+    /// window this whole guard closes, since a refusal cannot be atomic with a
+    /// later `fchmodat`. `state/` therefore behaves like `runs/` and `locks/`:
+    /// left alone — and, like theirs, not surfaced by health either, since
+    /// `verifyDirectory` rejects only group/world write. Accepted, not
+    /// reported.
+    @Test("a pre-existing 0755 state/ is left alone, neither refused nor tightened")
+    func ensureDirectoriesLeavesABenignStateDirectoryAlone() throws {
+        let (paths, root) = makeTempPaths()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try paths.ensureDirectories()
+
+        try FileManager.default.setAttributes(
+            [.posixPermissions: NSNumber(value: mode_t(0o755))],
+            ofItemAtPath: paths.stateDir.path
+        )
+        try paths.ensureDirectories() // must not throw
+
+        let after = try FileManager.default.attributesOfItem(
+            atPath: paths.stateDir.path
+        )[.posixPermissions] as? NSNumber
+        #expect(after?.uint16Value == 0o755, "no automatic repair means no erase window")
+    }
+
+    /// Not repairing an existing mode cuts both ways: a *restrictive* one is
+    /// no longer normalised either, and `0500`/`0600` leave the directory
+    /// unusable — locks and temp files cannot be created, and valid state
+    /// reads as corrupt. Refuse rather than accept a broken tree.
+    /// A mode can be both restrictive and exposed at once — `0333` is
+    /// owner-write-only *and* world-writable. Only the exposure branch carries
+    /// the trusted-copy warning, and on the `Tick` path this is the operator's
+    /// only message, so an ordering that let the restrictive branch win would
+    /// let someone chmod and restart without ever learning another uid may
+    /// have swapped in a checksum-valid forged watermark.
+    @Test("a mode that is both restrictive and exposed is diagnosed as the exposure")
+    func ensureDirectoriesPrefersTheExposureDiagnosis() throws {
+        // All keep owner execute, so the directory opens on both platforms
+        // and the *ordering* is what the assertion exercises — not Darwin's
+        // `O_SEARCH` refusing before either branch runs.
+        for mode in [mode_t(0o333), mode_t(0o533), mode_t(0o133)] {
+            let (paths, root) = makeTempPaths()
+            defer {
+                try? FileManager.default.setAttributes(
+                    [.posixPermissions: NSNumber(value: mode_t(0o700))],
+                    ofItemAtPath: paths.stateDir.path
+                )
+                try? FileManager.default.removeItem(at: root)
+            }
+            try paths.ensureDirectories()
+            try FileManager.default.setAttributes(
+                [.posixPermissions: NSNumber(value: mode)],
+                ofItemAtPath: paths.stateDir.path
+            )
+
+            do {
+                try paths.ensureDirectories()
+                Issue.record("mode \(String(mode, radix: 8)) must refuse")
+            } catch {
+                let text = "\(error)"
+                let label = "mode \(String(mode, radix: 8))"
+                #expect(text.contains("writable by other users"), "\(label)")
+                #expect(text.contains("against a trusted copy"), "\(label)")
+            }
+        }
+    }
+
+    /// `0500` keeps owner search, so the directory opens on both platforms and
+    /// the mode check is what refuses it — the case that pins the guidance.
+    @Test("a pre-existing 0500 state/ refuses setup and names the chmod")
+    func ensureDirectoriesRefusesASearchOnlyStateDirectory() throws {
+        let (paths, root) = makeTempPaths()
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: NSNumber(value: mode_t(0o700))],
+                ofItemAtPath: paths.stateDir.path
+            )
+            try? FileManager.default.removeItem(at: root)
+        }
+        try paths.ensureDirectories()
+        try FileManager.default.setAttributes(
+            [.posixPermissions: NSNumber(value: mode_t(0o500))],
+            ofItemAtPath: paths.stateDir.path
+        )
+
+        do {
+            try paths.ensureDirectories()
+            Issue.record("0500 must refuse, not be accepted")
+        } catch {
+            let text = "\(error)"
+            #expect(text.contains("denies the owner access"))
+            #expect(text.contains("chmod 700"))
+        }
+    }
+
+    /// `0600` and `0400` drop owner search, and which layer refuses them is
+    /// platform-dependent: Darwin's `O_SEARCH` needs execute so the open
+    /// itself fails, while Linux's `O_PATH` opens regardless and the mode
+    /// check refuses. Both are refusals; the test asserts only that, because
+    /// asserting the message would encode one platform's syscall semantics.
+    @Test("a pre-existing state/ without owner search refuses setup on either platform")
+    func ensureDirectoriesRefusesAStateDirectoryWithoutOwnerSearch() throws {
+        for mode in [mode_t(0o600), mode_t(0o400)] {
+            let (paths, root) = makeTempPaths()
+            defer {
+                try? FileManager.default.setAttributes(
+                    [.posixPermissions: NSNumber(value: mode_t(0o700))],
+                    ofItemAtPath: paths.stateDir.path
+                )
+                try? FileManager.default.removeItem(at: root)
+            }
+            try paths.ensureDirectories()
+            try FileManager.default.setAttributes(
+                [.posixPermissions: NSNumber(value: mode)],
+                ofItemAtPath: paths.stateDir.path
+            )
+
+            #expect(throws: (any Error).self, "mode \(String(mode, radix: 8)) must refuse") {
+                try paths.ensureDirectories()
+            }
+        }
+    }
+
+    /// A newly created `state/` is still pinned to `0700`; only *existing*
+    /// modes are left alone.
+    @Test("a freshly created state/ is still pinned to 0700")
+    func ensureDirectoriesPinsANewStateDirectory() throws {
+        let (paths, root) = makeTempPaths()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try paths.ensureDirectories()
+
+        let mode = try FileManager.default.attributesOfItem(
+            atPath: paths.stateDir.path
+        )[.posixPermissions] as? NSNumber
+        #expect(mode?.uint16Value == 0o700)
+    }
+
     @Test("operation directory setup does not depend on the health scratch path")
     func ensureDirectoriesIgnoresBrokenHealthScratch() throws {
         for scratchPath in [

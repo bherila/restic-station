@@ -414,17 +414,54 @@ public struct AppPaths: Equatable, Sendable {
         // pre-existing 755 dir staying 755), and the protection that matters
         // is per-file: the token index is 0600 and refuses to load if it is
         // not. This narrows the exposure without overriding that choice.
-        for (directory, tightenExisting) in [
-            (runsDir, false),
-            (stateDir, true),
-            (locksDir, false),
+        // `state/` is the only directory here that is re-tightened when it
+        // already exists, and setup runs *before* the safety-authoritative
+        // schedule-state read — `Tick` calls this roughly fifty lines earlier.
+        // Silently repairing a group/world-writable `state/` would therefore
+        // destroy the very evidence that read fails closed on: by the time
+        // anything could refuse, the exposure is gone and the tree looks
+        // healthy. That is the check-not-atomic-with-its-use pattern
+        // `AGENTS.md` §Safety rule 1 exists to rule out.
+        //
+        // The refusal lives inside `ensureDirectory`, on the same descriptor
+        // it would otherwise tighten, rather than in a pathname check here:
+        // a concurrent widen between an `lstat` here and the open there would
+        // otherwise slip straight through into a silent repair.
+        //
+        // `state/` no longer auto-tightens an existing mode either. Refusing
+        // cannot be made atomic with a later `fchmodat`, so a directory that
+        // both refuses *and* repairs still has an interval in which a widen
+        // lands after the check and is erased by the chmod. Not repairing at
+        // all removes the interval rather than narrowing it. Benign widening
+        // (`0755`) is therefore left in place, exactly as it is for `runs/`
+        // and `locks/` — and, like theirs, *not* surfaced by live health
+        // either, since `FileLock.verifyDirectory` rejects only group/world
+        // write. It is accepted rather than reported: a listable directory
+        // exposes nothing another uid can act on, and the protection that
+        // matters inside `state/` is per-file. A newly created directory is
+        // still pinned to `0700`.
+        //
+        // Because `Tick` exits at this call, the refusal must also carry the
+        // trusted-copy guidance the schedule-state reader would have given;
+        // an operator who only chmods and restarts could otherwise admit a
+        // forged, checksum-valid watermark.
+        let stateGuidance = "Repairing the mode does not make the contents trustworthy: "
+            + "the schedule-state checksum is unkeyed, so a forged purge watermark verifies. "
+            + "Inspect \(ShellQuoting.quoteIfNeeded(scheduleStateFile.path)) against a trusted "
+            + "copy before resuming, and replace it if you cannot account for its current state."
+
+        for (directory, tightenExisting, guidance) in [
+            (runsDir, false, String?.none),
+            (stateDir, false, String?.some(stateGuidance)),
+            (locksDir, false, String?.none),
         ] {
             if let failure = FileLock.ensureDirectory(
                 directory,
                 parent: root,
                 trustedRoot: root,
                 mode: 0o700,
-                tightenExisting: tightenExisting
+                tightenExisting: tightenExisting,
+                unsafeExistingGuidance: guidance
             ) {
                 throw failure
             }

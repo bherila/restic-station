@@ -342,6 +342,41 @@ public struct FdaCheckResult: Codable, Equatable, Sendable {
 
 // MARK: - StateStoreError
 
+/// Which path under `state/` a permission refusal names. Structured rather
+/// than spelled into free text because the operator remedy differs per
+/// subject, and because `recoveryMessage` must dispatch on it rather than
+/// substring-matching a human sentence.
+public enum UnsafeStateSubject: Equatable, Sendable {
+    case canonicalDocument
+    case versionMarker
+    case stateDirectory
+
+    public var subject: String {
+        switch self {
+        case .canonicalDocument: return "the canonical schedule-state document"
+        case .versionMarker: return "the schedule state version marker"
+        case .stateDirectory: return "the state directory"
+        }
+    }
+
+    /// The marker is refused for any group/world access; the canonical
+    /// document and the directory are refused only for *write* access.
+    fileprivate var refusal: String {
+        switch self {
+        case .versionMarker: return "accessible by other users"
+        case .canonicalDocument, .stateDirectory: return "writable by other users"
+        }
+    }
+
+    /// The mode that repairs the defect in place.
+    public var repairMode: String {
+        switch self {
+        case .canonicalDocument, .versionMarker: return "600"
+        case .stateDirectory: return "700"
+        }
+    }
+}
+
 public enum ScheduleStateReadFailureReason: Equatable, Sendable, CustomStringConvertible {
     case malformedDocument
     case checksumMismatch
@@ -349,6 +384,11 @@ public enum ScheduleStateReadFailureReason: Equatable, Sendable, CustomStringCon
     case versionMarkerMissing
     case unsupportedVersion(found: Int, current: Int)
     case unsafeFile(reason: String)
+    /// A path under `state/` carries permissions another uid could exploit.
+    /// Separate from ``unsafeFile`` because it is the one unsafe-path defect
+    /// an operator repairs in place, so it must not inherit the
+    /// replace-the-document recovery guidance.
+    case unsafeMode(subject: UnsafeStateSubject, path: String, mode: mode_t)
     case ioFailure(operation: String, errno: Int32)
     case tooLarge(bytes: Int64, limit: Int64)
 
@@ -366,6 +406,9 @@ public enum ScheduleStateReadFailureReason: Equatable, Sendable, CustomStringCon
             return "the document version is \(found), but this build supports version \(current)"
         case .unsafeFile(let reason):
             return "the canonical path is unsafe: \(reason)"
+        case .unsafeMode(let subject, let path, let mode):
+            return "\(subject.subject) at \(path) is \(subject.refusal) "
+                + "(mode \(String(mode & 0o777, radix: 8)))"
         case .ioFailure(let operation, let code):
             return "\(operation) failed with errno \(code)"
         case .tooLarge(let bytes, let limit):
@@ -414,6 +457,47 @@ public struct ScheduleStateReadFailure: Equatable, Sendable, CustomStringConvert
     }
 
     public var recoveryMessage: String {
+        // `chmod` closes the exposure, but it proves nothing about the bytes
+        // already on disk. Where another uid could *write* — the canonical
+        // document, or a `state/` whose write bit let it swap that document —
+        // the payload may already be forged, and the envelope checksum is
+        // unkeyed, so it authenticates nothing an editor could not recompute.
+        // Declaring those contents trustworthy because the mode was repaired
+        // would invite exactly the forged `appliedPurgeExcludes` that
+        // suppresses a required rewrite. Only a read-only exposure (the
+        // marker's stricter 0o077 threshold catches those) leaves the bytes
+        // provably untouched.
+        if case .unsafeMode(let subject, let path, _) = reason {
+            let repair = "`chmod \(subject.repairMode) \(ShellQuoting.quoteIfNeeded(path))`"
+            switch subject {
+            case .versionMarker:
+                // The marker holds only `1\n`. It carries no schedule or
+                // purge state and cannot alter any, so a widened marker never
+                // implicates the canonical document — sending an operator to
+                // replace that document would discard trustworthy bookkeeping
+                // over a defect confined to a two-byte file.
+                return description
+                    + ". Stop Restic Station and repair the marker with \(repair), or recreate it "
+                    + "as exactly `1\\n` with mode 0600. It carries no schedule or purge state, so "
+                    + "the canonical document is not implicated and must not be replaced or "
+                    + "deleted for this failure."
+            case .canonicalDocument, .stateDirectory:
+                // Both are refused only for *write* exposure, so reaching here
+                // means another uid could have written the document — directly,
+                // or by swapping it through `state/`. `chmod` closes the
+                // exposure but says nothing about bytes already on disk, and
+                // the envelope checksum is unkeyed, so a forged watermark
+                // verifies.
+                return description
+                    + ". Stop Restic Station and repair the mode with \(repair) — but closing the "
+                    + "exposure says nothing about the bytes already written. Another user could "
+                    + "write \(subject.subject), and the envelope checksum is unkeyed, so a forged "
+                    + "purge watermark would verify. Inspect the canonical document against a "
+                    + "trusted copy before resuming, and replace it if you cannot account for its "
+                    + "current state."
+            }
+        }
+
         let markerFailure: Bool
         switch reason {
         case .versionMarkerMissing:
@@ -714,9 +798,42 @@ public struct StateStore: Sendable {
         )
         guard descriptor >= 0 else {
             let code = errno
-            return code == ENOENT
-                ? .missing
-                : .failed(.ioFailure(operation: "open state directory", errno: code))
+            if code == ENOENT { return .missing }
+            // A `state/` that others can write but we cannot read (`0333`)
+            // fails `O_RDONLY` before the mode guard below ever runs, and
+            // would otherwise surface as a generic I/O error whose recovery
+            // text points at replacing the canonical document.
+            //
+            // The descriptor cannot simply be opened `O_PATH`/`O_SEARCH` the
+            // way `FileLock` opens a lock parent: this same descriptor is the
+            // fsync target for durable publication, and Linux rejects
+            // `fsync(2)` on an `O_PATH` descriptor with `EBADF`.
+            //
+            // So diagnose by pathname instead. This is deliberately the one
+            // unbound lookup in the read path: no descriptor exists to bind it
+            // to, no security decision rides on it, and the read fails closed
+            // either way — it only chooses which refusal to report.
+            if code == EACCES,
+               let info = DirectoryHandle.directoryStatByPathname(paths.stateDir.path) {
+                // Same order the descriptor path uses: ownership outranks
+                // mode. A foreign-owned `state/` is not an owner-controlled
+                // mode defect, and telling this user to `chmod 700` it is
+                // advice they cannot act on — worse, an administrator who did
+                // would leave it foreign-owned and still unusable.
+                if info.st_uid != geteuid() {
+                    return .failed(.unsafeFile(
+                        reason: "state directory owned by uid \(info.st_uid), expected \(geteuid())"
+                    ))
+                }
+                if info.st_mode & 0o022 != 0 {
+                    return .failed(.unsafeMode(
+                        subject: .stateDirectory,
+                        path: paths.stateDir.path,
+                        mode: info.st_mode
+                    ))
+                }
+            }
+            return .failed(.ioFailure(operation: "open state directory", errno: code))
         }
         var info = stat()
         guard fileOperations.stat(descriptor, &info) == 0 else {
@@ -732,6 +849,27 @@ public struct StateStore: Sendable {
             _ = fileOperations.close(descriptor)
             return .failed(.unsafeFile(
                 reason: "state directory owned by uid \(info.st_uid), expected \(geteuid())"
+            ))
+        }
+        // `FileLock.verifyDirectory` refuses a group/world-writable immediate
+        // lock parent, and `state/` *is* that parent for
+        // `schedule-state.lock`. Reads take that lock and publish quarantine
+        // copies beside the canonical document, so a reader that skipped this
+        // check would do both inside a directory another uid can rewrite —
+        // it could unlink the canonical file between our open and our lock,
+        // or swap the quarantine copy we just wrote. Refusing here keeps one
+        // policy for the directory however it is reached.
+        //
+        // Write bits only, matching `verifyDirectory`: a legacy `0755`
+        // `state/` exposes nothing another uid can act on, and refusing it
+        // would strand installs that predate the `0700` tightening in
+        // `AppPaths.ensureDirectories()`.
+        guard info.st_mode & 0o022 == 0 else {
+            _ = fileOperations.close(descriptor)
+            return .failed(.unsafeMode(
+                subject: .stateDirectory,
+                path: paths.stateDir.path,
+                mode: info.st_mode
             ))
         }
         return .opened(DirectoryHandle.adopting(descriptor: descriptor, path: paths.stateDir))
@@ -880,9 +1018,30 @@ public struct StateStore: Sendable {
         )
         guard fd >= 0 else {
             let code = errno
-            return code == ENOENT
-                ? .missing
-                : .failed(.ioFailure(operation: "open schedule state", errno: code))
+            if code == ENOENT { return .missing }
+            // A canonical document that denies the owner read but grants
+            // another uid write (`0220`) fails this open before the mode
+            // guard below can classify it, so the write exposure would be
+            // reported as a bare I/O error with no `chmod` and none of the
+            // inspect-and-replace warning. Descriptor-relative, like the
+            // marker: the parent descriptor is in hand.
+            if code == EACCES {
+                var info = stat()
+                let statted = paths.scheduleStateFile.lastPathComponent.withCString {
+                    fstatat(directoryFD, $0, &info, AT_SYMLINK_NOFOLLOW)
+                }
+                if statted == 0,
+                   (info.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG),
+                   info.st_uid == geteuid(),
+                   info.st_mode & 0o022 != 0 {
+                    return .failed(.unsafeMode(
+                        subject: .canonicalDocument,
+                        path: paths.scheduleStateFile.path,
+                        mode: info.st_mode
+                    ))
+                }
+            }
+            return .failed(.ioFailure(operation: "open schedule state", errno: code))
         }
         defer { _ = fileOperations.close(fd) }
 
@@ -910,8 +1069,10 @@ public struct StateStore: Sendable {
         // an install's own state would be a worse failure than the exposure
         // that mode represents.
         guard info.st_mode & 0o022 == 0 else {
-            return .failed(.unsafeFile(
-                reason: "writable by other users (mode \(String(info.st_mode & 0o777, radix: 8)))"
+            return .failed(.unsafeMode(
+                subject: .canonicalDocument,
+                path: paths.scheduleStateFile.path,
+                mode: info.st_mode
             ))
         }
         let fileSize = Int64(info.st_size)
@@ -965,9 +1126,34 @@ public struct StateStore: Sendable {
         )
         guard fd >= 0 else {
             let code = errno
-            return code == ENOENT
-                ? .missing
-                : .failed(.ioFailure(operation: "open schedule state version marker", errno: code))
+            if code == ENOENT { return .missing }
+            // A marker that denies the owner read but grants group/world
+            // access (`0066`) fails this open before the mode guard below can
+            // classify it, and the legacy marker-recovery branch would then
+            // tell the operator to inspect or replace *both* files — risking
+            // valid schedule and purge bookkeeping over a two-byte file.
+            //
+            // Unlike `state/` itself, the parent descriptor is in hand here,
+            // so this diagnosis is descriptor-relative rather than a pathname
+            // lookup: `fstatat` through `directoryFD`, without following a
+            // symlink.
+            if code == EACCES {
+                var info = stat()
+                let statted = paths.scheduleStateVersionMarkerFile.lastPathComponent.withCString {
+                    fstatat(directoryFD, $0, &info, AT_SYMLINK_NOFOLLOW)
+                }
+                if statted == 0,
+                   (info.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG),
+                   info.st_uid == geteuid(),
+                   info.st_mode & 0o077 != 0 {
+                    return .failed(.unsafeMode(
+                        subject: .versionMarker,
+                        path: paths.scheduleStateVersionMarkerFile.path,
+                        mode: info.st_mode
+                    ))
+                }
+            }
+            return .failed(.ioFailure(operation: "open schedule state version marker", errno: code))
         }
         defer { _ = fileOperations.close(fd) }
 
@@ -984,7 +1170,11 @@ public struct StateStore: Sendable {
             ))
         }
         guard info.st_mode & 0o077 == 0 else {
-            return .failed(.unsafeFile(reason: "schedule state version marker is accessible by other users"))
+            return .failed(.unsafeMode(
+                subject: .versionMarker,
+                path: paths.scheduleStateVersionMarkerFile.path,
+                mode: info.st_mode
+            ))
         }
         guard Int64(info.st_size) == Int64(Self.scheduleStateVersionMarkerBytes.count) else {
             return .failed(.unsafeFile(reason: "schedule state version marker has invalid contents"))

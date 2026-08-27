@@ -517,7 +517,8 @@ public final class FileLock: @unchecked Sendable {
         parent: URL,
         trustedRoot: URL,
         mode: mode_t,
-        tightenExisting: Bool = true
+        tightenExisting: Bool = true,
+        unsafeExistingGuidance: String? = nil
     ) -> LockFailure? {
         let directoryPath = directory.standardizedFileURL.path
         guard directory.deletingLastPathComponent().standardizedFileURL.path
@@ -583,6 +584,52 @@ public final class FileLock: @unchecked Sendable {
         }
         guard info.st_uid == geteuid() else {
             return LockFailure(path: directoryPath, operation: "protected directory ownership", errnoValue: 0)
+        }
+
+        // Bind the safety decision to this descriptor, never to an earlier
+        // pathname lookup by the caller: another process can widen the
+        // directory between the two. `info` came from `fstat(directoryFD)`
+        // above, so this is the mode of the inode actually in hand.
+        //
+        // Note the guarantee is only as strong as the caller's `tightenExisting`
+        // choice. Refusing here cannot be atomic with a later `fchmodat`, so a
+        // caller that both refuses *and* auto-tightens still has a window in
+        // which a widen lands after this check and is erased by that chmod.
+        // Callers holding safety-authoritative state pass
+        // `tightenExisting: false` for exactly that reason: with no automatic
+        // repair there is no interval in which evidence can be destroyed.
+        // Order matters: a mode can be *both* restrictive and exposed (`0333`
+        // is owner-write-only and world-writable at once). Only the exposure
+        // branch carries the trusted-copy warning, and on the `Tick` path this
+        // is the operator's only message, so exposure is diagnosed first —
+        // its `chmod` repairs the restrictive half too.
+        if let guidance = unsafeExistingGuidance, !createdDirectory, info.st_mode & 0o022 != 0 {
+            return LockFailure(
+                path: directoryPath,
+                operation: "protected directory writable by other users "
+                    + "(mode \(String(info.st_mode & 0o777, radix: 8))) — not repaired "
+                    + "automatically, because that would erase the evidence; after confirming no "
+                    + "other user has written to it, run chmod \(String(mode, radix: 8)) "
+                    + "\(ShellQuoting.quoteIfNeeded(directoryPath)). \(guidance)",
+                errnoValue: 0
+            )
+        }
+
+        // Not repairing an existing mode means a *restrictive* one is no
+        // longer normalised either, and `0500` (no owner write) or `0600` (no
+        // owner search) leaves the directory unusable — locks and temp files
+        // cannot be created, and valid state reads as corrupt. Refuse those
+        // too rather than accepting a broken tree: same rule, no repair, but
+        // the operator is told which way it is wrong.
+        if unsafeExistingGuidance != nil, !createdDirectory, info.st_mode & mode != mode {
+            return LockFailure(
+                path: directoryPath,
+                operation: "protected directory mode "
+                    + "\(String(info.st_mode & 0o777, radix: 8)) denies the owner access it "
+                    + "needs — it is not repaired automatically; run chmod "
+                    + "\(String(mode, radix: 8)) \(ShellQuoting.quoteIfNeeded(directoryPath))",
+                errnoValue: 0
+            )
         }
 
         if info.st_mode & 0o777 != mode, createdDirectory || tightenExisting {
