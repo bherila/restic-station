@@ -80,6 +80,15 @@ the #114 defect itself. `timeoutStopsTheProcess` (formerly
 `timeoutSendsSIGINT`) asserted only the throw and so could not distinguish
 them; it is plausible it had been passing vacuously on Linux for some time.
 
+**A fixed sleep before an action is a race, not a wait.**
+`cancellingDeliversSIGINT` cancelled 0.5 s after spawning a child that
+installs a SIGINT trap. That is fine on a dev Mac and lost on CI: a spawn
+slower than the delay let the signal arrive before the trap existed, and the
+test then failed for a reason unrelated to its contract. It now waits for the
+child to write a "trap armed" file and cancels only after it appears —
+faster (0.12 s, no fixed sleep) as well as deterministic. Prefer waiting on
+an observable state change over a delay chosen to be "long enough".
+
 **The suite's own speed changed a flake rate (#116).** `posix_spawn`
 intermittently fails with `EFAULT` under concurrent spawn load. Shrinking the
 stop-sequence graces took the Core suite from ~24 s to ~5 s, which packed the

@@ -178,12 +178,20 @@ struct ProcessLifetimeTests {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let marker = directory.appendingPathComponent("caught-sigint")
+        let armed = directory.appendingPathComponent("trap-armed")
 
         // Writes the marker from a SIGINT handler, exactly as restic uses its
         // own handler to release the repository lock. Only reachable if the
         // signal is delivered and the child is given time to act on it.
-        let script = "trap 'printf caught > '\''\(marker.path)'\''; exit 0' INT; i=0; "
-            + "while [ $i -lt 300 ]; do sleep 0.1; i=$((i+1)); done"
+        //
+        // The second file exists because cancelling on a fixed delay is a
+        // race, and it is one this test lost on CI: a spawn slower than the
+        // delay lets SIGINT arrive before `sh` has installed the trap, and
+        // the marker then never appears for a reason that has nothing to do
+        // with the contract under test.
+        let script = "trap 'printf caught > '\''\(marker.path)'\''; exit 0' INT; "
+            + "printf armed > '\(armed.path)'; "
+            + "i=0; while [ $i -lt 300 ]; do sleep 0.1; i=$((i+1)); done"
 
         let task = Task {
             try await Self.runner().run(
@@ -196,7 +204,16 @@ struct ProcessLifetimeTests {
                 timeout: 30
             )
         }
-        try await Task.sleep(nanoseconds: 500_000_000)
+        // Cancel only once the trap is demonstrably installed.
+        let armedBy = Date().addingTimeInterval(20)
+        while !FileManager.default.fileExists(atPath: armed.path), Date() < armedBy {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        try #require(
+            FileManager.default.fileExists(atPath: armed.path),
+            "the child never got as far as installing its trap; nothing about SIGINT is under test yet"
+        )
+
         task.cancel()
         _ = try? await task.value
 
