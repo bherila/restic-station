@@ -112,8 +112,9 @@ set_busy|yes|2|live
 repository_offline|yes|3|live
 repository_locked|yes|1|live
 repository_not_initialized|no|1|live
-secret_unavailable|yes|1|live
+secret_unavailable|yes|1|unit:every retryable store failure is an errno case (EACCES opening secrets.json is the only portable one) and the linux CI container runs as root, where DAC cannot produce it — pinned in Swift by SecretStoreErrorTableTests and KeychainSecretStoreTests instead
 secret_not_configured|no|1|unit:reaching classify(itemNotFound) needs a keychain/secret-env miss no fixture can stage portably
+secret_store_unusable|no|1|live
 secret_rejected|no|1|live
 restic_not_found|no|1|live
 restic_unsupported|no|1|env
@@ -727,16 +728,21 @@ write_config "$FIXTURE" "\"$FAKE_DIR/restic\""
 mark_code "restic_not_found"
 ok "restic_not_found: an unreadable pinned restic refuses the prune at exit 1"
 
-# secret_unavailable: the file backend's documented refusal of a widened
+# secret_store_unusable: the file backend's documented refusal of a widened
 # secrets.json. Mode-based, so it holds even when running as root (the
-# linux CI container does).
+# linux CI container does) — which is also why it is this code and not
+# `secret_unavailable` that a shell fixture can reach. The refusal is
+# permanent: no repetition of this request can widen-then-narrow the mode,
+# so the envelope must say `retryable: false` (#96).
 chmod 0644 "$FIXTURE/secrets.json"
 RESTIC_STATION_DATA_DIR="$FIXTURE" run_helper_split maintenance prune --set "$SET_ID" --dry-run --json
 expect_rc 1
-assert_error_envelope "secret_unavailable"
+assert_error_envelope "secret_store_unusable"
+jq -e '.error.message | test("chmod 600")' "$OUT_FILE" >/dev/null \
+    || fail "the refusal did not carry the exact chmod to run"
 chmod 0600 "$FIXTURE/secrets.json"
-mark_code "secret_unavailable"
-ok "secret_unavailable: a group-accessible secrets.json is refused, retryable, exit 1"
+mark_code "secret_store_unusable"
+ok "secret_store_unusable: a group-accessible secrets.json is refused, non-retryable, exit 1"
 
 # set_busy: a purge preview parked inside the fake restic (blocked on a
 # FIFO) holds the set lock; a concurrent prune of the same set must answer

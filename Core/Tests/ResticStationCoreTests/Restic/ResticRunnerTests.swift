@@ -449,6 +449,81 @@ struct ResticRunnerTests {
         #expect(fake.invocations.isEmpty)
     }
 
+    @Test("a store that refuses to be read is terminal, not the retryable pre-flight answer")
+    func storeUnusableIsNotCollapsedIntoUnavailable() async throws {
+        let fake = FakeProcessRunner()
+        let secrets = FakeSecretStore(defaultPassword: Self.password)
+        secrets.failPassword(
+            for: Self.primaryId,
+            with: .storeUnusable(
+                "refusing to read /data/secrets.json: it is group- or world-accessible "
+                    + "(mode 0644). Fix it with: chmod 600 /data/secrets.json"
+            )
+        )
+        let runner = Self.makeRunner(fake, secrets: secrets)
+
+        // The distinction #96 exists to preserve: before this, every
+        // non-`itemNotFound` store failure became `secretsUnavailable`, so a
+        // refusal that had already printed the exact `chmod` was published
+        // as `retryable: true`.
+        await #expect(throws: ResticRunnerError.secretsStoreUnusable(destinationId: Self.primaryId)) {
+            _ = try await runner.run(
+                .backup(repo: Self.primary.repoURL, sources: ["/Users/user/Documents"]),
+                for: ResticInvocation(destination: Self.primary)
+            )
+        }
+        #expect(fake.invocations.isEmpty)
+
+        let failure = CLIFailure.classify(
+            ResticRunnerError.secretsStoreUnusable(destinationId: Self.primaryId)
+        )
+        #expect(failure.code == .secretStoreUnusable)
+        #expect(!failure.retryable)
+        // The store's own text names a path and a uid, and this string
+        // reaches run logs — the runner drops it either way.
+        #expect(!failure.message.contains("/data/secrets.json"))
+    }
+
+    @Test("an unreadable secret-env blob keeps the same three-way split")
+    func secretEnvStoreUnusableIsTerminal() async throws {
+        let fake = FakeProcessRunner()
+        let secrets = FakeSecretStore(defaultPassword: Self.password)
+        secrets.failSecretEnv(for: Self.primaryId, with: .storeUnusable("refusing to read: it is a symbolic link."))
+        let runner = Self.makeRunner(fake, secrets: secrets)
+
+        await #expect(throws: ResticRunnerError.secretsStoreUnusable(destinationId: Self.primaryId)) {
+            _ = try await runner.run(.snapshots(repo: "/repo"), for: ResticInvocation(destination: Self.primary))
+        }
+        #expect(fake.invocations.isEmpty)
+    }
+
+    @Test("a locked login keychain at a pre-login tick stays retryable, end to end")
+    func lockedKeychainRemainsRetryable() async throws {
+        let fake = FakeProcessRunner()
+        let secrets = FakeSecretStore(defaultPassword: Self.password, backend: .keychain)
+        // What `KeychainSecretStore` raises for `security`'s exit 51 — see
+        // `KeychainSecretStoreTests` for the exit-code half of this chain.
+        secrets.failPassword(for: Self.primaryId, with: .backendFailed("keychain locked"))
+        let runner = Self.makeRunner(fake, secrets: secrets)
+
+        await #expect(throws: ResticRunnerError.secretsUnavailable(destinationId: Self.primaryId)) {
+            _ = try await runner.run(.snapshots(repo: "/repo"), for: ResticInvocation(destination: Self.primary))
+        }
+
+        // The asymmetry that makes the #96 sweep per-site rather than a
+        // rename: this run must stay retryable so the tick that fires before
+        // the keychain unlocks skips and retries instead of giving up
+        // (`docs/keychain-and-fda.md` §2).
+        let storeFailure = CLIFailure.classify(SecretStoreError.backendFailed("keychain locked"))
+        #expect(storeFailure.code == .secretUnavailable)
+        #expect(storeFailure.retryable)
+        let runnerFailure = CLIFailure.classify(
+            ResticRunnerError.secretsUnavailable(destinationId: Self.primaryId)
+        )
+        #expect(runnerFailure.retryable)
+        #expect(ResticRunnerError.secretsUnavailable(destinationId: Self.primaryId).category == .retryable)
+    }
+
     // MARK: - NDJSON streaming
 
     @Test("streams decoded NDJSON messages and captures raw output")

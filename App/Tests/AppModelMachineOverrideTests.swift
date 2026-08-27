@@ -2136,6 +2136,59 @@ struct AppModelMachineOverrideTests {
         ))
     }
 
+    /// `Reachability` writes this reason into `repo-status-<destId>.json`
+    /// and `SetsBadges` is the only thing that reads it, so the two halves
+    /// of the contract live in different packages and can drift silently.
+    /// The Core-side test (`ReachabilityTests`) pins the string; this one
+    /// pins what the badge does with it.
+    @Test("a store that refuses to be read badges as Error, not Offline")
+    func unusableSecretStoreBadgesAsError() {
+        let destId = UUID()
+        let probedAt = Date(timeIntervalSince1970: 1_760_000_000)
+
+        // The exact string `Reachability.probe` records for
+        // `ResticRunnerError.secretsStoreUnusable` (#96).
+        let unusable = DestinationStatus.derive(
+            status: RepoStatus(
+                destId: destId,
+                reachable: false,
+                probedAt: probedAt,
+                lastError: "the secret store is not usable as configured"
+            ),
+            isStale: false
+        )
+        // "Offline" reads as "try later", which is exactly wrong for a
+        // refusal whose message names the `chmod` to run.
+        #expect(unusable == .error)
+        #expect(unusable.label == "Error")
+
+        // The transient sibling must still badge as Offline, or the
+        // pre-login tick would look like a fault every morning.
+        for backend in SecretBackend.allCases {
+            let transient = DestinationStatus.derive(
+                status: RepoStatus(
+                    destId: destId,
+                    reachable: false,
+                    probedAt: probedAt,
+                    lastError: backend.unavailableProbeReason
+                ),
+                isStale: false
+            )
+            #expect(transient == .offline, "\(backend) should stay environmental")
+        }
+
+        // And so must the third one, for the same reason as the first.
+        #expect(DestinationStatus.derive(
+            status: RepoStatus(
+                destId: destId,
+                reachable: false,
+                probedAt: probedAt,
+                lastError: "no password stored for this destination"
+            ),
+            isStale: false
+        ) == .error)
+    }
+
     @Test("config preflight failures never advise unlocking the keychain")
     func destinationSecretFailureCopyDistinguishesConfigAndKeychain() {
         let configMessage = SetsCopy.destinationSecretFailureMessage(

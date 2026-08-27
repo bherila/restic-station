@@ -40,8 +40,8 @@ struct SecretBackendTests {
             _ = try SecretBackend.resolve(environment: [SecretBackend.environmentKey: "gnome-keyring"])
             Issue.record("expected an unrecognised backend to throw")
         } catch let error as SecretStoreError {
-            guard case .backendFailed(let message) = error else {
-                Issue.record("expected .backendFailed, got \(error)")
+            guard case .storeUnusable(let message) = error else {
+                Issue.record("expected .storeUnusable, got \(error)")
                 return
             }
             #expect(message.contains(SecretBackend.environmentKey))

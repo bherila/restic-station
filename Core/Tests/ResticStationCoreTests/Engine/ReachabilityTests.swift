@@ -236,6 +236,45 @@ struct ReachabilityTests {
         #expect(fake.invocations.isEmpty)
     }
 
+    @Test("remote destination: a store that refuses to be read is not environmental")
+    func remoteStoreUnusableIsNotEnvironmental() async throws {
+        let dest = Destination(id: Self.destId, label: "R2", repoURL: "s3:https://x/bucket", isPrimary: false)
+        let fake = FakeProcessRunner()
+        let secrets = FakeSecretStore(defaultPassword: Self.password)
+        secrets.failPassword(
+            for: Self.destId,
+            with: .storeUnusable(
+                "refusing to read /data/secrets.json: it is group- or world-accessible "
+                    + "(mode 0644). Fix it with: chmod 600 /data/secrets.json"
+            )
+        )
+        let reachability = Self.makeReachability(fake, secrets: secrets)
+
+        let result = await reachability.probe(dest)
+        #expect(result == .offline(reason: "the secret store is not usable as configured"))
+        // Same requirement as the no-password-stored case, for the same
+        // reason: this string is persisted to `repo-status-<destId>.json`
+        // and read by `SetsBadges`, whose environmental list would turn a
+        // refusal naming an exact `chmod` into "Offline — try later".
+        for backend in SecretBackend.allCases {
+            #expect(result != .offline(reason: backend.unavailableProbeReason))
+        }
+        // `SetsBadges.offlineOrError` matches the bare substring "could not"
+        // as well as the four phrases above; the App-side test owns that
+        // list, but a reason that trips it here would defeat the badge
+        // before the App ever sees it.
+        guard case .offline(let reason) = result else {
+            Issue.record("expected an offline probe result, got \(result)")
+            return
+        }
+        for environmental in ["volume not mounted", "timed out", "keychain locked",
+                              "secret store unavailable", "could not"] {
+            #expect(!reason.lowercased().contains(environmental), "reason matched \(environmental)")
+        }
+        #expect(!reason.contains("/data/secrets.json"))
+        #expect(fake.invocations.isEmpty)
+    }
+
     @Test("remote destination: launch failure is offline with the launch failure reason")
     func remoteLaunchFailureIsOffline() async throws {
         let dest = Destination(id: Self.destId, label: "R2", repoURL: "s3:https://x/bucket", isPrimary: false)
