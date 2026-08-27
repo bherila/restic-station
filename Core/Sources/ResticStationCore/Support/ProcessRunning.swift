@@ -246,7 +246,16 @@ public struct DefaultProcessRunner: ProcessRunning {
             // `cancelAll()` cannot unpark. See `TerminationSignal`.
             if let timeout {
                 await terminationSignal.wait(upTo: max(0, timeout))
-                if !terminationSignal.hasFired {
+                // `!cancellationFlag.isSet` because that wait can also be
+                // ended by the cancellation handler releasing its waiters,
+                // not only by the deadline. Without it a cancelled run would
+                // run a second, redundant stop sequence here — another
+                // SIGINT, another full grace — behind the one cancellation
+                // already started, and would flag itself as timed out on the
+                // way past. `CancellationError` still wins the classification
+                // below either way; this keeps the run from paying for a
+                // stop sequence twice.
+                if !terminationSignal.hasFired && !cancellationFlag.isSet {
                     await timeoutFlag.trigger()
                     await Self.stopAfterGracePeriod(
                         processBox,
