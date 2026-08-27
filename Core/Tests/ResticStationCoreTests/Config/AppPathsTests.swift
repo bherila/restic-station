@@ -381,6 +381,61 @@ struct AppPathsEnvTests {
         #expect(values.isDirectory == true)
     }
 
+    /// Setup runs long before the safety-authoritative schedule-state read —
+    /// `Tick` calls `ensureDirectories()` roughly fifty lines earlier — and
+    /// `state/` is the one directory here that is re-tightened when it already
+    /// exists. Silently repairing a group/world-writable `state/` would erase
+    /// the evidence the read fails closed on, leaving a tree that looks
+    /// healthy after an exposure another uid could have written through.
+    @Test("a pre-existing group- or world-writable state/ refuses setup, evidence intact")
+    func ensureDirectoriesRefusesAWritableStateDirectory() throws {
+        for mode in [mode_t(0o722), mode_t(0o772), mode_t(0o777)] {
+            let (paths, root) = makeTempPaths()
+            defer { try? FileManager.default.removeItem(at: root) }
+            try paths.ensureDirectories()
+
+            try FileManager.default.setAttributes(
+                [.posixPermissions: NSNumber(value: mode)],
+                ofItemAtPath: paths.stateDir.path
+            )
+
+            #expect(throws: (any Error).self) {
+                try paths.ensureDirectories()
+            }
+
+            // The point of refusing rather than repairing: the mode is still
+            // there for the operator, and for the read that fails closed on it.
+            let after = try FileManager.default.attributesOfItem(
+                atPath: paths.stateDir.path
+            )[.posixPermissions] as? NSNumber
+            #expect(
+                after?.uint16Value == UInt16(mode),
+                "mode \(String(mode, radix: 8)) must survive the refusal, not be tightened away"
+            )
+        }
+    }
+
+    /// Benign widening is still repaired. `0755` is listable but exposes
+    /// nothing another uid can act on, so refusing it would strand installs
+    /// over a privacy nit rather than a safety event.
+    @Test("a pre-existing 0755 state/ is still tightened, not refused")
+    func ensureDirectoriesStillTightensABenignStateDirectory() throws {
+        let (paths, root) = makeTempPaths()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try paths.ensureDirectories()
+
+        try FileManager.default.setAttributes(
+            [.posixPermissions: NSNumber(value: mode_t(0o755))],
+            ofItemAtPath: paths.stateDir.path
+        )
+        try paths.ensureDirectories()
+
+        let after = try FileManager.default.attributesOfItem(
+            atPath: paths.stateDir.path
+        )[.posixPermissions] as? NSNumber
+        #expect(after?.uint16Value == 0o700)
+    }
+
     @Test("operation directory setup does not depend on the health scratch path")
     func ensureDirectoriesIgnoresBrokenHealthScratch() throws {
         for scratchPath in [

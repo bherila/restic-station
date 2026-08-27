@@ -58,6 +58,21 @@ public final class DirectoryHandle: @unchecked Sendable {
         self.storedDescriptor = descriptor
     }
 
+    /// `lstat(2)` of a directory pathname, returning `nil` for anything that
+    /// is not a directory.
+    ///
+    /// **Diagnosis only.** A pathname lookup is not bound to any descriptor,
+    /// so nothing that grants authority may depend on it. It exists for the
+    /// cases where no descriptor can be obtained at all — a directory this
+    /// user cannot open — and where the only decision left is which refusal
+    /// to report.
+    static func directoryStatByPathname(_ path: String) -> stat? {
+        var info = stat()
+        guard path.withCString({ lstat($0, &info) }) == 0 else { return nil }
+        guard (info.st_mode & mode_t(S_IFMT)) == mode_t(S_IFDIR) else { return nil }
+        return info
+    }
+
     /// Opens and verifies `directory`, retaining the descriptor.
     ///
     /// - Parameter trustedRoot: the owner-controlled data-directory boundary

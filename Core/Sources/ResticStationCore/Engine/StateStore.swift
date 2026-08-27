@@ -789,17 +789,6 @@ public struct StateStore: Sendable {
     /// Opened through `fileOperations` rather than `DirectoryHandle.open`, so
     /// the injectable syscall seam still governs this open; the handle adopts
     /// the verified descriptor and owns closing it.
-    /// `lstat(2)` of a directory pathname, for diagnosis only — see the sole
-    /// call site in ``openStateDirectory()``. Returns `nil` for anything that
-    /// is not a directory, so a symlink or replaced entry cannot borrow the
-    /// unsafe-mode refusal.
-    private static func directoryModeByPathname(_ path: String) -> mode_t? {
-        var info = stat()
-        guard path.withCString({ lstat($0, &info) }) == 0 else { return nil }
-        guard (info.st_mode & mode_t(S_IFMT)) == mode_t(S_IFDIR) else { return nil }
-        return info.st_mode
-    }
-
     private func openStateDirectory() -> StateDirectoryOpen {
         let descriptor = fileOperations.openAt(
             AT_FDCWD,
@@ -825,13 +814,24 @@ public struct StateStore: Sendable {
             // to, no security decision rides on it, and the read fails closed
             // either way — it only chooses which refusal to report.
             if code == EACCES,
-               let mode = Self.directoryModeByPathname(paths.stateDir.path),
-               mode & 0o022 != 0 {
-                return .failed(.unsafeMode(
-                    subject: .stateDirectory,
-                    path: paths.stateDir.path,
-                    mode: mode
-                ))
+               let info = DirectoryHandle.directoryStatByPathname(paths.stateDir.path) {
+                // Same order the descriptor path uses: ownership outranks
+                // mode. A foreign-owned `state/` is not an owner-controlled
+                // mode defect, and telling this user to `chmod 700` it is
+                // advice they cannot act on — worse, an administrator who did
+                // would leave it foreign-owned and still unusable.
+                if info.st_uid != geteuid() {
+                    return .failed(.unsafeFile(
+                        reason: "state directory owned by uid \(info.st_uid), expected \(geteuid())"
+                    ))
+                }
+                if info.st_mode & 0o022 != 0 {
+                    return .failed(.unsafeMode(
+                        subject: .stateDirectory,
+                        path: paths.stateDir.path,
+                        mode: info.st_mode
+                    ))
+                }
             }
             return .failed(.ioFailure(operation: "open state directory", errno: code))
         }

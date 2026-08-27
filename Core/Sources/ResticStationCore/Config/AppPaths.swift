@@ -414,6 +414,34 @@ public struct AppPaths: Equatable, Sendable {
         // pre-existing 755 dir staying 755), and the protection that matters
         // is per-file: the token index is 0600 and refuses to load if it is
         // not. This narrows the exposure without overriding that choice.
+        // `state/` is the only directory here that is re-tightened when it
+        // already exists, and setup runs *before* the safety-authoritative
+        // schedule-state read — `Tick` calls this roughly fifty lines earlier.
+        // Silently repairing a group/world-writable `state/` would therefore
+        // destroy the very evidence that read fails closed on: by the time
+        // anything could refuse, the exposure is gone and the tree looks
+        // healthy. That is the check-not-atomic-with-its-use pattern
+        // `AGENTS.md` §Safety rule 1 exists to rule out.
+        //
+        // Refuse instead, at the same `0o022` threshold the read applies, so
+        // an operator sees a mode another uid could have written through
+        // rather than a tree that quietly healed itself. Benign widening
+        // (`0755` — listable, not writable by others) is still tightened as
+        // before; it exposes nothing another uid can act on.
+        if let info = DirectoryHandle.directoryStatByPathname(stateDir.path),
+           info.st_uid == geteuid(),
+           info.st_mode & 0o022 != 0 {
+            throw LockFailure(
+                path: stateDir.path,
+                operation: "state directory writable by other users "
+                    + "(mode \(String(info.st_mode & 0o777, radix: 8))) — it is not repaired "
+                    + "automatically because that would erase the evidence; after confirming no "
+                    + "other user has written to it, run chmod 700 "
+                    + "\(ShellQuoting.quoteIfNeeded(stateDir.path))",
+                errnoValue: 0
+            )
+        }
+
         for (directory, tightenExisting) in [
             (runsDir, false),
             (stateDir, true),
