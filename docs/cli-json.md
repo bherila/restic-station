@@ -116,7 +116,7 @@ never match on it. `details` is omitted entirely when empty.
 | `restic_not_found` | no | 1 | No restic binary anywhere that was searched. |
 | `restic_unsupported` | no | 1 | A restic was found and ran, but is below the minimum or is not restic. |
 | `restic_failed` | no | 1 | restic ran and failed. |
-| `operation_timed_out` | **yes** | 1 | The operation exceeded the caller's timeout and was stopped; restic never reported. A stalled network or a spinning-up remote clears on its own. |
+| `operation_timed_out` | **yes** | 1 | The operation exceeded the caller's timeout and was told to stop; restic never reported. A child that survives the stop sequence is abandoned rather than waited out, so the helper does not hang — see `architecture.md` §DI, and #114's process-group half for reaping. A stalled network or a spinning-up remote clears on its own. |
 | `preview_expired` | no | 1 | A destructive preview token has expired. Run a fresh preview; the old token can never be applied. |
 | `operation_not_allowed` | no | 1 | Refused by a safety invariant — `forget` with an empty retention policy, `prune` on a mirror behind its primary (`architecture.md` §Invariants). |
 | `operation_completed_audit_failed` | no | 1 | A destructive launch crossed its audit boundary, but complete terminal metadata plus its index projection could not be proven. Inspect repository state and reconcile run history; never retry the destructive request automatically. |

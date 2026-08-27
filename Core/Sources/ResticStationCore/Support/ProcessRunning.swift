@@ -45,13 +45,22 @@ public protocol ProcessRunning: Sendable {
     ///
     /// The deadline races process *termination*, never pipe EOF: a child that
     /// closes stdout and stderr but keeps running must still be stopped
-    /// (#114). Once the stop sequence has run, the readers get a bounded
-    /// grace and are then told to stop, so a descendant that inherited the
-    /// pipe ends cannot extend the call by holding them open. Both readers
-    /// still run to completion before `run` returns, so no `onStdoutLine` or
-    /// `onStderrLine` callback can fire after it — callers close per-run log
-    /// writers on that return. The accumulated transcripts are discarded:
-    /// `run` throws instead of returning a `ProcessResult`.
+    /// (#114).
+    ///
+    /// Once the child is gone — or has been told to go and did not — the
+    /// readers get a bounded grace and are then told to stop. That bound is
+    /// unconditional, including on the success path: a descendant which
+    /// inherited the pipe ends (`ssh` with `ControlPersist` outlives its
+    /// client by design) would otherwise hold the call open for its own
+    /// lifetime, and where the deadline never fired the call would come back
+    /// a descendant's lifetime late reporting *success*. A run is still
+    /// waited on for as long as its own child runs; only the drain after
+    /// that is bounded, and a transcript cut short by it fails a downstream
+    /// parse closed rather than reading as an empty success.
+    ///
+    /// Both readers run to completion before `run` returns, so no
+    /// `onStdoutLine` or `onStderrLine` callback can fire after it — callers
+    /// close per-run log writers on that return.
     ///
     /// Cancelling the calling task stops the subprocess the same way (SIGINT,
     /// 10 s grace, SIGKILL) and throws `CancellationError`.
@@ -93,9 +102,10 @@ public extension ProcessRunning {
 /// work on Linux via swift-corelibs-foundation) plus `kill(2)` for signaling,
 /// imported from `Darwin` or `Glibc` depending on platform.
 public struct DefaultProcessRunner: ProcessRunning {
-    /// How long SIGINT is given to work before SIGKILL, and how long a
-    /// stopped run keeps waiting for termination and for its pipes. Both are
-    /// the documented 10 s in production.
+    /// How long SIGINT is given to work before SIGKILL (`terminationGrace`,
+    /// the documented 10 s), and how long a run keeps waiting for termination
+    /// and for its pipes once the child is gone or has been told to go
+    /// (`drainGrace`, also 10 s).
     ///
     /// They are settable only so tests can assert the stop sequence in
     /// seconds rather than half a minute. The sequence is four waits deep in
@@ -251,27 +261,32 @@ public struct DefaultProcessRunner: ProcessRunning {
                 }
             } else {
                 // No deadline was asked for, so there is none to enforce: a
-                // legitimate multi-hour backup must not be abandoned.
+                // legitimate multi-hour backup must not be abandoned. It is
+                // still released if the caller cancels — see
+                // `releaseWaiters`, armed by the cancellation handler — so
+                // "no deadline" never means "no way out once we have decided
+                // to stop".
                 await terminationSignal.wait()
             }
 
-            let timedOut = await timeoutFlag.triggered
-            guard timedOut || cancellationFlag.isSet else {
-                return (await stdoutTask.value, await stderrTask.value)
-            }
-            // The stop sequence has run. Any writer still holding the
-            // inherited pipe ends is either a descendant (`ssh` for the sftp
-            // backend, a password command) or, in the worst case, a direct
-            // child that outlived SIGKILL. Waiting for *their* EOF is
-            // unbounded and would make the deadline unenforceable again by a
-            // second route, so the readers are told to stop once the grace
-            // expires.
+            // Once the direct child is gone, any writer still holding the
+            // inherited pipe ends is a descendant (`ssh` for the sftp
+            // backend, a password command), and waiting for *their* EOF is
+            // unbounded. That is true on the success path too, which is why
+            // this is armed unconditionally rather than only after a stop
+            // sequence: an `ssh` master with `ControlPersist` outlives the
+            // child by design. Bounded only from here, so a run still waits
+            // as long as its own child runs.
             //
-            // Both readers are still awaited to completion. That is what
-            // keeps every `onLine` callback strictly inside the call: this
-            // path throws, and the engine closes the run's `LogWriter` on
-            // return, so a reader still delivering lines afterwards would be
-            // racing that close.
+            // Measured before this was unconditional: a child exiting at once
+            // while a descendant held the pipes returned 15.02 s later — and
+            // on the success path returned *success*, with the deadline it
+            // had been given never raised at all.
+            //
+            // Awaiting both readers to completion is what keeps every
+            // `onLine` callback strictly inside the call. Callers close the
+            // run's `LogWriter` on this return, so a reader still delivering
+            // lines afterwards would be racing that close.
             let stopper = Task.detached {
                 try await Task.sleep(nanoseconds: UInt64(drainGrace * 1_000_000_000))
                 readerStop.set()
@@ -290,6 +305,15 @@ public struct DefaultProcessRunner: ProcessRunning {
                     grace: terminationGrace,
                     sendInitialInterrupt: false
                 )
+                // The run may be parked in the unbounded wait used when no
+                // deadline was requested — which every real backup, forget
+                // and prune uses. Cancelling is a stop decision like any
+                // other, so the same bound applies from here: SIGINT and
+                // SIGKILL have both been spent, and a child that survived
+                // them will not be waited into submission while the caller
+                // holds the set lock.
+                await terminationSignal.wait(upTo: drainGrace)
+                terminationSignal.releaseWaiters()
             }
         }
 
@@ -544,6 +568,23 @@ private final class TerminationSignal: @unchecked Sendable {
     func fire() {
         lock.lock()
         fired = true
+        let pending = waiters
+        waiters = []
+        lock.unlock()
+        for waiter in pending {
+            waiter.resumeOnce()
+        }
+    }
+
+    /// Resumes everyone waiting **without** claiming the child has
+    /// terminated: `hasFired` stays false, so the stop sequence keeps
+    /// refusing to signal a child it believes is gone and no caller reads
+    /// `terminationStatus` off the back of it.
+    ///
+    /// Used only by the cancellation path, to release a run parked in the
+    /// unbounded `wait()` that a no-deadline call uses.
+    func releaseWaiters() {
+        lock.lock()
         let pending = waiters
         waiters = []
         lock.unlock()

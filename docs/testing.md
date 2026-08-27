@@ -52,8 +52,9 @@ Two suites deliberately spawn real processes, because what they assert *is* the
 POSIX behaviour a double would have to invent: `DefaultProcessRunnerTests`
 (stdin/EOF handling, SIGPIPE disposition inheritance) and `ProcessLifetimeTests`
 (#114 — the deadline must race process termination rather than pipe EOF, and a
-descendant holding the inherited pipe ends must not outlast it). Both use only
-`/bin/sh`, present on macOS and in the `swift:6.1` Linux container.
+descendant holding the inherited pipe ends must not outlast it). Between them they use only `/bin/sh`,
+`/bin/echo` and `/bin/sleep`, all present on macOS and in the `swift:6.1`
+Linux container.
 
 `ProcessLifetimeTests` asserts that a run with a deadline always returns
 within a bound. It does **not** assert which signal ended the child, because
@@ -83,12 +84,25 @@ them; it is plausible it had been passing vacuously on Linux for some time.
 shows it.** On the `linux` job, a child does not stop on SIGINT and is ended
 by the SIGKILL escalation behind it — an ignored disposition is inherited
 across `exec` there, while macOS's Foundation resets child dispositions (cf.
-the same divergence behind `SIGPIPEGuard`'s no-op handler). Two further
-Linux-only observations came out of #114 and are recorded in #149: a
+the same divergence behind `SIGPIPEGuard`'s no-op handler). One further
+Linux-only observation came out of #114 and is recorded in #149 alongside it: a
 `/bin/sh -c` child's termination is not observed after SIGKILL the way a
 direct `/bin/sleep` child's is. None of it is visible from a green macOS run.
 
-### Fixture conventions### Fixture conventions
+**An elapsed bound is necessary and not sufficient.** Two independent reviews
+of #147 built the same counterexample: delete the runner's entire kill path,
+and every elapsed-bound test still passed, because the bounded give-up
+satisfies the bounds on its own — leaving eight children running. A timeout
+test must therefore assert *liveness* too. `deadlineEndsTheChild` does it
+portably, by having the child append to a file on a loop and requiring that
+file to stop growing; a pid probe would not work, since `kill(pid, 0)`
+succeeds against a zombie and a child ended on Linux may not be reaped
+promptly (#149). `descendantCannotExtendARunWhoseChildExited` covers the
+interleaving every other test structurally cannot reach — the child exits
+*before* the deadline, so no stop sequence runs, and an unbounded drain then
+returns **success** a descendant's lifetime late.
+
+### Fixture conventions
 `Core/Tests/ResticStationCoreTests/Fixtures/` — restic output fixtures are copied verbatim from `docs/fixtures/` (captured from restic 0.18.1; see restic-cli.md). Load via `Bundle.module` (declare `resources: [.copy("Fixtures")]` in Package.swift). Every parser has a test decoding its fixture; NDJSON parsers additionally get a partial-line-buffering test (feed the fixture in random-sized chunks, expect identical parse) and an unknown-`message_type` tolerance test.
 
 The same directory also holds **our own** persisted-file fixtures, which have no `docs/fixtures/` counterpart because they are not restic output: `config-v1.json` (a realistic pre-schema-v2 `config.json`, the input to the migration tests) and `config-v2.json` (the same fleet with per-machine overrides, the input to the resolution tests).
