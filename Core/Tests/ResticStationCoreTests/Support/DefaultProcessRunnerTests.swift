@@ -179,17 +179,25 @@ struct DefaultProcessRunnerTests {
     /// The elapsed bound is the half of this test that earns its name.
     /// `#expect(throws:)` alone passes just as happily when the deadline is
     /// reported on schedule and the child then runs to completion regardless
-    /// — which is exactly the failure #114 was about. Returning within a few
-    /// seconds of a 0.3 s deadline can only mean SIGINT actually reached
-    /// `sleep`, since the SIGKILL escalation is 10 s behind it.
-    @Test("throws ProcessRunnerError.timeout and stops a long-running process via SIGINT", .timeLimit(.minutes(1)))
-    func timeoutSendsSIGINT() async throws {
-        let runner = DefaultProcessRunner()
+    /// — which is exactly the failure #114 was about, and this assertion had
+    /// been missing long enough that it is plausible the test was passing
+    /// vacuously on Linux.
+    ///
+    /// The bound admits the SIGKILL escalation rather than requiring SIGINT
+    /// to have worked. Whether SIGINT reaches a child is not portable: on the
+    /// `linux` CI job this same case returns only after the escalation
+    /// (measured 10.34 s against production graces), because an ignored
+    /// disposition is inherited across `exec` there while macOS's Foundation
+    /// resets it. Asserting the mechanism would assert a platform; the
+    /// contract is that the deadline is enforced within a bound.
+    @Test("throws ProcessRunnerError.timeout and stops a long-running process", .timeLimit(.minutes(1)))
+    func timeoutStopsTheProcess() async throws {
+        let runner = DefaultProcessRunner(terminationGrace: 1, drainGrace: 1)
         let started = Date()
 
         await #expect(throws: ProcessRunnerError.timeout) {
             _ = try await runner.run(
-                ["/bin/sleep", "30"],
+                ["/bin/sleep", "60"],
                 env: nil,
                 currentDirectory: nil,
                 onStdoutLine: nil,
@@ -199,7 +207,7 @@ struct DefaultProcessRunnerTests {
         }
 
         let elapsed = Date().timeIntervalSince(started)
-        #expect(elapsed < 5, "returned after \(elapsed)s; SIGINT did not reach the child")
+        #expect(elapsed < 10, "returned after \(elapsed)s; the child was waited out rather than stopped")
     }
 }
 

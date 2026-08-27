@@ -93,7 +93,26 @@ public extension ProcessRunning {
 /// work on Linux via swift-corelibs-foundation) plus `kill(2)` for signaling,
 /// imported from `Darwin` or `Glibc` depending on platform.
 public struct DefaultProcessRunner: ProcessRunning {
+    /// How long SIGINT is given to work before SIGKILL, and how long a
+    /// stopped run keeps waiting for termination and for its pipes. Both are
+    /// the documented 10 s in production.
+    ///
+    /// They are settable only so tests can assert the stop sequence in
+    /// seconds rather than half a minute. The sequence is four waits deep in
+    /// the worst case — deadline, SIGINT grace, termination bound, drain
+    /// grace — so at production values a single assertion costs 30 s+, and a
+    /// bound loose enough to survive that is too loose to distinguish "the
+    /// deadline was enforced" from "the child was waited out".
+    let terminationGrace: TimeInterval
+    let drainGrace: TimeInterval
+
     public init() {
+        self.init(terminationGrace: 10, drainGrace: 10)
+    }
+
+    init(terminationGrace: TimeInterval, drainGrace: TimeInterval) {
+        self.terminationGrace = terminationGrace
+        self.drainGrace = drainGrace
         // Install before anything can spawn, rather than lazily inside the
         // call that also spawns. `static let` initialization is thread-safe,
         // but doing it at first use leaves one window where a thread is
@@ -219,12 +238,16 @@ public struct DefaultProcessRunner: ProcessRunning {
                 await terminationSignal.wait(upTo: max(0, timeout))
                 if !terminationSignal.hasFired {
                     await timeoutFlag.trigger()
-                    await Self.stopAfterGracePeriod(processBox, terminated: terminationSignal)
+                    await Self.stopAfterGracePeriod(
+                        processBox,
+                        terminated: terminationSignal,
+                        grace: terminationGrace
+                    )
                     // A child that has now survived both SIGINT and SIGKILL
                     // is not going to be waited into submission, and the
                     // caller is holding a lock. Give up on a bound rather
                     // than trade a reported deadline for a real hang.
-                    await terminationSignal.wait(upTo: Self.postStopDrainGrace)
+                    await terminationSignal.wait(upTo: drainGrace)
                 }
             } else {
                 // No deadline was asked for, so there is none to enforce: a
@@ -250,7 +273,7 @@ public struct DefaultProcessRunner: ProcessRunning {
             // return, so a reader still delivering lines afterwards would be
             // racing that close.
             let stopper = Task.detached {
-                try await Task.sleep(nanoseconds: UInt64(Self.postStopDrainGrace * 1_000_000_000))
+                try await Task.sleep(nanoseconds: UInt64(drainGrace * 1_000_000_000))
                 readerStop.set()
             }
             defer { stopper.cancel() }
@@ -264,6 +287,7 @@ public struct DefaultProcessRunner: ProcessRunning {
                 await Self.stopAfterGracePeriod(
                     processBox,
                     terminated: terminationSignal,
+                    grace: terminationGrace,
                     sendInitialInterrupt: false
                 )
             }
@@ -289,12 +313,13 @@ public struct DefaultProcessRunner: ProcessRunning {
     private static func stopAfterGracePeriod(
         _ box: ProcessBox,
         terminated: TerminationSignal,
+        grace: TimeInterval,
         sendInitialInterrupt: Bool = true
     ) async {
         if sendInitialInterrupt {
             sendSignal(SIGINT, to: box, unlessTerminated: terminated)
         }
-        let graceEnds = Date().addingTimeInterval(10)
+        let graceEnds = Date().addingTimeInterval(grace)
         while !terminated.hasFired && Date() < graceEnds {
             do {
                 try await Task.sleep(nanoseconds: 100_000_000)
@@ -329,13 +354,6 @@ public struct DefaultProcessRunner: ProcessRunning {
         guard !terminated.hasFired else { return }
         kill(box.process.processIdentifier, signal)
     }
-
-    /// How long a timed-out or cancelled run keeps reading its pipes after
-    /// the direct child is gone, before telling the readers to stop. Bytes
-    /// already buffered in a 64 KiB pipe drain in microseconds, so this is
-    /// generous by orders of magnitude for anything but a descendant that is
-    /// still holding the write ends open.
-    private static let postStopDrainGrace: TimeInterval = 10
 
 
     /// Reads a pipe on a background dispatch queue (never blocks the Swift

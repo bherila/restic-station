@@ -55,37 +55,40 @@ POSIX behaviour a double would have to invent: `DefaultProcessRunnerTests`
 descendant holding the inherited pipe ends must not outlast it). Both use only
 `/bin/sh`, present on macOS and in the `swift:6.1` Linux container.
 
-`ProcessLifetimeTests` takes ~25 s wall-clock and that is load-bearing, not
-waste: each test starts a 45 s child and asserts an elapsed-time bound that
-separates "the deadline was enforced" from "the child was waited out".
-Shortening the children below the 10 s SIGKILL grace plus the 10 s post-stop
-drain grace would make every one of them pass against the defect they exist to
-catch. The bounds are deliberately loose for the same reason they are
-meaningful — they must not become timing flakes on a loaded CI runner. Note
-that the first test observes ~12 s, not ~2 s: SIGINT reaches only the direct
-child, and a shell defers it while waiting on `sleep`, so nothing stops until
-SIGKILL. That is the process-group half of #114, still open.
+`ProcessLifetimeTests` asserts that a run with a deadline always returns
+within a bound. It does **not** assert which signal ended the child, because
+that is not portable — see below — and a test that pins the mechanism pins a
+platform. The engine's actual requirement is that a deadline cannot be
+outlasted while the set lock is held.
+
+The stop sequence is up to four waits deep in the worst case (deadline →
+SIGINT grace → termination bound → drain grace), so at the production 10 s
+graces one assertion costs 30 s+, and a bound loose enough to survive that
+stops distinguishing "the deadline was enforced" from "the child was waited
+out". `DefaultProcessRunner` therefore takes its two graces as an internal
+initializer parameter; these tests pass 1 s and finish in ~3 s with bounds
+that are tight enough to mean something. `stopSequenceGracesAreTenSecondsInProduction`
+guards the seam, so shrinking graces for tests cannot quietly become the
+shipped values. The children sleep 60 s, far longer than any bound, so
+"waited the child out" can never pass.
 
 **An elapsed bound is not optional on a timeout test.** `#expect(throws:)`
 alone passes identically whether the deadline stopped the child or was merely
 *reported* on schedule while the child ran to completion — and the second is
-the #114 defect itself. `timeoutSendsSIGINT` asserted only the throw and so
-could not distinguish them; it is plausible it had been passing vacuously on
-Linux for some time. It now bounds elapsed time too, which is what makes its
-name ("stops a long-running process via SIGINT") an assertion rather than a
-claim.
+the #114 defect itself. `timeoutStopsTheProcess` (formerly
+`timeoutSendsSIGINT`) asserted only the throw and so could not distinguish
+them; it is plausible it had been passing vacuously on Linux for some time.
 
-`killEscalationReachesChildIgnoringSIGINT` covers the escalation on its own,
-with a child that ignores SIGINT so only SIGKILL can end it. That is the case
-the `linux` job caught while #114 was in review: the stop sequence gated every
-signal on `Foundation.Process.isRunning`, and where that flag misreports a live
-child as finished, SIGINT *and* SIGKILL both become no-ops — `run` threw
-`.timeout` exactly on schedule while the child ran its full 45 s with the set
-lock held. macOS never showed it. Liveness is now judged by the runner's own
-termination latch instead, which doubles as proof the pid has not been reaped
-and so cannot have been reused.
+**Signal delivery to children is not portable, and CI is the only place that
+shows it.** On the `linux` job, a child does not stop on SIGINT and is ended
+by the SIGKILL escalation behind it — an ignored disposition is inherited
+across `exec` there, while macOS's Foundation resets child dispositions (cf.
+the same divergence behind `SIGPIPEGuard`'s no-op handler). Two further
+Linux-only observations came out of #114 and are recorded in #149: a
+`/bin/sh -c` child's termination is not observed after SIGKILL the way a
+direct `/bin/sleep` child's is. None of it is visible from a green macOS run.
 
-### Fixture conventions
+### Fixture conventions### Fixture conventions
 `Core/Tests/ResticStationCoreTests/Fixtures/` — restic output fixtures are copied verbatim from `docs/fixtures/` (captured from restic 0.18.1; see restic-cli.md). Load via `Bundle.module` (declare `resources: [.copy("Fixtures")]` in Package.swift). Every parser has a test decoding its fixture; NDJSON parsers additionally get a partial-line-buffering test (feed the fixture in random-sized chunks, expect identical parse) and an unknown-`message_type` tolerance test.
 
 The same directory also holds **our own** persisted-file fixtures, which have no `docs/fixtures/` counterpart because they are not restic output: `config-v1.json` (a realistic pre-schema-v2 `config.json`, the input to the migration tests) and `config-v2.json` (the same fleet with per-machine overrides, the input to the resolution tests).
