@@ -122,6 +122,17 @@ public struct Reachability: Sendable {
                 // environmental list, so the badge reads "Error" (needs
                 // attention) rather than "Offline" (try later).
                 return .offline(reason: "no password stored for this destination")
+            case .secretsStoreUnusable:
+                // Also not environmental, and for a stronger reason than
+                // `secretsNotConfigured`: the store refused to be read at
+                // all and its refusal already names the fix. `.offline`
+                // for the same reason as above — restic never ran, so
+                // there is no exit class to publish — with a reason string
+                // deliberately outside `SetsBadges`'s environmental list
+                // (note that list matches the bare substring "could not",
+                // which is why this wording avoids it) so the badge reads
+                // "Error" rather than "Offline".
+                return .offline(reason: "the secret store is not usable as configured")
             case .timedOut:
                 return .offline(reason: "timed out")
             case .launchFailed(let reason):

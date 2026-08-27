@@ -44,6 +44,7 @@ struct CLIErrorCodeTableTests {
         (.secretUnavailable, "secret_unavailable", .error, true),
         (.secretRejected, "secret_rejected", .error, false),
         (.secretNotConfigured, "secret_not_configured", .error, false),
+        (.secretStoreUnusable, "secret_store_unusable", .error, false),
         (.repositoryNotInitialized, "repository_not_initialized", .error, false),
         (.resticNotFound, "restic_not_found", .error, false),
         (.resticUnsupported, "restic_unsupported", .error, false),
@@ -226,6 +227,8 @@ struct ResticRunnerErrorTableTests {
             return (.secretUnavailable, true, .retryable)
         case .secretsNotConfigured:
             return (.secretNotConfigured, false, .terminal)
+        case .secretsStoreUnusable:
+            return (.secretStoreUnusable, false, .terminal)
         case .launchFailed:
             return (.resticNotFound, false, .terminal)
         case .timedOut:
@@ -236,6 +239,7 @@ struct ResticRunnerErrorTableTests {
     private static let cases: [ResticRunnerError] = [
         .secretsUnavailable(destinationId: destId),
         .secretsNotConfigured(destinationId: destId),
+        .secretsStoreUnusable(destinationId: destId),
         .launchFailed("no such file"),
         .timedOut,
     ]
@@ -264,6 +268,8 @@ struct SecretStoreErrorTableTests {
             return (.secretNotConfigured, false)
         case .lockUnusable:
             return (.internalError, false)
+        case .storeUnusable:
+            return (.secretStoreUnusable, false)
         case .backendFailed:
             return (.secretUnavailable, true)
         }
@@ -272,7 +278,8 @@ struct SecretStoreErrorTableTests {
     private static let cases: [SecretStoreError] = [
         .itemNotFound,
         .lockUnusable(LockFailure(path: "/data/locks/secrets.lock", operation: "ownership", errnoValue: 0)),
-        .backendFailed("security: exit 44"),
+        .storeUnusable("refusing to read /data/secrets.json: it is a symbolic link."),
+        .backendFailed("security: exit 51"),
     ]
 
     @Test("every secret-store error maps to its pinned envelope code and retryable bit")

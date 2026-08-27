@@ -21,8 +21,8 @@ final class FakeSecretStore: SecretStore, @unchecked Sendable {
     private let lock = NSLock()
     private var _passwords: [UUID: String] = [:]
     private var _secretEnvs: [UUID: [String: String]] = [:]
-    private var _failingPasswords: Set<UUID> = []
-    private var _failingSecretEnvs: Set<UUID> = []
+    private var _failingPasswords: [UUID: SecretStoreError] = [:]
+    private var _failingSecretEnvs: [UUID: SecretStoreError] = [:]
     private let defaultPassword: String?
     private let onPasswordRead: (@Sendable (UUID) -> Void)?
 
@@ -58,14 +58,19 @@ final class FakeSecretStore: SecretStore, @unchecked Sendable {
 
     /// Makes `password(destId:)` throw — the "locked keychain / unreadable
     /// secrets file" pre-flight failure.
-    func failPassword(for destId: UUID) {
-        withLock { _failingPasswords.insert(destId) }
+    ///
+    /// `error` defaults to the retryable ``SecretStoreError/backendFailed(_:)``
+    /// because that is what most callers mean by "the store failed". Pass
+    /// ``SecretStoreError/storeUnusable(_:)`` to reach the permanent arm the
+    /// pre-flight must not collapse into the retryable one (#96).
+    func failPassword(for destId: UUID, with error: SecretStoreError = .backendFailed("fake: password read failed")) {
+        withLock { _failingPasswords[destId] = error }
     }
 
     /// Makes `secretEnv(destId:)` throw (a *failure*, not "absent": absent is
     /// `[:]` and is the default).
-    func failSecretEnv(for destId: UUID) {
-        withLock { _failingSecretEnvs.insert(destId) }
+    func failSecretEnv(for destId: UUID, with error: SecretStoreError = .backendFailed("fake: secret env read failed")) {
+        withLock { _failingSecretEnvs[destId] = error }
     }
 
     // MARK: - SecretStore
@@ -77,8 +82,8 @@ final class FakeSecretStore: SecretStore, @unchecked Sendable {
     func password(destId: UUID) async throws -> String {
         onPasswordRead?(destId)
         let outcome: Result<String, SecretStoreError> = withLock {
-            if _failingPasswords.contains(destId) {
-                return .failure(.backendFailed("fake: password read failed"))
+            if let failure = _failingPasswords[destId] {
+                return .failure(failure)
             }
             if let stored = _passwords[destId] {
                 return .success(stored)
@@ -101,8 +106,8 @@ final class FakeSecretStore: SecretStore, @unchecked Sendable {
 
     func secretEnv(destId: UUID) async throws -> [String: String] {
         let outcome: Result<[String: String], SecretStoreError> = withLock {
-            if _failingSecretEnvs.contains(destId) {
-                return .failure(.backendFailed("fake: secret env read failed"))
+            if let failure = _failingSecretEnvs[destId] {
+                return .failure(failure)
             }
             return .success(_secretEnvs[destId] ?? [:])
         }

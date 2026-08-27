@@ -161,6 +161,23 @@ public enum ResticRunnerError: Error, Equatable, Sendable, CustomStringConvertib
     /// Carries only the destination id, for the same reason
     /// ``secretsUnavailable`` does.
     case secretsNotConfigured(destinationId: UUID)
+    /// The secret store could not be consulted at all, and repeating the
+    /// request cannot change that: a symlinked or group-readable
+    /// `secrets.json`, a file owned outside the trust boundary, contents
+    /// that do not decode, or a document written by a newer format version
+    /// (``SecretStoreError/storeUnusable(_:)``).
+    ///
+    /// **Terminal**, not retryable. Split from ``secretsUnavailable``
+    /// because the pre-flight collapsed the two and published the
+    /// pre-login-tick answer — "wait, this clears itself" — for a store
+    /// whose refusal had already named the `chmod` a human has to run
+    /// (#96).
+    ///
+    /// Carries only the destination id, for the same reason
+    /// ``secretsUnavailable`` does: the backend's own text names a path and
+    /// an owner, and this value ends up in run logs. `secret list` prints
+    /// the exact refusal on demand.
+    case secretsStoreUnusable(destinationId: UUID)
     /// The restic binary could not be spawned (missing/not executable).
     case launchFailed(String)
     /// The caller's timeout elapsed. `ProcessRunning` has already sent
@@ -173,6 +190,8 @@ public enum ResticRunnerError: Error, Equatable, Sendable, CustomStringConvertib
             return "secret store unavailable for destination \(destinationId)"
         case .secretsNotConfigured(let destinationId):
             return "no password stored for destination \(destinationId)"
+        case .secretsStoreUnusable(let destinationId):
+            return "secret store unusable for destination \(destinationId)"
         case .launchFailed(let reason):
             return "failed to launch restic: \(reason)"
         case .timedOut:
@@ -184,7 +203,7 @@ public enum ResticRunnerError: Error, Equatable, Sendable, CustomStringConvertib
         switch self {
         case .secretsUnavailable:
             return .retryable
-        case .secretsNotConfigured, .launchFailed, .timedOut:
+        case .secretsNotConfigured, .secretsStoreUnusable, .launchFailed, .timedOut:
             return .terminal
         }
     }
@@ -213,6 +232,14 @@ public enum ResticRunnerError: Error, Equatable, Sendable, CustomStringConvertib
             // it for something that is not there.
             return "No password is stored for this destination. "
                 + "Set one in Destinations (or run `restic-station-helper secret set`), then try again."
+        case .secretsStoreUnusable:
+            // Deliberately not worded per backend, and deliberately without
+            // the store's own text: that text names a path, a uid, and a
+            // mode, and this string reaches run logs. Point at the command
+            // that prints it in full instead of paraphrasing a refusal
+            // whose value is its exactness.
+            return "The secret store cannot be read as configured, and retrying will not change that. "
+                + "Run `restic-station-helper secret list` to see the exact refusal and how to fix it."
         case .launchFailed:
             return "The restic program could not be started. "
                 + "Check the restic path in Settings."

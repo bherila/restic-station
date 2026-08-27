@@ -228,7 +228,11 @@ struct HelperContext {
     ///   `secret list` gets the envelope instead of prose on stderr. The
     ///   only way this fails is a bad `RESTIC_STATION_SECRET_BACKEND`, which
     ///   is a misconfiguration of this host that a human has to fix — hence
-    ///   `config_invalid` and not the retryable `secret_unavailable`.
+    ///   `config_invalid`. The factory's own `SecretStoreError.storeUnusable`
+    ///   would classify as the non-retryable `secret_store_unusable`, which
+    ///   is not wrong, but this is a *configuration* fault reached before any
+    ///   store exists rather than a store refusing to be read; `cli-json.md`
+    ///   documents the environment variable under `config_invalid`.
     static func makeSecretStore(paths: AppPaths, runner: ProcessRunning) throws -> any SecretStore {
         do {
             return try SecretStoreFactory.make(

@@ -19,7 +19,32 @@ public enum SecretStoreError: Error, Sendable, Equatable, CustomStringConvertibl
     /// of `backendFailed` because retrying the identical write cannot repair
     /// a symlink, wrong owner, unsafe parent, or wrong file type.
     case lockUnusable(LockFailure)
+    /// The store itself cannot be used until something outside this request
+    /// changes: a file's type, mode, or owner; the document's format; or the
+    /// build that is reading it. Kept out of ``backendFailed`` for the same
+    /// reason ``lockUnusable`` is — repeating the identical read cannot
+    /// repair a symlinked `secrets.json`, a group-readable mode, an
+    /// untrusted owner, malformed contents, or a document written by a newer
+    /// format version.
+    ///
+    /// The distinction is not cosmetic: ``backendFailed`` publishes
+    /// `retryable: true`, which tells an automated caller to repeat a request
+    /// that cannot ever succeed (#96). The dividing line is *whether
+    /// repeating the identical request can produce a different answer*, not
+    /// whether a human would call the condition serious — a bare `errno`
+    /// wrapper stays ``backendFailed`` because its errno set includes
+    /// transient causes.
+    ///
+    /// The safe direction is asymmetric. Marking a genuinely transient
+    /// failure permanent is the more damaging mistake: it breaks the
+    /// pre-login-tick behaviour `docs/keychain-and-fda.md` §2 depends on,
+    /// where a tick that fires before the login keychain unlocks must keep
+    /// skipping and retrying rather than give up. So the keychain backend's
+    /// `security` failures — exit 51 included — stay ``backendFailed``.
+    case storeUnusable(String)
     /// Any other backend failure, with the backend's own diagnostic text.
+    /// The backend answered badly and may answer well later: a locked login
+    /// keychain, a transient I/O error, a lock held by a stuck peer.
     case backendFailed(String)
 
     public var description: String {
@@ -28,6 +53,8 @@ public enum SecretStoreError: Error, Sendable, Equatable, CustomStringConvertibl
             return "no stored secret for this destination"
         case .lockUnusable(let failure):
             return "secrets lock unusable: \(failure)"
+        case .storeUnusable(let detail):
+            return detail
         case .backendFailed(let detail):
             return detail
         }

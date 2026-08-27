@@ -52,6 +52,22 @@ import Musl
 /// at the same time, so every read-modify-write happens under the shared
 /// `locks/secrets.lock` `flock`. Reads take no lock: `rename(2)` is atomic,
 /// so a reader always observes one complete generation of the file.
+///
+/// **Which failures are retryable.** Besides
+/// ``SecretStoreError/itemNotFound`` and
+/// ``SecretStoreError/lockUnusable(_:)``, every failure this type raises is
+/// either ``SecretStoreError/storeUnusable(_:)`` — repeating the identical
+/// request cannot succeed, because a file type, mode, owner, or format has
+/// to change first — or ``SecretStoreError/backendFailed(_:)``, where it
+/// can. The published `retryable` flag is derived from that split, so the
+/// categorisation is a contract, not a comment: an automated caller loops on
+/// the second and stops on the first (#96).
+///
+/// After the sweep, every remaining `backendFailed` here either **wraps a
+/// bare `errno`** — no errno set is uniformly permanent, so those stay
+/// retryable — or is one of three non-errno exceptions whose reasoning is
+/// written at the site: the lock-wait timeout, the temp-path race, and a
+/// short write. Each permanent site names its own reasoning too.
 public struct FileSecretStore: SecretStore {
 
     /// Bumped only if the on-disk shape changes. A file whose `version` is
@@ -444,12 +460,12 @@ public struct FileSecretStore: SecretStore {
         } catch {
             // `error` describes JSON structure, never a value: `DecodingError`
             // reports key paths and expected types only.
-            throw SecretStoreError.backendFailed(
+            throw SecretStoreError.storeUnusable(
                 "\(fileURL.path) is not readable as a secrets file: \(error)"
             )
         }
         guard document.version <= Self.currentVersion else {
-            throw SecretStoreError.backendFailed(
+            throw SecretStoreError.storeUnusable(
                 "\(fileURL.path) was written by a newer version of Restic Station "
                     + "(format \(document.version), this build understands \(Self.currentVersion)). "
                     + "Upgrade Restic Station rather than letting it overwrite the file."
@@ -471,28 +487,37 @@ public struct FileSecretStore: SecretStore {
                 return nil
             }
             if code == ELOOP {
-                throw SecretStoreError.backendFailed(
+                throw SecretStoreError.storeUnusable(
                     "refusing to read \(path): it is a symbolic link. "
                         + "Replace it with a regular file owned by you (mode 0600)."
                 )
             }
+            // Transient by the rule on `SecretStoreError.storeUnusable`: this
+            // errno set is not uniformly permanent. EACCES here can be Full
+            // Disk Access not yet granted, which *does* resolve without the
+            // file changing; EMFILE/ENFILE clear on their own. A permanent
+            // cause reaching this line (a mode a human must fix) is reported
+            // by the explicit checks below instead, which is why they exist
+            // as checks rather than as errno interpretations.
             throw SecretStoreError.backendFailed("could not open \(path): \(Self.describe(errno: code))")
         }
         defer { close(fd) }
 
         var info = stat()
         guard fstat(fd, &info) == 0 else {
+            // Transient: fstat on an already-open descriptor fails only for
+            // I/O-level reasons (EIO on a failing or disconnected volume).
             throw SecretStoreError.backendFailed("could not stat \(path): \(Self.describe(errno: errno))")
         }
         let mode = UInt32(info.st_mode)
         guard mode & UInt32(S_IFMT) == UInt32(S_IFREG) else {
-            throw SecretStoreError.backendFailed(
+            throw SecretStoreError.storeUnusable(
                 "refusing to read \(path): it is not a regular file."
             )
         }
         let euid = effectiveUserID()
         guard Self.isTrustedOwner(info.st_uid, effectiveUID: euid) else {
-            throw SecretStoreError.backendFailed(
+            throw SecretStoreError.storeUnusable(
                 "refusing to read \(path): it is owned by uid \(info.st_uid), outside this "
                     + "helper's trusted ownership boundary (\(Self.trustedOwnerDescription(effectiveUID: euid))). "
                     + "Fix the ownership with: chown \(euid) \(ShellQuoting.quoteIfNeeded(path))"
@@ -500,7 +525,7 @@ public struct FileSecretStore: SecretStore {
         }
         let permissions = mode & 0o777
         guard permissions & 0o077 == 0 else {
-            throw SecretStoreError.backendFailed(
+            throw SecretStoreError.storeUnusable(
                 "refusing to read \(path): it is group- or world-accessible "
                     + "(mode \(Self.octal(permissions))). Fix it with: chmod 600 \(path)"
             )
@@ -537,6 +562,9 @@ public struct FileSecretStore: SecretStore {
                 break
             case .busy:
                 guard clock.now < deadline else {
+                    // Transient: a peer holding the lock releases it when it
+                    // finishes or dies. A lock that is *structurally*
+                    // unusable is the `.failed` arm below, not this one.
                     throw SecretStoreError.backendFailed(
                         "timed out after 10s waiting for the secrets lock at "
                             + "\(lockFileURL.path). Another Restic Station process may be stuck; "
@@ -568,7 +596,11 @@ public struct FileSecretStore: SecretStore {
         do {
             data = try encoder.encode(document)
         } catch {
-            throw SecretStoreError.backendFailed("could not encode the secrets file: \(error)")
+            // Permanent: encoding a `Document` of strings is deterministic,
+            // so the identical encode of the identical document cannot
+            // succeed on a retry. Unreachable in practice; if it is ever
+            // reached the fix is a new build, not a repeated request.
+            throw SecretStoreError.storeUnusable("could not encode the secrets file: \(error)")
         }
 
         let tempPath = tempFileURL.path
@@ -581,6 +613,16 @@ public struct FileSecretStore: SecretStore {
         if removed != 0 {
             let code = errno
             if code != ENOENT {
+                // Transient by the errno rule, and this is the site where
+                // that rule costs the most: the message below names an
+                // owner and an actionable recovery, which reads like a
+                // permanent refusal. It is classified transient anyway
+                // because the errno cannot tell a squatted entry in a
+                // sticky shared directory (permanent) from EBUSY or EIO
+                // (not), and on macOS EACCES/EPERM here can equally be Full
+                // Disk Access that has not been granted yet. Deciding a
+                // structural fact is what makes a site permanent; surfacing
+                // an errno is not.
                 throw SecretStoreError.backendFailed(
                     Self.tempFileConflictMessage(
                         path: tempPath,
@@ -593,6 +635,8 @@ public struct FileSecretStore: SecretStore {
         guard fd >= 0 else {
             let code = errno
             if code == EEXIST {
+                // Transient: this is a lost race for the temp path, and
+                // the next attempt can win it.
                 throw SecretStoreError.backendFailed(
                     Self.tempFileConflictMessage(
                         path: tempPath,
@@ -622,7 +666,11 @@ public struct FileSecretStore: SecretStore {
                 )
             }
             guard tightened.st_mode & 0o777 == 0o600 else {
-                throw SecretStoreError.backendFailed(
+                // Permanent: the chmod returned success and the mode did
+                // not change, which is a filesystem that does not honour
+                // permissions at all. No repetition by anyone changes that;
+                // the data directory has to move.
+                throw SecretStoreError.storeUnusable(
                     "could not enforce mode 0600 on \(tempPath): filesystem reported mode "
                         + "\(Self.octal(UInt32(tightened.st_mode) & 0o777))"
                 )
@@ -670,6 +718,8 @@ public struct FileSecretStore: SecretStore {
             }
         }
         guard offset == data.count else {
+            // Transient: a short write without an errno is a full or
+            // quota-limited filesystem, which freeing space repairs.
             throw SecretStoreError.backendFailed("short write to the secrets file")
         }
     }
@@ -760,7 +810,7 @@ public struct FileSecretStore: SecretStore {
             entryOwner: euid,
             effectiveUID: euid
         ) else {
-            throw SecretStoreError.backendFailed(
+            throw SecretStoreError.storeUnusable(
                 "refusing to store secrets in \(path): the directory has unprotected group/world "
                     + "write-and-search access (mode \(Self.octal(displayedMode))). Another user "
                     + "could replace secrets.json "
@@ -826,7 +876,7 @@ public struct FileSecretStore: SecretStore {
             effectiveUID: euid
         ) else {
             let displayedMode = UInt32(parentInfo.st_mode) & 0o7777
-            throw SecretStoreError.backendFailed(
+            throw SecretStoreError.storeUnusable(
                 "refusing to store secrets under \(parent.path): the immediate parent directory "
                     + "has unprotected group/world write-and-search access "
                     + "(mode \(Self.octal(displayedMode))), allowing another user to rename or "
@@ -844,7 +894,7 @@ public struct FileSecretStore: SecretStore {
             )
         }
         guard UInt32(info.st_mode) & UInt32(S_IFMT) == UInt32(S_IFDIR) else {
-            throw SecretStoreError.backendFailed("expected a directory at \(url.path)")
+            throw SecretStoreError.storeUnusable("expected a directory at \(url.path)")
         }
         return info
     }
@@ -883,7 +933,7 @@ public struct FileSecretStore: SecretStore {
         effectiveUID: uid_t
     ) throws {
         guard Self.isTrustedOwner(owner, effectiveUID: effectiveUID) else {
-            throw SecretStoreError.backendFailed(
+            throw SecretStoreError.storeUnusable(
                 "refusing to store secrets at \(path): the \(role) is owned by uid \(owner), "
                     + "outside this helper's trusted ownership boundary "
                     + "(\(Self.trustedOwnerDescription(effectiveUID: effectiveUID))). "
