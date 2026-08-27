@@ -467,21 +467,35 @@ public struct ScheduleStateReadFailure: Equatable, Sendable, CustomStringConvert
         // suppresses a required rewrite. Only a read-only exposure (the
         // marker's stricter 0o077 threshold catches those) leaves the bytes
         // provably untouched.
-        if case .unsafeMode(let subject, let path, let mode) = reason {
+        if case .unsafeMode(let subject, let path, _) = reason {
             let repair = "`chmod \(subject.repairMode) \(ShellQuoting.quoteIfNeeded(path))`"
-            guard mode & 0o022 != 0 else {
+            switch subject {
+            case .versionMarker:
+                // The marker holds only `1\n`. It carries no schedule or
+                // purge state and cannot alter any, so a widened marker never
+                // implicates the canonical document — sending an operator to
+                // replace that document would discard trustworthy bookkeeping
+                // over a defect confined to a two-byte file.
                 return description
-                    + ". Another user could read \(subject.subject) but not write it, so its "
-                    + "contents are unchanged. Stop Restic Station and repair the mode in place "
-                    + "with \(repair); do not replace or delete it for this failure."
+                    + ". Stop Restic Station and repair the marker with \(repair), or recreate it "
+                    + "as exactly `1\\n` with mode 0600. It carries no schedule or purge state, so "
+                    + "the canonical document is not implicated and must not be replaced or "
+                    + "deleted for this failure."
+            case .canonicalDocument, .stateDirectory:
+                // Both are refused only for *write* exposure, so reaching here
+                // means another uid could have written the document — directly,
+                // or by swapping it through `state/`. `chmod` closes the
+                // exposure but says nothing about bytes already on disk, and
+                // the envelope checksum is unkeyed, so a forged watermark
+                // verifies.
+                return description
+                    + ". Stop Restic Station and repair the mode with \(repair) — but closing the "
+                    + "exposure says nothing about the bytes already written. Another user could "
+                    + "write \(subject.subject), and the envelope checksum is unkeyed, so a forged "
+                    + "purge watermark would verify. Inspect the canonical document against a "
+                    + "trusted copy before resuming, and replace it if you cannot account for its "
+                    + "current state."
             }
-            return description
-                + ". Stop Restic Station and repair the mode with \(repair) — but note that "
-                + "closing the exposure says nothing about the bytes already written. Another "
-                + "user could write \(subject.subject), and the envelope checksum is unkeyed, so "
-                + "a forged purge watermark would verify. Inspect the canonical document against "
-                + "a trusted copy before resuming, and replace it if you cannot account for its "
-                + "current state."
         }
 
         let markerFailure: Bool
@@ -775,6 +789,17 @@ public struct StateStore: Sendable {
     /// Opened through `fileOperations` rather than `DirectoryHandle.open`, so
     /// the injectable syscall seam still governs this open; the handle adopts
     /// the verified descriptor and owns closing it.
+    /// `lstat(2)` of a directory pathname, for diagnosis only — see the sole
+    /// call site in ``openStateDirectory()``. Returns `nil` for anything that
+    /// is not a directory, so a symlink or replaced entry cannot borrow the
+    /// unsafe-mode refusal.
+    private static func directoryModeByPathname(_ path: String) -> mode_t? {
+        var info = stat()
+        guard path.withCString({ lstat($0, &info) }) == 0 else { return nil }
+        guard (info.st_mode & mode_t(S_IFMT)) == mode_t(S_IFDIR) else { return nil }
+        return info.st_mode
+    }
+
     private func openStateDirectory() -> StateDirectoryOpen {
         let descriptor = fileOperations.openAt(
             AT_FDCWD,
@@ -784,9 +809,31 @@ public struct StateStore: Sendable {
         )
         guard descriptor >= 0 else {
             let code = errno
-            return code == ENOENT
-                ? .missing
-                : .failed(.ioFailure(operation: "open state directory", errno: code))
+            if code == ENOENT { return .missing }
+            // A `state/` that others can write but we cannot read (`0333`)
+            // fails `O_RDONLY` before the mode guard below ever runs, and
+            // would otherwise surface as a generic I/O error whose recovery
+            // text points at replacing the canonical document.
+            //
+            // The descriptor cannot simply be opened `O_PATH`/`O_SEARCH` the
+            // way `FileLock` opens a lock parent: this same descriptor is the
+            // fsync target for durable publication, and Linux rejects
+            // `fsync(2)` on an `O_PATH` descriptor with `EBADF`.
+            //
+            // So diagnose by pathname instead. This is deliberately the one
+            // unbound lookup in the read path: no descriptor exists to bind it
+            // to, no security decision rides on it, and the read fails closed
+            // either way — it only chooses which refusal to report.
+            if code == EACCES,
+               let mode = Self.directoryModeByPathname(paths.stateDir.path),
+               mode & 0o022 != 0 {
+                return .failed(.unsafeMode(
+                    subject: .stateDirectory,
+                    path: paths.stateDir.path,
+                    mode: mode
+                ))
+            }
+            return .failed(.ioFailure(operation: "open state directory", errno: code))
         }
         var info = stat()
         guard fileOperations.stat(descriptor, &info) == 0 else {

@@ -547,15 +547,24 @@ the offending path and the shell-quoted `chmod` that repairs it (`700` for the
 directory, `600` for either file).
 
 Repairing the mode is not the same as trusting the bytes, and the guidance
-splits on exactly that. Where the exposure was **read-only** (only the marker's
-stricter threshold catches those), the contents are provably unchanged and the
-remedy is the `chmod` alone — replacing a healthy file would discard a
-trustworthy purge watermark over a mode bit. Where another uid could **write** —
-the canonical document, or a `state/` whose write bit let it swap that document
-— `chmod` closes the exposure but proves nothing about what is already on disk.
-The envelope checksum is unkeyed, so a forged `appliedPurgeExcludes` would
-verify, and a fabricated watermark suppresses a required rewrite. That case
-keeps the inspect-and-replace guidance.
+splits on which path was exposed. The **marker** holds only `1\n`: it carries no
+schedule or purge state and cannot alter any, so a widened marker — writable or
+merely readable — is repaired on its own and never implicates the canonical
+document. Sending an operator to replace that document for a two-byte file
+would discard trustworthy bookkeeping. The **canonical document** and **`state/`**
+are refused only for *write* exposure, so reaching that refusal means another
+uid could have written the document, directly or by swapping it through the
+directory. There `chmod` closes the exposure but proves nothing about what is
+already on disk: the envelope checksum is unkeyed, so a forged
+`appliedPurgeExcludes` verifies, and a fabricated watermark suppresses a
+required rewrite. That case keeps the inspect-and-replace guidance.
+
+A `state/` that others can write but this user cannot read (`0333`) fails the
+`O_RDONLY` open before the mode check runs, so it is diagnosed by pathname and
+still reported as the directory-mode refusal rather than a bare I/O error. The
+directory descriptor cannot instead be opened `O_PATH`/`O_SEARCH` as lock
+parents are: it is also the fsync target for durable publication, and Linux
+rejects `fsync(2)` on an `O_PATH` descriptor.
 
 ## state/repo-status-<destId>.json
 
