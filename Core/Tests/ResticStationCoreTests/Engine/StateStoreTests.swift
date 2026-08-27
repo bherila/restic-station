@@ -374,7 +374,15 @@ struct StateStoreTests {
     /// The descriptor cannot be opened `O_PATH`/`O_SEARCH` instead: it is the
     /// fsync target for durable publication, and Linux rejects `fsync(2)` on
     /// an `O_PATH` descriptor.
-    @Test("an unreadable but world-writable state/ is still named as a mode defect")
+    ///
+    /// Guarded: root opens a `0333` directory happily, so the `EACCES` branch
+    /// never runs there and the assertion would pass through the ordinary mode
+    /// guard instead — a vacuous pass. The macOS job runs unprivileged and
+    /// covers it.
+    @Test(
+        "an unreadable but world-writable state/ is still named as a mode defect",
+        .enabled(if: canInjectPermissionFaults, "root ignores directory read denial")
+    )
     func unreadableWritableStateDirectoryIsDiagnosed() throws {
         let (store, root) = makeStore()
         let paths = AppPaths(root: root)
@@ -409,7 +417,10 @@ struct StateStoreTests {
     /// An unreadable directory that is *not* writable by others is a genuine
     /// permission problem, not an unsafe mode — it must keep the I/O
     /// diagnosis rather than borrow the mode refusal.
-    @Test("an unreadable but otherwise safe state/ stays an I/O failure")
+    @Test(
+        "an unreadable but otherwise safe state/ stays an I/O failure",
+        .enabled(if: canInjectPermissionFaults, "root ignores directory read denial")
+    )
     func unreadableSafeStateDirectoryStaysAnIOFailure() throws {
         let (store, root) = makeStore()
         let paths = AppPaths(root: root)
