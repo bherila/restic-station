@@ -614,6 +614,9 @@ public enum ConfigError: Error, Equatable, Sendable, CustomStringConvertible {
     case emptySources(setId: UUID)
     /// Invariant 3: a set has a non-absolute source path.
     case relativeSourcePath(setId: UUID, path: String)
+    /// Invariant 3: a set has a source path containing a `.` or `..`
+    /// component.
+    case nonCanonicalSourcePath(setId: UUID, path: String)
     /// Invariant 3: a set has an empty `purgeExcludes` pattern.
     case emptyPurgeExcludePattern(setId: UUID, index: Int)
     /// Invariant 4: a `Schedule` field is out of range.
@@ -626,6 +629,9 @@ public enum ConfigError: Error, Equatable, Sendable, CustomStringConvertible {
     case invalidMachineIdKey(setId: UUID, machineId: String)
     /// Invariant 6: an override `sources` entry is not an absolute path.
     case relativeOverrideSourcePath(setId: UUID, machineId: String, path: String)
+    /// Invariant 6: an override `sources` entry contains a `.` or `..`
+    /// component.
+    case nonCanonicalOverrideSourcePath(setId: UUID, machineId: String, path: String)
     /// Invariant 7: after resolving for `machineId`, a set that still runs
     /// there does not have exactly one primary destination — e.g. a config
     /// that disables the primary on some machine without disabling the set.
@@ -645,6 +651,10 @@ public enum ConfigError: Error, Equatable, Sendable, CustomStringConvertible {
             return "backup set \(setId) has no sources"
         case .relativeSourcePath(let setId, let path):
             return "backup set \(setId) has a non-absolute source path: \(path)"
+        case .nonCanonicalSourcePath(let setId, let path):
+            return "backup set \(setId) has a source path containing a \".\" or \"..\" component: \(path)"
+                + " — restic records the cleaned path in its snapshots, so snapshots from this source "
+                + "cannot be attributed to it and purge would refuse. Write the resolved path instead."
         case .emptyPurgeExcludePattern(let setId, let index):
             return "backup set \(setId) has an empty purgeExcludes pattern at position \(index) — "
                 + "remove the blank row; an empty pattern would be passed to restic as --exclude \"\""
@@ -659,6 +669,11 @@ public enum ConfigError: Error, Equatable, Sendable, CustomStringConvertible {
                 + "non-empty and use only lowercase letters, digits and '-'"
         case .relativeOverrideSourcePath(let setId, let machineId, let path):
             return "backup set \(setId) has a non-absolute source path for machine \"\(machineId)\": \(path)"
+        case .nonCanonicalOverrideSourcePath(let setId, let machineId, let path):
+            return "backup set \(setId) has a source path containing a \".\" or \"..\" component "
+                + "for machine \"\(machineId)\": \(path) — restic records the cleaned path in its "
+                + "snapshots, so snapshots from this source cannot be attributed to it and purge "
+                + "would refuse. Write the resolved path instead."
         case .notExactlyOnePrimaryDestinationForMachine(let setId, let machineId, let count):
             return "backup set \(setId) must have exactly one primary destination on machine \"\(machineId)\", "
                 + "found \(count) — disable the whole set for that machine instead of its primary destination"
@@ -708,6 +723,9 @@ extension AppConfig {
             for source in set.sources where !source.hasPrefix("/") {
                 throw ConfigError.relativeSourcePath(setId: set.id, path: source)
             }
+            for source in set.sources where Self.hasNonCanonicalComponent(source) {
+                throw ConfigError.nonCanonicalSourcePath(setId: set.id, path: source)
+            }
 
             // Invariant 3: no blank purge pattern. `excludes` is deliberately
             // left unvalidated — a stray blank row there is harmless noise —
@@ -737,6 +755,23 @@ extension AppConfig {
         try validateResolutions()
     }
 
+    /// Whether a configured source path carries a `.` or `..` component.
+    ///
+    /// restic lexically cleans the paths it records in a snapshot, while
+    /// `PurgePlan` deliberately does not resolve them — it has no filesystem
+    /// access, and resolving `..` lexically is wrong across a symlink. The
+    /// configured path and the recorded path therefore never compare equal,
+    /// so every snapshot from such a source is unattributable: purge finds a
+    /// plan that matches nothing while snapshots were declined, and fails
+    /// closed. Safe, but diagnosed at purge time from a message about
+    /// attribution. Refusing here makes it an obvious configuration error.
+    ///
+    /// Empty components are *not* refused: `//` and a trailing `/` already
+    /// compare equal, because `PurgePlan` normalizes both sides for those.
+    static func hasNonCanonicalComponent(_ path: String) -> Bool {
+        path.split(separator: "/").contains { $0 == "." || $0 == ".." }
+    }
+
     // MARK: Invariant 6 — override shape
 
     /// Every `machines` key on a set or on one of its destinations must be a
@@ -754,6 +789,13 @@ extension AppConfig {
             // reason rather than running a sourceless backup.
             for source in override.sources ?? [] where !source.hasPrefix("/") {
                 throw ConfigError.relativeOverrideSourcePath(setId: set.id, machineId: machineId, path: source)
+            }
+            for source in override.sources ?? [] where hasNonCanonicalComponent(source) {
+                throw ConfigError.nonCanonicalOverrideSourcePath(
+                    setId: set.id,
+                    machineId: machineId,
+                    path: source
+                )
             }
             // Same rule as invariant 4 for the schedule it replaces.
             if let schedule = override.schedule {

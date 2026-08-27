@@ -305,6 +305,7 @@ struct ConfigErrorTableTests {
              .emptyPurgeExcludePattern, .invalidSchedule,
              .invalidStalenessWarningDays, .invalidReadDataSubsetSlices,
              .invalidMachineIdKey, .relativeOverrideSourcePath,
+             .nonCanonicalSourcePath, .nonCanonicalOverrideSourcePath,
              .notExactlyOnePrimaryDestinationForMachine:
             return (.configInvalid, false)
         }
@@ -323,6 +324,8 @@ struct ConfigErrorTableTests {
         .invalidReadDataSubsetSlices(setId: setId, value: 1),
         .invalidMachineIdKey(setId: setId, machineId: "Bad_Slug"),
         .relativeOverrideSourcePath(setId: setId, machineId: "linux-nas", path: "Documents"),
+        .nonCanonicalSourcePath(setId: setId, path: "/srv/../srv/data"),
+        .nonCanonicalOverrideSourcePath(setId: setId, machineId: "linux-nas", path: "/srv/./data"),
         .notExactlyOnePrimaryDestinationForMachine(setId: setId, machineId: "linux-nas", count: 0),
     ]
 

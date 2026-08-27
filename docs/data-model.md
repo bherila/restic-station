@@ -160,11 +160,11 @@ public struct CheckPolicy: Codable, Equatable {
 
 1. Each set has **exactly one** destination with `isPrimary == true`.
 2. Set and destination UUIDs are unique across the whole config.
-3. `sources` non-empty for every set; every source is an absolute path.
+3. `sources` non-empty for every set; every source is an absolute path, and carries no `.` or `..` component. restic records the lexically cleaned path in a snapshot while `PurgePlan` deliberately does not resolve those components — it has no filesystem access, and resolving `..` lexically is wrong across a symlink — so a source written that way makes its own snapshots unattributable, and purge fails closed at run time. Repeated and trailing separators stay legal: both sides are normalized for those.
 4. `Schedule` fields in range (minute 0–59, hour 0–23, weekday 1–7, everyMinutes ≥ 5).
 5. Every `purgeExcludes` pattern is non-empty. A blank plain `excludes` entry is harmless noise, but a blank pattern must never become a history-changing purge rule.
 6. `stalenessWarningDays ≥ 1`; `readDataSubsetSlices` in 2...100.
-7. Every `machines` key is a valid `machineId` (see §machine.json for the charset), and every value an override supplies gets the same check as the field it replaces: override `sources` entries must be absolute, an override `schedule` must be in range. **Exception:** an override `sources` of `[]` is legal where a top-level `[]` is not — it is how a machine says "nothing to back up here", and resolution drops the set with a recorded reason rather than running a source-less backup.
+7. Every `machines` key is a valid `machineId` (see §machine.json for the charset), and every value an override supplies gets the same check as the field it replaces: override `sources` entries get the whole of invariant 3's path rule (absolute, no `.`/`..`), an override `schedule` must be in range. **Exception:** an override `sources` of `[]` is legal where a top-level `[]` is not — it is how a machine says "nothing to back up here", and resolution drops the set with a recorded reason rather than running a source-less backup.
 8. **Per machine:** if a set runs on a machine, exactly one of its destinations must be a primary that is enabled there. Disabling the primary is never a valid way to say "do not run here" — disable the whole set for that machine instead. Checked for every `machineId` the config mentions; machines with no overrides see the shared values, which invariant 1 already covers.
 
 A `machines` key that no `machine.json` in the fleet claims is **not** an error — machines come and go, and the config is shared. It is a warning surfaced by `config validate` (T27).

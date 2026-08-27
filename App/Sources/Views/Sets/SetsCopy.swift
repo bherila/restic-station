@@ -207,6 +207,13 @@ enum SetsCopy {
             return (.sources, "Add at least one folder or file to back up.")
         case .relativeSourcePath(_, let path):
             return (.sources, "Sources must be absolute paths — “\(path)” is not.")
+        case .nonCanonicalSourcePath(_, let path):
+            return (
+                .sources,
+                "“\(path)” contains “.” or “..”. Use the folder's real path instead — restic "
+                    + "stores the resolved path, so backups from this source could not be matched "
+                    + "back to it."
+            )
         case .emptyPurgeExcludePattern:
             return (
                 .purgeExcludes,
@@ -235,6 +242,13 @@ enum SetsCopy {
             return (
                 .sources,
                 "Sources must be absolute paths — “\(path)”, set for machine “\(machineId)” in config.json, is not."
+            )
+        case .nonCanonicalOverrideSourcePath(_, let machineId, let path):
+            return (
+                .sources,
+                "“\(path)”, set for machine “\(machineId)” in config.json, contains “.” or “..”. "
+                    + "Use the folder's real path instead — restic stores the resolved path, so "
+                    + "backups from this source could not be matched back to it."
             )
         case .notExactlyOnePrimaryDestinationForMachine(_, let machineId, let count):
             if count == 0 {

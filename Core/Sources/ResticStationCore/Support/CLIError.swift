@@ -761,6 +761,7 @@ extension CLIFailure {
              .emptyPurgeExcludePattern, .invalidSchedule,
              .invalidStalenessWarningDays, .invalidReadDataSubsetSlices,
              .invalidMachineIdKey, .relativeOverrideSourcePath,
+             .nonCanonicalSourcePath, .nonCanonicalOverrideSourcePath,
              .notExactlyOnePrimaryDestinationForMachine:
             // Every other case is a validation failure of a config this
             // build *can* read. They are one code on purpose: a caller
