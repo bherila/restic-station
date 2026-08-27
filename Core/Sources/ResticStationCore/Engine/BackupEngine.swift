@@ -411,7 +411,7 @@ public final class BackupEngine: Sendable {
         // created by another host during the previous query→rewrite gap can
         // never be omitted permanently.
         let primaryPurgePatterns = set.purgeExcludes
-        var primaryPurgeSnapshotIDs: [String] = []
+        var primaryPurgeSnapshotPrefixes: [String] = []
         if !primaryPurgePatterns.isEmpty {
             do {
                 // Validate the canonical state before repository I/O. The
@@ -448,7 +448,7 @@ public final class BackupEngine: Sendable {
                         reason: "primary purge did not produce a copy-bound snapshot generation"
                     )
                 }
-                primaryPurgeSnapshotIDs = snapshotIDs
+                primaryPurgeSnapshotPrefixes = snapshotIDs
             } catch {
                 logWarning(
                     "BackupEngine: could not purge primary \"\(primary.label)\" before mirroring: \(error)"
@@ -464,6 +464,9 @@ public final class BackupEngine: Sendable {
                 return .completed(status: .failed, groupId: groupId, children: children)
             }
         }
+
+        var primaryPurgeFullSnapshotIDs: [String]?
+        var boundedCopyExecutable: ResticRunner.MaintenanceExecutable?
 
         // ── Step 7: secondaries, in config order ────────────────────────
         for secondary in set.destinations where !secondary.isPrimary {
@@ -522,16 +525,40 @@ public final class BackupEngine: Sendable {
                 }
             }
 
-            let boundedCopyExecutable: ResticRunner.MaintenanceExecutable?
-            if primaryPurgeSnapshotIDs.isEmpty {
-                boundedCopyExecutable = nil
-            } else if let executable = restic.maintenanceExecutable() {
-                boundedCopyExecutable = executable
+            let copySnapshotIDs: [String]
+            if primaryPurgeSnapshotPrefixes.isEmpty {
+                copySnapshotIDs = []
+            } else if let resolved = primaryPurgeFullSnapshotIDs {
+                copySnapshotIDs = resolved
             } else {
-                infrastructureFailures.append(
-                    "secondary \"\(secondary.label)\": restic unavailable before bounded copy"
-                )
-                continue
+                do {
+                    guard let executable = restic.maintenanceExecutable() else {
+                        throw PurgeApplyError.resticUnavailable
+                    }
+                    let secretEnv = try await restic.maintenanceSecretEnvironment(for: primary)
+                    let liveSnapshotIDs = try await purgeSnapshotIDs(
+                        destination: primary,
+                        destinationSecretEnv: secretEnv,
+                        executable: executable
+                    )
+                    guard let resolved = Self.resolveFullSnapshotIDs(
+                        forPrefixes: primaryPurgeSnapshotPrefixes,
+                        in: liveSnapshotIDs
+                    ) else {
+                        throw PurgeApplyError.infrastructureFailure(
+                            reason: "the bounded primary generation cannot be resolved to full snapshot ids",
+                            operationMayHaveRun: false
+                        )
+                    }
+                    primaryPurgeFullSnapshotIDs = resolved
+                    boundedCopyExecutable = executable
+                    copySnapshotIDs = resolved
+                } catch {
+                    let reason = "could not bind the bounded primary generation before copy — \(error)"
+                    logWarning("BackupEngine: \(reason) for \"\(secondary.label)\"")
+                    infrastructureFailures.append("secondary \"\(secondary.label)\": \(reason)")
+                    continue
+                }
             }
 
             let copyResult = await performChild(
@@ -545,7 +572,7 @@ public final class BackupEngine: Sendable {
                 command: .copy(
                     toRepo: secondary.repoURL,
                     fromRepo: primary.repoURL,
-                    snapshotIDs: primaryPurgeSnapshotIDs
+                    snapshotIDs: copySnapshotIDs
                 ),
                 invocation: ResticInvocation(
                     destination: secondary,
@@ -581,47 +608,18 @@ public final class BackupEngine: Sendable {
                 continue
             }
 
-            // A bounded copy names only the generation proven by the
-            // primary purge. A peer can commit another primary snapshot
-            // while that copy is running; in that case the successful restic
-            // exit proves only that the bounded operands arrived, not that
-            // the mirror caught up. Re-list the primary after copy and refuse
-            // both the freshness marker and mirror retention unless the live
-            // generation is still exactly the copied generation.
-            if !primaryPurgeSnapshotIDs.isEmpty {
-                do {
-                    guard let executable = boundedCopyExecutable else {
-                        throw PurgeApplyError.resticUnavailable
-                    }
-                    let secretEnv = try await restic.maintenanceSecretEnvironment(for: primary)
-                    let liveSnapshotIDs = try await purgeSnapshotIDs(
-                        destination: primary,
-                        destinationSecretEnv: secretEnv,
-                        executable: executable
-                    )
-                    guard Self.snapshotGeneration(
-                        liveSnapshotIDs,
-                        exactlyMatchesPrefixes: primaryPurgeSnapshotIDs
-                    ) else {
-                        let reason = "primary snapshot generation changed during bounded copy"
-                        logWarning(
-                            "BackupEngine: \(reason) to \"\(secondary.label)\" — "
-                                + "skipping sync marker and retention"
-                        )
-                        infrastructureFailures.append(
-                            "secondary \"\(secondary.label)\": \(reason)"
-                        )
-                        continue
-                    }
-                } catch {
-                    let reason = "could not verify primary snapshot generation after bounded copy — \(error)"
-                    logWarning(
-                        "BackupEngine: \(reason) for \"\(secondary.label)\" — "
-                            + "skipping sync marker and retention"
-                    )
-                    infrastructureFailures.append("secondary \"\(secondary.label)\": \(reason)")
-                    continue
-                }
+            // No Restic CLI transaction can bind a primary observation
+            // through destructive retention on another repository. A bounded
+            // copy therefore proves only that these exact, full snapshot ids
+            // arrived. It never claims that the mirror caught up and never
+            // authorizes mirror retention; a peer may add another primary
+            // snapshot at any point after the ids were resolved.
+            if !primaryPurgeSnapshotPrefixes.isEmpty {
+                logWarning(
+                    "BackupEngine: bounded copy to \"\(secondary.label)\" completed — "
+                        + "withholding sync marker and mirror retention"
+                )
+                continue
             }
             markSynced(secondary)
 
@@ -2189,17 +2187,19 @@ public final class BackupEngine: Sendable {
             && Set(transcriptIDs).count == snapshotIDs.count
     }
 
-    private static func snapshotGeneration(
-        _ liveSnapshotIDs: Set<String>,
-        exactlyMatchesPrefixes expectedPrefixes: [String]
-    ) -> Bool {
-        guard liveSnapshotIDs.count == expectedPrefixes.count,
-              hasUnambiguousRewriteTranscriptIDs(expectedPrefixes) else {
-            return false
+    private static func resolveFullSnapshotIDs(
+        forPrefixes prefixes: [String],
+        in liveSnapshotIDs: Set<String>
+    ) -> [String]? {
+        guard hasUnambiguousRewriteTranscriptIDs(prefixes) else { return nil }
+        var resolved: [String] = []
+        resolved.reserveCapacity(prefixes.count)
+        for prefix in prefixes {
+            let matches = liveSnapshotIDs.lazy.filter { $0.hasPrefix(prefix) }.prefix(2)
+            guard matches.count == 1, let fullID = matches.first else { return nil }
+            resolved.append(fullID)
         }
-        return expectedPrefixes.allSatisfy { prefix in
-            liveSnapshotIDs.lazy.filter { $0.hasPrefix(prefix) }.prefix(2).count == 1
-        }
+        return Set(resolved).count == resolved.count ? resolved : nil
     }
 
     /// The only `rewrite --forget` call site.  It receives explicit ids from

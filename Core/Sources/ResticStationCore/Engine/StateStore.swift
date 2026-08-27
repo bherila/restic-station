@@ -465,6 +465,7 @@ public enum StateStoreError: Error, Equatable, Sendable, CustomStringConvertible
     /// the bounded retry window.
     case scheduleStateLockTimeout(path: String)
     case scheduleStateCorrupt(ScheduleStateReadFailure)
+    case scheduleStateWriteTooLarge(bytes: Int64, limit: Int64, path: String)
 
     public var description: String {
         switch self {
@@ -478,6 +479,9 @@ public enum StateStoreError: Error, Equatable, Sendable, CustomStringConvertible
             return "schedule-state lock unusable: \(failure)"
         case .scheduleStateCorrupt(let failure):
             return failure.recoveryMessage
+        case .scheduleStateWriteTooLarge(let bytes, let limit, let path):
+            return "refusing to publish schedule state at \(path): encoded document is "
+                + "\(bytes) bytes; the safety limit is \(limit) bytes"
         }
     }
 }
@@ -583,15 +587,24 @@ struct StateStoreFileOperations: @unchecked Sendable {
 public struct StateStore: Sendable {
     public let paths: AppPaths
     private let fileOperations: StateStoreFileOperations
+    private let maximumScheduleStateBytes: Int64
+
+    private static let defaultMaximumScheduleStateBytes: Int64 = 64 * 1_024 * 1_024
 
     public init(paths: AppPaths) {
         self.paths = paths
         fileOperations = .live
+        maximumScheduleStateBytes = Self.defaultMaximumScheduleStateBytes
     }
 
-    init(paths: AppPaths, fileOperations: StateStoreFileOperations) {
+    init(
+        paths: AppPaths,
+        fileOperations: StateStoreFileOperations,
+        maximumScheduleStateBytes: Int64 = StateStore.defaultMaximumScheduleStateBytes
+    ) {
         self.paths = paths
         self.fileOperations = fileOperations
+        self.maximumScheduleStateBytes = maximumScheduleStateBytes
     }
 
     // MARK: - schedule-state.json
@@ -765,8 +778,6 @@ public struct StateStore: Sendable {
         }
     }
 
-    private static let maximumScheduleStateBytes: Int64 = 64 * 1_024 * 1_024
-
     private enum ScheduleStateBytesRead {
         case missing
         case bytes(Data)
@@ -819,8 +830,8 @@ public struct StateStore: Sendable {
         }
         let fileSize = Int64(info.st_size)
         guard fileSize >= 0,
-              fileSize <= Self.maximumScheduleStateBytes else {
-            return .failed(.tooLarge(bytes: fileSize, limit: Self.maximumScheduleStateBytes))
+              fileSize <= maximumScheduleStateBytes else {
+            return .failed(.tooLarge(bytes: fileSize, limit: maximumScheduleStateBytes))
         }
 
         var data = Data()
@@ -837,10 +848,10 @@ public struct StateStore: Sendable {
                 return .failed(.ioFailure(operation: "read schedule state", errno: code))
             }
             if count == 0 { break }
-            guard Int64(data.count + count) <= Self.maximumScheduleStateBytes else {
+            guard Int64(data.count + count) <= maximumScheduleStateBytes else {
                 return .failed(.tooLarge(
                     bytes: Int64(data.count + count),
-                    limit: Self.maximumScheduleStateBytes
+                    limit: maximumScheduleStateBytes
                 ))
             }
             data.append(contentsOf: buffer.prefix(count))
@@ -1168,9 +1179,20 @@ public struct StateStore: Sendable {
     }
 
     fileprivate func writeScheduleState(_ state: ScheduleState) throws {
-        try ensureScheduleStateVersionMarker()
         let document = try ScheduleStateDocument(state: state)
         let data = try Self.makeEncoder().encode(document)
+        guard Int64(data.count) <= maximumScheduleStateBytes else {
+            // Validate the complete prospective envelope before publishing
+            // the monotonic migration marker. Otherwise a legacy document
+            // that fits the read limit could be stranded behind a v1 marker
+            // when its envelope does not fit.
+            throw StateStoreError.scheduleStateWriteTooLarge(
+                bytes: Int64(data.count),
+                limit: maximumScheduleStateBytes,
+                path: paths.scheduleStateFile.path
+            )
+        }
+        try ensureScheduleStateVersionMarker()
         try writeDurably(
             data,
             to: paths.scheduleStateFile,

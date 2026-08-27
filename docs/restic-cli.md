@@ -115,13 +115,14 @@ snapshot a231ccb7 saved
 ```
 A fully-caught-up copy prints nothing (`copy-noop.txt` is empty) and exits 0. Parse nothing — record the raw log; success = exit 0. Count copied snapshots by counting `snapshot .* saved` lines if wanted for stats.
 
-An exit-0 bounded copy proves only that its explicit operands arrived. Restic
-Station pins one executable across the bounded copy and the following
-`snapshots --json` query against the primary, then requires the live full-id
-set to match those copied prefixes exactly before it marks the mirror synced
-or runs mirror retention. A peer addition, deletion, ambiguous prefix,
-executable replacement, malformed reply, or failed query withholds both and
-makes the set run an infrastructure failure.
+Before a bounded copy, Restic Station pins one executable, resolves every
+terminal purge-output prefix against `snapshots --json`, and supplies the
+resulting full snapshot ids as operands. An absent or ambiguous resolution,
+executable replacement, malformed reply, or failed query fails closed. Exit 0
+then proves only that those exact operands arrived: another host can still add
+a primary snapshot at any later instant, and the CLI exposes no transaction
+that spans both repositories. A bounded copy therefore never advances the
+mirror's `lastSyncedAt` and never runs mirror retention.
 
 ### snapshots
 ```

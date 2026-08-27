@@ -309,9 +309,10 @@ snapshot a permanent omission. The fixed order is:
    attributed snapshot ids, even when every pattern is already recorded;
 3. for each reachable secondary, revalidate and purge it first, then copy only
    the exact primary snapshot generation produced by step 2;
-4. after each bounded copy, re-list the primary generation; mark the mirror
-   synced and run its retention only if that generation is still exactly the
-   one copied;
+4. resolve the purge outputs to exact full primary snapshot ids and use those
+   as bounded copy operands; because no cross-repository transaction can
+   exclude a later primary commit, a bounded copy never advances mirror
+   freshness and never authorizes mirror retention;
 5. run primary retention last.
 
 **Attribution** decides which snapshots a purge is allowed to touch, and is
@@ -400,12 +401,13 @@ snapshots. Scheduled `copy` passes exactly those result ids as operands. A
 snapshot created after the launch observation is absent from the copy argv;
 because the watermark cannot suppress the next scheduled revalidation, that
 snapshot becomes attributed purge work on the next run rather than retaining
-excluded data permanently. After a bounded copy succeeds, Restic Station
-re-lists the primary and compares the live full ids to those exact output
-prefixes. A changed or unreadable generation makes the run an infrastructure
-failure and withholds both `lastSyncedAt` and mirror retention. Prefix
-ambiguity fails before rewrite instead of becoming a post-mutation audit
-failure or widening the copy.
+excluded data permanently. Before copying, Restic Station resolves each output
+prefix to exactly one live full snapshot id and supplies the full ids as copy
+operands; an absent or ambiguous result fails closed. No later primary query
+can bind evidence atomically through retention on a different repository, so a
+successful bounded copy deliberately withholds both `lastSyncedAt` and mirror
+retention. Prefix ambiguity fails before rewrite instead of becoming a
+post-mutation audit failure or widening the copy.
 
 ## Locking
 

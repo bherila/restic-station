@@ -419,6 +419,57 @@ struct StateStoreTests {
         #expect(store.readScheduleState()?.sets[setId]?.checkSliceCursor == 5)
     }
 
+    @Test("an oversized prospective envelope publishes neither marker nor canonical state")
+    func oversizedScheduleStateWriteRefusesBeforeMigrationMarker() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-state-size-\(UUID().uuidString)")
+        let paths = AppPaths(root: root)
+        let limit: Int64 = 512
+        let store = StateStore(
+            paths: paths,
+            fileOperations: .live,
+            maximumScheduleStateBytes: limit
+        )
+        try paths.ensureDirectories()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let setId = UUID()
+        let destinationId = UUID()
+        var pattern = String(repeating: "x", count: 128)
+        func legacyBytes(_ value: String) throws -> Data {
+            try StateStore.makeEncoder().encode(ScheduleState(sets: [
+                setId: SetScheduleState(appliedPurgeExcludes: [destinationId: [value]])
+            ]))
+        }
+        var legacy = try legacyBytes(pattern)
+        let targetSize = Int(limit) - 1
+        pattern += String(repeating: "x", count: targetSize - legacy.count)
+        legacy = try legacyBytes(pattern)
+        #expect(legacy.count == targetSize)
+        try legacy.write(to: paths.scheduleStateFile)
+
+        do {
+            try store.updateScheduleState(setId: setId) { $0.checkSliceCursor = 1 }
+            Issue.record("the oversized envelope must be refused before publication")
+        } catch let error as StateStoreError {
+            guard case .scheduleStateWriteTooLarge(let bytes, let reportedLimit, let path) = error else {
+                Issue.record("expected scheduleStateWriteTooLarge, got \(error)")
+                return
+            }
+            #expect(bytes > limit)
+            #expect(reportedLimit == limit)
+            #expect(path == paths.scheduleStateFile.path)
+        }
+
+        #expect(try Data(contentsOf: paths.scheduleStateFile) == legacy)
+        #expect(!FileManager.default.fileExists(atPath: paths.scheduleStateVersionMarkerFile.path))
+        guard case .valid(let state) = store.readScheduleStateResult() else {
+            Issue.record("the unchanged legacy canonical state must remain readable")
+            return
+        }
+        #expect(state.sets[setId]?.appliedPurgeExcludes[destinationId] == [pattern])
+    }
+
     @Test("a reader binds the migration marker and canonical document under the writer lock")
     func migrationReadWaitsForOneStableGeneration() throws {
         let (liveStore, root) = makeStore()
