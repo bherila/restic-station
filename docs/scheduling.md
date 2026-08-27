@@ -433,20 +433,21 @@ snapshot-id set is re-listed there and compared with the generation observed
 during token revalidation. Malformed identity or snapshot JSON retains an explicit
 infrastructure reason instead of being collapsed into secret unavailability. A
 replacement or stale-host backup in the earlier planning window refuses launch
-and restores a first-child token. Watermark recovery
-likewise rechecks that canonical purge metadata still reproduces the exact
-verified index projection, including its purge-evidence digest, at the point
-that evidence is consumed. Every full snapshot id in each destination's
+and restores a first-child token. Every full snapshot id in each destination's
 complete launch generation — selected or unattributed — must also have a
 unique eight-character prefix,
 because those prefixes are the only old-id keys in restic's rewrite transcript;
-ambiguity refuses before token consumption or destructive launch. Manual
-recovery consumes the stale token and does not rewrite the repository again;
-scheduled apply deliberately does not take this shortcut. Evidence
-from a replaced repository or a same-id repository restored to a pre-purge
-generation is ignored so the live history receives its own rewrite; malformed,
-incomplete, identity-less legacy, or only partially matching history cannot
-authorize the recovery shortcut.
+ambiguity refuses before token consumption or destructive launch.
+
+No run history of any shape can stand in for the watermark. Run records carry
+purge metadata as **audit evidence only**: a pattern stays pending until this
+host observes that destination's own terminal success, so evidence from a
+replaced repository, from a same-id repository restored to a pre-purge
+generation, or from a malformed, incomplete, or only partially matching record
+cannot suppress the rewrite — it re-runs as a no-op and re-establishes the
+watermark. That retained metadata is still bound into the independently
+verified index projection, so tampering with the recorded patterns, repository
+id, or snapshot mapping stays detectable at audit time.
 
 There is no Restic CLI transaction that can hold the repository lock across
 the separate attribution query and `rewrite --forget` spawn. The remaining
