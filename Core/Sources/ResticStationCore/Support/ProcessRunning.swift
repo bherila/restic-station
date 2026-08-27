@@ -197,8 +197,11 @@ public struct DefaultProcessRunner: ProcessRunning {
             }
 
             do {
-                // Under the same lock as the SIGPIPE window, so no child is
-                // ever created while that signal is ignored and inherits it.
+                // Forces `SIGPIPEGuard`'s one-time installation before any
+                // child can exist. It installs a no-op *handler* rather than
+                // `SIG_IGN` exactly so a child does not inherit it — see
+                // `SIGPIPEGuard` — so there is no window to serialise and
+                // nothing here to lock.
                 try launch(process)
                 return Spawned(
                     process: process,
@@ -213,6 +216,9 @@ public struct DefaultProcessRunner: ProcessRunning {
                 }
             }
         }
+        // Unreachable: the final iteration's `guard` always throws, since
+        // `attempt < spawnAttempts` is false there. Swift still needs the
+        // function to end in a throw or a return.
         throw lastError ?? ProcessRunnerError.launchFailed("spawn failed with no reported error")
     }
 
@@ -220,9 +226,39 @@ public struct DefaultProcessRunner: ProcessRunning {
     /// about the moment it was attempted. `EFAULT` is #116's signature;
     /// `EAGAIN` is the ordinary "out of process slots right now".
     static func isTransientSpawnFailure(_ error: Error) -> Bool {
-        let posix = error as NSError
-        guard posix.domain == NSPOSIXErrorDomain else { return false }
-        return posix.code == Int(EFAULT) || posix.code == Int(EAGAIN)
+        guard let code = spawnErrno(of: error) else { return false }
+        return code == EFAULT || code == EAGAIN
+    }
+
+    /// The errno behind a spawn failure, however this platform's Foundation
+    /// chose to wrap it.
+    ///
+    /// Darwin throws `NSPOSIXErrorDomain` directly. swift-corelibs-foundation
+    /// does not: `Process.run()` reports the failure through
+    /// `_NSErrorWithErrno`, which yields `NSCocoaErrorDomain` /
+    /// `fileReadUnknown` and carries the errno only under
+    /// `NSUnderlyingErrorKey`. Matching the POSIX domain alone made this
+    /// retry dead code on every Linux host — which is precisely where the
+    /// production argument for retrying applies, since that is what runs
+    /// unattended.
+    ///
+    /// The Linux errno is also the less trustworthy of the two: corelibs
+    /// passes the global `errno`, while `posix_spawn` returns its error
+    /// without setting `errno`. That can only cause a retry of something
+    /// that was never going to work, which costs two further attempts and
+    /// returns the same error. It cannot make a retry *unsafe*: that rests
+    /// on no child existing when a spawn reports failure, not on which
+    /// errno was reported.
+    private static func spawnErrno(of error: Error) -> Int32? {
+        let reported = error as NSError
+        if reported.domain == NSPOSIXErrorDomain {
+            return Int32(reported.code)
+        }
+        guard let underlying = reported.userInfo[NSUnderlyingErrorKey] as? NSError,
+              underlying.domain == NSPOSIXErrorDomain else {
+            return nil
+        }
+        return Int32(underlying.code)
     }
 
     public func run(
@@ -591,7 +627,7 @@ private final class AtomicFlag: @unchecked Sendable {
 /// 45.003 s, the child's full natural lifetime, with the set lock held
 /// throughout. macOS never showed it, because there SIGKILL lands and the
 /// waiter is freed a few seconds in.
-private final class TerminationSignal: @unchecked Sendable {
+final class TerminationSignal: @unchecked Sendable {
     /// Holds one parked continuation and guarantees a single resume,
     /// whichever of `fire()` or an expiring bound gets there first.
     ///
@@ -639,6 +675,9 @@ private final class TerminationSignal: @unchecked Sendable {
 
     private let lock = NSLock()
     private var fired = false
+    /// Sticky, and deliberately separate from `fired`: cancellation releases
+    /// waiters without anyone concluding the child terminated.
+    private var released = false
     private var waiters: [Waiter] = []
 
     var hasFired: Bool {
@@ -667,6 +706,7 @@ private final class TerminationSignal: @unchecked Sendable {
     /// unbounded `wait()` that a no-deadline call uses.
     func releaseWaiters() {
         lock.lock()
+        released = true
         let pending = waiters
         waiters = []
         lock.unlock()
@@ -689,7 +729,14 @@ private final class TerminationSignal: @unchecked Sendable {
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             let waiter = Waiter(continuation)
             lock.lock()
-            if fired {
+            // `released` is checked here, not just drained in
+            // `releaseWaiters`, because the release can land *before* the
+            // waiter exists. An already-cancelled task runs its cancellation
+            // handler before the operation body, so the detached stop task
+            // can reach `releaseWaiters` while there is nothing to drain —
+            // and the wait registered afterwards would then park forever,
+            // recreating the very hang the release was added to prevent.
+            if fired || released {
                 lock.unlock()
                 waiter.resumeOnce()
                 return

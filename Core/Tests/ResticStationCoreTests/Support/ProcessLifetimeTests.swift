@@ -41,6 +41,47 @@ struct ProcessLifetimeTests {
         #expect(production.drainGrace == 10)
     }
 
+    /// Cancellation's release must be sticky, not a one-shot drain of
+    /// whoever happens to be parked at that instant.
+    ///
+    /// The reachable path is an **already-cancelled** task:
+    /// `withTaskCancellationHandler` runs its handler before the operation
+    /// body, so the detached stop sequence can reach `releaseWaiters()` while
+    /// there is nothing yet to drain. A wait registered afterwards would then
+    /// park with nobody left to free it — recreating the exact hang the
+    /// release exists to prevent.
+    ///
+    /// The second assertion matters as much as the first: a release must
+    /// never be mistaken for termination, or the stop sequence would stop
+    /// signalling a child that is still alive and a caller could read
+    /// `terminationStatus` off a process that never exited.
+    @Test("a release landing before the wait still frees it", .timeLimit(.minutes(1)))
+    func releaseBeforeWaitDoesNotPark() async {
+        let signal = TerminationSignal()
+        let completed = CompletionFlag()
+
+        signal.releaseWaiters()
+        let waiter = Task.detached {
+            await signal.wait()
+            completed.set()
+        }
+
+        // Polled rather than awaited, and deliberately. A regression here
+        // parks on a `withCheckedContinuation`, which cannot be cancelled, so
+        // `await signal.wait()` would hang this test forever — and
+        // `.timeLimit` cannot interrupt it either, since that also relies on
+        // cancellation. Confirmed by red-check: reverting the latch hangs
+        // rather than fails. Polling turns a hung suite into a 2 s failure.
+        let deadline = Date().addingTimeInterval(2)
+        while !completed.isSet, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+
+        #expect(completed.isSet, "the wait parked — a release landing before the waiter existed was lost")
+        #expect(!signal.hasFired, "a release must not be mistaken for the child having terminated")
+        waiter.cancel()
+    }
+
     /// The retry must cover only failures that say nothing about the
     /// command. Retrying a real one — a missing binary, a permission
     /// refusal — would turn one honest error into three attempts at the same
@@ -69,6 +110,29 @@ struct ProcessLifetimeTests {
         #expect(!DefaultProcessRunner.isTransientSpawnFailure(
             NSError(domain: NSCocoaErrorDomain, code: Int(EFAULT))
         ))
+
+        // How swift-corelibs-foundation actually reports a failed spawn:
+        // `NSCocoaErrorDomain` / `fileReadUnknown`, with the errno buried
+        // under `NSUnderlyingErrorKey`. Matching only the POSIX domain made
+        // this retry dead code on Linux — and this test green there while
+        // proving nothing, because it built errors Linux never throws.
+        func corelibsWrapped(_ code: Int32) -> Error {
+            NSError(
+                domain: NSCocoaErrorDomain,
+                code: CocoaError.fileReadUnknown.rawValue,
+                userInfo: [NSUnderlyingErrorKey: NSError(domain: NSPOSIXErrorDomain, code: Int(code))]
+            )
+        }
+        #expect(DefaultProcessRunner.isTransientSpawnFailure(corelibsWrapped(EFAULT)))
+        #expect(DefaultProcessRunner.isTransientSpawnFailure(corelibsWrapped(EAGAIN)))
+        #expect(!DefaultProcessRunner.isTransientSpawnFailure(corelibsWrapped(ENOENT)))
+
+        // Wrapped, but the underlying error is not a POSIX one.
+        #expect(!DefaultProcessRunner.isTransientSpawnFailure(NSError(
+            domain: NSCocoaErrorDomain,
+            code: CocoaError.fileReadUnknown.rawValue,
+            userInfo: [NSUnderlyingErrorKey: NSError(domain: NSCocoaErrorDomain, code: Int(EFAULT))]
+        )))
     }
 
     /// A child that closes stdout and stderr but keeps running hands the
@@ -326,5 +390,24 @@ struct ProcessLifetimeTests {
 
         let elapsed = Date().timeIntervalSince(started)
         #expect(elapsed < 12, "returned after \(elapsed)s; the descendant holding the pipes was waited out")
+    }
+}
+
+/// Minimal thread-safe flag, so `releaseBeforeWaitDoesNotPark` can observe a
+/// wait completing without awaiting it.
+private final class CompletionFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = false
+
+    var isSet: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+
+    func set() {
+        lock.lock()
+        defer { lock.unlock() }
+        value = true
     }
 }

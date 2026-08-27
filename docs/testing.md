@@ -97,7 +97,12 @@ same 936 tests into a fifth of the wall clock and took that flake from roughly
 not the new tests: skipping `ProcessLifetimeTests` entirely left the rate
 unchanged at 4/20. `DefaultProcessRunner` now retries a spawn up to three
 times when it fails with `EFAULT` or `EAGAIN`, which took it to **0 failures
-in 45 runs**. Retrying is safe specifically because POSIX guarantees no child
+in 65 runs**. Matching the errno takes two forms, because the platforms differ:
+Darwin throws `NSPOSIXErrorDomain` directly, while swift-corelibs-foundation
+reports `NSCocoaErrorDomain`/`fileReadUnknown` and buries the errno under
+`NSUnderlyingErrorKey`. Matching only the POSIX domain made the retry dead code
+on Linux — and made its boundary test pass there while proving nothing, since
+the test built errors Linux never throws for a spawn failure. Retrying is safe specifically because POSIX guarantees no child
 exists when `posix_spawn` reports an error, so it cannot double-spawn a
 destructive command; `onlyTransientSpawnFailuresAreRetried` pins the boundary
 so a real `ENOENT` or `EACCES` still fails on the first attempt.
