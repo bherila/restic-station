@@ -102,6 +102,70 @@ let canInjectPermissionFaults = geteuid() != 0
         return url
     }
 
+    /// The refusal must live on the descriptor `ensureDirectory` would
+    /// otherwise tighten, not on an earlier pathname check by the caller: a
+    /// concurrent widen between the two would slip through into a silent
+    /// repair, erasing evidence a downstream reader must fail closed on.
+    @Test("refusingUnsafeExisting refuses the mode of the inode it would repair")
+    func ensureDirectoryRefusesUnsafeExistingOnTheDescriptor() throws {
+        for mode in [mode_t(0o722), mode_t(0o772), mode_t(0o777)] {
+            let parent = makeDirectory()
+            defer { try? FileManager.default.removeItem(at: parent) }
+            let child = parent.appendingPathComponent("state", isDirectory: true)
+
+            #expect(FileLock.ensureDirectory(
+                child, parent: parent, trustedRoot: parent, mode: 0o700
+            ) == nil, "precondition: creation succeeds")
+
+            try FileManager.default.setAttributes(
+                [.posixPermissions: NSNumber(value: mode)],
+                ofItemAtPath: child.path
+            )
+
+            let failure = FileLock.ensureDirectory(
+                child, parent: parent, trustedRoot: parent, mode: 0o700,
+                tightenExisting: true, refusingUnsafeExisting: true
+            )
+            #expect(failure != nil, "mode \(String(mode, radix: 8)) must refuse")
+            #expect(failure?.operation.contains("writable by other users") == true)
+
+            let after = try FileManager.default.attributesOfItem(
+                atPath: child.path
+            )[.posixPermissions] as? NSNumber
+            #expect(
+                after?.uint16Value == UInt16(mode),
+                "the refused mode must survive, not be tightened away"
+            )
+        }
+    }
+
+    /// Without the flag the existing behaviour is unchanged: a widened
+    /// directory is still repaired, which is what `runs/` and `locks/` rely on
+    /// not doing and what `state/` relied on doing before this split.
+    @Test("without refusingUnsafeExisting, a widened directory is still tightened")
+    func ensureDirectoryStillTightensWhenNotRefusing() throws {
+        let parent = makeDirectory()
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let child = parent.appendingPathComponent("state", isDirectory: true)
+        #expect(FileLock.ensureDirectory(
+            child, parent: parent, trustedRoot: parent, mode: 0o700
+        ) == nil)
+
+        try FileManager.default.setAttributes(
+            [.posixPermissions: NSNumber(value: mode_t(0o772))],
+            ofItemAtPath: child.path
+        )
+        #expect(FileLock.ensureDirectory(
+            child, parent: parent, trustedRoot: parent, mode: 0o700,
+            tightenExisting: true, refusingUnsafeExisting: false
+        ) == nil)
+
+        let after = try FileManager.default.attributesOfItem(
+            atPath: child.path
+        )[.posixPermissions] as? NSNumber
+        #expect(after?.uint16Value == 0o700)
+    }
+
     @Test(
         "an unwritable directory is .failed(EACCES), never .busy",
         .enabled(if: canInjectPermissionFaults, "chmod means nothing to root")

@@ -366,6 +366,52 @@ struct StateStoreTests {
         }
     }
 
+    /// A marker that denies the owner read but grants group/world access
+    /// (`0066`) fails its open before the mode guard can classify it. Without
+    /// a diagnosis it reaches the legacy marker-recovery branch, which tells
+    /// the operator to inspect or replace *both* files — risking valid
+    /// schedule and purge bookkeeping over a two-byte file.
+    ///
+    /// Guarded: root reads a `0066` file regardless, so the `EACCES` branch
+    /// never runs there.
+    @Test(
+        "an owner-unreadable but exposed marker is still classified as a marker defect",
+        .enabled(if: canInjectPermissionFaults, "root ignores file read denial")
+    )
+    func unreadableExposedMarkerIsClassifiedAsAMarkerDefect() throws {
+        let (store, root) = makeStore()
+        let paths = AppPaths(root: root)
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: NSNumber(value: mode_t(0o600))],
+                ofItemAtPath: paths.scheduleStateVersionMarkerFile.path
+            )
+            try? FileManager.default.removeItem(at: root)
+        }
+        try paths.ensureDirectories()
+        _ = try store.updateScheduleState(setId: UUID()) { $0.checkCount = 1 }
+
+        try FileManager.default.setAttributes(
+            [.posixPermissions: NSNumber(value: mode_t(0o066))],
+            ofItemAtPath: paths.scheduleStateVersionMarkerFile.path
+        )
+
+        guard case .corrupt(let failure) = store.readScheduleStateResult() else {
+            Issue.record("an owner-unreadable, exposed marker must refuse")
+            return
+        }
+        guard case .unsafeMode(let subject, _, _) = failure.reason else {
+            Issue.record("expected unsafeMode, got \(failure.reason)")
+            return
+        }
+        #expect(subject == .versionMarker)
+        // The whole point: a two-byte marker must not send the operator at
+        // the canonical document.
+        #expect(failure.recoveryMessage.contains("repair the marker"))
+        #expect(!failure.recoveryMessage.contains("Inspect the canonical document"))
+        #expect(!failure.recoveryMessage.contains("replace both files"))
+    }
+
     /// `0333` is writable by others but unreadable by us, so the `O_RDONLY`
     /// open fails `EACCES` before the mode guard can run. Without a diagnosis
     /// it surfaces as a generic I/O error whose recovery text points at

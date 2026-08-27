@@ -423,36 +423,25 @@ public struct AppPaths: Equatable, Sendable {
         // healthy. That is the check-not-atomic-with-its-use pattern
         // `AGENTS.md` §Safety rule 1 exists to rule out.
         //
-        // Refuse instead, at the same `0o022` threshold the read applies, so
-        // an operator sees a mode another uid could have written through
-        // rather than a tree that quietly healed itself. Benign widening
-        // (`0755` — listable, not writable by others) is still tightened as
-        // before; it exposes nothing another uid can act on.
-        if let info = DirectoryHandle.directoryStatByPathname(stateDir.path),
-           info.st_uid == geteuid(),
-           info.st_mode & 0o022 != 0 {
-            throw LockFailure(
-                path: stateDir.path,
-                operation: "state directory writable by other users "
-                    + "(mode \(String(info.st_mode & 0o777, radix: 8))) — it is not repaired "
-                    + "automatically because that would erase the evidence; after confirming no "
-                    + "other user has written to it, run chmod 700 "
-                    + "\(ShellQuoting.quoteIfNeeded(stateDir.path))",
-                errnoValue: 0
-            )
-        }
-
-        for (directory, tightenExisting) in [
-            (runsDir, false),
-            (stateDir, true),
-            (locksDir, false),
+        // The refusal lives inside `ensureDirectory`, on the same descriptor
+        // it would otherwise tighten, rather than in a pathname check here:
+        // a concurrent widen between an `lstat` here and the open there would
+        // otherwise slip straight through into a silent repair.
+        //
+        // Benign widening (`0755` — listable, not writable by others) is still
+        // tightened as before; it exposes nothing another uid can act on.
+        for (directory, tightenExisting, refuseUnsafe) in [
+            (runsDir, false, false),
+            (stateDir, true, true),
+            (locksDir, false, false),
         ] {
             if let failure = FileLock.ensureDirectory(
                 directory,
                 parent: root,
                 trustedRoot: root,
                 mode: 0o700,
-                tightenExisting: tightenExisting
+                tightenExisting: tightenExisting,
+                refusingUnsafeExisting: refuseUnsafe
             ) {
                 throw failure
             }

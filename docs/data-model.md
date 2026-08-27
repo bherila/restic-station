@@ -559,17 +559,24 @@ already on disk: the envelope checksum is unkeyed, so a forged
 `appliedPurgeExcludes` verifies, and a fabricated watermark suppresses a
 required rewrite. That case keeps the inspect-and-replace guidance.
 
-That refusal is also reached before it can be erased: `AppPaths.ensureDirectories()`
-re-tightens a pre-existing `state/` only when the widening is benign (`0755`),
-and refuses outright when the directory is group/world-writable, because setup
-runs before the safety-authoritative read and would otherwise repair away the
-evidence.
+That refusal is also reached before it can be erased. Setup re-tightens a
+pre-existing `state/` only when the widening is benign (`0755`), and refuses
+outright when the directory is group/world-writable, because setup runs before
+the safety-authoritative read and would otherwise repair away the evidence. The
+refusal is made **on the descriptor that would be tightened**, inside
+`FileLock.ensureDirectory`, not on a pathname check by the caller — a
+concurrent widen between an earlier `lstat` and that open would otherwise slip
+straight through into a silent repair.
 
 A `state/` that others can write but this user cannot read (`0333`) fails the
 `O_RDONLY` open before the mode check runs, so it is diagnosed by pathname and
 still reported as the directory-mode refusal rather than a bare I/O error —
 unless it is also foreign-owned, which outranks mode exactly as it does on the
-descriptor path, since `chmod` is not advice that user can act on. The
+descriptor path, since `chmod` is not advice that user can act on. A marker
+that denies the owner read while granting group/world access (`0066`) is
+diagnosed the same way, but descriptor-relative (`fstatat` through the retained
+`state/` descriptor), so it keeps the marker-only recovery instead of reaching
+the two-file branch that would risk the canonical document. The
 directory descriptor cannot instead be opened `O_PATH`/`O_SEARCH` as lock
 parents are: it is also the fsync target for durable publication, and Linux
 rejects `fsync(2)` on an `O_PATH` descriptor.

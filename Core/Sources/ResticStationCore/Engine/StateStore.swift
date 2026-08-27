@@ -1105,9 +1105,34 @@ public struct StateStore: Sendable {
         )
         guard fd >= 0 else {
             let code = errno
-            return code == ENOENT
-                ? .missing
-                : .failed(.ioFailure(operation: "open schedule state version marker", errno: code))
+            if code == ENOENT { return .missing }
+            // A marker that denies the owner read but grants group/world
+            // access (`0066`) fails this open before the mode guard below can
+            // classify it, and the legacy marker-recovery branch would then
+            // tell the operator to inspect or replace *both* files — risking
+            // valid schedule and purge bookkeeping over a two-byte file.
+            //
+            // Unlike `state/` itself, the parent descriptor is in hand here,
+            // so this diagnosis is descriptor-relative rather than a pathname
+            // lookup: `fstatat` through `directoryFD`, without following a
+            // symlink.
+            if code == EACCES {
+                var info = stat()
+                let statted = paths.scheduleStateVersionMarkerFile.lastPathComponent.withCString {
+                    fstatat(directoryFD, $0, &info, AT_SYMLINK_NOFOLLOW)
+                }
+                if statted == 0,
+                   (info.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG),
+                   info.st_uid == geteuid(),
+                   info.st_mode & 0o077 != 0 {
+                    return .failed(.unsafeMode(
+                        subject: .versionMarker,
+                        path: paths.scheduleStateVersionMarkerFile.path,
+                        mode: info.st_mode
+                    ))
+                }
+            }
+            return .failed(.ioFailure(operation: "open schedule state version marker", errno: code))
         }
         defer { _ = fileOperations.close(fd) }
 
