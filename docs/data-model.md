@@ -540,14 +540,22 @@ Marker safety is classified before canonical version compatibility, so a
 newer-version document cannot hide a missing or unsafe marker that also needs
 operator repair.
 
-A **permission** defect is the exception to all of that: the bytes are intact
-and the remedy is in place. `state/`, the canonical document, and the marker
-each fail closed when another uid could write them — the marker also when
-another uid could merely read it — and the refusal names the offending path
-and the `chmod` that repairs it (`700` for the directory, `600` for either
-file). Recovery guidance for this case explicitly does *not* prescribe
-replacing or deleting the document, because doing so would discard a
-trustworthy purge watermark over a mode bit.
+A **permission** defect is classified separately. `state/`, the canonical
+document, and the marker each fail closed when another uid could write them —
+the marker also when another uid could merely read it — and the refusal names
+the offending path and the shell-quoted `chmod` that repairs it (`700` for the
+directory, `600` for either file).
+
+Repairing the mode is not the same as trusting the bytes, and the guidance
+splits on exactly that. Where the exposure was **read-only** (only the marker's
+stricter threshold catches those), the contents are provably unchanged and the
+remedy is the `chmod` alone — replacing a healthy file would discard a
+trustworthy purge watermark over a mode bit. Where another uid could **write** —
+the canonical document, or a `state/` whose write bit let it swap that document
+— `chmod` closes the exposure but proves nothing about what is already on disk.
+The envelope checksum is unkeyed, so a forged `appliedPurgeExcludes` would
+verify, and a fabricated watermark suppresses a required rewrite. That case
+keeps the inspect-and-replace guidance.
 
 ## state/repo-status-<destId>.json
 

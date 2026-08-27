@@ -294,34 +294,95 @@ struct StateStoreTests {
 
     // MARK: - A permission defect is repaired in place, not by replacement
 
-    /// The generic recovery guidance prescribes replacing the canonical
-    /// document, and says deleting it accepts loss of the purge watermark.
-    /// For a widened mode that is the wrong instruction: the bytes are fine
-    /// and `chmod` fixes it, so following the generic advice would discard
-    /// real bookkeeping over a permissions problem.
-    @Test("a widened canonical mode is told to chmod, not to replace the document")
-    func permissionRecoveryNamesChmodRatherThanReplacement() throws {
+    /// `chmod` closes the exposure but proves nothing about the bytes already
+    /// written. A canonical document another uid could write may already carry
+    /// a forged `appliedPurgeExcludes` — the envelope checksum is unkeyed, so
+    /// it would verify — and a forged watermark suppresses a required rewrite,
+    /// the dangerous direction of the asymmetry. Repairing the mode must
+    /// therefore *not* be presented as making the contents trustworthy.
+    @Test("a write-exposed subject is told to chmod and still to verify the bytes")
+    func writeExposedPermissionRecoveryStillDistrustsContents() throws {
+        for (label, apply) in [
+            ("canonical document", { (p: AppPaths) in p.scheduleStateFile.path }),
+            ("state directory", { (p: AppPaths) in p.stateDir.path }),
+        ] {
+            let (store, root) = makeStore()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let paths = AppPaths(root: root)
+            try paths.ensureDirectories()
+            _ = try store.updateScheduleState(setId: UUID()) { $0.checkCount = 1 }
+
+            try FileManager.default.setAttributes(
+                [.posixPermissions: NSNumber(value: mode_t(0o662))],
+                ofItemAtPath: apply(paths)
+            )
+            guard case .corrupt(let failure) = store.readScheduleStateResult() else {
+                Issue.record("a group-writable \(label) must refuse")
+                return
+            }
+            let message = failure.recoveryMessage
+            #expect(message.contains("chmod"), "\(label): names the repair")
+            // The point of the finding: repairing the mode is necessary but
+            // not sufficient, so the guidance must still distrust the bytes.
+            #expect(message.contains("Inspect the canonical document"), "\(label)")
+            #expect(message.contains("replace it if you cannot account"), "\(label)")
+            #expect(
+                !message.contains("contents are unchanged"),
+                "\(label): must never claim write-exposed bytes are trustworthy"
+            )
+        }
+    }
+
+    /// The marker is refused for any group/world access, including read-only.
+    /// A subject nobody could *write* genuinely does have unchanged contents,
+    /// so that case keeps the in-place repair and must not send the operator
+    /// off replacing a healthy file.
+    @Test("a read-only exposure is repaired in place, without replacement")
+    func readOnlyPermissionRecoveryRepairsInPlace() throws {
         let (store, root) = makeStore()
         defer { try? FileManager.default.removeItem(at: root) }
         let paths = AppPaths(root: root)
         try paths.ensureDirectories()
-
         _ = try store.updateScheduleState(setId: UUID()) { $0.checkCount = 1 }
+
+        try FileManager.default.setAttributes(
+            [.posixPermissions: NSNumber(value: mode_t(0o644))],
+            ofItemAtPath: paths.scheduleStateVersionMarkerFile.path
+        )
+        guard case .corrupt(let failure) = store.readScheduleStateResult() else {
+            Issue.record("a world-readable marker must refuse")
+            return
+        }
+        let message = failure.recoveryMessage
+        #expect(message.contains("contents are unchanged"))
+        #expect(message.contains("do not replace or delete it"))
+        #expect(!message.contains("Inspect the canonical document"))
+    }
+
+    /// The recovery text is meant to be pasted into a shell, and the default
+    /// macOS data root lives under `Library/Application Support`.
+    @Test("the chmod target is shell-quoted when the path needs it")
+    func permissionRecoveryQuotesTheRepairTarget() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic station statestore \(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = AppPaths(root: root)
+        let store = StateStore(paths: paths)
+        try paths.ensureDirectories()
+        _ = try store.updateScheduleState(setId: UUID()) { $0.checkCount = 1 }
+
         try FileManager.default.setAttributes(
             [.posixPermissions: NSNumber(value: mode_t(0o662))],
             ofItemAtPath: paths.scheduleStateFile.path
         )
-
         guard case .corrupt(let failure) = store.readScheduleStateResult() else {
             Issue.record("a group-writable canonical document must refuse")
             return
         }
-        let message = failure.recoveryMessage
-        #expect(message.contains("chmod 600 \(paths.scheduleStateFile.path)"))
-        #expect(message.contains("must not be replaced or deleted"))
-        // The two guidance paths this one must not fall through to.
-        #expect(!message.contains("explicitly replace the canonical file"))
-        #expect(!message.contains("Deleting it accepts loss"))
+        #expect(failure.recoveryMessage.contains(
+            "chmod 600 \(ShellQuoting.quoteIfNeeded(paths.scheduleStateFile.path))"
+        ))
+        #expect(!failure.recoveryMessage.contains("chmod 600 \(paths.scheduleStateFile.path) "))
     }
 
     /// The marker and the directory carry their own repair target and mode,
@@ -343,7 +404,7 @@ struct StateStoreTests {
             return
         }
         #expect(markerFailure.recoveryMessage.contains(
-            "chmod 600 \(paths.scheduleStateVersionMarkerFile.path)"
+            "chmod 600 \(ShellQuoting.quoteIfNeeded(paths.scheduleStateVersionMarkerFile.path))"
         ))
 
         try FileManager.default.setAttributes(
@@ -358,7 +419,9 @@ struct StateStoreTests {
             Issue.record("a group-writable state/ must refuse")
             return
         }
-        #expect(directoryFailure.recoveryMessage.contains("chmod 700 \(paths.stateDir.path)"))
+        #expect(directoryFailure.recoveryMessage.contains(
+            "chmod 700 \(ShellQuoting.quoteIfNeeded(paths.stateDir.path))"
+        ))
     }
 
     // MARK: - A lease is bound to the directory generation it locked

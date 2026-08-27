@@ -457,16 +457,31 @@ public struct ScheduleStateReadFailure: Equatable, Sendable, CustomStringConvert
     }
 
     public var recoveryMessage: String {
-        // A permission defect is the only unsafe-path failure the operator
-        // repairs in place. Both branches below prescribe replacing or
-        // recreating a file; for a merely widened mode that would discard a
-        // perfectly good purge watermark to fix something `chmod` fixes.
-        if case .unsafeMode(let subject, let path, _) = reason {
+        // `chmod` closes the exposure, but it proves nothing about the bytes
+        // already on disk. Where another uid could *write* — the canonical
+        // document, or a `state/` whose write bit let it swap that document —
+        // the payload may already be forged, and the envelope checksum is
+        // unkeyed, so it authenticates nothing an editor could not recompute.
+        // Declaring those contents trustworthy because the mode was repaired
+        // would invite exactly the forged `appliedPurgeExcludes` that
+        // suppresses a required rewrite. Only a read-only exposure (the
+        // marker's stricter 0o077 threshold catches those) leaves the bytes
+        // provably untouched.
+        if case .unsafeMode(let subject, let path, let mode) = reason {
+            let repair = "`chmod \(subject.repairMode) \(ShellQuoting.quoteIfNeeded(path))`"
+            guard mode & 0o022 != 0 else {
+                return description
+                    + ". Another user could read \(subject.subject) but not write it, so its "
+                    + "contents are unchanged. Stop Restic Station and repair the mode in place "
+                    + "with \(repair); do not replace or delete it for this failure."
+            }
             return description
-                + ". Stop Restic Station and confirm no other user has written to "
-                + "\(subject.subject), then repair it in place with "
-                + "`chmod \(subject.repairMode) \(path)`. The contents are unchanged "
-                + "and must not be replaced or deleted for this failure."
+                + ". Stop Restic Station and repair the mode with \(repair) — but note that "
+                + "closing the exposure says nothing about the bytes already written. Another "
+                + "user could write \(subject.subject), and the envelope checksum is unkeyed, so "
+                + "a forged purge watermark would verify. Inspect the canonical document against "
+                + "a trusted copy before resuming, and replace it if you cannot account for its "
+                + "current state."
         }
 
         let markerFailure: Bool
