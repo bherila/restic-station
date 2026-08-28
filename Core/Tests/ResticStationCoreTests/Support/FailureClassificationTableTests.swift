@@ -109,7 +109,7 @@ struct PurgeApplyErrorTableTests {
             return (.repositoryOffline, true)
         case .unavailable:
             return (.secretUnavailable, true)
-        case .secretRefused(let attention, _):
+        case .secretRefused(let attention, _, _):
             // The code the pre-flight reported, never a fixed one: a
             // destination with no password and a store that will not be
             // read need different repairs (#96 review).
@@ -128,8 +128,12 @@ struct PurgeApplyErrorTableTests {
         .token(.alreadyUsed),
         .tokenDoesNotMatchCurrentPlan,
         .busy,
-        .secretRefused(.secretStoreUnusable, "refusing to read /data/secrets.json: it is a symbolic link."),
-        .secretRefused(.secretNotConfigured, "no stored secret for this destination"),
+        .secretRefused(
+            .secretStoreUnusable,
+            destinationId: destId,
+            "refusing to read /data/secrets.json: it is a symbolic link."
+        ),
+        .secretRefused(.secretNotConfigured, destinationId: destId, "no stored secret for this destination"),
         .lockUnusable("open lock directory failed"),
         .infrastructureFailure(reason: "run history unusable", operationMayHaveRun: false),
         .infrastructureFailure(reason: "run history unusable", operationMayHaveRun: true),
@@ -156,6 +160,23 @@ struct PurgeApplyErrorTableTests {
             #expect(failure.retryable == want.retryable, "\(error)")
             #expect(failure.exitCode == want.code.exitCode, "\(error)")
             #expect(failure.details.setId == setId, "\(error)")
+        }
+    }
+
+    /// A permanent secret refusal names the destination it is about. An
+    /// apply spans several, and the repair it prescribes — `secret set`, or
+    /// a `chmod` on one repository's credentials — cannot be carried out
+    /// against a set id alone (#96 review).
+    @Test("a secret refusal publishes the destination that was refused")
+    func secretRefusalCarriesItsDestination() {
+        for attention in DestinationAttention.allCases {
+            let failure = CLIFailure.classifyPurgeOperation(
+                PurgeApplyError.secretRefused(attention, destinationId: destId, "refused"),
+                setId: setId
+            )
+            #expect(failure.details.destinationId == destId, "\(attention)")
+            #expect(failure.code == attention.code, "\(attention)")
+            #expect(!failure.retryable, "\(attention)")
         }
     }
 

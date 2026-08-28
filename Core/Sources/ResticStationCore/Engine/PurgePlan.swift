@@ -232,12 +232,17 @@ public enum PurgeApplyError: Error, Equatable, Sendable {
     /// `secret rm`, and "repair the store" is the wrong repair to name for
     /// a destination that simply has no password (#96 review).
     ///
+    /// It carries the destination id for the same reason: an apply spans
+    /// several destinations, and the prescribed `secret set` needs to name
+    /// one. Without it the envelope publishes `setId` alone and an agent
+    /// has to guess which repository to repair.
+    ///
     /// Split from ``unavailable``, whose whole point is that it is
     /// cause-neutral *and retryable*: it covers secret storage, the token
     /// index, and a failed `snapshots` listing alike. That is the right
     /// answer for all three transient causes and the wrong one here, where
     /// the store has already told the operator what to change (#96).
-    case secretRefused(DestinationAttention, String)
+    case secretRefused(DestinationAttention, destinationId: UUID, String)
     /// No restic executable could be identified, so no destructive purge
     /// capability may be minted or honoured. Distinct from ``unavailable``
     /// because the remedy is specific: restore the configured binary

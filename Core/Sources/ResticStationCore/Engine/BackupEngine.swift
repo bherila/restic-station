@@ -1070,9 +1070,9 @@ public final class BackupEngine: Sendable {
         switch await secretStoreRefusal(for: [destination]) {
         case .none:
             break
-        case .some(let error):
-            if let attention = DestinationAttention(error) {
-                return .skipped(.secretRefused(attention, error.description))
+        case .some(let refusal):
+            if let attention = DestinationAttention(refusal.error) {
+                return .skipped(.secretRefused(attention, refusal.error.description))
             }
             return .skipped(.secretUnavailable)
         }
@@ -1393,17 +1393,17 @@ public final class BackupEngine: Sendable {
         switch await secretStoreRefusal(for: [destination]) {
         case .none:
             break
-        case .some(let error):
+        case .some(let refusal):
             // Not `.failed`, which publishes `restic_failed`: restic never
             // ran, and the refusal's own message names the repair (#96).
-            switch DestinationAttention(error) {
+            switch DestinationAttention(refusal.error) {
             case .secretNotConfigured:
                 return PurgePlanResult(
-                    plan: emptyPlan, status: .secretNotConfigured, message: error.description
+                    plan: emptyPlan, status: .secretNotConfigured, message: refusal.error.description
                 )
             case .secretStoreUnusable:
                 return PurgePlanResult(
-                    plan: emptyPlan, status: .secretStoreUnusable, message: error.description
+                    plan: emptyPlan, status: .secretStoreUnusable, message: refusal.error.description
                 )
             case nil:
                 return PurgePlanResult(
@@ -1772,9 +1772,13 @@ public final class BackupEngine: Sendable {
         switch await secretStoreRefusal(for: pendingDestinations) {
         case .none:
             break
-        case .some(let error):
-            if let attention = DestinationAttention(error) {
-                throw PurgeApplyError.secretRefused(attention, error.description)
+        case .some(let refusal):
+            if let attention = DestinationAttention(refusal.error) {
+                throw PurgeApplyError.secretRefused(
+                    attention,
+                    destinationId: refusal.destination.id,
+                    refusal.error.description
+                )
             }
             throw PurgeApplyError.unavailable
         }
@@ -2459,9 +2463,13 @@ public final class BackupEngine: Sendable {
         switch await secretStoreRefusal(for: [destination]) {
         case .none:
             break
-        case .some(let error):
-            if let attention = DestinationAttention(error) {
-                throw PurgeApplyError.secretRefused(attention, error.description)
+        case .some(let refusal):
+            if let attention = DestinationAttention(refusal.error) {
+                throw PurgeApplyError.secretRefused(
+                    attention,
+                    destinationId: refusal.destination.id,
+                    refusal.error.description
+                )
             }
             throw PurgeApplyError.unavailable
         }
@@ -3602,26 +3610,31 @@ public final class BackupEngine: Sendable {
         await secretStoreRefusal(for: destinations) == nil
     }
 
-    /// The first destination's secret-store failure, or `nil` if every
-    /// password read succeeded.
+    /// The first destination whose secret read failed, with its failure,
+    /// or `nil` if every read succeeded.
     ///
     /// Returned typed rather than as a `Bool` so a caller can tell a
-    /// permanent refusal from a locked keychain. Every caller that only
-    /// needs "did it work" keeps using ``secretsAvailable(for:)``.
-    private func secretStoreRefusal(for destinations: [Destination]) async -> SecretStoreError? {
+    /// permanent refusal from a locked keychain — and paired with the
+    /// destination, because an operation can span several and the repair a
+    /// permanent refusal prescribes has to name one. Every caller that
+    /// only needs "did it work" keeps using ``secretsAvailable(for:)``.
+    private func secretStoreRefusal(
+        for destinations: [Destination]
+    ) async -> (destination: Destination, error: SecretStoreError)? {
         for destination in destinations {
             do {
                 _ = try await secrets.password(destId: destination.id)
-                // The secret *environment* too, not just the password. A
-                // destination can have a perfectly good password beside a
-                // `<uuid>-env` blob that does not parse, and `ResticRunner`
-                // reads both — so a password-only pre-flight declared the
-                // store usable and then let the env failure surface as a
-                // generic runner error, which purge published as
-                // `restic_failed` for a restic that never ran (#96 review).
-                // Absent is `[:]` and not an error, so this only fails when
-                // something is actually wrong.
-                _ = try await secrets.secretEnv(destId: destination.id)
+                // Deliberately the password only. Reading the secret
+                // *environment* here too would classify a malformed
+                // `<uuid>-env` blob at the pre-flight — which is right for
+                // the paths that pass that environment to local restic, and
+                // wrong for the two that do not: remote maintenance reads
+                // only the password and spawns with `env: nil`, and the
+                // `Bool`-shaped callers below would turn a permanent fault
+                // into a silent forever-deferral. Scoping the read to the
+                // paths that consume it belongs with the engine pre-flight
+                // rework in #95, not in a classification change. Tracked
+                // there; see the note in `architecture.md` §Error taxonomy.
             } catch let error as SecretStoreError {
                 // Exhaustive, no `default:` — a new `SecretStoreError` case
                 // must be judged here rather than inheriting the retryable
@@ -3638,7 +3651,7 @@ public final class BackupEngine: Sendable {
                             + "\"\(destination.label)\" — skipping (retryable, nothing recorded)"
                     )
                 }
-                return error
+                return (destination, error)
             } catch {
                 logWarning(
                     "BackupEngine: \(secretStoreDescription) could not be read for destination "
@@ -3646,7 +3659,7 @@ public final class BackupEngine: Sendable {
                 )
                 // Not a `SecretStoreError`: transient is the safe direction
                 // for the unknown, matching `ResticRunner`'s pre-flight.
-                return .backendFailed("\(error)")
+                return (destination, .backendFailed("\(error)"))
             }
         }
         return nil
