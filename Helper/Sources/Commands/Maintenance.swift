@@ -245,11 +245,13 @@ struct MaintenancePrune: AsyncParsableCommand, JSONRenderable {
                 message: "Could not read the repository secret. Unlock or repair secret storage, then try again.",
                 details: CLIErrorDetails(setId: setId, destinationId: destination.id)
             )
-        case .skipped(.secretStoreUnusable(let detail)):
+        case .skipped(.secretRefused(let attention, let detail)):
             // Not `secret_unavailable`: "try again" is the wrong advice for
-            // a store whose refusal already names the repair (#96).
+            // a refusal that already names the repair — and the code is the
+            // one the pre-flight reported, so a missing password is not
+            // published as a broken store (#96).
             throw CLIFailure(
-                code: .secretStoreUnusable,
+                code: attention.code,
                 message: CLIFailure.bounded("The prune was refused: \(detail)"),
                 details: CLIErrorDetails(setId: setId, destinationId: destination.id)
             )

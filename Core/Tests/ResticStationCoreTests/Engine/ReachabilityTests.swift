@@ -231,7 +231,7 @@ struct ReachabilityTests {
         // caller to try later — wrong for a destination whose remedy is
         // `secret set` (#96).
         #expect(result == .needsAttention(
-            code: .secretNotConfigured,
+            .secretNotConfigured,
             reason: "no password stored for this destination"
         ))
         // Not the unreadable-store reason, whichever backend answered: that
@@ -259,7 +259,7 @@ struct ReachabilityTests {
 
         let result = await reachability.probe(dest)
         #expect(result == .needsAttention(
-            code: .secretStoreUnusable,
+            .secretStoreUnusable,
             reason: "the secret store is not usable as configured"
         ))
         // Same requirement as the no-password-stored case, for the same
@@ -273,11 +273,12 @@ struct ReachabilityTests {
         // as well as the four phrases above; the App-side test owns that
         // list, but a reason that trips it here would defeat the badge
         // before the App ever sees it.
-        guard case .needsAttention(let code, let reason) = result else {
+        guard case .needsAttention(let attention, let reason) = result else {
             Issue.record("expected a needs-attention probe result, got \(result)")
             return
         }
-        #expect(!code.retryable, "a permanent refusal must not publish a retryable code")
+        #expect(attention == .secretStoreUnusable)
+        #expect(!attention.code.retryable, "a permanent refusal must not publish a retryable code")
         for environmental in ["volume not mounted", "timed out", "keychain locked",
                               "secret store unavailable", "could not"] {
             #expect(!reason.lowercased().contains(environmental), "reason matched \(environmental)")

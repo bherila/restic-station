@@ -196,14 +196,17 @@ struct PurgePreview: AsyncParsableCommand, JSONRenderable {
                 message: CLIFailure.bounded(result.message ?? "Purge preview failed."),
                 details: CLIErrorDetails(setId: setId, destinationId: destination.id)
             )
-        case .secretStoreUnusable:
-            // Not `restic_failed`: restic never ran. The store's own
-            // refusal names the repair, so it is carried verbatim and the
-            // code is non-retryable (#96).
+        case .secretNotConfigured, .secretStoreUnusable:
+            // Not `restic_failed`: restic never ran. The refusal's own
+            // text names the repair, so it is carried verbatim, and the
+            // two statuses publish different codes because they need
+            // different repairs (#96).
             throw CLIFailure(
-                code: .secretStoreUnusable,
+                code: result.status == .secretNotConfigured
+                    ? DestinationAttention.secretNotConfigured.code
+                    : DestinationAttention.secretStoreUnusable.code,
                 message: CLIFailure.bounded(
-                    result.message ?? "The secret store could not be read."
+                    result.message ?? "The secret pre-flight refused."
                 ),
                 details: CLIErrorDetails(setId: setId, destinationId: destination.id)
             )
@@ -245,7 +248,8 @@ struct PurgePreview: AsyncParsableCommand, JSONRenderable {
                 }
             }
             print("  space is not reclaimed until a prune runs")
-        case .busy, .offline, .infrastructureFailure, .failed, .secretStoreUnusable:
+        case .busy, .offline, .infrastructureFailure, .failed,
+             .secretNotConfigured, .secretStoreUnusable:
             // These states are rejected before a report is printed.
             break
         }

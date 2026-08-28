@@ -65,6 +65,48 @@ extension SecretStoreError: LocalizedError {
     public var errorDescription: String? { description }
 }
 
+// MARK: - DestinationAttention
+
+/// Why a destination cannot proceed until a human acts, as a closed
+/// two-case enum rather than a `CLIErrorCode` or prose.
+///
+/// These are exactly the ``SecretStoreError`` cases for which repeating the
+/// identical request cannot produce a different answer. Keeping them in
+/// their own type is what lets every downstream switch be exhaustive over
+/// *two* cases instead of over the whole published code table, so a caller
+/// cannot quietly pick one of them as a fallback for the other — which is
+/// how a "no password stored" refusal came to be reported as an unusable
+/// store during a pre-flight race (#96 review).
+public enum DestinationAttention: String, Sendable, Equatable, CaseIterable {
+    /// Nothing is stored for this destination. Remedy: `secret set`.
+    case secretNotConfigured = "secret_not_configured"
+    /// The store refused to be read at all. Remedy: whatever its own
+    /// refusal names — a `chmod`, a `chown`, or moving the data directory.
+    case secretStoreUnusable = "secret_store_unusable"
+
+    /// `nil` for the transient cases, which are not attention at all: they
+    /// clear without anyone doing anything.
+    public init?(_ error: SecretStoreError) {
+        switch error {
+        case .itemNotFound:
+            self = .secretNotConfigured
+        case .storeUnusable:
+            self = .secretStoreUnusable
+        case .backendFailed, .lockUnusable:
+            return nil
+        }
+    }
+
+    /// The published envelope code. Both are non-retryable, and the
+    /// `CLIErrorCode` table test pins that.
+    public var code: CLIErrorCode {
+        switch self {
+        case .secretNotConfigured: return .secretNotConfigured
+        case .secretStoreUnusable: return .secretStoreUnusable
+        }
+    }
+}
+
 // MARK: - SecretStore
 
 /// Where Restic Station keeps a destination's repository password and its
