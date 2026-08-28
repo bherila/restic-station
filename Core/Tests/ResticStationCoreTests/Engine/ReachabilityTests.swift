@@ -226,13 +226,64 @@ struct ReachabilityTests {
         let reachability = Self.makeReachability(fake, secrets: secrets)
 
         let result = await reachability.probe(dest)
-        #expect(result == .offline(reason: "no password stored for this destination"))
+        // `.needsAttention`, not `.offline`: `probe-repo` publishes an
+        // offline probe as `ok: true` at exit 3, which tells a headless
+        // caller to try later — wrong for a destination whose remedy is
+        // `secret set` (#96).
+        #expect(result == .needsAttention(
+            .secretNotConfigured,
+            reason: "no password stored for this destination"
+        ))
         // Not the unreadable-store reason, whichever backend answered: that
         // string is on `SetsBadges`'s environmental list and would show this
         // as "Offline — try later" when the remedy is `secret set`.
         for backend in SecretBackend.allCases {
             #expect(result != .offline(reason: backend.unavailableProbeReason))
         }
+        #expect(fake.invocations.isEmpty)
+    }
+
+    @Test("remote destination: a store that refuses to be read is not environmental")
+    func remoteStoreUnusableIsNotEnvironmental() async throws {
+        let dest = Destination(id: Self.destId, label: "R2", repoURL: "s3:https://x/bucket", isPrimary: false)
+        let fake = FakeProcessRunner()
+        let secrets = FakeSecretStore(defaultPassword: Self.password)
+        secrets.failPassword(
+            for: Self.destId,
+            with: .storeUnusable(
+                "refusing to read /data/secrets.json: it is group- or world-accessible "
+                    + "(mode 0644). Fix it with: chmod 600 /data/secrets.json"
+            )
+        )
+        let reachability = Self.makeReachability(fake, secrets: secrets)
+
+        let result = await reachability.probe(dest)
+        #expect(result == .needsAttention(
+            .secretStoreUnusable,
+            reason: "the secret store is not usable as configured"
+        ))
+        // Same requirement as the no-password-stored case, for the same
+        // reason: this string is persisted to `repo-status-<destId>.json`
+        // and read by `SetsBadges`, whose environmental list would turn a
+        // refusal naming an exact `chmod` into "Offline — try later".
+        for backend in SecretBackend.allCases {
+            #expect(result != .offline(reason: backend.unavailableProbeReason))
+        }
+        // `SetsBadges.offlineOrError` matches the bare substring "could not"
+        // as well as the four phrases above; the App-side test owns that
+        // list, but a reason that trips it here would defeat the badge
+        // before the App ever sees it.
+        guard case .needsAttention(let attention, let reason) = result else {
+            Issue.record("expected a needs-attention probe result, got \(result)")
+            return
+        }
+        #expect(attention == .secretStoreUnusable)
+        #expect(!attention.code.retryable, "a permanent refusal must not publish a retryable code")
+        for environmental in ["volume not mounted", "timed out", "keychain locked",
+                              "secret store unavailable", "could not"] {
+            #expect(!reason.lowercased().contains(environmental), "reason matched \(environmental)")
+        }
+        #expect(!reason.contains("/data/secrets.json"))
         #expect(fake.invocations.isEmpty)
     }
 

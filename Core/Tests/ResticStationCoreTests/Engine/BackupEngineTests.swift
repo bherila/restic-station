@@ -164,6 +164,9 @@ struct BackupEngineTests {
         let paths: AppPaths
         let clock: TestClock
         let fake: FakeProcessRunner
+        /// The store the engine and its `ResticRunner` share, so a test can
+        /// stage one destination's password and environment independently.
+        let secrets: FakeSecretStore
         let runStore: RunStore
         let stateStore: StateStore
         let engine: BackupEngine
@@ -223,6 +226,10 @@ struct BackupEngineTests {
     ///     simply has no repository directory on disk.
     static func makeEnv(
         secretsUnavailableFor: [UUID] = [],
+        /// Which failure `secretsUnavailableFor` produces. Defaults to the
+        /// retryable one, which is what every pre-#96 caller meant by
+        /// "unavailable"; pass a permanent case to reach the refusing arms.
+        secretFailure: SecretStoreError = .backendFailed("fake: password read failed"),
         secretBackend: SecretBackend = .platformDefault,
         script: [FakeProcessRunner.Expectation],
         retention: RetentionPolicy? = RetentionPolicy(keepLast: 3),
@@ -299,7 +306,7 @@ struct BackupEngineTests {
             onPasswordRead: onSecretPasswordRead
         )
         for id in secretsUnavailableFor {
-            secrets.failPassword(for: id)
+            secrets.failPassword(for: id, with: secretFailure)
         }
         let restic = ResticRunner(
             resticPath: resticPath,
@@ -332,6 +339,7 @@ struct BackupEngineTests {
             paths: paths,
             clock: clock,
             fake: fake,
+            secrets: secrets,
             runStore: runStore,
             stateStore: stateStore,
             engine: engine,
@@ -2755,6 +2763,30 @@ struct BackupEngineTests {
         #expect(result == .skipped(.secretUnavailable))
         #expect(try PreviewTokenStore(paths: env.paths).token(token).value == token)
         #expect(env.fake.invocations.isEmpty)
+    }
+
+    /// And the code must be the one the pre-flight reported. Answering
+    /// "repair the store" to a destination whose only problem is that
+    /// nobody ran `secret set` sends automation at the wrong repair.
+    @Test("standalone prune: an absent password is not reported as an unusable store")
+    func standalonePruneDistinguishesAbsentFromUnusable() async throws {
+        let env = Self.makeEnv(
+            secretsUnavailableFor: [Self.primaryId],
+            secretFailure: .itemNotFound,
+            script: [],
+            retention: nil
+        )
+        defer { env.cleanUp() }
+
+        let result = await env.engine.runPruneRepository(set: env.set, destination: env.primary)
+
+        guard case .skipped(.secretRefused(let attention, _)) = result else {
+            Issue.record("expected .skipped(.secretRefused), got \(result)")
+            return
+        }
+        #expect(attention == .secretNotConfigured)
+        #expect(attention.code == .secretNotConfigured)
+        #expect(!attention.code.retryable)
     }
 
     @Test("standalone prune: a process launch failure restores its preview token")

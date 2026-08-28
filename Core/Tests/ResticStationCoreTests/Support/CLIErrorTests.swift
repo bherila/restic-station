@@ -35,6 +35,12 @@ private let representative: [CLIErrorCode: CLIFailure] = [
     .repositoryNotInitialized: .classify(exitClass: .repoDoesNotExist),
     .secretUnavailable: .classify(SecretStoreError.backendFailed("security: SecKeychainSearchCopyNext: user canceled")),
     .secretNotConfigured: .classify(SecretStoreError.itemNotFound),
+    .secretStoreUnusable: .classify(
+        SecretStoreError.storeUnusable(
+            "refusing to read /data/secrets.json: it is group- or world-accessible "
+                + "(mode 0644). Fix it with: chmod 600 /data/secrets.json"
+        )
+    ),
     .secretRejected: .classify(exitClass: .wrongPassword),
     .resticNotFound: .resticUnavailable(
         result: ResticDiscoveryResult(chosen: nil, rejected: [], searchedDescription: "PATH"),
@@ -106,6 +112,7 @@ struct CLIErrorContractTests {
         #expect(CLIErrorCode.secretUnavailable.rawValue == "secret_unavailable")
         #expect(CLIErrorCode.secretRejected.rawValue == "secret_rejected")
         #expect(CLIErrorCode.secretNotConfigured.rawValue == "secret_not_configured")
+        #expect(CLIErrorCode.secretStoreUnusable.rawValue == "secret_store_unusable")
         #expect(CLIErrorCode.resticNotFound.rawValue == "restic_not_found")
         #expect(CLIErrorCode.resticUnsupported.rawValue == "restic_unsupported")
         #expect(CLIErrorCode.resticFailed.rawValue == "restic_failed")
@@ -114,7 +121,7 @@ struct CLIErrorContractTests {
         #expect(CLIErrorCode.operationNotAllowed.rawValue == "operation_not_allowed")
         #expect(CLIErrorCode.operationCompletedAuditFailed.rawValue == "operation_completed_audit_failed")
         #expect(CLIErrorCode.internalError.rawValue == "internal_error")
-        #expect(CLIErrorCode.allCases.count == 22)
+        #expect(CLIErrorCode.allCases.count == 23)
     }
 
     @Test("only busy and offline leave exit 1 — the coarse shell contract is unchanged")

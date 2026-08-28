@@ -68,7 +68,13 @@ Two payload notes that are easy to get wrong:
 - **`probe-repo` reports offline as a success.** `outcome: "offline"` with
   `ok: true` and exit 3. An unplugged drive is a destination's expected
   state, not a fault — an error envelope would make a sleeping NAS
-  indistinguishable from a broken config. Branch on `outcome`.
+  indistinguishable from a broken config. Branch on `outcome`. The one
+  probe failure that is *not* published this way is a secret pre-flight
+  that refused permanently: nothing is stored for the destination, or the
+  store will not be read at all. Those get the error envelope
+  (`secret_not_configured` / `secret_store_unusable`, exit 1), because
+  `ok: true` at exit 3 means "try later" and neither will ever succeed
+  unattended.
 - **`fda-check` has three states, not two.** Off macOS, `applicable` is
   `false` and `granted` is `null`. A caller must check `applicable` before
   reading `granted`, exactly as an absent `state/fda-check.json` means
@@ -110,8 +116,9 @@ never match on it. `details` is omitted entirely when empty.
 | `repository_offline` | **yes** | **3** | The destination did not answer — an unplugged drive, a sleeping NAS. Expected, not a fault. |
 | `repository_locked` | **yes** | 1 | restic exit 11: another restic process holds the repository lock. |
 | `repository_not_initialized` | no | 1 | restic exit 10: nothing is initialized at that location. |
-| `secret_unavailable` | **yes** | 1 | The secret backend answered badly and may answer well later — a locked login keychain, a transient I/O error. **Also currently reported for the file backend's permanent `secrets.json` refusals** (a group-accessible or symlinked file, an untrusted owner, malformed contents), which retrying cannot fix — see #96. A structurally unusable `secrets.lock` is instead non-retryable `internal_error`. |
+| `secret_unavailable` | **yes** | 1 | The secret backend answered badly and may answer well later — a locked login keychain at a pre-login tick, a transient I/O error, a lock held by a stuck peer. Every remaining `errno` wrapper in the file backend is here, because no `errno` set is uniformly permanent. A structurally unusable `secrets.lock` is instead non-retryable `internal_error`. |
 | `secret_not_configured` | no | 1 | The backend answered "no such item": no password is stored for this destination. Run `secret set`. Also what `ResticRunner`'s pre-flight reports, so the distinction survives to the commands that actually run restic. |
+| `secret_store_unusable` | no | 1 | The store could not be consulted at all, and repeating the request cannot change that: a symlinked `secrets.json`, one that is group- or world-accessible, one owned outside the helper's trust boundary, contents that do not decode (the outer document or a stored secret-env blob, on either backend), a document written by a newer format version, a directory another user could replace entries in, or a filesystem that does not honour `chmod`. `message` carries the backend's own refusal, which names the exact `chmod`, `chown`, or move to perform. Reported by every command that reads a secret, `maintenance prune`, `purge preview`/`purge apply` and `probe-repo` included — none of them may report it as retryable or as a restic failure, because restic never ran. One gap is known and tracked: the engine's pre-flight reads only the password, so a destination with a good password beside an unparseable `<uuid>-env` blob is not refused at the pre-flight and surfaces later as a restic failure instead. Closing it means reading the environment on exactly the paths that pass it to local restic (remote maintenance does not), which is engine-pre-flight work — see #95. |
 | `secret_rejected` | no | 1 | restic exit 12: the secret was read fine and restic refused it. |
 | `restic_not_found` | no | 1 | No restic binary anywhere that was searched. |
 | `restic_unsupported` | no | 1 | A restic was found and ran, but is below the minimum or is not restic. |
@@ -128,17 +135,36 @@ Means precisely: **the identical request could succeed later with nobody
 changing anything.** It is advice for a backoff loop, not a judgement about
 severity.
 
-This is why `secret_rejected` and `secret_not_configured` are split from
-`secret_unavailable`. A locked keychain is worth retrying unchanged; a wrong
-password will fail identically forever until a human replaces it, and a
-destination with no password stored stays that way until someone runs
-`secret set`. Collapsing them — as the original issue's taxonomy did — would
-force one `retryable` value that is wrong for two of the three.
+This is why `secret_rejected`, `secret_not_configured` and
+`secret_store_unusable` are split from `secret_unavailable`. A locked keychain
+is worth retrying unchanged; a wrong password will fail identically forever
+until a human replaces it; a destination with no password stored stays that way
+until someone runs `secret set`; and a `secrets.json` that is a symlink, is
+group-readable, or does not decode keeps refusing until someone repairs the
+file. Collapsing them — as the original issue's taxonomy did — would force one
+`retryable` value that is wrong for three of the four.
+
+The dividing line is narrow and mechanical: **can the caller repeat this
+identical request and get a different answer?** Not "is this serious?". That is
+why a bare `errno` failure stays retryable even when its most likely cause is
+permanent — `EACCES` opening `secrets.json` can be Full Disk Access not yet
+granted, which does resolve — while a check that has already *decided* the file
+is a symlink is not retryable at all. The asymmetry is deliberate: marking a
+transient failure permanent breaks the pre-login-tick behaviour
+`keychain-and-fda.md` §2 depends on, so the keychain backend's `security`
+failures are all classified transient (its two permanent conditions, exit 44 and
+an unusable mutation lock, are already separate cases).
 
 The split is by **condition, not by backend**: `SecretStoreError.itemNotFound`
 is what the macOS keychain backend reports for `security`'s exit 44 and what
 the Linux file backend reports for a missing key, so #81's requirement that the
-two backends be indistinguishable to a caller still holds.
+two backends be indistinguishable to a caller still holds. `secret_store_unusable`
+is reachable from **both** backends, and again by condition rather than by
+backend: the file backend reaches it through the checks on `secrets.json`
+itself, and either backend reaches it through a stored secret-environment blob
+that does not parse, since both decode that blob with the same function. What
+the keychain backend has no path to is the *file* half — `security`'s own
+failures are all classified transient, for the pre-login-tick reason above.
 
 ### `details`
 
@@ -365,7 +391,8 @@ arrive:
   mean matching restic's English stderr, which is exactly the practice this
   contract exists to stop.
 
-Three codes not in that list are defined: `secret_rejected` and
-`secret_not_configured` (see §`retryable`) and `run_not_found`
+Four codes not in that list are defined: `secret_rejected`,
+`secret_not_configured` and `secret_store_unusable` (see §`retryable`)
+and `run_not_found`
 (`runs show <unknown-id>` is a real failure of a `--json` command and had no
 code at all).

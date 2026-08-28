@@ -133,6 +133,14 @@ public enum PruneRepositoryResult: Equatable, Sendable {
 public enum PruneRepositorySkipReason: Equatable, Sendable {
     case busy
     case secretUnavailable
+    /// The secret pre-flight refused permanently. Split from
+    /// ``secretUnavailable`` because that one publishes a retryable code
+    /// and neither of these is retryable, and it carries the
+    /// ``DestinationAttention`` rather than assuming one: a pre-flight that
+    /// passed can still be overtaken by a concurrent `secret rm`, and
+    /// answering "repair the store" to a destination that simply has no
+    /// password sends automation at the wrong repair (#96 review).
+    case secretRefused(DestinationAttention, String)
     case staleMirror
     case previewChanged
     /// The reclaim binding outlived `PreviewTokenStore.defaultLifetime`.
@@ -1059,7 +1067,15 @@ public final class BackupEngine: Sendable {
             logWarning("BackupEngine: destination \(destination.id) is not in backup set \(set.id) — cannot prune")
             return .failed(.didNotRun)
         }
-        guard await secretsAvailable(for: [destination]) else { return .skipped(.secretUnavailable) }
+        switch await secretStoreRefusal(for: [destination]) {
+        case .none:
+            break
+        case .some(let refusal):
+            if let attention = DestinationAttention(refusal.error) {
+                return .skipped(.secretRefused(attention, refusal.error.description))
+            }
+            return .skipped(.secretUnavailable)
+        }
         let executablePath = authorization?.resticExecutablePath ?? resticExecutablePath
         let executableIdentity = authorization?.resticExecutableIdentity ?? resticExecutableIdentity
 
@@ -1224,6 +1240,12 @@ public final class BackupEngine: Sendable {
             return .failed(.offline(reason))
         case .error(let exitClass):
             return .failed(.restic(exitClass))
+        case .needsAttention(let attention, let reason):
+            // Reachable only through a race — a concurrent `secret rm` or
+            // `chmod` between the pre-flight above and this probe — which
+            // is exactly why the probe's own `attention` is carried
+            // through instead of assuming one.
+            return .skipped(.secretRefused(attention, reason))
         }
 
         if dryRun {
@@ -1368,8 +1390,26 @@ public final class BackupEngine: Sendable {
         }
         defer { lock.release() }
 
-        guard await secretsAvailable(for: [destination]) else {
-            return PurgePlanResult(plan: emptyPlan, status: .failed, message: "secret store unavailable")
+        switch await secretStoreRefusal(for: [destination]) {
+        case .none:
+            break
+        case .some(let refusal):
+            // Not `.failed`, which publishes `restic_failed`: restic never
+            // ran, and the refusal's own message names the repair (#96).
+            switch DestinationAttention(refusal.error) {
+            case .secretNotConfigured:
+                return PurgePlanResult(
+                    plan: emptyPlan, status: .secretNotConfigured, message: refusal.error.description
+                )
+            case .secretStoreUnusable:
+                return PurgePlanResult(
+                    plan: emptyPlan, status: .secretStoreUnusable, message: refusal.error.description
+                )
+            case nil:
+                return PurgePlanResult(
+                    plan: emptyPlan, status: .failed, message: "secret store unavailable"
+                )
+            }
         }
 
         let probe = await reachability.probe(
@@ -1391,6 +1431,16 @@ public final class BackupEngine: Sendable {
                 status: .failed,
                 message: exitClass.userFacingMessage
             )
+        case .needsAttention(let attention, let reason):
+            // Reachable only through a race with a concurrent `secret rm`
+            // or `chmod`, which is why the probe's own answer decides the
+            // status rather than this site assuming one.
+            switch attention {
+            case .secretNotConfigured:
+                return PurgePlanResult(plan: emptyPlan, status: .secretNotConfigured, message: reason)
+            case .secretStoreUnusable:
+                return PurgePlanResult(plan: emptyPlan, status: .secretStoreUnusable, message: reason)
+            }
         }
 
         let snapshotsOutcome: ResticOutcome
@@ -1531,7 +1581,8 @@ public final class BackupEngine: Sendable {
             switch result.status {
             case .empty, .ready:
                 continue
-            case .busy, .offline, .infrastructureFailure, .failed:
+            case .busy, .offline, .infrastructureFailure, .failed,
+                 .secretNotConfigured, .secretStoreUnusable:
                 return PurgePreviewSession(previews: previews, token: nil)
             }
         }
@@ -1718,7 +1769,17 @@ public final class BackupEngine: Sendable {
             throw PurgeApplyError.tokenDoesNotMatchCurrentPlan
         }
 
-        guard await secretsAvailable(for: pendingDestinations) else {
+        switch await secretStoreRefusal(for: pendingDestinations) {
+        case .none:
+            break
+        case .some(let refusal):
+            if let attention = DestinationAttention(refusal.error) {
+                throw PurgeApplyError.secretRefused(
+                    attention,
+                    destinationId: refusal.destination.id,
+                    refusal.error.description
+                )
+            }
             throw PurgeApplyError.unavailable
         }
 
@@ -2399,7 +2460,19 @@ public final class BackupEngine: Sendable {
         trigger: RunTrigger,
         groupId: String
     ) async throws -> PurgeRunResult {
-        guard await secretsAvailable(for: [destination]) else { throw PurgeApplyError.unavailable }
+        switch await secretStoreRefusal(for: [destination]) {
+        case .none:
+            break
+        case .some(let refusal):
+            if let attention = DestinationAttention(refusal.error) {
+                throw PurgeApplyError.secretRefused(
+                    attention,
+                    destinationId: refusal.destination.id,
+                    refusal.error.description
+                )
+            }
+            throw PurgeApplyError.unavailable
+        }
         // Captured before the plan query, not after it: the automatic path
         // mints and spends its own token, so the same "one binary for the
         // whole operation" rule applies here (#118).
@@ -3375,7 +3448,8 @@ public final class BackupEngine: Sendable {
             return "preview-token store unusable — \(detail)"
         case .token(.unavailable), .token(.unknown), .token(.expired),
              .token(.alreadyUsed), .tokenDoesNotMatchCurrentPlan, .busy,
-             .destinationOffline, .unavailable, .resticUnavailable:
+             .destinationOffline, .unavailable, .secretRefused,
+             .resticUnavailable:
             // Refusals and transient conditions, not broken infrastructure.
             // Enumerated (no `default`) so a new `PurgeApplyError` or
             // `PreviewTokenError` case must decide whether it is an
@@ -3402,7 +3476,7 @@ public final class BackupEngine: Sendable {
             case .reachable:
                 status.reachable = true
                 status.lastError = nil
-            case .offline, .error:
+            case .offline, .error, .needsAttention:
                 status.reachable = false
                 status.lastError = self.describe(probe)
             }
@@ -3482,6 +3556,8 @@ public final class BackupEngine: Sendable {
             return reason
         case .error(let exitClass):
             return exitClass.userFacingMessage
+        case .needsAttention(_, let reason):
+            return reason
         }
     }
 
@@ -3531,18 +3607,62 @@ public final class BackupEngine: Sendable {
     /// `.skipped` without writing a run record (`docs/architecture.md`
     /// §Error taxonomy).
     private func secretsAvailable(for destinations: [Destination]) async -> Bool {
+        await secretStoreRefusal(for: destinations) == nil
+    }
+
+    /// The first destination whose secret read failed, with its failure,
+    /// or `nil` if every read succeeded.
+    ///
+    /// Returned typed rather than as a `Bool` so a caller can tell a
+    /// permanent refusal from a locked keychain — and paired with the
+    /// destination, because an operation can span several and the repair a
+    /// permanent refusal prescribes has to name one. Every caller that
+    /// only needs "did it work" keeps using ``secretsAvailable(for:)``.
+    private func secretStoreRefusal(
+        for destinations: [Destination]
+    ) async -> (destination: Destination, error: SecretStoreError)? {
         for destination in destinations {
             do {
                 _ = try await secrets.password(destId: destination.id)
+                // Deliberately the password only. Reading the secret
+                // *environment* here too would classify a malformed
+                // `<uuid>-env` blob at the pre-flight — which is right for
+                // the paths that pass that environment to local restic, and
+                // wrong for the two that do not: remote maintenance reads
+                // only the password and spawns with `env: nil`, and the
+                // `Bool`-shaped callers below would turn a permanent fault
+                // into a silent forever-deferral. Scoping the read to the
+                // paths that consume it belongs with the engine pre-flight
+                // rework in #95, not in a classification change. Tracked
+                // there; see the note in `architecture.md` §Error taxonomy.
+            } catch let error as SecretStoreError {
+                // Exhaustive, no `default:` — a new `SecretStoreError` case
+                // must be judged here rather than inheriting the retryable
+                // reading by omission (#96).
+                switch error {
+                case .storeUnusable(let detail):
+                    logWarning(
+                        "BackupEngine: \(secretStoreDescription) refused to be read for destination "
+                            + "\"\(destination.label)\" — \(detail)"
+                    )
+                case .itemNotFound, .backendFailed, .lockUnusable:
+                    logWarning(
+                        "BackupEngine: \(secretStoreDescription) could not be read for destination "
+                            + "\"\(destination.label)\" — skipping (retryable, nothing recorded)"
+                    )
+                }
+                return (destination, error)
             } catch {
                 logWarning(
                     "BackupEngine: \(secretStoreDescription) could not be read for destination "
                         + "\"\(destination.label)\" — skipping (retryable, nothing recorded)"
                 )
-                return false
+                // Not a `SecretStoreError`: transient is the safe direction
+                // for the unknown, matching `ResticRunner`'s pre-flight.
+                return (destination, .backendFailed("\(error)"))
             }
         }
-        return true
+        return nil
     }
 
     /// Finds the set that owns `destId` (a destination id is unique across

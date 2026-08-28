@@ -15,6 +15,18 @@ public enum RepoProbeResult: Equatable, Sendable {
     case reachable
     case offline(reason: String)
     case error(ResticExitClass)
+    /// The pre-flight refused before restic could run, and repeating the
+    /// identical probe cannot change the answer: nothing is stored for this
+    /// destination, or the secret store will not be read at all.
+    ///
+    /// Distinct from ``offline`` because a caller is told to *retry* an
+    /// offline probe — `probe-repo` publishes it as `ok: true`, exit 3, on
+    /// the grounds that an unplugged drive is a destination's expected
+    /// state. That advice is wrong for a refusal whose message names the
+    /// `chmod` or the `secret set` to run (#96). Distinct from ``error``
+    /// because that carries a ``ResticExitClass``, and inventing one here
+    /// would publish an exit code restic never produced.
+    case needsAttention(DestinationAttention, reason: String)
 }
 
 /// Destination reachability probing — see `docs/data-model.md`
@@ -114,14 +126,28 @@ public struct Reachability: Sendable {
                 return .offline(reason: restic.secretBackend.unavailableProbeReason)
             case .secretsNotConfigured:
                 // Not environmental: nothing is stored, and no amount of
-                // waiting changes that. Still `.offline` rather than
-                // `.error` because `.error` carries a `ResticExitClass` and
-                // restic never ran — inventing `wrongPassword` here would
-                // publish an exit code that did not happen. The reason
+                // waiting changes that. The reason string is deliberately
+                // outside `SetsBadges`'s environmental list, so the badge
+                // reads "Error" (needs attention) rather than "Offline"
+                // (try later) — and it is unchanged from when this case
+                // returned `.offline`, because that string is persisted
+                // and matched.
+                return .needsAttention(
+                    .secretNotConfigured,
+                    reason: "no password stored for this destination"
+                )
+            case .secretsStoreUnusable:
+                // Also not environmental, and for a stronger reason than
+                // `secretsNotConfigured`: the store refused to be read at
+                // all and its refusal already names the fix. The reason
                 // string is deliberately outside `SetsBadges`'s
-                // environmental list, so the badge reads "Error" (needs
-                // attention) rather than "Offline" (try later).
-                return .offline(reason: "no password stored for this destination")
+                // environmental list — note that list matches the bare
+                // substring "could not", which is why this wording avoids
+                // it — so the badge reads "Error" rather than "Offline".
+                return .needsAttention(
+                    .secretStoreUnusable,
+                    reason: "the secret store is not usable as configured"
+                )
             case .timedOut:
                 return .offline(reason: "timed out")
             case .launchFailed(let reason):

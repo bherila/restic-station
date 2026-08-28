@@ -110,13 +110,26 @@ Every failure is classified into one of three categories, which drive both `RunS
 | **Warning** | The operation completed with caveats; run record `.warning` | restic exit 3 (some source files unreadable), a secondary offline (skip + staleness), check found no errors but a slice was skipped | run `.warning` |
 | **Retryable** | Environmental/transient; do NOT write a `.failed` run — leave schedule state untouched so the next tick retries | keychain locked (password command fails at pre-login tick), set lock busy (another run in flight), tick lock busy | run `.skipped` (busy) or no record (keychain locked) |
 
-A locked keychain and a destination with **no password stored** are both
-"the pre-flight could not produce a password", and only the first clears
-itself at the next tick. `ResticRunner`'s pre-flight keeps them apart
-(`ResticRunnerError.secretsUnavailable` vs `.secretsNotConfigured`, from
-`SecretStoreError.backendFailed` vs `.itemNotFound`), which is what stops
-the `--json` envelope advising an agent to retry a request that cannot
-succeed until someone runs `secret set`.
+A locked keychain, a destination with **no password stored**, and a
+`secrets.json` the store **refuses to read** are all "the pre-flight could
+not produce a password", and only the first clears itself at the next tick.
+`ResticRunner`'s pre-flight keeps the three apart —
+`ResticRunnerError.secretsUnavailable` vs `.secretsNotConfigured` vs
+`.secretsStoreUnusable`, from `SecretStoreError.backendFailed` vs
+`.itemNotFound` vs `.storeUnusable` — which is what stops the `--json`
+envelope advising an agent to retry a request that cannot succeed until
+someone runs `secret set` or repairs the file.
+
+The store-side split is by whether **repeating the identical request can
+produce a different answer**, judged per throw site rather than by how
+serious the condition looks: a bare `errno` wrapper stays retryable (its
+errno set is never uniformly permanent, and `EACCES` in particular can be
+Full Disk Access that has not been granted *yet*), while a check that has
+already decided the file is a symlink, is group-readable, is owned outside
+the trust boundary, or does not decode is permanent. The keychain backend's
+`security` failures are all transient by the same rule — the pre-login tick
+in `keychain-and-fda.md` §2 depends on it, and marking a transient failure
+permanent is the more damaging error. See `cli-json.md` §`retryable`.
 
 **The engine has not yet followed.** `BackupEngine.runSet`'s own pre-flight
 and `secretsAvailable` still collapse both into the retryable row: a
@@ -126,6 +139,17 @@ consequences — whether it should become a `.failed` run every tick, a
 `.misconfigured` result, or a health warning that is not a run at all — so
 it is issue #95 rather than a side effect of the CLI contract. Until then,
 the classification is honest and the scheduling behaviour is unchanged.
+
+**Two known gaps in that classification, both tracked rather than hidden.**
+The engine's pre-flight reads a destination's *password* only, so a stored
+secret-environment blob that does not parse is not refused there and
+surfaces later as a restic failure; closing it means reading the
+environment on exactly the paths that pass it to local restic, since remote
+maintenance spawns with no environment at all (#95). And the pre-flight is
+not atomic with the reads that follow it, so a `secret rm` or `chmod` in
+the window between it and the restic spawn is still published as retryable
+by the later generic catches — the evidence-binding rule in `AGENTS.md`,
+applied to secrets.
 
 restic exit code mapping (verified against restic 0.18.1 — see `restic-cli.md`): `0` success, `1` fatal, `2` Go runtime error, `3` backup incomplete-read warning, `10` repository does not exist, `11` repository locked, `12` wrong password. Exit 11 on a *scheduled* run: attempt `restic unlock` once (removes only stale locks of dead processes), retry the operation once, then fail terminal if still locked.
 

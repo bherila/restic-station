@@ -29,8 +29,9 @@ public enum SecretBackend: String, Sendable, CaseIterable {
         #endif
     }
 
-    /// - Throws: ``SecretStoreError/backendFailed(_:)`` naming the variable,
-    ///   the bad value, and the accepted values.
+    /// - Throws: ``SecretStoreError/storeUnusable(_:)`` naming the variable,
+    ///   the bad value, and the accepted values. Permanent: the same
+    ///   environment produces the same refusal until someone edits it.
     public static func resolve(
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) throws -> SecretBackend {
@@ -44,7 +45,7 @@ public enum SecretBackend: String, Sendable, CaseIterable {
             return platformDefault
         }
         guard let backend = SecretBackend(rawValue: trimmed.lowercased()) else {
-            throw SecretStoreError.backendFailed(
+            throw SecretStoreError.storeUnusable(
                 "\(environmentKey)=\"\(raw)\" is not a known secret backend — "
                     + "expected \"keychain\" or \"file\""
             )
@@ -141,9 +142,11 @@ public enum SecretStoreFactory {
     ///     compile error instead of a runtime hang. The helper passes
     ///     ``FileSecretStore/currentExecutablePath()``; the app passes its
     ///     embedded helper's path.
-    /// - Throws: ``SecretStoreError/backendFailed(_:)`` for an unrecognised
+    /// - Throws: ``SecretStoreError/storeUnusable(_:)`` for an unrecognised
     ///   `RESTIC_STATION_SECRET_BACKEND`, or for `keychain` on a platform
-    ///   that has no `/usr/bin/security`.
+    ///   that has no `/usr/bin/security`. Both are permanent: no store is
+    ///   ever built, and repeating the request on this host with this
+    ///   environment cannot build one.
     public static func make(
         paths: AppPaths,
         runner: ProcessRunning,
@@ -155,7 +158,7 @@ public enum SecretStoreFactory {
             #if os(macOS)
             return KeychainSecretStore(runner: runner, paths: paths)
             #else
-            throw SecretStoreError.backendFailed(
+            throw SecretStoreError.storeUnusable(
                 "\(SecretBackend.environmentKey)=keychain is only available on macOS — "
                     + "/usr/bin/security does not exist on this platform. "
                     + "Use \(SecretBackend.environmentKey)=file, or leave it unset."
