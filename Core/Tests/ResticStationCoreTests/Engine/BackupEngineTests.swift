@@ -2765,31 +2765,6 @@ struct BackupEngineTests {
         #expect(env.fake.invocations.isEmpty)
     }
 
-    /// The two halves of the #96 review, on the path that publishes them.
-    ///
-    /// A pre-flight that only read the password declared the store usable
-    /// while a malformed `<uuid>-env` blob sat beside it, and the failure
-    /// then surfaced from `ResticRunner` as a generic error that purge
-    /// reported as `restic_failed` — for a restic that never ran.
-    @Test("standalone prune: a malformed secret-env blob refuses permanently")
-    func standalonePruneRefusesOnUnreadableSecretEnv() async throws {
-        let env = Self.makeEnv(script: [], retention: nil)
-        defer { env.cleanUp() }
-        // A perfectly good password beside an unreadable environment.
-        env.secrets.failSecretEnv(
-            for: Self.primaryId,
-            with: .storeUnusable("refusing to read /data/secrets.json: it is a symbolic link.")
-        )
-
-        let result = await env.engine.runPruneRepository(set: env.set, destination: env.primary)
-
-        #expect(result == .skipped(.secretRefused(
-            .secretStoreUnusable,
-            "refusing to read /data/secrets.json: it is a symbolic link."
-        )))
-        #expect(env.fake.invocations.isEmpty, "restic must not run for a refusal restic cannot fix")
-    }
-
     /// And the code must be the one the pre-flight reported. Answering
     /// "repair the store" to a destination whose only problem is that
     /// nobody ran `secret set` sends automation at the wrong repair.

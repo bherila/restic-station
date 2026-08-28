@@ -140,6 +140,17 @@ consequences — whether it should become a `.failed` run every tick, a
 it is issue #95 rather than a side effect of the CLI contract. Until then,
 the classification is honest and the scheduling behaviour is unchanged.
 
+**Two known gaps in that classification, both tracked rather than hidden.**
+The engine's pre-flight reads a destination's *password* only, so a stored
+secret-environment blob that does not parse is not refused there and
+surfaces later as a restic failure; closing it means reading the
+environment on exactly the paths that pass it to local restic, since remote
+maintenance spawns with no environment at all (#95). And the pre-flight is
+not atomic with the reads that follow it, so a `secret rm` or `chmod` in
+the window between it and the restic spawn is still published as retryable
+by the later generic catches — the evidence-binding rule in `AGENTS.md`,
+applied to secrets.
+
 restic exit code mapping (verified against restic 0.18.1 — see `restic-cli.md`): `0` success, `1` fatal, `2` Go runtime error, `3` backup incomplete-read warning, `10` repository does not exist, `11` repository locked, `12` wrong password. Exit 11 on a *scheduled* run: attempt `restic unlock` once (removes only stale locks of dead processes), retry the operation once, then fail terminal if still locked.
 
 The three categories above drive *this app's* behavior. What a **headless caller** sees is a second, finer classification carried in the `--json` error envelope — `set_not_found`, `repository_locked`, `secret_rejected` and the rest — so an agent never has to match English prose to find out what went wrong. The exit-code contract below is unchanged by it. See `cli-json.md` for the code table, the redaction policy, and the versioning rules.
