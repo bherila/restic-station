@@ -133,10 +133,14 @@ public enum PruneRepositoryResult: Equatable, Sendable {
 public enum PruneRepositorySkipReason: Equatable, Sendable {
     case busy
     case secretUnavailable
-    /// The secret store refused to be read at all. Split from
+    /// The secret pre-flight refused permanently. Split from
     /// ``secretUnavailable`` because that one publishes a retryable code
-    /// and this condition is not retryable (#96).
-    case secretStoreUnusable(String)
+    /// and neither of these is retryable, and it carries the
+    /// ``DestinationAttention`` rather than assuming one: a pre-flight that
+    /// passed can still be overtaken by a concurrent `secret rm`, and
+    /// answering "repair the store" to a destination that simply has no
+    /// password sends automation at the wrong repair (#96 review).
+    case secretRefused(DestinationAttention, String)
     case staleMirror
     case previewChanged
     /// The reclaim binding outlived `PreviewTokenStore.defaultLifetime`.
@@ -1066,9 +1070,10 @@ public final class BackupEngine: Sendable {
         switch await secretStoreRefusal(for: [destination]) {
         case .none:
             break
-        case .storeUnusable(let detail):
-            return .skipped(.secretStoreUnusable(detail))
-        case .some:
+        case .some(let error):
+            if let attention = DestinationAttention(error) {
+                return .skipped(.secretRefused(attention, error.description))
+            }
             return .skipped(.secretUnavailable)
         }
         let executablePath = authorization?.resticExecutablePath ?? resticExecutablePath
@@ -1235,12 +1240,12 @@ public final class BackupEngine: Sendable {
             return .failed(.offline(reason))
         case .error(let exitClass):
             return .failed(.restic(exitClass))
-        case .needsAttention(_, let reason):
-            // Not reachable in practice — the secret pre-flight above
-            // already refused anything that produces this — but spelled
-            // rather than folded into `.offline`, which publishes a
-            // retryable code.
-            return .skipped(.secretStoreUnusable(reason))
+        case .needsAttention(let attention, let reason):
+            // Reachable only through a race — a concurrent `secret rm` or
+            // `chmod` between the pre-flight above and this probe — which
+            // is exactly why the probe's own `attention` is carried
+            // through instead of assuming one.
+            return .skipped(.secretRefused(attention, reason))
         }
 
         if dryRun {
@@ -1388,12 +1393,23 @@ public final class BackupEngine: Sendable {
         switch await secretStoreRefusal(for: [destination]) {
         case .none:
             break
-        case .storeUnusable(let detail):
+        case .some(let error):
             // Not `.failed`, which publishes `restic_failed`: restic never
-            // ran, and the store's own message names the repair (#96).
-            return PurgePlanResult(plan: emptyPlan, status: .secretStoreUnusable, message: detail)
-        case .some:
-            return PurgePlanResult(plan: emptyPlan, status: .failed, message: "secret store unavailable")
+            // ran, and the refusal's own message names the repair (#96).
+            switch DestinationAttention(error) {
+            case .secretNotConfigured:
+                return PurgePlanResult(
+                    plan: emptyPlan, status: .secretNotConfigured, message: error.description
+                )
+            case .secretStoreUnusable:
+                return PurgePlanResult(
+                    plan: emptyPlan, status: .secretStoreUnusable, message: error.description
+                )
+            case nil:
+                return PurgePlanResult(
+                    plan: emptyPlan, status: .failed, message: "secret store unavailable"
+                )
+            }
         }
 
         let probe = await reachability.probe(
@@ -1415,14 +1431,16 @@ public final class BackupEngine: Sendable {
                 status: .failed,
                 message: exitClass.userFacingMessage
             )
-        case .needsAttention(_, let reason):
-            // As above: already gated, spelled anyway so it cannot inherit
-            // a retryable status by omission.
-            return PurgePlanResult(
-                plan: emptyPlan,
-                status: .secretStoreUnusable,
-                message: reason
-            )
+        case .needsAttention(let attention, let reason):
+            // Reachable only through a race with a concurrent `secret rm`
+            // or `chmod`, which is why the probe's own answer decides the
+            // status rather than this site assuming one.
+            switch attention {
+            case .secretNotConfigured:
+                return PurgePlanResult(plan: emptyPlan, status: .secretNotConfigured, message: reason)
+            case .secretStoreUnusable:
+                return PurgePlanResult(plan: emptyPlan, status: .secretStoreUnusable, message: reason)
+            }
         }
 
         let snapshotsOutcome: ResticOutcome
@@ -1563,7 +1581,8 @@ public final class BackupEngine: Sendable {
             switch result.status {
             case .empty, .ready:
                 continue
-            case .busy, .offline, .infrastructureFailure, .failed, .secretStoreUnusable:
+            case .busy, .offline, .infrastructureFailure, .failed,
+                 .secretNotConfigured, .secretStoreUnusable:
                 return PurgePreviewSession(previews: previews, token: nil)
             }
         }
@@ -1753,9 +1772,10 @@ public final class BackupEngine: Sendable {
         switch await secretStoreRefusal(for: pendingDestinations) {
         case .none:
             break
-        case .storeUnusable(let detail):
-            throw PurgeApplyError.secretStoreUnusable(detail)
-        case .some:
+        case .some(let error):
+            if let attention = DestinationAttention(error) {
+                throw PurgeApplyError.secretRefused(attention, error.description)
+            }
             throw PurgeApplyError.unavailable
         }
 
@@ -2439,9 +2459,10 @@ public final class BackupEngine: Sendable {
         switch await secretStoreRefusal(for: [destination]) {
         case .none:
             break
-        case .storeUnusable(let detail):
-            throw PurgeApplyError.secretStoreUnusable(detail)
-        case .some:
+        case .some(let error):
+            if let attention = DestinationAttention(error) {
+                throw PurgeApplyError.secretRefused(attention, error.description)
+            }
             throw PurgeApplyError.unavailable
         }
         // Captured before the plan query, not after it: the automatic path
@@ -3419,7 +3440,7 @@ public final class BackupEngine: Sendable {
             return "preview-token store unusable — \(detail)"
         case .token(.unavailable), .token(.unknown), .token(.expired),
              .token(.alreadyUsed), .tokenDoesNotMatchCurrentPlan, .busy,
-             .destinationOffline, .unavailable, .secretStoreUnusable,
+             .destinationOffline, .unavailable, .secretRefused,
              .resticUnavailable:
             // Refusals and transient conditions, not broken infrastructure.
             // Enumerated (no `default`) so a new `PurgeApplyError` or
@@ -3591,6 +3612,16 @@ public final class BackupEngine: Sendable {
         for destination in destinations {
             do {
                 _ = try await secrets.password(destId: destination.id)
+                // The secret *environment* too, not just the password. A
+                // destination can have a perfectly good password beside a
+                // `<uuid>-env` blob that does not parse, and `ResticRunner`
+                // reads both — so a password-only pre-flight declared the
+                // store usable and then let the env failure surface as a
+                // generic runner error, which purge published as
+                // `restic_failed` for a restic that never ran (#96 review).
+                // Absent is `[:]` and not an error, so this only fails when
+                // something is actually wrong.
+                _ = try await secrets.secretEnv(destId: destination.id)
             } catch let error as SecretStoreError {
                 // Exhaustive, no `default:` — a new `SecretStoreError` case
                 // must be judged here rather than inheriting the retryable

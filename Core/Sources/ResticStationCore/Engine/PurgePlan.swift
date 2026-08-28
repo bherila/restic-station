@@ -112,11 +112,16 @@ public struct PurgePlanResult: Equatable, Sendable {
         /// query itself could not complete.
         case infrastructureFailure
         case failed
-        /// The secret store refused to be read at all, so restic never ran.
+        /// The secret pre-flight refused permanently, so restic never ran.
         /// Distinct from ``failed`` because that publishes `restic_failed`,
         /// and from ``offline`` because that publishes a retryable code —
-        /// neither is true of a store whose refusal names the `chmod` to
-        /// run (#96).
+        /// neither is true of a refusal that names the repair (#96).
+        ///
+        /// Two cases rather than one carrying a
+        /// ``DestinationAttention``, because `Status` is a payload-free
+        /// `String` enum; the pair keeps every consumer's switch exhaustive
+        /// without a fallback that could report one as the other.
+        case secretNotConfigured
         case secretStoreUnusable
     }
 
@@ -219,15 +224,20 @@ public enum PurgeApplyError: Error, Equatable, Sendable {
     case auditFailure(reason: String, operationMayHaveRun: Bool, runId: String)
     case destinationOffline(destinationId: UUID)
     case unavailable
-    /// The secret store refused to be read, and repeating the identical
-    /// request cannot repair it (``SecretStoreError/storeUnusable(_:)``).
+    /// The secret pre-flight refused permanently: nothing is stored for a
+    /// destination, or the store will not be read at all.
+    ///
+    /// Carries the ``DestinationAttention`` rather than assuming one — a
+    /// pre-flight that passed can be overtaken by a concurrent
+    /// `secret rm`, and "repair the store" is the wrong repair to name for
+    /// a destination that simply has no password (#96 review).
     ///
     /// Split from ``unavailable``, whose whole point is that it is
     /// cause-neutral *and retryable*: it covers secret storage, the token
     /// index, and a failed `snapshots` listing alike. That is the right
     /// answer for all three transient causes and the wrong one here, where
     /// the store has already told the operator what to change (#96).
-    case secretStoreUnusable(String)
+    case secretRefused(DestinationAttention, String)
     /// No restic executable could be identified, so no destructive purge
     /// capability may be minted or honoured. Distinct from ``unavailable``
     /// because the remedy is specific: restore the configured binary

@@ -26,7 +26,7 @@ public enum RepoProbeResult: Equatable, Sendable {
     /// `chmod` or the `secret set` to run (#96). Distinct from ``error``
     /// because that carries a ``ResticExitClass``, and inventing one here
     /// would publish an exit code restic never produced.
-    case needsAttention(code: CLIErrorCode, reason: String)
+    case needsAttention(DestinationAttention, reason: String)
 }
 
 /// Destination reachability probing — see `docs/data-model.md`
@@ -133,7 +133,7 @@ public struct Reachability: Sendable {
                 // returned `.offline`, because that string is persisted
                 // and matched.
                 return .needsAttention(
-                    code: .secretNotConfigured,
+                    .secretNotConfigured,
                     reason: "no password stored for this destination"
                 )
             case .secretsStoreUnusable:
@@ -145,7 +145,7 @@ public struct Reachability: Sendable {
                 // substring "could not", which is why this wording avoids
                 // it — so the badge reads "Error" rather than "Offline".
                 return .needsAttention(
-                    code: .secretStoreUnusable,
+                    .secretStoreUnusable,
                     reason: "the secret store is not usable as configured"
                 )
             case .timedOut:

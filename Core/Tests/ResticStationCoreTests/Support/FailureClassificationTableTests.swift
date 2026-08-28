@@ -109,8 +109,11 @@ struct PurgeApplyErrorTableTests {
             return (.repositoryOffline, true)
         case .unavailable:
             return (.secretUnavailable, true)
-        case .secretStoreUnusable:
-            return (.secretStoreUnusable, false)
+        case .secretRefused(let attention, _):
+            // The code the pre-flight reported, never a fixed one: a
+            // destination with no password and a store that will not be
+            // read need different repairs (#96 review).
+            return (attention.code, false)
         case .resticUnavailable:
             return (.resticNotFound, false)
         }
@@ -125,7 +128,8 @@ struct PurgeApplyErrorTableTests {
         .token(.alreadyUsed),
         .tokenDoesNotMatchCurrentPlan,
         .busy,
-        .secretStoreUnusable("refusing to read /data/secrets.json: it is a symbolic link."),
+        .secretRefused(.secretStoreUnusable, "refusing to read /data/secrets.json: it is a symbolic link."),
+        .secretRefused(.secretNotConfigured, "no stored secret for this destination"),
         .lockUnusable("open lock directory failed"),
         .infrastructureFailure(reason: "run history unusable", operationMayHaveRun: false),
         .infrastructureFailure(reason: "run history unusable", operationMayHaveRun: true),

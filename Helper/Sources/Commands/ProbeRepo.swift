@@ -108,7 +108,7 @@ struct ProbeRepo: AsyncParsableCommand, JSONRenderable {
             (outcome, reason, exitCode) = (.offline, text, HelperExitCode.offline.rawValue)
         case .error(let exitClass):
             (outcome, reason, exitCode) = (.error, exitClass.userFacingMessage, HelperExitCode.error.rawValue)
-        case .needsAttention(let code, let text):
+        case .needsAttention(let attention, let text):
             // The one probe outcome that is neither a success nor a restic
             // result. `outcome: "offline"` here would be published as
             // `ok: true` at exit 3 — the documented "an unplugged drive is
@@ -116,7 +116,7 @@ struct ProbeRepo: AsyncParsableCommand, JSONRenderable {
             // refusal that names the `chmod` or the `secret set` to run. It
             // gets the error envelope, non-retryable, at exit 1 (#96).
             throw CLIFailure(
-                code: code,
+                code: attention.code,
                 message: CLIFailure.bounded(text),
                 details: CLIErrorDetails(setId: set, destinationId: destination.id)
             )

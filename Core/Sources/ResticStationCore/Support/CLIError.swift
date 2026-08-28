@@ -537,12 +537,15 @@ extension CLIFailure {
                 message: "The destination is offline. Reconnect it and run purge preview again.",
                 details: CLIErrorDetails(setId: setId, destinationId: destinationId)
             )
-        case .secretStoreUnusable(let detail):
+        case .secretRefused(let attention, let detail):
             // Unlike `.unavailable` below, the cause here is known and the
-            // store has already named the repair, so the message carries it
-            // and the code is non-retryable (#96).
+            // refusal has already named the repair, so the message carries
+            // it and the code is the one the pre-flight actually reported —
+            // never a fixed `secret_store_unusable`, which would send an
+            // agent to repair a store whose only problem is that nobody
+            // has run `secret set` (#96).
             return CLIFailure(
-                code: .secretStoreUnusable,
+                code: attention.code,
                 message: bounded("The purge was refused: \(detail)"),
                 details: CLIErrorDetails(setId: setId)
             )
