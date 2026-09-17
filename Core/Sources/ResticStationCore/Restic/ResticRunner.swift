@@ -214,6 +214,35 @@ public final class ResticRunner: Sendable {
         return try await execute(cmd, env: baseEnvironment(), onLine: onLine, onRawLine: onRawLine, timeout: timeout)
     }
 
+    /// The first restic whose `backup --exclude-cloud-files` works on macOS.
+    ///
+    /// Older releases fail the whole backup when the flag is passed: 0.17
+    /// does not know it, and 0.18 accepts it only on Windows. Linux releases
+    /// from 0.19 accept it and find nothing to skip.
+    public static let excludeCloudFilesMinimumVersion = "0.19.0"
+
+    /// The version the restic this runner launches reports, or nil when it
+    /// cannot be run or its answer cannot be read.
+    ///
+    /// Asked immediately before the backup whose argv depends on it rather
+    /// than cached from discovery, so a restic upgraded or replaced since
+    /// launch is judged as it is now. It is not bound to the later launch;
+    /// if the binary changes in between, the worst case is a backup that
+    /// fails on an unknown flag or reads online-only files, never one that
+    /// skips data silently on a restic that cannot report it.
+    public func launchedResticVersion() async -> String? {
+        guard let outcome = try? await runWithoutRepository(.version, timeout: 20),
+              outcome.exitCode == 0 else {
+            return nil
+        }
+        // `rawOutput` is stdout followed by stderr; the JSON is one line.
+        return outcome.rawOutput
+            .split(whereSeparator: \.isNewline)
+            .lazy
+            .compactMap { try? parseVersion(Data($0.utf8)) }
+            .first?.version
+    }
+
     /// Runs an ssh-wrapped maintenance command. The destination password is
     /// delivered solely on the local ssh process stdin; it is never present
     /// in argv or environment.

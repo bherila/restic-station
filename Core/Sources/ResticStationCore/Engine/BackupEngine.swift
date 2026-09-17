@@ -352,6 +352,30 @@ public final class BackupEngine: Sendable {
         var children: [SetRunChild] = []
         var infrastructureFailures: [String] = []
 
+        // Online-only files under a cloud-synced source are skipped rather
+        // than downloaded, but only by a restic that accepts the flag on
+        // this platform; an older one would fail the whole backup on it.
+        let excludeCloudFiles: Bool
+        let cloudSourceNote: String?
+        if CloudStorageSafety.containsCloudBackedSource(set.sources) {
+            let version = await restic.launchedResticVersion()
+            excludeCloudFiles = version.map {
+                VersionInfo.compareVersions($0, ResticRunner.excludeCloudFilesMinimumVersion) >= 0
+            } ?? false
+            if excludeCloudFiles {
+                cloudSourceNote = "cloud-synced source: online-only files are skipped, not downloaded"
+            } else {
+                let note = "warning: cloud-synced source, but restic \(version ?? "(version unknown)") "
+                    + "cannot skip online-only files (needs \(ResticRunner.excludeCloudFilesMinimumVersion)); "
+                    + "reading them will download them"
+                logWarning("BackupEngine: set \"\(set.name)\": \(note)")
+                cloudSourceNote = note
+            }
+        } else {
+            excludeCloudFiles = false
+            cloudSourceNote = nil
+        }
+
         // ── Steps 4 + 5: probe primary, then back it up ─────────────────
         let backupResult = await performChild(
             kind: .backup,
@@ -368,12 +392,15 @@ public final class BackupEngine: Sendable {
                 repo: primary.repoURL,
                 sources: set.sources,
                 excludes: set.effectiveBackupExcludes,
-                excludeCloudFiles: CloudStorageSafety.containsCloudBackedSource(set.sources)
+                excludeCloudFiles: excludeCloudFiles
             ),
             invocation: ResticInvocation(destination: primary),
             streamProgress: true,
             preflightPhase: "probing",
             preflight: { [self] logWriter in
+                if let cloudSourceNote {
+                    logWriter?.appendLine(cloudSourceNote)
+                }
                 let probe = await reachability.probe(primary)
                 logWriter?.appendLine("probe primary \"\(primary.label)\": \(describe(probe))")
                 record(probe: probe, for: primary)

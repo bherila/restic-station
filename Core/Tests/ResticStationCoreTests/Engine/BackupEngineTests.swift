@@ -519,34 +519,104 @@ struct BackupEngineTests {
 
     // MARK: - Row 2 — primary unreachable
 
-    @Test("cloud-backed source automatically skips online-only files")
+    static func versionCall(_ version: String) -> [FakeProcessRunner.Expectation] {
+        [
+            .init(
+                argvPrefix: [resticPath, "version", "--json"],
+                stdoutLines: [
+                    "{\"message_type\":\"version\",\"version\":\"\(version)\",\"go_version\":\"go1.25.1\",\"go_os\":\"darwin\",\"go_arch\":\"arm64\"}",
+                ]
+            ),
+        ]
+    }
+
+    static var cloudSource: String {
+        (NSHomeDirectory() as NSString).appendingPathComponent("Library/CloudStorage/Provider-Example/Documents")
+    }
+
+    @Test("cloud-backed source on restic 0.19.0 skips online-only files")
     func cloudSourceUsesExcludeCloudFiles() async throws {
-        let cloudSource = (NSHomeDirectory() as NSString)
-            .appendingPathComponent("Library/CloudStorage/OneDrive/Documents")
         let env = Self.makeEnv(
             script: [],
-            sources: [cloudSource],
+            sources: [Self.cloudSource],
             retention: nil,
             reachableSecondaries: []
         )
         defer { env.cleanUp() }
-        let expected = [
-            "-r", env.primary.repoURL, "backup", "--json", "--exclude-cloud-files", cloudSource,
-        ]
-        env.fake.script = Self.resticCall(
-            expected,
-            dest: Self.primaryId,
-            stdoutLines: Self.backupStream()
-        )
+        let backup = ["-r", env.primary.repoURL, "backup", "--json", "--exclude-cloud-files", Self.cloudSource]
+        env.fake.script = Self.versionCall("0.19.0")
+            + Self.resticCall(backup, dest: Self.primaryId, stdoutLines: Self.backupStream())
 
         let outcome = await env.engine.runSet(env.set, trigger: .manual)
 
-        guard case .completed(let status, _, _) = outcome else {
+        guard case .completed(let status, let groupId, _) = outcome else {
             Issue.record("expected completed backup, got \(outcome)")
             return
         }
         #expect(status == .success)
-        #expect(env.resticArgvs == [[Self.resticPath] + expected])
+        #expect(env.resticArgvs == [
+            [Self.resticPath, "version", "--json"],
+            [Self.resticPath] + backup,
+        ])
+        #expect(env.log(runId: groupId).contains("online-only files are skipped"))
+    }
+
+    @Test("cloud-backed source on a restic that rejects the flag backs up without it and says so")
+    func cloudSourceOnOldResticOmitsFlag() async throws {
+        for version in ["0.17.3", "0.18.1"] {
+            let env = Self.makeEnv(
+                script: [],
+                sources: [Self.cloudSource],
+                retention: nil,
+                reachableSecondaries: []
+            )
+            defer { env.cleanUp() }
+            let backup = ["-r", env.primary.repoURL, "backup", "--json", Self.cloudSource]
+            env.fake.script = Self.versionCall(version)
+                + Self.resticCall(backup, dest: Self.primaryId, stdoutLines: Self.backupStream())
+
+            let outcome = await env.engine.runSet(env.set, trigger: .manual)
+
+            guard case .completed(let status, let groupId, _) = outcome else {
+                Issue.record("\(version): expected completed backup, got \(outcome)")
+                continue
+            }
+            #expect(status == .success, "\(version)")
+            #expect(!env.resticArgvs.contains { $0.contains("--exclude-cloud-files") }, "\(version)")
+            #expect(env.resticArgvs.last == [Self.resticPath] + backup, "\(version)")
+            #expect(env.log(runId: groupId).contains("cannot skip online-only files"), "\(version)")
+        }
+    }
+
+    @Test("an unreadable restic version is treated as not supporting the flag")
+    func cloudSourceWithUnknownVersionOmitsFlag() async throws {
+        let env = Self.makeEnv(
+            script: [],
+            sources: [Self.cloudSource],
+            retention: nil,
+            reachableSecondaries: []
+        )
+        defer { env.cleanUp() }
+        let backup = ["-r", env.primary.repoURL, "backup", "--json", Self.cloudSource]
+        env.fake.script = [.init(argvPrefix: [Self.resticPath, "version", "--json"], exitCode: 1)]
+            + Self.resticCall(backup, dest: Self.primaryId, stdoutLines: Self.backupStream())
+
+        _ = await env.engine.runSet(env.set, trigger: .manual)
+
+        #expect(env.resticArgvs.last == [Self.resticPath] + backup)
+        #expect(!env.resticArgvs.contains { $0.contains("--exclude-cloud-files") })
+    }
+
+    @Test("a set with no cloud-backed source never asks restic for its version")
+    func localSourceSkipsVersionProbe() async throws {
+        let env = Self.makeEnv(script: [], retention: nil, reachableSecondaries: [])
+        defer { env.cleanUp() }
+        let backup = ["-r", env.primary.repoURL, "backup", "--json", Self.source]
+        env.fake.script = Self.resticCall(backup, dest: Self.primaryId, stdoutLines: Self.backupStream())
+
+        _ = await env.engine.runSet(env.set, trigger: .manual)
+
+        #expect(env.resticArgvs == [[Self.resticPath] + backup])
     }
 
     @Test("row 2: primary unreachable → failed backup record, no restic at all, lastBackupStart still updated")
