@@ -397,7 +397,7 @@ write_config() { # write_config <dir> <resticPath-or-null-json>
     local dir="$1" restic_json="$2"
     cat > "$dir/config.json" <<EOF
 {
-  "version": 3,
+  "version": 4,
   "resticPath": $restic_json,
   "showMenuBarIcon": true,
   "sets": [

@@ -233,6 +233,7 @@ struct BackupEngineTests {
         secretBackend: SecretBackend = .platformDefault,
         script: [FakeProcessRunner.Expectation],
         sources: [String] = [source],
+        onlineOnlyFiles: OnlineOnlyFiles = .skip,
         retention: RetentionPolicy? = RetentionPolicy(keepLast: 3),
         checkPolicy: CheckPolicy? = nil,
         excludes: [String] = [],
@@ -288,6 +289,7 @@ struct BackupEngineTests {
             sources: sources,
             excludes: excludes,
             purgeExcludes: purgeExcludes,
+            onlineOnlyFiles: onlineOnlyFiles,
             schedule: .daily(hour: 2, minute: 30),
             retention: retention,
             checkPolicy: checkPolicy,
@@ -605,6 +607,30 @@ struct BackupEngineTests {
 
         #expect(env.resticArgvs.last == [Self.resticPath] + backup)
         #expect(!env.resticArgvs.contains { $0.contains("--exclude-cloud-files") })
+    }
+
+    @Test("a set that downloads online-only files never passes the flag or asks for a version")
+    func cloudSourceWithDownloadPolicy() async throws {
+        let env = Self.makeEnv(
+            script: [],
+            sources: [Self.cloudSource],
+            onlineOnlyFiles: .download,
+            retention: nil,
+            reachableSecondaries: []
+        )
+        defer { env.cleanUp() }
+        let backup = ["-r", env.primary.repoURL, "backup", "--json", Self.cloudSource]
+        env.fake.script = Self.resticCall(backup, dest: Self.primaryId, stdoutLines: Self.backupStream())
+
+        let outcome = await env.engine.runSet(env.set, trigger: .manual)
+
+        guard case .completed(let status, let groupId, _) = outcome else {
+            Issue.record("expected completed backup, got \(outcome)")
+            return
+        }
+        #expect(status == .success)
+        #expect(env.resticArgvs == [[Self.resticPath] + backup])
+        #expect(env.log(runId: groupId).contains("online-only files are downloaded"))
     }
 
     @Test("a set with no cloud-backed source never asks restic for its version")

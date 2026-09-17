@@ -17,7 +17,9 @@ public struct AppConfig: Codable, Equatable, Sendable {
     ///   `Destination`, and `resticPath` relocated to `machine.json`.
     /// - 3: `purgeExcludes` on `BackupSet` — patterns excluded from new
     ///   backups *and* rewritten out of existing snapshots.
-    public static let currentVersion = 3
+    /// - 4: `onlineOnlyFiles` on `BackupSet` — whether a backup skips or
+    ///   downloads cloud files that are not stored on this Mac.
+    public static let currentVersion = 4
 
     public var version: Int
     /// **Deprecated** — superseded by `MachineConfig.resticPath`, because
@@ -102,6 +104,9 @@ public struct BackupSet: Codable, Equatable, Identifiable, Sendable {
     /// while removing one restores nothing. `restic rewrite --forget` has no
     /// inverse.
     public var purgeExcludes: [String]
+    /// What a backup does with online-only cloud files under a cloud-synced
+    /// source (schema v4). Absent decodes as ``OnlineOnlyFiles/skip``.
+    public var onlineOnlyFiles: OnlineOnlyFiles
     public var schedule: Schedule
     /// `nil` = never forget.
     public var retention: RetentionPolicy?
@@ -125,6 +130,7 @@ public struct BackupSet: Codable, Equatable, Identifiable, Sendable {
         sources: [String],
         excludes: [String] = [],
         purgeExcludes: [String] = [],
+        onlineOnlyFiles: OnlineOnlyFiles = .skip,
         schedule: Schedule,
         retention: RetentionPolicy? = nil,
         checkPolicy: CheckPolicy? = nil,
@@ -137,6 +143,7 @@ public struct BackupSet: Codable, Equatable, Identifiable, Sendable {
         self.sources = sources
         self.excludes = excludes
         self.purgeExcludes = purgeExcludes
+        self.onlineOnlyFiles = onlineOnlyFiles
         self.schedule = schedule
         self.retention = retention
         self.checkPolicy = checkPolicy
@@ -146,7 +153,7 @@ public struct BackupSet: Codable, Equatable, Identifiable, Sendable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, name, sources, excludes, purgeExcludes, schedule, retention, checkPolicy
+        case id, name, sources, excludes, purgeExcludes, onlineOnlyFiles, schedule, retention, checkPolicy
         case stalenessWarningDays, destinations
         case machines
     }
@@ -158,6 +165,8 @@ public struct BackupSet: Codable, Equatable, Identifiable, Sendable {
     // migrates). The synthesized decoder would throw `keyNotFound` on every
     // pre-v3 config and no migration would ever get the chance to run.
     // Absent and explicit `null` both read as "no purge patterns".
+    // `onlineOnlyFiles` is the v4 key and is hand-decoded for the same
+    // reason; absent and `null` both read as `.skip`.
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         id = try container.decode(UUID.self, forKey: .id)
@@ -165,6 +174,7 @@ public struct BackupSet: Codable, Equatable, Identifiable, Sendable {
         sources = try container.decode([String].self, forKey: .sources)
         excludes = try container.decode([String].self, forKey: .excludes)
         purgeExcludes = try container.decodeIfPresent([String].self, forKey: .purgeExcludes) ?? []
+        onlineOnlyFiles = try container.decodeIfPresent(OnlineOnlyFiles.self, forKey: .onlineOnlyFiles) ?? .skip
         schedule = try container.decode(Schedule.self, forKey: .schedule)
         retention = try container.decodeIfPresent(RetentionPolicy.self, forKey: .retention)
         checkPolicy = try container.decodeIfPresent(CheckPolicy.self, forKey: .checkPolicy)
@@ -187,6 +197,7 @@ public struct BackupSet: Codable, Equatable, Identifiable, Sendable {
         try container.encode(sources, forKey: .sources)
         try container.encode(excludes, forKey: .excludes)
         try container.encode(purgeExcludes, forKey: .purgeExcludes)
+        try container.encode(onlineOnlyFiles, forKey: .onlineOnlyFiles)
         try container.encode(schedule, forKey: .schedule)
         try container.encode(retention, forKey: .retention)
         try container.encode(checkPolicy, forKey: .checkPolicy)
@@ -209,6 +220,25 @@ public struct BackupSet: Codable, Equatable, Identifiable, Sendable {
         var seen = Set<String>()
         return (excludes + purgeExcludes).filter { seen.insert($0).inserted }
     }
+}
+
+// MARK: - OnlineOnlyFiles
+
+/// What `backup` does with a cloud file that is only a placeholder on this
+/// Mac — an iCloud Drive or File Provider (OneDrive, Dropbox, …) file whose
+/// contents live in the cloud. Only sources under `~/Library/Mobile
+/// Documents` or `~/Library/CloudStorage` are affected
+/// (`docs/restic-cli.md` §backup).
+public enum OnlineOnlyFiles: String, Codable, Equatable, Sendable, CaseIterable {
+    /// Leave them out of the snapshot (`restic backup --exclude-cloud-files`,
+    /// restic 0.19 or newer) rather than download them. The snapshot holds
+    /// only files stored on this Mac. The default, and what an absent key in
+    /// a pre-v4 config reads as.
+    case skip
+    /// Let restic read them, which makes the cloud provider download each
+    /// one first. Every file lands in the snapshot, at the cost of the
+    /// download and the disk space it takes.
+    case download
 }
 
 // MARK: - BackupSetMachineOverride

@@ -16,7 +16,7 @@ public enum ConfigDiff {
 
     /// `true` when the change between `old` and `new` can affect what the
     /// next tick does: sets added/removed, or any set's schedule, sources,
-    /// excludes, destinations, retention, check policy or **per-machine
+    /// excludes, online-only-files policy, destinations, retention, check policy or **per-machine
     /// overrides** changed — plus the restic path, since a config that just
     /// gained a usable restic binary should start backing up immediately
     /// rather than in two minutes.
@@ -145,6 +145,7 @@ public enum ConfigDiff {
             if oldSet.sources != newSet.sources { fields.append("sources") }
             if oldSet.excludes != newSet.excludes { fields.append("excludes") }
             if oldSet.purgeExcludes != newSet.purgeExcludes { fields.append("purgeExcludes") }
+            if oldSet.onlineOnlyFiles != newSet.onlineOnlyFiles { fields.append("onlineOnlyFiles") }
             if oldSet.schedule != newSet.schedule { fields.append("schedule") }
             if oldSet.retention != newSet.retention { fields.append("retention") }
             if oldSet.checkPolicy != newSet.checkPolicy { fields.append("checkPolicy") }
@@ -169,6 +170,7 @@ public enum ConfigDiff {
                 sources: set.sources,
                 excludes: set.excludes,
                 purgeExcludes: set.purgeExcludes,
+                onlineOnlyFiles: set.onlineOnlyFiles,
                 retention: set.retention,
                 checkPolicy: set.checkPolicy,
                 destinations: set.destinations,
@@ -192,6 +194,9 @@ public enum ConfigDiff {
         /// `--exclude` set of the next `backup`, *and* gaining a pattern is
         /// what makes the next run owe a purge.
         let purgeExcludes: [String]
+        /// Changes the argv of the next `backup` (`--exclude-cloud-files`),
+        /// the same way an exclude does.
+        let onlineOnlyFiles: OnlineOnlyFiles
         let retention: RetentionPolicy?
         let checkPolicy: CheckPolicy?
         /// Whole destinations, not just ids: a changed `repoURL` or a moved

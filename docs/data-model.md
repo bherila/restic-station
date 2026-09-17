@@ -15,11 +15,11 @@ Every Restic Station writer serializes `config.json` through `locks/config.lock`
 
 ## config.json — `AppConfig`
 
-The example below is a schema-v3 config with **no** `machines` keys — the shape most installs have, and the one the compatibility guarantee is about: absent `machines` means inherit and run everywhere. `resticPath` is shown for completeness; it is deprecated (see §machine.json) and migration clears it.
+The example below is a schema-v4 config with **no** `machines` keys — the shape most installs have, and the one the compatibility guarantee is about: absent `machines` means inherit and run everywhere. `resticPath` is shown for completeness; it is deprecated (see §machine.json) and migration clears it.
 
 ```json
 {
-  "version": 3,
+  "version": 4,
   "resticPath": "/opt/homebrew/bin/restic",
   "showMenuBarIcon": true,
   "sets": [
@@ -29,6 +29,7 @@ The example below is a schema-v3 config with **no** `machines` keys — the shap
       "sources": ["/Users/user/proj", "/Users/user/.gitconfig"],
       "excludes": ["node_modules", ".build", "*.tmp"],
       "purgeExcludes": ["DerivedData"],
+      "onlineOnlyFiles": "skip",
       "schedule": { "kind": "daily", "hour": 2, "minute": 30 },
       "retention": {
         "keepLast": null, "keepHourly": null, "keepDaily": 7,
@@ -80,6 +81,7 @@ public struct BackupSet: Codable, Equatable, Identifiable {
     public var sources: [String]           // absolute paths
     public var excludes: [String]          // restic --exclude patterns
     public var purgeExcludes: [String]     // history-affecting restic --exclude patterns (v3)
+    public var onlineOnlyFiles: OnlineOnlyFiles // v4; .skip | .download — cloud placeholders under cloud-synced sources
     public var schedule: Schedule
     public var retention: RetentionPolicy? // nil = never forget
     public var checkPolicy: CheckPolicy?   // nil = no scheduled checks
@@ -154,7 +156,7 @@ public struct CheckPolicy: Codable, Equatable {
 
 `Schedule` encodes with a `kind` discriminator (custom Codable). Unknown `kind` on decode → throw (config version gates compatibility).
 
-**Encoding conventions.** Optionals are encoded as explicit JSON `null` (never omitted) so the file stays diffable — with two deliberate exceptions, both about *absence being meaningful*: `onboardingCompleted`, and every `machines` key (on sets, on destinations, and on the fields inside an override). `purgeExcludes` is non-optional and always encoded, including as `[]`; missing or explicit `null` decodes as `[]` solely for pre-v3 compatibility. Absent `machines` means "runs everywhere", so a config with no per-machine overrides — which is every config written before v2, and most configs after it — is byte-identical apart from its `version` number instead of gaining a `"machines": null` on every set and destination. Inside an override, `"sources": null` would read like "override to no sources" when it means the opposite, so sparse overrides are written sparsely.
+**Encoding conventions.** Optionals are encoded as explicit JSON `null` (never omitted) so the file stays diffable — with two deliberate exceptions, both about *absence being meaningful*: `onboardingCompleted`, and every `machines` key (on sets, on destinations, and on the fields inside an override). `purgeExcludes` is non-optional and always encoded, including as `[]`; missing or explicit `null` decodes as `[]` solely for pre-v3 compatibility. `onlineOnlyFiles` (`"skip"` or `"download"`) is likewise always encoded; missing or `null` decodes as `"skip"`, and any other string refuses to load rather than guess. Absent `machines` means "runs everywhere", so a config with no per-machine overrides — which is every config written before v2, and most configs after it — is byte-identical apart from its `version` number instead of gaining a `"machines": null` on every set and destination. Inside an override, `"sources": null` would read like "override to no sources" when it means the opposite, so sparse overrides are written sparsely.
 
 ### Invariants (enforced by `AppConfig.validate() throws`, called on every save and after load)
 
@@ -688,7 +690,7 @@ The tick clears it: `recoverInterrupted()` returns the `setId` alongside the
 
 ## Versioning & migration
 
-`AppConfig.currentVersion` is **3**. Loader behavior: version > current → refuse with a clear error ("config written by a newer Restic Station"); version < current → run the in-code migration chain, then persist. Regenerable state/run caches carry no version field and tolerate decode failure. The exception is `state/schedule-state.json`, whose current envelope version is **1** and whose checksum protects destructive purge bookkeeping. Legacy unversioned schedule state is accepted only before `state/schedule-state.version-1` is durably published and is upgraded on mutation; malformed, downgraded, tampered, or newer-version state is preserved and makes schedule mutations, `status`, and the app fail unhealthy until explicit recovery. `machine.json` versions independently (`MachineConfig.currentVersion`, currently 1).
+`AppConfig.currentVersion` is **4**. Loader behavior: version > current → refuse with a clear error ("config written by a newer Restic Station"); version < current → run the in-code migration chain, then persist. Regenerable state/run caches carry no version field and tolerate decode failure. The exception is `state/schedule-state.json`, whose current envelope version is **1** and whose checksum protects destructive purge bookkeeping. Legacy unversioned schedule state is accepted only before `state/schedule-state.version-1` is durably published and is upgraded on mutation; malformed, downgraded, tampered, or newer-version state is preserved and makes schedule mutations, `status`, and the app fail unhealthy until explicit recovery. `machine.json` versions independently (`MachineConfig.currentVersion`, currently 1).
 
 ### v1 → v2
 
@@ -698,9 +700,15 @@ The schema change needs no data change: an absent `machines` key already means "
 
 `purgeExcludes` is a second exclusion list. An absent or explicit `null` key decodes as `[]`, preserving the pre-v3 behavior of not marking anything for purge. Every saved v3 config writes the key, including when empty.
 
+### v3 → v4
+
+`onlineOnlyFiles` says what `backup` does with online-only cloud files — iCloud Drive or File Provider placeholders whose contents are not on the Mac — under a source in `~/Library/Mobile Documents` or `~/Library/CloudStorage`: `"skip"` passes `--exclude-cloud-files` (restic 0.19 or newer) so they are left out of the snapshot, `"download"` lets restic read them, which makes the provider download each one. An absent or explicit `null` key decodes as `"skip"`.
+
+This is the first step that does **not** preserve the older behavior: a v3 build let restic download them. That is deliberate — an unattended backup that silently pulls a cloud library down to a small disk is the failure this key exists to prevent — and a set that needs every file in its snapshots opts back in with `"download"`, or keeps the folder available offline in the provider. It changes nothing for a set with no cloud-synced source. As with v3, a v3 build refuses a v4 config (§Loader behavior), so hosts sharing a config upgrade together.
+
 ### Persistence and backups
 
-`ConfigStore` performs a **single jump** from the file's source version to the current version; it does not write one intermediate config or backup per version crossed. A v1 file loaded by a v3 build therefore produces only `config.v1.backup.json`, because no v2 file ever existed on that host.
+`ConfigStore` performs a **single jump** from the file's source version to the current version; it does not write one intermediate config or backup per version crossed. A v1 file loaded by a v4 build therefore produces only `config.v1.backup.json`, because no v2 file ever existed on that host.
 
 For a file below the current version, `ConfigStore.load()`:
 
@@ -708,13 +716,13 @@ For a file below the current version, `ConfigStore.load()`:
 2. If `config.json` has a `resticPath` and `machine.json` has none, moves it into `machine.json` and clears the deprecated field. If `machine.json` already has one, that one wins and the deprecated field is still cleared. If the write fails, `resticPath` is left in `config.json`, where it still works as the documented fallback.
 3. Copies the untouched source bytes to **`config.v<source-version>.backup.json`**, beside `config.json`, with `O_EXCL` — **never** overwriting an existing backup, so a second migration cannot clobber the source's copy (or a copy the user put there by hand).
 4. Only if that backup exists, writes the current-version config atomically.
-5. Sets `version: 3` and returns.
+5. Sets `version: 4` and returns.
 
-Migration is **idempotent**: the second load sees `version: 3` and does nothing. Every persistence step is best-effort — a data directory that cannot be written must not stop the helper from running backups, and the migration is a pure function of the file, so an unwritten migration simply reruns next load. What is *not* best-effort is the ordering: **the source file is never overwritten unless a backup of it exists.**
+Migration is **idempotent**: the second load sees `version: 4` and does nothing. Every persistence step is best-effort — a data directory that cannot be written must not stop the helper from running backups, and the migration is a pure function of the file, so an unwritten migration simply reruns next load. What is *not* best-effort is the ordering: **the source file is never overwritten unless a backup of it exists.**
 
 A v1 config that fails `validate()` at its own version is a hard error: it produces no backup file and no rewritten `config.json`.
 
-The net effect on an existing single-machine install is that `"version": 1` becomes `"version": 3`, `"resticPath"` becomes `null`, `"purgeExcludes"` becomes `[]`, and everything the engine acts on — sources, destinations, schedules, retention, the effective restic binary — is unchanged.
+The net effect on an existing single-machine install is that `"version": 1` becomes `"version": 4`, `"resticPath"` becomes `null`, `"purgeExcludes"` becomes `[]`, `"onlineOnlyFiles"` becomes `"skip"`, and everything the engine acts on — sources, destinations, schedules, retention, the effective restic binary — is unchanged, with one exception stated in §v3 → v4: online-only files under a cloud-synced source are skipped rather than downloaded.
 
 ## Headless CLI `--json` shapes (T27)
 
@@ -739,7 +747,7 @@ Both commands build the identical report (`EffectiveConfigReport`, `Helper/Sourc
 ```json
 {
   "machineId": "studio-mac",
-  "version": 3,
+  "version": 4,
   "resticPath": null,
   "sets": [
     {
@@ -749,6 +757,7 @@ Both commands build the identical report (`EffectiveConfigReport`, `Helper/Sourc
       "sources": ["/Users/user/proj"],
       "excludes": ["node_modules"],
       "purgeExcludes": [],
+      "onlineOnlyFiles": "skip",
       "schedule": { "kind": "daily", "hour": 2, "minute": 30 },
       "retention": null,
       "checkPolicy": null,

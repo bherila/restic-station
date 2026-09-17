@@ -353,11 +353,18 @@ public final class BackupEngine: Sendable {
         var infrastructureFailures: [String] = []
 
         // Online-only files under a cloud-synced source are skipped rather
-        // than downloaded, but only by a restic that accepts the flag on
-        // this platform; an older one would fail the whole backup on it.
+        // than downloaded when the set asks for it, but only by a restic that
+        // accepts the flag on this platform; an older one would fail the
+        // whole backup on it.
         let excludeCloudFiles: Bool
         let cloudSourceNote: String?
-        if CloudStorageSafety.containsCloudBackedSource(set.sources) {
+        if !CloudStorageSafety.containsCloudBackedSource(set.sources) {
+            excludeCloudFiles = false
+            cloudSourceNote = nil
+        } else if set.onlineOnlyFiles == .download {
+            excludeCloudFiles = false
+            cloudSourceNote = "cloud-synced source: online-only files are downloaded (set policy)"
+        } else {
             let version = await restic.launchedResticVersion()
             excludeCloudFiles = version.map {
                 VersionInfo.compareVersions($0, ResticRunner.excludeCloudFilesMinimumVersion) >= 0
@@ -371,9 +378,6 @@ public final class BackupEngine: Sendable {
                 logWarning("BackupEngine: set \"\(set.name)\": \(note)")
                 cloudSourceNote = note
             }
-        } else {
-            excludeCloudFiles = false
-            cloudSourceNote = nil
         }
 
         // ── Steps 4 + 5: probe primary, then back it up ─────────────────

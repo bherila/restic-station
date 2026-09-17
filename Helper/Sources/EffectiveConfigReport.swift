@@ -39,6 +39,7 @@ struct EffectiveConfigReport: Encodable {
         let sources: [String]
         let excludes: [String]
         let purgeExcludes: [String]
+        let onlineOnlyFiles: OnlineOnlyFiles
         let schedule: Schedule
         let retention: RetentionPolicy?
         let checkPolicy: CheckPolicy?
@@ -46,7 +47,7 @@ struct EffectiveConfigReport: Encodable {
         let destinations: [DestinationEntry]
 
         private enum CodingKeys: String, CodingKey {
-            case id, name, enabledHere, sources, excludes, purgeExcludes, schedule, retention, checkPolicy
+            case id, name, enabledHere, sources, excludes, purgeExcludes, onlineOnlyFiles, schedule, retention, checkPolicy
             case stalenessWarningDays, destinations
         }
 
@@ -63,6 +64,7 @@ struct EffectiveConfigReport: Encodable {
             try container.encode(sources, forKey: .sources)
             try container.encode(excludes, forKey: .excludes)
             try container.encode(purgeExcludes, forKey: .purgeExcludes)
+            try container.encode(onlineOnlyFiles, forKey: .onlineOnlyFiles)
             try container.encode(schedule, forKey: .schedule)
             try container.encode(retention, forKey: .retention)
             try container.encode(checkPolicy, forKey: .checkPolicy)
@@ -143,6 +145,7 @@ struct EffectiveConfigReport: Encodable {
                 sources: set.sources,
                 excludes: set.excludes,
                 purgeExcludes: set.purgeExcludes,
+                onlineOnlyFiles: set.onlineOnlyFiles,
                 schedule: set.schedule,
                 retention: set.retention,
                 checkPolicy: set.checkPolicy,
@@ -203,6 +206,11 @@ struct EffectiveConfigReport: Encodable {
             lines.append("    sources: \(set.sources.isEmpty ? "(none)" : set.sources.joined(separator: ", "))")
             lines.append("    excludes: \(set.excludes.isEmpty ? "(none)" : set.excludes.joined(separator: ", "))")
             lines.append("    purge excludes: \(set.purgeExcludes.isEmpty ? "(none)" : set.purgeExcludes.joined(separator: ", "))")
+            // Only where it can matter, so a set with no cloud-synced source
+            // (every Linux host) reads exactly as it did before v4.
+            if CloudStorageSafety.containsCloudBackedSource(set.sources) {
+                lines.append("    online-only files: \(set.onlineOnlyFiles.rawValue)")
+            }
             lines.append("    schedule: \(Self.describe(set.schedule))")
             for destination in set.destinations {
                 let role = destination.isPrimary ? "primary" : "secondary"

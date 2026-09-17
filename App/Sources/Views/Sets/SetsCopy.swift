@@ -43,10 +43,31 @@ enum SetsCopy {
         + "“Always Keep on This Device” or “Keep Downloaded”). Sync folders replicate deletions — "
         + "treat this as a convenience copy, not your only backup."
 
-    static let cloudSourceWarning =
-        "Cloud-synced source — online-only files are skipped instead of downloaded (restic 0.19 "
-        + "or newer), so snapshots contain only files stored on this Mac. Keep the folder available "
-        + "offline in the cloud provider if every file must be backed up."
+    static let cloudSourceNote =
+        "Cloud-synced folder — see Online-only Files below."
+
+    /// Header of the set editor's online-only files section, shown only
+    /// while a source is cloud-synced.
+    static let onlineOnlyFilesHeader = "Online-only Files"
+
+    static func onlineOnlyFilesLabel(_ policy: OnlineOnlyFiles) -> String {
+        switch policy {
+        case .skip: return "Skip"
+        case .download: return "Download"
+        }
+    }
+
+    static func onlineOnlyFilesFooter(_ policy: OnlineOnlyFiles) -> String {
+        switch policy {
+        case .skip:
+            return "Files the cloud provider keeps only online are left out of snapshots instead of "
+                + "being downloaded (restic 0.19 or newer). Keep the folder available offline in the "
+                + "provider if every file must be backed up."
+        case .download:
+            return "restic reads every file, so the cloud provider downloads each online-only file "
+                + "first. Snapshots are complete, at the cost of the download and the disk space."
+        }
+    }
 
     /// Local destination under `/Volumes`.
     static let removableVolumeNote = "Removable volume — will be skipped when not mounted"
