@@ -62,6 +62,44 @@ struct ProbeRepo: AsyncParsableCommand, JSONRenderable {
         }
     }
 
+    /// The envelope for a probe that needs a human.
+    ///
+    /// `Reachability`'s reason is deliberately sanitized — it is persisted to
+    /// repo-status and rendered by the app — so it names the condition but
+    /// not the remedy. `docs/cli-json.md` promises the remedy in `message`:
+    /// the `secret set` for a missing password, and the store's own refusal
+    /// (the exact `chmod`, `chown` or move) for an unusable store. That
+    /// refusal is re-read here. It is permanent by definition, so the second
+    /// read reports it again; if it somehow does not, the sanitized reason
+    /// is still a true description of what the probe saw.
+    static func attentionFailure(
+        _ attention: DestinationAttention,
+        reason: String,
+        setId: UUID,
+        destination: Destination,
+        store: any SecretStore
+    ) async -> CLIFailure {
+        let details = CLIErrorDetails(setId: setId, destinationId: destination.id)
+        switch attention {
+        case .secretNotConfigured:
+            return CLIFailure(
+                code: attention.code,
+                message: ResticRunnerError.secretsNotConfigured(destinationId: destination.id).userFacingMessage,
+                details: details
+            )
+        case .secretStoreUnusable:
+            do {
+                _ = try await store.password(destId: destination.id)
+                _ = try await store.secretEnv(destId: destination.id)
+            } catch let error as SecretStoreError {
+                if case .storeUnusable = error {
+                    return CLIFailure(code: attention.code, message: CLIFailure.classify(error).message, details: details)
+                }
+            } catch {}
+            return CLIFailure(code: attention.code, message: CLIFailure.bounded(reason), details: details)
+        }
+    }
+
     func run() async throws {
         let context = try await HelperContext.make()
         // Repository utilities address every repository in the shared config,
@@ -115,10 +153,12 @@ struct ProbeRepo: AsyncParsableCommand, JSONRenderable {
             // expected, try later" answer — which is exactly wrong for a
             // refusal that names the `chmod` or the `secret set` to run. It
             // gets the error envelope, non-retryable, at exit 1 (#96).
-            throw CLIFailure(
-                code: attention.code,
-                message: CLIFailure.bounded(text),
-                details: CLIErrorDetails(setId: set, destinationId: destination.id)
+            throw await Self.attentionFailure(
+                attention,
+                reason: text,
+                setId: set,
+                destination: destination,
+                store: context.secrets
             )
         }
 

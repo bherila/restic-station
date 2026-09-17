@@ -746,7 +746,26 @@ expect_rc 1
 assert_error_envelope "secret_store_unusable"
 jq -e '.error.message | test("chmod 600")' "$OUT_FILE" >/dev/null \
     || fail "the refusal did not carry the exact chmod to run"
+
 chmod 0600 "$FIXTURE/secrets.json"
+
+# probe-repo reaches the same refusal through Reachability, which keeps a
+# sanitized reason for repo-status; the envelope must still carry the
+# store's own remedy. Only a non-local destination reads a secret to probe
+# (local paths are an existence check), so this runs on a copy of the
+# fixture whose primary is a REST URL — the store refuses before restic
+# could be launched against it.
+REMOTE_FIXTURE="$WORK/remote-fixture"
+cp -Rp "$FIXTURE" "$REMOTE_FIXTURE"
+jq '.sets[0].destinations[0].repoURL = "rest:http://127.0.0.1:9/repo"' \
+    "$FIXTURE/config.json" >"$REMOTE_FIXTURE/config.json"
+chmod 0644 "$REMOTE_FIXTURE/secrets.json"
+RESTIC_STATION_DATA_DIR="$REMOTE_FIXTURE" run_helper_split probe-repo --set "$SET_ID" --dest "$PRIMARY_ID" --json
+expect_rc 1
+assert_error_envelope "secret_store_unusable"
+jq -e '.error.message | test("chmod 600")' "$OUT_FILE" >/dev/null \
+    || fail "probe-repo's refusal did not carry the exact chmod to run: $(jq -c '.error' "$OUT_FILE")"
+
 mark_code "secret_store_unusable"
 ok "secret_store_unusable: a group-accessible secrets.json is refused, non-retryable, exit 1"
 
