@@ -247,8 +247,8 @@ public enum ResticRunnerError: Error, Equatable, Sendable, CustomStringConvertib
             return "The secret store cannot be read as configured, and retrying will not change that. "
                 + "Run `restic-station-helper secret list` to see the exact refusal and how to fix it."
         case .cloudRepositoryNotHydrated(_, let relativePath):
-            return "The cloud-synced repository is not fully downloaded (\(relativePath)). "
-                + "Choose Always Keep Downloaded in the cloud provider, then try again."
+            return "The cloud-synced repository is not fully downloaded (\(relativePath) is online-only). "
+                + "Keep the repository folder available offline in the cloud provider, then try again."
         case .launchFailed:
             return "The restic program could not be started. "
                 + "Check the restic path in Settings."

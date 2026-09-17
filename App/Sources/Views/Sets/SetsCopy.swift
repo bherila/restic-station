@@ -37,15 +37,16 @@ enum SetsCopy {
 
     /// Local destination under iCloud Drive or `~/Library/CloudStorage`.
     static let cloudRepositoryWarning =
-        "Cloud storage may evict repository files. Restic Station refuses to use a repository "
-        + "while any file is dataless, avoiding an unexpected large download. Choose Always Keep "
-        + "Downloaded in the cloud provider. Sync folders replicate deletions — treat this as a "
-        + "convenience copy, not your only backup."
+        "Cloud storage may evict repository files to online-only placeholders. Restic Station "
+        + "will not use the repository while any file is online-only, rather than download it "
+        + "unexpectedly — keep this folder available offline in the cloud provider (for example "
+        + "“Always Keep on This Device” or “Keep Downloaded”). Sync folders replicate deletions — "
+        + "treat this as a convenience copy, not your only backup."
 
     static let cloudSourceWarning =
-        "Cloud-backed source — online-only files are skipped instead of downloaded. The snapshot "
-        + "contains only files resident on this Mac; keep the cloud service's own recovery/version "
-        + "history as a separate protection layer."
+        "Cloud-synced source — online-only files are skipped instead of downloaded (restic 0.19 "
+        + "or newer), so snapshots contain only files stored on this Mac. Keep the folder available "
+        + "offline in the cloud provider if every file must be backed up."
 
     /// Local destination under `/Volumes`.
     static let removableVolumeNote = "Removable volume — will be skipped when not mounted"

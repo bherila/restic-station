@@ -93,7 +93,7 @@ Output (`init-secondary.json`): same `initialized` message. Without `--copy-chun
 ```
 restic -r <primaryRepo> backup --json [--exclude-cloud-files] [--exclude <pat>]... <source>...
 ```
-`--exclude-cloud-files` is included automatically when any effective source is under macOS's iCloud Drive (`~/Library/Mobile Documents`) or File Provider (`~/Library/CloudStorage`) roots. It prevents restic from opening online-only placeholders and triggering large implicit downloads. The resulting snapshot intentionally contains only files resident on the Mac; the set editor warns about that completeness boundary.
+`--exclude-cloud-files` is included automatically when any effective source is under macOS's iCloud Drive (`~/Library/Mobile Documents`) or File Provider (`~/Library/CloudStorage`) roots **and** the launched restic reports version 0.19.0 or newer (`restic version --json`, run immediately before the backup). It prevents restic from opening online-only placeholders and triggering large implicit downloads. The resulting snapshot intentionally contains only files resident on the Mac; the set editor warns about that completeness boundary. restic 0.17 does not know the flag and 0.18 accepts it only on Windows, so with an older or unreadable version the backup runs without it, as before, and the run log records a warning that online-only files will be downloaded. On Linux 0.19+ accepts the flag and skips nothing.
 
 Sources passed as **absolute paths**. NDJSON stream on stdout (`backup.ndjson`, `backup2.ndjson`):
 ```json
