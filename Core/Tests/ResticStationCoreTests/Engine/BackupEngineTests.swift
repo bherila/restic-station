@@ -609,6 +609,20 @@ struct BackupEngineTests {
         #expect(!env.resticArgvs.contains { $0.contains("--exclude-cloud-files") })
     }
 
+    @Test("a home-directory source reaches cloud storage, so it skips online-only files too")
+    func homeDirectorySourceUsesExcludeCloudFiles() async throws {
+        let home = NSHomeDirectory()
+        let env = Self.makeEnv(script: [], sources: [home], retention: nil, reachableSecondaries: [])
+        defer { env.cleanUp() }
+        let backup = ["-r", env.primary.repoURL, "backup", "--json", "--exclude-cloud-files", home]
+        env.fake.script = Self.versionCall("0.19.1")
+            + Self.resticCall(backup, dest: Self.primaryId, stdoutLines: Self.backupStream())
+
+        _ = await env.engine.runSet(env.set, trigger: .manual)
+
+        #expect(env.resticArgvs.last == [Self.resticPath] + backup)
+    }
+
     @Test("a set that downloads online-only files never passes the flag or asks for a version")
     func cloudSourceWithDownloadPolicy() async throws {
         let env = Self.makeEnv(

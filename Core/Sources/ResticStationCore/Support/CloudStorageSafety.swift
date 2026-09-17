@@ -26,29 +26,50 @@ public enum CloudStorageSafety {
         _ path: String,
         homeDirectory: String = NSHomeDirectory()
     ) -> Bool {
-        let standardized = (path as NSString).standardizingPath
-        guard !standardized.isEmpty else { return false }
-
-        let candidates = Set([standardized, resolvingSymlinks(standardized)].map(comparable))
-        let homes = Set([
-            (homeDirectory as NSString).standardizingPath,
-            resolvingSymlinks((homeDirectory as NSString).standardizingPath),
-        ])
-        let roots = homes.flatMap { home in
-            ["Library/Mobile Documents", "Library/CloudStorage"].map {
-                comparable((home as NSString).appendingPathComponent($0))
-            }
-        }
-        return candidates.contains { candidate in
+        let roots = cloudRoots(homeDirectory: homeDirectory)
+        return comparableForms(of: path).contains { candidate in
             roots.contains { candidate == $0 || candidate.hasPrefix($0 + "/") }
         }
     }
 
+    /// Whether backing up `source` reaches cloud storage: it lies inside a
+    /// cloud root, or a cloud root lies inside it — a backup of the home
+    /// directory or of `~/Library` walks straight into both.
+    public static func reachesCloudStorage(
+        _ source: String,
+        homeDirectory: String = NSHomeDirectory()
+    ) -> Bool {
+        let roots = cloudRoots(homeDirectory: homeDirectory)
+        return comparableForms(of: source).contains { candidate in
+            let ancestor = candidate == "/" ? "/" : candidate + "/"
+            return roots.contains { candidate == $0 || candidate.hasPrefix($0 + "/") || $0.hasPrefix(ancestor) }
+        }
+    }
+
+    /// Whether any source reaches cloud storage (``reachesCloudStorage(_:homeDirectory:)``)
+    /// — the condition for the set's online-only files policy to apply.
     public static func containsCloudBackedSource(
         _ sources: [String],
         homeDirectory: String = NSHomeDirectory()
     ) -> Bool {
-        sources.contains { isCloudSyncedPath($0, homeDirectory: homeDirectory) }
+        sources.contains { reachesCloudStorage($0, homeDirectory: homeDirectory) }
+    }
+
+    /// The path as written and with symlinks resolved, each in comparable
+    /// form; empty for an empty path.
+    private static func comparableForms(of path: String) -> Set<String> {
+        let standardized = (path as NSString).standardizingPath
+        guard !standardized.isEmpty else { return [] }
+        return Set([standardized, resolvingSymlinks(standardized)].map(comparable))
+    }
+
+    private static func cloudRoots(homeDirectory: String) -> [String] {
+        let home = (homeDirectory as NSString).standardizingPath
+        return Set([home, resolvingSymlinks(home)]).flatMap { home in
+            ["Library/Mobile Documents", "Library/CloudStorage"].map {
+                comparable((home as NSString).appendingPathComponent($0))
+            }
+        }
     }
 
     /// Returns the first dataless entry relative to `repositoryPath` (`.` for

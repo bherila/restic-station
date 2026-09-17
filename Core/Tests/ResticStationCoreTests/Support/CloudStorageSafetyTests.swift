@@ -43,6 +43,20 @@ struct CloudStorageSafetyTests {
         ], homeDirectory: home))
     }
 
+    @Test("a source that contains a cloud root reaches cloud storage; a sibling does not")
+    func ancestorSources() {
+        for source in ["/Users/test", "/Users/test/Library", "/Users", "/"] {
+            #expect(CloudStorageSafety.reachesCloudStorage(source, homeDirectory: home), "\(source)")
+            #expect(CloudStorageSafety.containsCloudBackedSource([source], homeDirectory: home), "\(source)")
+            // Containing a cloud root is not *being* in one: a repository
+            // there is not cloud-synced.
+            #expect(!CloudStorageSafety.isCloudSyncedPath(source, homeDirectory: home), "\(source)")
+        }
+        for source in ["/Users/test/Documents", "/Users/test/Library/Caches", "/Users/testing", "/Users/test/Lib"] {
+            #expect(!CloudStorageSafety.reachesCloudStorage(source, homeDirectory: home), "\(source)")
+        }
+    }
+
     #if canImport(Darwin)
     @Test("on macOS a differently-cased path to a cloud root still counts")
     func caseInsensitiveOnMac() {
