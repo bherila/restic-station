@@ -69,7 +69,7 @@ The example below is a schema-v4 config with **no** `machines` keys — the shap
 
 ```swift
 public struct AppConfig: Codable, Equatable {
-    public var version: Int            // = 3; bump on breaking schema change
+    public var version: Int            // = 4; bump on breaking schema change
     public var resticPath: String?     // DEPRECATED — see machine.json; nil = not set
     public var showMenuBarIcon: Bool   // default true
     public var sets: [BackupSet]
