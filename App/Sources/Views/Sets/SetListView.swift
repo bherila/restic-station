@@ -15,6 +15,7 @@ struct SetListView: View {
     @Binding var selection: UUID?
     let onCreate: () -> Void
     let onEdit: (UUID) -> Void
+    let onOpenRun: (String) -> Void
 
     /// The set the delete confirmation is about (`nil` = not shown).
     @State private var pendingDeletion: BackupSet?
@@ -122,7 +123,7 @@ struct SetListView: View {
 
             TableColumn("Last backup") { set in
                 if let health = model.setHealth(for: set.id) {
-                    SetHealthBadge(health: health)
+                    statusCell(health)
                 } else {
                     Text("—").foregroundStyle(.secondary)
                 }
@@ -159,6 +160,23 @@ struct SetListView: View {
     }
 
     @ViewBuilder
+    private func statusCell(_ health: SetHealth) -> some View {
+        if !health.isRunning, let run = health.lastBackup {
+            SetHealthBadge(health: health)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+                .highPriorityGesture(TapGesture(count: 2).onEnded {
+                    onOpenRun(run.runId)
+                })
+                .accessibilityAction(named: Text("Open Run Details")) {
+                    onOpenRun(run.runId)
+                }
+        } else {
+            SetHealthBadge(health: health)
+        }
+    }
+
+    @ViewBuilder
     private func primaryDestinationCell(_ set: BackupSet) -> some View {
         if let primary = set.destinations.first(where: \.isPrimary) {
             HStack(spacing: 6) {
@@ -180,6 +198,9 @@ struct SetListView: View {
         if let id = ids.first, let set = model.config.sets.first(where: { $0.id == id }) {
             let backupUnavailableReason = model.backUpNowUnavailableReason(setId: id)
             Button("Edit…") { onEdit(id) }
+            if let health = model.setHealth(for: id), !health.isRunning, let run = health.lastBackup {
+                Button("Open Run Details") { onOpenRun(run.runId) }
+            }
             Button("Back Up Now") { model.backUpNow(setId: id) }
                 .disabled(backupUnavailableReason != nil)
                 .help(backupUnavailableReason ?? "Back up \(set.name) now.")

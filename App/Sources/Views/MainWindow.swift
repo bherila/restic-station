@@ -16,6 +16,8 @@ struct MainWindow: View {
     /// the detail pane falls back to Backup Sets if it is ever cleared.
     @State private var selection: SidebarSection? = .backupSets
 
+    @State private var runsPath: [String] = []
+
     var body: some View {
         NavigationSplitView {
             List(selection: $selection) {
@@ -57,9 +59,12 @@ struct MainWindow: View {
     private var detail: some View {
         switch selection ?? .backupSets {
         case .backupSets:
-            BackupSetsRootView()
+            BackupSetsRootView { runId in
+                runsPath = [runId]
+                selection = .runs
+            }
         case .runs:
-            RunsRootView()
+            RunsRootView(path: $runsPath)
         case .restore:
             RestoreRootView()
         case .maintenance:

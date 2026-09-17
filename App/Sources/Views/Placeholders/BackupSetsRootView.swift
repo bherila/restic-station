@@ -13,6 +13,8 @@ import SwiftUI
 struct BackupSetsRootView: View {
     @EnvironmentObject private var model: AppModel
 
+    let onOpenRun: (String) -> Void
+
     @State private var selection: UUID?
     @State private var editorTarget: SetEditorTarget?
 
@@ -30,7 +32,8 @@ struct BackupSetsRootView: View {
                         isNew: false,
                         configFingerprint: model.configFingerprint
                     )
-                }
+                },
+                onOpenRun: onOpenRun
             )
             .navigationDestination(item: $editorTarget) { target in
                 editor(for: target)

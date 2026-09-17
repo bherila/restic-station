@@ -10,7 +10,7 @@ import SwiftUI
 struct RunsRootView: View {
     /// Pushed `runId`s — a plain `[String]`, because a run is identified by
     /// nothing else.
-    @State private var path: [String] = []
+    @Binding var path: [String]
 
     var body: some View {
         NavigationStack(path: $path) {

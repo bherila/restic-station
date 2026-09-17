@@ -136,7 +136,7 @@ struct SetHealthBadge: View {
             Label(title, systemImage: symbol)
                 .font(.caption)
                 .foregroundStyle(tint)
-                .help(helpText)
+                .help(helpText + (health.lastBackup != nil ? " Double-click to open run details." : ""))
         }
     }
 
