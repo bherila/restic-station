@@ -1283,10 +1283,10 @@ public final class BackupEngine: Sendable {
         case .error(let exitClass):
             return .failed(.restic(exitClass))
         case .needsAttention(let attention, let reason):
-            // Reachable only through a race — a concurrent `secret rm` or
-            // `chmod` between the pre-flight above and this probe — which
-            // is exactly why the probe's own `attention` is carried
-            // through instead of assuming one.
+            // A cloud-synced repository with online-only files, or — only
+            // through a race with a concurrent `secret rm` or `chmod` after
+            // the pre-flight above — a secret refusal. The probe's own
+            // `attention` is carried through instead of assuming one.
             return .skipped(.secretRefused(attention, reason))
         }
 
@@ -1447,6 +1447,12 @@ public final class BackupEngine: Sendable {
                 return PurgePlanResult(
                     plan: emptyPlan, status: .secretStoreUnusable, message: refusal.error.description
                 )
+            case .cloudRepositoryNotHydrated:
+                // Not produced from a `SecretStoreError`; listed so this
+                // switch stays exhaustive over every attention.
+                return PurgePlanResult(
+                    plan: emptyPlan, status: .cloudRepositoryNotHydrated, message: refusal.error.description
+                )
             case nil:
                 return PurgePlanResult(
                     plan: emptyPlan, status: .failed, message: "secret store unavailable"
@@ -1482,6 +1488,8 @@ public final class BackupEngine: Sendable {
                 return PurgePlanResult(plan: emptyPlan, status: .secretNotConfigured, message: reason)
             case .secretStoreUnusable:
                 return PurgePlanResult(plan: emptyPlan, status: .secretStoreUnusable, message: reason)
+            case .cloudRepositoryNotHydrated:
+                return PurgePlanResult(plan: emptyPlan, status: .cloudRepositoryNotHydrated, message: reason)
             }
         }
 
@@ -1624,7 +1632,7 @@ public final class BackupEngine: Sendable {
             case .empty, .ready:
                 continue
             case .busy, .offline, .infrastructureFailure, .failed,
-                 .secretNotConfigured, .secretStoreUnusable:
+                 .secretNotConfigured, .secretStoreUnusable, .cloudRepositoryNotHydrated:
                 return PurgePreviewSession(previews: previews, token: nil)
             }
         }

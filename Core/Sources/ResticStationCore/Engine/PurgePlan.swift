@@ -117,12 +117,15 @@ public struct PurgePlanResult: Equatable, Sendable {
         /// and from ``offline`` because that publishes a retryable code —
         /// neither is true of a refusal that names the repair (#96).
         ///
-        /// Two cases rather than one carrying a
-        /// ``DestinationAttention``, because `Status` is a payload-free
-        /// `String` enum; the pair keeps every consumer's switch exhaustive
-        /// without a fallback that could report one as the other.
+        /// One case per ``DestinationAttention`` rather than one carrying
+        /// it, because `Status` is a payload-free `String` enum; separate
+        /// cases keep every consumer's switch exhaustive without a fallback
+        /// that could report one as another.
         case secretNotConfigured
         case secretStoreUnusable
+        /// The destination is a cloud-synced local repository with
+        /// online-only files; reading it would download them.
+        case cloudRepositoryNotHydrated
     }
 
     public let plan: PurgePlan

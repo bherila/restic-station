@@ -67,13 +67,14 @@ extension SecretStoreError: LocalizedError {
 
 // MARK: - DestinationAttention
 
-/// Why a destination cannot proceed until a human acts, as a closed
-/// two-case enum rather than a `CLIErrorCode` or prose.
+/// Why a destination cannot proceed until a human acts, as a closed enum
+/// rather than a `CLIErrorCode` or prose.
 ///
-/// These are exactly the ``SecretStoreError`` cases for which repeating the
-/// identical request cannot produce a different answer. Keeping them in
+/// Two cases are exactly the ``SecretStoreError`` cases for which repeating
+/// the identical request cannot produce a different answer; the third is a
+/// cloud-synced local repository with online-only files. Keeping them in
 /// their own type is what lets every downstream switch be exhaustive over
-/// *two* cases instead of over the whole published code table, so a caller
+/// these few cases instead of over the whole published code table, so a caller
 /// cannot quietly pick one of them as a fallback for the other — which is
 /// how a "no password stored" refusal came to be reported as an unusable
 /// store during a pre-flight race (#96 review).
@@ -83,6 +84,10 @@ public enum DestinationAttention: String, Sendable, Equatable, CaseIterable {
     /// The store refused to be read at all. Remedy: whatever its own
     /// refusal names — a `chmod`, a `chown`, or moving the data directory.
     case secretStoreUnusable = "secret_store_unusable"
+    /// A local repository inside iCloud Drive or a File Provider folder has
+    /// online-only (dataless) files, and reading them would download them.
+    /// Remedy: keep the repository folder available offline in the provider.
+    case cloudRepositoryNotHydrated = "cloud_repository_not_hydrated"
 
     /// `nil` for the transient cases, which are not attention at all: they
     /// clear without anyone doing anything.
@@ -97,12 +102,13 @@ public enum DestinationAttention: String, Sendable, Equatable, CaseIterable {
         }
     }
 
-    /// The published envelope code. Both are non-retryable, and the
+    /// The published envelope code. All are non-retryable, and the
     /// `CLIErrorCode` table test pins that.
     public var code: CLIErrorCode {
         switch self {
         case .secretNotConfigured: return .secretNotConfigured
         case .secretStoreUnusable: return .secretStoreUnusable
+        case .cloudRepositoryNotHydrated: return .cloudRepositoryNotHydrated
         }
     }
 }

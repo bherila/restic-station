@@ -17,7 +17,8 @@ public enum RepoProbeResult: Equatable, Sendable {
     case error(ResticExitClass)
     /// The pre-flight refused before restic could run, and repeating the
     /// identical probe cannot change the answer: nothing is stored for this
-    /// destination, or the secret store will not be read at all.
+    /// destination, the secret store will not be read at all, or a
+    /// cloud-synced local repository has online-only files.
     ///
     /// Distinct from ``offline`` because a caller is told to *retry* an
     /// offline probe — `probe-repo` publishes it as `ok: true`, exit 3, on
@@ -33,7 +34,8 @@ public enum RepoProbeResult: Equatable, Sendable {
 /// §state/repo-status and `docs/architecture.md` §Process model.
 ///
 /// Local-path destinations (including `/Volumes/...` and iCloud paths) are
-/// probed with a plain `FileManager` existence check — no restic invocation.
+/// probed with a plain `FileManager` existence check — no restic invocation —
+/// plus, under a cloud root, a metadata-only scan for online-only entries.
 /// Every other destination kind is probed with the cheap `restic cat config`
 /// read-only command (`docs/restic-cli.md` §version / cat config), bounded
 /// by a 10 s timeout.
@@ -42,9 +44,19 @@ public struct Reachability: Sendable {
     static let probeTimeout: TimeInterval = 10
 
     private let restic: ResticRunner
+    private let datalessRepositoryEntry: @Sendable (String) -> String?
 
-    public init(restic: ResticRunner) {
+    /// - Parameter datalessRepositoryEntry: the first online-only entry of a
+    ///   local repository path, or nil. Injected so the probe's refusal can
+    ///   be tested on hosts without File Provider placeholders.
+    public init(
+        restic: ResticRunner,
+        datalessRepositoryEntry: @escaping @Sendable (String) -> String? = { path in
+            CloudStorageSafety.firstDatalessEntry(inRepository: path)
+        }
+    ) {
         self.restic = restic
+        self.datalessRepositoryEntry = datalessRepositoryEntry
     }
 
     public func probe(
@@ -53,7 +65,7 @@ public struct Reachability: Sendable {
         expectedExecutableIdentity: String? = nil
     ) async -> RepoProbeResult {
         if dest.kind == .localPath {
-            return Self.probeLocal(dest)
+            return Self.probeLocal(dest, datalessEntry: datalessRepositoryEntry)
         }
         return await probeRemote(
             dest,
@@ -64,9 +76,22 @@ public struct Reachability: Sendable {
 
     // MARK: - Local
 
-    static func probeLocal(_ dest: Destination) -> RepoProbeResult {
+    static func probeLocal(
+        _ dest: Destination,
+        datalessEntry: (String) -> String? = { _ in nil }
+    ) -> RepoProbeResult {
         let path = dest.repoURL
         if FileManager.default.fileExists(atPath: path) {
+            // A metadata-only walk, and only for a path under a cloud root.
+            // Reported here, before anything runs restic, so every command
+            // that probes first publishes the refusal as itself rather than
+            // as a restic failure — and the badge reads Error, not Offline.
+            if let entry = datalessEntry(path) {
+                return .needsAttention(
+                    .cloudRepositoryNotHydrated,
+                    reason: "repository is not fully downloaded (\(entry) is online-only)"
+                )
+            }
             return .reachable
         }
         if let root = volumeRoot(forPath: path), !FileManager.default.fileExists(atPath: root) {

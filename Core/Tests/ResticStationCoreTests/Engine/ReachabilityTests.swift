@@ -48,6 +48,35 @@ struct ReachabilityTests {
         #expect(result == .reachable)
     }
 
+    @Test("a local repository with an online-only entry needs attention, and nothing runs restic")
+    func localCloudRepositoryWithDatalessEntry() async throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-reachability-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let dest = Destination(id: Self.destId, label: "Cloud", repoURL: dir.path, isPrimary: true)
+        let fake = FakeProcessRunner()
+        let runner = ResticRunner(
+            resticPath: "/usr/local/bin/restic", paths: Self.paths(),
+            secrets: FakeSecretStore(defaultPassword: Self.password), runner: fake
+        )
+        let path = dir.path
+        let reachability = Reachability(restic: runner, datalessRepositoryEntry: { $0 == path ? "data/ab/abcdef" : nil })
+
+        let result = await reachability.probe(dest)
+
+        #expect(result == .needsAttention(
+            .cloudRepositoryNotHydrated,
+            reason: "repository is not fully downloaded (data/ab/abcdef is online-only)"
+        ))
+        #expect(fake.invocations.isEmpty)
+        // The badge heuristic treats "could not" as environmental (Offline);
+        // this reason must read as needing attention.
+        if case .needsAttention(_, let reason) = result {
+            #expect(!reason.lowercased().contains("could not"))
+        }
+    }
+
     @Test("local path that does not exist (not under /Volumes) is offline with a generic reason")
     func localPathMissingGenericReason() async throws {
         let missing = FileManager.default.temporaryDirectory
