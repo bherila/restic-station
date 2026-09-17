@@ -149,6 +149,25 @@ struct CloudStorageSafetyTests {
         #expect(!checked.contains { $0.hasPrefix(dataDir + "/") })
     }
 
+    @Test("a repository reached through a symlink is checked and walked at its target")
+    func symlinkedRepository() throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanUp() }
+        let repo = try fixture.repository()
+        let link = fixture.path("RepoLink")
+        try FileManager.default.createSymbolicLink(atPath: link, withDestinationPath: repo)
+        let target = URL(fileURLWithPath: repo).resolvingSymlinksInPath().path
+
+        var checked: [String] = []
+        let found = CloudStorageSafety.firstDatalessEntry(
+            inRepository: link, homeDirectory: fixture.root,
+            isDataless: { checked.append($0); return $0 == target }
+        )
+
+        #expect(found == ".")
+        #expect(checked == [target])
+    }
+
     @Test("a repository outside cloud storage is never walked")
     func nonCloudRepositoryIsNotWalked() throws {
         let fixture = try Fixture()

@@ -101,6 +101,11 @@ public enum CloudStorageSafety {
         isDataless: (String) -> Bool
     ) -> String? {
         guard isCloudSyncedPath(repositoryPath, homeDirectory: homeDirectory) else { return nil }
+        // Walk the directory restic will actually open. For a repository
+        // path that is (or passes through) a symlink into cloud storage,
+        // `lstat` of the configured path describes the link, not the
+        // possibly-dataless directory behind it.
+        let repositoryPath = resolvingSymlinks((repositoryPath as NSString).standardizingPath)
 
         // The repository directory itself can be a File Provider placeholder.
         // Check it before enumerating children: listing a dataless directory
