@@ -178,6 +178,10 @@ public enum ResticRunnerError: Error, Equatable, Sendable, CustomStringConvertib
     /// an owner, and this value ends up in run logs. `secret list` prints
     /// the exact refusal on demand.
     case secretsStoreUnusable(destinationId: UUID)
+    /// A local repository inside iCloud Drive or a File Provider folder has
+    /// at least one dataless entry. Running restic would ask macOS to hydrate
+    /// repository data implicitly, potentially downloading many gigabytes.
+    case cloudRepositoryNotHydrated(destinationId: UUID, relativePath: String)
     /// The restic binary could not be spawned (missing/not executable).
     case launchFailed(String)
     /// The caller's timeout elapsed. `ProcessRunning` has already sent
@@ -192,6 +196,8 @@ public enum ResticRunnerError: Error, Equatable, Sendable, CustomStringConvertib
             return "no password stored for destination \(destinationId)"
         case .secretsStoreUnusable(let destinationId):
             return "secret store unusable for destination \(destinationId)"
+        case .cloudRepositoryNotHydrated(let destinationId, let relativePath):
+            return "cloud repository \(destinationId) contains a dataless file: \(relativePath)"
         case .launchFailed(let reason):
             return "failed to launch restic: \(reason)"
         case .timedOut:
@@ -203,7 +209,7 @@ public enum ResticRunnerError: Error, Equatable, Sendable, CustomStringConvertib
         switch self {
         case .secretsUnavailable:
             return .retryable
-        case .secretsNotConfigured, .secretsStoreUnusable, .launchFailed, .timedOut:
+        case .secretsNotConfigured, .secretsStoreUnusable, .cloudRepositoryNotHydrated, .launchFailed, .timedOut:
             return .terminal
         }
     }
@@ -240,6 +246,9 @@ public enum ResticRunnerError: Error, Equatable, Sendable, CustomStringConvertib
             // whose value is its exactness.
             return "The secret store cannot be read as configured, and retrying will not change that. "
                 + "Run `restic-station-helper secret list` to see the exact refusal and how to fix it."
+        case .cloudRepositoryNotHydrated(_, let relativePath):
+            return "The cloud-synced repository is not fully downloaded (\(relativePath)). "
+                + "Choose Always Keep Downloaded in the cloud provider, then try again."
         case .launchFailed:
             return "The restic program could not be started. "
                 + "Check the restic path in Settings."

@@ -35,11 +35,17 @@ enum SetsCopy {
     static let checkFootnote =
         "Weekly `restic check`; over 20 weeks the entire repository's data is read and verified."
 
-    /// Local destination under `~/Library/Mobile Documents`.
-    static let iCloudWarning =
-        "iCloud may evict repository files with Optimize Mac Storage — this can corrupt reads; "
-        + "consider a non-synced location. Sync folders replicate deletions — treat this as a "
+    /// Local destination under iCloud Drive or `~/Library/CloudStorage`.
+    static let cloudRepositoryWarning =
+        "Cloud storage may evict repository files. Restic Station refuses to use a repository "
+        + "while any file is dataless, avoiding an unexpected large download. Choose Always Keep "
+        + "Downloaded in the cloud provider. Sync folders replicate deletions — treat this as a "
         + "convenience copy, not your only backup."
+
+    static let cloudSourceWarning =
+        "Cloud-backed source — online-only files are skipped instead of downloaded. The snapshot "
+        + "contains only files resident on this Mac; keep the cloud service's own recovery/version "
+        + "history as a separate protection layer."
 
     /// Local destination under `/Volumes`.
     static let removableVolumeNote = "Removable volume — will be skipped when not mounted"

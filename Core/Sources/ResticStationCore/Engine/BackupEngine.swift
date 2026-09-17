@@ -367,7 +367,8 @@ public final class BackupEngine: Sendable {
             command: .backup(
                 repo: primary.repoURL,
                 sources: set.sources,
-                excludes: set.effectiveBackupExcludes
+                excludes: set.effectiveBackupExcludes,
+                excludeCloudFiles: CloudStorageSafety.containsCloudBackedSource(set.sources)
             ),
             invocation: ResticInvocation(destination: primary),
             streamProgress: true,

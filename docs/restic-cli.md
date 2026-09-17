@@ -91,8 +91,10 @@ Output (`init-secondary.json`): same `initialized` message. Without `--copy-chun
 
 ### backup
 ```
-restic -r <primaryRepo> backup --json [--exclude <pat>]... <source>...
+restic -r <primaryRepo> backup --json [--exclude-cloud-files] [--exclude <pat>]... <source>...
 ```
+`--exclude-cloud-files` is included automatically when any effective source is under macOS's iCloud Drive (`~/Library/Mobile Documents`) or File Provider (`~/Library/CloudStorage`) roots. It prevents restic from opening online-only placeholders and triggering large implicit downloads. The resulting snapshot intentionally contains only files resident on the Mac; the set editor warns about that completeness boundary.
+
 Sources passed as **absolute paths**. NDJSON stream on stdout (`backup.ndjson`, `backup2.ndjson`):
 ```json
 {"message_type":"status","percent_done":1,"total_files":3,"files_done":3,"total_bytes":65571,"bytes_done":65571}
@@ -257,4 +259,4 @@ Repo URL forms:
 - Any S3-compatible endpoint (Cloudflare R2, MinIO, Backblaze S3 API…): `s3:https://<endpoint-host>/<bucket>[/<prefix>]` — e.g. `s3:https://<accountid>.r2.cloudflarestorage.com/<bucket>/<prefix>`
 - Required env: `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (secret → keychain env blob). Optional non-secret: `AWS_DEFAULT_REGION` (R2: `auto`).
 
-Local-path destinations include external volumes (`/Volumes/...`) and cloud-sync-mounted folders (iCloud Drive under `~/Library/Mobile Documents/...`). **iCloud caveat (surface in UI):** "Optimize Mac Storage" may evict repo pack files to dataless placeholders; restic reads then force slow re-downloads or fail. The destination editor shows a warning when a repo path is under `Mobile Documents`.
+Local-path destinations include external volumes (`/Volumes/...`) and cloud-sync-mounted folders (iCloud Drive under `~/Library/Mobile Documents/...`, plus OneDrive, SharePoint and other File Provider services under `~/Library/CloudStorage/...`). Cloud storage may evict repo pack files to dataless placeholders. Restic Station checks cloud-backed local repositories before every restic invocation and refuses to run when any entry is dataless, avoiding an implicit multi-gigabyte hydration. The destination editor surfaces the same warning and directs the user to make the repository available offline first.

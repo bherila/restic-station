@@ -232,6 +232,7 @@ struct BackupEngineTests {
         secretFailure: SecretStoreError = .backendFailed("fake: password read failed"),
         secretBackend: SecretBackend = .platformDefault,
         script: [FakeProcessRunner.Expectation],
+        sources: [String] = [source],
         retention: RetentionPolicy? = RetentionPolicy(keepLast: 3),
         checkPolicy: CheckPolicy? = nil,
         excludes: [String] = [],
@@ -284,7 +285,7 @@ struct BackupEngineTests {
         let set = BackupSet(
             id: setId,
             name: "Projects",
-            sources: [source],
+            sources: sources,
             excludes: excludes,
             purgeExcludes: purgeExcludes,
             schedule: .daily(hour: 2, minute: 30),
@@ -517,6 +518,36 @@ struct BackupEngineTests {
     }
 
     // MARK: - Row 2 — primary unreachable
+
+    @Test("cloud-backed source automatically skips online-only files")
+    func cloudSourceUsesExcludeCloudFiles() async throws {
+        let cloudSource = (NSHomeDirectory() as NSString)
+            .appendingPathComponent("Library/CloudStorage/OneDrive/Documents")
+        let env = Self.makeEnv(
+            script: [],
+            sources: [cloudSource],
+            retention: nil,
+            reachableSecondaries: []
+        )
+        defer { env.cleanUp() }
+        let expected = [
+            "-r", env.primary.repoURL, "backup", "--json", "--exclude-cloud-files", cloudSource,
+        ]
+        env.fake.script = Self.resticCall(
+            expected,
+            dest: Self.primaryId,
+            stdoutLines: Self.backupStream()
+        )
+
+        let outcome = await env.engine.runSet(env.set, trigger: .manual)
+
+        guard case .completed(let status, _, _) = outcome else {
+            Issue.record("expected completed backup, got \(outcome)")
+            return
+        }
+        #expect(status == .success)
+        #expect(env.resticArgvs == [[Self.resticPath] + expected])
+    }
 
     @Test("row 2: primary unreachable → failed backup record, no restic at all, lastBackupStart still updated")
     func rowTwoPrimaryUnreachable() async throws {

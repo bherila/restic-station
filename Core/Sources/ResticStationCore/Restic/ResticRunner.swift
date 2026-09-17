@@ -106,6 +106,7 @@ public final class ResticRunner: Sendable {
     private let paths: AppPaths
     private let secrets: any SecretStore
     private let runner: ProcessRunning
+    private let datalessRepositoryEntry: @Sendable (Destination) -> String?
     private let decoder = ResticMessageDecoder()
 
     public struct MaintenanceExecutable: Equatable, Sendable {
@@ -113,11 +114,21 @@ public final class ResticRunner: Sendable {
         public let identity: String
     }
 
-    public init(resticPath: String, paths: AppPaths, secrets: any SecretStore, runner: ProcessRunning) {
+    public init(
+        resticPath: String,
+        paths: AppPaths,
+        secrets: any SecretStore,
+        runner: ProcessRunning,
+        datalessRepositoryEntry: @escaping @Sendable (Destination) -> String? = { destination in
+            guard destination.kind == .localPath else { return nil }
+            return CloudStorageSafety.firstDatalessEntry(inRepository: destination.repoURL)
+        }
+    ) {
         self.resticPath = resticPath
         self.paths = paths
         self.secrets = secrets
         self.runner = runner
+        self.datalessRepositoryEntry = datalessRepositoryEntry
     }
 
     /// The exact secret-free argv that ``run(_:for:onLine:onRawLine:timeout:launchPreflight:beforeLaunch:auditBeforeLaunch:afterLaunchFailure:)``
@@ -153,6 +164,11 @@ public final class ResticRunner: Sendable {
         afterLaunchFailure: (@Sendable () -> Void)? = nil
     ) async throws -> ResticOutcome {
         try Task.checkCancellation()
+
+        try preflightCloudRepository(destination: inv.destination)
+        if let fromDestination = inv.fromDestination {
+            try preflightCloudRepository(destination: fromDestination)
+        }
 
         // Pre-flight: read every password we are about to make restic read,
         // so an unreadable secret store (a locked keychain, a secrets file
@@ -304,6 +320,14 @@ public final class ResticRunner: Sendable {
     }
 
     // MARK: - Secret-store pre-flight
+
+    private func preflightCloudRepository(destination: Destination) throws {
+        guard let relativePath = datalessRepositoryEntry(destination) else { return }
+        throw ResticRunnerError.cloudRepositoryNotHydrated(
+            destinationId: destination.id,
+            relativePath: relativePath
+        )
+    }
 
     private func preflightSecrets(destination: Destination) async throws {
         do {

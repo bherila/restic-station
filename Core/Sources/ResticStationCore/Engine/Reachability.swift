@@ -148,6 +148,12 @@ public struct Reachability: Sendable {
                     .secretStoreUnusable,
                     reason: "the secret store is not usable as configured"
                 )
+            case .cloudRepositoryNotHydrated:
+                // Not reached by today's probes: the dataless pre-flight only
+                // examines local-path repositories, and those are probed with
+                // an existence check that never runs restic. Mapped rather
+                // than defaulted so the switch stays exhaustive.
+                return .offline(reason: error.userFacingMessage)
             case .timedOut:
                 return .offline(reason: "timed out")
             case .launchFailed(let reason):

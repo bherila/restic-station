@@ -57,6 +57,21 @@ struct ResticCommandTests {
         ])
     }
 
+    @Test("backup can skip cloud-only placeholders before evaluating excludes")
+    func backupExcludingCloudFiles() {
+        let cmd = ResticCommand.backup(
+            repo: Self.repo,
+            sources: ["/Users/user/Library/CloudStorage/OneDrive/Documents"],
+            excludes: ["Temp"],
+            excludeCloudFiles: true
+        )
+        #expect(cmd.argv == [
+            "-r", Self.repo, "backup", "--json", "--exclude-cloud-files",
+            "--exclude", "Temp",
+            "/Users/user/Library/CloudStorage/OneDrive/Documents",
+        ])
+    }
+
     @Test("copy: -r is the destination, --from-repo the source, and there is no --json")
     func copy() {
         // restic -r <secondaryRepo> copy --from-repo <primaryRepo>

@@ -100,6 +100,10 @@ struct ResticErrorTests {
         // answer was a refusal that names the repair (#96). Retrying the
         // identical read cannot perform that repair.
         #expect(ResticRunnerError.secretsStoreUnusable(destinationId: destinationId).category == .terminal)
+        #expect(ResticRunnerError.cloudRepositoryNotHydrated(
+            destinationId: destinationId,
+            relativePath: "data/ab/cdef"
+        ).category == .terminal)
         #expect(ResticRunnerError.launchFailed("no such file").category == .terminal)
         #expect(ResticRunnerError.timedOut.category == .terminal)
     }

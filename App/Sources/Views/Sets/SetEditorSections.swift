@@ -77,6 +77,9 @@ struct SourcesSection: View {
                 return "Inside “\(other)”, which is already a source — it is backed up either way."
             }
         }
+        if CloudStorageSafety.isCloudSyncedPath(path) {
+            return SetsCopy.cloudSourceWarning
+        }
         return nil
     }
 
