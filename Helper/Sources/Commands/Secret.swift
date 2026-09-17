@@ -161,6 +161,18 @@ struct SecretList: AsyncParsableCommand, JSONRenderable {
     @Flag(name: .long, help: "Emit JSON. Only JSON reaches stdout in this mode.")
     var json = false
 
+    /// Both reads concern exactly one destination, and the listing stops
+    /// at the first failure, so the envelope names which one. Without it a
+    /// caller with several destinations cannot tell which `<uuid>-env` blob
+    /// to rewrite (`docs/cli-json.md`: `destinationId` is set whenever a
+    /// failure concerns one destination).
+    static func failure(_ error: any Error, destId: UUID) -> CLIFailure {
+        let classified = CLIFailure.classify(error)
+        var details = classified.details
+        details.destinationId = destId
+        return CLIFailure(code: classified.code, message: classified.message, details: details)
+    }
+
     func run() async throws {
         let context = try SecretContext.make()
 
@@ -176,14 +188,14 @@ struct SecretList: AsyncParsableCommand, JSONRenderable {
             } catch SecretStoreError.itemNotFound {
                 hasPassword = false
             } catch {
-                throw CLIFailure.classify(error)
+                throw Self.failure(error, destId: destId)
             }
 
             let secretEnvCount: Int
             do {
                 secretEnvCount = try await context.store.secretEnv(destId: destId).count
             } catch {
-                throw CLIFailure.classify(error)
+                throw Self.failure(error, destId: destId)
             }
 
             rows.append(

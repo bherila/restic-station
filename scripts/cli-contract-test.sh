@@ -766,6 +766,19 @@ assert_error_envelope "secret_store_unusable"
 jq -e '.error.message | test("chmod 600")' "$OUT_FILE" >/dev/null \
     || fail "probe-repo's refusal did not carry the exact chmod to run: $(jq -c '.error' "$OUT_FILE")"
 
+# A malformed secret-env blob is refused per destination; `secret list`
+# stops at it and must say which destination to repair.
+cp -p "$FIXTURE/secrets.json" "$WORK/secrets.json.good"
+jq --arg account "$(printf '%s' "$PRIMARY_ID" | tr '[:upper:]' '[:lower:]')-env" \
+    '.secrets[$account] = "not json"' "$WORK/secrets.json.good" >"$FIXTURE/secrets.json"
+chmod 0600 "$FIXTURE/secrets.json"
+RESTIC_STATION_DATA_DIR="$FIXTURE" run_helper_split secret list --json
+expect_rc 1
+assert_error_envelope "secret_store_unusable"
+jq -e --arg id "$PRIMARY_ID" '(.error.details.destinationId | ascii_downcase) == ($id | ascii_downcase)' \
+    "$OUT_FILE" >/dev/null \
+    || fail "secret list did not name the destination with the malformed env blob: $(jq -c '.error' "$OUT_FILE")"
+cp -p "$WORK/secrets.json.good" "$FIXTURE/secrets.json"
 mark_code "secret_store_unusable"
 ok "secret_store_unusable: a group-accessible secrets.json is refused, non-retryable, exit 1"
 
