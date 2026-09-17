@@ -112,8 +112,9 @@ set_busy|yes|2|live
 repository_offline|yes|3|live
 repository_locked|yes|1|live
 repository_not_initialized|no|1|live
-secret_unavailable|yes|1|live
+secret_unavailable|yes|1|unit:every retryable store failure is an errno case (EACCES opening secrets.json is the only portable one) and the linux CI container runs as root, where DAC cannot produce it — pinned in Swift by SecretStoreErrorTableTests and KeychainSecretStoreTests instead
 secret_not_configured|no|1|unit:reaching classify(itemNotFound) needs a keychain/secret-env miss no fixture can stage portably
+secret_store_unusable|no|1|live
 secret_rejected|no|1|live
 restic_not_found|no|1|live
 restic_unsupported|no|1|env
@@ -584,6 +585,12 @@ assert_success_envelope "probe-repo --json (offline)"
 jq -e '.data | .outcome == "offline" and .reachable == false and .reason != null' "$OUT_FILE" >/dev/null \
     || fail "probe-repo offline must be a success envelope with outcome=offline at exit 3, got $(jq -c . "$OUT_FILE")"
 mv "$REPO_DIR.unplugged" "$REPO_DIR"
+
+# There is deliberately no third probe-repo case here: this fixture's only
+# destination is a local path, which `Reachability` answers with a
+# `FileManager` existence check and never reads a secret for. The
+# permanent-refusal arm (`outcome` replaced by a non-retryable error
+# envelope, #96) is pinned in Swift by `ReachabilityTests` instead.
 mark_cmd "probe-repo"
 ok "probe-repo: reachable → ok/0, offline → success envelope with outcome=offline at exit 3"
 
@@ -727,16 +734,53 @@ write_config "$FIXTURE" "\"$FAKE_DIR/restic\""
 mark_code "restic_not_found"
 ok "restic_not_found: an unreadable pinned restic refuses the prune at exit 1"
 
-# secret_unavailable: the file backend's documented refusal of a widened
+# secret_store_unusable: the file backend's documented refusal of a widened
 # secrets.json. Mode-based, so it holds even when running as root (the
-# linux CI container does).
+# linux CI container does) — which is also why it is this code and not
+# `secret_unavailable` that a shell fixture can reach. The refusal is
+# permanent: no repetition of this request can widen-then-narrow the mode,
+# so the envelope must say `retryable: false` (#96).
 chmod 0644 "$FIXTURE/secrets.json"
 RESTIC_STATION_DATA_DIR="$FIXTURE" run_helper_split maintenance prune --set "$SET_ID" --dry-run --json
 expect_rc 1
-assert_error_envelope "secret_unavailable"
+assert_error_envelope "secret_store_unusable"
+jq -e '.error.message | test("chmod 600")' "$OUT_FILE" >/dev/null \
+    || fail "the refusal did not carry the exact chmod to run"
+
 chmod 0600 "$FIXTURE/secrets.json"
-mark_code "secret_unavailable"
-ok "secret_unavailable: a group-accessible secrets.json is refused, retryable, exit 1"
+
+# probe-repo reaches the same refusal through Reachability, which keeps a
+# sanitized reason for repo-status; the envelope must still carry the
+# store's own remedy. Only a non-local destination reads a secret to probe
+# (local paths are an existence check), so this runs on a copy of the
+# fixture whose primary is a REST URL — the store refuses before restic
+# could be launched against it.
+REMOTE_FIXTURE="$WORK/remote-fixture"
+cp -Rp "$FIXTURE" "$REMOTE_FIXTURE"
+jq '.sets[0].destinations[0].repoURL = "rest:http://127.0.0.1:9/repo"' \
+    "$FIXTURE/config.json" >"$REMOTE_FIXTURE/config.json"
+chmod 0644 "$REMOTE_FIXTURE/secrets.json"
+RESTIC_STATION_DATA_DIR="$REMOTE_FIXTURE" run_helper_split probe-repo --set "$SET_ID" --dest "$PRIMARY_ID" --json
+expect_rc 1
+assert_error_envelope "secret_store_unusable"
+jq -e '.error.message | test("chmod 600")' "$OUT_FILE" >/dev/null \
+    || fail "probe-repo's refusal did not carry the exact chmod to run: $(jq -c '.error' "$OUT_FILE")"
+
+# A malformed secret-env blob is refused per destination; `secret list`
+# stops at it and must say which destination to repair.
+cp -p "$FIXTURE/secrets.json" "$WORK/secrets.json.good"
+jq --arg account "$(printf '%s' "$PRIMARY_ID" | tr '[:upper:]' '[:lower:]')-env" \
+    '.secrets[$account] = "not json"' "$WORK/secrets.json.good" >"$FIXTURE/secrets.json"
+chmod 0600 "$FIXTURE/secrets.json"
+RESTIC_STATION_DATA_DIR="$FIXTURE" run_helper_split secret list --json
+expect_rc 1
+assert_error_envelope "secret_store_unusable"
+jq -e --arg id "$PRIMARY_ID" '(.error.details.destinationId | ascii_downcase) == ($id | ascii_downcase)' \
+    "$OUT_FILE" >/dev/null \
+    || fail "secret list did not name the destination with the malformed env blob: $(jq -c '.error' "$OUT_FILE")"
+cp -p "$WORK/secrets.json.good" "$FIXTURE/secrets.json"
+mark_code "secret_store_unusable"
+ok "secret_store_unusable: a group-accessible secrets.json is refused, non-retryable, exit 1"
 
 # set_busy: a purge preview parked inside the fake restic (blocked on a
 # FIFO) holds the set lock; a concurrent prune of the same set must answer

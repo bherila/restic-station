@@ -323,9 +323,24 @@ public final class ResticRunner: Sendable {
     /// Which pre-flight failure a secret-store error is, with the backend's
     /// own text discarded either way.
     private static func runnerError(for error: any Error, destination: Destination) -> ResticRunnerError {
-        if case SecretStoreError.itemNotFound = error {
-            return .secretsNotConfigured(destinationId: destination.id)
+        // Exhaustive, with no `default:`, so a new `SecretStoreError` case
+        // is a compile error here rather than something that silently
+        // inherits `secretsUnavailable`'s `retryable: true` — which is
+        // exactly how the file backend's permanent refusals came to be
+        // published as retryable (#96).
+        if let storeError = error as? SecretStoreError {
+            switch storeError {
+            case .itemNotFound:
+                return .secretsNotConfigured(destinationId: destination.id)
+            case .storeUnusable:
+                return .secretsStoreUnusable(destinationId: destination.id)
+            case .lockUnusable, .backendFailed:
+                return .secretsUnavailable(destinationId: destination.id)
+            }
         }
+        // Not a `SecretStoreError` at all — a store may surface an I/O or
+        // subprocess error of its own. Transient is the safe direction for
+        // the unknown, for the reason on `SecretStoreError.storeUnusable`.
         return .secretsUnavailable(destinationId: destination.id)
     }
 

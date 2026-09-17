@@ -19,7 +19,32 @@ public enum SecretStoreError: Error, Sendable, Equatable, CustomStringConvertibl
     /// of `backendFailed` because retrying the identical write cannot repair
     /// a symlink, wrong owner, unsafe parent, or wrong file type.
     case lockUnusable(LockFailure)
+    /// The store itself cannot be used until something outside this request
+    /// changes: a file's type, mode, or owner; the document's format; or the
+    /// build that is reading it. Kept out of ``backendFailed`` for the same
+    /// reason ``lockUnusable`` is — repeating the identical read cannot
+    /// repair a symlinked `secrets.json`, a group-readable mode, an
+    /// untrusted owner, malformed contents, or a document written by a newer
+    /// format version.
+    ///
+    /// The distinction is not cosmetic: ``backendFailed`` publishes
+    /// `retryable: true`, which tells an automated caller to repeat a request
+    /// that cannot ever succeed (#96). The dividing line is *whether
+    /// repeating the identical request can produce a different answer*, not
+    /// whether a human would call the condition serious — a bare `errno`
+    /// wrapper stays ``backendFailed`` because its errno set includes
+    /// transient causes.
+    ///
+    /// The safe direction is asymmetric. Marking a genuinely transient
+    /// failure permanent is the more damaging mistake: it breaks the
+    /// pre-login-tick behaviour `docs/keychain-and-fda.md` §2 depends on,
+    /// where a tick that fires before the login keychain unlocks must keep
+    /// skipping and retrying rather than give up. So the keychain backend's
+    /// `security` failures — exit 51 included — stay ``backendFailed``.
+    case storeUnusable(String)
     /// Any other backend failure, with the backend's own diagnostic text.
+    /// The backend answered badly and may answer well later: a locked login
+    /// keychain, a transient I/O error, a lock held by a stuck peer.
     case backendFailed(String)
 
     public var description: String {
@@ -28,6 +53,8 @@ public enum SecretStoreError: Error, Sendable, Equatable, CustomStringConvertibl
             return "no stored secret for this destination"
         case .lockUnusable(let failure):
             return "secrets lock unusable: \(failure)"
+        case .storeUnusable(let detail):
+            return detail
         case .backendFailed(let detail):
             return detail
         }
@@ -36,6 +63,48 @@ public enum SecretStoreError: Error, Sendable, Equatable, CustomStringConvertibl
 
 extension SecretStoreError: LocalizedError {
     public var errorDescription: String? { description }
+}
+
+// MARK: - DestinationAttention
+
+/// Why a destination cannot proceed until a human acts, as a closed
+/// two-case enum rather than a `CLIErrorCode` or prose.
+///
+/// These are exactly the ``SecretStoreError`` cases for which repeating the
+/// identical request cannot produce a different answer. Keeping them in
+/// their own type is what lets every downstream switch be exhaustive over
+/// *two* cases instead of over the whole published code table, so a caller
+/// cannot quietly pick one of them as a fallback for the other — which is
+/// how a "no password stored" refusal came to be reported as an unusable
+/// store during a pre-flight race (#96 review).
+public enum DestinationAttention: String, Sendable, Equatable, CaseIterable {
+    /// Nothing is stored for this destination. Remedy: `secret set`.
+    case secretNotConfigured = "secret_not_configured"
+    /// The store refused to be read at all. Remedy: whatever its own
+    /// refusal names — a `chmod`, a `chown`, or moving the data directory.
+    case secretStoreUnusable = "secret_store_unusable"
+
+    /// `nil` for the transient cases, which are not attention at all: they
+    /// clear without anyone doing anything.
+    public init?(_ error: SecretStoreError) {
+        switch error {
+        case .itemNotFound:
+            self = .secretNotConfigured
+        case .storeUnusable:
+            self = .secretStoreUnusable
+        case .backendFailed, .lockUnusable:
+            return nil
+        }
+    }
+
+    /// The published envelope code. Both are non-retryable, and the
+    /// `CLIErrorCode` table test pins that.
+    public var code: CLIErrorCode {
+        switch self {
+        case .secretNotConfigured: return .secretNotConfigured
+        case .secretStoreUnusable: return .secretStoreUnusable
+        }
+    }
 }
 
 // MARK: - SecretStore
@@ -344,10 +413,13 @@ enum SecretEnvBlob {
         do {
             data = try JSONEncoder().encode(env)
         } catch {
-            throw SecretStoreError.backendFailed("failed to encode secret env as JSON: \(error)")
+            // Permanent for the same reason `FileSecretStore`'s encode
+            // failure is: encoding the identical dictionary of strings is
+            // deterministic, so a retry cannot succeed.
+            throw SecretStoreError.storeUnusable("failed to encode secret env as JSON: \(error)")
         }
         guard let json = String(data: data, encoding: .utf8) else {
-            throw SecretStoreError.backendFailed("failed to encode secret env as UTF-8 JSON")
+            throw SecretStoreError.storeUnusable("failed to encode secret env as UTF-8 JSON")
         }
         return json
     }
@@ -359,7 +431,12 @@ enum SecretEnvBlob {
         do {
             return try JSONDecoder().decode([String: String].self, from: data)
         } catch {
-            throw SecretStoreError.backendFailed("failed to decode secret env JSON: \(error)")
+            // The malformed-content condition, on the *inner* blob rather
+            // than the outer document — and it reaches here from both
+            // backends, since a keychain item's value is this same JSON.
+            // Decoding the identical bytes cannot start succeeding; the
+            // stored blob has to be rewritten (#96).
+            throw SecretStoreError.storeUnusable("failed to decode secret env JSON: \(error)")
         }
     }
 }

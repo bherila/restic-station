@@ -189,6 +189,9 @@ struct Tick: AsyncParsableCommand {
                         case .error(let exitClass):
                             status.reachable = false
                             status.lastError = exitClass.userFacingMessage
+                        case .needsAttention(_, let reason):
+                            status.reachable = false
+                            status.lastError = reason
                         }
                     }
                 } catch {

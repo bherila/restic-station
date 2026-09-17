@@ -96,6 +96,10 @@ struct ResticErrorTests {
         // destination with nothing stored stays that way until a human
         // stores something.
         #expect(ResticRunnerError.secretsNotConfigured(destinationId: destinationId).category == .terminal)
+        // Terminal for a third reason again: the store answered, and its
+        // answer was a refusal that names the repair (#96). Retrying the
+        // identical read cannot perform that repair.
+        #expect(ResticRunnerError.secretsStoreUnusable(destinationId: destinationId).category == .terminal)
         #expect(ResticRunnerError.launchFailed("no such file").category == .terminal)
         #expect(ResticRunnerError.timedOut.category == .terminal)
     }
@@ -123,10 +127,24 @@ struct ResticErrorTests {
         for error in [
             ResticRunnerError.secretsUnavailable(destinationId: destinationId),
             ResticRunnerError.secretsNotConfigured(destinationId: destinationId),
+            ResticRunnerError.secretsStoreUnusable(destinationId: destinationId),
         ] {
             #expect(error.description.contains(destinationId.uuidString))
             #expect(!error.userFacingMessage.isEmpty)
         }
+    }
+
+    @Test("an unusable store points at the command that prints the refusal in full")
+    func secretsStoreUnusableWording() {
+        let message = ResticRunnerError.secretsStoreUnusable(destinationId: UUID()).userFacingMessage
+        // The store's own refusal names a path, a uid, and a mode, and this
+        // string reaches run logs — so it points at `secret list` rather
+        // than paraphrasing a message whose whole value is its exactness.
+        #expect(message.contains("secret list"))
+        #expect(message.contains("retrying will not change that"))
+        // Not worded per backend: only the file backend can raise it, and
+        // the reader's next step is the same either way.
+        #expect(!message.lowercased().contains("keychain"))
     }
 
     @Test("an absent password names the remedy, not the store it is absent from")

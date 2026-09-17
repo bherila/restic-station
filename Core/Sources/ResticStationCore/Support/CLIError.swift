@@ -70,10 +70,15 @@ public enum CLIErrorCode: String, Sendable, Codable, CaseIterable, Equatable {
     case repositoryOffline = "repository_offline"
     /// restic exit 11: another restic process holds the repository lock.
     case repositoryLocked = "repository_locked"
-    /// The repository password or secret environment could not be *read* —
-    /// a locked login keychain at a pre-login tick, or a `secrets.json`
-    /// whose mode has been widened. Retryable: the same request can succeed
-    /// once the backend is available again.
+    /// The repository password or secret environment could not be *read*,
+    /// and repeating the identical request can succeed once the backend is
+    /// available again — a locked login keychain at a pre-login tick, an
+    /// I/O error, a lock held by a stuck peer.
+    ///
+    /// **Not** a `secrets.json` whose mode has been widened, which this
+    /// comment used to name: since #96 that is the non-retryable
+    /// ``secretStoreUnusable``, because no repetition of the read performs
+    /// the `chmod` the refusal names.
     case secretUnavailable = "secret_unavailable"
     /// The secret was read fine and restic rejected it (exit 12).
     ///
@@ -95,6 +100,26 @@ public enum CLIErrorCode: String, Sendable, Codable, CaseIterable, Equatable {
     /// unlocks by itself; a destination whose password was never stored
     /// stays that way until a human runs `secret set`.
     case secretNotConfigured = "secret_not_configured"
+    /// The store itself cannot be used until something outside the request
+    /// changes — a symlinked or group-readable `secrets.json`, a file owned
+    /// outside the trust boundary, contents that do not decode, a document
+    /// written by a newer format version, or a directory another user could
+    /// replace entries in.
+    ///
+    /// Not what a bad `RESTIC_STATION_SECRET_BACKEND` reports, even though
+    /// the factory raises the same store error for it: both helper entry
+    /// points wrap that one as ``configInvalid`` before it reaches here,
+    /// because it is a host misconfiguration reached before any store
+    /// exists. `cli-json.md` documents it there.
+    ///
+    /// Split from ``secretUnavailable`` for the third time the same reason
+    /// applies (#96): those conditions were published as `retryable: true`,
+    /// which told an automated caller to repeat, unchanged and forever, a
+    /// request whose refusal message already named the exact `chmod`,
+    /// `chown`, or edit a human had to perform. Distinct from
+    /// ``secretNotConfigured``, which means the store answered and had
+    /// nothing stored — here the store could not be consulted at all.
+    case secretStoreUnusable = "secret_store_unusable"
 
     // ── Repository state ──────────────────────────────────────────────────
 
@@ -164,7 +189,7 @@ extension CLIErrorCode {
         case .invalidArguments, .configInvalid, .setNotFound, .setDisabledHere,
              .destinationNotFound, .destinationDisabledHere, .runNotFound,
              .repositoryLocked, .secretUnavailable, .secretRejected,
-             .secretNotConfigured,
+             .secretNotConfigured, .secretStoreUnusable,
              .repositoryNotInitialized, .resticNotFound, .resticUnsupported,
              .resticFailed, .operationTimedOut, .previewExpired, .operationNotAllowed,
              .operationCompletedAuditFailed, .internalError:
@@ -187,7 +212,7 @@ extension CLIErrorCode {
             return true
         case .invalidArguments, .configInvalid, .setNotFound, .setDisabledHere,
              .destinationNotFound, .destinationDisabledHere, .runNotFound,
-             .secretRejected, .secretNotConfigured,
+             .secretRejected, .secretNotConfigured, .secretStoreUnusable,
              .repositoryNotInitialized, .resticNotFound,
              .resticUnsupported, .resticFailed, .previewExpired, .operationNotAllowed,
              .operationCompletedAuditFailed, .internalError:
@@ -512,6 +537,20 @@ extension CLIFailure {
                 message: "The destination is offline. Reconnect it and run purge preview again.",
                 details: CLIErrorDetails(setId: setId, destinationId: destinationId)
             )
+        case .secretRefused(let attention, let destinationId, let detail):
+            // Unlike `.unavailable` below, the cause here is known and the
+            // refusal has already named the repair, so the message carries
+            // it and the code is the one the pre-flight actually reported —
+            // never a fixed `secret_store_unusable`, which would send an
+            // agent to repair a store whose only problem is that nobody
+            // has run `secret set` (#96).
+            return CLIFailure(
+                code: attention.code,
+                message: bounded("The purge was refused: \(detail)"),
+                // The destination too: an apply spans several, and
+                // `secret set` has to name one.
+                details: CLIErrorDetails(setId: setId, destinationId: destinationId)
+            )
         case .unavailable:
             // `.unavailable` covers secret storage, the token index, and a
             // failed `snapshots` listing alike, so the advice stays
@@ -794,6 +833,15 @@ extension CLIFailure {
                     resticCategory: error.category
                 )
             )
+        case .secretsStoreUnusable(let destinationId):
+            return CLIFailure(
+                code: .secretStoreUnusable,
+                message: error.userFacingMessage,
+                details: CLIErrorDetails(
+                    destinationId: destinationId,
+                    resticCategory: error.category
+                )
+            )
         case .launchFailed:
             return CLIFailure(
                 code: .resticNotFound,
@@ -816,15 +864,26 @@ extension CLIFailure {
     static func classify(_ error: SecretStoreError) -> CLIFailure {
         // The acceptance criterion is that the macOS keychain backend and
         // the Linux file backend map to the *same* logical code — and they
-        // do: both report a missing item as `itemNotFound` and everything
-        // else as `backendFailed`, so this split is by condition, not by
-        // backend. It is `retryable` that forces it. `backendFailed` is a
-        // backend that answered badly and may answer well later; a missing
-        // item is a stable fact about this host until someone runs
-        // `secret set`, and publishing `retryable: true` for it would tell
-        // an automated caller to loop forever on a request that cannot
-        // succeed. The backend's own diagnostic text stays in `message`,
-        // bounded, and never reaches `details`.
+        // do: this split is by condition, not by backend. It is `retryable`
+        // that forces it, and the question each case answers is the same
+        // one: can the caller repeat this identical request and get a
+        // different answer?
+        //
+        //   - `backendFailed` — yes. The backend answered badly and may
+        //     answer well later (a locked login keychain at a pre-login
+        //     tick, a transient I/O error, a lock held by a stuck peer).
+        //   - `itemNotFound` — no. A stable fact about this host until
+        //     someone runs `secret set`.
+        //   - `storeUnusable` — no. The store cannot be consulted at all
+        //     until a file, mode, owner, format, or environment variable
+        //     changes (#96). Before it existed these arrived as
+        //     `backendFailed`, so a refusal that had already printed the
+        //     exact `chmod` to run was published as `retryable: true`.
+        //   - `lockUnusable` — no, and deliberately not `set_busy` for the
+        //     same reason (#110): waiting does not fix it.
+        //
+        // The backend's own diagnostic text stays in `message`, bounded,
+        // and never reaches `details`.
         switch error {
         case .itemNotFound:
             return CLIFailure(code: .secretNotConfigured, message: error.description)
@@ -836,6 +895,8 @@ extension CLIFailure {
                         + "Check the permissions on the Restic Station data directory."
                 )
             )
+        case .storeUnusable:
+            return CLIFailure(code: .secretStoreUnusable, message: error.description)
         case .backendFailed:
             return CLIFailure(code: .secretUnavailable, message: error.description)
         }

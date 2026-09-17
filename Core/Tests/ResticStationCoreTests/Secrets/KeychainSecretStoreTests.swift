@@ -117,6 +117,37 @@ struct KeychainSecretStoreTests {
         }
     }
 
+    /// The asymmetry that makes the #96 sweep a per-site judgement rather
+    /// than a rename: this exit must stay retryable, because a `RunAtLoad`
+    /// tick can fire before the login keychain unlocks
+    /// (`docs/keychain-and-fda.md` §2) and must skip-and-retry rather than
+    /// give up. Asserted from `security`'s real documented exit code
+    /// through to the published envelope, so neither half can move alone.
+    @Test("a locked login keychain at a pre-login tick stays retryable")
+    func lockedKeychainStaysRetryable() async throws {
+        let runner = FakeProcessRunner(script: [
+            .init(
+                argvPrefix: ["/usr/bin/security", "find-generic-password"],
+                stderr: "SecKeychainSearchCopyNext: User interaction is not allowed.",
+                exitCode: 51
+            ),
+        ])
+        let client = KeychainSecretStore(runner: runner)
+
+        do {
+            _ = try await client.password(destId: Self.destId)
+            Issue.record("expected a locked keychain to fail the read")
+        } catch let error as SecretStoreError {
+            guard case .backendFailed = error else {
+                Issue.record("exit 51 must stay backendFailed, got \(error)")
+                return
+            }
+            let failure = CLIFailure.classify(error)
+            #expect(failure.code == .secretUnavailable)
+            #expect(failure.retryable)
+        }
+    }
+
     @Test("deletePassword tolerates a not-found item (idempotent)")
     func deletePasswordToleratesNotFound() async throws {
         let runner = FakeProcessRunner(script: [

@@ -451,6 +451,19 @@ public struct KeychainSecretStore: SecretStore {
         }
     }
 
+    /// **Every `security(1)` failure this backend reports is transient**
+    /// (``SecretStoreError/backendFailed(_:)``), and that is a deliberate
+    /// per-site judgement, not an omission from the #96 sweep. The load-
+    /// bearing case is exit 51: a tick that fires before the login keychain
+    /// unlocks must keep skipping and retrying, which is the behaviour
+    /// `docs/keychain-and-fda.md` §2 depends on. Marking a genuinely
+    /// transient failure permanent breaks that, and the remaining
+    /// `security` exit codes arrive as an exit code plus stderr prose with
+    /// no reliable way to tell a permanent ACL refusal from a locked
+    /// keychain — so the whole surface takes the safe direction. The two
+    /// conditions that *are* permanent here are already split out:
+    /// exit 44 is ``SecretStoreError/itemNotFound`` and an unusable
+    /// mutation lock is ``SecretStoreError/lockUnusable(_:)``.
     private func runSecurity(_ argv: [String]) async throws -> ProcessResult {
         try await runner.run(
             argv,

@@ -231,8 +231,8 @@ struct FileSecretStoreTests {
             try await store.setPassword("hunter2", destId: Self.destId)
             Issue.record("expected a group-writable secrets directory to be refused")
         } catch let error as SecretStoreError {
-            guard case .backendFailed(let message) = error else {
-                Issue.record("expected .backendFailed, got \(error)")
+            guard case .storeUnusable(let message) = error else {
+                Issue.record("expected .storeUnusable, got \(error)")
                 return
             }
             #expect(message.contains(root.path))
@@ -367,8 +367,8 @@ struct FileSecretStoreTests {
             try await store.setPassword("hunter2", destId: Self.destId)
             Issue.record("expected a writable non-sticky parent to be refused")
         } catch let error as SecretStoreError {
-            guard case .backendFailed(let message) = error else {
-                Issue.record("expected .backendFailed, got \(error)")
+            guard case .storeUnusable(let message) = error else {
+                Issue.record("expected .storeUnusable, got \(error)")
                 return
             }
             #expect(message.contains(base.path))
@@ -434,8 +434,8 @@ struct FileSecretStoreTests {
             try await store.setPassword("hunter2", destId: Self.destId)
             Issue.record("expected root to refuse a non-root-owned secrets directory")
         } catch let error as SecretStoreError {
-            guard case .backendFailed(let message) = error else {
-                Issue.record("expected .backendFailed, got \(error)")
+            guard case .storeUnusable(let message) = error else {
+                Issue.record("expected .storeUnusable, got \(error)")
                 return
             }
             #expect(message.contains(root.path))
@@ -568,8 +568,8 @@ struct FileSecretStoreTests {
             _ = try await store.password(destId: Self.destId)
             Issue.record("expected a group/world-readable secrets file to be refused")
         } catch let error as SecretStoreError {
-            guard case .backendFailed(let message) = error else {
-                Issue.record("expected .backendFailed, got \(error)")
+            guard case .storeUnusable(let message) = error else {
+                Issue.record("expected .storeUnusable, got \(error)")
                 return
             }
             #expect(message.contains(store.fileURL.path))
@@ -633,8 +633,8 @@ struct FileSecretStoreTests {
             _ = try await reader.password(destId: Self.destId)
             Issue.record("expected root to refuse a non-root-owned secrets file")
         } catch let error as SecretStoreError {
-            guard case .backendFailed(let message) = error else {
-                Issue.record("expected .backendFailed, got \(error)")
+            guard case .storeUnusable(let message) = error else {
+                Issue.record("expected .storeUnusable, got \(error)")
                 return
             }
             #expect(message.contains(reader.fileURL.path))
@@ -659,8 +659,8 @@ struct FileSecretStoreTests {
             _ = try await store.password(destId: Self.destId)
             Issue.record("expected a symlinked secrets file to be refused")
         } catch let error as SecretStoreError {
-            guard case .backendFailed(let message) = error else {
-                Issue.record("expected .backendFailed, got \(error)")
+            guard case .storeUnusable(let message) = error else {
+                Issue.record("expected .storeUnusable, got \(error)")
                 return
             }
             #expect(message.contains("symbolic link"))
