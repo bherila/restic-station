@@ -609,6 +609,52 @@ struct BackupEngineTests {
         #expect(!env.resticArgvs.contains { $0.contains("--exclude-cloud-files") })
     }
 
+    @Test("a restic replaced after the version probe is refused at the backup launch")
+    func cloudSourceBackupRefusesAReplacedExecutable() async throws {
+        let binaryDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-swap-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: binaryDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: binaryDir) }
+        let binary = binaryDir.appendingPathComponent("restic").path
+        try Data("restic 0.18.1".utf8).write(to: URL(fileURLWithPath: binary))
+
+        // Password reads: the engine's own pre-flight first, then the
+        // runner's, which sits between the version probe and the launch —
+        // the window an upgrade would land in.
+        let reads = LockedCounter()
+        let env = Self.makeEnv(
+            script: [],
+            sources: [Self.cloudSource],
+            retention: nil,
+            reachableSecondaries: [],
+            onSecretPasswordRead: { _ in
+                if reads.increment() == 2 {
+                    try? Data("restic 0.19.1, upgraded mid-run".utf8).write(to: URL(fileURLWithPath: binary))
+                }
+            },
+            resticPath: binary
+        )
+        defer { env.cleanUp() }
+        env.fake.script = [
+            .init(
+                argvPrefix: [binary, "version", "--json"],
+                stdoutLines: [#"{"message_type":"version","version":"0.18.1","go_version":"go1.25.1","go_os":"darwin","go_arch":"arm64"}"#]
+            ),
+        ]
+
+        let outcome = await env.engine.runSet(env.set, trigger: .manual)
+
+        // The argv was decided for 0.18.1 (no flag); the bytes changed, so
+        // the backup never launched rather than running that argv.
+        #expect(env.fake.invocations.map(\.argv) == [[binary, "version", "--json"]])
+        guard case .completed(let status, let groupId, _) = outcome else {
+            Issue.record("expected a recorded failed backup, got \(outcome)")
+            return
+        }
+        #expect(status == .failed)
+        #expect(env.log(runId: groupId).contains("changed after it was checked"))
+    }
+
     @Test("a home-directory source reaches cloud storage, so it skips online-only files too")
     func homeDirectorySourceUsesExcludeCloudFiles() async throws {
         let home = NSHomeDirectory()
@@ -5972,5 +6018,18 @@ final class Box<T>: @unchecked Sendable {
             storage = newValue
             lock.unlock()
         }
+    }
+}
+
+/// A thread-safe counter for `@Sendable` test hooks.
+final class LockedCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+
+    func increment() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        value += 1
+        return value
     }
 }

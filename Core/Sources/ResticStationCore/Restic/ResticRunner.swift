@@ -243,6 +243,28 @@ public final class ResticRunner: Sendable {
             .first?.version
     }
 
+    /// A version answer bound to the exact executable bytes that gave it.
+    public struct BoundVersion: Equatable, Sendable {
+        public let version: String
+        /// Pass as ``ResticInvocation/expectedExecutableIdentity`` so the
+        /// launch that depends on `version` refuses different bytes.
+        public let executableIdentity: String
+    }
+
+    /// ``launchedResticVersion()``, bound to the executable: the bytes are
+    /// hashed before and after the version probe and must match, and the
+    /// caller binds the identity into its launch. nil when the executable
+    /// cannot be read, does not report a version, or changed during the probe.
+    public func boundResticVersion() async -> BoundVersion? {
+        guard let before = maintenanceExecutable(path: resticPath, bypassingCache: true),
+              let version = await launchedResticVersion(),
+              let after = maintenanceExecutable(path: resticPath, bypassingCache: true),
+              after.identity == before.identity else {
+            return nil
+        }
+        return BoundVersion(version: version, executableIdentity: before.identity)
+    }
+
     /// Runs an ssh-wrapped maintenance command. The destination password is
     /// delivered solely on the local ssh process stdin; it is never present
     /// in argv or environment.
@@ -489,7 +511,7 @@ public final class ResticRunner: Sendable {
         // overwrite that preserves size and mtime.
         if let expectedExecutableIdentity,
            revalidatedMaintenanceExecutable(path: resolvedExecutablePath)?.identity != expectedExecutableIdentity {
-            throw ResticRunnerError.launchFailed("the restic executable changed after the maintenance preview")
+            throw ResticRunnerError.launchFailed("the restic executable changed after it was checked")
         }
         // Destructive preview tokens are consumed here, after every launch
         // prerequisite has passed but immediately before the process runner

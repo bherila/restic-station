@@ -356,16 +356,26 @@ public final class BackupEngine: Sendable {
         // than downloaded when the set asks for it, but only by a restic that
         // accepts the flag on this platform; an older one would fail the
         // whole backup on it.
+        //
+        // The version answer decides the argv, so it is bound to the bytes
+        // that gave it: the backup launch revalidates that identity and
+        // refuses a restic replaced in between (an upgrade mid-tick) rather
+        // than running an argv decided for a different binary.
         let excludeCloudFiles: Bool
         let cloudSourceNote: String?
+        let versionBoundIdentity: String?
         if !CloudStorageSafety.containsCloudBackedSource(set.sources) {
             excludeCloudFiles = false
             cloudSourceNote = nil
+            versionBoundIdentity = nil
         } else if set.onlineOnlyFiles == .download {
             excludeCloudFiles = false
             cloudSourceNote = "cloud-synced source: online-only files are downloaded (set policy)"
+            versionBoundIdentity = nil
         } else {
-            let version = await restic.launchedResticVersion()
+            let bound = await restic.boundResticVersion()
+            let version = bound?.version
+            versionBoundIdentity = bound?.executableIdentity
             excludeCloudFiles = version.map {
                 VersionInfo.compareVersions($0, ResticRunner.excludeCloudFilesMinimumVersion) >= 0
             } ?? false
@@ -398,7 +408,7 @@ public final class BackupEngine: Sendable {
                 excludes: set.effectiveBackupExcludes,
                 excludeCloudFiles: excludeCloudFiles
             ),
-            invocation: ResticInvocation(destination: primary),
+            invocation: ResticInvocation(destination: primary, expectedExecutableIdentity: versionBoundIdentity),
             streamProgress: true,
             preflightPhase: "probing",
             preflight: { [self] logWriter in
