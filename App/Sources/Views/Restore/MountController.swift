@@ -107,6 +107,17 @@ final class MountController: ObservableObject {
             lastError = Self.missingMacFUSECopy
             return
         }
+        // The mount is launched here, not through `ResticRunner`, so it must
+        // run the runner's cloud-repository pre-flight itself: browsing a
+        // mount of a repository with online-only packs downloads them. Off
+        // the main actor — the scan walks every repository entry.
+        let destination = repository.destination
+        if let refusal = await Task.detached(operation: {
+            Self.cloudRepositoryRefusal(for: destination)
+        }).value {
+            lastError = refusal
+            return
+        }
 
         phase = .mounting
         lastError = nil
@@ -165,6 +176,18 @@ final class MountController: ObservableObject {
         self.outputPipe = pipe
 
         await waitForReadiness(process: process, directory: directory)
+    }
+
+    /// The user-facing refusal for mounting a cloud-synced local repository
+    /// that has online-only entries, or nil. The same scan and wording as
+    /// `ResticRunner`'s pre-flight; `datalessEntry` is injectable for tests.
+    nonisolated static func cloudRepositoryRefusal(
+        for destination: Destination,
+        datalessEntry: (String) -> String? = { CloudStorageSafety.firstDatalessEntry(inRepository: $0) }
+    ) -> String? {
+        guard destination.kind == .localPath, let entry = datalessEntry(destination.repoURL) else { return nil }
+        return ResticRunnerError.cloudRepositoryNotHydrated(destinationId: destination.id, relativePath: entry)
+            .userFacingMessage
     }
 
     /// Polls until FUSE serves the mountpoint, restic exits, or the timeout
