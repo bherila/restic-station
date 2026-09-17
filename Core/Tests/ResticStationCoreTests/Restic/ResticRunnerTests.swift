@@ -36,13 +36,15 @@ struct ResticRunnerTests {
     /// That is what makes these tests run identically on macOS and Linux.
     static func makeRunner(
         _ fake: FakeProcessRunner,
-        secrets: FakeSecretStore = FakeSecretStore(defaultPassword: password)
+        secrets: FakeSecretStore = FakeSecretStore(defaultPassword: password),
+        datalessRepositoryEntry: @escaping @Sendable (Destination) -> String? = { _ in nil }
     ) -> ResticRunner {
         ResticRunner(
             resticPath: resticPath,
             paths: paths(),
             secrets: secrets,
-            runner: fake
+            runner: fake,
+            datalessRepositoryEntry: datalessRepositoryEntry
         )
     }
 
@@ -128,7 +130,7 @@ struct ResticRunnerTests {
         let previewed = try #require(runner.maintenanceExecutable())
         try Data("replacement binary".utf8).write(to: executable)
 
-        await #expect(throws: ResticRunnerError.launchFailed("the restic executable changed after the maintenance preview")) {
+        await #expect(throws: ResticRunnerError.launchFailed("the restic executable changed after it was checked")) {
             try await runner.run(
                 .backup(repo: Self.primary.repoURL, sources: ["/tmp/source"]),
                 for: ResticInvocation(
@@ -401,7 +403,83 @@ struct ResticRunnerTests {
         #expect(env["PATH"] == "/usr/bin:/bin:/usr/sbin:/sbin")
     }
 
+    @Test("a version answer is bound to the executable, and a change during the probe voids it")
+    func boundResticVersion() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-bound-version-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let executable = root.appendingPathComponent("restic", isDirectory: false)
+        try Data("restic 0.19.1".utf8).write(to: executable)
+        let versionLine = #"{"message_type":"version","version":"0.19.1","go_version":"go1.25.1","go_os":"darwin","go_arch":"arm64"}"#
+
+        let steady = FakeProcessRunner(script: [
+            .init(argvPrefix: [executable.path, "version", "--json"], stdoutLines: [versionLine]),
+        ])
+        let bound = await ResticRunner(
+            resticPath: executable.path, paths: Self.paths(),
+            secrets: FakeSecretStore(defaultPassword: Self.password), runner: steady
+        ).boundResticVersion()
+        #expect(bound?.version == "0.19.1")
+        #expect(bound?.executableIdentity == ResticRunner(
+            resticPath: executable.path, paths: Self.paths(),
+            secrets: FakeSecretStore(defaultPassword: Self.password), runner: steady
+        ).maintenanceExecutable()?.identity)
+
+        let path = executable.path
+        let swapping = FakeProcessRunner(script: [
+            .init(
+                argvPrefix: [path, "version", "--json"],
+                stdoutLines: [versionLine],
+                onRun: { try? Data("restic 0.18.1, installed mid-probe".utf8).write(to: URL(fileURLWithPath: path)) }
+            ),
+        ])
+        let voided = await ResticRunner(
+            resticPath: path, paths: Self.paths(),
+            secrets: FakeSecretStore(defaultPassword: Self.password), runner: swapping
+        ).boundResticVersion()
+        #expect(voided == nil)
+    }
+
     // MARK: - Secret-store pre-flight
+
+    @Test("dataless cloud repository is rejected before secrets or restic are touched")
+    func datalessCloudRepositoryPreflight() async throws {
+        let fake = FakeProcessRunner()
+        let runner = Self.makeRunner(fake, datalessRepositoryEntry: { destination in
+            destination.id == Self.primaryId ? "data/ab/cdef" : nil
+        })
+
+        await #expect(throws: ResticRunnerError.cloudRepositoryNotHydrated(
+            destinationId: Self.primaryId,
+            relativePath: "data/ab/cdef"
+        )) {
+            _ = try await runner.run(
+                .snapshots(repo: Self.primary.repoURL),
+                for: ResticInvocation(destination: Self.primary)
+            )
+        }
+        #expect(fake.invocations.isEmpty)
+    }
+
+    @Test("copy preflight checks the source repository as well as the destination")
+    func datalessFromRepositoryPreflight() async throws {
+        let fake = FakeProcessRunner()
+        let runner = Self.makeRunner(fake, datalessRepositoryEntry: { destination in
+            destination.id == Self.primaryId ? "index/1234" : nil
+        })
+
+        await #expect(throws: ResticRunnerError.cloudRepositoryNotHydrated(
+            destinationId: Self.primaryId,
+            relativePath: "index/1234"
+        )) {
+            _ = try await runner.run(
+                .copy(toRepo: Self.secondary.repoURL, fromRepo: Self.primary.repoURL),
+                for: ResticInvocation(destination: Self.secondary, fromDestination: Self.primary)
+            )
+        }
+        #expect(fake.invocations.isEmpty)
+    }
 
     @Test("pre-flight failure throws secretsUnavailable and never spawns restic")
     func secretPreflightFailure() async throws {

@@ -97,6 +97,15 @@ struct ProbeRepo: AsyncParsableCommand, JSONRenderable {
                 }
             } catch {}
             return CLIFailure(code: attention.code, message: CLIFailure.bounded(reason), details: details)
+        case .cloudRepositoryNotHydrated:
+            return CLIFailure(
+                code: attention.code,
+                message: CLIFailure.bounded(
+                    "The cloud-synced repository is \(reason). "
+                        + "Keep the repository folder available offline in the cloud provider, then try again."
+                ),
+                details: details
+            )
         }
     }
 

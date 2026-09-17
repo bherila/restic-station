@@ -106,6 +106,7 @@ public final class ResticRunner: Sendable {
     private let paths: AppPaths
     private let secrets: any SecretStore
     private let runner: ProcessRunning
+    private let datalessRepositoryEntry: @Sendable (Destination) -> String?
     private let decoder = ResticMessageDecoder()
 
     public struct MaintenanceExecutable: Equatable, Sendable {
@@ -113,11 +114,21 @@ public final class ResticRunner: Sendable {
         public let identity: String
     }
 
-    public init(resticPath: String, paths: AppPaths, secrets: any SecretStore, runner: ProcessRunning) {
+    public init(
+        resticPath: String,
+        paths: AppPaths,
+        secrets: any SecretStore,
+        runner: ProcessRunning,
+        datalessRepositoryEntry: @escaping @Sendable (Destination) -> String? = { destination in
+            guard destination.kind == .localPath else { return nil }
+            return CloudStorageSafety.firstDatalessEntry(inRepository: destination.repoURL)
+        }
+    ) {
         self.resticPath = resticPath
         self.paths = paths
         self.secrets = secrets
         self.runner = runner
+        self.datalessRepositoryEntry = datalessRepositoryEntry
     }
 
     /// The exact secret-free argv that ``run(_:for:onLine:onRawLine:timeout:launchPreflight:beforeLaunch:auditBeforeLaunch:afterLaunchFailure:)``
@@ -153,6 +164,11 @@ public final class ResticRunner: Sendable {
         afterLaunchFailure: (@Sendable () -> Void)? = nil
     ) async throws -> ResticOutcome {
         try Task.checkCancellation()
+
+        try preflightCloudRepository(destination: inv.destination)
+        if let fromDestination = inv.fromDestination {
+            try preflightCloudRepository(destination: fromDestination)
+        }
 
         // Pre-flight: read every password we are about to make restic read,
         // so an unreadable secret store (a locked keychain, a secrets file
@@ -196,6 +212,57 @@ public final class ResticRunner: Sendable {
         )
         try Task.checkCancellation()
         return try await execute(cmd, env: baseEnvironment(), onLine: onLine, onRawLine: onRawLine, timeout: timeout)
+    }
+
+    /// The first restic whose `backup --exclude-cloud-files` works on macOS.
+    ///
+    /// Older releases fail the whole backup when the flag is passed: 0.17
+    /// does not know it, and 0.18 accepts it only on Windows. Linux releases
+    /// from 0.19 accept it and find nothing to skip.
+    public static let excludeCloudFilesMinimumVersion = "0.19.0"
+
+    /// The version the restic this runner launches reports, or nil when it
+    /// cannot be run or its answer cannot be read.
+    ///
+    /// Asked immediately before the backup whose argv depends on it rather
+    /// than cached from discovery, so a restic upgraded or replaced since
+    /// launch is judged as it is now. It is not bound to the later launch;
+    /// if the binary changes in between, the worst case is a backup that
+    /// fails on an unknown flag or reads online-only files, never one that
+    /// skips data silently on a restic that cannot report it.
+    public func launchedResticVersion() async -> String? {
+        guard let outcome = try? await runWithoutRepository(.version, timeout: 20),
+              outcome.exitCode == 0 else {
+            return nil
+        }
+        // `rawOutput` is stdout followed by stderr; the JSON is one line.
+        return outcome.rawOutput
+            .split(whereSeparator: \.isNewline)
+            .lazy
+            .compactMap { try? parseVersion(Data($0.utf8)) }
+            .first?.version
+    }
+
+    /// A version answer bound to the exact executable bytes that gave it.
+    public struct BoundVersion: Equatable, Sendable {
+        public let version: String
+        /// Pass as ``ResticInvocation/expectedExecutableIdentity`` so the
+        /// launch that depends on `version` refuses different bytes.
+        public let executableIdentity: String
+    }
+
+    /// ``launchedResticVersion()``, bound to the executable: the bytes are
+    /// hashed before and after the version probe and must match, and the
+    /// caller binds the identity into its launch. nil when the executable
+    /// cannot be read, does not report a version, or changed during the probe.
+    public func boundResticVersion() async -> BoundVersion? {
+        guard let before = maintenanceExecutable(path: resticPath, bypassingCache: true),
+              let version = await launchedResticVersion(),
+              let after = maintenanceExecutable(path: resticPath, bypassingCache: true),
+              after.identity == before.identity else {
+            return nil
+        }
+        return BoundVersion(version: version, executableIdentity: before.identity)
     }
 
     /// Runs an ssh-wrapped maintenance command. The destination password is
@@ -304,6 +371,14 @@ public final class ResticRunner: Sendable {
     }
 
     // MARK: - Secret-store pre-flight
+
+    private func preflightCloudRepository(destination: Destination) throws {
+        guard let relativePath = datalessRepositoryEntry(destination) else { return }
+        throw ResticRunnerError.cloudRepositoryNotHydrated(
+            destinationId: destination.id,
+            relativePath: relativePath
+        )
+    }
 
     private func preflightSecrets(destination: Destination) async throws {
         do {
@@ -436,7 +511,7 @@ public final class ResticRunner: Sendable {
         // overwrite that preserves size and mtime.
         if let expectedExecutableIdentity,
            revalidatedMaintenanceExecutable(path: resolvedExecutablePath)?.identity != expectedExecutableIdentity {
-            throw ResticRunnerError.launchFailed("the restic executable changed after the maintenance preview")
+            throw ResticRunnerError.launchFailed("the restic executable changed after it was checked")
         }
         // Destructive preview tokens are consumed here, after every launch
         // prerequisite has passed but immediately before the process runner

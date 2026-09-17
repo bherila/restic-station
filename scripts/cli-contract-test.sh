@@ -112,6 +112,7 @@ set_busy|yes|2|live
 repository_offline|yes|3|live
 repository_locked|yes|1|live
 repository_not_initialized|no|1|live
+cloud_repository_not_hydrated|no|1|unit:needs an SF_DATALESS File Provider placeholder, which no shell fixture can create (ReachabilityTests pins the probe, ProbeRepoAttentionTests the envelope, the classification tables every purge/prune route)
 secret_unavailable|yes|1|unit:every retryable store failure is an errno case (EACCES opening secrets.json is the only portable one) and the linux CI container runs as root, where DAC cannot produce it — pinned in Swift by SecretStoreErrorTableTests and KeychainSecretStoreTests instead
 secret_not_configured|no|1|unit:reaching classify(itemNotFound) needs a keychain/secret-env miss no fixture can stage portably
 secret_store_unusable|no|1|live
@@ -396,7 +397,7 @@ write_config() { # write_config <dir> <resticPath-or-null-json>
     local dir="$1" restic_json="$2"
     cat > "$dir/config.json" <<EOF
 {
-  "version": 3,
+  "version": 4,
   "resticPath": $restic_json,
   "showMenuBarIcon": true,
   "sets": [

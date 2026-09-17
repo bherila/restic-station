@@ -196,21 +196,29 @@ struct PurgePreview: AsyncParsableCommand, JSONRenderable {
                 message: CLIFailure.bounded(result.message ?? "Purge preview failed."),
                 details: CLIErrorDetails(setId: setId, destinationId: destination.id)
             )
-        case .secretNotConfigured, .secretStoreUnusable:
-            // Not `restic_failed`: restic never ran. The refusal's own
-            // text names the repair, so it is carried verbatim, and the
-            // two statuses publish different codes because they need
-            // different repairs (#96).
-            throw CLIFailure(
-                code: result.status == .secretNotConfigured
-                    ? DestinationAttention.secretNotConfigured.code
-                    : DestinationAttention.secretStoreUnusable.code,
-                message: CLIFailure.bounded(
-                    result.message ?? "The secret pre-flight refused."
-                ),
-                details: CLIErrorDetails(setId: setId, destinationId: destination.id)
-            )
+        case .secretNotConfigured:
+            throw Self.attentionFailure(.secretNotConfigured, result: result, setId: setId, destination: destination)
+        case .secretStoreUnusable:
+            throw Self.attentionFailure(.secretStoreUnusable, result: result, setId: setId, destination: destination)
+        case .cloudRepositoryNotHydrated:
+            throw Self.attentionFailure(.cloudRepositoryNotHydrated, result: result, setId: setId, destination: destination)
         }
+    }
+
+    /// Not `restic_failed`: restic never ran. The refusal's own text names
+    /// the repair, so it is carried verbatim, and each attention publishes
+    /// its own code because each needs a different repair (#96).
+    private static func attentionFailure(
+        _ attention: DestinationAttention,
+        result: PurgePlanResult,
+        setId: UUID,
+        destination: Destination
+    ) -> CLIFailure {
+        CLIFailure(
+            code: attention.code,
+            message: CLIFailure.bounded(result.message ?? "The pre-flight refused."),
+            details: CLIErrorDetails(setId: setId, destinationId: destination.id)
+        )
     }
 
     /// One preview session has one shared capability, regardless of how many
@@ -249,7 +257,7 @@ struct PurgePreview: AsyncParsableCommand, JSONRenderable {
             }
             print("  space is not reclaimed until a prune runs")
         case .busy, .offline, .infrastructureFailure, .failed,
-             .secretNotConfigured, .secretStoreUnusable:
+             .secretNotConfigured, .secretStoreUnusable, .cloudRepositoryNotHydrated:
             // These states are rejected before a report is printed.
             break
         }

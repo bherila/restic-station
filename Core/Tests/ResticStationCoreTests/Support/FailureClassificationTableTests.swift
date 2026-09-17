@@ -46,6 +46,7 @@ struct CLIErrorCodeTableTests {
         (.secretNotConfigured, "secret_not_configured", .error, false),
         (.secretStoreUnusable, "secret_store_unusable", .error, false),
         (.repositoryNotInitialized, "repository_not_initialized", .error, false),
+        (.cloudRepositoryNotHydrated, "cloud_repository_not_hydrated", .error, false),
         (.resticNotFound, "restic_not_found", .error, false),
         (.resticUnsupported, "restic_unsupported", .error, false),
         (.resticFailed, "restic_failed", .error, false),
@@ -257,6 +258,8 @@ struct ResticRunnerErrorTableTests {
             return (.secretNotConfigured, false, .terminal)
         case .secretsStoreUnusable:
             return (.secretStoreUnusable, false, .terminal)
+        case .cloudRepositoryNotHydrated:
+            return (.cloudRepositoryNotHydrated, false, .terminal)
         case .launchFailed:
             return (.resticNotFound, false, .terminal)
         case .timedOut:
@@ -268,6 +271,7 @@ struct ResticRunnerErrorTableTests {
         .secretsUnavailable(destinationId: destId),
         .secretsNotConfigured(destinationId: destId),
         .secretsStoreUnusable(destinationId: destId),
+        .cloudRepositoryNotHydrated(destinationId: destId, relativePath: "data/ab/cdef"),
         .launchFailed("no such file"),
         .timedOut,
     ]

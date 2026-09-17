@@ -11,6 +11,7 @@ Scheduling and management for [restic](https://restic.net) backups: a native mac
 - **Runs** — full history of every backup / copy / check / prune with live progress, stats, and logs; "Back Up Now" manual trigger.
 - **Restore** — browse or search snapshots of any destination, restore selected paths with overwrite warnings, or mount a snapshot read-only (optional, requires [macFUSE](https://macfuse.github.io)).
 - **Maintenance** — retention policies (`restic forget --prune`), repository statistics, and scheduled integrity checks (`restic check --read-data-subset` slice rotation).
+- **Cloud placeholder safety** — per backup set, online-only files under iCloud Drive or File Provider folders (OneDrive, Dropbox, …) are skipped instead of downloaded, or downloaded if you choose; cloud-synced repositories are refused while any repository file is online-only.
 
 ## A look at the app
 

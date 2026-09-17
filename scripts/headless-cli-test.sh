@@ -135,7 +135,7 @@ capture_clean_status_rc() {
 SECRET_PASSWORD='h34dl3ss "cli" $ecret with spaces '
 
 # ─────────────────────────────────────────────────────────────────────────
-# 1. config export / import round trip, including a v1 → v3 migration.
+# 1. config export / import round trip, including a v1 → v4 migration.
 # ─────────────────────────────────────────────────────────────────────────
 log "1. config export / import round trip"
 
@@ -177,10 +177,10 @@ EOF
 
 RESTIC_STATION_DATA_DIR="$MAC_DATA" run_helper config export --out "$WORK/exported-config.json"
 expect_rc 0
-grep -q '"version" : 3' "$WORK/exported-config.json" \
-    || fail "exported config was not migrated to v3 in memory before export"
+grep -q '"version" : 4' "$WORK/exported-config.json" \
+    || fail "exported config was not migrated to v4 in memory before export"
 grep -q 'machine.json' "$OUT_FILE" || true # note-only; not asserted further
-ok "export migrates v1 → v3 and writes to --out"
+ok "export migrates v1 → v4 and writes to --out"
 
 RESTIC_STATION_DATA_DIR="$LINUX_DATA" run_helper config import "$WORK/exported-config.json" --dry-run
 expect_rc 0
@@ -218,7 +218,7 @@ cat > "$WORK/incoming-v1.json" <<EOF
 EOF
 RESTIC_STATION_DATA_DIR="$V1_IMPORT_DATA" run_helper config import "$WORK/incoming-v1.json"
 expect_rc 0
-grep -q '"version" : 3' "$V1_IMPORT_DATA/config.json" || fail "v1 import was not migrated to v3 on disk"
+grep -q '"version" : 4' "$V1_IMPORT_DATA/config.json" || fail "v1 import was not migrated to v4 on disk"
 [[ -f "$V1_IMPORT_DATA/config.v1.backup.json" ]] || fail "v1 import did not write config.v1.backup.json"
 ok "importing a v1 file migrates it to v3 and writes config.v1.backup.json (T24's migration, reused)"
 
@@ -231,7 +231,7 @@ ALL_DISABLED_DATA="$WORK/all-disabled-data"
 mkdir -p "$ALL_DISABLED_DATA"
 cat > "$ALL_DISABLED_DATA/config.json" <<EOF
 {
-  "version": 3,
+  "version": 4,
   "resticPath": null,
   "showMenuBarIcon": true,
   "sets": [
@@ -303,7 +303,7 @@ make_status_fixture() {
     mkdir -p "$dir/state" "$dir/runs"
     cat > "$dir/config.json" <<EOF
 {
-  "version": 3,
+  "version": 4,
   "resticPath": null,
   "showMenuBarIcon": true,
   "sets": [
@@ -671,7 +671,7 @@ else
     echo "hello" > "$WORK/real-source/a.txt"
     cat > "$REAL_DATA/config.json" <<EOF
 {
-  "version": 3,
+  "version": 4,
   "resticPath": "$RESTIC_BIN",
   "showMenuBarIcon": true,
   "sets": [

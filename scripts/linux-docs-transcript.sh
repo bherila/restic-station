@@ -202,7 +202,7 @@ MIRROR_BOX_DATA="$WORK/data-mirror-box"
 mkdir -p "$MIRROR_BOX_DATA"
 cat > "$MIRROR_BOX_DATA/config.json" <<'JSON'
 {
-  "version": 3,
+  "version": 4,
   "resticPath": null,
   "showMenuBarIcon": true,
   "sets": [
@@ -327,7 +327,7 @@ FIRE_SET_ID="e1000000-0000-4000-8000-000000000001"
 FIRE_PRIMARY_ID="e1000000-0000-4000-8000-000000000002"
 cat > "$FIRE_DATA/config.json" <<JSON
 {
-  "version": 3,
+  "version": 4,
   "resticPath": null,
   "showMenuBarIcon": true,
   "sets": [

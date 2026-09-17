@@ -157,7 +157,7 @@ jobs:
           # it going stale — the v2 → v3 bump reached CI red for exactly that
           # reason. Migration is a single jump, so the backup is named for the
           # version the file started at (v1 here), not for current - 1.
-          grep -qE '"version"[[:space:]]*:[[:space:]]*3' "$RESTIC_STATION_DATA_DIR/config.json"
+          grep -qE '"version"[[:space:]]*:[[:space:]]*4' "$RESTIC_STATION_DATA_DIR/config.json"
           grep -qE '"version"[[:space:]]*:[[:space:]]*1' "$RESTIC_STATION_DATA_DIR/config.v1.backup.json"
           grep -qE '"machineId"[[:space:]]*:[[:space:]]*"[a-z0-9-]+"' "$RESTIC_STATION_DATA_DIR/machine.json"
 

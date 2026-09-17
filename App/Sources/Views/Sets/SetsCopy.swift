@@ -35,11 +35,39 @@ enum SetsCopy {
     static let checkFootnote =
         "Weekly `restic check`; over 20 weeks the entire repository's data is read and verified."
 
-    /// Local destination under `~/Library/Mobile Documents`.
-    static let iCloudWarning =
-        "iCloud may evict repository files with Optimize Mac Storage — this can corrupt reads; "
-        + "consider a non-synced location. Sync folders replicate deletions — treat this as a "
-        + "convenience copy, not your only backup."
+    /// Local destination under iCloud Drive or `~/Library/CloudStorage`.
+    static let cloudRepositoryWarning =
+        "Cloud storage may evict repository files to online-only placeholders. Restic Station "
+        + "will not use the repository while any file is online-only, rather than download it "
+        + "unexpectedly — keep this folder available offline in the cloud provider (for example "
+        + "“Always Keep on This Device” or “Keep Downloaded”). Sync folders replicate deletions — "
+        + "treat this as a convenience copy, not your only backup."
+
+    static let cloudSourceNote =
+        "Cloud-synced folder — follows the set's Online-only Files setting."
+
+    /// Header of the set editor's online-only files section, shown only
+    /// while a source is cloud-synced.
+    static let onlineOnlyFilesHeader = "Online-only Files"
+
+    static func onlineOnlyFilesLabel(_ policy: OnlineOnlyFiles) -> String {
+        switch policy {
+        case .skip: return "Skip"
+        case .download: return "Download"
+        }
+    }
+
+    static func onlineOnlyFilesFooter(_ policy: OnlineOnlyFiles) -> String {
+        switch policy {
+        case .skip:
+            return "Files the cloud provider keeps only online are left out of snapshots instead of "
+                + "being downloaded (restic 0.19 or newer). Keep the folder available offline in the "
+                + "provider if every file must be backed up."
+        case .download:
+            return "restic reads every file, so the cloud provider downloads each online-only file "
+                + "first. Snapshots are complete, at the cost of the download and the disk space."
+        }
+    }
 
     /// Local destination under `/Volumes`.
     static let removableVolumeNote = "Removable volume — will be skipped when not mounted"

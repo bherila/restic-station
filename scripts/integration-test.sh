@@ -380,7 +380,7 @@ build_helper() {
 # write_config <retention-json-or-null>
 #
 # Deliberately written at schema **version 1**, with `resticPath` in
-# config.json: every helper invocation below therefore runs the real v1 → v3
+# config.json: every helper invocation below therefore runs the real v1 → v4
 # migration (docs/data-model.md §Versioning & migration) against a real
 # restic, which `assert_migration` checks once up front. Rewriting the file
 # at v1 again between scenarios is fine — migration is idempotent and never
@@ -593,13 +593,13 @@ assert_run4() {
 # migrates non-destructively and keeps backing up exactly what it did before.
 # Runs after the first backup, so migration has definitely happened.
 assert_migration() {
-    local step="migration (v1 -> v3, resticPath relocated, v1 backed up)"
+    local step="migration (v1 -> v4, resticPath relocated, v1 backed up)"
     log "$step"
 
     local version restic_in_config machine_id machine_restic
     version="$(jq -r '.version' "$DATA_DIR/config.json")"
     restic_in_config="$(jq -r '.resticPath' "$DATA_DIR/config.json")"
-    [[ "$version" == "3" ]] || fail "$step" "expected config.json at version 3, got '$version'"
+    [[ "$version" == "4" ]] || fail "$step" "expected config.json at version 4, got '$version'"
     [[ "$restic_in_config" == "null" ]] || fail "$step" "expected resticPath cleared, got '$restic_in_config'"
 
     # No `machines` keys invented: absence already means "runs everywhere".

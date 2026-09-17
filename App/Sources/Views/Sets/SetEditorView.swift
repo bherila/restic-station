@@ -21,7 +21,7 @@ enum SetEditorSaveState {
 }
 
 /// The set editor (`docs/ui-spec.md` §Backup Sets, **Set editor**): name,
-/// sources, excludes, purge excludes, schedule, staleness warning, retention, integrity
+/// sources, online-only files, excludes, purge excludes, schedule, staleness warning, retention, integrity
 /// checks, destinations.
 ///
 /// Editing rules (T14): every change lands in a **draft copy**; *Save*
@@ -65,6 +65,8 @@ struct SetEditorView: View {
                 sources: $draft.sources,
                 errorMessage: fieldErrors[.sources]
             )
+
+            OnlineOnlyFilesSection(policy: $draft.onlineOnlyFiles, sources: draft.sourcesOnAnyMachine)
 
             ExcludesSection(excludes: $draft.excludes)
 

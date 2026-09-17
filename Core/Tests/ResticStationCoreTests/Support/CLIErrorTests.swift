@@ -33,6 +33,9 @@ private let representative: [CLIErrorCode: CLIFailure] = [
     .setBusy: .setBusy(setId: setId),
     .repositoryLocked: .classify(exitClass: .repoLocked),
     .repositoryNotInitialized: .classify(exitClass: .repoDoesNotExist),
+    .cloudRepositoryNotHydrated: .classify(
+        ResticRunnerError.cloudRepositoryNotHydrated(destinationId: destId, relativePath: "data/ab/cdef")
+    ),
     .secretUnavailable: .classify(SecretStoreError.backendFailed("security: SecKeychainSearchCopyNext: user canceled")),
     .secretNotConfigured: .classify(SecretStoreError.itemNotFound),
     .secretStoreUnusable: .classify(
@@ -109,6 +112,7 @@ struct CLIErrorContractTests {
         #expect(CLIErrorCode.repositoryOffline.rawValue == "repository_offline")
         #expect(CLIErrorCode.repositoryLocked.rawValue == "repository_locked")
         #expect(CLIErrorCode.repositoryNotInitialized.rawValue == "repository_not_initialized")
+        #expect(CLIErrorCode.cloudRepositoryNotHydrated.rawValue == "cloud_repository_not_hydrated")
         #expect(CLIErrorCode.secretUnavailable.rawValue == "secret_unavailable")
         #expect(CLIErrorCode.secretRejected.rawValue == "secret_rejected")
         #expect(CLIErrorCode.secretNotConfigured.rawValue == "secret_not_configured")
@@ -121,7 +125,7 @@ struct CLIErrorContractTests {
         #expect(CLIErrorCode.operationNotAllowed.rawValue == "operation_not_allowed")
         #expect(CLIErrorCode.operationCompletedAuditFailed.rawValue == "operation_completed_audit_failed")
         #expect(CLIErrorCode.internalError.rawValue == "internal_error")
-        #expect(CLIErrorCode.allCases.count == 23)
+        #expect(CLIErrorCode.allCases.count == 24)
     }
 
     @Test("only busy and offline leave exit 1 — the coarse shell contract is unchanged")

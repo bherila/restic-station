@@ -27,9 +27,7 @@ import Foundation
 /// Deliberately absent, each for a reason recorded in `docs/cli-json.md`:
 /// `config_missing` (a missing `config.json` is an empty config, not an
 /// error — see ``ConfigStore/load()``), the `preview_*` family (the
-/// mechanism lands with #82/#88), and `cloud_repository_not_hydrated` (no
-/// detector exists, and inferring it would mean matching restic's English
-/// stderr — exactly what this contract is meant to stop callers doing).
+/// mechanism lands with #82/#88).
 public enum CLIErrorCode: String, Sendable, Codable, CaseIterable, Equatable {
 
     // ── The request could not be understood ───────────────────────────────
@@ -125,6 +123,13 @@ public enum CLIErrorCode: String, Sendable, Codable, CaseIterable, Equatable {
 
     /// restic exit 10: nothing is initialized at this location.
     case repositoryNotInitialized = "repository_not_initialized"
+    /// A local repository inside a cloud-synced folder has at least one
+    /// dataless (online-only) entry, so restic was not started: reading it
+    /// would make macOS download repository data implicitly. Detected from
+    /// file metadata by ``ResticRunner``'s pre-flight, never from restic's
+    /// stderr. Not retryable: it clears only once someone makes the
+    /// repository available offline.
+    case cloudRepositoryNotHydrated = "cloud_repository_not_hydrated"
 
     // ── restic itself ─────────────────────────────────────────────────────
 
@@ -190,7 +195,8 @@ extension CLIErrorCode {
              .destinationNotFound, .destinationDisabledHere, .runNotFound,
              .repositoryLocked, .secretUnavailable, .secretRejected,
              .secretNotConfigured, .secretStoreUnusable,
-             .repositoryNotInitialized, .resticNotFound, .resticUnsupported,
+             .repositoryNotInitialized, .cloudRepositoryNotHydrated,
+             .resticNotFound, .resticUnsupported,
              .resticFailed, .operationTimedOut, .previewExpired, .operationNotAllowed,
              .operationCompletedAuditFailed, .internalError:
             return .error
@@ -213,7 +219,7 @@ extension CLIErrorCode {
         case .invalidArguments, .configInvalid, .setNotFound, .setDisabledHere,
              .destinationNotFound, .destinationDisabledHere, .runNotFound,
              .secretRejected, .secretNotConfigured, .secretStoreUnusable,
-             .repositoryNotInitialized, .resticNotFound,
+             .repositoryNotInitialized, .cloudRepositoryNotHydrated, .resticNotFound,
              .resticUnsupported, .resticFailed, .previewExpired, .operationNotAllowed,
              .operationCompletedAuditFailed, .internalError:
             return false
@@ -836,6 +842,15 @@ extension CLIFailure {
         case .secretsStoreUnusable(let destinationId):
             return CLIFailure(
                 code: .secretStoreUnusable,
+                message: error.userFacingMessage,
+                details: CLIErrorDetails(
+                    destinationId: destinationId,
+                    resticCategory: error.category
+                )
+            )
+        case .cloudRepositoryNotHydrated(let destinationId, _):
+            return CLIFailure(
+                code: .cloudRepositoryNotHydrated,
                 message: error.userFacingMessage,
                 details: CLIErrorDetails(
                     destinationId: destinationId,

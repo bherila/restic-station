@@ -14,7 +14,7 @@ import Testing
 /// about: absent `machines` means inherit and run everywhere.
 let dataModelExampleConfigJSON = """
 {
-  "version": 3,
+  "version": 4,
   "resticPath": "/opt/homebrew/bin/restic",
   "showMenuBarIcon": true,
   "sets": [
@@ -24,6 +24,7 @@ let dataModelExampleConfigJSON = """
       "sources": ["/Users/user/proj", "/Users/user/.gitconfig"],
       "excludes": ["node_modules", ".build", "*.tmp"],
       "purgeExcludes": ["DerivedData"],
+      "onlineOnlyFiles": "skip",
       "schedule": { "kind": "daily", "hour": 2, "minute": 30 },
       "retention": {
         "keepLast": null, "keepHourly": null, "keepDaily": 7,
@@ -66,11 +67,12 @@ let dataModelExampleConfigJSON = """
         try config.validate()
 
         // Field-for-field checks against the documented example.
-        #expect(config.version == 3)
+        #expect(config.version == 4)
         #expect(config.resticPath == "/opt/homebrew/bin/restic")
         #expect(config.showMenuBarIcon == true)
         #expect(config.sets.count == 1)
         #expect(config.sets[0].purgeExcludes == ["DerivedData"])
+        #expect(config.sets[0].onlineOnlyFiles == .skip)
 
         let set = config.sets[0]
         #expect(set.id == UUID(uuidString: "6F9619FF-8B86-D011-B42D-00C04FC964FF"))
@@ -233,6 +235,7 @@ let dataModelExampleConfigJSON = """
               "sources": ["/src/a"],
               "excludes": [],
               "purgeExcludes": [],
+              "onlineOnlyFiles": "skip",
               "schedule": { "kind": "everyMinutes", "minutes": 30 },
               "retention": null,
               "checkPolicy": null,
@@ -253,6 +256,7 @@ let dataModelExampleConfigJSON = """
               "sources": ["/src/b"],
               "excludes": ["*.tmp"],
               "purgeExcludes": [],
+              "onlineOnlyFiles": "skip",
               "schedule": { "kind": "hourly", "minute": 15 },
               "retention": { "keepLast": 5, "keepHourly": null, "keepDaily": null, "keepWeekly": null, "keepMonthly": null, "keepYearly": null },
               "checkPolicy": { "enabled": false, "readDataSubsetSlices": 10 },
@@ -280,6 +284,7 @@ let dataModelExampleConfigJSON = """
               "sources": ["/src/c"],
               "excludes": [],
               "purgeExcludes": [],
+              "onlineOnlyFiles": "skip",
               "schedule": { "kind": "daily", "hour": 2, "minute": 30 },
               "retention": { "keepLast": null, "keepHourly": null, "keepDaily": null, "keepWeekly": null, "keepMonthly": null, "keepYearly": null },
               "checkPolicy": null,
@@ -300,6 +305,7 @@ let dataModelExampleConfigJSON = """
               "sources": ["/src/d"],
               "excludes": [],
               "purgeExcludes": [],
+              "onlineOnlyFiles": "skip",
               "schedule": { "kind": "weekly", "weekday": 7, "hour": 23, "minute": 59 },
               "retention": null,
               "checkPolicy": null,
@@ -346,6 +352,7 @@ let dataModelMachinesExampleJSON = """
       "sources": ["/Users/bwh/Documents"],
       "excludes": [],
       "purgeExcludes": [],
+      "onlineOnlyFiles": "skip",
       "schedule": { "kind": "daily", "hour": 2, "minute": 30 },
       "retention": null,
       "checkPolicy": null,
@@ -777,5 +784,82 @@ private func backupSetJSON(purgeExcludesField: String) -> String {
     @Test func anEmptyStringEntryInPlainExcludesStillValidates() throws {
         let config = AppConfig(sets: [set(excludes: ["", "node_modules"])])
         try config.validate()
+    }
+}
+
+// MARK: - onlineOnlyFiles (schema v4)
+
+private func backupSetJSON(onlineOnlyFilesField: String) -> String {
+    backupSetJSON(purgeExcludesField: #","purgeExcludes":[]"# + onlineOnlyFilesField)
+}
+
+/// `BackupSet.onlineOnlyFiles` was added at schema v4 and follows
+/// `purgeExcludes`' contract: absent or `null` decodes (so a pre-v4 file
+/// can load and migrate), and the key is always written.
+@Suite struct BackupSetOnlineOnlyFilesCompatibilityTests {
+    @Test func decodesLegacySetWithoutTheKeyAsSkip() throws {
+        let set = try ConfigStore.makeDecoder().decode(
+            BackupSet.self, from: Data(backupSetJSON(onlineOnlyFilesField: "").utf8)
+        )
+        #expect(set.onlineOnlyFiles == .skip)
+    }
+
+    @Test func decodesExplicitNullAsSkip() throws {
+        let set = try ConfigStore.makeDecoder().decode(
+            BackupSet.self, from: Data(backupSetJSON(onlineOnlyFilesField: #","onlineOnlyFiles":null"#).utf8)
+        )
+        #expect(set.onlineOnlyFiles == .skip)
+    }
+
+    @Test func downloadRoundTrips() throws {
+        let set = try ConfigStore.makeDecoder().decode(
+            BackupSet.self, from: Data(backupSetJSON(onlineOnlyFilesField: #","onlineOnlyFiles":"download""#).utf8)
+        )
+        #expect(set.onlineOnlyFiles == .download)
+        let reencoded = try ConfigStore.makeDecoder().decode(BackupSet.self, from: ConfigStore.makeEncoder().encode(set))
+        #expect(reencoded == set)
+    }
+
+    /// A value this build does not know is a config it cannot honour, not a
+    /// default: reading it as `.skip` would quietly change what gets backed
+    /// up.
+    @Test func anUnknownValueIsRefused() {
+        #expect(throws: DecodingError.self) {
+            try ConfigStore.makeDecoder().decode(
+                BackupSet.self, from: Data(backupSetJSON(onlineOnlyFilesField: #","onlineOnlyFiles":"ask""#).utf8)
+            )
+        }
+    }
+
+    @Test func theKeyIsAlwaysPresentInEncodedOutput() throws {
+        let set = BackupSet(
+            id: UUID(),
+            name: "Plain",
+            sources: ["/src"],
+            schedule: .daily(hour: 1, minute: 0),
+            destinations: [Destination(id: UUID(), label: "Primary", repoURL: "/repo", isPrimary: true)]
+        )
+        let object = try JSONSerialization.jsonObject(with: ConfigStore.makeEncoder().encode(set)) as? [String: Any]
+        #expect(object?["onlineOnlyFiles"] as? String == "skip")
+    }
+}
+
+@Suite struct BackupSetSourcesOnAnyMachineTests {
+    @Test func includesEveryOverrideReplacementOnce() {
+        let set = BackupSet(
+            id: UUID(),
+            name: "Docs",
+            sources: ["/Users/user/proj"],
+            schedule: .daily(hour: 1, minute: 0),
+            destinations: [Destination(id: UUID(), label: "Primary", repoURL: "/repo", isPrimary: true)],
+            machines: [
+                "work-mac": BackupSetMachineOverride(sources: ["/Users/user/Library/CloudStorage/Provider/Docs"]),
+                "old-mac": BackupSetMachineOverride(enabled: false),
+                "home-mac": BackupSetMachineOverride(sources: ["/Users/user/proj", "/Users/user/Music"]),
+            ]
+        )
+        #expect(set.sourcesOnAnyMachine == [
+            "/Users/user/proj", "/Users/user/Music", "/Users/user/Library/CloudStorage/Provider/Docs",
+        ])
     }
 }

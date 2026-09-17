@@ -352,6 +352,44 @@ public final class BackupEngine: Sendable {
         var children: [SetRunChild] = []
         var infrastructureFailures: [String] = []
 
+        // Online-only files under a cloud-synced source are skipped rather
+        // than downloaded when the set asks for it, but only by a restic that
+        // accepts the flag on this platform; an older one would fail the
+        // whole backup on it.
+        //
+        // The version answer decides the argv, so it is bound to the bytes
+        // that gave it: the backup launch revalidates that identity and
+        // refuses a restic replaced in between (an upgrade mid-tick) rather
+        // than running an argv decided for a different binary.
+        let excludeCloudFiles: Bool
+        let cloudSourceNote: String?
+        let versionBoundIdentity: String?
+        if !CloudStorageSafety.containsCloudBackedSource(set.sources) {
+            excludeCloudFiles = false
+            cloudSourceNote = nil
+            versionBoundIdentity = nil
+        } else if set.onlineOnlyFiles == .download {
+            excludeCloudFiles = false
+            cloudSourceNote = "cloud-synced source: online-only files are downloaded (set policy)"
+            versionBoundIdentity = nil
+        } else {
+            let bound = await restic.boundResticVersion()
+            let version = bound?.version
+            versionBoundIdentity = bound?.executableIdentity
+            excludeCloudFiles = version.map {
+                VersionInfo.compareVersions($0, ResticRunner.excludeCloudFilesMinimumVersion) >= 0
+            } ?? false
+            if excludeCloudFiles {
+                cloudSourceNote = "cloud-synced source: online-only files are skipped, not downloaded"
+            } else {
+                let note = "warning: cloud-synced source, but restic \(version ?? "(version unknown)") "
+                    + "cannot skip online-only files (needs \(ResticRunner.excludeCloudFilesMinimumVersion)); "
+                    + "reading them will download them"
+                logWarning("BackupEngine: set \"\(set.name)\": \(note)")
+                cloudSourceNote = note
+            }
+        }
+
         // ── Steps 4 + 5: probe primary, then back it up ─────────────────
         let backupResult = await performChild(
             kind: .backup,
@@ -367,12 +405,16 @@ public final class BackupEngine: Sendable {
             command: .backup(
                 repo: primary.repoURL,
                 sources: set.sources,
-                excludes: set.effectiveBackupExcludes
+                excludes: set.effectiveBackupExcludes,
+                excludeCloudFiles: excludeCloudFiles
             ),
-            invocation: ResticInvocation(destination: primary),
+            invocation: ResticInvocation(destination: primary, expectedExecutableIdentity: versionBoundIdentity),
             streamProgress: true,
             preflightPhase: "probing",
             preflight: { [self] logWriter in
+                if let cloudSourceNote {
+                    logWriter?.appendLine(cloudSourceNote)
+                }
                 let probe = await reachability.probe(primary)
                 logWriter?.appendLine("probe primary \"\(primary.label)\": \(describe(probe))")
                 record(probe: probe, for: primary)
@@ -1241,10 +1283,10 @@ public final class BackupEngine: Sendable {
         case .error(let exitClass):
             return .failed(.restic(exitClass))
         case .needsAttention(let attention, let reason):
-            // Reachable only through a race — a concurrent `secret rm` or
-            // `chmod` between the pre-flight above and this probe — which
-            // is exactly why the probe's own `attention` is carried
-            // through instead of assuming one.
+            // A cloud-synced repository with online-only files, or — only
+            // through a race with a concurrent `secret rm` or `chmod` after
+            // the pre-flight above — a secret refusal. The probe's own
+            // `attention` is carried through instead of assuming one.
             return .skipped(.secretRefused(attention, reason))
         }
 
@@ -1405,6 +1447,12 @@ public final class BackupEngine: Sendable {
                 return PurgePlanResult(
                     plan: emptyPlan, status: .secretStoreUnusable, message: refusal.error.description
                 )
+            case .cloudRepositoryNotHydrated:
+                // Not produced from a `SecretStoreError`; listed so this
+                // switch stays exhaustive over every attention.
+                return PurgePlanResult(
+                    plan: emptyPlan, status: .cloudRepositoryNotHydrated, message: refusal.error.description
+                )
             case nil:
                 return PurgePlanResult(
                     plan: emptyPlan, status: .failed, message: "secret store unavailable"
@@ -1440,6 +1488,8 @@ public final class BackupEngine: Sendable {
                 return PurgePlanResult(plan: emptyPlan, status: .secretNotConfigured, message: reason)
             case .secretStoreUnusable:
                 return PurgePlanResult(plan: emptyPlan, status: .secretStoreUnusable, message: reason)
+            case .cloudRepositoryNotHydrated:
+                return PurgePlanResult(plan: emptyPlan, status: .cloudRepositoryNotHydrated, message: reason)
             }
         }
 
@@ -1582,7 +1632,7 @@ public final class BackupEngine: Sendable {
             case .empty, .ready:
                 continue
             case .busy, .offline, .infrastructureFailure, .failed,
-                 .secretNotConfigured, .secretStoreUnusable:
+                 .secretNotConfigured, .secretStoreUnusable, .cloudRepositoryNotHydrated:
                 return PurgePreviewSession(previews: previews, token: nil)
             }
         }

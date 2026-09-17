@@ -23,6 +23,9 @@ final class FakeProcessRunner: ProcessRunning, @unchecked Sendable {
         /// how tests reach the `ProcessRunnerError.timeout` / `.launchFailed`
         /// paths that a scripted exit code cannot express.
         let failure: ProcessRunnerError?
+        /// Runs when this expectation is consumed, before it answers — how a
+        /// test changes the world *during* a child process.
+        let onRun: (@Sendable () -> Void)?
 
         init(
             argvPrefix: [String],
@@ -30,7 +33,8 @@ final class FakeProcessRunner: ProcessRunning, @unchecked Sendable {
             stderr: String = "",
             exitCode: Int32 = 0,
             delay: TimeInterval? = nil,
-            failure: ProcessRunnerError? = nil
+            failure: ProcessRunnerError? = nil,
+            onRun: (@Sendable () -> Void)? = nil
         ) {
             self.argvPrefix = argvPrefix
             self.stdoutLines = stdoutLines
@@ -38,6 +42,7 @@ final class FakeProcessRunner: ProcessRunning, @unchecked Sendable {
             self.exitCode = exitCode
             self.delay = delay
             self.failure = failure
+            self.onRun = onRun
         }
     }
 
@@ -84,6 +89,8 @@ final class FakeProcessRunner: ProcessRunning, @unchecked Sendable {
             )
             throw ProcessRunnerError.launchFailed("FakeProcessRunner: argv mismatch")
         }
+
+        expectation.onRun?()
 
         if let delay = expectation.delay {
             try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))

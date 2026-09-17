@@ -59,6 +59,29 @@ struct EffectiveConfigReportTests {
         #expect(report.excludedHere.isEmpty)
         #expect(report.sets[0].excludes == [".DS_Store"])
         #expect(report.sets[0].purgeExcludes == ["node_modules"])
+        #expect(report.sets[0].onlineOnlyFiles == .skip)
+    }
+
+    @Test("the online-only files line appears only for a set with a cloud-synced source")
+    func onlineOnlyFilesLineOnlyForCloudSources() throws {
+        var config = fleetConfig()
+        config.sets[0].machines = nil
+        let plain = EffectiveConfigReport.build(
+            addressable: config.addressable(for: "studio-mac"),
+            scheduled: config.resolved(for: "studio-mac")
+        )
+        #expect(!plain.humanLines().contains { $0.contains("online-only files") })
+
+        config.sets[0].sources = [
+            (NSHomeDirectory() as NSString).appendingPathComponent("Library/CloudStorage/Provider-Example/Documents"),
+        ]
+        config.sets[0].onlineOnlyFiles = .download
+        let cloud = EffectiveConfigReport.build(
+            addressable: config.addressable(for: "studio-mac"),
+            scheduled: config.resolved(for: "studio-mac")
+        )
+        #expect(cloud.humanLines().contains("    online-only files: download"))
+        #expect(cloud.sets[0].onlineOnlyFiles == .download)
     }
 
     /// The headline case: a set disabled on `mirror-box` still appears in

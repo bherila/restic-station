@@ -77,6 +77,9 @@ struct SourcesSection: View {
                 return "Inside “\(other)”, which is already a source — it is backed up either way."
             }
         }
+        if CloudStorageSafety.reachesCloudStorage(path) {
+            return SetsCopy.cloudSourceNote
+        }
         return nil
     }
 
@@ -111,6 +114,35 @@ struct SourcesSection: View {
 
 /// "**Excludes**: editable string list; caption linking restic
 /// exclude-pattern syntax." (`docs/ui-spec.md` §Backup Sets)
+/// "**Online-only files**" (`docs/ui-spec.md` §Backup Sets): shown only
+/// while a source reaches cloud storage on some machine — the shared list or
+/// any machine override's replacement (``BackupSet/sourcesOnAnyMachine``) —
+/// since the policy does nothing otherwise.
+struct OnlineOnlyFilesSection: View {
+    @Binding var policy: OnlineOnlyFiles
+    let sources: [String]
+
+    var body: some View {
+        if CloudStorageSafety.containsCloudBackedSource(sources) {
+            Section {
+                Picker("Online-only files", selection: $policy) {
+                    ForEach(OnlineOnlyFiles.allCases, id: \.self) { option in
+                        Text(SetsCopy.onlineOnlyFilesLabel(option)).tag(option)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+            } header: {
+                Text(SetsCopy.onlineOnlyFilesHeader)
+            } footer: {
+                Text(SetsCopy.onlineOnlyFilesFooter(policy))
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+}
+
 struct ExcludesSection: View {
     @Binding var excludes: [String]
 

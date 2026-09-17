@@ -116,6 +116,7 @@ never match on it. `details` is omitted entirely when empty.
 | `repository_offline` | **yes** | **3** | The destination did not answer — an unplugged drive, a sleeping NAS. Expected, not a fault. |
 | `repository_locked` | **yes** | 1 | restic exit 11: another restic process holds the repository lock. |
 | `repository_not_initialized` | no | 1 | restic exit 10: nothing is initialized at that location. |
+| `cloud_repository_not_hydrated` | no | 1 | A local repository inside a cloud-synced folder (`~/Library/Mobile Documents`, `~/Library/CloudStorage`) has an online-only entry, so restic was not started — reading it would download repository data implicitly. Detected from file metadata, never from restic's stderr: the local reachability probe reports it, so `probe-repo`, `maintenance prune` and `purge preview`/`purge apply` publish it before anything runs restic. `message` names the online-only entry. Make the repository folder available offline in the cloud provider, then retry. |
 | `secret_unavailable` | **yes** | 1 | The secret backend answered badly and may answer well later — a locked login keychain at a pre-login tick, a transient I/O error, a lock held by a stuck peer. Every remaining `errno` wrapper in the file backend is here, because no `errno` set is uniformly permanent. A structurally unusable `secrets.lock` is instead non-retryable `internal_error`. |
 | `secret_not_configured` | no | 1 | The backend answered "no such item": no password is stored for this destination. Run `secret set`. Also what `ResticRunner`'s pre-flight reports, so the distinction survives to the commands that actually run restic. |
 | `secret_store_unusable` | no | 1 | The store could not be consulted at all, and repeating the request cannot change that: a symlinked `secrets.json`, one that is group- or world-accessible, one owned outside the helper's trust boundary, contents that do not decode (the outer document or a stored secret-env blob, on either backend), a document written by a newer format version, a directory another user could replace entries in, or a filesystem that does not honour `chmod`. `message` carries the backend's own refusal, which names the exact `chmod`, `chown`, or move to perform. Reported by every command that reads a secret, `maintenance prune`, `purge preview`/`purge apply` and `probe-repo` included — none of them may report it as retryable or as a restic failure, because restic never ran. One gap is known and tracked: the engine's pre-flight reads only the password, so a destination with a good password beside an unparseable `<uuid>-env` blob is not refused at the pre-flight and surfaces later as a restic failure instead. Closing it means reading the environment on exactly the paths that pass it to local restic (remote maintenance does not), which is engine-pre-flight work — see #95. |
@@ -387,9 +388,10 @@ arrive:
 - **`preview_required` / `preview_stale` / `preview_already_used`** — these
   may be useful for a future preview-token operation, but no current path
   produces them. `preview_expired` is defined above because purge does.
-- **`cloud_repository_not_hydrated`** — no detector exists. Inferring it would
-  mean matching restic's English stderr, which is exactly the practice this
-  contract exists to stop.
+
+`cloud_repository_not_hydrated`, also from #81's taxonomy, was absent until
+`ResticRunner` gained a metadata-based pre-flight that detects it without
+reading restic's stderr; it is defined above.
 
 Four codes not in that list are defined: `secret_rejected`,
 `secret_not_configured` and `secret_store_unusable` (see §`retryable`)

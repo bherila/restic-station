@@ -82,12 +82,20 @@ public struct ResticCommand: Equatable, Sendable {
 
     // MARK: - backup / copy
 
-    /// `restic -r <primaryRepo> backup --json [--exclude <pat>]... <source>...`
+    /// `restic -r <primaryRepo> backup --json [--exclude-cloud-files] [--exclude <pat>]... <source>...`
     ///
     /// Sources must be absolute paths (enforced by `AppConfig.validate()`).
-    public static func backup(repo: String, sources: [String], excludes: [String] = []) -> ResticCommand {
+    public static func backup(
+        repo: String,
+        sources: [String],
+        excludes: [String] = [],
+        excludeCloudFiles: Bool = false
+    ) -> ResticCommand {
         precondition(!sources.isEmpty, "ResticCommand.backup requires at least one source path")
         var argv = ["-r", repo, "backup", "--json"]
+        if excludeCloudFiles {
+            argv.append("--exclude-cloud-files")
+        }
         for exclude in excludes {
             argv.append("--exclude")
             argv.append(exclude)

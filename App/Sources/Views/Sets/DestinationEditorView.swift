@@ -194,8 +194,8 @@ struct DestinationEditorView: View {
                 Button("Choose…") { chooseFolder() }
             }
 
-            if isICloudPath {
-                InlineMessage(SetsCopy.iCloudWarning, level: .warning)
+            if isCloudStoragePath {
+                InlineMessage(SetsCopy.cloudRepositoryWarning, level: .warning)
             }
             if isRemovableVolumePath {
                 InlineMessage(removableVolumeText, level: .info)
@@ -512,11 +512,8 @@ struct DestinationEditorView: View {
         return false
     }
 
-    private var isICloudPath: Bool {
-        let path = (localPath as NSString).standardizingPath
-        let mobileDocuments = (NSHomeDirectory() as NSString)
-            .appendingPathComponent("Library/Mobile Documents")
-        return !path.isEmpty && path.hasPrefix(mobileDocuments)
+    private var isCloudStoragePath: Bool {
+        CloudStorageSafety.isCloudSyncedPath(localPath)
     }
 
     private var isRemovableVolumePath: Bool {

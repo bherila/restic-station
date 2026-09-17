@@ -221,6 +221,11 @@ public struct ConfigStore: Sendable {
     /// - **v2 → v3.** An absent `purgeExcludes` decodes as `[]` (see
     ///   `BackupSet.init(from:)`), which is "no patterns are purged" — the
     ///   behaviour every pre-v3 config already had. A pure version bump.
+    /// - **v3 → v4.** An absent `onlineOnlyFiles` decodes as `.skip`. Unlike
+    ///   the steps before it, that is *not* the pre-v4 behaviour: a v3 build
+    ///   let restic download online-only cloud files. It is still a pure
+    ///   version bump — no value is written — and the change is deliberate
+    ///   (`docs/data-model.md` §v3 → v4).
     ///
     /// The pre-migration bytes are copied to `config.v<from>.backup.json`,
     /// keyed by the version being migrated *from*, so each step of the chain
