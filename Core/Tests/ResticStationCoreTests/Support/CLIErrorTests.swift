@@ -125,7 +125,7 @@ struct CLIErrorContractTests {
         #expect(CLIErrorCode.operationNotAllowed.rawValue == "operation_not_allowed")
         #expect(CLIErrorCode.operationCompletedAuditFailed.rawValue == "operation_completed_audit_failed")
         #expect(CLIErrorCode.internalError.rawValue == "internal_error")
-        #expect(CLIErrorCode.allCases.count == 23)
+        #expect(CLIErrorCode.allCases.count == 24)
     }
 
     @Test("only busy and offline leave exit 1 — the coarse shell contract is unchanged")
