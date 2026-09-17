@@ -44,7 +44,7 @@ enum SetsCopy {
         + "treat this as a convenience copy, not your only backup."
 
     static let cloudSourceNote =
-        "Cloud-synced folder — see Online-only Files below."
+        "Cloud-synced folder — follows the set's Online-only Files setting."
 
     /// Header of the set editor's online-only files section, shown only
     /// while a source is cloud-synced.

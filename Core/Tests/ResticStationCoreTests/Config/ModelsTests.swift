@@ -843,3 +843,23 @@ private func backupSetJSON(onlineOnlyFilesField: String) -> String {
         #expect(object?["onlineOnlyFiles"] as? String == "skip")
     }
 }
+
+@Suite struct BackupSetSourcesOnAnyMachineTests {
+    @Test func includesEveryOverrideReplacementOnce() {
+        let set = BackupSet(
+            id: UUID(),
+            name: "Docs",
+            sources: ["/Users/user/proj"],
+            schedule: .daily(hour: 1, minute: 0),
+            destinations: [Destination(id: UUID(), label: "Primary", repoURL: "/repo", isPrimary: true)],
+            machines: [
+                "work-mac": BackupSetMachineOverride(sources: ["/Users/user/Library/CloudStorage/Provider/Docs"]),
+                "old-mac": BackupSetMachineOverride(enabled: false),
+                "home-mac": BackupSetMachineOverride(sources: ["/Users/user/proj", "/Users/user/Music"]),
+            ]
+        )
+        #expect(set.sourcesOnAnyMachine == [
+            "/Users/user/proj", "/Users/user/Music", "/Users/user/Library/CloudStorage/Provider/Docs",
+        ])
+    }
+}

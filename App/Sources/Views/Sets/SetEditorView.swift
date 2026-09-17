@@ -66,7 +66,7 @@ struct SetEditorView: View {
                 errorMessage: fieldErrors[.sources]
             )
 
-            OnlineOnlyFilesSection(policy: $draft.onlineOnlyFiles, sources: draft.sources)
+            OnlineOnlyFilesSection(policy: $draft.onlineOnlyFiles, sources: draft.sourcesOnAnyMachine)
 
             ExcludesSection(excludes: $draft.excludes)
 

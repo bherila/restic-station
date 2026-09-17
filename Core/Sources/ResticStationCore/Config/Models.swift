@@ -220,6 +220,17 @@ public struct BackupSet: Codable, Equatable, Identifiable, Sendable {
         var seen = Set<String>()
         return (excludes + purgeExcludes).filter { seen.insert($0).inserted }
     }
+
+    /// The shared ``sources`` followed by every per-machine replacement
+    /// list, deduped in first-occurrence order — every path this set backs
+    /// up on *some* machine. For editors deciding whether a set-level option
+    /// that depends on its sources can apply anywhere (a machine override may
+    /// swap a local source list for a cloud-synced one).
+    public var sourcesOnAnyMachine: [String] {
+        let overrides = (machines ?? [:]).keys.sorted().compactMap { machines?[$0]?.sources }
+        var seen = Set<String>()
+        return ([sources] + overrides).flatMap { $0 }.filter { seen.insert($0).inserted }
+    }
 }
 
 // MARK: - OnlineOnlyFiles
