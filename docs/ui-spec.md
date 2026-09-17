@@ -33,6 +33,8 @@ Quitting the app does NOT stop scheduled backups (they're launchd's job) — the
 
 **List** (sidebar selection → content): table/list of sets: name, source count, primary destination label + kind icon, schedule summary ("Daily 02:30"), last run status badge, next due time (via ScheduleMath, display only). Toolbar: add set, delete set (confirmation: "Deletes the backup set configuration. Repositories and snapshots are NOT touched."). Empty state: short explainer + "Create your first backup set".
 
+Double-clicking a recorded status in the **Last backup** cell opens that exact backup run in **Runs**, with its warning/error reason and full log. The set context menu and status accessibility action also offer **Open Run Details**. Double-clicking other cells still opens the set editor. Running and never-run statuses have no completed-run shortcut.
+
 The toolbar's **Effective Plan** sheet lists the union of machine IDs referenced anywhere in `config.json`, plus this host's `machineId`. Picking a machine previews every effective source, schedule, repository URL, enabled destination, and exclusion reason. This is a preview of the shared configuration only; it never changes the host-local `machine.json`.
 
 **Set editor** (form):
@@ -58,7 +60,7 @@ The toolbar's **Effective Plan** sheet lists the union of machine IDs referenced
 ## Runs
 
 - **List**: newest-first, grouped by `groupId` (a scheduled run shows backup + its copies/prunes nested). Columns: time, set, kind icon, destination, status badge, duration, data added. Filter bar: set, kind, status. A `running` run shows a progress bar fed by `current-run-<setId>.json`.
-- **Detail**: metadata header (status, trigger, snapshot id monospaced+copyable, files new/changed/unmodified, data added (packed), total processed, duration); scrolling monospaced log view — tail -f while running (re-read on StateWatcher events), full content when finished. "Reveal log in Finder" button.
+- **Detail**: metadata header (status, trigger, snapshot id monospaced+copyable, files new/changed/unmodified, data added (packed), total processed, duration); scrolling selectable monospaced native text view with noncontiguous layout for long logs — tail -f while running (re-read on StateWatcher events). Displayed text retains the existing one-million-character cap; truncated output is marked and the complete file remains available through Finder. "Reveal log in Finder" button.
 - Toolbar: **Back Up Now** (per-set picker or context), disabled with explanation while that set is busy.
 
 ## Restore

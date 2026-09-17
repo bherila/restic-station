@@ -20,7 +20,6 @@ struct RunDetailView: View {
     @State private var followTail = true
     @State private var didCopySnapshotId = false
 
-    private static let logBottomAnchor = "run-log-bottom"
 
     var body: some View {
         VSplitView {
@@ -323,29 +322,12 @@ struct RunDetailView: View {
 
             Divider()
 
-            ScrollViewReader { proxy in
-                ScrollView(.vertical) {
-                    VStack(alignment: .leading, spacing: 0) {
-                        Text(logText)
-                            .font(.system(.caption, design: .monospaced))
-                            .textSelection(.enabled)
-                            .foregroundStyle(log.text.isEmpty ? AnyShapeStyle(.secondary) : AnyShapeStyle(.primary))
-                            .fixedSize(horizontal: false, vertical: true)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                        Color.clear
-                            .frame(height: 1)
-                            .id(Self.logBottomAnchor)
-                    }
-                    .padding(12)
-                }
-                .onChange(of: log.text) { _, _ in
-                    guard isRunning, followTail else { return }
-                    proxy.scrollTo(Self.logBottomAnchor, anchor: .bottom)
-                }
-                .onAppear {
-                    proxy.scrollTo(Self.logBottomAnchor, anchor: .bottom)
-                }
-            }
+            RunLogTextView(
+                text: logText,
+                isPlaceholder: log.text.isEmpty,
+                followTail: isRunning && followTail
+            )
+            .id(runId)
             .background(Color(nsColor: .textBackgroundColor))
         }
     }
