@@ -12,6 +12,11 @@ import Darwin
 /// pack is part of one repository, so skipping an evicted file would make the
 /// repository incomplete. Repository operations are therefore refused while
 /// any dataless entry is present.
+///
+/// Every check here is a scan taken before restic launches. It cannot bind
+/// what happens after: macOS may evict a file between the scan and the
+/// spawn, or during a long run, and restic reading it then downloads it.
+/// Enforcing that on the child process is #156.
 public enum CloudStorageSafety {
     /// Whether `path` lies under one of the two standard macOS roots used by
     /// iCloud Drive and File Provider services such as OneDrive, SharePoint,
