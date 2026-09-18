@@ -78,6 +78,15 @@ These three rules account for the largest clusters of past review findings
 
 ## Environment facts
 
+- **Claude Code cloud sessions** (claude.ai/code) run on Ubuntu 24.04
+  x86_64, with Swift 6.1.3 (the `linux` CI job's toolchain), restic 0.18.1
+  and jq from the Swift cloud environment's setup script. They can run the
+  `linux` job's steps: `swift build`, `swift test`,
+  `swift test --package-path Core`, `scripts/secret-cli-test.sh`. They cannot
+  build or test `App/`, run `xcodebuild`, sign, or reproduce macOS-only
+  behaviour: there is no Xcode or macOS SDK. Say what went unverified rather
+  than inferring macOS results from a Linux run; that work needs a Mac (Claude
+  Code Remote Control, or a local session).
 - A config schema version bump affects every machine sharing a repo; hosts
   must upgrade in lockstep or backups stop on the laggard. Treat migrations
   as fleet events, not code details (`docs/data-model.md` §Versioning).
