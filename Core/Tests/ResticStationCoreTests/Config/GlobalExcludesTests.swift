@@ -114,26 +114,65 @@ import Testing
         let off = GlobalExcludeCatalog.groups.filter { !$0.enabledByDefault }.map(\.id)
         #expect(
             off == [
-                "container-engines", "game-installs",
+                "container-engines", "game-and-media-libraries",
                 "virtual-machine-images", "installers-and-disk-images",
             ]
         )
     }
 
     /// The split that keeps the on-by-default half honest: a launcher's
-    /// caches are regenerable and stay on, while the installation roots
-    /// they sit beside are the opt-in group. An install-root pattern that
-    /// drifted back into the caches group would silently stop backing up
-    /// modded games on every host that upgrades.
-    @Test func theGameCachesGroupNamesNoInstallationRoot() throws {
+    /// download staging and a transcoder cache are regenerable and stay on,
+    /// while the stores they sit beside — game installation roots, and
+    /// Plex's metadata and media — are the opt-in group. Either can hold
+    /// something that exists nowhere else: a hand-installed mod, or a poster
+    /// uploaded through Plex rather than filed beside the media. One of
+    /// those patterns drifting back into the caches group would silently
+    /// stop backing it up on every host that upgrades.
+    @Test func theCachesGroupNamesNoStoreThatCanHoldAnOnlyCopy() throws {
         let caches = try #require(GlobalExcludeCatalog.group(id: "game-and-media-caches"))
-        let installs = try #require(GlobalExcludeCatalog.group(id: "game-installs"))
+        let libraries = try #require(GlobalExcludeCatalog.group(id: "game-and-media-libraries"))
         #expect(caches.enabledByDefault)
-        #expect(!installs.enabledByDefault)
-        for root in installs.patterns.map(\.pattern) {
-            #expect(!caches.patterns.map(\.pattern).contains(root))
+        #expect(!libraries.enabledByDefault)
+
+        let cachePatterns = caches.patterns.map(\.pattern)
+        for store in libraries.patterns.map(\.pattern) {
+            #expect(!cachePatterns.contains(store))
         }
-        #expect(!caches.patterns.map(\.pattern).contains("Steam/steamapps/common"))
+        // Named explicitly, so the assertion survives a rewrite of either
+        // group's contents.
+        for store in ["Steam/steamapps/common", "Plex Media Server/Metadata", "Plex Media Server/Media"] {
+            #expect(!cachePatterns.contains(store))
+            #expect(libraries.patterns.map(\.pattern).contains(store))
+        }
+        // The one Plex path that really is a cache stays on by default.
+        #expect(cachePatterns.contains("Plex Media Server/Cache"))
+    }
+
+    /// A host pattern is deduplicated against the other host patterns and
+    /// **not** against the catalogue.
+    ///
+    /// Sharing one `seen` set dropped `excludes add '*.icloud'` because the
+    /// catalogue already carried that text — and on a set using
+    /// `onlineOnlyFiles: "download"`, where the catalogue's copy is held
+    /// back on purpose, that left nothing reaching restic at all.
+    @Test func aHostPatternIsNeverDroppedBecauseTheCatalogueSharesItsText() {
+        var settings = GlobalExcludeSettings()
+        settings.extraPatterns = ["*.icloud", "/srv/scratch", "/srv/scratch"]
+        let plan = settings.plan(on: .macOS)
+
+        #expect(plan.hostPatterns == ["*.icloud", "/srv/scratch"])
+        #expect(plan.cloudPlaceholderPatterns == ["*.icloud"])
+
+        // The case that made it matter: the catalogue's copy is held back
+        // for a downloading set, and the host's copy still gets through.
+        let set = BackupSet(
+            id: UUID(), name: "Docs", sources: ["/Users/user/Documents"],
+            onlineOnlyFiles: .download,
+            schedule: .daily(hour: 2, minute: 30),
+            destinations: [Destination(id: UUID(), label: "P", repoURL: "/repo", isPrimary: true)]
+        )
+        #expect(!set.globalBackupExcludes(applying: plan).contains("*.icloud"))
+        #expect(set.hostBackupExcludes(applying: plan).contains("*.icloud"))
     }
 
     /// A VM's disk images are skipped; the few kilobytes that describe the
@@ -296,10 +335,14 @@ import Testing
 
         #expect(plan.patterns.contains("node_modules"))
         #expect(!plan.patterns.contains("*.TMP"))
-        // `node_modules` is already in the catalogue, so only the genuinely
-        // new one survives on the host list.
-        #expect(plan.hostPatterns == ["*.TMP"])
-        #expect(plan.allPatterns.filter { $0 == "node_modules" }.count == 1)
+        // Both survive on the host list, `node_modules` included. It is
+        // **not** dropped for matching a catalogue entry: the catalogue's
+        // copy rides `--iexclude` and this one rides `--exclude`, so they
+        // are different rules, and the catalogue's copy can be held back for
+        // a given set while the host's is not. The visible cost is the same
+        // text reaching restic twice under two flags.
+        #expect(plan.hostPatterns == ["*.TMP", "node_modules"])
+        #expect(plan.allPatterns.filter { $0 == "node_modules" }.count == 2)
     }
 
     @Test func everyKeyIsEncodedExplicitly() throws {
@@ -646,6 +689,34 @@ import Testing
             #expect(!FileManager.default.fileExists(atPath: paths.globalExcludesFile.path))
             let back = try store.load()
             #expect(back == .default)
+        }
+    }
+
+    /// The compare-and-swap must tell "there is no file" from "there is an
+    /// entry I cannot read".
+    ///
+    /// Both used to fingerprint as `nil`, so a Settings pane whose *load*
+    /// failed on a dangling symlink still held its initial `nil` and its
+    /// next toggle compared equal — renaming a defaults-based file over the
+    /// entry and re-enabling every group the unavailable settings had turned
+    /// off. The strict comparison refuses instead.
+    @Test func aConditionalSaveRefusesAnEntryItCannotRead() throws {
+        try withPaths { paths in
+            try paths.ensureDirectories()
+            let absent = paths.root.appendingPathComponent("not-there.json", isDirectory: false)
+            try FileManager.default.createSymbolicLink(
+                at: paths.globalExcludesFile, withDestinationURL: absent
+            )
+            let store = GlobalExcludeStore(paths: paths)
+            // The editor's starting state after a load that threw.
+            #expect(throws: GlobalExcludeError.self) {
+                try store.save(.default, ifUnchangedFrom: nil)
+            }
+            // The link is untouched — nothing was renamed over it.
+            let attributes = try FileManager.default.attributesOfItem(
+                atPath: paths.globalExcludesFile.path
+            )
+            #expect(attributes[.type] as? FileAttributeType == .typeSymbolicLink)
         }
     }
 

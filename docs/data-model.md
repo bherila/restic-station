@@ -222,7 +222,7 @@ The list has three parts, and each lives where its scope actually is:
 ```json
 {
   "version": 1,
-  "catalogVersion": 5,
+  "catalogVersion": 6,
   "enabled": true,
   "excludeCaches": true,
   "excludeLargerThan": null,
@@ -237,7 +237,7 @@ The list has three parts, and each lives where its scope actually is:
 - **`excludeCaches`** — pass `restic backup --exclude-caches`, which skips any directory its own creator tagged `CACHEDIR.TAG` (the Cache Directory Tagging Specification). Cargo, Go and others write that tag, so it catches caches no pattern list knows the name of. Default `true`.
 - **`excludeLargerThan`** — `restic backup --exclude-larger-than <size>` (`500m`, `10G`, …), or `null` — the default — for no cap. Validated as `<digits>[kKmMgGtT]` when it is saved, so a typo fails there rather than at 3 a.m. when the backup refuses to start. **Opt-in, deliberately.** Code42's equivalent list caps at 10 GB by default; every other rule here names a *directory* of regenerable things, while a size cap can drop one irreplaceable file — a video, a dataset, a disk image — with no pattern anyone could point at afterwards.
 - **`groups`** — **only the decisions that differ from the built-in default.** A group absent from this map takes `GlobalExcludeGroup.enabledByDefault`, which is what lets a later build add a group and have it take effect without rewriting anyone's file.
-- **`extraPatterns`** — this host's own patterns. Unlike the catalogue these may be absolute, and they reach restic as case-sensitive `--exclude` rather than `--iexclude`, because a person typed them and meant the case they typed.
+- **`extraPatterns`** — this host's own patterns. Unlike the catalogue these may be absolute, and they reach restic as case-sensitive `--exclude` rather than `--iexclude`, because a person typed them and meant the case they typed. They are deduplicated **only against each other**, never against the catalogue: the same text under two different flags is two different rules, and the catalogue's copy may be held back for a set (§Cloud placeholders) while the host's is not.
 
 **Writes are compare-and-swap, under a lock.** `GlobalExcludeStore.loadFingerprinted()` returns the byte fingerprint the caller read, and `save(_:ifUnchangedFrom:)` refuses if the file has changed since — the same rule `config.json` saves follow (§config.json), for a sharper reason. The Settings pane holds this file while it is open, so without it a `restic-station excludes disable …` run in a terminal is erased by the pane's next toggle; and the decision most likely to be lost is a *disabled* group, which silently re-enables it and drops paths the operator meant to keep. The app surfaces the refusal and reloads rather than overwriting.
 
@@ -286,8 +286,8 @@ There is no `windows` scope, because Restic Station has no Windows build and a s
 | `container-engines` | **off** | Docker Desktop, OrbStack, colima, podman and Lima machine storage. Off because these roots hold named volumes and writable container state as well as images: a database living in a volume exists nowhere else, and unlike an image no registry has a copy. A host whose volumes are backed up another way turns it on with `excludes enable container-engines`. |
 | `virtual-machine-images` | **off** | Parallels, VMware, VirtualBox, UTM, QEMU and Vagrant disk images and suspended state. Off because, unlike a container image, a VM someone built by hand may exist nowhere else. |
 | `installers-and-disk-images` | **off** | `.dmg`, `.iso`, `.pkg`, `.msi`, sparse and Time Machine bundles. Off because an image you built yourself may exist nowhere else. |
-| `game-and-media-caches` | on | A launcher's download staging and shader caches, and a Plex server's generated artwork and metadata. Re-downloaded or rebuilt by a re-scan; no installed game, save or mod is in it. |
-| `game-installs` | **off** | Steam, Epic, GOG and Battle.net installation roots — routinely the largest thing on the disk. Off because plenty of games keep saves, configuration and manually installed mods beside the executable, and a re-download restores the game without them. The caches beside them stay on by default. |
+| `game-and-media-caches` | on | A launcher's download staging and shader caches, and a media server's transcoder cache. Re-downloaded or regenerated on demand; no installed game, save, mod or uploaded artwork is in it. |
+| `game-and-media-libraries` | **off** | Steam, Epic, GOG and Battle.net installation roots, plus a Plex server's `Metadata` and `Media` stores — routinely the largest thing on the disk. Off because each can hold the only copy of something: saves, configuration and hand-installed mods live beside a game's executable, and a poster or background uploaded through Plex lives in its metadata store. Neither comes back from a re-download or a re-scan. |
 
 `excludes show` prints the catalogue this build carries, which groups apply here, and the exact resolved pattern list; `excludes show --patterns` adds every individual pattern. That command — not this table — is the authority for what a given build excludes.
 
@@ -941,8 +941,8 @@ This host's global exclusion list (§global-excludes.json). Host-local — `--ma
   "excludeCaches": true,
   "excludeLargerThan": null,
   "platform": "macOS",
-  "catalogVersion": 5,
-  "savedCatalogVersion": 5,
+  "catalogVersion": 6,
+  "savedCatalogVersion": 6,
   "groups": [
     {
       "id": "browser-caches",

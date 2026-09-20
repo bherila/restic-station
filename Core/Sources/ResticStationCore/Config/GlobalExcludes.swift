@@ -217,7 +217,7 @@ public enum GlobalExcludeCatalog {
     /// never heard of is an error (see ``GlobalExcludeError/unknownGroup``),
     /// and a group added after the file was written takes its built-in
     /// default.
-    public static let version = 5
+    public static let version = 6
 
     /// The catalogue, in the order its patterns reach argv.
     public static let groups: [GlobalExcludeGroup] = [
@@ -513,32 +513,39 @@ public enum GlobalExcludeCatalog {
         GlobalExcludeGroup(
             id: "game-and-media-caches",
             title: "Game and media server caches",
-            summary: "A game launcher's download staging and shader caches, and a Plex server's "
-                + "generated artwork and metadata. All of it is re-downloaded or rebuilt by a "
-                + "re-scan; none of it is an installed game, a save or a mod.",
+            summary: "A game launcher's download staging and shader caches, and a media server's "
+                + "transcoder cache. Every byte is re-downloaded or regenerated on demand, and "
+                + "nothing here is an installed game, a save, a mod or artwork anyone uploaded.",
             patterns: [
                 "Steam/steamapps/downloading",
                 "Steam/steamapps/shadercache",
                 "Steam/appcache",
                 "Plex Media Server/Cache",
-                "Plex Media Server/Media",
-                "Plex Media Server/Metadata",
             ]
         ),
         GlobalExcludeGroup(
-            id: "game-installs",
-            title: "Installed game libraries",
-            summary: "Steam, Epic, GOG and Battle.net installation roots — routinely hundreds of "
-                + "gigabytes. Off by default: plenty of games keep saves, configuration and "
-                + "manually installed mods beside the executable, and a re-download restores the "
-                + "game without them. Turn it on with `excludes enable game-installs` once you "
-                + "know your saves and mods live elsewhere.",
+            id: "game-and-media-libraries",
+            title: "Game installs and media server libraries",
+            summary: "Steam, Epic, GOG and Battle.net installation roots, and a Plex server's "
+                + "metadata and media stores — routinely the largest thing on the disk. Off by "
+                + "default: games keep saves, configuration and hand-installed mods beside the "
+                + "executable, and a poster or background uploaded through Plex lives in its "
+                + "metadata store and exists nowhere else. Neither comes back from a re-download "
+                + "or a re-scan. Turn it on with `excludes enable game-and-media-libraries`.",
             enabledByDefault: false,
             patterns: [
                 "Steam/steamapps/common",
                 "Epic Games",
                 "GOG Galaxy/Games",
                 "Battle.net",
+                // Plex's own stores, not caches. `Metadata` holds the bundle
+                // for every library item, including artwork an operator
+                // uploaded through Plex rather than filing beside the media;
+                // `Media` holds the binary blobs those bundles point at. A
+                // re-scan rebuilds what it derived from the media files and
+                // silently cannot rebuild the rest.
+                "Plex Media Server/Media",
+                "Plex Media Server/Metadata",
             ]
         ),
         GlobalExcludeGroup(
@@ -832,11 +839,19 @@ public struct GlobalExcludeSettings: Codable, Equatable, Sendable {
             .filter { $0.applies(on: platform) && seen.insert($0.pattern).inserted }
         let catalogue = applicable.filter { !$0.isCloudPlaceholder }.map(\.pattern)
         let placeholders = applicable.filter(\.isCloudPlaceholder).map(\.pattern)
-        // `extraPatterns` stay in their own list: they reach restic through
-        // the case-sensitive `--exclude`, and deduplicating them against the
-        // case-insensitive catalogue would be comparing two different
-        // matching rules.
-        let host = extraPatterns.filter { seen.insert($0).inserted }
+        // `extraPatterns` are deduplicated **only against each other**, in
+        // their own `seen` set.
+        //
+        // Sharing the catalogue's set silently dropped a host pattern whose
+        // text a catalogue entry already used — and the two are not the same
+        // rule, because they ride different flags. The case that makes it
+        // concrete: `excludes add '*.icloud'` on a host with a set using
+        // `onlineOnlyFiles: "download"`. The catalogue's copy is held back
+        // for that set on purpose, and if the host's copy had been dropped
+        // as a duplicate, *nothing* would reach restic — an operator's
+        // explicit instruction quietly lost.
+        var hostSeen = Set<String>()
+        let host = extraPatterns.filter { hostSeen.insert($0).inserted }
         return GlobalExcludePlan(
             patterns: catalogue,
             cloudPlaceholderPatterns: placeholders,
@@ -1083,7 +1098,30 @@ public struct GlobalExcludeStore: Sendable {
     /// the save overwrite whatever landed since. This exists for a caller
     /// that wants to observe the file, and for the check inside the lock.
     public func currentFingerprint() -> String? {
-        guard let data = try? Data(contentsOf: paths.globalExcludesFile) else { return nil }
+        try? strictFingerprint()
+    }
+
+    /// The same answer, but with "there is no file" and "there is an entry I
+    /// cannot read" kept apart.
+    ///
+    /// The lenient version collapses both to `nil`, which is safe to *read*
+    /// and unsafe to compare against: a pane that failed to load a dangling
+    /// symlink holds the `nil` fingerprint it started with, and a `nil ==
+    /// nil` comparison would let its defaults-based value rename itself over
+    /// that entry — re-enabling every group the unavailable settings had
+    /// turned off. The compare-and-swap uses this one, so an unreadable
+    /// entry refuses instead of matching.
+    private func strictFingerprint() throws -> String? {
+        guard Self.entryExists(at: paths.globalExcludesFile) else { return nil }
+        let data: Data
+        do {
+            data = try Data(contentsOf: paths.globalExcludesFile)
+        } catch {
+            throw GlobalExcludeError.unreadable(
+                path: paths.globalExcludesFile.path,
+                underlying: "\(error)"
+            )
+        }
         return Self.fingerprint(of: data)
     }
 
@@ -1164,7 +1202,10 @@ public struct GlobalExcludeStore: Sendable {
         updated.version = GlobalExcludeSettings.currentVersion
         updated.catalogVersion = GlobalExcludeCatalog.version
         try updated.validate()
-        if case .unchangedFrom(let expected) = precondition, currentFingerprint() != expected {
+        // `strictFingerprint()`, not `currentFingerprint()`: an entry that
+        // exists but cannot be read throws here rather than comparing equal
+        // to the `nil` an editor carries when its own load failed.
+        if case .unchangedFrom(let expected) = precondition, try strictFingerprint() != expected {
             throw GlobalExcludeError.staleWrite(path: paths.globalExcludesFile.path)
         }
         let data = try ConfigStore.makeEncoder().encode(updated)

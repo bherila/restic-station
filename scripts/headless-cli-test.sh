@@ -247,12 +247,13 @@ ok "excludes show reports the built-in defaults without creating a settings file
 # can be the only copy of something: a hand-built VM, an installer that is
 # no longer downloadable, a container engine's data root (which holds named
 # volumes and writable container state, not just registry images), and a
-# game installation root (saves, configuration and manually installed mods
-# often live beside the executable, and a re-download leaves them out).
+# game or media library root (saves, configuration and hand-installed mods
+# live beside a game's executable, and a poster uploaded through Plex lives
+# in its metadata store — neither returns from a re-download or a re-scan).
 RESTIC_STATION_DATA_DIR="$EXCLUDES_DATA" run_helper excludes show --json
 expect_rc 0
 OFF_BY_DEFAULT="$(jq -r '[.data.groups[] | select(.enabledByDefault == false) | .id] | join(",")' "$OUT_FILE")"
-[[ "$OFF_BY_DEFAULT" == "container-engines,game-installs,virtual-machine-images,installers-and-disk-images" ]] \
+[[ "$OFF_BY_DEFAULT" == "container-engines,game-and-media-libraries,virtual-machine-images,installers-and-disk-images" ]] \
     || fail "the off-by-default groups changed to: $OFF_BY_DEFAULT"
 # Cloud placeholder stubs are reported in both places: in `patterns`,
 # which is what nearly every set receives, and in their own list, which is

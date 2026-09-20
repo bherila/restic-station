@@ -503,16 +503,36 @@ struct ConfigValidate: AsyncParsableCommand, JSONRenderable {
         // error because `validate` is about `config.json` and may be run
         // with `--machine <other>`, where the file belongs to *this* host
         // and not to the machine being described — but it is worded as the
-        // blocker it is: every backup here refuses to run until it is
-        // fixed, rather than falling back to defaults that may skip more
-        // than this host had configured (`docs/data-model.md`
+        // blocker it is, rather than falling back to defaults that may skip
+        // more than this host had configured (`docs/data-model.md`
         // §global-excludes.json).
+        //
+        // Scoped to the sets it actually blocks. `BackupEngine` refuses only
+        // a set that uses the list, so a host whose sets all carry
+        // `usesGlobalExcludes: false` keeps backing up normally — and
+        // telling that operator "every backup refuses" would send them
+        // hunting a fleet-wide outage that is not happening. The count is
+        // over the sets that run *here*: a set this machine does not back up
+        // is not blocked by anything.
         do {
             _ = try GlobalExcludeStore(paths: context.paths).load()
         } catch {
+            let affected = report.sets.filter { $0.enabledHere && $0.usesGlobalExcludes }
+            let scope: String
+            switch affected.count {
+            case 0:
+                scope = "No backup here is blocked by it: every set that runs on this machine has "
+                    + "usesGlobalExcludes: false"
+            case report.sets.filter(\.enabledHere).count:
+                scope = "Every backup on this host refuses to run until it is fixed"
+            default:
+                let names = affected.map { "\"\($0.name)\"" }.joined(separator: ", ")
+                scope = "\(affected.count) of the sets that run here refuse to back up until it is "
+                    + "fixed (\(names)); the rest have usesGlobalExcludes: false and are unaffected"
+            }
             warnings.append(
-                "this machine's global exclusion list cannot be read: \(error). Every backup on this "
-                    + "host refuses to run until it is fixed — see `excludes show`"
+                "this machine's global exclusion list cannot be read: \(error). \(scope) — "
+                    + "see `excludes show`"
             )
         }
 
