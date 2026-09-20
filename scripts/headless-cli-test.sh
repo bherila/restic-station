@@ -272,6 +272,16 @@ RESTIC_STATION_DATA_DIR="$EXCLUDES_DATA" run_helper excludes show --json
 expect_rc 0
 jq -e '.data | has("excludeLargerThan") and .excludeLargerThan == null' "$OUT_FILE" >/dev/null \
     || fail "no cap must be an explicit null, not an omitted key"
+# The catalogue is platform-scoped, so the report has to name which scope
+# it resolved and must not carry the other platform's spellings.
+jq -e '.data.platform == "linux"' "$OUT_FILE" >/dev/null \
+    || fail "excludes show --json must name the platform it resolved"
+jq -e '[.data.patterns[] | select(startswith("Library/"))] | length == 0' "$OUT_FILE" >/dev/null \
+    || fail "a Linux host must not carry the macOS Library/ patterns"
+jq -e '[.data.patterns[] | select(. == ".cache")] | length == 1' "$OUT_FILE" >/dev/null \
+    || fail "a Linux host must carry the XDG cache pattern"
+jq -e '[.data.groups[] | select(.otherPlatformPatternCount > 0)] | length > 0' "$OUT_FILE" >/dev/null \
+    || fail "the report must say how many patterns belong to the other platform"
 ok "the size cap is opt-in, validated on the way in, and liftable with \"none\""
 
 # A typo'd group id is refused rather than ignored: "disable this group"

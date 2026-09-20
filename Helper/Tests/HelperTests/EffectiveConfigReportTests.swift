@@ -250,7 +250,7 @@ struct GlobalExcludeReportTests {
 
     @Test("with no settings file, the report is the built-in defaults and says so")
     func defaultsAreReportedAsSuch() {
-        let report = GlobalExcludeReport.build(settings: .default, path: path, exists: false)
+        let report = GlobalExcludeReport.build(settings: .default, path: path, exists: false, platform: .macOS)
 
         #expect(!report.exists)
         #expect(report.enabled)
@@ -258,7 +258,8 @@ struct GlobalExcludeReportTests {
         // A size cap is opt-in; the default must never carry one.
         #expect(report.excludeLargerThan == nil)
         #expect(report.groups.count == GlobalExcludeCatalog.groups.count)
-        #expect(report.patterns == GlobalExcludeSettings.default.plan.patterns)
+        #expect(report.patterns == GlobalExcludeSettings.default.plan(on: .macOS).patterns)
+        #expect(report.platform == "macOS")
         // Not "written against catalogue 0" — there is no file to have been
         // written against an older one.
         #expect(report.savedCatalogVersion == GlobalExcludeCatalog.version)
@@ -272,7 +273,7 @@ struct GlobalExcludeReportTests {
     func aChangedGroupIsMarked() {
         var settings = GlobalExcludeSettings()
         settings.groups = ["browser-caches": false]
-        let report = GlobalExcludeReport.build(settings: settings, path: path, exists: true)
+        let report = GlobalExcludeReport.build(settings: settings, path: path, exists: true, platform: .macOS)
 
         let browser = try? #require(report.groups.first { $0.id == "browser-caches" })
         #expect(browser?.enabled == false)
@@ -291,7 +292,7 @@ struct GlobalExcludeReportTests {
     func anOlderCatalogueVersionIsCalledOut() {
         var settings = GlobalExcludeSettings()
         settings.catalogVersion = 0
-        let report = GlobalExcludeReport.build(settings: settings, path: path, exists: true)
+        let report = GlobalExcludeReport.build(settings: settings, path: path, exists: true, platform: .macOS)
 
         let lines = report.humanLines(includePatterns: false).joined(separator: "\n")
         #expect(lines.contains("note: this build carries catalogue version"))
@@ -299,7 +300,7 @@ struct GlobalExcludeReportTests {
 
     @Test("--patterns prints every individual pattern")
     func patternsFlagPrintsThem() {
-        let report = GlobalExcludeReport.build(settings: .default, path: path, exists: false)
+        let report = GlobalExcludeReport.build(settings: .default, path: path, exists: false, platform: .macOS)
         let terse = report.humanLines(includePatterns: false).joined(separator: "\n")
         let verbose = report.humanLines(includePatterns: true).joined(separator: "\n")
 
@@ -314,10 +315,10 @@ struct GlobalExcludeReportTests {
     func theSizeCapIsAlwaysReportedBothWays() throws {
         var settings = GlobalExcludeSettings()
         settings.excludeLargerThan = "10G"
-        let capped = GlobalExcludeReport.build(settings: settings, path: path, exists: true)
+        let capped = GlobalExcludeReport.build(settings: settings, path: path, exists: true, platform: .macOS)
         #expect(capped.humanLines(includePatterns: false).contains("--exclude-larger-than: 10G"))
 
-        let uncapped = GlobalExcludeReport.build(settings: .default, path: path, exists: false)
+        let uncapped = GlobalExcludeReport.build(settings: .default, path: path, exists: false, platform: .macOS)
         #expect(uncapped.humanLines(includePatterns: false).contains("--exclude-larger-than: (no cap)"))
 
         let object = try JSONSerialization.jsonObject(
@@ -327,11 +328,33 @@ struct GlobalExcludeReportTests {
         #expect(object?["excludeLargerThan"] is NSNull)
     }
 
+    /// The catalogue is platform-scoped, so the same build reports a
+    /// different list on each host — and the report says which one it is,
+    /// because a `--json` consumer cannot tell otherwise.
+    @Test("the report names its platform and resolves that platform's patterns")
+    func theReportIsPlatformScoped() {
+        let mac = GlobalExcludeReport.build(settings: .default, path: path, exists: false, platform: .macOS)
+        let linux = GlobalExcludeReport.build(settings: .default, path: path, exists: false, platform: .linux)
+
+        #expect(mac.platform == "macOS")
+        #expect(linux.platform == "linux")
+        #expect(mac.patterns != linux.patterns)
+        #expect(mac.patterns.contains("Library/Caches"))
+        #expect(!linux.patterns.contains("Library/Caches"))
+
+        // The count of what this host will never apply is reported, not
+        // hidden — otherwise "why is this group smaller here?" has no answer.
+        let linuxSystem = linux.groups.first { $0.id == "system-caches" }
+        #expect((linuxSystem?.otherPlatformPatternCount ?? 0) > 0)
+
+        #expect(linux.humanLines(includePatterns: false).contains("platform: linux"))
+    }
+
     @Test("the master switch off reports no patterns at all")
     func masterSwitchOffReportsNothing() {
         var settings = GlobalExcludeSettings()
         settings.enabled = false
-        let report = GlobalExcludeReport.build(settings: settings, path: path, exists: true)
+        let report = GlobalExcludeReport.build(settings: settings, path: path, exists: true, platform: .macOS)
 
         #expect(report.patterns.isEmpty)
         #expect(report.humanLines(includePatterns: false).first == "global exclusion list: off")

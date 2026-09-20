@@ -222,7 +222,7 @@ The list has three parts, and each lives where its scope actually is:
 ```json
 {
   "version": 1,
-  "catalogVersion": 2,
+  "catalogVersion": 3,
   "enabled": true,
   "excludeCaches": true,
   "excludeLargerThan": null,
@@ -243,11 +243,23 @@ The list has three parts, and each lives where its scope actually is:
 
 ### Pattern shape
 
-Every catalogue pattern is **relative and unanchored**: no leading `/`, no `~`, no `$VAR`. restic matches a relative pattern against the trailing path components, so `Library/Caches` skips `~/Library/Caches` wherever the home directory is, and `node_modules` skips one at any depth. A `*` inside a component works (`*.photoslibrary/resources/derivatives`), as does `**` between them (`*.imovielibrary/**/Render Files`). That is also why there is **no platform branch** in the catalogue: a macOS-shaped pattern simply matches nothing on Linux, and one list means `config show` on either OS describes the same rules. `extraPatterns` is exempt — a host adding one of its own may anchor it however it likes.
+Every catalogue pattern is **relative and unanchored**: no leading `/`, no `~`, no `$VAR`. restic matches a relative pattern against the trailing path components, so `Library/Caches` skips `~/Library/Caches` wherever the home directory is, and `node_modules` skips one at any depth. A `*` inside a component matches exactly one component — `bin/*/Debug` reaches `bin/x64/Debug` but not `bin/Debug`, which is why the catalogue carries both — and `**` spans several (`*.imovielibrary/**/Render Files`). `extraPatterns` is exempt from all of this — a host adding one of its own may anchor it however it likes.
 
 **The hazard that shapes the whole list.** An unanchored pattern is matched against every component of the *absolute* path, **including directories above the source**. `--exclude tmp` against a source under `/tmp/…` therefore excludes the source itself and produces an empty snapshot — verified against restic 0.18.1 while this catalogue was written. A single-component pattern must name something nobody has above their data: `node_modules` is safe, `tmp`, `var`, `data`, `bin` and `target` are not. `GlobalExcludeCatalogTests` holds the denylist.
 
-That is also why generic build-directory names are avoided. A bare `target`, `bin` or `obj` would skip a folder of 3-D models or a directory someone named "target", so the catalogue names the build configuration underneath them (`target/debug`, `obj/Release`) and leaves the rest to `--exclude-caches`, which Cargo's own `CACHEDIR.TAG` already answers.
+That is also why generic build-directory names are avoided. A bare `target`, `bin` or `obj` would skip a folder of 3-D models, a directory someone named "target", or — worst — a directory *above* the source. The catalogue names the build configuration underneath them instead, in both the flat (`target/debug`, `obj/Release`) and architecture-qualified (`target/*/release`, `bin/*/Debug`) forms, and leaves the rest to `--exclude-caches`, which Cargo's own `CACHEDIR.TAG` already answers.
+
+### Platform scoping
+
+Patterns carry a platform scope, the way [Code42's list](https://mimecastsupport.zendesk.com/hc/en-us/articles/42666059024403-Files-excluded-from-backup-by-default) prefixes its rules `mac:`, `linux:` and `win:`. A Linux host has no `~/Library`, a Mac has no `~/.local/share/Trash`, and carrying either into the other's argv is noise in the run log and in `excludes show`.
+
+The rule is deliberately narrow: **a pattern is scoped only when its *path shape* cannot exist on the other platform.** `Library/…` and the Xcode/Apple-bundle directories are `.mac`; XDG directories and the Linux browser profile roots are `.linux`. Anything that is a file or directory *name* rather than a home-directory layout stays unscoped, because it turns up on either host — `.DS_Store` on a Samba share, `Thumbs.db` and `System Volume Information` on an attached NTFS drive, an `*.photoslibrary` bundle on a NAS, `node_modules` anywhere. `GlobalExcludeCatalogTests` asserts that rule rather than leaving it to review.
+
+There is no `windows` scope, because Restic Station has no Windows build and a scope that can never activate is dead weight. The useful half of Code42's `win:` rules is exactly the removable-media debris above, and that is unscoped.
+
+`GlobalExcludePlatform.current` is the **only** OS branch in this machinery. It is legitimate here where it would not be in `AppConfig.resolved(for:)`: the catalogue is host-local by construction, while config resolution must return the same bytes for a given `machineId` on either OS (§Per-machine scoping).
+
+**The residual cost, stated plainly:** a Linux host backing up a *Mac's* home directory over a mount does not get the `.mac` patterns, so that machine's `~/Library/Caches` would be backed up. It is rare, it is visible in `excludes show` (which prints the platform it resolved and how many patterns it left to the other one), and `excludes add` puts them back.
 
 **The catalogue reaches restic as `--iexclude`, not `--exclude`.** It is a list of well-known names rather than something a person typed, so `Library/Caches` should skip `library/caches` and `*.dmg` should skip `Installer.DMG`; Code42's equivalent list is entirely case-insensitive for the same reason. A backup set's own `excludes` keep the case-sensitive `--exclude` they have always had, so nothing about an existing config changes meaning.
 
@@ -256,15 +268,15 @@ That is also why generic build-directory names are avoided. A bare `target`, `bi
 | id | Default | What it skips |
 |---|---|---|
 | `browser-caches` | on | Cached pages, images, compiled scripts and GPU shaders for the Chromium and Gecko families, plus the same cache directory names inside Electron apps. Bookmarks, history, passwords and profile settings are not in it. |
-| `system-caches` | on | Per-user cache, log and trash directories, the index/metadata sidecars the OS maintains, iCloud placeholder stubs, and a Time Machine destination or local snapshot store (backing up a backup). |
+| `system-caches` | on | Per-user cache, log and trash directories, the index/metadata sidecars either OS leaves on removable media, iCloud placeholder stubs, and a Time Machine destination or local snapshot store (backing up a backup). |
 | `temporary-files` | on | Editor swap files, partial downloads, crash dumps, anything already named as scratch. |
-| `developer-build-artifacts` | on | Swift, Xcode, Rust, .NET, Node, Python, JVM and CMake output trees, including the hidden framework directories (`.next`, `.nuxt`, `.vercel`, `.turbo`, …). |
+| `developer-build-artifacts` | on | Swift, Xcode, Rust, .NET, Node, Python, JVM and CMake output trees, including the hidden framework directories (`.next`, `.nuxt`, `.vercel`, `.turbo`, …) and the architecture-qualified layouts (`bin/x64/Debug`, `target/<triple>/release`). |
 | `package-manager-caches` | on | npm/yarn/pnpm/bun, cargo, Go module, Gradle, Maven, NuGet, pip, Homebrew, CocoaPods, Playwright and Hugging Face caches. |
 | `media-app-caches` | on | Thumbnails, previews and render/analysis files that Photos, Lightroom, Final Cut, iMovie and iTunes rebuild from the originals. |
 | `container-engines` | on | Docker Desktop, OrbStack, colima, podman and Lima machine storage. |
 | `virtual-machine-images` | **off** | Parallels, VMware, VirtualBox, UTM, QEMU and Vagrant disk images and suspended state. Off because, unlike a container image, a VM someone built by hand may exist nowhere else. |
 | `installers-and-disk-images` | **off** | `.dmg`, `.iso`, `.pkg`, `.msi`, sparse and Time Machine bundles. Off because an image you built yourself may exist nowhere else. |
-| `game-and-media-libraries` | **off** | Installed Steam/Epic/GOG/Battle.net games and a Plex server's generated metadata. Off because rebuilding is cheap in effort and expensive in time — that is a judgement call, not a default. |
+| `game-and-media-libraries` | on | Installed Steam/Epic/GOG/Battle.net games and a Plex server's generated metadata. Every byte comes back from a re-download or a re-scan, and a game library is routinely the largest thing on the disk. Save data is not in it. |
 
 `excludes show` prints the catalogue this build carries, which groups apply here, and the exact resolved pattern list; `excludes show --patterns` adds every individual pattern. That command — not this table — is the authority for what a given build excludes.
 
@@ -907,8 +919,9 @@ This host's global exclusion list (§global-excludes.json). Host-local — `--ma
   "enabled": true,
   "excludeCaches": true,
   "excludeLargerThan": null,
-  "catalogVersion": 2,
-  "savedCatalogVersion": 2,
+  "platform": "macOS",
+  "catalogVersion": 3,
+  "savedCatalogVersion": 3,
   "groups": [
     {
       "id": "browser-caches",
@@ -916,7 +929,8 @@ This host's global exclusion list (§global-excludes.json). Host-local — `--ma
       "summary": "Cached pages, images, compiled scripts and GPU shaders that every browser refetches or rebuilds on demand. …",
       "enabled": true,
       "enabledByDefault": true,
-      "patterns": ["Library/Caches/Google/Chrome", "…"]
+      "patterns": ["Library/Caches/Google/Chrome", "…"],
+      "otherPlatformPatternCount": 7
     }
   ],
   "extraPatterns": [],
@@ -924,7 +938,7 @@ This host's global exclusion list (§global-excludes.json). Host-local — `--ma
 }
 ```
 
-`exists: false` means there is no `global-excludes.json` and every value above is the built-in default. `groups[]` is the whole catalogue this build carries, in catalogue order, each with the decision that applies here (`enabled`) beside the built-in one (`enabledByDefault`). `patterns` at the top level is the resolved result — exactly what every applying backup set receives, in argv order — so a script never has to re-derive it from the groups. `savedCatalogVersion` is what the file was last written against, and is `0` for a file written before the key existed; when it is below `catalogVersion`, groups added since then are applying by their own default.
+`platform` names the scope this report resolved (`"macOS"` or `"linux"`), and `groups[].otherPlatformPatternCount` says how many of a group's patterns this host will never apply — see §Platform scoping. `exists: false` means there is no `global-excludes.json` and every value above is the built-in default. `groups[]` is the whole catalogue this build carries, in catalogue order, each with the decision that applies here (`enabled`) beside the built-in one (`enabledByDefault`). `patterns` at the top level is the resolved result — exactly what every applying backup set receives, in argv order — so a script never has to re-derive it from the groups. `savedCatalogVersion` is what the file was last written against, and is `0` for a file written before the key existed; when it is below `catalogVersion`, groups added since then are applying by their own default.
 
 Never a secret: `nonSecretEnv` is exactly `Destination.nonSecretEnv` (never the keychain/secrets.json value), and no field here can hold a repository password.
 

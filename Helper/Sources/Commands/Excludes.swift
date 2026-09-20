@@ -225,7 +225,12 @@ struct ExcludesRemove: AsyncParsableCommand {
         // no-op: "I removed it" followed by every run still skipping the
         // directory is the exact confusion this list has to avoid.
         for pattern in patterns where !settings.extraPatterns.contains(pattern) {
-            let hint = GlobalExcludeCatalog.groups.first { $0.patterns.contains(pattern) }
+            // Across every platform, not just this one: "that is part of
+            // group X" is the useful answer even for a pattern this host
+            // would never apply.
+            let hint = GlobalExcludeCatalog.groups.first { group in
+                group.patterns.contains { $0.pattern == pattern }
+            }
             throw CLIFailure.invalidArguments(
                 hint.map {
                     "\"\(pattern)\" is part of the built-in group \"\($0.id)\", not a pattern this "
@@ -350,7 +355,12 @@ struct GlobalExcludeReport: Encodable {
         let enabled: Bool
         /// What it would be with no `global-excludes.json` at all.
         let enabledByDefault: Bool
+        /// The patterns that apply on **this** platform, in argv order.
         let patterns: [String]
+        /// Patterns the group carries for the other platform, which this
+        /// host will never apply. Reported rather than hidden so "why is
+        /// this group only four patterns here?" has an answer.
+        let otherPlatformPatternCount: Int
     }
 
     /// Where the adjustments live — printed because "machine level or user
@@ -363,6 +373,12 @@ struct GlobalExcludeReport: Encodable {
     let excludeCaches: Bool
     /// `restic backup --exclude-larger-than`, or `null` for no cap.
     let excludeLargerThan: String?
+    /// The platform whose patterns this report resolved — `"macOS"` or
+    /// `"linux"`. The catalogue is scoped (`docs/data-model.md`
+    /// §global-excludes.json), so the same build reports different pattern
+    /// lists on different hosts, and a `--json` consumer needs to know
+    /// which it is looking at.
+    let platform: String
     /// The catalogue version this build carries.
     let catalogVersion: Int
     /// The catalogue version the file was last written against; `0` for a
@@ -376,7 +392,7 @@ struct GlobalExcludeReport: Encodable {
     let patterns: [String]
 
     private enum CodingKeys: String, CodingKey {
-        case path, exists, enabled, excludeCaches, excludeLargerThan, catalogVersion
+        case path, exists, enabled, excludeCaches, excludeLargerThan, platform, catalogVersion
         case savedCatalogVersion, groups, extraPatterns, patterns
     }
 
@@ -391,6 +407,7 @@ struct GlobalExcludeReport: Encodable {
         try container.encode(enabled, forKey: .enabled)
         try container.encode(excludeCaches, forKey: .excludeCaches)
         try container.encode(excludeLargerThan, forKey: .excludeLargerThan)
+        try container.encode(platform, forKey: .platform)
         try container.encode(catalogVersion, forKey: .catalogVersion)
         try container.encode(savedCatalogVersion, forKey: .savedCatalogVersion)
         try container.encode(groups, forKey: .groups)
@@ -398,14 +415,20 @@ struct GlobalExcludeReport: Encodable {
         try container.encode(patterns, forKey: .patterns)
     }
 
-    static func build(settings: GlobalExcludeSettings, path: URL, exists: Bool) -> GlobalExcludeReport {
-        let plan = settings.plan
+    static func build(
+        settings: GlobalExcludeSettings,
+        path: URL,
+        exists: Bool,
+        platform: GlobalExcludePlatform = .current
+    ) -> GlobalExcludeReport {
+        let plan = settings.plan(on: platform)
         return GlobalExcludeReport(
             path: path.path,
             exists: exists,
             enabled: settings.enabled,
             excludeCaches: settings.excludeCaches,
             excludeLargerThan: settings.excludeLargerThan,
+            platform: platform.rawValue,
             catalogVersion: GlobalExcludeCatalog.version,
             savedCatalogVersion: exists ? settings.catalogVersion : GlobalExcludeCatalog.version,
             groups: GlobalExcludeCatalog.groups.map { group in
@@ -415,7 +438,8 @@ struct GlobalExcludeReport: Encodable {
                     summary: group.summary,
                     enabled: settings.isEnabled(group),
                     enabledByDefault: group.enabledByDefault,
-                    patterns: group.patterns
+                    patterns: group.patterns(on: platform),
+                    otherPlatformPatternCount: group.patterns.count - group.patterns(on: platform).count
                 )
             },
             extraPatterns: settings.extraPatterns,
@@ -429,6 +453,7 @@ struct GlobalExcludeReport: Encodable {
         lines.append("settings file: \(path)\(exists ? "" : "  (not present — built-in defaults)")")
         lines.append("--exclude-caches: \(excludeCaches ? "on" : "off")")
         lines.append("--exclude-larger-than: \(excludeLargerThan ?? "(no cap)")")
+        lines.append("platform: \(platform)")
         lines.append("")
         for group in groups {
             let mark = group.enabled ? "[x]" : "[ ]"
@@ -437,7 +462,10 @@ struct GlobalExcludeReport: Encodable {
                 : "  (changed on this machine)"
             lines.append("\(mark) \(group.id) — \(group.title)\(drift)")
             lines.append("      \(group.summary)")
-            lines.append("      \(group.patterns.count) pattern(s)")
+            let other = group.otherPlatformPatternCount == 0
+                ? ""
+                : "  (+\(group.otherPlatformPatternCount) for the other platform)"
+            lines.append("      \(group.patterns.count) pattern(s) here\(other)")
             if includePatterns {
                 for pattern in group.patterns {
                     lines.append("        \(pattern)")

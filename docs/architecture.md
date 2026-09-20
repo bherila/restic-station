@@ -177,7 +177,7 @@ State — not config — is the right XDG base dir for `root`: `config.json` is 
 | `config.json` | `AppConfig` (see `data-model.md`) — **shared across every machine** |
 | `config.v<N>.backup.json` | untouched copy of the schema-vN `config.json` that was migrated, written once before its current-version replacement |
 | `machine.json` | `MachineConfig`: this host's `machineId` and restic path — **host-local, never copy it between machines** |
-| `global-excludes.json` | `GlobalExcludeSettings`: this host's adjustments to the built-in exclusion catalogue — **host-local**, optional, absent on a host that has customised nothing (`data-model.md` §global-excludes.json) |
+| `global-excludes.json` | `GlobalExcludeSettings`: this host's adjustments to the built-in exclusion catalogue — **host-local**, optional, absent on a host that has customised nothing (`data-model.md` §global-excludes.json). The file itself stays platform-neutral (it records group decisions, not paths); only what the catalogue *resolves to* is platform-scoped, so the byte-identical rule above still holds |
 | `runs/<runId>/metadata.json` | one `RunMetadata` per run |
 | `runs/<runId>/log.txt` | full streamed log of the run |
 | `runs/index.jsonl` | append-only, one summary JSON line per finished run |

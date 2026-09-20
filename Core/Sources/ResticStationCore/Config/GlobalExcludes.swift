@@ -1,8 +1,84 @@
 import Foundation
 
+// MARK: - GlobalExcludePlatform
+
+/// The platforms a catalogue pattern can apply on.
+///
+/// Code42's published list is organised the same way — its patterns carry
+/// `mac:`, `linux:` and `win:` prefixes, or none for "everywhere" — and for
+/// the same reason: `Library/Caches` is meaningless on a Linux host and
+/// `.local/share/Trash` is meaningless on a Mac, so carrying either into
+/// the other's argv is noise in the run log and in `excludes show`.
+///
+/// There is no `windows` case because Restic Station has no Windows build,
+/// and a scope that can never activate is dead weight. The *useful* half of
+/// Code42's `win:` rules is the debris Windows leaves on removable and
+/// network media — `Thumbs.db`, `desktop.ini`, `System Volume Information`
+/// — and that is scoped ``any`` precisely because it turns up on a Mac or
+/// Linux host with an NTFS drive attached.
+public enum GlobalExcludePlatform: String, Equatable, Sendable, CaseIterable, Codable {
+    case macOS
+    case linux
+
+    /// The platform this process is running on, which is the one whose
+    /// patterns the catalogue resolves to.
+    ///
+    /// This is the **only** OS branch in the exclusion machinery, and it is
+    /// legitimate where config resolution's would not be: the catalogue is
+    /// host-local by construction (`docs/data-model.md`
+    /// §global-excludes.json), unlike `AppConfig.resolved(for:)`, which must
+    /// return the same bytes for a given `machineId` on either OS.
+    public static var current: GlobalExcludePlatform {
+        #if os(macOS)
+        return .macOS
+        #else
+        return .linux
+        #endif
+    }
+}
+
+// MARK: - GlobalExcludePattern
+
+/// One catalogue pattern and the platforms it applies on.
+///
+/// Written as a bare string literal in the catalogue when it applies
+/// everywhere, and as ``mac(_:)`` or ``linux(_:)`` when it does not — which
+/// keeps the catalogue readable as a list of patterns rather than a list of
+/// structs.
+public struct GlobalExcludePattern: Equatable, Sendable, ExpressibleByStringLiteral {
+    public let pattern: String
+    public let platforms: Set<GlobalExcludePlatform>
+
+    public init(_ pattern: String, platforms: Set<GlobalExcludePlatform> = Set(GlobalExcludePlatform.allCases)) {
+        self.pattern = pattern
+        self.platforms = platforms
+    }
+
+    /// A bare string in the catalogue means "every platform".
+    public init(stringLiteral value: String) {
+        self.init(value)
+    }
+
+    /// A path shape that only exists on macOS — `Library/…`, an Apple media
+    /// bundle's internals, an Xcode directory.
+    public static func mac(_ pattern: String) -> GlobalExcludePattern {
+        GlobalExcludePattern(pattern, platforms: [.macOS])
+    }
+
+    /// A path shape that only exists on Linux — XDG directories, the
+    /// Linux-only spellings of the browser and container profile roots.
+    public static func linux(_ pattern: String) -> GlobalExcludePattern {
+        GlobalExcludePattern(pattern, platforms: [.linux])
+    }
+
+    public func applies(on platform: GlobalExcludePlatform) -> Bool {
+        platforms.contains(platform)
+    }
+}
+
 // MARK: - GlobalExcludeGroup
 
-/// One named block of built-in `--exclude` patterns.
+/// One named block of built-in exclusion patterns.
 ///
 /// Groups exist so the list is *reviewable*: "browser caches" is something a
 /// person can decide about, where eighty individual glob patterns are not.
@@ -25,21 +101,27 @@ public struct GlobalExcludeGroup: Equatable, Sendable, Identifiable {
     /// something (a virtual machine someone built by hand). Those are
     /// offered, never assumed.
     public let enabledByDefault: Bool
-    /// restic `--exclude` patterns, in the order they reach argv.
-    public let patterns: [String]
+    /// Every pattern in the group, across all platforms, in the order they
+    /// reach argv. Use ``patterns(on:)`` for the ones that apply here.
+    public let patterns: [GlobalExcludePattern]
 
     public init(
         id: String,
         title: String,
         summary: String,
         enabledByDefault: Bool = true,
-        patterns: [String]
+        patterns: [GlobalExcludePattern]
     ) {
         self.id = id
         self.title = title
         self.summary = summary
         self.enabledByDefault = enabledByDefault
         self.patterns = patterns
+    }
+
+    /// The group's patterns for one platform, in catalogue order.
+    public func patterns(on platform: GlobalExcludePlatform) -> [String] {
+        patterns.filter { $0.applies(on: platform) }.map(\.pattern)
     }
 }
 
@@ -50,7 +132,7 @@ public struct GlobalExcludeGroup: Equatable, Sendable, Identifiable {
 ///
 /// **Why compiled in.** A seeded file goes stale the moment a build learns
 /// about a new build system, and every host would then need a migration to
-/// pick the improvement up. Shipping the catalog in code means an upgrade
+/// pick the improvement up. Shipping the catalogue in code means an upgrade
 /// improves the defaults everywhere, and `global-excludes.json` stays what
 /// it should be: the short list of decisions *this host* made that differ
 /// from the defaults.
@@ -58,13 +140,10 @@ public struct GlobalExcludeGroup: Equatable, Sendable, Identifiable {
 /// **Every pattern here is relative and unanchored.** No leading `/`, no
 /// `~`, no `$VAR`. restic matches a relative pattern against the trailing
 /// path components, so `Library/Caches` skips `~/Library/Caches` wherever
-/// the home directory is and on whichever platform, and `node_modules`
-/// skips one at any depth. A `*` inside a component works
-/// (`*.photoslibrary/resources/derivatives`), as does `**` between them
-/// (`*.imovielibrary/**/Render Files`). That is also why there is **no
-/// platform branch**: a macOS-shaped pattern simply matches nothing on
-/// Linux, and keeping one list means `config show` on either OS describes
-/// the same rules.
+/// the home directory is, and `node_modules` skips one at any depth. A `*`
+/// inside a component matches exactly one component
+/// (`bin/*/Debug` reaches `bin/x64/Debug` but not `bin/Debug`), and `**`
+/// spans several (`*.imovielibrary/**/Render Files`).
 ///
 /// **The hazard that shapes the whole list: an unanchored pattern matches
 /// any component of the *absolute* path, including directories above the
@@ -73,6 +152,19 @@ public struct GlobalExcludeGroup: Equatable, Sendable, Identifiable {
 /// pattern must name something nobody has above their data — `node_modules`
 /// is safe, `tmp`, `var`, `data` and `bin` are not.
 /// ``GlobalExcludeCatalogTests`` pins both that denylist and the shape rule.
+///
+/// **Patterns are scoped by platform** (``GlobalExcludePattern``), the way
+/// Code42's `mac:`/`linux:` prefixes are. The rule applied here is narrow:
+/// a pattern is scoped only when its *path shape* cannot exist on the other
+/// platform — `Library/…` and Apple bundle internals are `.mac`, XDG
+/// directories and the Linux browser roots are `.linux`. Anything that is a
+/// *file or directory name* rather than a home-directory layout stays
+/// unscoped, because it can turn up on either host: `.DS_Store` on a Samba
+/// share, `Thumbs.db` on an attached NTFS drive, `node_modules` anywhere.
+///
+/// The residual cost is stated plainly: a Linux host backing up a *Mac's*
+/// home directory over a mount does not get the `.mac` patterns. That is
+/// rare, visible in `excludes show`, and fixable with `excludes add`.
 ///
 /// Patterns reach restic as **`--iexclude`**, not `--exclude`: this list is
 /// a set of well-known names rather than something a person typed, and
@@ -87,15 +179,15 @@ public enum GlobalExcludeCatalog {
     /// Bumped whenever ``groups`` gains, loses or edits a pattern.
     ///
     /// Recorded in `global-excludes.json` so `excludes show` can say "this
-    /// build knows a newer catalog than the one you last saved against",
+    /// build knows a newer catalogue than the one you last saved against",
     /// and so a support question about a surprising exclusion has a version
     /// to quote. It is **not** a compatibility gate: a group this build has
     /// never heard of is an error (see ``GlobalExcludeError/unknownGroup``),
     /// and a group added after the file was written takes its built-in
     /// default.
-    public static let version = 2
+    public static let version = 3
 
-    /// The catalog, in the order its patterns reach argv.
+    /// The catalogue, in the order its patterns reach argv.
     public static let groups: [GlobalExcludeGroup] = [
         GlobalExcludeGroup(
             id: "browser-caches",
@@ -104,26 +196,26 @@ public enum GlobalExcludeCatalog {
                 + "refetches or rebuilds on demand. Bookmarks, history, passwords and profile "
                 + "settings are not here and are still backed up.",
             patterns: [
-                // Per-user cache roots, where the Chromium and Gecko families
-                // keep the bulk of it.
-                "Library/Caches/Google/Chrome",
-                "Library/Caches/Chromium",
-                "Library/Caches/BraveSoftware",
-                "Library/Caches/Microsoft Edge",
-                "Library/Caches/com.microsoft.edgemac",
-                "Library/Caches/com.apple.Safari",
-                "Library/Caches/Firefox",
-                "Library/Caches/com.operasoftware.Opera",
-                ".cache/google-chrome",
-                ".cache/chromium",
-                ".cache/microsoft-edge",
-                ".cache/BraveSoftware",
-                ".cache/mozilla",
-                ".cache/opera",
-                ".cache/vivaldi",
+                // Per-user cache roots. Same browsers, different layouts.
+                .mac("Library/Caches/Google/Chrome"),
+                .mac("Library/Caches/Chromium"),
+                .mac("Library/Caches/BraveSoftware"),
+                .mac("Library/Caches/Microsoft Edge"),
+                .mac("Library/Caches/com.microsoft.edgemac"),
+                .mac("Library/Caches/com.apple.Safari"),
+                .mac("Library/Caches/Firefox"),
+                .mac("Library/Caches/com.operasoftware.Opera"),
+                .linux(".cache/google-chrome"),
+                .linux(".cache/chromium"),
+                .linux(".cache/microsoft-edge"),
+                .linux(".cache/BraveSoftware"),
+                .linux(".cache/mozilla"),
+                .linux(".cache/opera"),
+                .linux(".cache/vivaldi"),
                 // Caches that live *inside* the profile directory, so they
                 // are not covered by the roots above. These names are also
-                // what every Electron app uses, which is deliberate.
+                // what every Electron app uses, which is deliberate — and
+                // they are identical on both platforms.
                 "Code Cache",
                 "GPUCache",
                 "ShaderCache",
@@ -146,13 +238,18 @@ public enum GlobalExcludeCatalog {
             summary: "Per-user cache, log and trash directories, plus the index and metadata "
                 + "sidecars the OS maintains. All of it is rebuilt automatically.",
             patterns: [
-                "Library/Caches",
-                "Library/Logs",
-                "Library/Saved Application State",
-                "Library/Application Support/CrashReporter",
-                "Library/Metadata/CoreSpotlight",
-                ".cache",
-                ".local/share/Trash",
+                .mac("Library/Caches"),
+                .mac("Library/Logs"),
+                .mac("Library/Saved Application State"),
+                .mac("Library/Application Support/CrashReporter"),
+                .mac("Library/Metadata/CoreSpotlight"),
+                .mac("Library/Application Support/Google/DriveFS"),
+                .linux(".cache"),
+                .linux(".local/share/Trash"),
+                // Volume-level debris, deliberately unscoped: all of it
+                // travels on removable and network media, so a Linux host
+                // backing up a Mac-formatted drive still wants it gone, and
+                // a Mac with an NTFS drive attached wants the Windows half.
                 ".Trash",
                 ".Trashes",
                 ".Spotlight-V100",
@@ -160,32 +257,27 @@ public enum GlobalExcludeCatalog {
                 ".fseventsd",
                 ".TemporaryItems",
                 ".apdisk",
+                ".hotfiles.btree",
+                ".PKInstallSandboxManager-SystemSoftware",
+                "Network Trash Folder",
+                "Desktop DB",
+                "Desktop DF",
                 "lost+found",
                 ".DS_Store",
                 "Thumbs.db",
                 "desktop.ini",
-                // Sync clients' own scratch, which is re-downloaded.
-                ".dropbox.cache",
-                "Library/Application Support/Google/DriveFS",
+                "System Volume Information",
                 // Zero-byte iCloud placeholders. `--exclude-cloud-files`
                 // (restic 0.19+) is the real answer; this catches the same
                 // files on an older restic, where they would otherwise be
                 // backed up as empty stubs.
                 "*.icloud",
-                // Backing up a backup: Time Machine's destination and its
-                // local snapshots, and the Finder/system sidecars that
-                // regenerate on sight.
+                // Backing up a backup.
                 "backups.backupdb",
                 ".MobileBackups",
-                "Network Trash Folder",
-                ".hotfiles.btree",
-                ".PKInstallSandboxManager-SystemSoftware",
-                "Desktop DB",
-                "Desktop DF",
+                // Sync clients' own scratch, which is re-downloaded.
+                ".dropbox.cache",
                 ".adobeTemp",
-                // Present on an external drive that has also been used on
-                // Windows, where it is pure filesystem bookkeeping.
-                "System Volume Information",
             ]
         ),
         GlobalExcludeGroup(
@@ -219,25 +311,36 @@ public enum GlobalExcludeCatalog {
             summary: "Directories a build recreates from source that is itself backed up: Swift, "
                 + "Xcode, Rust, .NET, Node, Python, JVM and CMake output trees.",
             patterns: [
-                // Swift / Xcode.
+                // Swift / Xcode. `.build` is SwiftPM and exists on Linux
+                // too; the rest are Xcode-shaped.
                 ".build",
-                "DerivedData",
-                "Library/Developer/Xcode/DerivedData",
-                "Library/Developer/Xcode/iOS DeviceSupport",
-                "Library/Developer/CoreSimulator/Caches",
-                "xcuserdata",
-                "Pods",
-                // Rust and .NET. Deliberately two components: a bare
-                // `target`, `bin` or `obj` would also skip a directory of
-                // 3-D models or a folder someone named "target", so the
-                // patterns name the build configuration underneath them.
+                .mac("DerivedData"),
+                .mac("Library/Developer/Xcode/DerivedData"),
+                .mac("Library/Developer/Xcode/iOS DeviceSupport"),
+                .mac("Library/Developer/CoreSimulator/Caches"),
+                .mac("xcuserdata"),
+                .mac("Pods"),
+                // Rust and .NET. Deliberately never a bare `target`, `bin`
+                // or `obj` — those would also skip a directory of 3-D
+                // models, or a folder someone named "target", or (worse) a
+                // directory *above* the source. The configuration name
+                // underneath them is what makes the pattern safe, and the
+                // `*/` variants reach the architecture-qualified layouts
+                // (`bin/x64/Debug`, `target/<triple>/release`) that the
+                // two-component form alone misses.
                 "target/debug",
                 "target/release",
+                "target/*/debug",
+                "target/*/release",
                 "target/classes",
                 "bin/Debug",
                 "bin/Release",
+                "bin/*/Debug",
+                "bin/*/Release",
                 "obj/Debug",
                 "obj/Release",
+                "obj/*/Debug",
+                "obj/*/Release",
                 ".vs",
                 // Node and the hidden framework output directories.
                 "node_modules",
@@ -297,7 +400,6 @@ public enum GlobalExcludeCatalog {
                 ".cargo/registry",
                 ".cargo/git",
                 "go/pkg/mod",
-                ".cache/go-build",
                 ".gradle/caches",
                 ".m2/repository",
                 ".ivy2/cache",
@@ -305,16 +407,19 @@ public enum GlobalExcludeCatalog {
                 ".pub-cache",
                 ".composer/cache",
                 ".gem/cache",
-                "Library/Caches/Homebrew",
-                ".cache/Homebrew",
-                "Library/Caches/pip",
-                ".cache/pip",
-                "Library/Caches/CocoaPods",
                 "vendor/bundle",
-                ".nvm/.cache",
-                ".cache/ms-playwright",
-                "Library/Caches/ms-playwright",
+                // Tools that use XDG on both platforms stay unscoped; the
+                // ones macOS relocates under `Library/Caches` are paired.
                 ".cache/huggingface",
+                .mac("Library/Caches/Homebrew"),
+                .linux(".cache/Homebrew"),
+                .mac("Library/Caches/pip"),
+                .linux(".cache/pip"),
+                .mac("Library/Caches/go-build"),
+                .linux(".cache/go-build"),
+                .mac("Library/Caches/ms-playwright"),
+                .linux(".cache/ms-playwright"),
+                .mac("Library/Caches/CocoaPods"),
             ]
         ),
         GlobalExcludeGroup(
@@ -324,6 +429,10 @@ public enum GlobalExcludeCatalog {
                 + "Final Cut and iTunes rebuild from the originals. The originals themselves, and "
                 + "each library's own database, are still backed up.",
             patterns: [
+                // Bundle-internal paths, not home-directory layout, so they
+                // stay unscoped: a Linux host may well be backing up the
+                // library from a NAS share.
+                //
                 // Photos: the rendered derivatives, never `originals/` and
                 // never `database/`. Code42 excludes the database too, which
                 // it can afford because it restores files rather than a
@@ -352,15 +461,34 @@ public enum GlobalExcludeCatalog {
                 + "registry and the engine rebuilds its store; the disk images here are "
                 + "routinely tens of gigabytes.",
             patterns: [
-                "Library/Containers/com.docker.docker/Data",
-                "Library/Group Containers/group.com.docker",
+                .mac("Library/Containers/com.docker.docker/Data"),
+                .mac("Library/Group Containers/group.com.docker"),
+                .mac(".orbstack/data"),
+                .mac(".colima"),
+                .mac(".lima"),
+                .linux(".local/share/containers"),
+                .linux(".local/share/docker"),
                 ".docker/desktop",
                 ".docker/machine",
-                ".orbstack/data",
-                ".colima",
-                ".local/share/containers",
-                ".local/share/docker",
-                ".lima",
+            ]
+        ),
+        GlobalExcludeGroup(
+            id: "game-and-media-libraries",
+            title: "Game installs and media server data",
+            summary: "Installed Steam/Epic/GOG games and a Plex server's generated metadata — "
+                + "hundreds of gigabytes that a re-download or a re-scan rebuilds. Save data is "
+                + "not in here.",
+            patterns: [
+                "Steam/steamapps/common",
+                "Steam/steamapps/downloading",
+                "Steam/steamapps/shadercache",
+                "Steam/appcache",
+                "Epic Games",
+                "GOG Galaxy/Games",
+                "Battle.net",
+                "Plex Media Server/Cache",
+                "Plex Media Server/Media",
+                "Plex Media Server/Metadata",
             ]
         ),
         GlobalExcludeGroup(
@@ -379,7 +507,8 @@ public enum GlobalExcludeCatalog {
                 "*.pvm",
                 "*.utm",
                 "Virtual Machines.localized",
-                "Library/Application Support/VirtualBox",
+                .mac("Library/Application Support/VirtualBox"),
+                .linux(".config/VirtualBox"),
                 ".vagrant",
                 ".vagrant.d/boxes",
                 // Suspended-VM state and firmware scratch: large, and
@@ -424,35 +553,14 @@ public enum GlobalExcludeCatalog {
                 "*.mrimg",
             ]
         ),
-        GlobalExcludeGroup(
-            id: "game-and-media-libraries",
-            title: "Game installs and media server data",
-            summary: "Installed Steam/Epic/GOG games and a Plex server's generated metadata — "
-                + "hundreds of gigabytes that a re-download or a re-scan rebuilds. Off by "
-                + "default: rebuilding is cheap in effort and expensive in time, so it is your "
-                + "call. Save data is not in here.",
-            enabledByDefault: false,
-            patterns: [
-                "Steam/steamapps/common",
-                "Steam/steamapps/downloading",
-                "Steam/steamapps/shadercache",
-                "Steam/appcache",
-                "Epic Games",
-                "GOG Galaxy/Games",
-                "Battle.net",
-                "Plex Media Server/Cache",
-                "Plex Media Server/Media",
-                "Plex Media Server/Metadata",
-            ]
-        ),
     ]
 
-    /// Catalog lookup by ``GlobalExcludeGroup/id``.
+    /// Catalogue lookup by ``GlobalExcludeGroup/id``.
     public static func group(id: String) -> GlobalExcludeGroup? {
         groups.first { $0.id == id }
     }
 
-    /// Every known group id, in catalog order.
+    /// Every known group id, in catalogue order.
     public static var groupIDs: [String] {
         groups.map(\.id)
     }
@@ -609,18 +717,25 @@ public struct GlobalExcludeSettings: Codable, Equatable, Sendable {
         groups[group.id] ?? group.enabledByDefault
     }
 
-    /// The enabled groups, in catalog order.
+    /// The enabled groups, in catalogue order.
     public var enabledGroups: [GlobalExcludeGroup] {
         GlobalExcludeCatalog.groups.filter(isEnabled)
     }
 
-    /// Resolves to the value the engine consumes. Deduplicated with
-    /// first-occurrence order preserved, the same rule
+    /// Resolves to the value the engine consumes, for one platform.
+    /// Deduplicated with first-occurrence order preserved, the same rule
     /// ``BackupSet/effectiveBackupExcludes`` uses.
-    public var plan: GlobalExcludePlan {
+    ///
+    /// The platform is a parameter rather than a lookup so the resolution
+    /// is testable for both from either, and defaults to
+    /// ``GlobalExcludePlatform/current`` because the only caller that
+    /// matters — the helper, about to run a backup — is resolving for the
+    /// host it is running on. `extraPatterns` are never platform-scoped:
+    /// this host typed them, on this host.
+    public func plan(on platform: GlobalExcludePlatform = .current) -> GlobalExcludePlan {
         guard enabled else { return .none }
         var seen = Set<String>()
-        let patterns = (enabledGroups.flatMap(\.patterns) + extraPatterns)
+        let patterns = (enabledGroups.flatMap { $0.patterns(on: platform) } + extraPatterns)
             .filter { seen.insert($0).inserted }
         return GlobalExcludePlan(
             patterns: patterns,

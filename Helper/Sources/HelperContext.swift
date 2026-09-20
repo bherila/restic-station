@@ -158,7 +158,7 @@ struct HelperContext {
         // fault entirely once restic is missing.
         let globalExcludes: GlobalExcludePlan
         do {
-            globalExcludes = try GlobalExcludeStore(paths: paths).load().plan
+            globalExcludes = try GlobalExcludeStore(paths: paths).load().plan()
         } catch {
             throw CLIFailure.configInvalid(underlying: error)
         }

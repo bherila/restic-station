@@ -96,7 +96,7 @@ struct ExclusionsSettings: View {
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
-                    Text(ExclusionsCopy.patternCount(group.patterns.count))
+                    Text(ExclusionsCopy.patternCount(group.patterns(on: .current).count))
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
@@ -158,7 +158,7 @@ struct ExclusionsSettings: View {
                     .multilineTextAlignment(.trailing)
             }
             LabeledContent("Patterns applied") {
-                Text(String(pane.settings.plan.patterns.count))
+                Text(String(pane.settings.plan().patterns.count))
             }
             Button("Restore Built-in Defaults") { pane.restoreDefaults() }
         } footer: {
@@ -403,6 +403,10 @@ enum ExclusionsCopy {
         + "defaults: the defaults may skip more than you had configured, which would quietly stop "
         + "backing up directories you had kept."
 
+    /// Counted for **this** platform: the catalogue is scoped, so a macOS
+    /// host never applies the Linux spellings and vice versa
+    /// (`docs/data-model.md` §Platform scoping). Showing the total would
+    /// promise exclusions this machine will not make.
     static func patternCount(_ count: Int) -> String {
         count == 1 ? "1 pattern" : "\(count) patterns"
     }

@@ -118,294 +118,10 @@ bytes rather than needing a Linux host — the point being tested is the artifac
 tools' documented flag behavior, neither of which is platform-dependent.
 
 `install.sh` is idempotent (safe to re-run over a newer tarball) and warns — never fails — if
-the chosen prefix is not already on `PATH`. Real output, from CI's `linux-integration` job
-("`install.sh` works unprivileged, is idempotent, warns off-PATH" step):
-
-```
-$ ./install.sh --prefix=/home/runner/work/_temp/install-test-bin
-installed /home/runner/work/_temp/install-test-bin/restic-station-helper
-restic-station-helper 0.1.0
-
-WARNING: /home/runner/work/_temp/install-test-bin is not on your PATH.
-  Add it to your shell profile, e.g.:
-    echo 'export PATH="/home/runner/work/_temp/install-test-bin:$PATH"' >> ~/.profile
-  (then start a new shell, or: export PATH="/home/runner/work/_temp/install-test-bin:$PATH")
-
-Next steps:
-  1. Make sure restic (>= 0.18) is on PATH: restic version
-  2. Set up config.json — either:
-       - copy one exported from another machine:
-         /home/runner/work/_temp/install-test-bin/restic-station-helper config import /path/to/config.json
-       - or write $XDG_STATE_HOME/restic-station/config.json by hand
-         (see README.md in this tarball, and docs/data-model.md upstream)
-  3. Store each destination's password:
-       /home/runner/work/_temp/install-test-bin/restic-station-helper secret set --dest <destination-id>
-  4. Schedule it: /home/runner/work/_temp/install-test-bin/restic-station-helper timer install
-     (systemd --user; falls back to printing a cron line on hosts without systemd)
-  5. Check it: /home/runner/work/_temp/install-test-bin/restic-station-helper config validate
-```
-
-A second run over the same prefix is silent about the warning once the prefix is on `PATH`, and
-never re-warns once fixed. The rest of this document assumes `restic-station-helper` is on
-`PATH` (i.e. step 1 above is done) and writes commands accordingly.
-
-## Get a config across
-
-The headline M5 story: author sets, schedules and repositories once in the macOS app, then bring
-that same fleet-wide config to this machine. `config.json` is the file meant to travel —
-`config export` on the Mac writes it, `config import` here installs it, `config validate` shows
-exactly what runs on *this* machine before you schedule anything.
-
-The transcript below imports `scripts/fixtures/mac-exported-config.json` — a file checked into
-this repository in the exact shape macOS's `config export` produces (two sets: "Projects", which
-runs everywhere, and "Mac Photos Library", disabled for this machine via a `machines` override —
-the same fixture `scripts/integration-test.sh`'s `assert_fixture_flow` imports). Real output:
-
-```
-$ restic-station-helper config import mac-exported-config.json
-+ added set "Projects" (f1000000-0000-4000-8000-000000000001)
-+ added set "Mac Photos Library" (f1000000-0000-4000-8000-000000000004)
-installed /tmp/tmp.XXXXXXXXXX/data/config.json
-
-$ restic-station-helper config validate
-Errors:
-  (none)
-
-Warnings:
-  (none)
-
-Effective plan for machine "linux-nas":
-  set "Projects" (f1000000-0000-4000-8000-000000000001) — RUNS HERE
-      sources: /tmp/tmp.XXXXXXXXXX/source
-      excludes: (none)
-      purge excludes: (none)
-      schedule: every 5 minutes
-        - primary "NAS Primary": /tmp/tmp.XXXXXXXXXX/repo-primary
-        - secondary "Offsite Mirror": /tmp/tmp.XXXXXXXXXX/repo-mirror
-  set "Mac Photos Library" (f1000000-0000-4000-8000-000000000004) — does not run here
-      sources: /Users/author/Pictures/Photos Library.photoslibrary
-      excludes: (none)
-      purge excludes: (none)
-      schedule: daily 02:30
-        - primary "NAS Primary": /Volumes/BackupNAS/photos-repo  (excluded here)
-
-  excluded here, and why:
-    - backup set "Mac Photos Library" is disabled on this machine
-```
-
-(`linux-nas` here is a demo machine id set via `RESTIC_STATION_MACHINE_ID` for a readable
-transcript — see [Per-machine setup](#per-machine-setup); on a real host `machineId` is
-generated once from the hostname and you would not normally set this.) This is the
-anti-silent-failure guarantee of the whole per-machine design: `config validate` tells you, in
-plain language, exactly what will and will not run here, and why — see
-[Troubleshooting](#troubleshooting).
-
-`config import` **never touches secrets** — repository passwords and secret env vars are never
-in `config.json`, so `secret set` (below) is required on every machine, including this one, even
-right after a successful import.
-
-**`machine.json` (see next section) has one exception to "never touched": a v1 config's
-deprecated `resticPath`.** A real (non-`--dry-run`) import runs the same migration
-`ConfigStore.load()` always runs for an older-schema config
-(`ConfigStore.migrateToCurrentVersion`, `Core/Sources/ResticStationCore/Config/ConfigStore.swift`),
-and that migration *adopts* a v1 config's top-level `resticPath` into `machine.json` — only if
-this host's `machine.json` does not already have one — before clearing the deprecated field from
-the config it installs. That is exactly the case a config exported from an older, pre-schema-v2
-macOS install is likely to carry (`docs/data-model.md` §Versioning & migration). **Only
-`--dry-run` is guaranteed not to touch `machine.json`**: it previews the version bump via
-`ConfigStore.previewMigration`, which deliberately does not simulate the `resticPath` relocation —
-the import command's own `--dry-run` output says so explicitly ("a migration preview does not simulate
-moving resticPath into machine.json; only a real import does that"). If you need certainty that
-nothing on this host changes before committing, run `--dry-run` first and inspect the summary.
-(`config import --help`'s abstract still says "Never touches machine.json" unconditionally — that
-is the same overstatement, tracked to be tightened separately; this document states the actual
-behavior.)
-
-## Per-machine setup
-
-### `machine.json`
-
-`machine.json` holds exactly one thing that must never travel between hosts: this host's
-identity (`machineId`) and, optionally, its own restic binary path. **Never copy `machine.json`
-between machines.** If two hosts ever share a `machineId`, the second one silently inherits the
-first one's per-machine overrides — including, worst case, "back up nothing" or "back up the
-wrong directories." If you `rsync` an entire data directory to a new host (rather than using
-`config export`/`import`), delete `machine.json` on the destination and let it regenerate.
-
-`config.json`, by contrast, **is** the file meant to be shared — checked into a private repo,
-copied by hand, whatever you like. This split (`docs/data-model.md` §machine.json) is what makes
-one config file describe a whole fleet safely.
-
-`machineId` is generated once, on first load, from the hostname (lowercased, non-`[a-z0-9-]`
-characters become `-`). `RESTIC_STATION_MACHINE_ID`, if set, overrides it for that process only
-— it is never written back to `machine.json`, which makes it safe for giving one host a second
-identity, or for a reproducible test/demo transcript (as used above and below).
-
-### The two worked examples
-
-A `machines` override on a set or a destination **replaces** the field it names — it never
-merges with the shared value — and there is no automatic path rewriting between machines
-(`/Users/bwh/...` does not become `/home/bwh/...` on its own; that was considered and rejected as
-implicit and silently wrong at the edges). Both examples' `config validate` **output** below is real, produced in CI against a real config —
-but read the JSON blocks as *illustrations of the override shape*, not as files to copy:
-
-- **Example 1** is **abridged** from `Core/Tests/ResticStationCoreTests/Fixtures/config-v2.json`
-  (the fixture the per-machine resolution unit tests load, and what CI actually validated). The
-  elisions are marked `…` below: a third destination and several required keys — `excludes`,
-  `stalenessWarningDays`, `nonSecretEnv` — are omitted for readability. They are **not optional**;
-  the decoders require them, so this block would fail `config import` if hand-copied as-is. That
-  is why the validate output beneath it lists three destinations where the JSON shows two.
-- **Example 2**'s config is **not** from that fixture. It is synthesized inline by
-  `scripts/linux-docs-transcript.sh`, which is what CI ran to produce the output shown with it.
-
-For a complete, importable file, use `config export` from a working install, or read the fixture
-itself — do not reconstruct one from these excerpts.
-
-**Example 1 — Linux as a source.** A NAS backs up its own directories, on its own schedule, to
-its own path into the (shared) repository; a Mac-only scratch drive is not something the NAS can
-see, so it is disabled there:
-
-```jsonc
-// ABRIDGED — see the note above. `…` marks omitted required keys and a third
-// destination; this is not a copy-pasteable config.json.
-"sets": [{
-  "id": "6F9619FF-8B86-D011-B42D-00C04FC964FF",
-  "name": "Documents",
-  "sources": ["/Users/bwh/Documents"],
-  "excludes": [ … ],
-  "stalenessWarningDays": …,
-  "schedule": { "kind": "daily", "hour": 2, "minute": 30 },
-  "machines": {
-    "linux-nas": { "sources": ["/srv/data"], "schedule": { "kind": "daily", "hour": 4, "minute": 0 } },
-    "old-laptop": { "enabled": false }
-  },
-  "destinations": [
-    { "id": "0A1B2C3D-4E5F-4A1B-8C1D-000000000001", "label": "Big Drive",
-      "repoURL": "/Volumes/Big/documents.restic", "isPrimary": true, "nonSecretEnv": { … },
-      "machines": { "linux-nas": { "repoURL": "/mnt/big/documents.restic" } } },
-
-    // …the fixture's second destination, "R2 mirror", is omitted here — it is
-    // why the validate output below lists three destinations, not two…
-
-    { "id": "2C3D4E5F-6061-4A1B-8C1D-000000000003", "label": "Mac-only external HDD",
-      "repoURL": "/Volumes/Scratch/documents.restic", "isPrimary": false, "nonSecretEnv": { … },
-      "machines": { "linux-nas": { "enabled": false } } }
-  ]
-}]
-```
-
-Real `config validate` output — run in CI against the **full** fixture (`Core/Tests/ResticStationCoreTests/Fixtures/config-v2.json`), not the abridged block above, which is why it lists a third destination:
-
-```
-$ restic-station-helper config validate --machine linux-nas
-Errors:
-  (none)
-
-Warnings:
-  - a machines override references "old-laptop", which this host cannot confirm exists — normal in a multi-machine fleet, but if it is a typo, those overrides silently never apply
-
-Effective plan for machine "linux-nas":
-  set "Documents" (6f9619ff-8b86-d011-b42d-00c04fc964ff) — RUNS HERE
-      sources: /srv/data
-      excludes: node_modules, .build, *.tmp
-      purge excludes: (none)
-      schedule: daily 04:00
-        - primary "Big Drive": /mnt/big/documents.restic
-        - secondary "R2 mirror": s3:https://accountid.r2.cloudflarestorage.com/backups/documents
-        - secondary "Mac-only external HDD": /Volumes/Scratch/documents.restic  (excluded here)
-  set "Photos" (7a8b9c0d-1e2f-4a3b-8c4d-000000000010) — does not run here
-      sources: /Users/bwh/Pictures
-      excludes: (none)
-      purge excludes: (none)
-      schedule: weekly Sun 03:00
-        - primary "Big Drive": /mnt/big/photos.restic  (excluded here)
-
-  excluded here, and why:
-    - destination "Mac-only external HDD" is disabled on this machine
-    - backup set "Photos" is disabled on this machine
-
-$ restic-station-helper config validate --machine old-laptop
-Errors:
-  (none)
-
-Warnings:
-  (none)
-
-Effective plan for machine "old-laptop":
-  set "Documents" (6f9619ff-8b86-d011-b42d-00c04fc964ff) — does not run here
-      sources: /Users/bwh/Documents
-      excludes: node_modules, .build, *.tmp
-      purge excludes: (none)
-      schedule: daily 02:30
-        - primary "Big Drive": /Volumes/Big/documents.restic  (excluded here)
-        - secondary "R2 mirror": s3:https://accountid.r2.cloudflarestorage.com/backups/documents  (excluded here)
-        - secondary "Mac-only external HDD": /Volumes/Scratch/documents.restic  (excluded here)
-  set "Photos" (7a8b9c0d-1e2f-4a3b-8c4d-000000000010) — RUNS HERE
-      sources: /Users/bwh/Pictures
-      excludes: (none)
-      purge excludes: (none)
-      schedule: weekly Sun 03:00
-        - primary "Big Drive": /Volumes/Big/photos.restic
-
-  excluded here, and why:
-    - backup set "Documents" is disabled on this machine
-```
-
-Note "Photos" has no `linux-nas` override at all, and still shows up correctly excluded/included
-per machine — absent `machines`, or no entry for a given machine, always means "inherit and run
-here."
-
-**Example 2 — Linux as a mirror/restore target only.** A host that stores copies and can restore
-from them, but backs up nothing of its own: every set is disabled for it, but it still reads the
-same `config.json`, so `restore`, `probe-repo` and `unlock` know every repository in the fleet.
-Real output, from a config `scripts/linux-docs-transcript.sh` synthesizes inline for this section (not the fixture above), in which both "Documents" and "Photos" are disabled for `mirror-box`:
-
-```
-$ restic-station-helper config validate --machine mirror-box
-Errors:
-  (none)
-
-Warnings:
-  (none)
-
-Effective plan for machine "mirror-box":
-  set "Documents" (6f9619ff-8b86-d011-b42d-00c04fc964ff) — does not run here
-      sources: /Users/bwh/Documents
-      excludes: (none)
-      purge excludes: (none)
-      schedule: daily 02:30
-        - primary "Big Drive": /Volumes/Big/documents.restic  (excluded here)
-  set "Photos" (7a8b9c0d-1e2f-4a3b-8c4d-000000000010) — does not run here
-      sources: /Users/bwh/Pictures
-      excludes: (none)
-      purge excludes: (none)
-      schedule: weekly Sun 03:00
-        - primary "Big Drive": /Volumes/Big/photos.restic  (excluded here)
-
-  excluded here, and why:
-    - backup set "Documents" is disabled on this machine
-    - backup set "Photos" is disabled on this machine
-
-  nothing will run on this machine.
-```
-
-`tick` on a host like this prints one `skipping backup set "…" is disabled on this machine` line
-per set and exits 0 — nothing runs, but nothing is silently broken either. Everything else still
-works: `restic-station-helper restore --set … --dest …`, `probe-repo`, and `unlock` all use the
-`.addressable` resolution view, which does not drop disabled sets — only `.scheduling` (what
-`tick`/`run-set` act on) does. See `docs/data-model.md` §Per-machine scoping for the full
-algorithm and the distinction between the two views.
-
-## Global exclusions
-
-Every backup set also skips a built-in list of paths that are never worth a snapshot — browser
-caches, build output, package-manager downloads, partial downloads. The list ships in the binary;
-this host's adjustments live in `global-excludes.json` beside `machine.json` in the data
-directory, and are never carried by `config export`/`import` (`docs/data-model.md`
-§global-excludes.json).
-
-Real output, from CI's `linux-integration` job (`scripts/linux-docs-transcript.sh`), with the
-per-group descriptions elided for length — run it yourself to read them:
+the chosen prefix is not already on `PATH`. Real output, from CI's `linux-integration` job (`scripts/linux-docs-transcript.sh`), with the
+per-group descriptions elided for length — run it yourself to read them. Note the per-platform
+counts: the macOS-only patterns (`~/Library/...`) are not carried into a Linux host's argv
+(`docs/data-model.md` §Platform scoping).
 
 ```console
 $ restic-station-helper excludes show
@@ -413,32 +129,42 @@ global exclusion list: on
 settings file: /tmp/tmp.XXXXXXXXXX/data-excludes/global-excludes.json  (not present — built-in defaults)
 --exclude-caches: on
 --exclude-larger-than: (no cap)
+platform: linux
 
 [x] browser-caches — Browser caches
       …
-      28 pattern(s)
+      20 pattern(s) here  (+8 for the other platform)
 [x] system-caches — System and application caches
       …
-      20 pattern(s)
+      24 pattern(s) here  (+6 for the other platform)
 [x] temporary-files — Temporary and partial files
       …
-      10 pattern(s)
+      12 pattern(s) here
 [x] developer-build-artifacts — Build output
       …
-      48 pattern(s)
+      51 pattern(s) here  (+6 for the other platform)
 [x] package-manager-caches — Package manager caches
       …
-      22 pattern(s)
+      21 pattern(s) here  (+5 for the other platform)
+[x] media-app-caches — Photo and video app caches
+      …
+      11 pattern(s) here
 [x] container-engines — Container engine storage
       …
-      9 pattern(s)
+      4 pattern(s) here  (+5 for the other platform)
+[x] game-and-media-libraries — Game installs and media server data
+      …
+      10 pattern(s) here
 [ ] virtual-machine-images — Virtual machine disk images
       …
-      11 pattern(s)
+      25 pattern(s) here  (+1 for the other platform)
+[ ] installers-and-disk-images — Installers and disk images
+      …
+      11 pattern(s) here
 
 this machine adds no patterns of its own
 
-137 pattern(s) reach every backup set that has not set usesGlobalExcludes: false
+153 pattern(s) reach every backup set that has not set usesGlobalExcludes: false
 ```
 
 `excludes show --patterns` prints every individual pattern, and `excludes show --json` is the

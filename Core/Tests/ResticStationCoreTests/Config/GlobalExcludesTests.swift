@@ -33,12 +33,14 @@ import Testing
     /// no-op this rule exists to prevent.
     @Test func everyBuiltInPatternIsRelativeAndUnanchored() {
         for group in GlobalExcludeCatalog.groups {
-            for pattern in group.patterns {
+            for entry in group.patterns {
+                let pattern = entry.pattern
                 #expect(!pattern.isEmpty, "\(group.id): empty pattern")
                 #expect(!pattern.hasPrefix("/"), "\(group.id): \"\(pattern)\" is anchored")
                 #expect(!pattern.hasPrefix("~"), "\(group.id): \"\(pattern)\" relies on ~ expansion")
                 #expect(!pattern.contains("$"), "\(group.id): \"\(pattern)\" relies on $VAR expansion")
                 #expect(!pattern.hasSuffix("/"), "\(group.id): \"\(pattern)\" has a trailing separator")
+                #expect(!entry.platforms.isEmpty, "\(group.id): \"\(pattern)\" applies nowhere")
             }
         }
     }
@@ -61,7 +63,7 @@ import Testing
             "documents", "desktop", "downloads", "library", "backup", "backups",
         ]
         for group in GlobalExcludeCatalog.groups {
-            for pattern in group.patterns where !pattern.contains("/") {
+            for pattern in group.patterns.map(\.pattern) where !pattern.contains("/") {
                 #expect(
                     !dangerous.contains(pattern.lowercased()),
                     "\(group.id): \"\(pattern)\" can match a directory ABOVE the source"
@@ -73,7 +75,7 @@ import Testing
     @Test func noPatternIsListedTwiceAcrossTheCatalogue() {
         var seen: [String: String] = [:]
         for group in GlobalExcludeCatalog.groups {
-            for pattern in group.patterns {
+            for pattern in group.patterns.map(\.pattern) {
                 if let owner = seen[pattern] {
                     Issue.record("\"\(pattern)\" appears in both \(owner) and \(group.id)")
                 }
@@ -88,17 +90,17 @@ import Testing
     /// deliberate enough to edit a test for.
     @Test func theOffByDefaultGroupsAreTheOnesThatCanHoldAnOnlyCopy() {
         let off = GlobalExcludeCatalog.groups.filter { !$0.enabledByDefault }.map(\.id)
-        #expect(off == ["virtual-machine-images", "installers-and-disk-images", "game-and-media-libraries"])
+        #expect(off == ["virtual-machine-images", "installers-and-disk-images"])
     }
 
     /// A VM's disk images are skipped; the few kilobytes that describe the
     /// machine are not. Restoring the images without them is harder, not
     /// easier — Code42's equivalent list drops both.
     @Test func theVirtualMachineGroupKeepsTheMachineDefinitionFiles() {
-        let vm = GlobalExcludeCatalog.group(id: "virtual-machine-images")!
-        #expect(vm.patterns.contains("*.vmdk"))
-        #expect(!vm.patterns.contains("*.vmx"))
-        #expect(!vm.patterns.contains("*.vmxf"))
+        let vm = GlobalExcludeCatalog.group(id: "virtual-machine-images")!.patterns.map(\.pattern)
+        #expect(vm.contains("*.vmdk"))
+        #expect(!vm.contains("*.vmx"))
+        #expect(!vm.contains("*.vmxf"))
     }
 
     /// Lockfiles are the files a rebuild depends on most, and `*.lock`
@@ -107,9 +109,10 @@ import Testing
     @Test func noPatternSwallowsLockfiles() {
         let lockfiles = ["Cargo.lock", "yarn.lock", "poetry.lock", "flake.lock", "package-lock.json"]
         for group in GlobalExcludeCatalog.groups {
-            #expect(!group.patterns.contains("*.lock"), "\(group.id) would exclude \(lockfiles)")
-            #expect(!group.patterns.contains("*.db"))
-            #expect(!group.patterns.contains("*.sqlite"))
+            let patterns = group.patterns.map(\.pattern)
+            #expect(!patterns.contains("*.lock"), "\(group.id) would exclude \(lockfiles)")
+            #expect(!patterns.contains("*.db"))
+            #expect(!patterns.contains("*.sqlite"))
         }
     }
 
@@ -117,12 +120,79 @@ import Testing
     /// library restored without the database is one the Photos app refuses
     /// to open.
     @Test func thePhotoGroupSkipsOnlyDerivedMedia() {
-        let media = GlobalExcludeCatalog.group(id: "media-app-caches")!
-        for pattern in media.patterns {
+        let media = GlobalExcludeCatalog.group(id: "media-app-caches")!.patterns.map(\.pattern)
+        for pattern in media {
             #expect(!pattern.contains("originals"))
             #expect(!pattern.contains("database"))
         }
-        #expect(media.patterns.contains("*.photoslibrary/resources/derivatives"))
+        #expect(media.contains("*.photoslibrary/resources/derivatives"))
+    }
+
+    /// The scoping rule, stated as a test: a pattern is platform-scoped
+    /// only when its *path shape* cannot exist on the other platform.
+    /// Anything that is a file or directory **name** stays unscoped,
+    /// because it turns up on either host — `.DS_Store` on a Samba share,
+    /// `Thumbs.db` on an attached NTFS drive, `node_modules` anywhere.
+    @Test func onlyHomeDirectoryLayoutIsPlatformScoped() {
+        let both = Set(GlobalExcludePlatform.allCases)
+        for group in GlobalExcludeCatalog.groups {
+            for entry in group.patterns where entry.platforms != both {
+                let isMacLayout = entry.pattern.hasPrefix("Library/")
+                // The XDG base directories, which is the whole of what a
+                // Linux-only path shape looks like here.
+                let isLinuxLayout = entry.pattern.hasPrefix(".cache/")
+                    || entry.pattern.hasPrefix(".config/")
+                    || entry.pattern.hasPrefix(".local/")
+                    || entry.pattern == ".cache"
+                let isMacDotfile = entry.platforms == [.macOS]
+                    && (entry.pattern.hasPrefix(".orbstack")
+                        || entry.pattern == ".colima"
+                        || entry.pattern == ".lima")
+                let isMacBundleName = entry.platforms == [.macOS]
+                    && ["DerivedData", "xcuserdata", "Pods"].contains(entry.pattern)
+                #expect(
+                    isMacLayout || isLinuxLayout || isMacDotfile || isMacBundleName,
+                    "\(group.id): \"\(entry.pattern)\" is scoped but is not a home-directory layout"
+                )
+            }
+        }
+    }
+
+    /// Neither platform resolves to an empty catalogue, and each one drops
+    /// a meaningful share of the other's — the whole point of scoping.
+    @Test func eachPlatformGetsItsOwnListAndNeitherIsEmpty() {
+        let mac = GlobalExcludeSettings.default.plan(on: .macOS).patterns
+        let linux = GlobalExcludeSettings.default.plan(on: .linux).patterns
+
+        #expect(!mac.isEmpty)
+        #expect(!linux.isEmpty)
+        #expect(mac != linux)
+        #expect(mac.contains("Library/Caches"))
+        #expect(!linux.contains("Library/Caches"))
+        #expect(linux.contains(".cache"))
+        #expect(!mac.contains(".cache"))
+        // The unscoped majority is on both.
+        for shared in ["node_modules", ".DS_Store", "Thumbs.db", "*.tmp", "target/debug"] {
+            #expect(mac.contains(shared), "\(shared) missing on macOS")
+            #expect(linux.contains(shared), "\(shared) missing on Linux")
+        }
+    }
+
+    /// The `*` form reaches the architecture-qualified build layouts
+    /// (`bin/x64/Debug`, `target/<triple>/release`) that the two-component
+    /// form alone misses — verified against real restic, where `*` matches
+    /// exactly one component.
+    @Test func buildOutputCoversBothTheFlatAndQualifiedLayouts() {
+        let build = GlobalExcludeCatalog.group(id: "developer-build-artifacts")!
+            .patterns.map(\.pattern)
+        for pattern in ["bin/Debug", "bin/*/Debug", "obj/Release", "obj/*/Release",
+                        "target/debug", "target/*/release"] {
+            #expect(build.contains(pattern), "\(pattern) missing")
+        }
+        // Still never the bare names.
+        for bare in ["bin", "obj", "target"] {
+            #expect(!build.contains(bare))
+        }
     }
 
     @Test func groupLookupFindsEveryAdvertisedId() {
@@ -138,7 +208,7 @@ import Testing
 @Suite struct GlobalExcludeSettingsTests {
 
     @Test func theDefaultAppliesEveryDefaultOnGroupAndNothingElse() {
-        let plan = GlobalExcludeSettings.default.plan
+        let plan = GlobalExcludeSettings.default.plan(on: .macOS)
         #expect(plan.excludeCaches)
         #expect(plan.patterns.contains("node_modules"))
         #expect(plan.patterns.contains("Library/Caches"))
@@ -157,7 +227,7 @@ import Testing
     @Test func anExplicitTrueTurnsOnAGroupThatIsOffByDefault() {
         var settings = GlobalExcludeSettings()
         settings.groups = ["virtual-machine-images": true]
-        #expect(settings.plan.patterns.contains("*.vmdk"))
+        #expect(settings.plan(on: .macOS).patterns.contains("*.vmdk"))
     }
 
     @Test func theMasterSwitchSuppressesEverythingWithoutLosingTheGroupDecisions() {
@@ -165,16 +235,16 @@ import Testing
         settings.groups = ["virtual-machine-images": true]
         settings.enabled = false
 
-        #expect(settings.plan == .none)
+        #expect(settings.plan(on: .macOS) == .none)
         // The decision underneath survives, so turning it back on restores it.
         settings.enabled = true
-        #expect(settings.plan.patterns.contains("*.vmdk"))
+        #expect(settings.plan(on: .macOS).patterns.contains("*.vmdk"))
     }
 
     @Test func extraPatternsComeAfterTheCatalogueAndAreDeduped() {
         var settings = GlobalExcludeSettings()
         settings.extraPatterns = ["*.iso", "node_modules"]
-        let plan = settings.plan
+        let plan = settings.plan(on: .macOS)
         #expect(plan.patterns.last == "*.iso")
         #expect(plan.patterns.filter { $0 == "node_modules" }.count == 1)
     }
@@ -218,10 +288,10 @@ import Testing
     }
 
     @Test func aSizeCapIsOffUnlessAskedFor() {
-        #expect(GlobalExcludeSettings.default.plan.excludeLargerThan == nil)
+        #expect(GlobalExcludeSettings.default.plan(on: .macOS).excludeLargerThan == nil)
         var settings = GlobalExcludeSettings()
         settings.excludeLargerThan = "10G"
-        #expect(settings.plan.excludeLargerThan == "10G")
+        #expect(settings.plan(on: .macOS).excludeLargerThan == "10G")
     }
 
     @Test(arguments: ["500m", "10G", "1", "42k", "7T"])
