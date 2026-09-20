@@ -145,12 +145,19 @@ struct OnlineOnlyFilesSection: View {
 
 struct ExcludesSection: View {
     @Binding var excludes: [String]
+    @Binding var usesGlobalExcludes: Bool
 
     var body: some View {
         Section {
+            Toggle(SetsCopy.usesGlobalExcludesLabel, isOn: $usesGlobalExcludes)
+
             if excludes.isEmpty {
-                Text("Everything under the sources is backed up.")
-                    .foregroundStyle(.secondary)
+                Text(
+                    usesGlobalExcludes
+                        ? SetsCopy.excludesEmptyStateWithGlobalList
+                        : "Everything under the sources is backed up."
+                )
+                .foregroundStyle(.secondary)
             }
 
             ForEach(excludes.indices, id: \.self) { index in
@@ -176,6 +183,7 @@ struct ExcludesSection: View {
         } footer: {
             VStack(alignment: .leading, spacing: 2) {
                 Text("Each pattern is passed to restic as --exclude.")
+                Text(SetsCopy.usesGlobalExcludesFooter(usesGlobalExcludes))
                 Link(SetsCopy.excludeSyntaxLinkText, destination: SetsCopy.excludeSyntaxURL)
             }
             .font(.footnote)

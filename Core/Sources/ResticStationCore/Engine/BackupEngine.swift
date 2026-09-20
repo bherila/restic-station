@@ -237,6 +237,16 @@ public final class BackupEngine: Sendable {
     /// supplies these unions when it constructs the engine.
     private let purgeSourcePaths: [UUID: Set<String>]
     private let purgeHostnames: [UUID: Set<String>]
+    /// This host's global exclusion list, resolved once by whoever built the
+    /// engine (`docs/data-model.md` §global-excludes.json).
+    ///
+    /// A value, not a store: the engine must never re-read
+    /// `global-excludes.json` mid-run, so a file edited while a long backup
+    /// is in flight cannot make two children of the same run disagree about
+    /// what was skipped. It defaults to ``GlobalExcludePlan/none`` so a
+    /// construction site that has not wired it can only ever back up *more*
+    /// than intended, never less.
+    private let globalExcludes: GlobalExcludePlan
     private let logWriterFactory: @Sendable (URL) throws -> LogWriter
 
     public init(
@@ -251,6 +261,7 @@ public final class BackupEngine: Sendable {
         uptime: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
         purgeSourcePaths: [UUID: Set<String>] = [:],
         purgeHostnames: [UUID: Set<String>] = [:],
+        globalExcludes: GlobalExcludePlan = .none,
         machineId: String = MachineIdentity.generate(),
         previewTokens: PreviewTokenStore? = nil,
         logWriterFactory: (@Sendable (URL) throws -> LogWriter)? = nil
@@ -268,6 +279,7 @@ public final class BackupEngine: Sendable {
         self.previewTokens = previewTokens ?? PreviewTokenStore(paths: paths, now: now)
         self.purgeSourcePaths = purgeSourcePaths
         self.purgeHostnames = purgeHostnames
+        self.globalExcludes = globalExcludes
         self.logWriterFactory = logWriterFactory ?? { url in
             try LogWriter(url: url, now: now)
         }
@@ -398,15 +410,23 @@ public final class BackupEngine: Sendable {
             trigger: trigger,
             groupId: nil, // this run *is* the group
             phase: "backing-up-primary",
-            // `effectiveBackupExcludes`, not `excludes`: purge patterns are
-            // ordinary excludes as far as `backup` is concerned. Passing only
+            // `backupExcludes(applying:)`, not `excludes`: purge patterns
+            // are ordinary excludes as far as `backup` is concerned, and
+            // this host's global list is appended to both. Passing only
             // `excludes` here would have every run re-capture exactly what
             // the purge phase had just rewritten out of history.
+            //
+            // The flow is one-way. Nothing downstream turns a global
+            // pattern into a `purgeExcludes` entry, so a pattern that
+            // arrives because a newer build shipped a better default can
+            // keep files out of the *next* snapshot and can never delete
+            // anything already in a repository.
             command: .backup(
                 repo: primary.repoURL,
                 sources: set.sources,
-                excludes: set.effectiveBackupExcludes,
-                excludeCloudFiles: excludeCloudFiles
+                excludes: set.backupExcludes(applying: globalExcludes),
+                excludeCloudFiles: excludeCloudFiles,
+                excludeCaches: set.excludesCaches(applying: globalExcludes)
             ),
             invocation: ResticInvocation(destination: primary, expectedExecutableIdentity: versionBoundIdentity),
             streamProgress: true,
@@ -415,6 +435,7 @@ public final class BackupEngine: Sendable {
                 if let cloudSourceNote {
                     logWriter?.appendLine(cloudSourceNote)
                 }
+                logWriter?.appendLine(globalExcludeNote(for: set))
                 let probe = await reachability.probe(primary)
                 logWriter?.appendLine("probe primary \"\(primary.label)\": \(describe(probe))")
                 record(probe: probe, for: primary)
@@ -2451,6 +2472,22 @@ public final class BackupEngine: Sendable {
                 return completeRewrites
             }
         )
+    }
+
+    /// The one line every backup log carries about the global exclusion
+    /// list, so "why is this file missing from my snapshot?" is answerable
+    /// from the run log alone rather than by reconstructing which build
+    /// shipped which catalogue.
+    func globalExcludeNote(for set: BackupSet) -> String {
+        guard set.usesGlobalExcludes else {
+            return "global excludes: set opted out (usesGlobalExcludes: false)"
+        }
+        guard !globalExcludes.isEmpty else {
+            return "global excludes: none configured on this machine"
+        }
+        let caches = globalExcludes.excludeCaches ? " plus --exclude-caches" : ""
+        return "global excludes: \(globalExcludes.patterns.count) pattern(s)\(caches) "
+            + "from this machine's global exclusion list"
     }
 
     /// The patterns in `set.purgeExcludes` that this destination's durable

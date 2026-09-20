@@ -38,6 +38,7 @@ import Testing
             "fda-check",
             "secret",
             "config",
+            "excludes",
             "status",
             "sets",
             "runs",
@@ -61,6 +62,7 @@ import Testing
             "fda-check",
             "secret",
             "config",
+            "excludes",
             "status",
             "sets",
             "runs",
@@ -82,7 +84,7 @@ import Testing
     let names: [String?] = HelperMain.configuration.subcommands.map { subcommand in
         subcommand.configuration.commandName
     }
-    for name in ["config", "status", "sets", "runs"] {
+    for name in ["config", "excludes", "status", "sets", "runs"] {
         #expect(names.contains(name), "\(name) should be registered on every platform")
     }
 }

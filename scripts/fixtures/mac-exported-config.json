@@ -1,5 +1,5 @@
 {
-  "version": 4,
+  "version": 5,
   "resticPath": null,
   "showMenuBarIcon": true,
   "onboardingCompleted": true,
@@ -10,6 +10,7 @@
       "sources": ["__SOURCE_DIR__"],
       "excludes": [],
       "onlineOnlyFiles": "skip",
+      "usesGlobalExcludes": true,
       "purgeExcludes": [],
       "schedule": {"kind": "everyMinutes", "minutes": 5},
       "retention": null,
@@ -38,6 +39,7 @@
       "sources": ["/Users/author/Pictures/Photos Library.photoslibrary"],
       "excludes": [],
       "onlineOnlyFiles": "skip",
+      "usesGlobalExcludes": true,
       "purgeExcludes": [],
       "schedule": {"kind": "daily", "hour": 2, "minute": 30},
       "retention": null,

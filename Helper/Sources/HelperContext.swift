@@ -132,15 +132,36 @@ struct HelperContext {
         case noRestic(ResticDiscoveryResult)
     }
 
-    /// - Throws: only ``CLIFailure`` from ``makeSecretStore(paths:runner:)``,
+    /// - Throws: ``CLIFailure`` from ``makeSecretStore(paths:runner:)``,
     ///   which is a misconfigured backend selection — a hard error in every
     ///   caller including `tick`, and one that exited 1 here before it was
-    ///   made throwable.
+    ///   made throwable — and from an unusable `global-excludes.json`, which
+    ///   is fatal for the same reason: falling back to the built-in defaults
+    ///   would exclude more than a host that had turned groups off, so every
+    ///   run afterwards would silently skip directories someone had
+    ///   deliberately kept (`docs/data-model.md` §global-excludes.json).
     static func makeTolerant(
         paths: AppPaths,
         views: Views,
         configStore: ConfigStore
     ) async throws -> TolerantOutcome {
+        // Resolved once, here, for the same reason the two per-machine
+        // config views are: nothing downstream re-reads the file, so a
+        // mid-run edit cannot make two children of one run disagree about
+        // what was skipped.
+        //
+        // **Before** the restic search, deliberately. This is a cheap local
+        // read whose failure is a hard error, while discovery can take
+        // seconds and reports a *tolerable* one; doing it the other way
+        // round would report "restic not found" on a host whose real
+        // problem is an unusable global-excludes.json, and would hide the
+        // fault entirely once restic is missing.
+        let globalExcludes: GlobalExcludePlan
+        do {
+            globalExcludes = try GlobalExcludeStore(paths: paths).load().plan
+        } catch {
+            throw CLIFailure.configInvalid(underlying: error)
+        }
         let resticPath: String
         switch await resolveResticPath(resolved: views.scheduled) {
         case .resolved(let path):
@@ -195,6 +216,7 @@ struct HelperContext {
             reachability: reachability,
             purgeSourcePaths: purgeSourcePaths,
             purgeHostnames: purgeHostnames,
+            globalExcludes: globalExcludes,
             machineId: views.addressable.machineId
         )
         return .ready(HelperContext(

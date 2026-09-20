@@ -68,7 +68,10 @@ struct SetEditorView: View {
 
             OnlineOnlyFilesSection(policy: $draft.onlineOnlyFiles, sources: draft.sourcesOnAnyMachine)
 
-            ExcludesSection(excludes: $draft.excludes)
+            ExcludesSection(
+                excludes: $draft.excludes,
+                usesGlobalExcludes: $draft.usesGlobalExcludes
+            )
 
             PurgeExcludesSection(
                 purgeExcludes: $draft.purgeExcludes,

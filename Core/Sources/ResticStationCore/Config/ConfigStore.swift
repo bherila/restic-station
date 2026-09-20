@@ -226,6 +226,12 @@ public struct ConfigStore: Sendable {
     ///   let restic download online-only cloud files. It is still a pure
     ///   version bump — no value is written — and the change is deliberate
     ///   (`docs/data-model.md` §v3 → v4).
+    /// - **v4 → v5.** An absent `usesGlobalExcludes` decodes as `true`.
+    ///   Like v3 → v4 that is *not* the pre-v5 behaviour — a v4 build had no
+    ///   global exclusion list at all — and it is deliberate: the list
+    ///   exists precisely so a cache directory does not have to be named in
+    ///   every set on every machine (`docs/data-model.md` §v4 → v5). Still a
+    ///   pure version bump; no value is written.
     ///
     /// The pre-migration bytes are copied to `config.v<from>.backup.json`,
     /// keyed by the version being migrated *from*, so each step of the chain

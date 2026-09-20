@@ -396,6 +396,84 @@ works: `restic-station-helper restore --set … --dest …`, `probe-repo`, and `
 `tick`/`run-set` act on) does. See `docs/data-model.md` §Per-machine scoping for the full
 algorithm and the distinction between the two views.
 
+## Global exclusions
+
+Every backup set also skips a built-in list of paths that are never worth a snapshot — browser
+caches, build output, package-manager downloads, partial downloads. The list ships in the binary;
+this host's adjustments live in `global-excludes.json` beside `machine.json` in the data
+directory, and are never carried by `config export`/`import` (`docs/data-model.md`
+§global-excludes.json).
+
+Real output, from CI's `linux-integration` job (`scripts/linux-docs-transcript.sh`), with the
+per-group descriptions elided for length — run it yourself to read them:
+
+```console
+$ restic-station-helper excludes show
+global exclusion list: on
+settings file: /tmp/tmp.XXXXXXXXXX/data-excludes/global-excludes.json  (not present — built-in defaults)
+--exclude-caches: on
+
+[x] browser-caches — Browser caches
+      …
+      28 pattern(s)
+[x] system-caches — System and application caches
+      …
+      20 pattern(s)
+[x] temporary-files — Temporary and partial files
+      …
+      10 pattern(s)
+[x] developer-build-artifacts — Build output
+      …
+      48 pattern(s)
+[x] package-manager-caches — Package manager caches
+      …
+      22 pattern(s)
+[x] container-engines — Container engine storage
+      …
+      9 pattern(s)
+[ ] virtual-machine-images — Virtual machine disk images
+      …
+      11 pattern(s)
+
+this machine adds no patterns of its own
+
+137 pattern(s) reach every backup set that has not set usesGlobalExcludes: false
+```
+
+`excludes show --patterns` prints every individual pattern, and `excludes show --json` is the
+scriptable form. To change what applies here:
+
+```console
+$ restic-station-helper excludes disable developer-build-artifacts
+developer-build-artifacts: not applied on this machine
+
+$ restic-station-helper excludes enable virtual-machine-images
+virtual-machine-images: applied on this machine
+
+$ restic-station-helper excludes add /srv/scratch
+added /srv/scratch
+
+$ restic-station-helper excludes set --exclude-caches false
+global exclusion list: on
+--exclude-caches: off
+
+$ restic-station-helper excludes reset
+removed /tmp/tmp.XXXXXXXXXX/data-excludes/global-excludes.json — back to the built-in defaults
+```
+
+**Where the file lands is decided by the data directory, which is how "per user" and "per
+machine" are told apart.** A helper run as you keeps it under `$XDG_STATE_HOME`; a service that
+sets `RESTIC_STATION_DATA_DIR=/var/lib/restic-station` keeps it machine-wide. There is no
+`/etc` fallback layered underneath — one file, one answer.
+
+A set that must keep archiving something the list skips opts out in the **shared** config with
+`"usesGlobalExcludes": false`; `config show` prints `global excludes: opted out` for such a set.
+
+A `global-excludes.json` this build cannot honour — bad JSON, a group id it does not know, a
+blank pattern, a newer `version` — **fails the run** rather than falling back to the built-in
+defaults, because the defaults may skip more than you had configured. `config validate` and
+`tick` both name the file and the reason.
+
 ## Secrets
 
 Repository passwords and secret environment variables (e.g. S3 keys) live in `secrets.json`

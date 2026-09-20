@@ -11,6 +11,7 @@ Scheduling and management for [restic](https://restic.net) backups: a native mac
 - **Runs** — full history of every backup / copy / check / prune with live progress, stats, and logs; "Back Up Now" manual trigger.
 - **Restore** — browse or search snapshots of any destination, restore selected paths with overwrite warnings, or mount a snapshot read-only (optional, requires [macFUSE](https://macfuse.github.io)).
 - **Maintenance** — retention policies (`restic forget --prune`), repository statistics, and scheduled integrity checks (`restic check --read-data-subset` slice rotation).
+- **Global exclusions** — a built-in list of paths never worth a snapshot (browser caches, build output, package-manager downloads, partial downloads, container storage) applies to every backup set out of the box, plus `restic backup --exclude-caches` for directories their own tools tagged `CACHEDIR.TAG`. Groups are toggled per machine in **Settings → Exclusions** or with `restic-station excludes`, and any set can opt out entirely. It only ever affects new snapshots — nothing already backed up is removed.
 - **Cloud placeholder safety** — per backup set, online-only files under iCloud Drive or File Provider folders (OneDrive, Dropbox, …) are skipped instead of downloaded, or downloaded if you choose; cloud-synced repositories are refused while any repository file is online-only.
 
 ## A look at the app
@@ -70,9 +71,10 @@ restic-station status --json          # headless equivalent of the menu bar; exi
 restic-station sets list              # configured backup sets on this machine
 restic-station runs list --limit 20   # recent run history
 restic-station config show --json     # effective, per-machine-resolved configuration
+restic-station excludes show          # this machine's global exclusion list
 ```
 
-Run `restic-station --help` for the full subcommand list (`config`, `status`, `sets`, `runs`, `secret`, `cli`, and the mutating commands `tick`/`run-set`/`restore`/… that the app and the background agent use themselves). Out of scope for now: a Homebrew formula, man pages, and shell completions (ArgumentParser can generate the last one cheaply — see the open follow-up issue if you want to pick it up).
+Run `restic-station --help` for the full subcommand list (`config`, `excludes`, `status`, `sets`, `runs`, `secret`, `cli`, and the mutating commands `tick`/`run-set`/`restore`/… that the app and the background agent use themselves). Out of scope for now: a Homebrew formula, man pages, and shell completions (ArgumentParser can generate the last one cheaply — see the open follow-up issue if you want to pick it up).
 
 ## Building from source
 

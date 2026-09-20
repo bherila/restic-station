@@ -72,6 +72,32 @@ struct ResticCommandTests {
         ])
     }
 
+    /// `docs/restic-cli.md` §backup: `--exclude-caches` sits after
+    /// `--exclude-cloud-files` and before every `--exclude`, and it is the
+    /// global exclusion list's half of the argv
+    /// (`docs/data-model.md` §global-excludes.json).
+    @Test("backup: --exclude-caches follows --exclude-cloud-files and precedes every --exclude")
+    func backupExcludingCaches() {
+        let cmd = ResticCommand.backup(
+            repo: Self.repo,
+            sources: ["/Users/user/proj"],
+            excludes: ["node_modules"],
+            excludeCloudFiles: true,
+            excludeCaches: true
+        )
+        #expect(cmd.argv == [
+            "-r", Self.repo, "backup", "--json", "--exclude-cloud-files", "--exclude-caches",
+            "--exclude", "node_modules",
+            "/Users/user/proj",
+        ])
+    }
+
+    @Test("backup: --exclude-caches is absent unless asked for")
+    func backupWithoutExcludeCachesByDefault() {
+        let cmd = ResticCommand.backup(repo: Self.repo, sources: ["/Users/user/proj"])
+        #expect(!cmd.argv.contains("--exclude-caches"))
+    }
+
     @Test("copy: -r is the destination, --from-repo the source, and there is no --json")
     func copy() {
         // restic -r <secondaryRepo> copy --from-repo <primaryRepo>

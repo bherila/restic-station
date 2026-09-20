@@ -499,6 +499,23 @@ struct ConfigValidate: AsyncParsableCommand, JSONRenderable {
             }
         }
 
+        // This host's global exclusion list. A warning rather than a hard
+        // error because `validate` is about `config.json` and may be run
+        // with `--machine <other>`, where the file belongs to *this* host
+        // and not to the machine being described — but it is worded as the
+        // blocker it is: every backup here refuses to run until it is
+        // fixed, rather than falling back to defaults that may skip more
+        // than this host had configured (`docs/data-model.md`
+        // §global-excludes.json).
+        do {
+            _ = try GlobalExcludeStore(paths: context.paths).load()
+        } catch {
+            warnings.append(
+                "this machine's global exclusion list cannot be read: \(error). Every backup on this "
+                    + "host refuses to run until it is fixed — see `excludes show`"
+            )
+        }
+
         let nothingRunsHere = report.sets.allSatisfy { !$0.enabledHere }
 
         if json {

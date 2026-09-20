@@ -182,3 +182,136 @@ struct EffectiveConfigReportTests {
         #expect(text.contains("\"purgeExcludes\" : [\n        \"node_modules\"\n      ]"))
     }
 }
+
+// MARK: - Global exclusions
+
+/// `config show`/`config validate` report the **fleet-wide** half of the
+/// global exclusion list — whether a set applies it — and deliberately not
+/// the host-local list itself (`docs/data-model.md` §global-excludes.json).
+/// `excludes show` is the command for the list, and `GlobalExcludeReport`
+/// below is its payload.
+@Suite("Global exclusions in the effective plan")
+struct EffectiveConfigReportGlobalExcludesTests {
+
+    private let setId = UUID(uuidString: "6F9619FF-8B86-D011-B42D-000000000001")!
+    private let primaryId = UUID(uuidString: "0A1B2C3D-4E5F-4A1B-8C1D-000000000011")!
+
+    private func config(usesGlobalExcludes: Bool) -> AppConfig {
+        AppConfig(sets: [BackupSet(
+            id: setId,
+            name: "Build archive",
+            sources: ["/srv/artifacts"],
+            usesGlobalExcludes: usesGlobalExcludes,
+            schedule: .daily(hour: 2, minute: 30),
+            destinations: [
+                Destination(id: primaryId, label: "NAS", repoURL: "/mnt/nas/archive.restic", isPrimary: true),
+            ]
+        )])
+    }
+
+    private func report(usesGlobalExcludes: Bool) -> EffectiveConfigReport {
+        let config = config(usesGlobalExcludes: usesGlobalExcludes)
+        return EffectiveConfigReport.build(
+            addressable: config.addressable(for: "linux-nas"),
+            scheduled: config.resolved(for: "linux-nas")
+        )
+    }
+
+    @Test("usesGlobalExcludes is always in the --json payload, both ways round")
+    func theFlagIsAlwaysEncoded() throws {
+        for expected in [true, false] {
+            let data = try ConfigStore.makeEncoder().encode(report(usesGlobalExcludes: expected))
+            let object = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+            let sets = object?["sets"] as? [[String: Any]] ?? []
+            #expect(sets.count == 1)
+            #expect(sets.first?["usesGlobalExcludes"] as? Bool == expected)
+        }
+    }
+
+    /// The list applies everywhere by default, so saying so on every set
+    /// would be noise — but saying nothing when a set has opted out would
+    /// hide the one case where someone is surprised by what was backed up.
+    @Test("human output names the opt-out, and stays silent when the list applies")
+    func humanOutputOnlyMentionsTheOptOut() {
+        let optedIn = report(usesGlobalExcludes: true).humanLines().joined(separator: "\n")
+        #expect(!optedIn.contains("global excludes"))
+
+        let optedOut = report(usesGlobalExcludes: false).humanLines().joined(separator: "\n")
+        #expect(optedOut.contains("global excludes: opted out (usesGlobalExcludes: false)"))
+    }
+}
+
+// MARK: - excludes show
+
+@Suite("GlobalExcludeReport")
+struct GlobalExcludeReportTests {
+
+    private let path = URL(fileURLWithPath: "/data/global-excludes.json")
+
+    @Test("with no settings file, the report is the built-in defaults and says so")
+    func defaultsAreReportedAsSuch() {
+        let report = GlobalExcludeReport.build(settings: .default, path: path, exists: false)
+
+        #expect(!report.exists)
+        #expect(report.enabled)
+        #expect(report.excludeCaches)
+        #expect(report.groups.count == GlobalExcludeCatalog.groups.count)
+        #expect(report.patterns == GlobalExcludeSettings.default.plan.patterns)
+        // Not "written against catalogue 0" — there is no file to have been
+        // written against an older one.
+        #expect(report.savedCatalogVersion == GlobalExcludeCatalog.version)
+
+        let lines = report.humanLines(includePatterns: false).joined(separator: "\n")
+        #expect(lines.contains("(not present — built-in defaults)"))
+        #expect(!lines.contains("note: this build carries catalogue version"))
+    }
+
+    @Test("a group changed on this machine is marked, and its state is the one that applies")
+    func aChangedGroupIsMarked() {
+        var settings = GlobalExcludeSettings()
+        settings.groups = ["browser-caches": false]
+        let report = GlobalExcludeReport.build(settings: settings, path: path, exists: true)
+
+        let browser = try? #require(report.groups.first { $0.id == "browser-caches" })
+        #expect(browser?.enabled == false)
+        #expect(browser?.enabledByDefault == true)
+        #expect(!report.patterns.contains("Library/Caches/Google/Chrome"))
+
+        let lines = report.humanLines(includePatterns: false).joined(separator: "\n")
+        #expect(lines.contains("[ ] browser-caches"))
+        #expect(lines.contains("(changed on this machine)"))
+    }
+
+    /// A build that added groups since the file was written must say so:
+    /// those groups are already applying, and a surprise exclusion with no
+    /// explanation is the failure this line exists to prevent.
+    @Test("an older saved catalogue version is called out")
+    func anOlderCatalogueVersionIsCalledOut() {
+        var settings = GlobalExcludeSettings()
+        settings.catalogVersion = 0
+        let report = GlobalExcludeReport.build(settings: settings, path: path, exists: true)
+
+        let lines = report.humanLines(includePatterns: false).joined(separator: "\n")
+        #expect(lines.contains("note: this build carries catalogue version"))
+    }
+
+    @Test("--patterns prints every individual pattern")
+    func patternsFlagPrintsThem() {
+        let report = GlobalExcludeReport.build(settings: .default, path: path, exists: false)
+        let terse = report.humanLines(includePatterns: false).joined(separator: "\n")
+        let verbose = report.humanLines(includePatterns: true).joined(separator: "\n")
+
+        #expect(!terse.contains("node_modules"))
+        #expect(verbose.contains("node_modules"))
+    }
+
+    @Test("the master switch off reports no patterns at all")
+    func masterSwitchOffReportsNothing() {
+        var settings = GlobalExcludeSettings()
+        settings.enabled = false
+        let report = GlobalExcludeReport.build(settings: settings, path: path, exists: true)
+
+        #expect(report.patterns.isEmpty)
+        #expect(report.humanLines(includePatterns: false).first == "global exclusion list: off")
+    }
+}

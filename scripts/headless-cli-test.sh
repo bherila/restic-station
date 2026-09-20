@@ -10,6 +10,10 @@
 # What it proves (numbered to match the issue's own test list):
 #   1. `config export`/`config import` round-trip a real config.json,
 #      migrating a v1 file and backing it up in the process.
+#   1b. `excludes` — the host-local global exclusion list: the built-in
+#      defaults with no settings file, persisting a group and a pattern,
+#      refusing an unknown group id, and failing closed on an unusable
+#      global-excludes.json rather than reading it as "the defaults".
 #   2. `config validate` on a config where every set is disabled for this
 #      machine exits 0 but clearly explains that nothing will run — this is
 #      the anti-silent-failure guarantee, asserted on actual stdout.
@@ -135,7 +139,7 @@ capture_clean_status_rc() {
 SECRET_PASSWORD='h34dl3ss "cli" $ecret with spaces '
 
 # ─────────────────────────────────────────────────────────────────────────
-# 1. config export / import round trip, including a v1 → v4 migration.
+# 1. config export / import round trip, including a v1 → v5 migration.
 # ─────────────────────────────────────────────────────────────────────────
 log "1. config export / import round trip"
 
@@ -177,10 +181,10 @@ EOF
 
 RESTIC_STATION_DATA_DIR="$MAC_DATA" run_helper config export --out "$WORK/exported-config.json"
 expect_rc 0
-grep -q '"version" : 4' "$WORK/exported-config.json" \
-    || fail "exported config was not migrated to v4 in memory before export"
+grep -q '"version" : 5' "$WORK/exported-config.json" \
+    || fail "exported config was not migrated to v5 in memory before export"
 grep -q 'machine.json' "$OUT_FILE" || true # note-only; not asserted further
-ok "export migrates v1 → v4 and writes to --out"
+ok "export migrates v1 → v5 and writes to --out"
 
 RESTIC_STATION_DATA_DIR="$LINUX_DATA" run_helper config import "$WORK/exported-config.json" --dry-run
 expect_rc 0
@@ -218,9 +222,64 @@ cat > "$WORK/incoming-v1.json" <<EOF
 EOF
 RESTIC_STATION_DATA_DIR="$V1_IMPORT_DATA" run_helper config import "$WORK/incoming-v1.json"
 expect_rc 0
-grep -q '"version" : 4' "$V1_IMPORT_DATA/config.json" || fail "v1 import was not migrated to v4 on disk"
+grep -q '"version" : 5' "$V1_IMPORT_DATA/config.json" || fail "v1 import was not migrated to v5 on disk"
 [[ -f "$V1_IMPORT_DATA/config.v1.backup.json" ]] || fail "v1 import did not write config.v1.backup.json"
-ok "importing a v1 file migrates it to v3 and writes config.v1.backup.json (T24's migration, reused)"
+ok "importing a v1 file migrates it to v5 and writes config.v1.backup.json (T24's migration, reused)"
+
+# ─────────────────────────────────────────────────────────────────────────
+# 1b. excludes: the host-local global exclusion list, including the
+#     fail-closed refusal an unusable file produces.
+# ─────────────────────────────────────────────────────────────────────────
+log "1b. excludes show / enable / disable / add / reset"
+
+EXCLUDES_DATA="$WORK/excludes-data"
+mkdir -p "$EXCLUDES_DATA"
+
+RESTIC_STATION_DATA_DIR="$EXCLUDES_DATA" run_helper excludes show
+expect_rc 0
+grep -q "not present — built-in defaults" "$OUT_FILE" \
+    || fail "a host with no global-excludes.json must say it is on the built-in defaults"
+[[ ! -f "$EXCLUDES_DATA/global-excludes.json" ]] \
+    || fail "excludes show must not create global-excludes.json"
+ok "excludes show reports the built-in defaults without creating a settings file"
+
+RESTIC_STATION_DATA_DIR="$EXCLUDES_DATA" run_helper excludes disable browser-caches
+expect_rc 0
+RESTIC_STATION_DATA_DIR="$EXCLUDES_DATA" run_helper excludes add '/srv/scratch'
+expect_rc 0
+RESTIC_STATION_DATA_DIR="$EXCLUDES_DATA" run_helper excludes show --json
+expect_rc 0
+jq -e '.data.groups[] | select(.id == "browser-caches") | .enabled == false' "$OUT_FILE" >/dev/null \
+    || fail "excludes disable did not turn the group off"
+jq -e '.data.extraPatterns == ["/srv/scratch"]' "$OUT_FILE" >/dev/null \
+    || fail "excludes add did not record this machine's own pattern"
+jq -e '[.data.patterns[] | select(. == "/srv/scratch")] | length == 1' "$OUT_FILE" >/dev/null \
+    || fail "the resolved pattern list must include this machine's own pattern"
+ok "excludes disable/add persist, and excludes show --json reports the resolved list"
+
+# A typo'd group id is refused rather than ignored: "disable this group"
+# is a request to back up MORE, so silently dropping it would leave a
+# directory unprotected while the operator believes otherwise.
+RESTIC_STATION_DATA_DIR="$EXCLUDES_DATA" run_helper excludes disable browser-cache
+expect_rc 1
+ok "an unknown group id is refused, not silently ignored"
+
+# Fail closed: an unusable file must never read as "the built-in
+# defaults", which may exclude more than this host had configured.
+printf '{ not json' > "$EXCLUDES_DATA/global-excludes.json"
+RESTIC_STATION_DATA_DIR="$EXCLUDES_DATA" run_helper excludes show --json
+expect_rc 1
+jq -e '.ok == false and .error.code == "config_invalid"' "$OUT_FILE" >/dev/null \
+    || fail "an unusable global-excludes.json must be config_invalid, not a silent default"
+grep -q "Refusing to fall back to the built-in defaults" "$OUT_FILE" \
+    || fail "the refusal must say why it is not falling back"
+ok "an unusable global-excludes.json fails closed with config_invalid"
+
+RESTIC_STATION_DATA_DIR="$EXCLUDES_DATA" run_helper excludes reset
+expect_rc 0
+[[ ! -f "$EXCLUDES_DATA/global-excludes.json" ]] \
+    || fail "excludes reset must remove global-excludes.json"
+ok "excludes reset removes the settings file and restores the built-in defaults"
 
 # ─────────────────────────────────────────────────────────────────────────
 # 2. config validate: every set disabled here still exits 0, and says so.
@@ -231,7 +290,7 @@ ALL_DISABLED_DATA="$WORK/all-disabled-data"
 mkdir -p "$ALL_DISABLED_DATA"
 cat > "$ALL_DISABLED_DATA/config.json" <<EOF
 {
-  "version": 4,
+  "version": 5,
   "resticPath": null,
   "showMenuBarIcon": true,
   "sets": [
@@ -303,7 +362,7 @@ make_status_fixture() {
     mkdir -p "$dir/state" "$dir/runs"
     cat > "$dir/config.json" <<EOF
 {
-  "version": 4,
+  "version": 5,
   "resticPath": null,
   "showMenuBarIcon": true,
   "sets": [
@@ -671,7 +730,7 @@ else
     echo "hello" > "$WORK/real-source/a.txt"
     cat > "$REAL_DATA/config.json" <<EOF
 {
-  "version": 4,
+  "version": 5,
   "resticPath": "$RESTIC_BIN",
   "showMenuBarIcon": true,
   "sets": [
