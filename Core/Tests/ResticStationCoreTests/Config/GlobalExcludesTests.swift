@@ -54,19 +54,43 @@ import Testing
     /// 0.18.1 while this catalogue was written). A single-component pattern
     /// must therefore name something nobody has *above* their data.
     @Test func noSingleComponentPatternCanMatchAnAncestorDirectory() {
-        // Names that routinely appear high in a path — a source under any
-        // of them would vanish entirely.
-        let dangerous: Set<String> = [
-            "tmp", "temp", "var", "usr", "opt", "etc", "srv", "home", "users", "root",
-            "data", "src", "lib", "bin", "obj", "sbin", "mnt", "media", "volumes",
-            "target", "build", "dist", "out", "cache", "caches", "log", "logs",
-            "documents", "desktop", "downloads", "library", "backup", "backups",
+        // An **allowlist**, not a denylist of dangerous words.
+        //
+        // The denylist this replaces held thirty names someone had thought
+        // of, and `Pods` was not among them — an ordinary English word that
+        // a folder of podcast assets above a source would match, emptying
+        // that source's snapshot. A denylist can only ever encode the
+        // mistakes already made, so the rule is inverted: a bare,
+        // single-component pattern must be *unmistakable*, and adding one
+        // is a decision someone makes here, in a test, rather than a
+        // decision that slips through review.
+        //
+        // A pattern needs no entry if it is self-evidently not a name a
+        // person would give a directory of their own data: it begins with a
+        // dot, or contains a glob (`*.vmdk`), or has more than one component
+        // (`Steam/appcache`). Everything else is listed below with the
+        // reason it cannot plausibly sit above someone's files.
+        let allowedBareNames: Set<String> = [
+            // Tool-generated directory names nobody types by hand.
+            "node_modules", "__pycache__", "DerivedData", "CMakeFiles", "dist-newstyle",
+            "cmake-build-debug", "cmake-build-release", "Temporary Items",
+            "Network Trash Folder", "Desktop DB", "Desktop DF", "System Volume Information",
+            "Code Cache", "GPUCache", "ShaderCache", "GrShaderCache", "DawnCache",
+            "DawnGraphiteCache", "DawnWebGPUCache", "component_crx_cache", "cache2",
+            "startupCache", "safebrowsing", "backups.backupdb", "iPod Photo Cache",
+            "UserInterfaceState.xcuserstate", "Virtual Machines.localized",
+            // Vendor product names, distinctive enough to be unambiguous.
+            "Thumbs.db", "desktop.ini", "Epic Games", "Battle.net",
         ]
         for group in GlobalExcludeCatalog.groups {
             for pattern in group.patterns.map(\.pattern) where !pattern.contains("/") {
+                let isSelfEvident = pattern.hasPrefix(".") || pattern.contains("*")
                 #expect(
-                    !dangerous.contains(pattern.lowercased()),
-                    "\(group.id): \"\(pattern)\" can match a directory ABOVE the source"
+                    isSelfEvident || allowedBareNames.contains(pattern),
+                    """
+                    \(group.id): "\(pattern)" is a bare name that could match a directory ABOVE \
+                    the source — narrow it, or add it to allowedBareNames with a reason
+                    """
                 )
             }
         }
@@ -282,8 +306,15 @@ import Testing
                     && (entry.pattern.hasPrefix(".orbstack")
                         || entry.pattern == ".colima"
                         || entry.pattern == ".lima")
+                // Xcode/CocoaPods layouts, which exist only where Xcode
+                // does. `Pods/…` rather than a bare `Pods`: that word is an
+                // ordinary English one, and a single-component pattern is
+                // matched against every component of the absolute path, so
+                // a folder of podcast assets above a source would empty its
+                // snapshot — see
+                // `noSingleComponentPatternCanMatchAnAncestorDirectory`.
                 let isMacBundleName = entry.platforms == [.macOS]
-                    && ["DerivedData", "xcuserdata", "Pods"].contains(entry.pattern)
+                    && (entry.pattern == "DerivedData" || entry.pattern.hasPrefix("Pods/"))
                 #expect(
                     isMacLayout || isLinuxLayout || isMacDotfile || isMacBundleName,
                     "\(group.id): \"\(entry.pattern)\" is scoped but is not a home-directory layout"

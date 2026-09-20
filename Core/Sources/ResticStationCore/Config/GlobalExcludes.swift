@@ -217,7 +217,7 @@ public enum GlobalExcludeCatalog {
     /// never heard of is an error (see ``GlobalExcludeError/unknownGroup``),
     /// and a group added after the file was written takes its built-in
     /// default.
-    public static let version = 8
+    public static let version = 9
 
     /// The catalogue, in the order its patterns reach argv.
     public static let groups: [GlobalExcludeGroup] = [
@@ -361,7 +361,17 @@ public enum GlobalExcludeCatalog {
                 // turns up on a Linux host with a Mac project mounted. The
                 // platform-scoping test enforces that distinction.
                 "UserInterfaceState.xcuserstate",
-                .mac("Pods"),
+                // **Not** a bare `Pods`. A single-component pattern is
+                // matched against every component of the absolute path, and
+                // "Pods" is an ordinary English word — a folder of podcast
+                // assets, or Kubernetes material, sitting above a source
+                // would empty that source's snapshot entirely. Only the
+                // parts CocoaPods generates are named; the vendored pod
+                // sources come back from `pod install` but are left in the
+                // snapshot rather than risking the ancestor match.
+                .mac("Pods/Pods.xcodeproj"),
+                .mac("Pods/Target Support Files"),
+                .mac("Pods/Headers"),
                 // Rust and .NET. Deliberately never a bare `target`, `bin`
                 // or `obj` — those would also skip a directory of 3-D
                 // models, or a folder someone named "target", or (worse) a
@@ -383,7 +393,16 @@ public enum GlobalExcludeCatalog {
                 "obj/Release",
                 "obj/*/Debug",
                 "obj/*/Release",
-                ".vs",
+                // **Not** a bare `.vs`. For Open Folder and CMake
+                // workspaces that directory also holds `launch.vs.json` and
+                // `tasks.vs.json` — authored debugging and task settings no
+                // build reproduces. Only the generated databases and
+                // indexes are named.
+                ".vs/ProjectEvaluation",
+                ".vs/FileContentIndex",
+                ".vs/*/v16",
+                ".vs/*/v17",
+                "*.suo",
                 // Node and the hidden framework output directories.
                 "node_modules",
                 ".next",
@@ -396,7 +415,11 @@ public enum GlobalExcludeCatalog {
                 ".parcel-cache",
                 ".vercel",
                 ".netlify",
-                ".wrangler",
+                // **Not** a bare `.wrangler`. `.wrangler/state` holds local
+                // D1 databases and KV/R2 development data, which can be the
+                // only copy of something someone built by hand.
+                ".wrangler/tmp",
+                ".wrangler/deploy",
                 // Python.
                 "__pycache__",
                 "*.pyc",
@@ -1076,8 +1099,15 @@ public struct GlobalExcludeStore: Sendable {
     /// ``save(_:ifUnchangedFrom:)`` and a concurrent edit is refused rather
     /// than silently overwritten.
     public func loadFingerprinted() throws -> (settings: GlobalExcludeSettings, fingerprint: String?) {
-        guard Self.entryExists(at: paths.globalExcludesFile) else {
-            return (.default, nil)
+        do {
+            guard try Self.entryExists(at: paths.globalExcludesFile) else {
+                return (.default, nil)
+            }
+        } catch {
+            throw GlobalExcludeError.unreadable(
+                path: paths.globalExcludesFile.path,
+                underlying: "\(error)"
+            )
         }
         let settings: GlobalExcludeSettings
         let data: Data
@@ -1110,6 +1140,13 @@ public struct GlobalExcludeStore: Sendable {
     /// `fstat` on the descriptor we hold — not a second look at the path —
     /// rejects everything that is not `S_IFREG`, so there is no window in
     /// which the thing checked and the thing read could differ.
+    /// The largest `global-excludes.json` this build will read. Generous
+    /// beyond any real file — the default settings encode to a few hundred
+    /// bytes, and a host with a thousand extra patterns would not reach
+    /// 100 KB — and present only so an accident cannot become an
+    /// out-of-memory on a command that never consumes the file.
+    static let maximumSettingsFileSize: off_t = 4 * 1024 * 1024
+
     static func readRegularFile(at url: URL) throws -> Data {
         let flags = O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC
         let descriptor = url.path.withCString { open($0, flags) }
@@ -1124,6 +1161,15 @@ public struct GlobalExcludeStore: Sendable {
         }
         guard info.st_mode & S_IFMT == S_IFREG else {
             throw LockFailure(path: url.path, operation: "regular-file check", errnoValue: 0)
+        }
+        // `O_NONBLOCK` does nothing for a regular file, so a settings path
+        // accidentally replaced by a multi-gigabyte file would be read into
+        // memory in full — by every command, before any of them dispatches.
+        // The size is already in hand from the `fstat` above, so the refusal
+        // costs nothing. A settings file is a few hundred bytes; the cap is
+        // four orders of magnitude above anything legitimate.
+        guard info.st_size <= Self.maximumSettingsFileSize else {
+            throw LockFailure(path: url.path, operation: "size check", errnoValue: 0)
         }
 
         var data = Data()
@@ -1156,9 +1202,19 @@ public struct GlobalExcludeStore: Sendable {
     /// next backup would skip paths the operator had deliberately kept.
     /// With the entry seen, the read that follows fails and the error says
     /// so (`docs/data-model.md` §global-excludes.json).
-    static func entryExists(at url: URL) -> Bool {
+    /// - Throws: when the probe itself fails for any reason other than the
+    ///   two that genuinely mean "nothing is there". `EACCES` on a parent
+    ///   directory, `EIO` from failing storage or `ELOOP` from a symlink
+    ///   cycle all used to answer `false`, which is the documented *absent*
+    ///   state — so the host silently fell back to the built-in defaults and
+    ///   re-enabled every group its unreadable settings had turned off. Only
+    ///   `ENOENT` and `ENOTDIR` mean absent; everything else fails closed.
+    static func entryExists(at url: URL) throws -> Bool {
         var info = stat()
-        return lstat(url.path, &info) == 0
+        guard lstat(url.path, &info) != 0 else { return true }
+        let code = errno
+        if code == ENOENT || code == ENOTDIR { return false }
+        throw LockFailure(path: url.path, operation: "lstat", errnoValue: code)
     }
 
     /// The byte fingerprint of whatever is on disk right now, or `nil` when
@@ -1187,7 +1243,16 @@ public struct GlobalExcludeStore: Sendable {
     /// turned off. The compare-and-swap uses this one, so an unreadable
     /// entry refuses instead of matching.
     private func strictFingerprint() throws -> String? {
-        guard Self.entryExists(at: paths.globalExcludesFile) else { return nil }
+        let present: Bool
+        do {
+            present = try Self.entryExists(at: paths.globalExcludesFile)
+        } catch {
+            throw GlobalExcludeError.unreadable(
+                path: paths.globalExcludesFile.path,
+                underlying: "\(error)"
+            )
+        }
+        guard present else { return nil }
         let data: Data
         do {
             data = try Self.readRegularFile(at: paths.globalExcludesFile)
@@ -1310,7 +1375,7 @@ public struct GlobalExcludeStore: Sendable {
             // it: a dangling symlink is something to remove, not an absent
             // file. Reporting "already at the built-in defaults" and leaving
             // the entry there would mean the very next load refuses.
-            guard Self.entryExists(at: paths.globalExcludesFile) else {
+            guard try Self.entryExists(at: paths.globalExcludesFile) else {
                 return false
             }
             // Durably, for the mirror-image reason: an unlink that has not

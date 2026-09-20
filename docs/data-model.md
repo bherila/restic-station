@@ -222,7 +222,7 @@ The list has three parts, and each lives where its scope actually is:
 ```json
 {
   "version": 1,
-  "catalogVersion": 8,
+  "catalogVersion": 9,
   "enabled": true,
   "excludeCaches": true,
   "excludeLargerThan": null,
@@ -251,11 +251,13 @@ Every caller that read the file first must pass the fingerprint it read. A save 
 
 **Fatal to `backup`, and to nothing else.** The exclusion list reaches exactly one operation (§How it reaches restic), so exactly one operation refuses on it. `restore`, `unlock`, `probe-repo`, `purge`, `check`, `init-secondary` and `status` keep working on a host whose `global-excludes.json` has a typo in it — putting a mistyped exclusion file between someone and their data in an emergency would be a worse failure than the one being guarded against. The refusal is raised in the engine, per set, and a set with `usesGlobalExcludes: false` is not refused at all. It is reported as an *infrastructure* failure rather than a misconfiguration so a scheduled `tick` exits non-zero: a tick that printed the fault and exited 0 is the silent-stoppage shape of issue #110.
 
+**The refusal is recorded, not silent.** It happens after the set lock and after `lastBackupStart`, and writes a failed backup record. An earlier revision refused before both, "leaving no trace" by analogy with the secret pre-flight — wrong in two ways. That pre-flight is *retryable*, a transient condition a later tick may resolve; an unusable exclusion file is persistent and only a person can fix it, so it belongs in the run history where `status` and health derivation already look, rather than letting a host report its last successful run while every backup refuses. And leaving `lastBackupStart` untouched kept the set permanently due, so `tick`'s backup-wins branch suppressed its scheduled repository check forever — starving the one operation that could still have run.
+
 ### Pattern shape
 
 Every catalogue pattern is **relative and unanchored**: no leading `/`, no `~`, no `$VAR`. restic matches a relative pattern against the trailing path components, so `Library/Caches` skips `~/Library/Caches` wherever the home directory is, and `node_modules` skips one at any depth. A `*` inside a component matches exactly one component — `bin/*/Debug` reaches `bin/x64/Debug` but not `bin/Debug`, which is why the catalogue carries both — and `**` spans several (`*.imovielibrary/**/Render Files`). `extraPatterns` is exempt from all of this — a host adding one of its own may anchor it however it likes.
 
-**The hazard that shapes the whole list.** An unanchored pattern is matched against every component of the *absolute* path, **including directories above the source**. `--exclude tmp` against a source under `/tmp/…` therefore excludes the source itself and produces an empty snapshot — verified against restic 0.18.1 while this catalogue was written. A single-component pattern must name something nobody has above their data: `node_modules` is safe, `tmp`, `var`, `data`, `bin` and `target` are not. `GlobalExcludeCatalogTests` holds the denylist.
+**The hazard that shapes the whole list.** An unanchored pattern is matched against every component of the *absolute* path, **including directories above the source**. `--exclude tmp` against a source under `/tmp/…` therefore excludes the source itself and produces an empty snapshot — verified against restic 0.18.1 while this catalogue was written. A single-component pattern must name something nobody has above their data: `node_modules` is safe, `tmp`, `var`, `data`, `bin` and `target` are not. `GlobalExcludeCatalogTests` holds that rule as an **allowlist**: a bare single-component pattern must either be self-evidently machine-generated (a leading dot, or a glob) or be listed by name with its reason. The denylist it replaced could only encode mistakes already made, and it did not contain `Pods` — an ordinary English word that a folder of podcast assets above a source would match, emptying that source's snapshot.
 
 A related rule: **a default-enabled group never names a directory whose contents someone authored**, however generated the name sounds. `xcuserdata` is a developer's unshared schemes and breakpoints, which no build reproduces — only the `UserInterfaceState.xcuserstate` blob inside it is generated, and that is what the catalogue names. `GlobalExcludeCatalogTests` pins both this and the rule below.
 
@@ -945,8 +947,8 @@ This host's global exclusion list (§global-excludes.json). Host-local — `--ma
   "excludeCaches": true,
   "excludeLargerThan": null,
   "platform": "macOS",
-  "catalogVersion": 8,
-  "savedCatalogVersion": 8,
+  "catalogVersion": 9,
+  "savedCatalogVersion": 9,
   "groups": [
     {
       "id": "browser-caches",

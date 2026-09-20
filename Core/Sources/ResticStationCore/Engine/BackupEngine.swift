@@ -332,21 +332,6 @@ public final class BackupEngine: Sendable {
             return .misconfigured(reason: reason)
         }
 
-        // ── Step 0: this host's global exclusion list ───────────────────
-        // Before the lock and before any state mutation, for the same reason
-        // the secret pre-flight is: a refusal here must leave no trace.
-        //
-        // Only `backup` consumes the list, so only `backup` refuses on it. A
-        // set that has opted out with `usesGlobalExcludes: false` runs
-        // normally even now, and `restore`, `unlock`, `probe`, `purge`,
-        // `check` and `init` never look at it at all — an unusable
-        // `global-excludes.json` must never stand between someone and their
-        // data in an emergency.
-        if let reason = globalExcludesRefusal(for: set) {
-            logWarning("BackupEngine: set \"\(set.name)\": \(reason) — refusing to back up")
-            return .infrastructureFailure(reason: reason)
-        }
-
         // ── Step 1: secret-store pre-flight ─────────────────────────────
         // Deliberately the engine's own read, *before* the lock and before
         // any state mutation: `ResticRunner` performs the same pre-flight,
@@ -392,6 +377,37 @@ public final class BackupEngine: Sendable {
                 destId: primary.id,
                 trigger: trigger,
                 reason: reason
+            )
+            return .infrastructureFailure(reason: reason)
+        }
+
+        // ── Step 3b: this host's global exclusion list ──────────────────
+        // Only `backup` consumes the list, so only `backup` refuses on it. A
+        // set that has opted out with `usesGlobalExcludes: false` runs
+        // normally even now, and `restore`, `unlock`, `probe`, `purge`,
+        // `check` and `init` never look at it at all — an unusable
+        // `global-excludes.json` must never stand between someone and their
+        // data in an emergency.
+        //
+        // **After** the lock and after `lastBackupStart`, deliberately — an
+        // earlier revision refused before both, "leaving no trace", by
+        // analogy with the secret pre-flight. That analogy was wrong in two
+        // ways the review found. The secret pre-flight is `.retryable`, a
+        // transient condition a later tick may resolve on its own; an
+        // unusable exclusion file is persistent and only a person can fix
+        // it, so it belongs in the run history like every other persistent
+        // failure, where `status` and health derivation already look. And
+        // leaving `lastBackupStart` untouched kept the set permanently
+        // "due", so `tick`'s backup-wins branch suppressed its scheduled
+        // repository check forever — starving the one operation that could
+        // still have run.
+        if let reason = globalExcludesRefusal(for: set) {
+            recordInfrastructureFailure(
+                kind: .backup,
+                setId: set.id,
+                destId: primary.id,
+                trigger: trigger,
+                reason: "set \"\(set.name)\": \(reason)"
             )
             return .infrastructureFailure(reason: reason)
         }
@@ -2520,6 +2536,11 @@ public final class BackupEngine: Sendable {
     /// directories someone deliberately kept — and every run would keep
     /// exiting 0 while it happened (`docs/data-model.md`
     /// §global-excludes.json).
+    ///
+    /// The refusal is **recorded**, not silent: it writes a failed backup
+    /// record so `status`, health derivation and `runs list` all see that
+    /// this host has stopped backing up, instead of reporting the last
+    /// successful run until the staleness threshold expires.
     ///
     /// Reported as ``SetRunOutcome/infrastructureFailure(reason:)`` rather
     /// than ``SetRunOutcome/misconfigured(reason:)`` because of what the

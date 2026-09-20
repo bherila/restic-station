@@ -139,7 +139,7 @@ struct HelperContext {
     ///
     ///   An unusable `global-excludes.json` is **not** thrown here. It is
     ///   fatal, but only to `backup`: the failure is carried into the engine
-    ///   and refuses there (``BackupEngine``'s step 0), so `restore`,
+    ///   and refuses there (``BackupEngine``'s step 3b), so `restore`,
     ///   `unlock`, `probe`, `purge`, `check` and `init` — none of which the
     ///   exclusion list ever reaches — keep working on a host whose file has
     ///   a typo in it. Refusing them too would put a mistyped exclusion file
@@ -163,7 +163,7 @@ struct HelperContext {
         // The failure travels as a value rather than a `throw`. Every
         // command in this process goes through here, but only `backup`
         // consumes the exclusion list, so only `backup` may refuse on it;
-        // see the `Throws` note above and `BackupEngine`'s step 0.
+        // see the `Throws` note above and `BackupEngine`'s step 3b.
         let globalExcludes = Result { try GlobalExcludeStore(paths: paths).load().plan() }
         let resticPath: String
         switch await resolveResticPath(resolved: views.scheduled) {

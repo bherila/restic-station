@@ -428,7 +428,7 @@ platform: linux
       12 pattern(s) here
 [x] developer-build-artifacts — Build output
       …
-      55 pattern(s) here  (+5 for the other platform)
+      60 pattern(s) here  (+7 for the other platform)
 [x] package-manager-caches — Package manager caches
       …
       25 pattern(s) here  (+5 for the other platform)
@@ -453,7 +453,7 @@ platform: linux
 
 this machine adds no patterns of its own
 
-150 pattern(s) reach every backup set that has not set usesGlobalExcludes: false
+155 pattern(s) reach every backup set that has not set usesGlobalExcludes: false
 of those, 1 match cloud placeholder stubs (*.icloud) and are held back for a set whose onlineOnlyFiles is "download"
 ```
 
@@ -474,7 +474,6 @@ $ restic-station-helper excludes set --exclude-caches false
 global exclusion list: on
 --exclude-caches: off
 --exclude-larger-than: (no cap)
---exclude-larger-than: (no cap)
 
 $ restic-station-helper excludes reset
 removed /tmp/tmp.XXXXXXXXXX/data-excludes/global-excludes.json — back to the built-in defaults
@@ -492,13 +491,12 @@ A set that must keep archiving something the list skips opts out in the **shared
 lifts it again. It is off by default: every other rule names a folder of regenerable things,
 while a size cap can skip one irreplaceable file with nothing to point at afterwards.
 
-`excludes set --exclude-larger-than 10G` adds restic's size cap, and `--exclude-larger-than none`
-lifts it again. It is off by default: every other rule names a folder of regenerable things,
-while a size cap can skip one irreplaceable file with nothing to point at afterwards.
-
 A `global-excludes.json` this build cannot honour — bad JSON, a group id it does not know, a
-blank pattern, a newer `version` — **fails the run** rather than falling back to the built-in
-defaults, because the defaults may skip more than you had configured. `config validate` and
+blank pattern, a newer `version`, or a settings path that is not a plain readable file —
+**fails the backup** rather than falling back to the built-in defaults, because the defaults may
+skip more than you had configured. Only backups: `restore`, `unlock`, `probe-repo`, `purge`,
+`check` and `init-secondary` keep working, and the refusal is written into the run history so
+`status` reports the host as unhealthy rather than coasting on the last successful run. `config validate` and
 `tick` both name the file and the reason.
 
 ## Secrets

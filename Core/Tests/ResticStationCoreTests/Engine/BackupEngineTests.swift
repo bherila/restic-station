@@ -1662,11 +1662,15 @@ struct BackupEngineTests {
     /// rather than falling back to the built-in defaults, which exclude
     /// *more* than a host that had turned groups off.
     ///
-    /// Before the lock and before any state mutation, so the refusal leaves
-    /// no trace — and reported as an *infrastructure* failure rather than a
+    /// Reported as an *infrastructure* failure rather than a
     /// misconfiguration, because `tick` prints a misconfigured set and exits
-    /// 0, which is the silent-stoppage shape of issue #110.
-    @Test("global excludes: an unusable list refuses the backup and leaves no trace")
+    /// 0, which is the silent-stoppage shape of issue #110 — and **recorded**
+    /// rather than silent. An earlier revision refused before the lock,
+    /// leaving no trace, which meant `status` went on reporting the last
+    /// successful run while every scheduled backup was already refusing, and
+    /// left `lastBackupStart` untouched so `tick`'s backup-wins branch
+    /// starved the set's scheduled check forever.
+    @Test("global excludes: an unusable list refuses the backup and records the refusal")
     func anUnusableGlobalListRefusesTheBackup() async throws {
         let broken = GlobalExcludeError.unreadable(path: "/data/global-excludes.json", underlying: "boom")
         let env = Self.makeEnv(
@@ -1681,10 +1685,18 @@ struct BackupEngineTests {
             return
         }
         #expect(reason.contains("global exclusion list is unusable"))
-        // No restic at all, and nothing recorded: a refusal here is not a
-        // failed run, it is a run that never started.
+        // No restic is ever launched — the refusal happens before any
+        // repository is touched.
         #expect(env.resticArgvs.isEmpty)
-        #expect(env.indexEntries.isEmpty)
+        // But it IS in the run history, where health derivation and `status`
+        // look. A silent refusal let a host report the last successful run
+        // as its state while every backup was already failing.
+        let failures = env.entries(kind: .backup).filter { $0.status == .failed }
+        #expect(failures.count == 1)
+        #expect(failures.first?.errorSummary?.contains("global exclusion list is unusable") == true)
+        // And `lastBackupStart` advanced, so the set does not stay
+        // permanently due and starve its own scheduled check.
+        #expect(env.stateStore.readScheduleState()?.sets[Self.setId]?.lastBackupStart == Self.t0)
     }
 
     /// The refusal is scoped to the sets that actually consume the list. A
