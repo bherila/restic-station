@@ -428,10 +428,10 @@ platform: linux
       12 pattern(s) here
 [x] developer-build-artifacts — Build output
       …
-      51 pattern(s) here  (+6 for the other platform)
+      54 pattern(s) here  (+6 for the other platform)
 [x] package-manager-caches — Package manager caches
       …
-      21 pattern(s) here  (+5 for the other platform)
+      25 pattern(s) here  (+5 for the other platform)
 [x] media-app-caches — Photo and video app caches
       …
       11 pattern(s) here
@@ -453,7 +453,7 @@ platform: linux
 
 this machine adds no patterns of its own
 
-143 pattern(s) reach every backup set that has not set usesGlobalExcludes: false
+150 pattern(s) reach every backup set that has not set usesGlobalExcludes: false
 of those, 1 match cloud placeholder stubs (*.icloud) and are held back for a set whose onlineOnlyFiles is "download"
 ```
 

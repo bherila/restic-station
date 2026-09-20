@@ -108,11 +108,19 @@ struct ExcludesShow: AsyncParsableCommand, JSONRenderable {
 
     func run() async throws {
         let context = ExcludesCLIContext.make()
-        let settings = try context.load().settings
+        // One snapshot, not two. `exists` comes from the fingerprint the
+        // load returned — `nil` means there was no file at the instant the
+        // settings were read — rather than from a second filesystem lookup
+        // afterwards. A concurrent `excludes reset` or `excludes add`
+        // between the two could otherwise have the report label customised
+        // bytes "not present — built-in defaults", or claim a file exists
+        // while printing the defaults, and `savedCatalogVersion` reads off
+        // the same flag.
+        let loaded = try context.load()
         let report = GlobalExcludeReport.build(
-            settings: settings,
+            settings: loaded.settings,
             path: context.paths.globalExcludesFile,
-            exists: FileManager.default.fileExists(atPath: context.paths.globalExcludesFile.path)
+            exists: loaded.fingerprint != nil
         )
 
         if json {

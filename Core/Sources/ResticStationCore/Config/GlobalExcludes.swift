@@ -217,7 +217,7 @@ public enum GlobalExcludeCatalog {
     /// never heard of is an error (see ``GlobalExcludeError/unknownGroup``),
     /// and a group added after the file was written takes its built-in
     /// default.
-    public static let version = 6
+    public static let version = 7
 
     /// The catalogue, in the order its patterns reach argv.
     public static let groups: [GlobalExcludeGroup] = [
@@ -403,7 +403,19 @@ public enum GlobalExcludeCatalog {
                 ".ipynb_checkpoints",
                 "*.egg-info",
                 // JVM, CMake, Go, Dart, Haskell, Terraform, C/C++ tooling.
-                ".gradle",
+                //
+                // **Not a bare `.gradle`.** That name is a project's build
+                // directory *and* the Gradle user home, where
+                // `gradle.properties` and `init.d/` hold repository
+                // credentials, signing settings and init scripts someone
+                // wrote by hand. No build recreates those. The per-project
+                // scratch is named directly instead, and the user home's
+                // genuinely regenerable halves live in
+                // `package-manager-caches`.
+                ".gradle/buildOutputCleanup",
+                ".gradle/configuration-cache",
+                ".gradle/checksums",
+                ".gradle/vcs-1",
                 "cmake-build-debug",
                 "cmake-build-release",
                 "CMakeFiles",
@@ -436,6 +448,14 @@ public enum GlobalExcludeCatalog {
                 ".cargo/git",
                 "go/pkg/mod",
                 ".gradle/caches",
+                // The rest of the Gradle user home that a re-download or a
+                // re-run rebuilds. `gradle.properties`, `init.d/` and
+                // `init.gradle` are deliberately absent: see the note in
+                // `developer-build-artifacts`.
+                ".gradle/daemon",
+                ".gradle/native",
+                ".gradle/jdks",
+                ".gradle/wrapper/dists",
                 ".m2/repository",
                 ".ivy2/cache",
                 ".nuget/packages",

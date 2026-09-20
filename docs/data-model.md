@@ -222,7 +222,7 @@ The list has three parts, and each lives where its scope actually is:
 ```json
 {
   "version": 1,
-  "catalogVersion": 6,
+  "catalogVersion": 7,
   "enabled": true,
   "excludeCaches": true,
   "excludeLargerThan": null,
@@ -256,6 +256,8 @@ Every caller that read the file first must pass the fingerprint it read. A save 
 Every catalogue pattern is **relative and unanchored**: no leading `/`, no `~`, no `$VAR`. restic matches a relative pattern against the trailing path components, so `Library/Caches` skips `~/Library/Caches` wherever the home directory is, and `node_modules` skips one at any depth. A `*` inside a component matches exactly one component — `bin/*/Debug` reaches `bin/x64/Debug` but not `bin/Debug`, which is why the catalogue carries both — and `**` spans several (`*.imovielibrary/**/Render Files`). `extraPatterns` is exempt from all of this — a host adding one of its own may anchor it however it likes.
 
 **The hazard that shapes the whole list.** An unanchored pattern is matched against every component of the *absolute* path, **including directories above the source**. `--exclude tmp` against a source under `/tmp/…` therefore excludes the source itself and produces an empty snapshot — verified against restic 0.18.1 while this catalogue was written. A single-component pattern must name something nobody has above their data: `node_modules` is safe, `tmp`, `var`, `data`, `bin` and `target` are not. `GlobalExcludeCatalogTests` holds the denylist.
+
+That is also why a pattern is never a bare name that is *both* a project's scratch directory and a user home full of authored configuration. `.gradle` was exactly that — a project build directory, and the Gradle user home whose `gradle.properties` and `init.d/` hold repository credentials, signing settings and init scripts someone wrote by hand. The catalogue names the regenerable subdirectories on both sides instead (`.gradle/configuration-cache`, `.gradle/daemon`, …), the way it already did for `.cargo`, `.m2` and `.docker`. `GlobalExcludeCatalogTests` pins that too.
 
 That is also why generic build-directory names are avoided. A bare `target`, `bin` or `obj` would skip a folder of 3-D models, a directory someone named "target", or — worst — a directory *above* the source. The catalogue names the build configuration underneath them instead, in both the flat (`target/debug`, `obj/Release`) and architecture-qualified (`target/*/release`, `bin/*/Debug`) forms, and leaves the rest to `--exclude-caches`, which Cargo's own `CACHEDIR.TAG` already answers.
 
@@ -941,8 +943,8 @@ This host's global exclusion list (§global-excludes.json). Host-local — `--ma
   "excludeCaches": true,
   "excludeLargerThan": null,
   "platform": "macOS",
-  "catalogVersion": 6,
-  "savedCatalogVersion": 6,
+  "catalogVersion": 7,
+  "savedCatalogVersion": 7,
   "groups": [
     {
       "id": "browser-caches",

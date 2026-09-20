@@ -84,6 +84,36 @@ import Testing
         }
     }
 
+    /// No pattern names a directory that is a *project's* scratch under one
+    /// reading and a *user home* full of authored configuration under
+    /// another.
+    ///
+    /// `.gradle` was both: a project build directory, and the Gradle user
+    /// home whose `gradle.properties` and `init.d/` hold repository
+    /// credentials, signing settings and init scripts someone wrote. A bare
+    /// rule excluded the second while meaning the first, and no build
+    /// recreates what it took.
+    ///
+    /// The two near-misses left in deliberately are `.expo` and
+    /// `.wrangler`: their user-home forms hold a session token that a
+    /// re-login reissues, not authored content, so excluding them loses
+    /// nothing a person wrote. `.gradle` is the one where that was untrue.
+    @Test func noBarePatternNamesADirectoryThatIsAlsoAUserHome() {
+        let bare = GlobalExcludeCatalog.groups
+            .flatMap(\.patterns)
+            .map(\.pattern)
+            .filter { !$0.contains("/") }
+        // Each of these has an authored file or directory *inside* the
+        // user-home form — `.gradle/gradle.properties`, `.m2/settings.xml`,
+        // `.cargo/config.toml` and `.cargo/bin`, `.docker/config.json` —
+        // so the catalogue names the regenerable subdirectories instead.
+        // `.npm` is deliberately absent from this list: it is purely a
+        // cache, and npm's authored config is `.npmrc`, a different name.
+        for name in [".gradle", ".m2", ".cargo", ".docker", ".config", ".local", ".ssh"] {
+            #expect(!bare.contains(name), "\(name) is a user home as well as a project directory")
+        }
+    }
+
     /// Exactly one pattern is a *cloud placeholder*, and it is the one a
     /// sync client leaves behind for a file it has evicted.
     ///
