@@ -217,7 +217,7 @@ public enum GlobalExcludeCatalog {
     /// never heard of is an error (see ``GlobalExcludeError/unknownGroup``),
     /// and a group added after the file was written takes its built-in
     /// default.
-    public static let version = 10
+    public static let version = 11
 
     /// The catalogue, in the order its patterns reach argv.
     public static let groups: [GlobalExcludeGroup] = [
@@ -285,7 +285,6 @@ public enum GlobalExcludeCatalog {
                 ".Trash",
                 ".Trashes",
                 ".Spotlight-V100",
-                ".DocumentRevisions-V100",
                 ".fseventsd",
                 ".TemporaryItems",
                 ".apdisk",
@@ -455,7 +454,14 @@ public enum GlobalExcludeCatalog {
                 ".expo",
                 ".stack-work",
                 "dist-newstyle",
-                ".terraform",
+                // **Not** a bare `.terraform`. `.terraform/environment`
+                // records the selected workspace and
+                // `.terraform/terraform.tfstate` the local backend metadata;
+                // neither is derivable from the checked-in configuration
+                // when the backend was configured from outside it. Only the
+                // downloads are named.
+                ".terraform/providers",
+                ".terraform/modules",
                 ".ccls-cache",
                 "*.class",
                 ".sonarlint",
@@ -712,18 +718,60 @@ enum GlobalExcludeAncestorSafety {
         let patternParts = pattern.split(separator: "/").map(String.init)
         guard !patternParts.isEmpty else { return false }
         let sourceParts = sourcePath.split(separator: "/").map(String.init)
-        guard sourceParts.count >= patternParts.count else { return false }
+        guard !sourceParts.isEmpty else { return false }
 
-        // Every window of the source's own components, including the ones
-        // above it — `/srv`, `/srv/project.tmp`, `/srv/project.tmp/work`.
-        for end in patternParts.count...sourceParts.count {
-            let window = sourceParts[(end - patternParts.count)..<end]
-            let matched = zip(window, patternParts).allSatisfy { component, part in
-                glob(part, matches: component, caseInsensitive: caseInsensitive)
+        // Every ancestor of the source, and the source itself — `/srv`,
+        // `/srv/project.tmp`, `/srv/project.tmp/work` — against every
+        // trailing run of components, because a relative pattern is matched
+        // against the trailing components of a path.
+        for end in 1...sourceParts.count {
+            for start in 0..<end {
+                if consumes(
+                    patternParts, Array(sourceParts[start..<end]),
+                    caseInsensitive: caseInsensitive
+                ) {
+                    return true
+                }
             }
-            if matched { return true }
         }
         return false
+    }
+
+    /// Whether `patternParts` matches `pathParts` exactly, with `**`
+    /// spanning **zero or more** components.
+    ///
+    /// The first version of this guard split the pattern into a fixed
+    /// number of parts and matched each against exactly one component,
+    /// which quietly treated `**` as `*`. The catalogue really does use
+    /// `**` — `*.imovielibrary/**/Render Files` — so a source below
+    /// `…/Movie.imovielibrary/Event/Sub/Render Files/work` was not detected
+    /// and the pattern still reached restic, which would have emptied that
+    /// snapshot: precisely the hazard this guard exists to remove.
+    private static func consumes(
+        _ patternParts: [String],
+        _ pathParts: [String],
+        caseInsensitive: Bool
+    ) -> Bool {
+        guard let head = patternParts.first else { return pathParts.isEmpty }
+        let restPattern = Array(patternParts.dropFirst())
+        if head == "**" {
+            // Zero components, then one, then two…
+            for consumed in 0...pathParts.count {
+                if consumes(
+                    restPattern, Array(pathParts.dropFirst(consumed)),
+                    caseInsensitive: caseInsensitive
+                ) {
+                    return true
+                }
+            }
+            return false
+        }
+        guard let first = pathParts.first,
+              glob(head, matches: first, caseInsensitive: caseInsensitive)
+        else { return false }
+        return consumes(
+            restPattern, Array(pathParts.dropFirst()), caseInsensitive: caseInsensitive
+        )
     }
 
     /// One path component against one pattern component. `*` and `?` do not

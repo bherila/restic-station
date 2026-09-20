@@ -222,7 +222,7 @@ The list has three parts, and each lives where its scope actually is:
 ```json
 {
   "version": 1,
-  "catalogVersion": 10,
+  "catalogVersion": 11,
   "enabled": true,
   "excludeCaches": true,
   "excludeLargerThan": null,
@@ -257,7 +257,9 @@ Every caller that read the file first must pass the fingerprint it read. A save 
 
 Every catalogue pattern is **relative and unanchored**: no leading `/`, no `~`, no `$VAR`. restic matches a relative pattern against the trailing path components, so `Library/Caches` skips `~/Library/Caches` wherever the home directory is, and `node_modules` skips one at any depth. A `*` inside a component matches exactly one component — `bin/*/Debug` reaches `bin/x64/Debug` but not `bin/Debug`, which is why the catalogue carries both — and `**` spans several (`*.imovielibrary/**/Render Files`). `extraPatterns` is exempt from all of this — a host adding one of its own may anchor it however it likes.
 
-**The hazard that shapes the whole list.** An unanchored pattern is matched against every component of the *absolute* path, **including directories above the source**. `--exclude tmp` against a source under `/tmp/…` therefore excludes the source itself and produces an empty snapshot — verified against restic 0.18.1 while this catalogue was written. A single-component pattern must name something nobody has above their data: `node_modules` is safe, `tmp`, `var`, `data`, `bin` and `target` are not. **The engine closes this hazard for every pattern, rather than the catalogue guessing at it.** Before a backup, `BackupSet.globalBackupExcludes(applying:)` drops any pattern that would match one of that set's sources or a directory above it (`GlobalExcludeAncestorSafety`), and the run log names each one held back. Two catalogue-level rules were tried first and both were unsound: a denylist of dangerous names, which did not contain `Pods`; and an allowlist exempting anything with a glob, which missed that `*.tmp` matches a directory called `project.tmp` exactly as happily as a file called `draft.tmp` — verified against restic 0.18.1, where a source at `/srv/project.tmp/work` produced `total_files_processed: 0`. Dropping is the safe direction: the set backs up *more* than the catalogue intended, never less.
+**The hazard that shapes the whole list.** An unanchored pattern is matched against every component of the *absolute* path, **including directories above the source**. `--exclude tmp` against a source under `/tmp/…` therefore excludes the source itself and produces an empty snapshot — verified against restic 0.18.1 while this catalogue was written. A single-component pattern must name something nobody has above their data: `node_modules` is safe, `tmp`, `var`, `data`, `bin` and `target` are not. The guard understands `**` as zero or more components, because the catalogue uses it (`*.imovielibrary/**/Render Files`) and treating it as a single `*` left exactly the ancestors it is meant to catch undetected.
+
+**The engine closes this hazard for every pattern, rather than the catalogue guessing at it.** Before a backup, `BackupSet.globalBackupExcludes(applying:)` drops any pattern that would match one of that set's sources or a directory above it (`GlobalExcludeAncestorSafety`), and the run log names each one held back. Two catalogue-level rules were tried first and both were unsound: a denylist of dangerous names, which did not contain `Pods`; and an allowlist exempting anything with a glob, which missed that `*.tmp` matches a directory called `project.tmp` exactly as happily as a file called `draft.tmp` — verified against restic 0.18.1, where a source at `/srv/project.tmp/work` produced `total_files_processed: 0`. Dropping is the safe direction: the set backs up *more* than the catalogue intended, never less.
 
 `GlobalExcludeCatalogTests` still holds a catalogue-level rule as an **allowlist**: a bare single-component pattern must either be self-evidently machine-generated (a leading dot, or a glob) or be listed by name with its reason. The denylist it replaced could only encode mistakes already made, and it did not contain `Pods` — an ordinary English word that a folder of podcast assets above a source would match, emptying that source's snapshot.
 
@@ -949,8 +951,8 @@ This host's global exclusion list (§global-excludes.json). Host-local — `--ma
   "excludeCaches": true,
   "excludeLargerThan": null,
   "platform": "macOS",
-  "catalogVersion": 10,
-  "savedCatalogVersion": 10,
+  "catalogVersion": 11,
+  "savedCatalogVersion": 11,
   "groups": [
     {
       "id": "browser-caches",

@@ -165,6 +165,18 @@ import Testing
         // component between them, so it misses `/srv/a/b/work`.
         #expect(!matches("srv/*/work", "/srv/a/b/work"))
         #expect(matches("srv/*/work", "/srv/a/work"))
+        // `**` spans zero or more components — the catalogue really uses
+        // it, and treating it as a single `*` let
+        // `*.imovielibrary/**/Render Files` miss an ancestor and reach
+        // restic, which would have emptied that source's snapshot.
+        #expect(matches("*.imovielibrary/**/Render Files",
+                        "/media/Movie.imovielibrary/Event/Sub/Render Files/work"))
+        // Zero components between them, too.
+        #expect(matches("*.imovielibrary/**/Render Files",
+                        "/media/Movie.imovielibrary/Render Files/work"))
+        // And it still has to match the fixed parts on either side.
+        #expect(!matches("*.imovielibrary/**/Render Files",
+                        "/media/Movie.imovielibrary/Event/Other/work"))
         // Case follows the flag the pattern will ride.
         #expect(matches("PROJECT", "/srv/project/work"))
         #expect(!matches("PROJECT", "/srv/project/work", caseInsensitive: false))

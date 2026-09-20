@@ -422,13 +422,13 @@ platform: linux
       20 pattern(s) here  (+8 for the other platform)
 [x] system-caches — System and application caches
       …
-      23 pattern(s) here  (+6 for the other platform)
+      22 pattern(s) here  (+6 for the other platform)
 [x] temporary-files — Temporary and partial files
       …
       12 pattern(s) here
 [x] developer-build-artifacts — Build output
       …
-      57 pattern(s) here  (+7 for the other platform)
+      58 pattern(s) here  (+7 for the other platform)
 [x] package-manager-caches — Package manager caches
       …
       25 pattern(s) here  (+5 for the other platform)

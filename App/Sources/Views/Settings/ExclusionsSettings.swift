@@ -390,7 +390,13 @@ final class ExclusionsSettingsModel: ObservableObject {
     func restoreDefaults() {
         guard let store else { return }
         let file = store.paths.globalExcludesFile
-        settings = .default
+        // The in-memory state is **not** replaced until the removal has
+        // actually happened. Assigning `.default` first meant that a
+        // removal which failed before unlinking — a busy write lock, an
+        // unwritable directory — left the pane holding defaults beside the
+        // *old* fingerprint, so the next toggle passed its compare-and-swap
+        // and wrote those defaults over a file that still had the
+        // operator's extra patterns and disabled groups in it.
         hasPendingEdit = false
         do {
             // A compare-and-swap, like every other write from this pane.
@@ -399,6 +405,7 @@ final class ExclusionsSettingsModel: ObservableObject {
             // loaded would otherwise be deleted outright, silently
             // re-enabling the group it had turned off.
             try store.removeSettings(ifUnchangedFrom: fingerprint)
+            settings = .default
             persistedExcludeLargerThan = nil
             fingerprint = nil
             saveFailure = nil
@@ -410,8 +417,13 @@ final class ExclusionsSettingsModel: ObservableObject {
                 return
             }
             saveFailure = "Could not remove \(file.path): \(error)"
+            // Any other failure leaves the file as it was, so the pane must
+            // go back to describing it rather than keeping a half-applied
+            // "defaults" view beside a fingerprint for different bytes.
+            load(paths: store.paths)
         } catch {
             saveFailure = "Could not remove \(file.path): \(error)"
+            load(paths: store.paths)
         }
     }
 
