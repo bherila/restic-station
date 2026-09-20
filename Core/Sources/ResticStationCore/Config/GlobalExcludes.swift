@@ -217,7 +217,7 @@ public enum GlobalExcludeCatalog {
     /// never heard of is an error (see ``GlobalExcludeError/unknownGroup``),
     /// and a group added after the file was written takes its built-in
     /// default.
-    public static let version = 7
+    public static let version = 8
 
     /// The catalogue, in the order its patterns reach argv.
     public static let groups: [GlobalExcludeGroup] = [
@@ -294,7 +294,6 @@ public enum GlobalExcludeCatalog {
                 "Network Trash Folder",
                 "Desktop DB",
                 "Desktop DF",
-                "lost+found",
                 ".DS_Store",
                 "Thumbs.db",
                 "desktop.ini",
@@ -353,7 +352,15 @@ public enum GlobalExcludeCatalog {
                 .mac("Library/Developer/Xcode/DerivedData"),
                 .mac("Library/Developer/Xcode/iOS DeviceSupport"),
                 .mac("Library/Developer/CoreSimulator/Caches"),
-                .mac("xcuserdata"),
+                // **Not** a bare `xcuserdata`. That directory holds a
+                // developer's own schemes and breakpoint lists — unshared,
+                // authored, and not reproducible from the source tree. Only
+                // the window-state blob inside it is generated.
+                // Unscoped, unlike the `Library/…` Xcode paths above: this
+                // is a file *name*, not a macOS home-directory layout, so it
+                // turns up on a Linux host with a Mac project mounted. The
+                // platform-scoping test enforces that distinction.
+                "UserInterfaceState.xcuserstate",
                 .mac("Pods"),
                 // Rust and .NET. Deliberately never a bare `target`, `bin`
                 // or `obj` — those would also skip a directory of 3-D
@@ -1075,7 +1082,7 @@ public struct GlobalExcludeStore: Sendable {
         let settings: GlobalExcludeSettings
         let data: Data
         do {
-            data = try Data(contentsOf: paths.globalExcludesFile)
+            data = try Self.readRegularFile(at: paths.globalExcludesFile)
             settings = try ConfigStore.makeDecoder().decode(GlobalExcludeSettings.self, from: data)
         } catch {
             throw GlobalExcludeError.unreadable(
@@ -1085,6 +1092,54 @@ public struct GlobalExcludeStore: Sendable {
         }
         try settings.validate()
         return (settings, Self.fingerprint(of: data))
+    }
+
+    /// Reads the settings file, refusing anything that is not a plain
+    /// regular file **without ever blocking on it**.
+    ///
+    /// `Data(contentsOf:)` opens the path with no `O_NONBLOCK`, so a FIFO —
+    /// or a symlink to one — parked at `global-excludes.json` blocks the
+    /// open until some writer appears. That is worse than any decode error:
+    /// this read happens while the helper builds its context for *every*
+    /// command, so an emergency `restore` would hang indefinitely, and the
+    /// failure could not even be captured as a value because control never
+    /// returns. The backup-only contract has to survive a hostile file
+    /// type, not just malformed contents.
+    ///
+    /// `O_NONBLOCK` makes the open return immediately for a FIFO, and
+    /// `fstat` on the descriptor we hold — not a second look at the path —
+    /// rejects everything that is not `S_IFREG`, so there is no window in
+    /// which the thing checked and the thing read could differ.
+    static func readRegularFile(at url: URL) throws -> Data {
+        let flags = O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC
+        let descriptor = url.path.withCString { open($0, flags) }
+        guard descriptor >= 0 else {
+            throw LockFailure(path: url.path, operation: "open", errnoValue: errno)
+        }
+        defer { close(descriptor) }
+
+        var info = stat()
+        guard fstat(descriptor, &info) == 0 else {
+            throw LockFailure(path: url.path, operation: "fstat", errnoValue: errno)
+        }
+        guard info.st_mode & S_IFMT == S_IFREG else {
+            throw LockFailure(path: url.path, operation: "regular-file check", errnoValue: 0)
+        }
+
+        var data = Data()
+        var buffer = [UInt8](repeating: 0, count: 64 * 1024)
+        while true {
+            let count = buffer.withUnsafeMutableBytes { raw in
+                read(descriptor, raw.baseAddress, raw.count)
+            }
+            if count < 0 {
+                if errno == EINTR { continue }
+                throw LockFailure(path: url.path, operation: "read", errnoValue: errno)
+            }
+            if count == 0 { break }
+            data.append(contentsOf: buffer[0..<count])
+        }
+        return data
     }
 
     /// Whether the settings path has a directory entry of its own.
@@ -1135,7 +1190,7 @@ public struct GlobalExcludeStore: Sendable {
         guard Self.entryExists(at: paths.globalExcludesFile) else { return nil }
         let data: Data
         do {
-            data = try Data(contentsOf: paths.globalExcludesFile)
+            data = try Self.readRegularFile(at: paths.globalExcludesFile)
         } catch {
             throw GlobalExcludeError.unreadable(
                 path: paths.globalExcludesFile.path,

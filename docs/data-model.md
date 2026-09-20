@@ -222,7 +222,7 @@ The list has three parts, and each lives where its scope actually is:
 ```json
 {
   "version": 1,
-  "catalogVersion": 7,
+  "catalogVersion": 8,
   "enabled": true,
   "excludeCaches": true,
   "excludeLargerThan": null,
@@ -257,6 +257,8 @@ Every catalogue pattern is **relative and unanchored**: no leading `/`, no `~`, 
 
 **The hazard that shapes the whole list.** An unanchored pattern is matched against every component of the *absolute* path, **including directories above the source**. `--exclude tmp` against a source under `/tmp/…` therefore excludes the source itself and produces an empty snapshot — verified against restic 0.18.1 while this catalogue was written. A single-component pattern must name something nobody has above their data: `node_modules` is safe, `tmp`, `var`, `data`, `bin` and `target` are not. `GlobalExcludeCatalogTests` holds the denylist.
 
+A related rule: **a default-enabled group never names a directory whose contents someone authored**, however generated the name sounds. `xcuserdata` is a developer's unshared schemes and breakpoints, which no build reproduces — only the `UserInterfaceState.xcuserstate` blob inside it is generated, and that is what the catalogue names. `GlobalExcludeCatalogTests` pins both this and the rule below.
+
 That is also why a pattern is never a bare name that is *both* a project's scratch directory and a user home full of authored configuration. `.gradle` was exactly that — a project build directory, and the Gradle user home whose `gradle.properties` and `init.d/` hold repository credentials, signing settings and init scripts someone wrote by hand. The catalogue names the regenerable subdirectories on both sides instead (`.gradle/configuration-cache`, `.gradle/daemon`, …), the way it already did for `.cargo`, `.m2` and `.docker`. `GlobalExcludeCatalogTests` pins that too.
 
 That is also why generic build-directory names are avoided. A bare `target`, `bin` or `obj` would skip a folder of 3-D models, a directory someone named "target", or — worst — a directory *above* the source. The catalogue names the build configuration underneath them instead, in both the flat (`target/debug`, `obj/Release`) and architecture-qualified (`target/*/release`, `bin/*/Debug`) forms, and leaves the rest to `--exclude-caches`, which Cargo's own `CACHEDIR.TAG` already answers.
@@ -280,7 +282,7 @@ There is no `windows` scope, because Restic Station has no Windows build and a s
 | id | Default | What it skips |
 |---|---|---|
 | `browser-caches` | on | Cached pages, images, compiled scripts and GPU shaders for the Chromium and Gecko families, plus the same cache directory names inside Electron apps. Bookmarks, history, passwords and profile settings are not in it. |
-| `system-caches` | on | Per-user cache, log and trash directories, the index/metadata sidecars either OS leaves on removable media, iCloud placeholder stubs (but see §Cloud placeholders), and a Time Machine destination or local snapshot store (backing up a backup). |
+| `system-caches` | on | Per-user cache, log and trash directories, the index/metadata sidecars either OS leaves on removable media, iCloud placeholder stubs (but see §Cloud placeholders), and a Time Machine destination or local snapshot store (backing up a backup). **Not** `lost+found`: after an `fsck` that directory holds files recovered from a damaged filesystem, frequently the only surviving copy, so excluding it would skip exactly the data most in need of the backup. |
 | `temporary-files` | on | Editor swap files, partial downloads, crash dumps, anything already named as scratch. |
 | `developer-build-artifacts` | on | Swift, Xcode, Rust, .NET, Node, Python, JVM and CMake output trees, including the hidden framework directories (`.next`, `.nuxt`, `.vercel`, `.turbo`, …) and the architecture-qualified layouts (`bin/x64/Debug`, `target/<triple>/release`). |
 | `package-manager-caches` | on | npm/yarn/pnpm/bun, cargo, Go module, Gradle, Maven, NuGet, pip, Homebrew, CocoaPods, Playwright and Hugging Face caches. |
@@ -943,8 +945,8 @@ This host's global exclusion list (§global-excludes.json). Host-local — `--ma
   "excludeCaches": true,
   "excludeLargerThan": null,
   "platform": "macOS",
-  "catalogVersion": 7,
-  "savedCatalogVersion": 7,
+  "catalogVersion": 8,
+  "savedCatalogVersion": 8,
   "groups": [
     {
       "id": "browser-caches",

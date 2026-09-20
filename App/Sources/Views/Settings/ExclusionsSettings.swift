@@ -288,6 +288,18 @@ final class ExclusionsSettingsModel: ObservableObject {
     /// every save is a compare-and-swap. A CLI edit made while this pane is
     /// open is refused rather than silently overwritten.
     private var fingerprint: String?
+    /// The last size cap that actually reached disk.
+    ///
+    /// The size field edits ``settings`` directly so the text stays visible
+    /// while it is being typed, which means a half-typed value like `10`
+    /// lives in the model. A toggle flipped during that moment must still
+    /// be saved — it is a finished decision, and it cannot be half-made —
+    /// so the write substitutes this value for the unfinished draft rather
+    /// than abandoning the whole save. Without it, turning a group off
+    /// while an invalid size sat in the field silently wrote nothing, and
+    /// the next backup went on applying exclusions the operator had just
+    /// switched off.
+    private var persistedExcludeLargerThan: String?
     /// True while a text field holds an uncommitted draft. Toggles still
     /// save immediately — they cannot be half-typed — but they carry the
     /// pending text with them, so this only governs whether there is
@@ -304,6 +316,7 @@ final class ExclusionsSettingsModel: ObservableObject {
         do {
             let loaded = try store.loadFingerprinted()
             settings = loaded.settings
+            persistedExcludeLargerThan = loaded.settings.excludeLargerThan
             fingerprint = loaded.fingerprint
             hasPendingEdit = false
             loadFailure = nil
@@ -384,6 +397,7 @@ final class ExclusionsSettingsModel: ObservableObject {
             // the write lock with every other writer; an absent file is not
             // an error, it is the default state.
             try store.removeSettings()
+            persistedExcludeLargerThan = nil
             fingerprint = nil
             saveFailure = nil
             loadFailure = nil
@@ -411,8 +425,15 @@ final class ExclusionsSettingsModel: ObservableObject {
         // typed, is not an error to report — it simply is not written.
         var persistable = value
         persistable.extraPatterns.removeAll { $0.isEmpty }
+        // An unfinished size draft holds back **only itself**. Everything
+        // else in this value — a group just switched off, the master
+        // toggle, a pattern just removed — is a finished decision and is
+        // written with the last size that reached disk in place of the
+        // draft. Returning early here instead meant a toggle flipped while
+        // the field held `10` was dropped on the floor, with `hasPendingEdit`
+        // already cleared so leaving the pane could not retry it.
         if let size = persistable.excludeLargerThan, !GlobalExcludeSettings.isValidSize(size) {
-            return
+            persistable.excludeLargerThan = persistedExcludeLargerThan
         }
         do {
             // The fingerprint the write itself produced, taken under the
@@ -421,6 +442,7 @@ final class ExclusionsSettingsModel: ObservableObject {
             // save would then pass its compare-and-swap against *their*
             // bytes and overwrite them.
             fingerprint = try store.save(persistable, ifUnchangedFrom: fingerprint)
+            persistedExcludeLargerThan = persistable.excludeLargerThan
             saveFailure = nil
             loadFailure = nil
         } catch let error as GlobalExcludeError {

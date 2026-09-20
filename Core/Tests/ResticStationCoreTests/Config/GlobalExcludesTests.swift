@@ -114,6 +114,28 @@ import Testing
         }
     }
 
+    /// The catalogue never names a directory whose contents can be a user's
+    /// only copy of something, in a group that is on by default.
+    ///
+    /// Each of these was a real finding, and each was the same shape: a
+    /// name that reads as "generated" until you ask who created what is
+    /// inside it. `lost+found` holds files `fsck` recovered from a damaged
+    /// filesystem — frequently the only surviving copy, and excluded
+    /// exactly when it matters most. `xcuserdata` holds a developer's
+    /// unshared schemes and breakpoints, which no build reproduces; only
+    /// the window-state blob inside it is generated.
+    @Test func noDefaultOnGroupNamesADirectoryOfIrreplaceableContent() {
+        let defaultOn = GlobalExcludeCatalog.groups
+            .filter(\.enabledByDefault)
+            .flatMap(\.patterns)
+            .map(\.pattern)
+        for name in ["lost+found", "xcuserdata", ".git", "Documents", "Desktop"] {
+            #expect(!defaultOn.contains(name), "\(name) can hold content nobody can regenerate")
+        }
+        // The narrowed replacement is still there and still generated.
+        #expect(defaultOn.contains("UserInterfaceState.xcuserstate"))
+    }
+
     /// Exactly one pattern is a *cloud placeholder*, and it is the one a
     /// sync client leaves behind for a file it has evicted.
     ///
@@ -504,6 +526,28 @@ import Testing
     /// Fail closed. Falling back to the built-in defaults would apply *more*
     /// exclusions than a host that had turned groups off, so every run
     /// afterwards would silently skip directories someone deliberately kept.
+    /// A FIFO at the settings path must be refused, not waited on.
+    ///
+    /// `Data(contentsOf:)` opens without `O_NONBLOCK`, so a FIFO parked
+    /// there blocks the open until a writer appears — and this read runs
+    /// while the helper builds its context for *every* command, so an
+    /// emergency `restore` would hang forever. Worse than a decode error,
+    /// because the failure could not even be captured as a value.
+    ///
+    /// The test would hang rather than fail if this regressed, so it is
+    /// written to prove the refusal is immediate: a FIFO with no writer, and
+    /// a bounded expectation that the call returns at all.
+    @Test(.timeLimit(.minutes(1)))
+    func aFifoAtTheSettingsPathIsRefusedRatherThanWaitedOn() throws {
+        try withPaths { paths in
+            try paths.ensureDirectories()
+            #expect(mkfifo(paths.globalExcludesFile.path, 0o600) == 0)
+            #expect(throws: GlobalExcludeError.self) {
+                try GlobalExcludeStore(paths: paths).load()
+            }
+        }
+    }
+
     @Test func anUnreadableFileRefusesInsteadOfFallingBackToTheDefaults() throws {
         try withPaths { paths in
             try paths.ensureDirectories()

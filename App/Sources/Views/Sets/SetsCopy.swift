@@ -81,7 +81,8 @@ enum SetsCopy {
         usesGlobalExcludes
             ? "This set also skips the global exclusions from Settings → Exclusions."
             : "This set ignores the global exclusions from Settings → Exclusions, including "
-                + "CACHEDIR.TAG directories. Only the patterns above are skipped."
+                + "CACHEDIR.TAG directories. Only this set's own patterns are skipped — the ones "
+                + "above, plus anything listed under Purge."
     }
 
     /// Local destination under `/Volumes`.
