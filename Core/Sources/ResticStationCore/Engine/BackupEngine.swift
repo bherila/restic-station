@@ -424,7 +424,7 @@ public final class BackupEngine: Sendable {
             command: .backup(
                 repo: primary.repoURL,
                 sources: set.sources,
-                excludes: set.effectiveBackupExcludes,
+                excludes: set.effectiveBackupExcludes + set.hostBackupExcludes(applying: globalExcludes),
                 globalExcludes: set.globalBackupExcludes(applying: globalExcludes),
                 excludeCloudFiles: excludeCloudFiles,
                 excludeCaches: set.excludesCaches(applying: globalExcludes),
@@ -2491,7 +2491,7 @@ public final class BackupEngine: Sendable {
         if globalExcludes.excludeCaches { extras.append("--exclude-caches") }
         if let size = globalExcludes.excludeLargerThan { extras.append("--exclude-larger-than \(size)") }
         let suffix = extras.isEmpty ? "" : " plus \(extras.joined(separator: ", "))"
-        return "global excludes: \(globalExcludes.patterns.count) pattern(s)\(suffix) "
+        return "global excludes: \(globalExcludes.allPatterns.count) pattern(s)\(suffix) "
             + "from this machine's global exclusion list"
     }
 

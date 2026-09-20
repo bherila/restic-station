@@ -251,11 +251,17 @@ public struct BackupSet: Codable, Equatable, Identifiable, Sendable {
     /// nothing at all when the set has opted out with
     /// ``usesGlobalExcludes``.
     ///
-    /// A pattern the set already names in ``effectiveBackupExcludes`` is
-    /// dropped: it would reach restic twice with the same effect, and an
-    /// argv that repeats itself is harder to read in a run log. The
-    /// comparison is case-insensitive because the global half is matched
-    /// that way (`--iexclude`).
+    /// A pattern the set already names **exactly** is dropped: it would
+    /// reach restic twice with the same effect, and an argv that repeats
+    /// itself is harder to read in a run log.
+    ///
+    /// The comparison is case-*sensitive* on purpose. The set's own list is
+    /// matched case-sensitively (`--exclude`) while the catalogue is matched
+    /// case-insensitively (`--iexclude`), so a set carrying `NODE_MODULES`
+    /// does **not** make the catalogue's `node_modules` redundant —
+    /// dropping it there would leave ordinary lowercase `node_modules`
+    /// directories backed up despite global exclusions being on. Only
+    /// identical strings are genuinely the same rule.
     ///
     /// **The global list is forward-only and never becomes a purge
     /// pattern.** `purgeExcludes` is the only list `rewrite --forget` ever
@@ -265,8 +271,20 @@ public struct BackupSet: Codable, Equatable, Identifiable, Sendable {
     /// default must never delete anything already in a repository.
     public func globalBackupExcludes(applying plan: GlobalExcludePlan) -> [String] {
         guard usesGlobalExcludes else { return [] }
-        let own = Set(effectiveBackupExcludes.map { $0.lowercased() })
-        return plan.patterns.filter { !own.contains($0.lowercased()) }
+        let own = Set(effectiveBackupExcludes)
+        return plan.patterns.filter { !own.contains($0) }
+    }
+
+    /// This host's own ``GlobalExcludeSettings/extraPatterns`` for `backup`'s
+    /// case-sensitive `--exclude` block, appended after the set's own —
+    /// or nothing when the set has opted out.
+    ///
+    /// They join the set's list rather than the catalogue's because that is
+    /// the matching rule `excludes add` documents for them.
+    public func hostBackupExcludes(applying plan: GlobalExcludePlan) -> [String] {
+        guard usesGlobalExcludes else { return [] }
+        let own = Set(effectiveBackupExcludes)
+        return plan.hostPatterns.filter { !own.contains($0) }
     }
 
     /// Whether `backup` carries `--exclude-caches` for this set: the host

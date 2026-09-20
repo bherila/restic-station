@@ -241,12 +241,22 @@ import Testing
         #expect(settings.plan(on: .macOS).patterns.contains("*.vmdk"))
     }
 
-    @Test func extraPatternsComeAfterTheCatalogueAndAreDeduped() {
+    /// Host-added patterns keep their own list, because provenance decides
+    /// the matching rule: the catalogue rides case-insensitive `--iexclude`,
+    /// while `excludes add` documents its patterns as ordinary
+    /// case-sensitive `--exclude`. Folding `*.TMP` into the catalogue block
+    /// would also drop `draft.tmp` — more than the operator asked for.
+    @Test func hostPatternsStaySeparateFromTheCatalogue() {
         var settings = GlobalExcludeSettings()
-        settings.extraPatterns = ["*.iso", "node_modules"]
+        settings.extraPatterns = ["*.TMP", "node_modules"]
         let plan = settings.plan(on: .macOS)
-        #expect(plan.patterns.last == "*.iso")
-        #expect(plan.patterns.filter { $0 == "node_modules" }.count == 1)
+
+        #expect(plan.patterns.contains("node_modules"))
+        #expect(!plan.patterns.contains("*.TMP"))
+        // `node_modules` is already in the catalogue, so only the genuinely
+        // new one survives on the host list.
+        #expect(plan.hostPatterns == ["*.TMP"])
+        #expect(plan.allPatterns.filter { $0 == "node_modules" }.count == 1)
     }
 
     @Test func everyKeyIsEncodedExplicitly() throws {
@@ -376,15 +386,74 @@ import Testing
     /// text is foreign and unbounded, so it goes last.
     @Test func theRefusalReasonSurvivesTheMessageCap() {
         let noisy = String(repeating: "NSDebugDescription=the given data was not valid JSON; ", count: 40)
-        let error = GlobalExcludeError.unreadable(path: "/very/long/path/global-excludes.json", underlying: noisy)
-        let message = CLIFailure.configInvalid(underlying: error).message
+        // BOTH externally sized strings are pathological here: a deeply
+        // nested RESTIC_STATION_DATA_DIR can blow the cap on its own, which
+        // an earlier fix that only moved the decoder text still allowed.
+        let deepPath = "/" + Array(repeating: "deeply-nested-data-directory", count: 30).joined(separator: "/")
+            + "/global-excludes.json"
+        for (path, underlying) in [(deepPath, noisy), ("/short/x.json", noisy), (deepPath, "boom")] {
+            let error = GlobalExcludeError.unreadable(path: path, underlying: underlying)
+            let message = CLIFailure.configInvalid(underlying: error).message
 
-        #expect(message.count <= CLIFailure.messageCharacterLimit)
-        #expect(
-            message.contains("will not fall back to the built-in defaults"),
-            "the refusal must still say why it did not use the defaults: \(message)"
-        )
-        #expect(message.contains("global-excludes.json"))
+            #expect(message.count <= CLIFailure.messageCharacterLimit)
+            #expect(
+                message.contains("will not fall back to the built-in defaults"),
+                "the refusal must still say why it did not use the defaults: \(message)"
+            )
+        }
+    }
+
+    /// A concurrent edit must be refused, not silently overwritten.
+    ///
+    /// The Settings pane holds this file while it is open; without the
+    /// compare-and-swap a `restic-station excludes disable …` run in a
+    /// terminal is erased by the pane's next toggle. The decision most
+    /// likely to be lost is a *disabled* group, which silently re-enables
+    /// it and drops paths the operator meant to keep.
+    @Test func aConcurrentEditIsRefusedRatherThanOverwritten() throws {
+        try withPaths { paths in
+            let store = GlobalExcludeStore(paths: paths)
+            var initial = GlobalExcludeSettings()
+            initial.extraPatterns = ["/one"]
+            try store.save(initial)
+
+            // An editor loads, carrying the fingerprint it saw.
+            let editor = try store.loadFingerprinted()
+
+            // Someone else writes in the meantime — here, turning a group
+            // off, the edit whose loss actually costs data.
+            var other = try store.load()
+            other.groups["browser-caches"] = false
+            try store.save(other)
+
+            var stale = editor.settings
+            stale.extraPatterns = ["/two"]
+            #expect(throws: GlobalExcludeError.self) {
+                try store.save(stale, ifUnchangedFrom: editor.fingerprint)
+            }
+            // The other edit survived untouched.
+            #expect(try store.load().groups == ["browser-caches": false])
+            #expect(try store.load().extraPatterns == ["/one"])
+        }
+    }
+
+    @Test func aWriteAgainstTheCurrentFingerprintSucceeds() throws {
+        try withPaths { paths in
+            let store = GlobalExcludeStore(paths: paths)
+            let first = try store.loadFingerprinted()
+            #expect(first.fingerprint == nil)
+
+            var updated = first.settings
+            updated.extraPatterns = ["/one"]
+            try store.save(updated, ifUnchangedFrom: first.fingerprint)
+
+            let second = try store.loadFingerprinted()
+            #expect(second.fingerprint != nil)
+            var again = second.settings
+            again.extraPatterns = ["/one", "/two"]
+            try store.save(again, ifUnchangedFrom: second.fingerprint)
+            #expect(try store.load().extraPatterns == ["/one", "/two"])
+        }
     }
 
     @Test func aFileNamingAnUnknownGroupRefusesOnLoad() throws {
@@ -446,11 +515,19 @@ import Testing
         #expect(set.excludeLargerThan(applying: plan) == "10G")
     }
 
-    /// Dropped, not duplicated — and case-insensitively, because the global
-    /// half reaches restic as `--iexclude`.
-    @Test func aPatternTheSetAlreadyNamesIsNotRepeatedInTheGlobalBlock() {
+    /// Dropped only on an **exact** match.
+    ///
+    /// The set's list is case-sensitive (`--exclude`) and the catalogue's is
+    /// not (`--iexclude`), so a set carrying `NODE_MODULES` does not make
+    /// the catalogue's `node_modules` redundant — dropping it there would
+    /// leave ordinary lowercase `node_modules` directories backed up
+    /// despite global exclusions being on.
+    @Test func onlyAnExactDuplicateIsDroppedFromTheGlobalBlock() {
         #expect(makeSet(excludes: ["node_modules"]).globalBackupExcludes(applying: plan) == [".cache"])
-        #expect(makeSet(excludes: ["NODE_MODULES"]).globalBackupExcludes(applying: plan) == [".cache"])
+        #expect(
+            makeSet(excludes: ["NODE_MODULES"]).globalBackupExcludes(applying: plan)
+                == ["node_modules", ".cache"]
+        )
     }
 
     @Test func anOptedOutSetGetsNothingFromTheGlobalList() {

@@ -154,7 +154,18 @@ enum ExcludesGroupToggle {
         let context = ExcludesCLIContext.make()
         var settings = try context.load()
         for id in groups {
-            settings.groups[id] = enabled
+            // Record only a decision that differs from the catalogue's own
+            // default, which is what `docs/data-model.md`
+            // §global-excludes.json requires `groups` to hold and what the
+            // app already does. Writing an explicit value that happens to
+            // match today's default pins it: a later release that changes
+            // the safe default for that group would not reach this host,
+            // and `excludes show` would not mark the value as changed.
+            if GlobalExcludeCatalog.group(id: id)?.enabledByDefault == enabled {
+                settings.groups.removeValue(forKey: id)
+            } else {
+                settings.groups[id] = enabled
+            }
         }
         try context.save(settings)
         let verb = enabled ? "applied" : "not applied"
@@ -388,12 +399,18 @@ struct GlobalExcludeReport: Encodable {
     let groups: [GroupEntry]
     /// This machine's own additions.
     let extraPatterns: [String]
-    /// Exactly what every applying backup set receives, in argv order.
+    /// The catalogue patterns every applying backup set receives, in argv
+    /// order, as case-insensitive `--iexclude`.
     let patterns: [String]
+    /// ``extraPatterns`` as they actually reach restic: case-sensitive
+    /// `--exclude`, because `excludes add` documents them that way. Kept
+    /// separate from ``patterns`` so a consumer can see which matching rule
+    /// applies to which pattern.
+    let hostPatterns: [String]
 
     private enum CodingKeys: String, CodingKey {
         case path, exists, enabled, excludeCaches, excludeLargerThan, platform, catalogVersion
-        case savedCatalogVersion, groups, extraPatterns, patterns
+        case savedCatalogVersion, groups, extraPatterns, patterns, hostPatterns
     }
 
     // Explicit `null` for `excludeLargerThan` — the house convention for a
@@ -413,6 +430,7 @@ struct GlobalExcludeReport: Encodable {
         try container.encode(groups, forKey: .groups)
         try container.encode(extraPatterns, forKey: .extraPatterns)
         try container.encode(patterns, forKey: .patterns)
+        try container.encode(hostPatterns, forKey: .hostPatterns)
     }
 
     static func build(
@@ -443,7 +461,8 @@ struct GlobalExcludeReport: Encodable {
                 )
             },
             extraPatterns: settings.extraPatterns,
-            patterns: plan.patterns
+            patterns: plan.patterns,
+            hostPatterns: plan.hostPatterns
         )
     }
 
@@ -476,15 +495,15 @@ struct GlobalExcludeReport: Encodable {
         if extraPatterns.isEmpty {
             lines.append("this machine adds no patterns of its own")
         } else {
-            lines.append("this machine also excludes:")
+            lines.append("this machine also excludes (case-sensitively, as --exclude):")
             for pattern in extraPatterns {
                 lines.append("    \(pattern)")
             }
         }
         lines.append("")
         lines.append(
-            "\(patterns.count) pattern(s) reach every backup set that has not set "
-                + "usesGlobalExcludes: false"
+            "\(patterns.count + hostPatterns.count) pattern(s) reach every backup set that has "
+                + "not set usesGlobalExcludes: false"
         )
         if savedCatalogVersion < catalogVersion {
             lines.append(

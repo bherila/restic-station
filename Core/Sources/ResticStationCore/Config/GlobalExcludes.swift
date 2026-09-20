@@ -576,9 +576,23 @@ public enum GlobalExcludeCatalog {
 /// able to re-resolve it, disagree about it, or read the file a second time
 /// mid-run.
 public struct GlobalExcludePlan: Equatable, Sendable {
-    /// Patterns handed to every applying set as `--iexclude`, in catalogue
-    /// order followed by the host's own extra patterns.
+    /// Catalogue patterns, handed to every applying set as **`--iexclude`**,
+    /// in catalogue order.
+    ///
+    /// Case-insensitive because this list is a set of well-known names
+    /// rather than something a person typed: `Library/Caches` should also
+    /// skip `library/caches`.
     public let patterns: [String]
+    /// This host's own ``GlobalExcludeSettings/extraPatterns``, handed over
+    /// as **`--exclude`** — case-sensitive.
+    ///
+    /// Kept separate from ``patterns`` rather than merged into it, because
+    /// provenance decides the matching rule. `excludes add` documents these
+    /// as ordinary restic `--exclude` patterns, so folding them into the
+    /// catalogue's `--iexclude` block would make `*.TMP` also drop
+    /// `draft.tmp` — silently excluding more than the operator asked for,
+    /// which is the direction that loses data.
+    public let hostPatterns: [String]
     /// Whether `backup` also carries `--exclude-caches`, which skips any
     /// directory tagged `CACHEDIR.TAG` by the tool that created it.
     public let excludeCaches: Bool
@@ -590,8 +604,14 @@ public struct GlobalExcludePlan: Equatable, Sendable {
     /// of regenerable ones, so it is opt-in.
     public let excludeLargerThan: String?
 
-    public init(patterns: [String], excludeCaches: Bool, excludeLargerThan: String? = nil) {
+    public init(
+        patterns: [String],
+        hostPatterns: [String] = [],
+        excludeCaches: Bool,
+        excludeLargerThan: String? = nil
+    ) {
         self.patterns = patterns
+        self.hostPatterns = hostPatterns
         self.excludeCaches = excludeCaches
         self.excludeLargerThan = excludeLargerThan
     }
@@ -602,7 +622,13 @@ public struct GlobalExcludePlan: Equatable, Sendable {
     public static let none = GlobalExcludePlan(patterns: [], excludeCaches: false)
 
     public var isEmpty: Bool {
-        patterns.isEmpty && !excludeCaches && excludeLargerThan == nil
+        patterns.isEmpty && hostPatterns.isEmpty && !excludeCaches && excludeLargerThan == nil
+    }
+
+    /// Every pattern the plan contributes, in argv order, for logging and
+    /// for reports that do not care which flag carries which.
+    public var allPatterns: [String] {
+        patterns + hostPatterns
     }
 }
 
@@ -735,10 +761,16 @@ public struct GlobalExcludeSettings: Codable, Equatable, Sendable {
     public func plan(on platform: GlobalExcludePlatform = .current) -> GlobalExcludePlan {
         guard enabled else { return .none }
         var seen = Set<String>()
-        let patterns = (enabledGroups.flatMap { $0.patterns(on: platform) } + extraPatterns)
+        let catalogue = enabledGroups.flatMap { $0.patterns(on: platform) }
             .filter { seen.insert($0).inserted }
+        // `extraPatterns` stay in their own list: they reach restic through
+        // the case-sensitive `--exclude`, and deduplicating them against the
+        // case-insensitive catalogue would be comparing two different
+        // matching rules.
+        let host = extraPatterns.filter { seen.insert($0).inserted }
         return GlobalExcludePlan(
-            patterns: patterns,
+            patterns: catalogue,
+            hostPatterns: host,
             excludeCaches: excludeCaches,
             excludeLargerThan: excludeLargerThan
         )
@@ -806,6 +838,14 @@ public enum GlobalExcludeError: Error, Equatable, Sendable, CustomStringConverti
     case emptyExtraPattern(index: Int)
     /// `excludeLargerThan` is not restic's `<digits>[kKmMgGtT]` size form.
     case invalidSize(String)
+    /// The file changed underneath an editor that had already loaded it.
+    ///
+    /// Refused rather than overwritten because the losing write is silently
+    /// destructive in the dangerous direction: the edit most worth keeping
+    /// is a *disabled* group, and clobbering it re-enables that group, so
+    /// every later backup skips paths the operator had deliberately
+    /// protected.
+    case staleWrite(path: String)
     /// The file exists but could not be read or decoded. Deliberately fatal
     /// rather than "fall back to the defaults": the defaults exclude *more*
     /// than a host that had turned groups off, so guessing here silently
@@ -833,10 +873,17 @@ public enum GlobalExcludeError: Error, Equatable, Sendable, CustomStringConverti
         case .invalidSize(let size):
             return "global-excludes.json has an invalid excludeLargerThan \"\(size)\" — it must be "
                 + "a number optionally followed by k, m, g or t (for example \"500m\" or \"10G\")"
+        case .staleWrite(let path):
+            return "refusing to overwrite \(path): it changed since this editor loaded it, and "
+                + "saving now would silently discard that change — reload and reapply your edit"
         case .unreadable(let path, let underlying):
-            return "could not read \(path), and this build will not fall back to the built-in "
-                + "defaults, which may exclude more than this host had configured — fix or remove "
-                + "the file. Underlying error: \(underlying)"
+            // Reason first, then BOTH externally sized strings. `path` is
+            // unbounded too — a deeply nested `RESTIC_STATION_DATA_DIR` can
+            // blow the 500-character `CLIFailure` cap on its own — so it
+            // cannot sit between the reason and the start of the message.
+            return "global-excludes.json is unreadable and this build will not fall back to the "
+                + "built-in defaults, which may exclude more than this host had configured — fix "
+                + "or remove the file. Path: \(path). Underlying error: \(underlying)"
         }
     }
 }
@@ -891,12 +938,23 @@ public struct GlobalExcludeStore: Sendable {
     /// - Throws: ``GlobalExcludeError`` for a file that exists and cannot be
     ///   honoured exactly as written.
     public func load() throws -> GlobalExcludeSettings {
+        try loadFingerprinted().settings
+    }
+
+    /// The settings plus the fingerprint of the bytes they were decoded
+    /// from, for an editor that intends to write them back.
+    ///
+    /// `nil` fingerprint means "no file was there". Pass the whole thing to
+    /// ``save(_:ifUnchangedFrom:)`` and a concurrent edit is refused rather
+    /// than silently overwritten.
+    public func loadFingerprinted() throws -> (settings: GlobalExcludeSettings, fingerprint: String?) {
         guard FileManager.default.fileExists(atPath: paths.globalExcludesFile.path) else {
-            return .default
+            return (.default, nil)
         }
         let settings: GlobalExcludeSettings
+        let data: Data
         do {
-            let data = try Data(contentsOf: paths.globalExcludesFile)
+            data = try Data(contentsOf: paths.globalExcludesFile)
             settings = try ConfigStore.makeDecoder().decode(GlobalExcludeSettings.self, from: data)
         } catch {
             throw GlobalExcludeError.unreadable(
@@ -905,7 +963,28 @@ public struct GlobalExcludeStore: Sendable {
             )
         }
         try settings.validate()
-        return settings
+        return (settings, Self.fingerprint(of: data))
+    }
+
+    /// The byte fingerprint of whatever is on disk right now, or `nil` when
+    /// the file is absent. Deliberately over the raw bytes rather than the
+    /// decoded value: a rewrite that decodes identically still means another
+    /// writer was here.
+    public func currentFingerprint() -> String? {
+        guard let data = try? Data(contentsOf: paths.globalExcludesFile) else { return nil }
+        return Self.fingerprint(of: data)
+    }
+
+    static func fingerprint(of data: Data) -> String {
+        // Length plus a cheap order-dependent rolling hash. This only has to
+        // detect "someone else wrote here", not resist forgery: the file is
+        // owner-only host-local state, not a security boundary.
+        var hash: UInt64 = 1_469_598_103_934_665_603
+        for byte in data {
+            hash ^= UInt64(byte)
+            hash = hash &* 1_099_511_628_211
+        }
+        return "\(data.count)-\(String(hash, radix: 16))"
     }
 
     /// Validates, then writes atomically (temp file + `rename(2)`), creating
@@ -913,10 +992,26 @@ public struct GlobalExcludeStore: Sendable {
     /// catalog this build carries, since that is what the decisions in the
     /// written file were made against.
     public func save(_ settings: GlobalExcludeSettings) throws {
+        try save(settings, ifUnchangedFrom: currentFingerprint())
+    }
+
+    /// Compare-and-swap: writes only if the on-disk bytes still fingerprint
+    /// to `expected`, the value ``loadFingerprinted()`` returned.
+    ///
+    /// The same rule `config.json` saves already follow, and for a sharper
+    /// reason. The Settings pane holds this file in memory while it is open;
+    /// without this, a `restic-station excludes disable …` run from a
+    /// terminal is erased by the pane's next toggle — and the decision most
+    /// likely to be lost is a *disabled* group, which silently re-enables
+    /// it and drops paths the operator meant to keep.
+    public func save(_ settings: GlobalExcludeSettings, ifUnchangedFrom expected: String?) throws {
         var updated = settings
         updated.version = GlobalExcludeSettings.currentVersion
         updated.catalogVersion = GlobalExcludeCatalog.version
         try updated.validate()
+        guard currentFingerprint() == expected else {
+            throw GlobalExcludeError.staleWrite(path: paths.globalExcludesFile.path)
+        }
         try paths.ensureDirectories()
         let data = try ConfigStore.makeEncoder().encode(updated)
         try data.write(to: tempFile)

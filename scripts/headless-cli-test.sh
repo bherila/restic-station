@@ -253,8 +253,13 @@ jq -e '.data.groups[] | select(.id == "browser-caches") | .enabled == false' "$O
     || fail "excludes disable did not turn the group off"
 jq -e '.data.extraPatterns == ["/srv/scratch"]' "$OUT_FILE" >/dev/null \
     || fail "excludes add did not record this machine's own pattern"
-jq -e '[.data.patterns[] | select(. == "/srv/scratch")] | length == 1' "$OUT_FILE" >/dev/null \
-    || fail "the resolved pattern list must include this machine's own pattern"
+# This machine's own patterns keep their provenance: they reach restic as
+# case-sensitive `--exclude`, so they are reported separately from the
+# case-insensitive catalogue rather than folded into it.
+jq -e '[.data.hostPatterns[] | select(. == "/srv/scratch")] | length == 1' "$OUT_FILE" >/dev/null \
+    || fail "this machine's own pattern must be reported on the host list"
+jq -e '[.data.patterns[] | select(. == "/srv/scratch")] | length == 0' "$OUT_FILE" >/dev/null \
+    || fail "a host pattern must not be folded into the case-insensitive catalogue list"
 ok "excludes disable/add persist, and excludes show --json reports the resolved list"
 
 # The size cap: opt-in, validated when it is set, and liftable again.

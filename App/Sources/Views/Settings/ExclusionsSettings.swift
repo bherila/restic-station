@@ -14,6 +14,15 @@ import SwiftUI
 struct ExclusionsSettings: View {
     @EnvironmentObject private var model: AppModel
     @StateObject private var pane = ExclusionsSettingsModel()
+    @FocusState private var focusedField: Field?
+
+    /// Which text field holds focus. Leaving one is what commits its draft,
+    /// so a value is written when the edit is finished rather than while it
+    /// is being typed.
+    private enum Field: Hashable {
+        case sizeCap
+        case extraPattern(Int)
+    }
 
     var body: some View {
         Form {
@@ -27,6 +36,7 @@ struct ExclusionsSettings: View {
         }
         .formStyle(.grouped)
         .task { pane.load(paths: model.paths) }
+        .onDisappear { pane.commitEdits() }
     }
 
     // MARK: Sections
@@ -66,6 +76,8 @@ struct ExclusionsSettings: View {
                 .labelsHidden()
                 .frame(width: 90)
                 .disabled(pane.settings.excludeLargerThan == nil)
+                .onSubmit { pane.commitEdits() }
+                .focused($focusedField, equals: .sizeCap)
             }
             .disabled(!pane.settings.enabled)
         } header: {
@@ -122,6 +134,9 @@ struct ExclusionsSettings: View {
                 HStack {
                     TextField("Pattern", text: extraPatternBinding(at: index), prompt: Text("*.iso"))
                         .labelsHidden()
+                        .onSubmit { pane.commitEdits() }
+                        .onChange(of: focusedField) { _, _ in pane.commitEdits() }
+                        .focused($focusedField, equals: .extraPattern(index))
                     Button {
                         pane.removeExtraPattern(at: index)
                     } label: {
@@ -201,14 +216,20 @@ struct ExclusionsSettings: View {
     private var sizeCapEnabledBinding: Binding<Bool> {
         Binding(
             get: { pane.settings.excludeLargerThan != nil },
-            set: { pane.setExcludeLargerThan($0 ? ExclusionsCopy.sizeCapDefault : nil) }
+            // A checkbox cannot be half-typed: it seeds a valid default or
+            // clears the cap, so it commits straight away.
+            set: { pane.setSizeCapEnabled($0, default: ExclusionsCopy.sizeCapDefault) }
         )
     }
 
     private var sizeCapBinding: Binding<String> {
         Binding(
             get: { pane.settings.excludeLargerThan ?? "" },
-            set: { pane.setExcludeLargerThan($0.isEmpty ? nil : $0) }
+            // Draft only, for the same reason as a pattern and with a
+            // sharper edge: on the way to `10G` the field passes through
+            // `1`, which is a *valid* size meaning one byte. Saving that
+            // would cap the next backup at 1 byte.
+            set: { pane.draftExcludeLargerThan($0.isEmpty ? nil : $0) }
         )
     }
 
@@ -225,7 +246,11 @@ struct ExclusionsSettings: View {
                 guard pane.settings.extraPatterns.indices.contains(index) else { return "" }
                 return pane.settings.extraPatterns[index]
             },
-            set: { pane.setExtraPattern(at: index, to: $0) }
+            // Draft only. Persisting per keystroke would briefly write `*`
+            // on the way to `*.iso`, and `*` excludes every path component
+            // — a scheduled backup starting in that window would produce a
+            // near-empty snapshot. `commitExtraPattern` is the write.
+            set: { pane.draftExtraPattern(at: index, to: $0) }
         )
     }
 }
@@ -249,6 +274,15 @@ final class ExclusionsSettingsModel: ObservableObject {
     @Published private(set) var saveFailure: String?
 
     private var store: GlobalExcludeStore?
+    /// The fingerprint of the bytes ``settings`` was loaded from, carried so
+    /// every save is a compare-and-swap. A CLI edit made while this pane is
+    /// open is refused rather than silently overwritten.
+    private var fingerprint: String?
+    /// True while a text field holds an uncommitted draft. Toggles still
+    /// save immediately — they cannot be half-typed — but they carry the
+    /// pending text with them, so this only governs whether there is
+    /// anything to commit.
+    private var hasPendingEdit = false
 
     var settingsFilePath: String {
         store?.paths.globalExcludesFile.path ?? ""
@@ -258,11 +292,36 @@ final class ExclusionsSettingsModel: ObservableObject {
         let store = GlobalExcludeStore(paths: paths)
         self.store = store
         do {
-            settings = try store.load()
+            let loaded = try store.loadFingerprinted()
+            settings = loaded.settings
+            fingerprint = loaded.fingerprint
+            hasPendingEdit = false
             loadFailure = nil
         } catch {
             loadFailure = "\(error)"
         }
+    }
+
+    /// Records a text edit without writing it. See the bindings in the view
+    /// for why: an intermediate `*` or `1` is a valid value with dangerous
+    /// meaning, and a scheduled backup could start while it was on disk.
+    func draftExtraPattern(at index: Int, to pattern: String) {
+        guard settings.extraPatterns.indices.contains(index) else { return }
+        settings.extraPatterns[index] = pattern
+        hasPendingEdit = true
+    }
+
+    func draftExcludeLargerThan(_ size: String?) {
+        settings.excludeLargerThan = size
+        hasPendingEdit = true
+    }
+
+    /// Writes a finished text edit — on submit, on leaving the field, and
+    /// when the pane closes.
+    func commitEdits() {
+        guard hasPendingEdit else { return }
+        hasPendingEdit = false
+        persist(settings)
     }
 
     func setEnabled(_ enabled: Bool) {
@@ -273,15 +332,8 @@ final class ExclusionsSettingsModel: ObservableObject {
         mutate { $0.excludeCaches = excludeCaches }
     }
 
-    /// Held in memory while it is being typed — `500` is not a valid size
-    /// until its `m` arrives — and written through the moment it is. The
-    /// banner in the footer says why an in-between value has not saved.
-    func setExcludeLargerThan(_ size: String?) {
-        if let size, !GlobalExcludeSettings.isValidSize(size) {
-            settings.excludeLargerThan = size
-        } else {
-            mutate { $0.excludeLargerThan = size }
-        }
+    func setSizeCapEnabled(_ enabled: Bool, default seed: String) {
+        mutate { $0.excludeLargerThan = enabled ? seed : nil }
     }
 
     func setGroup(_ group: GlobalExcludeGroup, enabled: Bool) {
@@ -295,13 +347,6 @@ final class ExclusionsSettingsModel: ObservableObject {
             } else {
                 settings.groups[group.id] = enabled
             }
-        }
-    }
-
-    func setExtraPattern(at index: Int, to pattern: String) {
-        mutate { settings in
-            guard settings.extraPatterns.indices.contains(index) else { return }
-            settings.extraPatterns[index] = pattern
         }
     }
 
@@ -323,13 +368,16 @@ final class ExclusionsSettingsModel: ObservableObject {
         guard let store else { return }
         let file = store.paths.globalExcludesFile
         settings = .default
+        hasPendingEdit = false
         guard FileManager.default.fileExists(atPath: file.path) else {
+            fingerprint = nil
             saveFailure = nil
             loadFailure = nil
             return
         }
         do {
             try FileManager.default.removeItem(at: file)
+            fingerprint = nil
             saveFailure = nil
             loadFailure = nil
         } catch {
@@ -341,15 +389,36 @@ final class ExclusionsSettingsModel: ObservableObject {
         var updated = settings
         change(&updated)
         settings = updated
+        // A toggle carries any pending text with it, so it is a commit too.
+        hasPendingEdit = false
+        persist(updated)
+    }
+
+    /// The one write path. Compare-and-swap against the fingerprint this
+    /// pane loaded, so a `restic-station excludes …` run in a terminal is
+    /// not silently erased by the next toggle here; on a refusal the pane
+    /// reloads so the user sees the other edit rather than fighting it.
+    private func persist(_ value: GlobalExcludeSettings) {
         guard let store else { return }
-        // A blank row the user has not filled in yet is not an error to
-        // report; it simply is not written until it has a value.
-        var persistable = updated
+        // A blank row the user has not filled in yet, or a size still being
+        // typed, is not an error to report — it simply is not written.
+        var persistable = value
         persistable.extraPatterns.removeAll { $0.isEmpty }
+        if let size = persistable.excludeLargerThan, !GlobalExcludeSettings.isValidSize(size) {
+            return
+        }
         do {
-            try store.save(persistable)
+            try store.save(persistable, ifUnchangedFrom: fingerprint)
+            fingerprint = store.currentFingerprint()
             saveFailure = nil
             loadFailure = nil
+        } catch let error as GlobalExcludeError {
+            if case .staleWrite = error {
+                saveFailure = ExclusionsCopy.staleWrite
+                load(paths: store.paths)
+                return
+            }
+            saveFailure = "Could not save \(store.paths.globalExcludesFile.path): \(error)"
         } catch {
             saveFailure = "Could not save \(store.paths.globalExcludesFile.path): \(error)"
         }
@@ -371,6 +440,11 @@ enum ExclusionsCopy {
         "A size cap is off by default. Every other rule here names a folder of things that come "
         + "back on their own; a size cap can skip one irreplaceable file — a video, a disk image — "
         + "with nothing to point at afterwards."
+
+    static let staleWrite =
+        "Not saved: these settings were changed elsewhere — by `restic-station excludes`, or "
+        + "another window — while this pane was open. The current values have been reloaded; "
+        + "reapply your change."
 
     static let sizeCapInvalid =
         "Not saved: use a number followed by k, m, g or t — for example 500m or 10G."
