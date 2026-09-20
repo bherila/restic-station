@@ -238,6 +238,12 @@ struct BackupEngineTests {
         checkPolicy: CheckPolicy? = nil,
         excludes: [String] = [],
         purgeExcludes: [String] = [],
+        usesGlobalExcludes: Bool = true,
+        /// Defaults to ``GlobalExcludePlan/none`` so every pre-existing test
+        /// in this file keeps the argv it was written against. A `Result`
+        /// because the *failure* is engine-visible state too: an unusable
+        /// `global-excludes.json` refuses a backup and nothing else.
+        globalExcludes: Result<GlobalExcludePlan, Error> = .success(.none),
         primaryReachable: Bool = true,
         reachableSecondaries: [Bool] = [true, true],
         startingAt: Date = t0,
@@ -290,6 +296,7 @@ struct BackupEngineTests {
             excludes: excludes,
             purgeExcludes: purgeExcludes,
             onlineOnlyFiles: onlineOnlyFiles,
+            usesGlobalExcludes: usesGlobalExcludes,
             schedule: .daily(hour: 2, minute: 30),
             retention: retention,
             checkPolicy: checkPolicy,
@@ -333,6 +340,7 @@ struct BackupEngineTests {
             now: clock.now,
             purgeSourcePaths: purgeSourcePaths,
             purgeHostnames: purgeHostnames,
+            globalExcludes: globalExcludes,
             machineId: machineId,
             logWriterFactory: logWriterFactory
         )
@@ -411,10 +419,26 @@ struct BackupEngineTests {
             )
     }
 
-    static func backupArgv(_ repo: String, excludes: [String] = []) -> [String] {
+    static func backupArgv(
+        _ repo: String,
+        excludes: [String] = [],
+        globalExcludes: [String] = [],
+        excludeCaches: Bool = false,
+        excludeLargerThan: String? = nil
+    ) -> [String] {
         var argv = ["-r", repo, "backup", "--json"]
+        if excludeCaches {
+            argv.append("--exclude-caches")
+        }
+        if let excludeLargerThan {
+            argv += ["--exclude-larger-than", excludeLargerThan]
+        }
         for exclude in excludes {
             argv.append("--exclude")
+            argv.append(exclude)
+        }
+        for exclude in globalExcludes {
+            argv.append("--iexclude")
             argv.append(exclude)
         }
         argv.append(source)
@@ -1495,6 +1519,281 @@ struct BackupEngineTests {
             excludes: env.set.effectiveBackupExcludes
         )
         #expect(command.argv == Self.backupArgv(env.primary.repoURL, excludes: expectedExcludes))
+    }
+
+    // MARK: - Global exclusion list
+
+    /// The engine's own backup invocation carries this host's global list
+    /// after the set's own patterns, plus `--exclude-caches`
+    /// (`docs/data-model.md` §global-excludes.json).
+    ///
+    /// Asserted against `env.resticArgvs` rather than a command the test
+    /// builds: the point is that `runSet` threads the plan through, which a
+    /// locally constructed `ResticCommand` would not prove.
+    @Test("global excludes: the engine's backup invocation adds them as --iexclude, with the caps")
+    func engineBackupInvocationCarriesGlobalExcludes() async throws {
+        let plan = GlobalExcludePlan(
+            patterns: ["node_modules", "Library/Caches"],
+            excludeCaches: true,
+            excludeLargerThan: "10G"
+        )
+        let env = Self.makeEnv(
+            script: [],
+            retention: nil,
+            excludes: ["*.log"],
+            globalExcludes: .success(plan),
+            reachableSecondaries: []
+        )
+        defer { env.cleanUp() }
+
+        // The set's own list keeps `--exclude`; the catalogue is matched
+        // case-insensitively, so it rides on `--iexclude`.
+        let expected = Self.backupArgv(
+            env.primary.repoURL,
+            excludes: ["*.log"],
+            globalExcludes: ["node_modules", "Library/Caches"],
+            excludeCaches: true,
+            excludeLargerThan: "10G"
+        )
+        env.fake.script = Self.resticCall(
+            expected, dest: Self.primaryId, stdoutLines: Self.backupStream()
+        )
+
+        let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
+
+        guard case .completed(let status, let groupId, _) = outcome else {
+            Issue.record("expected .completed, got \(outcome)")
+            return
+        }
+        #expect(status == .success)
+        let backupArgv = try #require(env.resticArgvs.first { $0.contains("backup") })
+        #expect(backupArgv == [Self.resticPath] + expected)
+        // The run log has to answer "why is this file missing?" on its own.
+        #expect(env.log(runId: groupId).contains("global excludes: 2 pattern(s)"))
+        #expect(env.log(runId: groupId).contains("--exclude-larger-than 10G"))
+    }
+
+    /// `usesGlobalExcludes: false` removes the patterns **and**
+    /// `--exclude-caches`: a set that exists to archive build output must
+    /// not have its output skipped by a tag some tool left behind.
+    @Test("global excludes: an opted-out set gets no --iexclude, no --exclude-caches and no size cap")
+    func engineHonoursASetThatOptedOutOfTheGlobalList() async throws {
+        let plan = GlobalExcludePlan(
+            patterns: ["node_modules"],
+            excludeCaches: true,
+            excludeLargerThan: "10G"
+        )
+        let env = Self.makeEnv(
+            script: [],
+            retention: nil,
+            excludes: ["*.log"],
+            usesGlobalExcludes: false,
+            globalExcludes: .success(plan),
+            reachableSecondaries: []
+        )
+        defer { env.cleanUp() }
+
+        env.fake.script = Self.resticCall(
+            Self.backupArgv(env.primary.repoURL, excludes: ["*.log"]),
+            dest: Self.primaryId,
+            stdoutLines: Self.backupStream()
+        )
+
+        let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
+
+        guard case .completed(let status, let groupId, _) = outcome else {
+            Issue.record("expected .completed, got \(outcome)")
+            return
+        }
+        #expect(status == .success)
+        let backupArgv = try #require(env.resticArgvs.first { $0.contains("backup") })
+        #expect(backupArgv == [Self.resticPath] + Self.backupArgv(env.primary.repoURL, excludes: ["*.log"]))
+        #expect(!backupArgv.contains("--exclude-caches"))
+        #expect(!backupArgv.contains("--exclude-larger-than"))
+        #expect(!backupArgv.contains("--iexclude"))
+        #expect(!backupArgv.contains("node_modules"))
+        #expect(env.log(runId: groupId).contains("global excludes: set opted out"))
+    }
+
+    /// A set that has asked to *download* its online-only files keeps the
+    /// catalogue's cloud-placeholder patterns: it wants the real contents,
+    /// and the stub is the only record the file exists
+    /// (`docs/data-model.md` §Cloud placeholders). Asserted through the
+    /// engine's own argv, because the point is that `runSet` consults the
+    /// set's policy rather than applying the plan wholesale.
+    @Test("global excludes: a downloading set does not get the cloud-placeholder patterns")
+    func engineHoldsBackCloudPlaceholdersForADownloadingSet() async throws {
+        let plan = GlobalExcludePlan(
+            patterns: ["node_modules"],
+            cloudPlaceholderPatterns: ["*.icloud"],
+            excludeCaches: false
+        )
+        let env = Self.makeEnv(
+            script: [],
+            onlineOnlyFiles: .download,
+            retention: nil,
+            globalExcludes: .success(plan),
+            reachableSecondaries: []
+        )
+        defer { env.cleanUp() }
+
+        let expected = Self.backupArgv(env.primary.repoURL, globalExcludes: ["node_modules"])
+        env.fake.script = Self.resticCall(
+            expected, dest: Self.primaryId, stdoutLines: Self.backupStream()
+        )
+
+        let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
+
+        guard case .completed(let status, let groupId, _) = outcome else {
+            Issue.record("expected .completed, got \(outcome)")
+            return
+        }
+        #expect(status == .success)
+        let backupArgv = try #require(env.resticArgvs.first { $0.contains("backup") })
+        #expect(backupArgv == [Self.resticPath] + expected)
+        #expect(!backupArgv.contains("*.icloud"))
+        // And the log explains the shorter list rather than leaving the
+        // count unaccounted for.
+        #expect(env.log(runId: groupId).contains("global excludes: 1 pattern(s)"))
+        #expect(env.log(runId: groupId).contains("cloud-placeholder patterns held back"))
+    }
+
+    /// Fail closed: an unusable `global-excludes.json` refuses the backup
+    /// rather than falling back to the built-in defaults, which exclude
+    /// *more* than a host that had turned groups off.
+    ///
+    /// Reported as an *infrastructure* failure rather than a
+    /// misconfiguration, because `tick` prints a misconfigured set and exits
+    /// 0, which is the silent-stoppage shape of issue #110 — and **recorded**
+    /// rather than silent. An earlier revision refused before the lock,
+    /// leaving no trace, which meant `status` went on reporting the last
+    /// successful run while every scheduled backup was already refusing, and
+    /// left `lastBackupStart` untouched so `tick`'s backup-wins branch
+    /// starved the set's scheduled check forever.
+    @Test("global excludes: an unusable list refuses the backup and records the refusal")
+    func anUnusableGlobalListRefusesTheBackup() async throws {
+        let broken = GlobalExcludeError.unreadable(path: "/data/global-excludes.json", underlying: "boom")
+        let env = Self.makeEnv(
+            script: [], retention: nil, globalExcludes: .failure(broken), reachableSecondaries: []
+        )
+        defer { env.cleanUp() }
+
+        let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
+
+        guard case .infrastructureFailure(let reason) = outcome else {
+            Issue.record("expected .infrastructureFailure, got \(outcome)")
+            return
+        }
+        #expect(reason.contains("global exclusion list is unusable"))
+        // No restic is ever launched — the refusal happens before any
+        // repository is touched.
+        #expect(env.resticArgvs.isEmpty)
+        // But it IS in the run history, where health derivation and `status`
+        // look. A silent refusal let a host report the last successful run
+        // as its state while every backup was already failing.
+        let failures = env.entries(kind: .backup).filter { $0.status == .failed }
+        #expect(failures.count == 1)
+        #expect(failures.first?.errorSummary?.contains("global exclusion list is unusable") == true)
+        // And `lastBackupStart` advanced, so the set does not stay
+        // permanently due and starve its own scheduled check.
+        #expect(env.stateStore.readScheduleState()?.sets[Self.setId]?.lastBackupStart == Self.t0)
+    }
+
+    /// The refusal is scoped to the sets that actually consume the list. A
+    /// set that opted out never reads it, so a broken file must not stop it
+    /// — the same reasoning that keeps `restore` working on such a host.
+    @Test("global excludes: an unusable list does not stop a set that opted out")
+    func anUnusableGlobalListDoesNotStopAnOptedOutSet() async throws {
+        let broken = GlobalExcludeError.unreadable(path: "/data/global-excludes.json", underlying: "boom")
+        let env = Self.makeEnv(
+            script: [], retention: nil, excludes: ["*.log"], usesGlobalExcludes: false,
+            globalExcludes: .failure(broken), reachableSecondaries: []
+        )
+        defer { env.cleanUp() }
+
+        env.fake.script = Self.resticCall(
+            Self.backupArgv(env.primary.repoURL, excludes: ["*.log"]),
+            dest: Self.primaryId,
+            stdoutLines: Self.backupStream()
+        )
+
+        let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
+
+        guard case .completed(let status, _, _) = outcome else {
+            Issue.record("expected .completed, got \(outcome)")
+            return
+        }
+        #expect(status == .success)
+    }
+
+    /// The safety invariant the whole feature rests on: a global pattern is
+    /// **forward-only** and can never reach a destructive `rewrite
+    /// --forget`.
+    ///
+    /// Stated negatively on purpose (`CONTRIBUTING.md` §behavior-change
+    /// protocol). The scripted rewrite argv lists `purgeExcludes` and
+    /// nothing else, so an engine that merged the global list into the
+    /// destructive argv would fail to match the script *and* trip the
+    /// explicit scan below. A pattern that arrives because a newer build
+    /// shipped a better default must be able to keep files out of the next
+    /// snapshot, and must never delete anything already in a repository.
+    @Test("global excludes: a global pattern never reaches a destructive rewrite argv")
+    func globalExcludesNeverReachTheDestructiveArgv() async throws {
+        let sourcePaths = [Self.setId: Set(["/Users/user/example/src"])]
+        let hostnames = [Self.setId: Set(["example-mac.local"])]
+        let plan = GlobalExcludePlan(patterns: ["node_modules", "Library/Caches"], excludeCaches: false)
+        let env = Self.makeEnv(
+            script: [], retention: nil, purgeExcludes: ["build/**"],
+            globalExcludes: .success(plan), reachableSecondaries: [],
+            purgeSourcePaths: sourcePaths, purgeHostnames: hostnames
+        )
+        defer { env.cleanUp() }
+
+        let snapshotsJSON = try FixtureLoader.string("snapshots.json")
+        let snapshots = try parseSnapshots(Data(snapshotsJSON.utf8))
+        let purgePlan = PurgePlan(
+            destinationId: env.primary.id, snapshots: snapshots,
+            sourcePaths: sourcePaths[Self.setId]!, hostnames: hostnames[Self.setId]!,
+            patterns: env.set.purgeExcludes
+        )
+        let token = try #require(try env.engine.issuePurgeToken(
+            set: env.set, destinations: [env.primary], plans: [purgePlan],
+            executable: try env.requireResticExecutable()
+        ))
+        let rewrite = try FixtureLoader.string("rewrite-forget.txt")
+            .replacingOccurrences(of: "09b3295c", with: snapshots[0].shortId)
+            .replacingOccurrences(of: "b2435423", with: snapshots[1].shortId)
+        env.fake.script = Self.repositoryConfigCall(
+            env.primary.repoURL, dest: Self.primaryId
+        ) + Self.resticCall(
+            ["-r", env.primary.repoURL, "snapshots", "--json"], dest: Self.primaryId,
+            stdoutLines: [snapshotsJSON]
+        ) + Self.repositoryConfigCall(
+            env.primary.repoURL, dest: Self.primaryId
+        ) + Self.resticCall(
+            ["-r", env.primary.repoURL, "snapshots", "--json"], dest: Self.primaryId,
+            stdoutLines: [snapshotsJSON]
+        ) + Self.resticCall(
+            Self.rewriteArgv(
+                env.primary.repoURL, snapshotIDs: snapshots.map(\.id), patterns: env.set.purgeExcludes
+            ),
+            dest: Self.primaryId, stdoutLines: rewrite.split(separator: "\n").map(String.init)
+        )
+
+        let result = try await env.engine.runPurge(set: env.set, destinations: [env.primary], token: token.value)
+
+        #expect(result.status == .success)
+        let rewriteArgv = try #require(env.resticArgvs.first { $0.contains("rewrite") })
+        // Negative, and exhaustive over the plan: no global pattern in any
+        // form, and the only --exclude values are the set's purge patterns.
+        for pattern in plan.patterns {
+            #expect(!rewriteArgv.contains(pattern), "\(pattern) reached a destructive rewrite")
+        }
+        let destructiveExcludes = rewriteArgv.enumerated().compactMap { index, value -> String? in
+            guard index > 0, rewriteArgv[index - 1] == "--exclude" else { return nil }
+            return value
+        }
+        #expect(destructiveExcludes == env.set.purgeExcludes)
     }
 
     /// The load-bearing half of watermark-gated purge, asserted against the

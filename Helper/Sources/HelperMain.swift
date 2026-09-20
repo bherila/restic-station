@@ -155,6 +155,11 @@ struct HelperMain: AsyncParsableCommand {
             // acceptance criteria: identical CLI surface on macOS and
             // Linux) — T28 is what makes them reachable from the macOS app.
             Config.self,
+            // The host-local half of the configuration: this machine's
+            // global exclusion list. Beside `config` rather than under it
+            // because it is emphatically not part of the shared file —
+            // `config export` never carries it.
+            Excludes.self,
             Status.self,
             Sets.self,
             Runs.self,

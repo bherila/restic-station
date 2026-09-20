@@ -396,6 +396,109 @@ works: `restic-station-helper restore --set … --dest …`, `probe-repo`, and `
 `tick`/`run-set` act on) does. See `docs/data-model.md` §Per-machine scoping for the full
 algorithm and the distinction between the two views.
 
+## Global exclusions
+
+Every backup set also skips a built-in list of paths that are never worth a snapshot — browser
+caches, build output, package-manager downloads, partial downloads. The list ships in the binary;
+this host's adjustments live in `global-excludes.json` beside `machine.json` in the data
+directory, and are never carried by `config export`/`import` (`docs/data-model.md`
+§global-excludes.json).
+
+Real output, from CI's `linux-integration` job (`scripts/linux-docs-transcript.sh`), with the
+per-group descriptions elided for length — run it yourself to read them. Note the per-platform
+counts: the macOS-only patterns (`~/Library/...`) are not carried into a Linux host's argv
+(`docs/data-model.md` §Platform scoping).
+
+```console
+$ restic-station-helper excludes show
+global exclusion list: on
+settings file: /tmp/tmp.XXXXXXXXXX/data-excludes/global-excludes.json  (not present — built-in defaults)
+--exclude-caches: on
+--exclude-larger-than: (no cap)
+platform: linux
+
+[x] browser-caches — Browser caches
+      …
+      20 pattern(s) here  (+8 for the other platform)
+[x] system-caches — System and application caches
+      …
+      22 pattern(s) here  (+6 for the other platform)
+[x] temporary-files — Temporary and partial files
+      …
+      12 pattern(s) here
+[x] developer-build-artifacts — Build output
+      …
+      58 pattern(s) here  (+7 for the other platform)
+[x] package-manager-caches — Package manager caches
+      …
+      25 pattern(s) here  (+5 for the other platform)
+[x] media-app-caches — Photo and video app caches
+      …
+      11 pattern(s) here
+[ ] container-engines — Container engine storage
+      …
+      4 pattern(s) here  (+5 for the other platform)
+[x] game-and-media-caches — Game and media server caches
+      …
+      4 pattern(s) here
+[ ] game-and-media-libraries — Game installs and media server libraries
+      …
+      6 pattern(s) here
+[ ] virtual-machine-images — Virtual machine disk images
+      …
+      25 pattern(s) here  (+1 for the other platform)
+[ ] installers-and-disk-images — Installers and disk images
+      …
+      11 pattern(s) here
+
+this machine adds no patterns of its own
+
+152 pattern(s) reach every backup set that has not set usesGlobalExcludes: false
+of those, 1 match cloud placeholder stubs (*.icloud) and are held back for a set whose onlineOnlyFiles is "download"
+```
+
+`excludes show --patterns` prints every individual pattern, and `excludes show --json` is the
+scriptable form. To change what applies here:
+
+```console
+$ restic-station-helper excludes disable developer-build-artifacts
+developer-build-artifacts: not applied on this machine
+
+$ restic-station-helper excludes enable virtual-machine-images
+virtual-machine-images: applied on this machine
+
+$ restic-station-helper excludes add /srv/scratch
+added /srv/scratch
+
+$ restic-station-helper excludes set --exclude-caches false
+global exclusion list: on
+--exclude-caches: off
+--exclude-larger-than: (no cap)
+
+$ restic-station-helper excludes reset
+removed /tmp/tmp.XXXXXXXXXX/data-excludes/global-excludes.json — back to the built-in defaults
+```
+
+**Where the file lands is decided by the data directory, which is how "per user" and "per
+machine" are told apart.** A helper run as you keeps it under `$XDG_STATE_HOME`; a service that
+sets `RESTIC_STATION_DATA_DIR=/var/lib/restic-station` keeps it machine-wide. There is no
+`/etc` fallback layered underneath — one file, one answer.
+
+A set that must keep archiving something the list skips opts out in the **shared** config with
+`"usesGlobalExcludes": false`; `config show` prints `global excludes: opted out` for such a set.
+
+`excludes set --exclude-larger-than 10G` adds restic's size cap, and `--exclude-larger-than none`
+lifts it again. It is off by default: every other rule names a folder of regenerable things,
+while a size cap can skip one irreplaceable file with nothing to point at afterwards.
+
+A `global-excludes.json` this build cannot honour — bad JSON, a group id it does not know, a
+blank pattern, a newer `version`, or a settings path that is not a plain readable file —
+**fails the backup** rather than falling back to the built-in defaults, because the defaults may
+skip more than you had configured. Only backups: `restore`, `unlock`, `probe-repo`, `purge`,
+`check` and `init-secondary` keep working, and the refusal is written into the run history so
+`status` reports the host as unhealthy rather than coasting on the last successful run. `config validate` and
+`tick` both name the file and the reason.
+
 ## Secrets
 
 Repository passwords and secret environment variables (e.g. S3 keys) live in `secrets.json`

@@ -72,6 +72,46 @@ struct ResticCommandTests {
         ])
     }
 
+    /// `docs/restic-cli.md` §backup: `--exclude-caches` sits after
+    /// `--exclude-cloud-files` and before every `--exclude`, and it is the
+    /// global exclusion list's half of the argv
+    /// (`docs/data-model.md` §global-excludes.json).
+    /// `docs/restic-cli.md` §backup pins this whole order: the three flags,
+    /// then the set's own case-sensitive `--exclude` block, then the host
+    /// catalogue's case-insensitive `--iexclude` block, then the sources.
+    @Test("backup: the global-exclusion flags in documented order, and --iexclude after --exclude")
+    func backupWithEveryGlobalExclusionFlag() {
+        let cmd = ResticCommand.backup(
+            repo: Self.repo,
+            sources: ["/Users/user/proj"],
+            excludes: ["node_modules"],
+            globalExcludes: ["Library/Caches", "*.dmg"],
+            excludeCloudFiles: true,
+            excludeCaches: true,
+            excludeLargerThan: "10G"
+        )
+        #expect(cmd.argv == [
+            "-r", Self.repo, "backup", "--json", "--exclude-cloud-files", "--exclude-caches",
+            "--exclude-larger-than", "10G",
+            "--exclude", "node_modules",
+            "--iexclude", "Library/Caches",
+            "--iexclude", "*.dmg",
+            "/Users/user/proj",
+        ])
+    }
+
+    /// The pre-v5 argv, unchanged: a set whose host adds nothing produces
+    /// exactly what it always did.
+    @Test("backup: none of the global-exclusion flags appear unless asked for")
+    func backupWithoutAnyGlobalExclusionFlags() {
+        let cmd = ResticCommand.backup(
+            repo: Self.repo, sources: ["/Users/user/proj"], excludes: ["node_modules"]
+        )
+        #expect(cmd.argv == [
+            "-r", Self.repo, "backup", "--json", "--exclude", "node_modules", "/Users/user/proj",
+        ])
+    }
+
     @Test("copy: -r is the destination, --from-repo the source, and there is no --json")
     func copy() {
         // restic -r <secondaryRepo> copy --from-repo <primaryRepo>

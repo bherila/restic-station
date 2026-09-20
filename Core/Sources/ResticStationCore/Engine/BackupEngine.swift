@@ -237,6 +237,36 @@ public final class BackupEngine: Sendable {
     /// supplies these unions when it constructs the engine.
     private let purgeSourcePaths: [UUID: Set<String>]
     private let purgeHostnames: [UUID: Set<String>]
+    /// This host's global exclusion list, resolved once by whoever built the
+    /// engine (`docs/data-model.md` §global-excludes.json).
+    ///
+    /// A value, not a store: the engine must never re-read
+    /// `global-excludes.json` mid-run, so a file edited while a long backup
+    /// is in flight cannot make two children of the same run disagree about
+    /// what was skipped. It defaults to ``GlobalExcludePlan/none`` so a
+    /// construction site that has not wired it can only ever back up *more*
+    /// than intended, never less.
+    ///
+    /// A `Result`, not a plain value, because the *failure* has to travel
+    /// this far too. An unusable `global-excludes.json` must refuse a
+    /// backup — falling back to the built-in defaults would skip more than
+    /// this host had configured — but it must not refuse a **restore**, an
+    /// `unlock` or a `probe`, none of which the list ever reaches. Carrying
+    /// the error to the one operation that consumes it is what keeps a
+    /// mistyped exclusion file from standing between someone and their data
+    /// in an emergency.
+    private let globalExcludesResult: Result<GlobalExcludePlan, Error>
+
+    /// The resolved plan, or ``GlobalExcludePlan/none`` when it could not be
+    /// loaded.
+    ///
+    /// Only ever reached **after** ``globalExcludesRefusal(for:)``
+    /// has passed for the set in hand, so the fallback is unreachable on the
+    /// backup path rather than a silent degradation of it. It exists so a
+    /// non-backup caller that logs the note cannot crash on a broken file.
+    private var globalExcludes: GlobalExcludePlan {
+        (try? globalExcludesResult.get()) ?? .none
+    }
     private let logWriterFactory: @Sendable (URL) throws -> LogWriter
 
     public init(
@@ -251,6 +281,7 @@ public final class BackupEngine: Sendable {
         uptime: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
         purgeSourcePaths: [UUID: Set<String>] = [:],
         purgeHostnames: [UUID: Set<String>] = [:],
+        globalExcludes: Result<GlobalExcludePlan, Error> = .success(.none),
         machineId: String = MachineIdentity.generate(),
         previewTokens: PreviewTokenStore? = nil,
         logWriterFactory: (@Sendable (URL) throws -> LogWriter)? = nil
@@ -268,6 +299,7 @@ public final class BackupEngine: Sendable {
         self.previewTokens = previewTokens ?? PreviewTokenStore(paths: paths, now: now)
         self.purgeSourcePaths = purgeSourcePaths
         self.purgeHostnames = purgeHostnames
+        self.globalExcludesResult = globalExcludes
         self.logWriterFactory = logWriterFactory ?? { url in
             try LogWriter(url: url, now: now)
         }
@@ -349,6 +381,37 @@ public final class BackupEngine: Sendable {
             return .infrastructureFailure(reason: reason)
         }
 
+        // ── Step 3b: this host's global exclusion list ──────────────────
+        // Only `backup` consumes the list, so only `backup` refuses on it. A
+        // set that has opted out with `usesGlobalExcludes: false` runs
+        // normally even now, and `restore`, `unlock`, `probe`, `purge`,
+        // `check` and `init` never look at it at all — an unusable
+        // `global-excludes.json` must never stand between someone and their
+        // data in an emergency.
+        //
+        // **After** the lock and after `lastBackupStart`, deliberately — an
+        // earlier revision refused before both, "leaving no trace", by
+        // analogy with the secret pre-flight. That analogy was wrong in two
+        // ways the review found. The secret pre-flight is `.retryable`, a
+        // transient condition a later tick may resolve on its own; an
+        // unusable exclusion file is persistent and only a person can fix
+        // it, so it belongs in the run history like every other persistent
+        // failure, where `status` and health derivation already look. And
+        // leaving `lastBackupStart` untouched kept the set permanently
+        // "due", so `tick`'s backup-wins branch suppressed its scheduled
+        // repository check forever — starving the one operation that could
+        // still have run.
+        if let reason = globalExcludesRefusal(for: set) {
+            recordInfrastructureFailure(
+                kind: .backup,
+                setId: set.id,
+                destId: primary.id,
+                trigger: trigger,
+                reason: "set \"\(set.name)\": \(reason)"
+            )
+            return .infrastructureFailure(reason: reason)
+        }
+
         var children: [SetRunChild] = []
         var infrastructureFailures: [String] = []
 
@@ -399,14 +462,24 @@ public final class BackupEngine: Sendable {
             groupId: nil, // this run *is* the group
             phase: "backing-up-primary",
             // `effectiveBackupExcludes`, not `excludes`: purge patterns are
-            // ordinary excludes as far as `backup` is concerned. Passing only
-            // `excludes` here would have every run re-capture exactly what
-            // the purge phase had just rewritten out of history.
+            // ordinary excludes as far as `backup` is concerned. Passing
+            // only `excludes` here would have every run re-capture exactly
+            // what the purge phase had just rewritten out of history. This
+            // host's global catalogue rides alongside as `--iexclude`.
+            //
+            // The flow is one-way. Nothing downstream turns a global
+            // pattern into a `purgeExcludes` entry, so a pattern that
+            // arrives because a newer build shipped a better default can
+            // keep files out of the *next* snapshot and can never delete
+            // anything already in a repository.
             command: .backup(
                 repo: primary.repoURL,
                 sources: set.sources,
-                excludes: set.effectiveBackupExcludes,
-                excludeCloudFiles: excludeCloudFiles
+                excludes: set.effectiveBackupExcludes + set.hostBackupExcludes(applying: globalExcludes),
+                globalExcludes: set.globalBackupExcludes(applying: globalExcludes),
+                excludeCloudFiles: excludeCloudFiles,
+                excludeCaches: set.excludesCaches(applying: globalExcludes),
+                excludeLargerThan: set.excludeLargerThan(applying: globalExcludes)
             ),
             invocation: ResticInvocation(destination: primary, expectedExecutableIdentity: versionBoundIdentity),
             streamProgress: true,
@@ -415,6 +488,7 @@ public final class BackupEngine: Sendable {
                 if let cloudSourceNote {
                     logWriter?.appendLine(cloudSourceNote)
                 }
+                logWriter?.appendLine(globalExcludeNote(for: set))
                 let probe = await reachability.probe(primary)
                 logWriter?.appendLine("probe primary \"\(primary.label)\": \(describe(probe))")
                 record(probe: probe, for: primary)
@@ -2451,6 +2525,67 @@ public final class BackupEngine: Sendable {
                 return completeRewrites
             }
         )
+    }
+
+    /// Why this set cannot be backed up with the host's exclusion list in
+    /// its current state, or `nil` when it can.
+    ///
+    /// Fail closed, and deliberately **not** "fall back to the built-in
+    /// defaults": the defaults exclude more than a host that had turned
+    /// groups off, so guessing here would silently stop backing up
+    /// directories someone deliberately kept — and every run would keep
+    /// exiting 0 while it happened (`docs/data-model.md`
+    /// §global-excludes.json).
+    ///
+    /// The refusal is **recorded**, not silent: it writes a failed backup
+    /// record so `status`, health derivation and `runs list` all see that
+    /// this host has stopped backing up, instead of reporting the last
+    /// successful run until the staleness threshold expires.
+    ///
+    /// Reported as ``SetRunOutcome/infrastructureFailure(reason:)`` rather
+    /// than ``SetRunOutcome/misconfigured(reason:)`` because of what the
+    /// callers do with each: `tick` prints a `misconfigured` set and exits
+    /// 0, which is the silent-stoppage shape of issue #110 — the timer keeps
+    /// reporting success while the machine never backs up again. This fault
+    /// is host-local state a person has to repair, so it exits non-zero.
+    func globalExcludesRefusal(for set: BackupSet) -> String? {
+        guard set.usesGlobalExcludes else { return nil }
+        guard case .failure(let error) = globalExcludesResult else { return nil }
+        return "this machine's global exclusion list is unusable — \(error)"
+    }
+
+    /// The one line every backup log carries about the global exclusion
+    /// list, so "why is this file missing from my snapshot?" is answerable
+    /// from the run log alone rather than by reconstructing which build
+    /// shipped which catalogue.
+    func globalExcludeNote(for set: BackupSet) -> String {
+        guard set.usesGlobalExcludes else {
+            return "global excludes: set opted out (usesGlobalExcludes: false)"
+        }
+        guard !globalExcludes.isEmpty else {
+            return "global excludes: none configured on this machine"
+        }
+        var extras: [String] = []
+        if globalExcludes.excludeCaches { extras.append("--exclude-caches") }
+        if let size = globalExcludes.excludeLargerThan { extras.append("--exclude-larger-than \(size)") }
+        let suffix = extras.isEmpty ? "" : " plus \(extras.joined(separator: ", "))"
+        // The count this set actually sends, not the plan's: patterns the
+        // set already names are dropped, and a set that downloads its
+        // online-only files keeps the cloud placeholders. A log line that
+        // printed the plan's total would not add up to the argv beneath it.
+        let applied = set.globalBackupExcludes(applying: globalExcludes).count
+            + set.hostBackupExcludes(applying: globalExcludes).count
+        let heldBack = set.onlineOnlyFiles == .download && !globalExcludes.cloudPlaceholderPatterns.isEmpty
+            ? " (cloud-placeholder patterns held back: this set downloads online-only files)"
+            : ""
+        let swallowed = set.globalExcludesHeldBackForSources(applying: globalExcludes)
+        let ancestorNote = swallowed.isEmpty
+            ? ""
+            : " (held back as unsafe for this set's sources, where they would match the source "
+                + "itself or a directory above it and empty the snapshot: "
+                + "\(swallowed.joined(separator: ", ")))"
+        return "global excludes: \(applied) pattern(s)\(suffix) "
+            + "from this machine's global exclusion list\(heldBack)\(ancestorNote)"
     }
 
     /// The patterns in `set.purgeExcludes` that this destination's durable

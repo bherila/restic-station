@@ -51,6 +51,7 @@ itself, unwrapped, because its output is meant to be fed straight back into
 | `runs show <id>` | ✅ | `RunMetadata` |
 | `config show` | ✅ | effective-config report |
 | `config validate` | ✅ | `{ machineId, errors, warnings, effective, nothingRunsHere }` |
+| `excludes show` | ✅ | this host's global exclusion list — `data-model.md` §`excludes show --json` |
 | `probe-repo` | ✅ | `{ setId, destinationId, label, outcome, reachable, reason }` |
 | `secret list` | ✅ | array of `{ destId, label, setName, hasPassword, secretEnvCount }` — only destinations that have something stored, the same set human mode prints |
 | `cli status` | ✅ | `CLIInstaller.Status` |
@@ -61,7 +62,7 @@ itself, unwrapped, because its output is meant to be fed straight back into
 | `config export` | — | **Unwrapped by design.** The exported config document itself, so it round-trips into `config import`. |
 | `timer status` (Linux) | — | **Human-only.** Its report is narrative assembled while probing; the machine-readable equivalent is `status --json`'s `.scheduler`, in the same problem vocabulary. |
 | `print-password` | — | Hidden; exists for `RESTIC_PASSWORD_COMMAND` and writes a secret to stdout. |
-| `tick`, `run-set`, `restore`, `init-secondary`, `unlock`, `config import`, `secret set`/`set-env`/`rm`, `cli install`/`uninstall`, `timer install`/`uninstall` | — | Mutating, not inspection. Progress is a human/log concern; the machine-readable record of what happened is the run record (`runs show --json`). |
+| `tick`, `run-set`, `restore`, `init-secondary`, `unlock`, `config import`, `secret set`/`set-env`/`rm`, `excludes enable`/`disable`/`add`/`remove`/`set`/`reset`, `cli install`/`uninstall`, `timer install`/`uninstall` | — | Mutating, not inspection. Progress is a human/log concern; the machine-readable record of what happened is the run record (`runs show --json`). |
 
 Two payload notes that are easy to get wrong:
 

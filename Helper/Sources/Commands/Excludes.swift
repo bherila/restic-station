@@ -1,0 +1,565 @@
+import ArgumentParser
+import Foundation
+import ResticStationCore
+
+// MARK: - excludes
+
+/// `excludes …` — the host-local global exclusion list.
+///
+/// **Never touches `config.json`.** The built-in catalogue ships in the
+/// binary and the adjustments live in `global-excludes.json` beside
+/// `machine.json`, so nothing here travels with a `config export`
+/// (`docs/data-model.md` §global-excludes.json). The one fleet-wide half of
+/// the feature — a set opting out entirely — is a `config.json` field and is
+/// edited in the set editor or by hand, not here.
+struct Excludes: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "excludes",
+        abstract: "Inspect and adjust this machine's global exclusion list — the patterns every "
+            + "backup set skips unless it opts out. Host-local: never read or written by "
+            + "config export/import. Exit 0 ok, 1 error.",
+        subcommands: [
+            ExcludesShow.self,
+            ExcludesEnable.self,
+            ExcludesDisable.self,
+            ExcludesAdd.self,
+            ExcludesRemove.self,
+            ExcludesSet.self,
+            ExcludesReset.self,
+        ]
+    )
+}
+
+// MARK: - Shared loading
+
+/// Loads and saves `global-excludes.json` for the subcommands below,
+/// classifying a file this build cannot honour as `config_invalid` — the
+/// same code an unusable `config.json` produces, because it is the same kind
+/// of fault: local state a human has to fix before a backup can be trusted
+/// to skip exactly what was intended.
+struct ExcludesCLIContext {
+    let paths: AppPaths
+    let store: GlobalExcludeStore
+
+    static func make() -> ExcludesCLIContext {
+        let paths = AppPaths.default()
+        return ExcludesCLIContext(paths: paths, store: GlobalExcludeStore(paths: paths))
+    }
+
+    /// Settings plus the fingerprint of the bytes they were decoded from.
+    ///
+    /// The two travel together so a subcommand cannot separate them: a
+    /// `save` that re-read the file to get its own "expected" fingerprint
+    /// would compare the file against itself and overwrite whatever a
+    /// concurrent `excludes disable` (or the Settings pane) had just
+    /// written. Losing a *disabled* group that way silently re-enables it,
+    /// and every later backup then skips paths the operator meant to keep.
+    struct Loaded {
+        var settings: GlobalExcludeSettings
+        /// `nil` when there was no file at load time, which is itself a
+        /// fingerprint: a file that exists by save time fails the check.
+        let fingerprint: String?
+    }
+
+    func load() throws -> Loaded {
+        do {
+            let loaded = try store.loadFingerprinted()
+            return Loaded(settings: loaded.settings, fingerprint: loaded.fingerprint)
+        } catch {
+            throw CLIFailure.configInvalid(underlying: error)
+        }
+    }
+
+    func save(_ loaded: Loaded) throws {
+        do {
+            try store.save(loaded.settings, ifUnchangedFrom: loaded.fingerprint)
+        } catch {
+            throw CLIFailure.configInvalid(underlying: error)
+        }
+    }
+
+    /// Rejects a group id this build does not have, rather than writing it
+    /// and failing every later load. The available ids are listed, since a
+    /// typo is the overwhelmingly likely cause.
+    static func requireKnownGroup(_ id: String) throws {
+        guard GlobalExcludeCatalog.group(id: id) != nil else {
+            throw CLIFailure.invalidArguments(
+                "\"\(id)\" is not an exclusion group in this build — available groups: "
+                    + GlobalExcludeCatalog.groupIDs.joined(separator: ", ")
+            )
+        }
+    }
+}
+
+// MARK: - excludes show
+
+struct ExcludesShow: AsyncParsableCommand, JSONRenderable {
+    static let configuration = CommandConfiguration(
+        commandName: "show",
+        abstract: "Print every exclusion group, whether it applies on this machine, and the "
+            + "resolved pattern list. --json for scripting. Exit 0 ok, 1 error."
+    )
+
+    @Flag(name: .long, help: "Emit JSON. Only JSON reaches stdout in this mode.")
+    var json = false
+
+    @Flag(name: .long, help: "Also print every individual pattern in the human output.")
+    var patterns = false
+
+    func run() async throws {
+        let context = ExcludesCLIContext.make()
+        // One snapshot, not two. `exists` comes from the fingerprint the
+        // load returned — `nil` means there was no file at the instant the
+        // settings were read — rather than from a second filesystem lookup
+        // afterwards. A concurrent `excludes reset` or `excludes add`
+        // between the two could otherwise have the report label customised
+        // bytes "not present — built-in defaults", or claim a file exists
+        // while printing the defaults, and `savedCatalogVersion` reads off
+        // the same flag.
+        let loaded = try context.load()
+        let report = GlobalExcludeReport.build(
+            settings: loaded.settings,
+            path: context.paths.globalExcludesFile,
+            exists: loaded.fingerprint != nil
+        )
+
+        if json {
+            CLIJSON.print(report)
+        } else {
+            for line in report.humanLines(includePatterns: patterns) {
+                print(line)
+            }
+        }
+        HelperExit.code(0)
+    }
+}
+
+// MARK: - excludes enable / disable
+
+struct ExcludesEnable: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "enable",
+        abstract: "Apply these exclusion groups on this machine. Exit 0 ok, 1 error."
+    )
+
+    @Argument(help: "Group ids, as `excludes show` prints them.")
+    var groups: [String]
+
+    func run() async throws {
+        try await ExcludesGroupToggle.apply(groups: groups, enabled: true)
+    }
+}
+
+struct ExcludesDisable: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "disable",
+        abstract: "Stop applying these exclusion groups on this machine, so their paths are "
+            + "backed up again. Exit 0 ok, 1 error."
+    )
+
+    @Argument(help: "Group ids, as `excludes show` prints them.")
+    var groups: [String]
+
+    func run() async throws {
+        try await ExcludesGroupToggle.apply(groups: groups, enabled: false)
+    }
+}
+
+/// The body `enable` and `disable` share, so the two can never drift in how
+/// they validate or persist.
+enum ExcludesGroupToggle {
+    static func apply(groups: [String], enabled: Bool) async throws {
+        guard !groups.isEmpty else {
+            throw CLIFailure.invalidArguments("name at least one exclusion group")
+        }
+        for id in groups {
+            try ExcludesCLIContext.requireKnownGroup(id)
+        }
+        let context = ExcludesCLIContext.make()
+        var loaded = try context.load()
+        for id in groups {
+            // Record only a decision that differs from the catalogue's own
+            // default, which is what `docs/data-model.md`
+            // §global-excludes.json requires `groups` to hold and what the
+            // app already does. Writing an explicit value that happens to
+            // match today's default pins it: a later release that changes
+            // the safe default for that group would not reach this host,
+            // and `excludes show` would not mark the value as changed.
+            if GlobalExcludeCatalog.group(id: id)?.enabledByDefault == enabled {
+                loaded.settings.groups.removeValue(forKey: id)
+            } else {
+                loaded.settings.groups[id] = enabled
+            }
+        }
+        try context.save(loaded)
+        let verb = enabled ? "applied" : "not applied"
+        for id in groups {
+            print("\(id): \(verb) on this machine")
+        }
+        HelperExit.code(0)
+    }
+}
+
+// MARK: - excludes add / remove
+
+struct ExcludesAdd: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "add",
+        abstract: "Add this machine's own --exclude patterns, applied to every set that has not "
+            + "opted out. Exit 0 ok, 1 error."
+    )
+
+    @Argument(help: "restic --exclude patterns. Unlike the built-in list these may be absolute.")
+    var patterns: [String]
+
+    func run() async throws {
+        guard !patterns.isEmpty else {
+            throw CLIFailure.invalidArguments("name at least one pattern")
+        }
+        for pattern in patterns where pattern.isEmpty {
+            throw CLIFailure.invalidArguments(
+                "an exclusion pattern must not be empty — a blank entry silently matches nothing"
+            )
+        }
+        let context = ExcludesCLIContext.make()
+        var loaded = try context.load()
+        var added: [String] = []
+        for pattern in patterns where !loaded.settings.extraPatterns.contains(pattern) {
+            loaded.settings.extraPatterns.append(pattern)
+            added.append(pattern)
+        }
+        try context.save(loaded)
+        if added.isEmpty {
+            print("no change — every pattern was already in the list")
+        } else {
+            for pattern in added {
+                print("added \(pattern)")
+            }
+        }
+        HelperExit.code(0)
+    }
+}
+
+struct ExcludesRemove: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "remove",
+        abstract: "Remove patterns this machine added. Built-in groups are turned off with "
+            + "`excludes disable` instead. Exit 0 ok, 1 error."
+    )
+
+    @Argument(help: "Patterns to remove, exactly as `excludes show` prints them.")
+    var patterns: [String]
+
+    func run() async throws {
+        guard !patterns.isEmpty else {
+            throw CLIFailure.invalidArguments("name at least one pattern")
+        }
+        let context = ExcludesCLIContext.make()
+        var loaded = try context.load()
+        // A pattern that is not there is an error rather than a silent
+        // no-op: "I removed it" followed by every run still skipping the
+        // directory is the exact confusion this list has to avoid.
+        for pattern in patterns where !loaded.settings.extraPatterns.contains(pattern) {
+            // Across every platform, not just this one: "that is part of
+            // group X" is the useful answer even for a pattern this host
+            // would never apply.
+            let hint = GlobalExcludeCatalog.groups.first { group in
+                group.patterns.contains { $0.pattern == pattern }
+            }
+            throw CLIFailure.invalidArguments(
+                hint.map {
+                    "\"\(pattern)\" is part of the built-in group \"\($0.id)\", not a pattern this "
+                        + "machine added — turn the group off with `excludes disable \($0.id)`"
+                } ?? "\"\(pattern)\" is not one of this machine's own patterns"
+            )
+        }
+        loaded.settings.extraPatterns.removeAll { patterns.contains($0) }
+        try context.save(loaded)
+        for pattern in patterns {
+            print("removed \(pattern)")
+        }
+        HelperExit.code(0)
+    }
+}
+
+// MARK: - excludes set
+
+struct ExcludesSet: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "set",
+        abstract: "Turn the whole global list, or its CACHEDIR.TAG handling, on or off. "
+            + "Exit 0 ok, 1 error."
+    )
+
+    @Option(name: .long, help: "Apply the global exclusion list on this machine at all (true/false).")
+    var enabled: Bool?
+
+    @Option(
+        name: .customLong("exclude-caches"),
+        help: "Pass --exclude-caches, skipping directories their own creator tagged CACHEDIR.TAG (true/false)."
+    )
+    var excludeCaches: Bool?
+
+    @Option(
+        name: .customLong("exclude-larger-than"),
+        help: ArgumentHelp(
+            "Skip files larger than this (500m, 10G, …), or \"none\" to lift the cap. Off by default.",
+            discussion: "Every other rule here names a directory of regenerable things; a size cap "
+                + "can drop one irreplaceable file with no pattern to point at afterwards, so it "
+                + "is opt-in."
+        )
+    )
+    var excludeLargerThan: String?
+
+    func run() async throws {
+        guard enabled != nil || excludeCaches != nil || excludeLargerThan != nil else {
+            throw CLIFailure.invalidArguments(
+                "pass --enabled, --exclude-caches and/or --exclude-larger-than"
+            )
+        }
+        let context = ExcludesCLIContext.make()
+        var loaded = try context.load()
+        if let enabled {
+            loaded.settings.enabled = enabled
+        }
+        if let excludeCaches {
+            loaded.settings.excludeCaches = excludeCaches
+        }
+        if let excludeLargerThan {
+            // "none" rather than an empty string: an empty `--option ""` is
+            // easy to produce by accident from a shell variable, and
+            // "silently lifted the size cap" is the wrong thing for that to
+            // mean.
+            if excludeLargerThan.lowercased() == "none" {
+                loaded.settings.excludeLargerThan = nil
+            } else {
+                guard GlobalExcludeSettings.isValidSize(excludeLargerThan) else {
+                    throw CLIFailure.invalidArguments(
+                        "\"\(excludeLargerThan)\" is not a size — use a number optionally followed "
+                            + "by k, m, g or t (for example 500m or 10G), or \"none\" to lift the cap"
+                    )
+                }
+                loaded.settings.excludeLargerThan = excludeLargerThan
+            }
+        }
+        try context.save(loaded)
+        print("global exclusion list: \(loaded.settings.enabled ? "on" : "off")")
+        print("--exclude-caches: \(loaded.settings.excludeCaches ? "on" : "off")")
+        print("--exclude-larger-than: \(loaded.settings.excludeLargerThan ?? "(no cap)")")
+        HelperExit.code(0)
+    }
+}
+
+// MARK: - excludes reset
+
+struct ExcludesReset: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "reset",
+        abstract: "Discard this machine's adjustments and go back to the built-in defaults by "
+            + "removing global-excludes.json. Exit 0 ok, 1 error."
+    )
+
+    func run() async throws {
+        let context = ExcludesCLIContext.make()
+        let file = context.paths.globalExcludesFile
+        // Through the store, so the check and the unlink are one critical
+        // section: a concurrent `excludes add` must not land a file between
+        // them and leave this host carrying an adjustment after being told
+        // it is back on the defaults.
+        let removed: Bool
+        do {
+            removed = try context.store.removeSettings()
+        } catch {
+            throw CLIFailure.configInvalid(underlying: error)
+        }
+        if removed {
+            print("removed \(file.path) — back to the built-in defaults")
+        } else {
+            print("already at the built-in defaults — \(file.path) does not exist")
+        }
+        HelperExit.code(0)
+    }
+}
+
+// MARK: - Report
+
+/// `excludes show`'s payload, and the source of its human rendering — one
+/// value with two renderings, the same arrangement `EffectiveConfigReport`
+/// uses, so the two modes cannot disagree about what applies here.
+struct GlobalExcludeReport: Encodable {
+    struct GroupEntry: Encodable {
+        let id: String
+        let title: String
+        let summary: String
+        /// Applies on this machine.
+        let enabled: Bool
+        /// What it would be with no `global-excludes.json` at all.
+        let enabledByDefault: Bool
+        /// The patterns that apply on **this** platform, in argv order.
+        let patterns: [String]
+        /// Patterns the group carries for the other platform, which this
+        /// host will never apply. Reported rather than hidden so "why is
+        /// this group only four patterns here?" has an answer.
+        let otherPlatformPatternCount: Int
+    }
+
+    /// Where the adjustments live — printed because "machine level or user
+    /// level" is decided by which data directory this process resolved, and
+    /// the honest answer is the path.
+    let path: String
+    /// `false` means every value below is the built-in default.
+    let exists: Bool
+    let enabled: Bool
+    let excludeCaches: Bool
+    /// `restic backup --exclude-larger-than`, or `null` for no cap.
+    let excludeLargerThan: String?
+    /// The platform whose patterns this report resolved — `"macOS"` or
+    /// `"linux"`. The catalogue is scoped (`docs/data-model.md`
+    /// §global-excludes.json), so the same build reports different pattern
+    /// lists on different hosts, and a `--json` consumer needs to know
+    /// which it is looking at.
+    let platform: String
+    /// The catalogue version this build carries.
+    let catalogVersion: Int
+    /// The catalogue version the file was last written against; `0` for a
+    /// file written before the key existed, and equal to `catalogVersion`
+    /// when there is no file.
+    let savedCatalogVersion: Int
+    let groups: [GroupEntry]
+    /// This machine's own additions.
+    let extraPatterns: [String]
+    /// The catalogue patterns every applying backup set receives, in argv
+    /// order, as case-insensitive `--iexclude`. Includes
+    /// ``cloudPlaceholderPatterns``, which nearly every set does receive.
+    let patterns: [String]
+    /// The subset of ``patterns`` that names a *cloud placeholder* — a stub
+    /// a sync client leaves for a file it has evicted. A set whose
+    /// `onlineOnlyFiles` is `download` does **not** receive these: it has
+    /// asked for the real contents, and the stub is the only record the file
+    /// exists (`docs/data-model.md` §global-excludes.json). Reported as its
+    /// own list rather than silently folded in, so a script can tell which
+    /// of two sets got which argv.
+    let cloudPlaceholderPatterns: [String]
+    /// ``extraPatterns`` as they actually reach restic: case-sensitive
+    /// `--exclude`, because `excludes add` documents them that way. Kept
+    /// separate from ``patterns`` so a consumer can see which matching rule
+    /// applies to which pattern.
+    let hostPatterns: [String]
+
+    private enum CodingKeys: String, CodingKey {
+        case path, exists, enabled, excludeCaches, excludeLargerThan, platform, catalogVersion
+        case savedCatalogVersion, groups, extraPatterns, patterns, cloudPlaceholderPatterns
+        case hostPatterns
+    }
+
+    // Explicit `null` for `excludeLargerThan` — the house convention for a
+    // documented `--json` interface (`docs/data-model.md` preamble): the
+    // synthesized encoder would omit the key, and a consumer would have to
+    // tell "no cap" from "this build has no such field".
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(path, forKey: .path)
+        try container.encode(exists, forKey: .exists)
+        try container.encode(enabled, forKey: .enabled)
+        try container.encode(excludeCaches, forKey: .excludeCaches)
+        try container.encode(excludeLargerThan, forKey: .excludeLargerThan)
+        try container.encode(platform, forKey: .platform)
+        try container.encode(catalogVersion, forKey: .catalogVersion)
+        try container.encode(savedCatalogVersion, forKey: .savedCatalogVersion)
+        try container.encode(groups, forKey: .groups)
+        try container.encode(extraPatterns, forKey: .extraPatterns)
+        try container.encode(patterns, forKey: .patterns)
+        try container.encode(cloudPlaceholderPatterns, forKey: .cloudPlaceholderPatterns)
+        try container.encode(hostPatterns, forKey: .hostPatterns)
+    }
+
+    static func build(
+        settings: GlobalExcludeSettings,
+        path: URL,
+        exists: Bool,
+        platform: GlobalExcludePlatform = .current
+    ) -> GlobalExcludeReport {
+        let plan = settings.plan(on: platform)
+        return GlobalExcludeReport(
+            path: path.path,
+            exists: exists,
+            enabled: settings.enabled,
+            excludeCaches: settings.excludeCaches,
+            excludeLargerThan: settings.excludeLargerThan,
+            platform: platform.rawValue,
+            catalogVersion: GlobalExcludeCatalog.version,
+            savedCatalogVersion: exists ? settings.catalogVersion : GlobalExcludeCatalog.version,
+            groups: GlobalExcludeCatalog.groups.map { group in
+                GroupEntry(
+                    id: group.id,
+                    title: group.title,
+                    summary: group.summary,
+                    enabled: settings.isEnabled(group),
+                    enabledByDefault: group.enabledByDefault,
+                    patterns: group.patterns(on: platform),
+                    otherPlatformPatternCount: group.patterns.count - group.patterns(on: platform).count
+                )
+            },
+            extraPatterns: settings.extraPatterns,
+            patterns: plan.patterns + plan.cloudPlaceholderPatterns,
+            cloudPlaceholderPatterns: plan.cloudPlaceholderPatterns,
+            hostPatterns: plan.hostPatterns
+        )
+    }
+
+    func humanLines(includePatterns: Bool) -> [String] {
+        var lines: [String] = []
+        lines.append("global exclusion list: \(enabled ? "on" : "off")")
+        lines.append("settings file: \(path)\(exists ? "" : "  (not present — built-in defaults)")")
+        lines.append("--exclude-caches: \(excludeCaches ? "on" : "off")")
+        lines.append("--exclude-larger-than: \(excludeLargerThan ?? "(no cap)")")
+        lines.append("platform: \(platform)")
+        lines.append("")
+        for group in groups {
+            let mark = group.enabled ? "[x]" : "[ ]"
+            let drift = group.enabled == group.enabledByDefault
+                ? ""
+                : "  (changed on this machine)"
+            lines.append("\(mark) \(group.id) — \(group.title)\(drift)")
+            lines.append("      \(group.summary)")
+            let other = group.otherPlatformPatternCount == 0
+                ? ""
+                : "  (+\(group.otherPlatformPatternCount) for the other platform)"
+            lines.append("      \(group.patterns.count) pattern(s) here\(other)")
+            if includePatterns {
+                for pattern in group.patterns {
+                    lines.append("        \(pattern)")
+                }
+            }
+        }
+        lines.append("")
+        if extraPatterns.isEmpty {
+            lines.append("this machine adds no patterns of its own")
+        } else {
+            lines.append("this machine also excludes (case-sensitively, as --exclude):")
+            for pattern in extraPatterns {
+                lines.append("    \(pattern)")
+            }
+        }
+        lines.append("")
+        lines.append(
+            "\(patterns.count + hostPatterns.count) pattern(s) reach every backup set that has "
+                + "not set usesGlobalExcludes: false"
+        )
+        if !cloudPlaceholderPatterns.isEmpty {
+            lines.append(
+                "of those, \(cloudPlaceholderPatterns.count) match cloud placeholder stubs "
+                    + "(\(cloudPlaceholderPatterns.joined(separator: ", "))) and are held back "
+                    + "for a set whose onlineOnlyFiles is \"download\""
+            )
+        }
+        if savedCatalogVersion < catalogVersion {
+            lines.append(
+                "note: this build carries catalogue version \(catalogVersion); your settings were "
+                    + "last written against \(savedCatalogVersion). Groups added since then are on "
+                    + "or off by their own default."
+            )
+        }
+        return lines
+    }
+}

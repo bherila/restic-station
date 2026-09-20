@@ -176,6 +176,21 @@ run restic-station-helper probe-repo --set "$PROJECTS_ID" --dest "$PRIMARY_ID"
 mv "$FIXTURE_PRIMARY_REPO.unplugged" "$FIXTURE_PRIMARY_REPO"
 
 # ===========================================================================
+section "Global exclusions"
+# ===========================================================================
+# docs/linux.md §Global exclusions. A fresh data directory so the "no
+# settings file yet" line in the docs is the real one; every mutation below
+# then lands in that directory rather than in the fixture host's.
+EXCLUDES_DATA="$WORK/data-excludes"
+mkdir -p "$EXCLUDES_DATA"
+RESTIC_STATION_DATA_DIR="$EXCLUDES_DATA" run restic-station-helper excludes show
+RESTIC_STATION_DATA_DIR="$EXCLUDES_DATA" run restic-station-helper excludes disable developer-build-artifacts
+RESTIC_STATION_DATA_DIR="$EXCLUDES_DATA" run restic-station-helper excludes enable virtual-machine-images
+RESTIC_STATION_DATA_DIR="$EXCLUDES_DATA" run restic-station-helper excludes add /srv/scratch
+RESTIC_STATION_DATA_DIR="$EXCLUDES_DATA" run restic-station-helper excludes set --exclude-caches false
+RESTIC_STATION_DATA_DIR="$EXCLUDES_DATA" run restic-station-helper excludes reset
+
+# ===========================================================================
 section "Per-machine override worked examples (checked-in fixture)"
 # ===========================================================================
 # Core/Tests/ResticStationCoreTests/Fixtures/config-v2.json is the exact
@@ -202,7 +217,7 @@ MIRROR_BOX_DATA="$WORK/data-mirror-box"
 mkdir -p "$MIRROR_BOX_DATA"
 cat > "$MIRROR_BOX_DATA/config.json" <<'JSON'
 {
-  "version": 4,
+  "version": 5,
   "resticPath": null,
   "showMenuBarIcon": true,
   "sets": [
@@ -327,7 +342,7 @@ FIRE_SET_ID="e1000000-0000-4000-8000-000000000001"
 FIRE_PRIMARY_ID="e1000000-0000-4000-8000-000000000002"
 cat > "$FIRE_DATA/config.json" <<JSON
 {
-  "version": 4,
+  "version": 5,
   "resticPath": null,
   "showMenuBarIcon": true,
   "sets": [

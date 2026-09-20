@@ -19,7 +19,11 @@ public struct AppConfig: Codable, Equatable, Sendable {
     ///   backups *and* rewritten out of existing snapshots.
     /// - 4: `onlineOnlyFiles` on `BackupSet` — whether a backup skips or
     ///   downloads cloud files that are not stored on this Mac.
-    public static let currentVersion = 4
+    /// - 5: `usesGlobalExcludes` on `BackupSet` — whether this host's
+    ///   global exclusion list (`docs/data-model.md`
+    ///   §global-excludes.json) is applied to the set, or the set is opted
+    ///   out of it.
+    public static let currentVersion = 5
 
     public var version: Int
     /// **Deprecated** — superseded by `MachineConfig.resticPath`, because
@@ -107,6 +111,22 @@ public struct BackupSet: Codable, Equatable, Identifiable, Sendable {
     /// What a backup does with online-only cloud files under a cloud-synced
     /// source (schema v4). Absent decodes as ``OnlineOnlyFiles/skip``.
     public var onlineOnlyFiles: OnlineOnlyFiles
+    /// Whether this host's global exclusion list applies to the set (schema
+    /// v5). Absent decodes as `true`.
+    ///
+    /// The global list is the one thing here that is **not** a property of
+    /// the fleet: it is built into the binary and adjusted per host in
+    /// `global-excludes.json` (`docs/data-model.md` §global-excludes.json).
+    /// This flag is the fleet-wide half of that arrangement — "a set whose
+    /// whole job is to archive build output should not have build output
+    /// skipped" is true on every machine, so it belongs in the shared file
+    /// rather than being restated on each of them.
+    ///
+    /// Opting out is all-or-nothing on purpose. restic exclude patterns
+    /// have no re-include form, so "everything except one group" cannot be
+    /// expressed by cancelling a pattern; a set that needs a narrower
+    /// arrangement opts out and lists what it does want in ``excludes``.
+    public var usesGlobalExcludes: Bool
     public var schedule: Schedule
     /// `nil` = never forget.
     public var retention: RetentionPolicy?
@@ -131,6 +151,7 @@ public struct BackupSet: Codable, Equatable, Identifiable, Sendable {
         excludes: [String] = [],
         purgeExcludes: [String] = [],
         onlineOnlyFiles: OnlineOnlyFiles = .skip,
+        usesGlobalExcludes: Bool = true,
         schedule: Schedule,
         retention: RetentionPolicy? = nil,
         checkPolicy: CheckPolicy? = nil,
@@ -144,6 +165,7 @@ public struct BackupSet: Codable, Equatable, Identifiable, Sendable {
         self.excludes = excludes
         self.purgeExcludes = purgeExcludes
         self.onlineOnlyFiles = onlineOnlyFiles
+        self.usesGlobalExcludes = usesGlobalExcludes
         self.schedule = schedule
         self.retention = retention
         self.checkPolicy = checkPolicy
@@ -153,7 +175,8 @@ public struct BackupSet: Codable, Equatable, Identifiable, Sendable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, name, sources, excludes, purgeExcludes, onlineOnlyFiles, schedule, retention, checkPolicy
+        case id, name, sources, excludes, purgeExcludes, onlineOnlyFiles, usesGlobalExcludes
+        case schedule, retention, checkPolicy
         case stalenessWarningDays, destinations
         case machines
     }
@@ -166,7 +189,8 @@ public struct BackupSet: Codable, Equatable, Identifiable, Sendable {
     // pre-v3 config and no migration would ever get the chance to run.
     // Absent and explicit `null` both read as "no purge patterns".
     // `onlineOnlyFiles` is the v4 key and is hand-decoded for the same
-    // reason; absent and `null` both read as `.skip`.
+    // reason; absent and `null` both read as `.skip`. `usesGlobalExcludes`
+    // is the v5 key; absent and `null` both read as `true`.
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         id = try container.decode(UUID.self, forKey: .id)
@@ -175,6 +199,7 @@ public struct BackupSet: Codable, Equatable, Identifiable, Sendable {
         excludes = try container.decode([String].self, forKey: .excludes)
         purgeExcludes = try container.decodeIfPresent([String].self, forKey: .purgeExcludes) ?? []
         onlineOnlyFiles = try container.decodeIfPresent(OnlineOnlyFiles.self, forKey: .onlineOnlyFiles) ?? .skip
+        usesGlobalExcludes = try container.decodeIfPresent(Bool.self, forKey: .usesGlobalExcludes) ?? true
         schedule = try container.decode(Schedule.self, forKey: .schedule)
         retention = try container.decodeIfPresent(RetentionPolicy.self, forKey: .retention)
         checkPolicy = try container.decodeIfPresent(CheckPolicy.self, forKey: .checkPolicy)
@@ -198,6 +223,7 @@ public struct BackupSet: Codable, Equatable, Identifiable, Sendable {
         try container.encode(excludes, forKey: .excludes)
         try container.encode(purgeExcludes, forKey: .purgeExcludes)
         try container.encode(onlineOnlyFiles, forKey: .onlineOnlyFiles)
+        try container.encode(usesGlobalExcludes, forKey: .usesGlobalExcludes)
         try container.encode(schedule, forKey: .schedule)
         try container.encode(retention, forKey: .retention)
         try container.encode(checkPolicy, forKey: .checkPolicy)
@@ -219,6 +245,103 @@ public struct BackupSet: Codable, Equatable, Identifiable, Sendable {
     public var effectiveBackupExcludes: [String] {
         var seen = Set<String>()
         return (excludes + purgeExcludes).filter { seen.insert($0).inserted }
+    }
+
+    /// This host's global patterns for `backup`'s `--iexclude` block — or
+    /// nothing at all when the set has opted out with
+    /// ``usesGlobalExcludes``.
+    ///
+    /// **Nothing is dropped as a duplicate.** An earlier revision filtered
+    /// out a catalogue pattern the set already named exactly, to keep the
+    /// argv from repeating itself. That was wrong in the direction that
+    /// loses data: the two blocks are not the same rule even for identical
+    /// text, because `--exclude node_modules` is case-sensitive and
+    /// `--iexclude node_modules` is not. A set naming the common lowercase
+    /// spelling would therefore have suppressed the catalogue entry and
+    /// gone on backing up `NODE_MODULES`, with global exclusions on and
+    /// nothing to point at. A tidier run log is not worth that; the
+    /// duplicate is handed to restic and costs one redundant match.
+    ///
+    /// **The global list is forward-only and never becomes a purge
+    /// pattern.** `purgeExcludes` is the only list `rewrite --forget` ever
+    /// sees, and it is reached through ``purgeExcludes`` directly — never
+    /// through this method or ``effectiveBackupExcludes``. That asymmetry is
+    /// the point: a pattern that arrives because a build shipped a better
+    /// default must never delete anything already in a repository.
+    public func globalBackupExcludes(applying plan: GlobalExcludePlan) -> [String] {
+        guard usesGlobalExcludes else { return [] }
+        // A set that has asked to *download* its online-only files wants the
+        // real contents of everything a sync client has evicted, so the
+        // catalogue's cloud-placeholder patterns are dropped for it. Applying
+        // them anyway would delete the only filesystem record those files
+        // exist from a snapshot the operator has been told is complete —
+        // exactly the silent under-backup the rest of this file exists to
+        // prevent. Every other set still gets them.
+        let catalogue = onlineOnlyFiles == .download
+            ? plan.patterns
+            : plan.patterns + plan.cloudPlaceholderPatterns
+        return catalogue.filter { !swallowsASource($0, caseInsensitive: true) }
+    }
+
+    /// Whether this pattern would match one of this set's sources, or a
+    /// directory above it — in which case restic writes an **empty
+    /// snapshot** for that source rather than skipping something inside it.
+    ///
+    /// See ``GlobalExcludeAncestorSafety``. Held back rather than refused:
+    /// the set backs up more than the catalogue intended, which is the
+    /// recoverable direction, and `BackupEngine` names every held-back
+    /// pattern in the run log.
+    func swallowsASource(_ pattern: String, caseInsensitive: Bool) -> Bool {
+        effectiveSourcesForAncestorCheck.contains { source in
+            GlobalExcludeAncestorSafety.matchesSourceOrAncestor(
+                pattern: pattern, sourcePath: source, caseInsensitive: caseInsensitive
+            )
+        }
+    }
+
+    /// The paths the ancestor check runs against. `sources` as configured —
+    /// per-machine overrides are already applied by the time a `BackupSet`
+    /// reaches the engine (`docs/data-model.md` §Per-machine scoping).
+    private var effectiveSourcesForAncestorCheck: [String] { sources }
+
+    /// The global patterns this set cannot safely apply, for the run log.
+    public func globalExcludesHeldBackForSources(applying plan: GlobalExcludePlan) -> [String] {
+        guard usesGlobalExcludes else { return [] }
+        let catalogue = (plan.patterns + plan.cloudPlaceholderPatterns)
+            .filter { swallowsASource($0, caseInsensitive: true) }
+        let host = plan.hostPatterns.filter { swallowsASource($0, caseInsensitive: false) }
+        return catalogue + host
+    }
+
+    /// This host's own ``GlobalExcludeSettings/extraPatterns`` for `backup`'s
+    /// case-sensitive `--exclude` block, appended after the set's own —
+    /// or nothing when the set has opted out.
+    ///
+    /// They join the set's list rather than the catalogue's because that is
+    /// the matching rule `excludes add` documents for them.
+    ///
+    /// An exact duplicate *is* dropped here, unlike the catalogue block
+    /// above, and for the reason that block cannot: both lists reach restic
+    /// on the same case-sensitive `--exclude`, so identical text really is
+    /// the same rule and repeating it changes nothing.
+    public func hostBackupExcludes(applying plan: GlobalExcludePlan) -> [String] {
+        guard usesGlobalExcludes else { return [] }
+        let own = Set(effectiveBackupExcludes)
+        return plan.hostPatterns.filter {
+            !own.contains($0) && !swallowsASource($0, caseInsensitive: false)
+        }
+    }
+
+    /// Whether `backup` carries `--exclude-caches` for this set: the host
+    /// asked for it **and** the set has not opted out of the global list.
+    public func excludesCaches(applying plan: GlobalExcludePlan) -> Bool {
+        usesGlobalExcludes && plan.excludeCaches
+    }
+
+    /// The `--exclude-larger-than` size for this set, or `nil` — the host's
+    /// cap, unless the set has opted out of the global list.
+    public func excludeLargerThan(applying plan: GlobalExcludePlan) -> String? {
+        usesGlobalExcludes ? plan.excludeLargerThan : nil
     }
 
     /// The shared ``sources`` followed by every per-machine replacement

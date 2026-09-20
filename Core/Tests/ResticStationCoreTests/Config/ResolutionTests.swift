@@ -353,7 +353,7 @@ private func baseConfig() -> AppConfig {
     @Test func macResolutionIsIdenticalOnEveryHostOS() throws {
         let expected = """
         {
-          "version": 4,
+          "version": 5,
           "resticPath": null,
           "showMenuBarIcon": true,
           "sets": [
@@ -364,6 +364,7 @@ private func baseConfig() -> AppConfig {
               "excludes": ["*.tmp"],
               "purgeExcludes": [],
               "onlineOnlyFiles": "skip",
+              "usesGlobalExcludes": true,
               "schedule": { "kind": "daily", "hour": 2, "minute": 30 },
               "retention": {
                 "keepLast": null, "keepHourly": null, "keepDaily": 7,
@@ -406,7 +407,7 @@ private func baseConfig() -> AppConfig {
     @Test func linuxResolutionIsIdenticalOnEveryHostOS() throws {
         let expected = """
         {
-          "version": 4,
+          "version": 5,
           "resticPath": null,
           "showMenuBarIcon": true,
           "sets": [
@@ -417,6 +418,7 @@ private func baseConfig() -> AppConfig {
               "excludes": ["*.tmp"],
               "purgeExcludes": [],
               "onlineOnlyFiles": "skip",
+              "usesGlobalExcludes": true,
               "schedule": { "kind": "daily", "hour": 4, "minute": 0 },
               "retention": {
                 "keepLast": null, "keepHourly": null, "keepDaily": 7,
@@ -703,6 +705,7 @@ private func baseConfig() -> AppConfig {
         for index in sets.indices {
             sets[index]["purgeExcludes"] = [String]()
             sets[index]["onlineOnlyFiles"] = "skip"
+            sets[index]["usesGlobalExcludes"] = true
         }
         expected["sets"] = sets
         #expect(actual == (expected as NSDictionary))
