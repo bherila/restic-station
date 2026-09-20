@@ -2578,8 +2578,14 @@ public final class BackupEngine: Sendable {
         let heldBack = set.onlineOnlyFiles == .download && !globalExcludes.cloudPlaceholderPatterns.isEmpty
             ? " (cloud-placeholder patterns held back: this set downloads online-only files)"
             : ""
+        let swallowed = set.globalExcludesHeldBackForSources(applying: globalExcludes)
+        let ancestorNote = swallowed.isEmpty
+            ? ""
+            : " (held back as unsafe for this set's sources, where they would match the source "
+                + "itself or a directory above it and empty the snapshot: "
+                + "\(swallowed.joined(separator: ", ")))"
         return "global excludes: \(applied) pattern(s)\(suffix) "
-            + "from this machine's global exclusion list\(heldBack)"
+            + "from this machine's global exclusion list\(heldBack)\(ancestorNote)"
     }
 
     /// The patterns in `set.purgeExcludes` that this destination's durable

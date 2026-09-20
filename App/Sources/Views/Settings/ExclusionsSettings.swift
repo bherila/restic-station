@@ -393,14 +393,23 @@ final class ExclusionsSettingsModel: ObservableObject {
         settings = .default
         hasPendingEdit = false
         do {
-            // Through the store so the existence check and the unlink share
-            // the write lock with every other writer; an absent file is not
-            // an error, it is the default state.
-            try store.removeSettings()
+            // A compare-and-swap, like every other write from this pane.
+            // The lock keeps two writers from interleaving but does not stop
+            // a lost update: an `excludes disable …` run after this pane
+            // loaded would otherwise be deleted outright, silently
+            // re-enabling the group it had turned off.
+            try store.removeSettings(ifUnchangedFrom: fingerprint)
             persistedExcludeLargerThan = nil
             fingerprint = nil
             saveFailure = nil
             loadFailure = nil
+        } catch let error as GlobalExcludeError {
+            if case .staleWrite = error {
+                saveFailure = ExclusionsCopy.staleWrite
+                load(paths: store.paths)
+                return
+            }
+            saveFailure = "Could not remove \(file.path): \(error)"
         } catch {
             saveFailure = "Could not remove \(file.path): \(error)"
         }

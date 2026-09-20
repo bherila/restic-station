@@ -277,9 +277,40 @@ public struct BackupSet: Codable, Equatable, Identifiable, Sendable {
         // exist from a snapshot the operator has been told is complete —
         // exactly the silent under-backup the rest of this file exists to
         // prevent. Every other set still gets them.
-        return onlineOnlyFiles == .download
+        let catalogue = onlineOnlyFiles == .download
             ? plan.patterns
             : plan.patterns + plan.cloudPlaceholderPatterns
+        return catalogue.filter { !swallowsASource($0, caseInsensitive: true) }
+    }
+
+    /// Whether this pattern would match one of this set's sources, or a
+    /// directory above it — in which case restic writes an **empty
+    /// snapshot** for that source rather than skipping something inside it.
+    ///
+    /// See ``GlobalExcludeAncestorSafety``. Held back rather than refused:
+    /// the set backs up more than the catalogue intended, which is the
+    /// recoverable direction, and `BackupEngine` names every held-back
+    /// pattern in the run log.
+    func swallowsASource(_ pattern: String, caseInsensitive: Bool) -> Bool {
+        effectiveSourcesForAncestorCheck.contains { source in
+            GlobalExcludeAncestorSafety.matchesSourceOrAncestor(
+                pattern: pattern, sourcePath: source, caseInsensitive: caseInsensitive
+            )
+        }
+    }
+
+    /// The paths the ancestor check runs against. `sources` as configured —
+    /// per-machine overrides are already applied by the time a `BackupSet`
+    /// reaches the engine (`docs/data-model.md` §Per-machine scoping).
+    private var effectiveSourcesForAncestorCheck: [String] { sources }
+
+    /// The global patterns this set cannot safely apply, for the run log.
+    public func globalExcludesHeldBackForSources(applying plan: GlobalExcludePlan) -> [String] {
+        guard usesGlobalExcludes else { return [] }
+        let catalogue = (plan.patterns + plan.cloudPlaceholderPatterns)
+            .filter { swallowsASource($0, caseInsensitive: true) }
+        let host = plan.hostPatterns.filter { swallowsASource($0, caseInsensitive: false) }
+        return catalogue + host
     }
 
     /// This host's own ``GlobalExcludeSettings/extraPatterns`` for `backup`'s
@@ -296,7 +327,9 @@ public struct BackupSet: Codable, Equatable, Identifiable, Sendable {
     public func hostBackupExcludes(applying plan: GlobalExcludePlan) -> [String] {
         guard usesGlobalExcludes else { return [] }
         let own = Set(effectiveBackupExcludes)
-        return plan.hostPatterns.filter { !own.contains($0) }
+        return plan.hostPatterns.filter {
+            !own.contains($0) && !swallowsASource($0, caseInsensitive: false)
+        }
     }
 
     /// Whether `backup` carries `--exclude-caches` for this set: the host

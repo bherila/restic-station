@@ -217,7 +217,7 @@ public enum GlobalExcludeCatalog {
     /// never heard of is an error (see ``GlobalExcludeError/unknownGroup``),
     /// and a group added after the file was written takes its built-in
     /// default.
-    public static let version = 9
+    public static let version = 10
 
     /// The catalogue, in the order its patterns reach argv.
     public static let groups: [GlobalExcludeGroup] = [
@@ -398,11 +398,13 @@ public enum GlobalExcludeCatalog {
                 // `tasks.vs.json` — authored debugging and task settings no
                 // build reproduces. Only the generated databases and
                 // indexes are named.
+                // Only the two genuinely generated stores. The version
+                // directories (`.vs/<solution>/v17/…`) hold `.suo`, which is
+                // a developer's breakpoints, watch windows and debugging
+                // options — user state, not a build product — so neither
+                // they nor a bare `*.suo` belong in a default-on group.
                 ".vs/ProjectEvaluation",
                 ".vs/FileContentIndex",
-                ".vs/*/v16",
-                ".vs/*/v17",
-                "*.suo",
                 // Node and the hidden framework output directories.
                 "node_modules",
                 ".next",
@@ -670,6 +672,72 @@ public enum GlobalExcludeCatalog {
     /// Every known group id, in catalogue order.
     public static var groupIDs: [String] {
         groups.map(\.id)
+    }
+}
+
+// MARK: - Ancestor safety
+
+/// Whether an unanchored catalogue pattern would match a backup source
+/// itself, or any directory *above* it.
+///
+/// **The hazard this closes, once, for every pattern.** restic matches a
+/// relative pattern against the trailing components of each item's
+/// *absolute* path, and it applies that test to the source root too. A
+/// source at `/srv/project.tmp/work` backed up with `--iexclude '*.tmp'`
+/// therefore produces an empty snapshot — verified against restic 0.18.1:
+/// `total_files_processed: 0`, with the listing stopping at `project.tmp`.
+///
+/// The catalogue used to guard this by *naming* — first a denylist of
+/// dangerous words, then an allowlist that exempted anything containing a
+/// glob. Both were judgements about which names a person might give a
+/// directory, and both were wrong: the denylist missed `Pods`, and the
+/// allowlist missed that `*.tmp` matches a directory called `project.tmp`
+/// just as happily as a file called `draft.tmp`. A judgement about
+/// third-party directory layouts cannot be made exhaustive, so this stops
+/// being a judgement: the engine checks each source's own path and drops
+/// any pattern that would swallow it.
+///
+/// Dropping is the safe direction — the set backs up *more* than the
+/// catalogue intended, never less — and the run log names every pattern
+/// held back, so a surprisingly large backup is explainable.
+enum GlobalExcludeAncestorSafety {
+    /// - Parameter caseInsensitive: `true` for the catalogue, which reaches
+    ///   restic as `--iexclude`; `false` for this host's own patterns,
+    ///   which ride the case-sensitive `--exclude`.
+    static func matchesSourceOrAncestor(
+        pattern: String,
+        sourcePath: String,
+        caseInsensitive: Bool
+    ) -> Bool {
+        let patternParts = pattern.split(separator: "/").map(String.init)
+        guard !patternParts.isEmpty else { return false }
+        let sourceParts = sourcePath.split(separator: "/").map(String.init)
+        guard sourceParts.count >= patternParts.count else { return false }
+
+        // Every window of the source's own components, including the ones
+        // above it — `/srv`, `/srv/project.tmp`, `/srv/project.tmp/work`.
+        for end in patternParts.count...sourceParts.count {
+            let window = sourceParts[(end - patternParts.count)..<end]
+            let matched = zip(window, patternParts).allSatisfy { component, part in
+                glob(part, matches: component, caseInsensitive: caseInsensitive)
+            }
+            if matched { return true }
+        }
+        return false
+    }
+
+    /// One path component against one pattern component. `*` and `?` do not
+    /// cross a separator, which is already true here because both sides are
+    /// single components, and `FNM_PATHNAME` keeps it true for a `*` that
+    /// would otherwise span one.
+    private static func glob(_ pattern: String, matches value: String, caseInsensitive: Bool) -> Bool {
+        let left = caseInsensitive ? pattern.lowercased() : pattern
+        let right = caseInsensitive ? value.lowercased() : value
+        return left.withCString { patternC in
+            right.withCString { valueC in
+                fnmatch(patternC, valueC, FNM_PATHNAME) == 0
+            }
+        }
     }
 }
 
@@ -1183,6 +1251,13 @@ public struct GlobalExcludeStore: Sendable {
                 throw LockFailure(path: url.path, operation: "read", errnoValue: errno)
             }
             if count == 0 { break }
+            // Enforced as the bytes arrive, not only by the `fstat` above:
+            // another process can append after that check, and a fast
+            // enough writer would otherwise keep this loop — and every
+            // command waiting behind it — going indefinitely.
+            guard data.count + count <= Int(Self.maximumSettingsFileSize) else {
+                throw LockFailure(path: url.path, operation: "size check", errnoValue: 0)
+            }
             data.append(contentsOf: buffer[0..<count])
         }
         return data
@@ -1370,7 +1445,28 @@ public struct GlobalExcludeStore: Sendable {
     ///   error — an absent file is the documented default state.
     @discardableResult
     public func removeSettings() throws -> Bool {
+        try removeSettings(ifUnchangedFrom: nil, compare: false)
+    }
+
+    /// Removes the file only if it still fingerprints to `expected`.
+    ///
+    /// The lock keeps two writers from interleaving; it does not stop a
+    /// *lost update*. An editor that loaded, then sat open while
+    /// `excludes disable …` wrote a newly disabled group, would delete that
+    /// edit outright — silently re-enabling the group and dropping the paths
+    /// the other editor meant to protect. Same reasoning as
+    /// ``save(_:ifUnchangedFrom:)``, and the comparison happens under the
+    /// same lock as the unlink.
+    @discardableResult
+    public func removeSettings(ifUnchangedFrom expected: String?) throws -> Bool {
+        try removeSettings(ifUnchangedFrom: expected, compare: true)
+    }
+
+    private func removeSettings(ifUnchangedFrom expected: String?, compare: Bool) throws -> Bool {
         try withWriteLock {
+            if compare, try strictFingerprint() != expected {
+                throw GlobalExcludeError.staleWrite(path: paths.globalExcludesFile.path)
+            }
             // `entryExists`, for the same reason `loadFingerprinted()` uses
             // it: a dangling symlink is something to remove, not an absent
             // file. Reporting "already at the built-in defaults" and leaving

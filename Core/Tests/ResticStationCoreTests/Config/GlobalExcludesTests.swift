@@ -84,6 +84,17 @@ import Testing
         ]
         for group in GlobalExcludeCatalog.groups {
             for pattern in group.patterns.map(\.pattern) where !pattern.contains("/") {
+                // A glob is allowed here **only because**
+                // `GlobalExcludeAncestorSafety` makes it safe, not because
+                // it is inherently safe. `*.tmp` matches a directory called
+                // `project.tmp` exactly as happily as a file called
+                // `draft.tmp` — verified against restic 0.18.1, where a
+                // source at `/srv/project.tmp/work` backed up with
+                // `--iexclude '*.tmp'` produced an empty snapshot. The
+                // engine drops any pattern that would swallow a source, so
+                // the residual risk is gone; this test still bars a *bare
+                // literal* nobody has vetted, because those are the ones a
+                // reader of the catalogue would assume are fine.
                 let isSelfEvident = pattern.hasPrefix(".") || pattern.contains("*")
                 #expect(
                     isSelfEvident || allowedBareNames.contains(pattern),
@@ -94,6 +105,69 @@ import Testing
                 )
             }
         }
+    }
+
+    /// The ancestor hazard, closed in the engine rather than by judgement.
+    ///
+    /// Two catalogue-level rules were tried first and both were wrong: a
+    /// denylist of dangerous names, which missed `Pods`, and an allowlist
+    /// that exempted globs, which missed that `*.tmp` matches a directory.
+    /// The case below is the one verified against restic 0.18.1 — a source
+    /// at `/srv/project.tmp/work` with `--iexclude '*.tmp'` produced
+    /// `total_files_processed: 0`.
+    @Test func aPatternThatWouldSwallowASourceIsHeldBack() {
+        let plan = GlobalExcludePlan(
+            patterns: ["*.tmp", "node_modules"], excludeCaches: false
+        )
+        let set = BackupSet(
+            id: UUID(), name: "Work", sources: ["/srv/project.tmp/work"],
+            schedule: .daily(hour: 2, minute: 30),
+            destinations: [Destination(id: UUID(), label: "P", repoURL: "/repo", isPrimary: true)]
+        )
+        // `*.tmp` matches the `project.tmp` ancestor and would empty the
+        // snapshot; `node_modules` matches nothing above the source.
+        #expect(set.globalBackupExcludes(applying: plan) == ["node_modules"])
+        #expect(set.globalExcludesHeldBackForSources(applying: plan) == ["*.tmp"])
+
+        // A source that does not sit under such a directory keeps both.
+        let safe = BackupSet(
+            id: UUID(), name: "Work", sources: ["/srv/project/work"],
+            schedule: .daily(hour: 2, minute: 30),
+            destinations: [Destination(id: UUID(), label: "P", repoURL: "/repo", isPrimary: true)]
+        )
+        #expect(safe.globalBackupExcludes(applying: plan) == ["*.tmp", "node_modules"])
+        #expect(safe.globalExcludesHeldBackForSources(applying: plan).isEmpty)
+    }
+
+    /// The matcher itself: the catalogue is matched case-insensitively
+    /// (`--iexclude`) and this host's own patterns are not (`--exclude`), so
+    /// the guard has to honour both.
+    @Test func theAncestorCheckMatchesWholeComponentsAndHonoursCase() {
+        func matches(_ pattern: String, _ path: String, caseInsensitive: Bool = true) -> Bool {
+            GlobalExcludeAncestorSafety.matchesSourceOrAncestor(
+                pattern: pattern, sourcePath: path, caseInsensitive: caseInsensitive
+            )
+        }
+        // The source itself, and every directory above it.
+        #expect(matches("work", "/srv/project/work"))
+        #expect(matches("project", "/srv/project/work"))
+        #expect(matches("srv", "/srv/project/work"))
+        // A multi-component pattern must match consecutive components.
+        #expect(matches("srv/project", "/srv/project/work"))
+        #expect(!matches("srv/work", "/srv/project/work"))
+        // A partial component is not a match.
+        #expect(!matches("proj", "/srv/project/work"))
+        // A `*` component matches one component, so `srv/*` really does
+        // match the `/srv/project` ancestor — and must, or the source under
+        // it would be swallowed.
+        #expect(matches("srv/*", "/srv/project/work"))
+        // But it does not span separators: `srv/*/work` needs exactly one
+        // component between them, so it misses `/srv/a/b/work`.
+        #expect(!matches("srv/*/work", "/srv/a/b/work"))
+        #expect(matches("srv/*/work", "/srv/a/work"))
+        // Case follows the flag the pattern will ride.
+        #expect(matches("PROJECT", "/srv/project/work"))
+        #expect(!matches("PROJECT", "/srv/project/work", caseInsensitive: false))
     }
 
     @Test func noPatternIsListedTwiceAcrossTheCatalogue() {
