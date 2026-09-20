@@ -222,7 +222,7 @@ The list has three parts, and each lives where its scope actually is:
 ```json
 {
   "version": 1,
-  "catalogVersion": 4,
+  "catalogVersion": 5,
   "enabled": true,
   "excludeCaches": true,
   "excludeLargerThan": null,
@@ -247,7 +247,7 @@ The comparison and the write it guards are **one critical section**, held across
 
 Every caller that read the file first must pass the fingerprint it read. A save that re-read the file to supply its own would compare it against itself and overwrite anything written since the load; `ExcludesCLIContext.Loaded` carries the two together so a subcommand cannot separate them.
 
-**An absent file is a defined state** — the built-in defaults, unmodified — so the file is never auto-created. **A present but unusable file is fatal to `backup`**: a decode error, an unknown group id, a blank `extraPatterns` entry or a newer `version` refuses the backup with a reason rather than falling back to the defaults. The direction of the failure is why. Falling back would apply *more* exclusions than a host that had turned groups off, so every run afterwards would silently skip directories someone had deliberately kept — an under-backup nobody discovers until a restore. An unknown group id is refused for exactly the same reason: "disable this group" is a request to back up more, and quietly ignoring a typo leaves a person believing a directory is protected.
+**An absent file is a defined state** — the built-in defaults, unmodified — so the file is never auto-created. "Absent" means *no directory entry*, tested with `lstat` rather than `FileManager.fileExists(atPath:)`, which follows symlinks: a **dangling symlink** at the settings path is a present entry whose target is missing, and answering "no file here" for it would fall back to the defaults exactly when a host's real settings are unavailable. It reads as unreadable instead, and `excludes reset` removes the entry rather than reporting there was nothing to remove. **A present but unusable file is fatal to `backup`**: a decode error, an unknown group id, a blank `extraPatterns` entry or a newer `version` refuses the backup with a reason rather than falling back to the defaults. The direction of the failure is why. Falling back would apply *more* exclusions than a host that had turned groups off, so every run afterwards would silently skip directories someone had deliberately kept — an under-backup nobody discovers until a restore. An unknown group id is refused for exactly the same reason: "disable this group" is a request to back up more, and quietly ignoring a typo leaves a person believing a directory is protected.
 
 **Fatal to `backup`, and to nothing else.** The exclusion list reaches exactly one operation (§How it reaches restic), so exactly one operation refuses on it. `restore`, `unlock`, `probe-repo`, `purge`, `check`, `init-secondary` and `status` keep working on a host whose `global-excludes.json` has a typo in it — putting a mistyped exclusion file between someone and their data in an emergency would be a worse failure than the one being guarded against. The refusal is raised in the engine, per set, and a set with `usesGlobalExcludes: false` is not refused at all. It is reported as an *infrastructure* failure rather than a misconfiguration so a scheduled `tick` exits non-zero: a tick that printed the fault and exited 0 is the silent-stoppage shape of issue #110.
 
@@ -286,7 +286,8 @@ There is no `windows` scope, because Restic Station has no Windows build and a s
 | `container-engines` | **off** | Docker Desktop, OrbStack, colima, podman and Lima machine storage. Off because these roots hold named volumes and writable container state as well as images: a database living in a volume exists nowhere else, and unlike an image no registry has a copy. A host whose volumes are backed up another way turns it on with `excludes enable container-engines`. |
 | `virtual-machine-images` | **off** | Parallels, VMware, VirtualBox, UTM, QEMU and Vagrant disk images and suspended state. Off because, unlike a container image, a VM someone built by hand may exist nowhere else. |
 | `installers-and-disk-images` | **off** | `.dmg`, `.iso`, `.pkg`, `.msi`, sparse and Time Machine bundles. Off because an image you built yourself may exist nowhere else. |
-| `game-and-media-libraries` | on | Installed Steam/Epic/GOG/Battle.net games and a Plex server's generated metadata. Every byte comes back from a re-download or a re-scan, and a game library is routinely the largest thing on the disk. Save data is not in it. |
+| `game-and-media-caches` | on | A launcher's download staging and shader caches, and a Plex server's generated artwork and metadata. Re-downloaded or rebuilt by a re-scan; no installed game, save or mod is in it. |
+| `game-installs` | **off** | Steam, Epic, GOG and Battle.net installation roots — routinely the largest thing on the disk. Off because plenty of games keep saves, configuration and manually installed mods beside the executable, and a re-download restores the game without them. The caches beside them stay on by default. |
 
 `excludes show` prints the catalogue this build carries, which groups apply here, and the exact resolved pattern list; `excludes show --patterns` adds every individual pattern. That command — not this table — is the authority for what a given build excludes.
 
@@ -316,7 +317,7 @@ This is a per-*set* policy meeting a per-*host* list, which is why the split liv
 
 `backup` receives two exclusion blocks, split by **matching rule rather than by origin**. The case-sensitive `--exclude` block carries the set's own `effectiveBackupExcludes` (its `excludes` followed by its `purgeExcludes`) and then this host's `extraPatterns`, because `excludes add` documents those as ordinary restic `--exclude` patterns — folding them into the catalogue's block would make `*.TMP` also drop `draft.tmp`, silently excluding more than was asked for. The case-insensitive `--iexclude` block carries the catalogue, via `BackupSet.globalBackupExcludes(applying:)`.
 
-A catalogue pattern the set already names **exactly** is dropped so the argv does not repeat itself. The comparison is case-*sensitive*: a set carrying `NODE_MODULES` on `--exclude` does not make the catalogue's `node_modules` redundant, and dropping it would leave ordinary lowercase `node_modules` directories backed up despite global exclusions being on. `--exclude-caches` and `--exclude-larger-than` are added when the host asked for them and the set has not opted out. The full argv order is pinned in `docs/restic-cli.md` §backup.
+**Nothing is dropped from the `--iexclude` block as a duplicate, not even identical text.** The two blocks are different rules: `--exclude node_modules` is case-sensitive and `--iexclude node_modules` is not. A set naming the common lowercase spelling would otherwise suppress the catalogue entry and go on backing up `NODE_MODULES` with global exclusions on and no pattern to point at. The cost of keeping it is one redundant match in the argv. The `--exclude` block *is* deduplicated against the set's own list, because there both halves ride the same case-sensitive flag and identical text really is the same rule. `--exclude-caches` and `--exclude-larger-than` are added when the host asked for them and the set has not opted out. The full argv order is pinned in `docs/restic-cli.md` §backup.
 
 **The list is forward-only and never becomes a purge pattern.** `restic rewrite --forget` sees `BackupSet.purgeExcludes` and nothing else — never `effectiveBackupExcludes`, never the global list. The asymmetry is the whole safety argument: a pattern that arrives because a newer build shipped a better default can keep files out of the *next* snapshot, and can never delete anything already in a repository. Removing a global pattern likewise restores nothing to snapshots written while it applied; that is ordinary forward-only exclude behaviour, not a purge.
 
@@ -940,8 +941,8 @@ This host's global exclusion list (§global-excludes.json). Host-local — `--ma
   "excludeCaches": true,
   "excludeLargerThan": null,
   "platform": "macOS",
-  "catalogVersion": 4,
-  "savedCatalogVersion": 4,
+  "catalogVersion": 5,
+  "savedCatalogVersion": 5,
   "groups": [
     {
       "id": "browser-caches",

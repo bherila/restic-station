@@ -251,17 +251,16 @@ public struct BackupSet: Codable, Equatable, Identifiable, Sendable {
     /// nothing at all when the set has opted out with
     /// ``usesGlobalExcludes``.
     ///
-    /// A pattern the set already names **exactly** is dropped: it would
-    /// reach restic twice with the same effect, and an argv that repeats
-    /// itself is harder to read in a run log.
-    ///
-    /// The comparison is case-*sensitive* on purpose. The set's own list is
-    /// matched case-sensitively (`--exclude`) while the catalogue is matched
-    /// case-insensitively (`--iexclude`), so a set carrying `NODE_MODULES`
-    /// does **not** make the catalogue's `node_modules` redundant —
-    /// dropping it there would leave ordinary lowercase `node_modules`
-    /// directories backed up despite global exclusions being on. Only
-    /// identical strings are genuinely the same rule.
+    /// **Nothing is dropped as a duplicate.** An earlier revision filtered
+    /// out a catalogue pattern the set already named exactly, to keep the
+    /// argv from repeating itself. That was wrong in the direction that
+    /// loses data: the two blocks are not the same rule even for identical
+    /// text, because `--exclude node_modules` is case-sensitive and
+    /// `--iexclude node_modules` is not. A set naming the common lowercase
+    /// spelling would therefore have suppressed the catalogue entry and
+    /// gone on backing up `NODE_MODULES`, with global exclusions on and
+    /// nothing to point at. A tidier run log is not worth that; the
+    /// duplicate is handed to restic and costs one redundant match.
     ///
     /// **The global list is forward-only and never becomes a purge
     /// pattern.** `purgeExcludes` is the only list `rewrite --forget` ever
@@ -271,7 +270,6 @@ public struct BackupSet: Codable, Equatable, Identifiable, Sendable {
     /// default must never delete anything already in a repository.
     public func globalBackupExcludes(applying plan: GlobalExcludePlan) -> [String] {
         guard usesGlobalExcludes else { return [] }
-        let own = Set(effectiveBackupExcludes)
         // A set that has asked to *download* its online-only files wants the
         // real contents of everything a sync client has evicted, so the
         // catalogue's cloud-placeholder patterns are dropped for it. Applying
@@ -279,10 +277,9 @@ public struct BackupSet: Codable, Equatable, Identifiable, Sendable {
         // exist from a snapshot the operator has been told is complete —
         // exactly the silent under-backup the rest of this file exists to
         // prevent. Every other set still gets them.
-        let catalogue = onlineOnlyFiles == .download
+        return onlineOnlyFiles == .download
             ? plan.patterns
             : plan.patterns + plan.cloudPlaceholderPatterns
-        return catalogue.filter { !own.contains($0) }
     }
 
     /// This host's own ``GlobalExcludeSettings/extraPatterns`` for `backup`'s
@@ -291,6 +288,11 @@ public struct BackupSet: Codable, Equatable, Identifiable, Sendable {
     ///
     /// They join the set's list rather than the catalogue's because that is
     /// the matching rule `excludes add` documents for them.
+    ///
+    /// An exact duplicate *is* dropped here, unlike the catalogue block
+    /// above, and for the reason that block cannot: both lists reach restic
+    /// on the same case-sensitive `--exclude`, so identical text really is
+    /// the same rule and repeating it changes nothing.
     public func hostBackupExcludes(applying plan: GlobalExcludePlan) -> [String] {
         guard usesGlobalExcludes else { return [] }
         let own = Set(effectiveBackupExcludes)

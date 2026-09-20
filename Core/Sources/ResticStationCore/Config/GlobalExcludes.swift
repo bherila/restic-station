@@ -1,5 +1,13 @@
 import Foundation
 
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#endif
+
 // MARK: - GlobalExcludePlatform
 
 /// The platforms a catalogue pattern can apply on.
@@ -209,7 +217,7 @@ public enum GlobalExcludeCatalog {
     /// never heard of is an error (see ``GlobalExcludeError/unknownGroup``),
     /// and a group added after the file was written takes its built-in
     /// default.
-    public static let version = 4
+    public static let version = 5
 
     /// The catalogue, in the order its patterns reach argv.
     public static let groups: [GlobalExcludeGroup] = [
@@ -503,22 +511,34 @@ public enum GlobalExcludeCatalog {
             ]
         ),
         GlobalExcludeGroup(
-            id: "game-and-media-libraries",
-            title: "Game installs and media server data",
-            summary: "Installed Steam/Epic/GOG games and a Plex server's generated metadata — "
-                + "hundreds of gigabytes that a re-download or a re-scan rebuilds. Save data is "
-                + "not in here.",
+            id: "game-and-media-caches",
+            title: "Game and media server caches",
+            summary: "A game launcher's download staging and shader caches, and a Plex server's "
+                + "generated artwork and metadata. All of it is re-downloaded or rebuilt by a "
+                + "re-scan; none of it is an installed game, a save or a mod.",
             patterns: [
-                "Steam/steamapps/common",
                 "Steam/steamapps/downloading",
                 "Steam/steamapps/shadercache",
                 "Steam/appcache",
-                "Epic Games",
-                "GOG Galaxy/Games",
-                "Battle.net",
                 "Plex Media Server/Cache",
                 "Plex Media Server/Media",
                 "Plex Media Server/Metadata",
+            ]
+        ),
+        GlobalExcludeGroup(
+            id: "game-installs",
+            title: "Installed game libraries",
+            summary: "Steam, Epic, GOG and Battle.net installation roots — routinely hundreds of "
+                + "gigabytes. Off by default: plenty of games keep saves, configuration and "
+                + "manually installed mods beside the executable, and a re-download restores the "
+                + "game without them. Turn it on with `excludes enable game-installs` once you "
+                + "know your saves and mods live elsewhere.",
+            enabledByDefault: false,
+            patterns: [
+                "Steam/steamapps/common",
+                "Epic Games",
+                "GOG Galaxy/Games",
+                "Battle.net",
             ]
         ),
         GlobalExcludeGroup(
@@ -1014,7 +1034,7 @@ public struct GlobalExcludeStore: Sendable {
     /// ``save(_:ifUnchangedFrom:)`` and a concurrent edit is refused rather
     /// than silently overwritten.
     public func loadFingerprinted() throws -> (settings: GlobalExcludeSettings, fingerprint: String?) {
-        guard FileManager.default.fileExists(atPath: paths.globalExcludesFile.path) else {
+        guard Self.entryExists(at: paths.globalExcludesFile) else {
             return (.default, nil)
         }
         let settings: GlobalExcludeSettings
@@ -1030,6 +1050,25 @@ public struct GlobalExcludeStore: Sendable {
         }
         try settings.validate()
         return (settings, Self.fingerprint(of: data))
+    }
+
+    /// Whether the settings path has a directory entry of its own.
+    ///
+    /// `lstat`, not `FileManager.fileExists(atPath:)`, because that follows
+    /// symlinks: a **dangling** symlink at `global-excludes.json` — a
+    /// managed target that is temporarily absent, a broken deployment — has
+    /// an entry but no target, so `fileExists` answers `false` and the
+    /// settings silently read as ``GlobalExcludeSettings/default``.
+    ///
+    /// That is the fail-closed hole this whole file exists to avoid, in its
+    /// most dangerous direction: a host whose unavailable settings had a
+    /// group *disabled* would pick the built-in default back up, and the
+    /// next backup would skip paths the operator had deliberately kept.
+    /// With the entry seen, the read that follows fails and the error says
+    /// so (`docs/data-model.md` §global-excludes.json).
+    static func entryExists(at url: URL) -> Bool {
+        var info = stat()
+        return lstat(url.path, &info) == 0
     }
 
     /// The byte fingerprint of whatever is on disk right now, or `nil` when
@@ -1146,7 +1185,11 @@ public struct GlobalExcludeStore: Sendable {
     @discardableResult
     public func removeSettings() throws -> Bool {
         try withWriteLock {
-            guard FileManager.default.fileExists(atPath: paths.globalExcludesFile.path) else {
+            // `entryExists`, for the same reason `loadFingerprinted()` uses
+            // it: a dangling symlink is something to remove, not an absent
+            // file. Reporting "already at the built-in defaults" and leaving
+            // the entry there would mean the very next load refuses.
+            guard Self.entryExists(at: paths.globalExcludesFile) else {
                 return false
             }
             try FileManager.default.removeItem(at: paths.globalExcludesFile)

@@ -101,15 +101,39 @@ import Testing
     }
 
     /// The groups that are off by default, and the one reason they are: each
-    /// can hold the only copy of something. A VM image, a downloaded-but-
-    /// no-longer-downloadable installer, and — the third — a container
-    /// engine's data root, which holds named volumes and writable container
-    /// state as well as images: no registry has a copy of the database in a
-    /// volume. A change here is a change to what an upgrade silently stops
-    /// backing up, so it must be deliberate enough to edit a test for.
+    /// can hold the only copy of something. A VM image and a
+    /// no-longer-downloadable installer; a container engine's data root,
+    /// which holds named volumes and writable container state as well as
+    /// images, so no registry has a copy of the database in a volume; and a
+    /// game installation root, where plenty of titles keep saves,
+    /// configuration and manually installed mods beside the executable — a
+    /// re-download brings the game back without them. A change here is a
+    /// change to what an upgrade silently stops backing up, so it must be
+    /// deliberate enough to edit a test for.
     @Test func theOffByDefaultGroupsAreTheOnesThatCanHoldAnOnlyCopy() {
         let off = GlobalExcludeCatalog.groups.filter { !$0.enabledByDefault }.map(\.id)
-        #expect(off == ["container-engines", "virtual-machine-images", "installers-and-disk-images"])
+        #expect(
+            off == [
+                "container-engines", "game-installs",
+                "virtual-machine-images", "installers-and-disk-images",
+            ]
+        )
+    }
+
+    /// The split that keeps the on-by-default half honest: a launcher's
+    /// caches are regenerable and stay on, while the installation roots
+    /// they sit beside are the opt-in group. An install-root pattern that
+    /// drifted back into the caches group would silently stop backing up
+    /// modded games on every host that upgrades.
+    @Test func theGameCachesGroupNamesNoInstallationRoot() throws {
+        let caches = try #require(GlobalExcludeCatalog.group(id: "game-and-media-caches"))
+        let installs = try #require(GlobalExcludeCatalog.group(id: "game-installs"))
+        #expect(caches.enabledByDefault)
+        #expect(!installs.enabledByDefault)
+        for root in installs.patterns.map(\.pattern) {
+            #expect(!caches.patterns.map(\.pattern).contains(root))
+        }
+        #expect(!caches.patterns.map(\.pattern).contains("Steam/steamapps/common"))
     }
 
     /// A VM's disk images are skipped; the few kilobytes that describe the
@@ -417,6 +441,35 @@ import Testing
         }
     }
 
+    /// A **dangling symlink** at the settings path is a present entry, not
+    /// an absent file, and must refuse for the same reason a corrupt file
+    /// does.
+    ///
+    /// `FileManager.fileExists(atPath:)` follows symlinks, so a managed
+    /// target that is temporarily away answered "no file here" and the host
+    /// silently fell back to the built-in defaults — re-enabling any group
+    /// the missing settings had turned off, and skipping paths the operator
+    /// had deliberately kept, on every run afterwards.
+    @Test func aDanglingSymlinkRefusesInsteadOfReadingAsAbsent() throws {
+        try withPaths { paths in
+            try paths.ensureDirectories()
+            let absent = paths.root.appendingPathComponent("not-there.json", isDirectory: false)
+            try FileManager.default.createSymbolicLink(
+                at: paths.globalExcludesFile, withDestinationURL: absent
+            )
+            // The premise: the old check really does read this as absent.
+            #expect(!FileManager.default.fileExists(atPath: paths.globalExcludesFile.path))
+            #expect(throws: GlobalExcludeError.self) {
+                try GlobalExcludeStore(paths: paths).load()
+            }
+            // And `reset` removes the entry rather than reporting that there
+            // was nothing to remove — otherwise the very next load refuses.
+            #expect(try GlobalExcludeStore(paths: paths).removeSettings() == true)
+            let back = try GlobalExcludeStore(paths: paths).load()
+            #expect(back == .default)
+        }
+    }
+
     /// The reason for the refusal must survive `CLIFailure`'s 500-character
     /// cap, whatever the decoder put in the underlying string.
     ///
@@ -646,18 +699,34 @@ import Testing
         #expect(set.excludeLargerThan(applying: plan) == "10G")
     }
 
-    /// Dropped only on an **exact** match.
+    /// Nothing is dropped from the catalogue block as a duplicate, not even
+    /// identical text.
     ///
-    /// The set's list is case-sensitive (`--exclude`) and the catalogue's is
-    /// not (`--iexclude`), so a set carrying `NODE_MODULES` does not make
-    /// the catalogue's `node_modules` redundant — dropping it there would
-    /// leave ordinary lowercase `node_modules` directories backed up
-    /// despite global exclusions being on.
-    @Test func onlyAnExactDuplicateIsDroppedFromTheGlobalBlock() {
-        #expect(makeSet(excludes: ["node_modules"]).globalBackupExcludes(applying: plan) == [".cache"])
+    /// The two blocks are different *rules*: `--exclude node_modules` is
+    /// case-sensitive and `--iexclude node_modules` is not. Dropping the
+    /// catalogue entry because the set names the common lowercase spelling
+    /// would leave `NODE_MODULES` backed up with global exclusions on and
+    /// no pattern to point at — which is why an earlier exact-match filter
+    /// was removed rather than narrowed. The cost is one redundant match in
+    /// the argv.
+    @Test func theCatalogueBlockIsNeverThinnedByTheSetsOwnList() {
+        for spelling in ["node_modules", "NODE_MODULES"] {
+            #expect(
+                makeSet(excludes: [spelling]).globalBackupExcludes(applying: plan)
+                    == ["node_modules", ".cache"]
+            )
+        }
+    }
+
+    /// The host block *is* deduplicated, because there both lists ride the
+    /// same case-sensitive `--exclude` and identical text really is the
+    /// same rule.
+    @Test func theHostBlockDropsAnExactDuplicateOfTheSetsOwnPattern() {
+        let hostPlan = GlobalExcludePlan(
+            patterns: [], hostPatterns: ["/srv/scratch", "*.iso"], excludeCaches: false
+        )
         #expect(
-            makeSet(excludes: ["NODE_MODULES"]).globalBackupExcludes(applying: plan)
-                == ["node_modules", ".cache"]
+            makeSet(excludes: ["/srv/scratch"]).hostBackupExcludes(applying: hostPlan) == ["*.iso"]
         )
     }
 

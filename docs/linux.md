@@ -438,9 +438,12 @@ platform: linux
 [ ] container-engines — Container engine storage
       …
       4 pattern(s) here  (+5 for the other platform)
-[x] game-and-media-libraries — Game installs and media server data
+[x] game-and-media-caches — Game and media server caches
       …
-      10 pattern(s) here
+      6 pattern(s) here
+[ ] game-installs — Installed game libraries
+      …
+      4 pattern(s) here
 [ ] virtual-machine-images — Virtual machine disk images
       …
       25 pattern(s) here  (+1 for the other platform)
@@ -450,7 +453,7 @@ platform: linux
 
 this machine adds no patterns of its own
 
-149 pattern(s) reach every backup set that has not set usesGlobalExcludes: false
+145 pattern(s) reach every backup set that has not set usesGlobalExcludes: false
 of those, 1 match cloud placeholder stubs (*.icloud) and are held back for a set whose onlineOnlyFiles is "download"
 ```
 

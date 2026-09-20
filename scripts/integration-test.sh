@@ -952,6 +952,10 @@ assert_global_excludes() {
         # volumes and writable container state, not just registry images,
         # so a database living in a volume would have no other copy.
         ".docker/desktop/settings.json"
+        # `game-installs` is off by default for the same reason — a save or
+        # a hand-installed mod beside the executable comes back from no
+        # re-download. The caches beside it are still skipped, below.
+        "Games/Steam/steamapps/common/Skyrim/Data/mod.esp"
     )
     # Must be skipped. `notes.TMP` is the case variant only `--iexclude`
     # catches; `Render Files` is the `**` case.
@@ -969,6 +973,9 @@ assert_global_excludes() {
         "Movies/Proj.imovielibrary/Event1/Render Files/clip.mov"
         ".vscode/extensions/ms-python/x.js"
         "Documents/report.docx.icloud"
+        # `game-and-media-caches` stays on: this is staging for a download,
+        # not an installed game.
+        "Games/Steam/steamapps/downloading/12345/chunk.bin"
     )
 
     # The catalogue is platform-scoped (`docs/data-model.md` §Platform
