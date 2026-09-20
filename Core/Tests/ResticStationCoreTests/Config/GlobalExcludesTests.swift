@@ -366,6 +366,27 @@ import Testing
         }
     }
 
+    /// The reason for the refusal must survive `CLIFailure`'s 500-character
+    /// cap, whatever the decoder put in the underlying string.
+    ///
+    /// This is a real regression, not a hypothetical: the reason used to sit
+    /// *after* the `DecodingError` dump, and macOS spells that error far
+    /// more verbosely than Linux does, so the macOS CI job saw a truncated
+    /// message with the only explanatory sentence cut off. The underlying
+    /// text is foreign and unbounded, so it goes last.
+    @Test func theRefusalReasonSurvivesTheMessageCap() {
+        let noisy = String(repeating: "NSDebugDescription=the given data was not valid JSON; ", count: 40)
+        let error = GlobalExcludeError.unreadable(path: "/very/long/path/global-excludes.json", underlying: noisy)
+        let message = CLIFailure.configInvalid(underlying: error).message
+
+        #expect(message.count <= CLIFailure.messageCharacterLimit)
+        #expect(
+            message.contains("will not fall back to the built-in defaults"),
+            "the refusal must still say why it did not use the defaults: \(message)"
+        )
+        #expect(message.contains("global-excludes.json"))
+    }
+
     @Test func aFileNamingAnUnknownGroupRefusesOnLoad() throws {
         try withPaths { paths in
             try paths.ensureDirectories()

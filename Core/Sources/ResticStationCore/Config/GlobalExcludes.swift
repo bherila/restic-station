@@ -810,6 +810,13 @@ public enum GlobalExcludeError: Error, Equatable, Sendable, CustomStringConverti
     /// rather than "fall back to the defaults": the defaults exclude *more*
     /// than a host that had turned groups off, so guessing here silently
     /// stops backing up directories someone had deliberately kept.
+    ///
+    /// ``underlying`` is a foreign, unbounded string — a `DecodingError`'s
+    /// description, whose macOS spelling is far longer than Linux's — so it
+    /// goes **last** in the rendered message. `CLIFailure` caps a message at
+    /// 500 characters, and the reason for the refusal has to be the part
+    /// that survives the cap; putting it after the dump meant macOS
+    /// truncated away the only sentence that explained the failure.
     case unreadable(path: String, underlying: String)
 
     public var description: String {
@@ -827,8 +834,9 @@ public enum GlobalExcludeError: Error, Equatable, Sendable, CustomStringConverti
             return "global-excludes.json has an invalid excludeLargerThan \"\(size)\" — it must be "
                 + "a number optionally followed by k, m, g or t (for example \"500m\" or \"10G\")"
         case .unreadable(let path, let underlying):
-            return "could not read \(path): \(underlying). Refusing to fall back to the built-in "
-                + "defaults, which may exclude more than this host had configured"
+            return "could not read \(path), and this build will not fall back to the built-in "
+                + "defaults, which may exclude more than this host had configured — fix or remove "
+                + "the file. Underlying error: \(underlying)"
         }
     }
 }

@@ -309,7 +309,10 @@ RESTIC_STATION_DATA_DIR="$EXCLUDES_DATA" run_helper excludes show --json
 expect_rc 1
 jq -e '.ok == false and .error.code == "config_invalid"' "$OUT_FILE" >/dev/null \
     || fail "an unusable global-excludes.json must be config_invalid, not a silent default"
-grep -q "Refusing to fall back to the built-in defaults" "$OUT_FILE" \
+# The reason must survive CLIFailure's 500-character cap on either
+# platform — macOS spells a DecodingError far more verbosely than Linux,
+# which is exactly how this assertion caught a truncated message.
+grep -q "will not fall back to the built-in defaults" "$OUT_FILE" \
     || fail "the refusal must say why it is not falling back"
 ok "an unusable global-excludes.json fails closed with config_invalid"
 
