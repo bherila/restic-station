@@ -317,6 +317,17 @@ public struct AppPaths: Equatable, Sendable {
     }
 
     /// Serializes Linux file-secret read-modify-write operations.
+    /// `locks/global-excludes.lock` — serialises the compare-and-swap in
+    /// ``GlobalExcludeStore/save(_:ifUnchangedFrom:)`` with the rename it
+    /// guards, and the fixed `.tmp` file both writers would otherwise share.
+    ///
+    /// Separate from ``configLockFile`` because contention on one must not
+    /// be reported as the other: `global-excludes.json` is host-local state
+    /// and nothing that edits it touches `config.json`.
+    public var globalExcludesLockFile: URL {
+        locksDir.appendingPathComponent("global-excludes.lock", isDirectory: false)
+    }
+
     public var secretsLockFile: URL {
         locksDir.appendingPathComponent("secrets.lock", isDirectory: false)
     }

@@ -948,6 +948,10 @@ assert_global_excludes() {
         "Pictures/My Library.photoslibrary/originals/0/IMG_1.heic"
         "Pictures/My Library.photoslibrary/database/Photos.sqlite"
         "VMs/ubuntu.vmx"
+        # `container-engines` is off by default: these roots hold named
+        # volumes and writable container state, not just registry images,
+        # so a database living in a volume would have no other copy.
+        ".docker/desktop/settings.json"
     )
     # Must be skipped. `notes.TMP` is the case variant only `--iexclude`
     # catches; `Render Files` is the `**` case.

@@ -84,13 +84,32 @@ import Testing
         }
     }
 
-    /// The one group that is off by default, and the reason it is: a VM
-    /// image can be the only copy of something. A change here is a change
-    /// to what an upgrade silently stops backing up, so it must be
-    /// deliberate enough to edit a test for.
+    /// Exactly one pattern is a *cloud placeholder*, and it is the one a
+    /// sync client leaves behind for a file it has evicted.
+    ///
+    /// Pinned as a set rather than checked loosely because the flag changes
+    /// who gets the pattern: a set with `onlineOnlyFiles: "download"` does
+    /// not. Marking an ordinary pattern by accident would quietly stop
+    /// excluding it for those sets; forgetting to mark a new placeholder
+    /// pattern would quietly excluded it from them.
+    @Test func exactlyTheCloudPlaceholderStubsAreMarkedAsSuch() {
+        let marked = GlobalExcludeCatalog.groups
+            .flatMap(\.patterns)
+            .filter(\.isCloudPlaceholder)
+            .map(\.pattern)
+        #expect(marked == ["*.icloud"])
+    }
+
+    /// The groups that are off by default, and the one reason they are: each
+    /// can hold the only copy of something. A VM image, a downloaded-but-
+    /// no-longer-downloadable installer, and — the third — a container
+    /// engine's data root, which holds named volumes and writable container
+    /// state as well as images: no registry has a copy of the database in a
+    /// volume. A change here is a change to what an upgrade silently stops
+    /// backing up, so it must be deliberate enough to edit a test for.
     @Test func theOffByDefaultGroupsAreTheOnesThatCanHoldAnOnlyCopy() {
         let off = GlobalExcludeCatalog.groups.filter { !$0.enabledByDefault }.map(\.id)
-        #expect(off == ["virtual-machine-images", "installers-and-disk-images"])
+        #expect(off == ["container-engines", "virtual-machine-images", "installers-and-disk-images"])
     }
 
     /// A VM's disk images are skipped; the few kilobytes that describe the
@@ -338,6 +357,28 @@ import Testing
         try body(AppPaths(root: root))
     }
 
+    @Test func theDefaultPlanSplitsPlaceholdersOutWithoutLosingThem() {
+        let plan = GlobalExcludeSettings.default.plan(on: .macOS)
+        #expect(plan.cloudPlaceholderPatterns == ["*.icloud"])
+        #expect(!plan.patterns.contains("*.icloud"))
+        // Still reported, still applied to nearly every set — the split is
+        // about *which* sets receive them, not about dropping them.
+        #expect(plan.allPatterns.contains("*.icloud"))
+        #expect(!plan.isEmpty)
+    }
+
+    /// A plan whose only content is a placeholder pattern is not empty —
+    /// `isEmpty` decides whether the backup log says "none configured on
+    /// this machine", and saying that while patterns were applied is how a
+    /// missing file becomes unexplainable.
+    @Test func aPlanOfOnlyPlaceholdersIsNotEmpty() {
+        let plan = GlobalExcludePlan(
+            patterns: [], cloudPlaceholderPatterns: ["*.icloud"], excludeCaches: false
+        )
+        #expect(!plan.isEmpty)
+        #expect(GlobalExcludePlan.none.isEmpty)
+    }
+
     @Test func anAbsentFileIsTheDocumentedDefaultAndIsNotCreated() throws {
         try withPaths { paths in
             let store = GlobalExcludeStore(paths: paths)
@@ -467,6 +508,94 @@ import Testing
         }
     }
 
+    /// The compare-and-swap has to be *atomic with the rename*, or it is
+    /// not a compare-and-swap: two writers can fingerprint the same bytes,
+    /// both pass, and the loser's decision is gone. They also share one
+    /// fixed `.tmp` filename, so one can rename the other's half-written
+    /// bytes into place.
+    ///
+    /// `flock()` is per open file description, so a second `FileLock` on the
+    /// same path genuinely contends even inside this process — which is what
+    /// makes this a valid test of the cross-process behaviour.
+    @Test func aSaveWhileAnotherWriterHoldsTheLockIsRefusedNotInterleaved() throws {
+        try withPaths { paths in
+            let store = GlobalExcludeStore(paths: paths)
+            var settings = GlobalExcludeSettings()
+            settings.extraPatterns = ["/one"]
+            try store.save(settings)
+
+            try paths.ensureDirectories()
+            let peer = FileLock(path: paths.globalExcludesLockFile, trustedRoot: paths.root)
+            #expect(peer.acquire() == .acquired)
+
+            var blocked = settings
+            blocked.extraPatterns = ["/two"]
+            #expect(throws: GlobalExcludeError.self) { try store.save(blocked) }
+            // Nothing was written behind the holder's back.
+            let unchanged = try store.load()
+            #expect(unchanged.extraPatterns == ["/one"])
+
+            // And the lock is not left poisoned once the peer lets go.
+            peer.release()
+            try store.save(blocked)
+            let after = try store.load()
+            #expect(after.extraPatterns == ["/two"])
+        }
+    }
+
+    /// An editor that stays open must not re-read the file to learn its own
+    /// fingerprint: a writer that got in between the rename and that read
+    /// would hand it *their* fingerprint, and its next save would pass the
+    /// check and overwrite them. `save` returns what it wrote, from inside
+    /// the lock.
+    @Test func saveReturnsTheFingerprintItWroteSoAnEditorNeverReReadsTheFile() throws {
+        try withPaths { paths in
+            let store = GlobalExcludeStore(paths: paths)
+            var settings = GlobalExcludeSettings()
+            settings.extraPatterns = ["/one"]
+            let first = try store.save(settings, ifUnchangedFrom: nil)
+            #expect(first == store.currentFingerprint())
+
+            // The returned value is accepted as-is by the next save.
+            settings.extraPatterns = ["/one", "/two"]
+            let second = try store.save(settings, ifUnchangedFrom: first)
+            #expect(second != first)
+            #expect(second == store.currentFingerprint())
+
+            // The superseded one is not.
+            settings.extraPatterns = ["/three"]
+            #expect(throws: GlobalExcludeError.self) {
+                try store.save(settings, ifUnchangedFrom: first)
+            }
+        }
+    }
+
+    /// `excludes reset` goes through the store so its existence check and
+    /// its unlink share the write lock with every other writer: a save that
+    /// landed between them would leave a host carrying an adjustment after
+    /// being told it is back on the built-in defaults.
+    @Test func removingTheSettingsTakesTheSameWriteLockAsASave() throws {
+        try withPaths { paths in
+            let store = GlobalExcludeStore(paths: paths)
+            #expect(try store.removeSettings() == false)
+
+            var settings = GlobalExcludeSettings()
+            settings.extraPatterns = ["/one"]
+            try store.save(settings)
+
+            let peer = FileLock(path: paths.globalExcludesLockFile, trustedRoot: paths.root)
+            #expect(peer.acquire() == .acquired)
+            #expect(throws: GlobalExcludeError.self) { try store.removeSettings() }
+            #expect(FileManager.default.fileExists(atPath: paths.globalExcludesFile.path))
+
+            peer.release()
+            #expect(try store.removeSettings() == true)
+            #expect(!FileManager.default.fileExists(atPath: paths.globalExcludesFile.path))
+            let back = try store.load()
+            #expect(back == .default)
+        }
+    }
+
     @Test func savingAnInvalidSettingsValueWritesNothing() throws {
         try withPaths { paths in
             let store = GlobalExcludeStore(paths: paths)
@@ -485,7 +614,8 @@ import Testing
     private func makeSet(
         excludes: [String] = [],
         purgeExcludes: [String] = [],
-        usesGlobalExcludes: Bool = true
+        usesGlobalExcludes: Bool = true,
+        onlineOnlyFiles: OnlineOnlyFiles = .skip
     ) -> BackupSet {
         BackupSet(
             id: UUID(),
@@ -493,6 +623,7 @@ import Testing
             sources: ["/Users/user/proj"],
             excludes: excludes,
             purgeExcludes: purgeExcludes,
+            onlineOnlyFiles: onlineOnlyFiles,
             usesGlobalExcludes: usesGlobalExcludes,
             schedule: .daily(hour: 2, minute: 30),
             destinations: [
@@ -536,6 +667,42 @@ import Testing
         #expect(set.globalBackupExcludes(applying: plan).isEmpty)
         #expect(!set.excludesCaches(applying: plan))
         #expect(set.excludeLargerThan(applying: plan) == nil)
+    }
+
+    /// A set that has asked to *download* its online-only files wants their
+    /// real contents in the snapshot. Excluding the placeholder stubs there
+    /// would remove the last filesystem trace of those files from a snapshot
+    /// the operator has been told is complete — the silent under-backup this
+    /// whole feature is built to avoid. Every other set still skips them.
+    @Test func aSetThatDownloadsOnlineOnlyFilesKeepsTheCloudPlaceholders() {
+        let plan = GlobalExcludePlan(
+            patterns: ["node_modules"],
+            cloudPlaceholderPatterns: ["*.icloud"],
+            excludeCaches: true
+        )
+        #expect(
+            makeSet(onlineOnlyFiles: .skip).globalBackupExcludes(applying: plan)
+                == ["node_modules", "*.icloud"]
+        )
+        #expect(
+            makeSet(onlineOnlyFiles: .download).globalBackupExcludes(applying: plan)
+                == ["node_modules"]
+        )
+        // The policy governs the placeholders and nothing else: a
+        // downloading set still gets `--exclude-caches`, the size cap and
+        // this host's own patterns.
+        #expect(makeSet(onlineOnlyFiles: .download).excludesCaches(applying: plan))
+    }
+
+    /// Opting out still wins over everything, in either direction.
+    @Test func anOptedOutSetGetsNoPlaceholdersEitherWay() {
+        let plan = GlobalExcludePlan(
+            patterns: ["node_modules"], cloudPlaceholderPatterns: ["*.icloud"], excludeCaches: true
+        )
+        for policy in OnlineOnlyFiles.allCases {
+            let set = makeSet(usesGlobalExcludes: false, onlineOnlyFiles: policy)
+            #expect(set.globalBackupExcludes(applying: plan).isEmpty)
+        }
     }
 
     @Test func anEmptyPlanLeavesTheArgvExactlyAsItWasBeforeTheFeature() {

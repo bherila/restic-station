@@ -243,6 +243,24 @@ grep -q "not present — built-in defaults" "$OUT_FILE" \
     || fail "excludes show must not create global-excludes.json"
 ok "excludes show reports the built-in defaults without creating a settings file"
 
+# The groups that are off by default are exactly the ones whose contents
+# can be the only copy of something: a hand-built VM, an installer that is
+# no longer downloadable, and a container engine's data root (which holds
+# named volumes and writable container state, not just registry images).
+RESTIC_STATION_DATA_DIR="$EXCLUDES_DATA" run_helper excludes show --json
+expect_rc 0
+OFF_BY_DEFAULT="$(jq -r '[.data.groups[] | select(.enabledByDefault == false) | .id] | join(",")' "$OUT_FILE")"
+[[ "$OFF_BY_DEFAULT" == "container-engines,virtual-machine-images,installers-and-disk-images" ]] \
+    || fail "the off-by-default groups changed to: $OFF_BY_DEFAULT"
+# Cloud placeholder stubs are reported in both places: in `patterns`,
+# which is what nearly every set receives, and in their own list, which is
+# the subset a set with onlineOnlyFiles: "download" does not get.
+jq -e '.data.cloudPlaceholderPatterns == ["*.icloud"]' "$OUT_FILE" >/dev/null \
+    || fail "excludes show --json must report the cloud-placeholder subset"
+jq -e '[.data.patterns[] | select(. == "*.icloud")] | length == 1' "$OUT_FILE" >/dev/null \
+    || fail "a cloud-placeholder pattern must still appear in the resolved catalogue list"
+ok "the off-by-default groups and the cloud-placeholder subset are reported as documented"
+
 RESTIC_STATION_DATA_DIR="$EXCLUDES_DATA" run_helper excludes disable browser-caches
 expect_rc 0
 RESTIC_STATION_DATA_DIR="$EXCLUDES_DATA" run_helper excludes add '/srv/scratch'
@@ -1080,6 +1098,30 @@ else
         || fail "probe-repo --json omitted the reason key instead of encoding null"
     ok "probe-repo --json maps every outcome to a success envelope and its exit code"
 fi
+
+# An unusable global-excludes.json is fatal to `backup` and to nothing
+# else. The exclusion list never reaches probe-repo, restore, unlock,
+# purge, check or init, so a typo in a host-local settings file must not
+# stand between someone and their data in an emergency.
+#
+# Asserted on whichever host this runs: with no usable restic the answer is
+# restic_not_found, with one it is an ordinary probe outcome. Either way
+# the one answer that would be a regression is config_invalid.
+cp "$HEALTHY/config.json" "$WORK/healthy-config.bak"
+printf '{ not json' > "$HEALTHY/global-excludes.json"
+RESTIC_STATION_DATA_DIR="$HEALTHY" run_helper_split probe-repo --set "$SET_ID" --dest "$PRIMARY_ID" --json
+if [[ "$(jq -r '.ok' "$OUT_FILE")" == "false" ]]; then
+    BROKEN_CODE="$(jq -r '.error.code' "$OUT_FILE")"
+    [[ "$BROKEN_CODE" != "config_invalid" ]] \
+        || fail "an unusable global-excludes.json must not refuse probe-repo"
+fi
+if grep -q "global-excludes.json" "$OUT_FILE"; then
+    fail "probe-repo must not mention the global exclusion list at all"
+fi
+rm -f "$HEALTHY/global-excludes.json"
+cmp -s "$HEALTHY/config.json" "$WORK/healthy-config.bak" \
+    || fail "the broken-excludes probe disturbed the healthy config"
+ok "an unusable global-excludes.json refuses backups only — probe-repo is unaffected"
 
 RESTIC_STATION_DATA_DIR="$HEALTHY" run_helper_split config validate --json
 [[ "$(jq -r '.data.nothingRunsHere' "$OUT_FILE")" == "false" ]] \

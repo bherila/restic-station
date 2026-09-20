@@ -48,10 +48,27 @@ public enum GlobalExcludePlatform: String, Equatable, Sendable, CaseIterable, Co
 public struct GlobalExcludePattern: Equatable, Sendable, ExpressibleByStringLiteral {
     public let pattern: String
     public let platforms: Set<GlobalExcludePlatform>
+    /// Whether this pattern names a *cloud placeholder* rather than a file
+    /// with contents — a stub a sync client leaves behind for something it
+    /// has evicted.
+    ///
+    /// Such a pattern is skipped for a set whose
+    /// ``BackupSet/onlineOnlyFiles`` is ``BackupSet/OnlineOnlyFiles/download``.
+    /// That policy exists to say "materialise the evicted files, I want the
+    /// real contents in the snapshot"; dropping the placeholders under it
+    /// would remove the only filesystem record those files exist while the
+    /// operator believes the snapshot is complete. Every other set still
+    /// skips them, which is the whole point of the pattern.
+    public let isCloudPlaceholder: Bool
 
-    public init(_ pattern: String, platforms: Set<GlobalExcludePlatform> = Set(GlobalExcludePlatform.allCases)) {
+    public init(
+        _ pattern: String,
+        platforms: Set<GlobalExcludePlatform> = Set(GlobalExcludePlatform.allCases),
+        isCloudPlaceholder: Bool = false
+    ) {
         self.pattern = pattern
         self.platforms = platforms
+        self.isCloudPlaceholder = isCloudPlaceholder
     }
 
     /// A bare string in the catalogue means "every platform".
@@ -69,6 +86,13 @@ public struct GlobalExcludePattern: Equatable, Sendable, ExpressibleByStringLite
     /// Linux-only spellings of the browser and container profile roots.
     public static func linux(_ pattern: String) -> GlobalExcludePattern {
         GlobalExcludePattern(pattern, platforms: [.linux])
+    }
+
+    /// A stub left behind for an evicted cloud file, which a set that has
+    /// asked to download online-only files must keep. See
+    /// ``isCloudPlaceholder``.
+    public static func cloudPlaceholder(_ pattern: String) -> GlobalExcludePattern {
+        GlobalExcludePattern(pattern, isCloudPlaceholder: true)
     }
 
     public func applies(on platform: GlobalExcludePlatform) -> Bool {
@@ -185,7 +209,7 @@ public enum GlobalExcludeCatalog {
     /// never heard of is an error (see ``GlobalExcludeError/unknownGroup``),
     /// and a group added after the file was written takes its built-in
     /// default.
-    public static let version = 3
+    public static let version = 4
 
     /// The catalogue, in the order its patterns reach argv.
     public static let groups: [GlobalExcludeGroup] = [
@@ -270,8 +294,11 @@ public enum GlobalExcludeCatalog {
                 // Zero-byte iCloud placeholders. `--exclude-cloud-files`
                 // (restic 0.19+) is the real answer; this catches the same
                 // files on an older restic, where they would otherwise be
-                // backed up as empty stubs.
-                "*.icloud",
+                // backed up as empty stubs. Marked as a placeholder so a set
+                // that has asked to *download* its online-only files keeps
+                // them: under that policy the stub is the only record the
+                // file exists at all.
+                .cloudPlaceholder("*.icloud"),
                 // Backing up a backup.
                 "backups.backupdb",
                 ".MobileBackups",
@@ -457,9 +484,12 @@ public enum GlobalExcludeCatalog {
         GlobalExcludeGroup(
             id: "container-engines",
             title: "Container engine storage",
-            summary: "Docker, OrbStack, colima and podman machine data. Images come back from a "
-                + "registry and the engine rebuilds its store; the disk images here are "
-                + "routinely tens of gigabytes.",
+            summary: "Docker, OrbStack, colima and podman machine data — routinely tens of "
+                + "gigabytes. Off by default: these roots hold named volumes and writable "
+                + "container state as well as images, and a database living in a volume exists "
+                + "nowhere else. Turn it on with `excludes enable container-engines` once you "
+                + "know your volumes are backed up another way.",
+            enabledByDefault: false,
             patterns: [
                 .mac("Library/Containers/com.docker.docker/Data"),
                 .mac("Library/Group Containers/group.com.docker"),
@@ -583,6 +613,15 @@ public struct GlobalExcludePlan: Equatable, Sendable {
     /// rather than something a person typed: `Library/Caches` should also
     /// skip `library/caches`.
     public let patterns: [String]
+    /// Catalogue patterns that name a *cloud placeholder* rather than a file
+    /// with contents, also handed over as **`--iexclude`** — but only to a
+    /// set that is not downloading its online-only files.
+    ///
+    /// Kept out of ``patterns`` rather than filtered back out of it at the
+    /// call site, so a set's policy decides whether they apply and no caller
+    /// can apply them by forgetting to ask. See
+    /// ``GlobalExcludePattern/isCloudPlaceholder``.
+    public let cloudPlaceholderPatterns: [String]
     /// This host's own ``GlobalExcludeSettings/extraPatterns``, handed over
     /// as **`--exclude`** — case-sensitive.
     ///
@@ -606,11 +645,13 @@ public struct GlobalExcludePlan: Equatable, Sendable {
 
     public init(
         patterns: [String],
+        cloudPlaceholderPatterns: [String] = [],
         hostPatterns: [String] = [],
         excludeCaches: Bool,
         excludeLargerThan: String? = nil
     ) {
         self.patterns = patterns
+        self.cloudPlaceholderPatterns = cloudPlaceholderPatterns
         self.hostPatterns = hostPatterns
         self.excludeCaches = excludeCaches
         self.excludeLargerThan = excludeLargerThan
@@ -622,13 +663,18 @@ public struct GlobalExcludePlan: Equatable, Sendable {
     public static let none = GlobalExcludePlan(patterns: [], excludeCaches: false)
 
     public var isEmpty: Bool {
-        patterns.isEmpty && hostPatterns.isEmpty && !excludeCaches && excludeLargerThan == nil
+        patterns.isEmpty && cloudPlaceholderPatterns.isEmpty && hostPatterns.isEmpty
+            && !excludeCaches && excludeLargerThan == nil
     }
 
     /// Every pattern the plan contributes, in argv order, for logging and
     /// for reports that do not care which flag carries which.
+    ///
+    /// Includes ``cloudPlaceholderPatterns``, which most sets do apply; the
+    /// one that has opted into downloading its online-only files gets a
+    /// shorter list, and its run log says so.
     public var allPatterns: [String] {
-        patterns + hostPatterns
+        patterns + cloudPlaceholderPatterns + hostPatterns
     }
 }
 
@@ -761,8 +807,11 @@ public struct GlobalExcludeSettings: Codable, Equatable, Sendable {
     public func plan(on platform: GlobalExcludePlatform = .current) -> GlobalExcludePlan {
         guard enabled else { return .none }
         var seen = Set<String>()
-        let catalogue = enabledGroups.flatMap { $0.patterns(on: platform) }
-            .filter { seen.insert($0).inserted }
+        let applicable = enabledGroups
+            .flatMap { $0.patterns }
+            .filter { $0.applies(on: platform) && seen.insert($0.pattern).inserted }
+        let catalogue = applicable.filter { !$0.isCloudPlaceholder }.map(\.pattern)
+        let placeholders = applicable.filter(\.isCloudPlaceholder).map(\.pattern)
         // `extraPatterns` stay in their own list: they reach restic through
         // the case-sensitive `--exclude`, and deduplicating them against the
         // case-insensitive catalogue would be comparing two different
@@ -770,6 +819,7 @@ public struct GlobalExcludeSettings: Codable, Equatable, Sendable {
         let host = extraPatterns.filter { seen.insert($0).inserted }
         return GlobalExcludePlan(
             patterns: catalogue,
+            cloudPlaceholderPatterns: placeholders,
             hostPatterns: host,
             excludeCaches: excludeCaches,
             excludeLargerThan: excludeLargerThan
@@ -858,6 +908,16 @@ public enum GlobalExcludeError: Error, Equatable, Sendable, CustomStringConverti
     /// that survives the cap; putting it after the dump meant macOS
     /// truncated away the only sentence that explained the failure.
     case unreadable(path: String, underlying: String)
+    /// Another process holds the write lock. Refused rather than waited out
+    /// for the same reason `config.json` refuses: the caller is a person at
+    /// a terminal or a Settings pane, and "try that again" is a better
+    /// answer than an edit that blocks for an unbounded time.
+    case writeLockBusy(path: String)
+    /// The write lock itself could not be taken — an unwritable `locks/`,
+    /// a symlink planted at the lock path, a lock file owned by someone
+    /// else. Never treated as "no contention, go ahead": without the lock
+    /// the compare-and-swap below is not atomic with the rename it guards.
+    case writeLockUnusable(String)
 
     public var description: String {
         switch self {
@@ -884,6 +944,12 @@ public enum GlobalExcludeError: Error, Equatable, Sendable, CustomStringConverti
             return "global-excludes.json is unreadable and this build will not fall back to the "
                 + "built-in defaults, which may exclude more than this host had configured — fix "
                 + "or remove the file. Path: \(path). Underlying error: \(underlying)"
+        case .writeLockBusy(let path):
+            return "another Restic Station process is editing the global exclusion list right now "
+                + "(\(path)) — try again"
+        case .writeLockUnusable(let failure):
+            return "refusing to write global-excludes.json: its write lock is unusable, so a "
+                + "concurrent edit could not be detected — \(failure)"
         }
     }
 }
@@ -970,6 +1036,13 @@ public struct GlobalExcludeStore: Sendable {
     /// the file is absent. Deliberately over the raw bytes rather than the
     /// decoded value: a rewrite that decodes identically still means another
     /// writer was here.
+    ///
+    /// **Not** the value to pass to ``save(_:ifUnchangedFrom:)``. That has
+    /// to be the fingerprint the caller *loaded*, from
+    /// ``loadFingerprinted()`` or from the previous save's return value;
+    /// reading it here instead compares the file against itself and lets
+    /// the save overwrite whatever landed since. This exists for a caller
+    /// that wants to observe the file, and for the check inside the lock.
     public func currentFingerprint() -> String? {
         guard let data = try? Data(contentsOf: paths.globalExcludesFile) else { return nil }
         return Self.fingerprint(of: data)
@@ -991,8 +1064,22 @@ public struct GlobalExcludeStore: Sendable {
     /// the data directory if needed. `catalogVersion` is stamped with the
     /// catalog this build carries, since that is what the decisions in the
     /// written file were made against.
-    public func save(_ settings: GlobalExcludeSettings) throws {
-        try save(settings, ifUnchangedFrom: currentFingerprint())
+    ///
+    /// This overload replaces whatever is already there — still atomically
+    /// and still under the write lock, but with **no** compare-and-swap.
+    ///
+    /// For a caller that is *declaring* the contents rather than editing a
+    /// value it loaded: a test fixture, a first-run seed, an import.
+    /// Anything that read the file first must call
+    /// ``save(_:ifUnchangedFrom:)`` with the fingerprint
+    /// ``loadFingerprinted()`` returned. Re-reading the file here to supply
+    /// its own "expected" value would make the check vacuous — it would
+    /// compare the file against itself as of this instant and happily
+    /// overwrite an edit made since the load, which is the lost update the
+    /// compare-and-swap exists to prevent.
+    @discardableResult
+    public func save(_ settings: GlobalExcludeSettings) throws -> String {
+        try withWriteLock { try writeLocked(settings, precondition: .overwrite) }
     }
 
     /// Compare-and-swap: writes only if the on-disk bytes still fingerprint
@@ -1004,17 +1091,91 @@ public struct GlobalExcludeStore: Sendable {
     /// terminal is erased by the pane's next toggle — and the decision most
     /// likely to be lost is a *disabled* group, which silently re-enables
     /// it and drops paths the operator meant to keep.
-    public func save(_ settings: GlobalExcludeSettings, ifUnchangedFrom expected: String?) throws {
+    /// - Returns: the fingerprint of the bytes just written, so an editor
+    ///   that stays open can hold it for its *next* save. Reading it back
+    ///   from the file afterwards would be a second race: a writer that got
+    ///   in between the rename and that read would hand this editor the
+    ///   other process's fingerprint, and its next save would pass the check
+    ///   and overwrite them.
+    @discardableResult
+    public func save(_ settings: GlobalExcludeSettings, ifUnchangedFrom expected: String?) throws -> String {
+        try withWriteLock { try writeLocked(settings, precondition: .unchangedFrom(expected)) }
+    }
+
+    /// What ``writeLocked(_:precondition:)`` requires of the file it is
+    /// about to replace. Spelled as a type rather than an optional
+    /// fingerprint because `nil` already means something here — "there was
+    /// no file when I loaded" — and an unconditional write must not be
+    /// confused with that.
+    private enum WritePrecondition {
+        case overwrite
+        case unchangedFrom(String?)
+    }
+
+    /// The compare-and-swap and the write it guards, both inside the lock.
+    ///
+    /// `.unchangedFrom(nil)` means "there was no file when I loaded", and an
+    /// intervening writer is still caught: a file that exists now does not
+    /// fingerprint to `nil`.
+    private func writeLocked(
+        _ settings: GlobalExcludeSettings,
+        precondition: WritePrecondition
+    ) throws -> String {
         var updated = settings
         updated.version = GlobalExcludeSettings.currentVersion
         updated.catalogVersion = GlobalExcludeCatalog.version
         try updated.validate()
-        guard currentFingerprint() == expected else {
+        if case .unchangedFrom(let expected) = precondition, currentFingerprint() != expected {
             throw GlobalExcludeError.staleWrite(path: paths.globalExcludesFile.path)
         }
-        try paths.ensureDirectories()
         let data = try ConfigStore.makeEncoder().encode(updated)
         try data.write(to: tempFile)
         try AtomicFile.rename(from: tempFile, to: paths.globalExcludesFile)
+        return Self.fingerprint(of: data)
+    }
+
+    /// Deletes `global-excludes.json`, returning to the built-in defaults.
+    ///
+    /// Under the same write lock as a save, for the same reason: without it
+    /// a concurrent `excludes add` can rename its file into place between
+    /// the existence check and the unlink, leaving a host that was told it
+    /// is back on the defaults carrying an adjustment nobody meant to keep.
+    ///
+    /// - Returns: `false` when there was nothing to remove, which is not an
+    ///   error — an absent file is the documented default state.
+    @discardableResult
+    public func removeSettings() throws -> Bool {
+        try withWriteLock {
+            guard FileManager.default.fileExists(atPath: paths.globalExcludesFile.path) else {
+                return false
+            }
+            try FileManager.default.removeItem(at: paths.globalExcludesFile)
+            return true
+        }
+    }
+
+    /// Serialises the whole read-compare-write-rename sequence across
+    /// processes, the way `ConfigStore` serialises a config save.
+    ///
+    /// Without it the compare-and-swap is not a compare-and-swap: two
+    /// `excludes disable` runs can both fingerprint the same bytes, both
+    /// pass, and the loser's decision is gone — and since the decision most
+    /// worth keeping is a *disabled* group, losing it silently re-enables
+    /// that group and every later backup skips paths someone meant to keep.
+    /// The fixed `.tmp` filename is a second reason: two unsynchronised
+    /// writers share it, so one can rename the other's half-written bytes
+    /// into place.
+    private func withWriteLock<T>(_ body: () throws -> T) throws -> T {
+        try paths.ensureDirectories()
+        let lock = FileLock(path: paths.globalExcludesLockFile, trustedRoot: paths.root)
+        switch lock.acquire() {
+        case .acquired:
+            defer { lock.release() }
+            return try body()
+        case .busy:
+            throw GlobalExcludeError.writeLockBusy(path: paths.globalExcludesLockFile.path)
+        case .failed(let failure):
+            throw GlobalExcludeError.writeLockUnusable("\(failure)")
+        }
     }
 }

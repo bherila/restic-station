@@ -258,7 +258,12 @@ struct GlobalExcludeReportTests {
         // A size cap is opt-in; the default must never carry one.
         #expect(report.excludeLargerThan == nil)
         #expect(report.groups.count == GlobalExcludeCatalog.groups.count)
-        #expect(report.patterns == GlobalExcludeSettings.default.plan(on: .macOS).patterns)
+        // `allPatterns` rather than `patterns`: the report's top-level list
+        // is what an applying set receives, which includes the
+        // cloud-placeholder patterns (the default carries no host patterns
+        // of its own, so the two differ by exactly those).
+        #expect(report.patterns == GlobalExcludeSettings.default.plan(on: .macOS).allPatterns)
+        #expect(report.cloudPlaceholderPatterns == ["*.icloud"])
         #expect(report.platform == "macOS")
         // Not "written against catalogue 0" — there is no file to have been
         // written against an older one.
@@ -283,6 +288,27 @@ struct GlobalExcludeReportTests {
         let lines = report.humanLines(includePatterns: false).joined(separator: "\n")
         #expect(lines.contains("[ ] browser-caches"))
         #expect(lines.contains("(changed on this machine)"))
+    }
+
+    /// The placeholder patterns are reported in both places for a reason:
+    /// `patterns` is what nearly every set gets, and
+    /// `cloudPlaceholderPatterns` is the subset that a set with
+    /// `onlineOnlyFiles: "download"` does not — see `docs/data-model.md`
+    /// §Cloud placeholders. A script reading only `patterns` still sees the
+    /// common case correctly.
+    @Test("cloud placeholders appear in patterns and in their own list, and the human output says why")
+    func cloudPlaceholdersAreReportedTwice() throws {
+        let report = GlobalExcludeReport.build(settings: .default, path: path, exists: false, platform: .macOS)
+        #expect(report.cloudPlaceholderPatterns == ["*.icloud"])
+        #expect(report.patterns.contains("*.icloud"))
+
+        let data = try ConfigStore.makeEncoder().encode(report)
+        let object = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        #expect(object?["cloudPlaceholderPatterns"] as? [String] == ["*.icloud"])
+
+        let lines = report.humanLines(includePatterns: false).joined(separator: "\n")
+        #expect(lines.contains("match cloud placeholder stubs (*.icloud)"))
+        #expect(lines.contains("onlineOnlyFiles is \"download\""))
     }
 
     /// A build that added groups since the file was written must say so:

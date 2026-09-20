@@ -36,6 +36,13 @@ struct ExclusionsSettings: View {
         }
         .formStyle(.grouped)
         .task { pane.load(paths: model.paths) }
+        // One observer, on the Form, rather than one per text field.
+        // Attaching it inside the extra-patterns `ForEach` meant it existed
+        // only while this machine had at least one pattern of its own — so
+        // on the overwhelmingly common host with none, typing a size cap and
+        // tabbing away committed nothing and the old value stayed on disk.
+        // The `Form` is always here, and focus is pane-wide state anyway.
+        .onChange(of: focusedField) { _, _ in pane.commitEdits() }
         .onDisappear { pane.commitEdits() }
     }
 
@@ -135,7 +142,6 @@ struct ExclusionsSettings: View {
                     TextField("Pattern", text: extraPatternBinding(at: index), prompt: Text("*.iso"))
                         .labelsHidden()
                         .onSubmit { pane.commitEdits() }
-                        .onChange(of: focusedField) { _, _ in pane.commitEdits() }
                         .focused($focusedField, equals: .extraPattern(index))
                     Button {
                         pane.removeExtraPattern(at: index)
@@ -173,7 +179,11 @@ struct ExclusionsSettings: View {
                     .multilineTextAlignment(.trailing)
             }
             LabeledContent("Patterns applied") {
-                Text(String(pane.settings.plan().patterns.count))
+                // `allPatterns`, not `patterns`: this machine's own
+                // additions and the cloud-placeholder patterns are applied
+                // too, and a count that left them out disagreed with both
+                // `excludes show` and the run log.
+                Text(String(pane.settings.plan().allPatterns.count))
             }
             Button("Restore Built-in Defaults") { pane.restoreDefaults() }
         } footer: {
@@ -369,14 +379,11 @@ final class ExclusionsSettingsModel: ObservableObject {
         let file = store.paths.globalExcludesFile
         settings = .default
         hasPendingEdit = false
-        guard FileManager.default.fileExists(atPath: file.path) else {
-            fingerprint = nil
-            saveFailure = nil
-            loadFailure = nil
-            return
-        }
         do {
-            try FileManager.default.removeItem(at: file)
+            // Through the store so the existence check and the unlink share
+            // the write lock with every other writer; an absent file is not
+            // an error, it is the default state.
+            try store.removeSettings()
             fingerprint = nil
             saveFailure = nil
             loadFailure = nil
@@ -408,8 +415,12 @@ final class ExclusionsSettingsModel: ObservableObject {
             return
         }
         do {
-            try store.save(persistable, ifUnchangedFrom: fingerprint)
-            fingerprint = store.currentFingerprint()
+            // The fingerprint the write itself produced, taken under the
+            // write lock. Re-reading the file here would race a writer that
+            // got in between the rename and the read, and this pane's next
+            // save would then pass its compare-and-swap against *their*
+            // bytes and overwrite them.
+            fingerprint = try store.save(persistable, ifUnchangedFrom: fingerprint)
             saveFailure = nil
             loadFailure = nil
         } catch let error as GlobalExcludeError {
@@ -475,7 +486,8 @@ enum ExclusionsCopy {
     static let loadFailureFooter =
         "Backups refuse to run until this is fixed, rather than falling back to the built-in "
         + "defaults: the defaults may skip more than you had configured, which would quietly stop "
-        + "backing up directories you had kept."
+        + "backing up directories you had kept. Restoring, unlocking and checking a repository are "
+        + "unaffected — this list only ever applies to a backup."
 
     /// Counted for **this** platform: the catalogue is scoped, so a macOS
     /// host never applies the Linux spellings and vice versa

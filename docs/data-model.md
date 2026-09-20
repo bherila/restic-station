@@ -222,7 +222,7 @@ The list has three parts, and each lives where its scope actually is:
 ```json
 {
   "version": 1,
-  "catalogVersion": 3,
+  "catalogVersion": 4,
   "enabled": true,
   "excludeCaches": true,
   "excludeLargerThan": null,
@@ -239,9 +239,17 @@ The list has three parts, and each lives where its scope actually is:
 - **`groups`** — **only the decisions that differ from the built-in default.** A group absent from this map takes `GlobalExcludeGroup.enabledByDefault`, which is what lets a later build add a group and have it take effect without rewriting anyone's file.
 - **`extraPatterns`** — this host's own patterns. Unlike the catalogue these may be absolute, and they reach restic as case-sensitive `--exclude` rather than `--iexclude`, because a person typed them and meant the case they typed.
 
-**Writes are compare-and-swap.** `GlobalExcludeStore.loadFingerprinted()` returns the byte fingerprint the caller read, and `save(_:ifUnchangedFrom:)` refuses if the file has changed since — the same rule `config.json` saves follow (§config.json), for a sharper reason. The Settings pane holds this file while it is open, so without it a `restic-station excludes disable …` run in a terminal is erased by the pane's next toggle; and the decision most likely to be lost is a *disabled* group, which silently re-enables it and drops paths the operator meant to keep. The app surfaces the refusal and reloads rather than overwriting.
+**Writes are compare-and-swap, under a lock.** `GlobalExcludeStore.loadFingerprinted()` returns the byte fingerprint the caller read, and `save(_:ifUnchangedFrom:)` refuses if the file has changed since — the same rule `config.json` saves follow (§config.json), for a sharper reason. The Settings pane holds this file while it is open, so without it a `restic-station excludes disable …` run in a terminal is erased by the pane's next toggle; and the decision most likely to be lost is a *disabled* group, which silently re-enables it and drops paths the operator meant to keep. The app surfaces the refusal and reloads rather than overwriting.
 
-**An absent file is a defined state** — the built-in defaults, unmodified — so the file is never auto-created. **A present but unusable file is fatal**: a decode error, an unknown group id, a blank `extraPatterns` entry or a newer `version` refuses the run with a reason rather than falling back to the defaults. The direction of the failure is why. Falling back would apply *more* exclusions than a host that had turned groups off, so every run afterwards would silently skip directories someone had deliberately kept — an under-backup nobody discovers until a restore. An unknown group id is refused for exactly the same reason: "disable this group" is a request to back up more, and quietly ignoring a typo leaves a person believing a directory is protected.
+The comparison and the write it guards are **one critical section**, held across `locks/global-excludes.lock` for the whole read-compare-write-rename. Without the lock the compare-and-swap does not do its job: two `excludes` runs can fingerprint the same bytes, both pass, and the loser's decision is gone — and they share one fixed `global-excludes.json.tmp`, so one can rename the other's half-written bytes into place. `save` returns the fingerprint of what it wrote, taken inside the lock, so an editor that stays open never re-reads the file to learn its own fingerprint and never inherits another writer's.
+
+`excludes reset` and the pane's **Restore Built-in Defaults** take the same lock: without it a save can land between the existence check and the unlink, leaving a host carrying an adjustment right after being told it is back on the defaults.
+
+Every caller that read the file first must pass the fingerprint it read. A save that re-read the file to supply its own would compare it against itself and overwrite anything written since the load; `ExcludesCLIContext.Loaded` carries the two together so a subcommand cannot separate them.
+
+**An absent file is a defined state** — the built-in defaults, unmodified — so the file is never auto-created. **A present but unusable file is fatal to `backup`**: a decode error, an unknown group id, a blank `extraPatterns` entry or a newer `version` refuses the backup with a reason rather than falling back to the defaults. The direction of the failure is why. Falling back would apply *more* exclusions than a host that had turned groups off, so every run afterwards would silently skip directories someone had deliberately kept — an under-backup nobody discovers until a restore. An unknown group id is refused for exactly the same reason: "disable this group" is a request to back up more, and quietly ignoring a typo leaves a person believing a directory is protected.
+
+**Fatal to `backup`, and to nothing else.** The exclusion list reaches exactly one operation (§How it reaches restic), so exactly one operation refuses on it. `restore`, `unlock`, `probe-repo`, `purge`, `check`, `init-secondary` and `status` keep working on a host whose `global-excludes.json` has a typo in it — putting a mistyped exclusion file between someone and their data in an emergency would be a worse failure than the one being guarded against. The refusal is raised in the engine, per set, and a set with `usesGlobalExcludes: false` is not refused at all. It is reported as an *infrastructure* failure rather than a misconfiguration so a scheduled `tick` exits non-zero: a tick that printed the fault and exited 0 is the silent-stoppage shape of issue #110.
 
 ### Pattern shape
 
@@ -270,12 +278,12 @@ There is no `windows` scope, because Restic Station has no Windows build and a s
 | id | Default | What it skips |
 |---|---|---|
 | `browser-caches` | on | Cached pages, images, compiled scripts and GPU shaders for the Chromium and Gecko families, plus the same cache directory names inside Electron apps. Bookmarks, history, passwords and profile settings are not in it. |
-| `system-caches` | on | Per-user cache, log and trash directories, the index/metadata sidecars either OS leaves on removable media, iCloud placeholder stubs, and a Time Machine destination or local snapshot store (backing up a backup). |
+| `system-caches` | on | Per-user cache, log and trash directories, the index/metadata sidecars either OS leaves on removable media, iCloud placeholder stubs (but see §Cloud placeholders), and a Time Machine destination or local snapshot store (backing up a backup). |
 | `temporary-files` | on | Editor swap files, partial downloads, crash dumps, anything already named as scratch. |
 | `developer-build-artifacts` | on | Swift, Xcode, Rust, .NET, Node, Python, JVM and CMake output trees, including the hidden framework directories (`.next`, `.nuxt`, `.vercel`, `.turbo`, …) and the architecture-qualified layouts (`bin/x64/Debug`, `target/<triple>/release`). |
 | `package-manager-caches` | on | npm/yarn/pnpm/bun, cargo, Go module, Gradle, Maven, NuGet, pip, Homebrew, CocoaPods, Playwright and Hugging Face caches. |
 | `media-app-caches` | on | Thumbnails, previews and render/analysis files that Photos, Lightroom, Final Cut, iMovie and iTunes rebuild from the originals. |
-| `container-engines` | on | Docker Desktop, OrbStack, colima, podman and Lima machine storage. |
+| `container-engines` | **off** | Docker Desktop, OrbStack, colima, podman and Lima machine storage. Off because these roots hold named volumes and writable container state as well as images: a database living in a volume exists nowhere else, and unlike an image no registry has a copy. A host whose volumes are backed up another way turns it on with `excludes enable container-engines`. |
 | `virtual-machine-images` | **off** | Parallels, VMware, VirtualBox, UTM, QEMU and Vagrant disk images and suspended state. Off because, unlike a container image, a VM someone built by hand may exist nowhere else. |
 | `installers-and-disk-images` | **off** | `.dmg`, `.iso`, `.pkg`, `.msi`, sparse and Time Machine bundles. Off because an image you built yourself may exist nowhere else. |
 | `game-and-media-libraries` | on | Installed Steam/Epic/GOG/Battle.net games and a Plex server's generated metadata. Every byte comes back from a re-download or a re-scan, and a game library is routinely the largest thing on the disk. Save data is not in it. |
@@ -296,6 +304,14 @@ The list above is modelled on [Code42's default exclusions](https://mimecastsupp
 
 `*.vmx`/`*.vmxf` are likewise kept where Code42 drops them: they are the few kilobytes that describe a virtual machine, and a disk image restored without them is harder to revive, not easier.
 
+### Cloud placeholders
+
+`*.icloud` is a *placeholder*: the stub a sync client leaves behind for a file it has evicted from local storage. Skipping it is right for almost every set — the stub has no contents and restoring it restores nothing.
+
+It is wrong for one: a set with `onlineOnlyFiles: "download"` (§config.json) has explicitly asked for its online-only files to be materialised and captured. Applying the placeholder pattern there would remove the last filesystem trace of those files from a snapshot the operator has been told is complete. So the catalogue marks the pattern (`GlobalExcludePattern.isCloudPlaceholder`), the plan carries it in its own list, and `BackupSet.globalBackupExcludes(applying:)` drops it for a downloading set and applies it to every other. `excludes show` reports the same patterns under `cloudPlaceholderPatterns` as well as in `patterns`, and the backup log says when a set had them held back.
+
+This is a per-*set* policy meeting a per-*host* list, which is why the split lives in the plan rather than in the catalogue's group decisions: the same host can back up one set each way.
+
 ### How it reaches restic
 
 `backup` receives two exclusion blocks, split by **matching rule rather than by origin**. The case-sensitive `--exclude` block carries the set's own `effectiveBackupExcludes` (its `excludes` followed by its `purgeExcludes`) and then this host's `extraPatterns`, because `excludes add` documents those as ordinary restic `--exclude` patterns — folding them into the catalogue's block would make `*.TMP` also drop `draft.tmp`, silently excluding more than was asked for. The case-insensitive `--iexclude` block carries the catalogue, via `BackupSet.globalBackupExcludes(applying:)`.
@@ -304,9 +320,9 @@ A catalogue pattern the set already names **exactly** is dropped so the argv doe
 
 **The list is forward-only and never becomes a purge pattern.** `restic rewrite --forget` sees `BackupSet.purgeExcludes` and nothing else — never `effectiveBackupExcludes`, never the global list. The asymmetry is the whole safety argument: a pattern that arrives because a newer build shipped a better default can keep files out of the *next* snapshot, and can never delete anything already in a repository. Removing a global pattern likewise restores nothing to snapshots written while it applied; that is ordinary forward-only exclude behaviour, not a purge.
 
-Resolution happens **once**, where the host-local file is read (`HelperContext.makeTolerant`), and the engine receives a `GlobalExcludePlan` value. Nothing downstream re-reads the file, so a settings edit during a long backup cannot make two children of one run disagree about what was skipped. The value defaults to `GlobalExcludePlan.none`, so a construction site that has not wired it can only ever back up *more* than intended, never less.
+Resolution happens **once**, where the host-local file is read (`HelperContext.makeTolerant`), and the engine receives a `Result<GlobalExcludePlan, Error>`. Nothing downstream re-reads the file, so a settings edit during a long backup cannot make two children of one run disagree about what was skipped. The success value defaults to `GlobalExcludePlan.none`, so a construction site that has not wired it can only ever back up *more* than intended, never less; the failure travels the same way so the refusal happens where the list is consumed, and only there (see above).
 
-Every backup log records one line saying how many patterns applied, or that the set opted out — so "why is this file missing from my snapshot?" is answerable from the run log rather than by working out which build shipped which catalogue.
+Every backup log records one line saying how many patterns applied to *that set* — after the exact-match drop and the cloud-placeholder rule, so the number matches the argv beneath it — or that the set opted out — so "why is this file missing from my snapshot?" is answerable from the run log rather than by working out which build shipped which catalogue.
 
 ### Opting a set out
 
@@ -924,8 +940,8 @@ This host's global exclusion list (§global-excludes.json). Host-local — `--ma
   "excludeCaches": true,
   "excludeLargerThan": null,
   "platform": "macOS",
-  "catalogVersion": 3,
-  "savedCatalogVersion": 3,
+  "catalogVersion": 4,
+  "savedCatalogVersion": 4,
   "groups": [
     {
       "id": "browser-caches",
@@ -938,12 +954,13 @@ This host's global exclusion list (§global-excludes.json). Host-local — `--ma
     }
   ],
   "extraPatterns": [],
-  "patterns": ["Library/Caches/Google/Chrome", "…"],
+  "patterns": ["Library/Caches/Google/Chrome", "…", "*.icloud"],
+  "cloudPlaceholderPatterns": ["*.icloud"],
   "hostPatterns": []
 }
 ```
 
-`platform` names the scope this report resolved (`"macOS"` or `"linux"`), and `groups[].otherPlatformPatternCount` says how many of a group's patterns this host will never apply — see §Platform scoping. `exists: false` means there is no `global-excludes.json` and every value above is the built-in default. `groups[]` is the whole catalogue this build carries, in catalogue order, each with the decision that applies here (`enabled`) beside the built-in one (`enabledByDefault`). `patterns` at the top level is the resolved catalogue — what every applying backup set receives as case-insensitive `--iexclude`, in argv order — so a script never has to re-derive it from the groups. `hostPatterns` is `extraPatterns` as it actually reaches restic: case-sensitive `--exclude`, kept separate precisely so the matching rule is visible (see §How it reaches restic). `savedCatalogVersion` is what the file was last written against, and is `0` for a file written before the key existed; when it is below `catalogVersion`, groups added since then are applying by their own default.
+`platform` names the scope this report resolved (`"macOS"` or `"linux"`), and `groups[].otherPlatformPatternCount` says how many of a group's patterns this host will never apply — see §Platform scoping. `exists: false` means there is no `global-excludes.json` and every value above is the built-in default. `groups[]` is the whole catalogue this build carries, in catalogue order, each with the decision that applies here (`enabled`) beside the built-in one (`enabledByDefault`). `patterns` at the top level is the resolved catalogue — what every applying backup set receives as case-insensitive `--iexclude`, in argv order — so a script never has to re-derive it from the groups. `cloudPlaceholderPatterns` is the subset of `patterns` a set with `onlineOnlyFiles: "download"` does **not** receive — see §Cloud placeholders. `hostPatterns` is `extraPatterns` as it actually reaches restic: case-sensitive `--exclude`, kept separate precisely so the matching rule is visible (see §How it reaches restic). `savedCatalogVersion` is what the file was last written against, and is `0` for a file written before the key existed; when it is below `catalogVersion`, groups added since then are applying by their own default.
 
 Never a secret: `nonSecretEnv` is exactly `Destination.nonSecretEnv` (never the keychain/secrets.json value), and no field here can hold a repository password.
 

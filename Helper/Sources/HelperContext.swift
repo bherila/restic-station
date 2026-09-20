@@ -135,11 +135,16 @@ struct HelperContext {
     /// - Throws: ``CLIFailure`` from ``makeSecretStore(paths:runner:)``,
     ///   which is a misconfigured backend selection — a hard error in every
     ///   caller including `tick`, and one that exited 1 here before it was
-    ///   made throwable — and from an unusable `global-excludes.json`, which
-    ///   is fatal for the same reason: falling back to the built-in defaults
-    ///   would exclude more than a host that had turned groups off, so every
-    ///   run afterwards would silently skip directories someone had
-    ///   deliberately kept (`docs/data-model.md` §global-excludes.json).
+    ///   made throwable.
+    ///
+    ///   An unusable `global-excludes.json` is **not** thrown here. It is
+    ///   fatal, but only to `backup`: the failure is carried into the engine
+    ///   and refuses there (``BackupEngine``'s step 0), so `restore`,
+    ///   `unlock`, `probe`, `purge`, `check` and `init` — none of which the
+    ///   exclusion list ever reaches — keep working on a host whose file has
+    ///   a typo in it. Refusing them too would put a mistyped exclusion file
+    ///   between someone and their data in an emergency, which is a worse
+    ///   failure than the one being guarded against.
     static func makeTolerant(
         paths: AppPaths,
         views: Views,
@@ -151,17 +156,15 @@ struct HelperContext {
         // what was skipped.
         //
         // **Before** the restic search, deliberately. This is a cheap local
-        // read whose failure is a hard error, while discovery can take
-        // seconds and reports a *tolerable* one; doing it the other way
-        // round would report "restic not found" on a host whose real
-        // problem is an unusable global-excludes.json, and would hide the
-        // fault entirely once restic is missing.
-        let globalExcludes: GlobalExcludePlan
-        do {
-            globalExcludes = try GlobalExcludeStore(paths: paths).load().plan()
-        } catch {
-            throw CLIFailure.configInvalid(underlying: error)
-        }
+        // read, while discovery can take seconds; resolving it here also
+        // means the answer — success *or* failure — is fixed before anything
+        // slow happens, rather than depending on when the engine first asks.
+        //
+        // The failure travels as a value rather than a `throw`. Every
+        // command in this process goes through here, but only `backup`
+        // consumes the exclusion list, so only `backup` may refuse on it;
+        // see the `Throws` note above and `BackupEngine`'s step 0.
+        let globalExcludes = Result { try GlobalExcludeStore(paths: paths).load().plan() }
         let resticPath: String
         switch await resolveResticPath(resolved: views.scheduled) {
         case .resolved(let path):

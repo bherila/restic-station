@@ -272,7 +272,17 @@ public struct BackupSet: Codable, Equatable, Identifiable, Sendable {
     public func globalBackupExcludes(applying plan: GlobalExcludePlan) -> [String] {
         guard usesGlobalExcludes else { return [] }
         let own = Set(effectiveBackupExcludes)
-        return plan.patterns.filter { !own.contains($0) }
+        // A set that has asked to *download* its online-only files wants the
+        // real contents of everything a sync client has evicted, so the
+        // catalogue's cloud-placeholder patterns are dropped for it. Applying
+        // them anyway would delete the only filesystem record those files
+        // exist from a snapshot the operator has been told is complete —
+        // exactly the silent under-backup the rest of this file exists to
+        // prevent. Every other set still gets them.
+        let catalogue = onlineOnlyFiles == .download
+            ? plan.patterns
+            : plan.patterns + plan.cloudPlaceholderPatterns
+        return catalogue.filter { !own.contains($0) }
     }
 
     /// This host's own ``GlobalExcludeSettings/extraPatterns`` for `backup`'s
