@@ -420,14 +420,23 @@ struct BackupEngineTests {
     static func backupArgv(
         _ repo: String,
         excludes: [String] = [],
-        excludeCaches: Bool = false
+        globalExcludes: [String] = [],
+        excludeCaches: Bool = false,
+        excludeLargerThan: String? = nil
     ) -> [String] {
         var argv = ["-r", repo, "backup", "--json"]
         if excludeCaches {
             argv.append("--exclude-caches")
         }
+        if let excludeLargerThan {
+            argv += ["--exclude-larger-than", excludeLargerThan]
+        }
         for exclude in excludes {
             argv.append("--exclude")
+            argv.append(exclude)
+        }
+        for exclude in globalExcludes {
+            argv.append("--iexclude")
             argv.append(exclude)
         }
         argv.append(source)
@@ -1519,9 +1528,13 @@ struct BackupEngineTests {
     /// Asserted against `env.resticArgvs` rather than a command the test
     /// builds: the point is that `runSet` threads the plan through, which a
     /// locally constructed `ResticCommand` would not prove.
-    @Test("global excludes: the engine's backup invocation appends them and adds --exclude-caches")
+    @Test("global excludes: the engine's backup invocation adds them as --iexclude, with the caps")
     func engineBackupInvocationCarriesGlobalExcludes() async throws {
-        let plan = GlobalExcludePlan(patterns: ["node_modules", "Library/Caches"], excludeCaches: true)
+        let plan = GlobalExcludePlan(
+            patterns: ["node_modules", "Library/Caches"],
+            excludeCaches: true,
+            excludeLargerThan: "10G"
+        )
         let env = Self.makeEnv(
             script: [],
             retention: nil,
@@ -1531,11 +1544,17 @@ struct BackupEngineTests {
         )
         defer { env.cleanUp() }
 
-        let expectedExcludes = ["*.log", "node_modules", "Library/Caches"]
+        // The set's own list keeps `--exclude`; the catalogue is matched
+        // case-insensitively, so it rides on `--iexclude`.
+        let expected = Self.backupArgv(
+            env.primary.repoURL,
+            excludes: ["*.log"],
+            globalExcludes: ["node_modules", "Library/Caches"],
+            excludeCaches: true,
+            excludeLargerThan: "10G"
+        )
         env.fake.script = Self.resticCall(
-            Self.backupArgv(env.primary.repoURL, excludes: expectedExcludes, excludeCaches: true),
-            dest: Self.primaryId,
-            stdoutLines: Self.backupStream()
+            expected, dest: Self.primaryId, stdoutLines: Self.backupStream()
         )
 
         let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
@@ -1546,19 +1565,22 @@ struct BackupEngineTests {
         }
         #expect(status == .success)
         let backupArgv = try #require(env.resticArgvs.first { $0.contains("backup") })
-        #expect(backupArgv == [Self.resticPath] + Self.backupArgv(
-            env.primary.repoURL, excludes: expectedExcludes, excludeCaches: true
-        ))
+        #expect(backupArgv == [Self.resticPath] + expected)
         // The run log has to answer "why is this file missing?" on its own.
         #expect(env.log(runId: groupId).contains("global excludes: 2 pattern(s)"))
+        #expect(env.log(runId: groupId).contains("--exclude-larger-than 10G"))
     }
 
     /// `usesGlobalExcludes: false` removes the patterns **and**
     /// `--exclude-caches`: a set that exists to archive build output must
     /// not have its output skipped by a tag some tool left behind.
-    @Test("global excludes: an opted-out set gets neither the patterns nor --exclude-caches")
+    @Test("global excludes: an opted-out set gets no --iexclude, no --exclude-caches and no size cap")
     func engineHonoursASetThatOptedOutOfTheGlobalList() async throws {
-        let plan = GlobalExcludePlan(patterns: ["node_modules"], excludeCaches: true)
+        let plan = GlobalExcludePlan(
+            patterns: ["node_modules"],
+            excludeCaches: true,
+            excludeLargerThan: "10G"
+        )
         let env = Self.makeEnv(
             script: [],
             retention: nil,
@@ -1585,6 +1607,8 @@ struct BackupEngineTests {
         let backupArgv = try #require(env.resticArgvs.first { $0.contains("backup") })
         #expect(backupArgv == [Self.resticPath] + Self.backupArgv(env.primary.repoURL, excludes: ["*.log"]))
         #expect(!backupArgv.contains("--exclude-caches"))
+        #expect(!backupArgv.contains("--exclude-larger-than"))
+        #expect(!backupArgv.contains("--iexclude"))
         #expect(!backupArgv.contains("node_modules"))
         #expect(env.log(runId: groupId).contains("global excludes: set opted out"))
     }

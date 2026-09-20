@@ -255,6 +255,8 @@ struct GlobalExcludeReportTests {
         #expect(!report.exists)
         #expect(report.enabled)
         #expect(report.excludeCaches)
+        // A size cap is opt-in; the default must never carry one.
+        #expect(report.excludeLargerThan == nil)
         #expect(report.groups.count == GlobalExcludeCatalog.groups.count)
         #expect(report.patterns == GlobalExcludeSettings.default.plan.patterns)
         // Not "written against catalogue 0" — there is no file to have been
@@ -303,6 +305,26 @@ struct GlobalExcludeReportTests {
 
         #expect(!terse.contains("node_modules"))
         #expect(verbose.contains("node_modules"))
+    }
+
+    /// `null` rather than an omitted key, and the human line says "(no
+    /// cap)" — a `--json` consumer must be able to tell "no cap" from "this
+    /// build has no such field".
+    @Test("the size cap is reported in both modes, capped or not")
+    func theSizeCapIsAlwaysReportedBothWays() throws {
+        var settings = GlobalExcludeSettings()
+        settings.excludeLargerThan = "10G"
+        let capped = GlobalExcludeReport.build(settings: settings, path: path, exists: true)
+        #expect(capped.humanLines(includePatterns: false).contains("--exclude-larger-than: 10G"))
+
+        let uncapped = GlobalExcludeReport.build(settings: .default, path: path, exists: false)
+        #expect(uncapped.humanLines(includePatterns: false).contains("--exclude-larger-than: (no cap)"))
+
+        let object = try JSONSerialization.jsonObject(
+            with: try ConfigStore.makeEncoder().encode(uncapped)
+        ) as? [String: Any]
+        #expect(object?.keys.contains("excludeLargerThan") == true)
+        #expect(object?["excludeLargerThan"] is NSNull)
     }
 
     @Test("the master switch off reports no patterns at all")

@@ -257,6 +257,23 @@ jq -e '[.data.patterns[] | select(. == "/srv/scratch")] | length == 1' "$OUT_FIL
     || fail "the resolved pattern list must include this machine's own pattern"
 ok "excludes disable/add persist, and excludes show --json reports the resolved list"
 
+# The size cap: opt-in, validated when it is set, and liftable again.
+RESTIC_STATION_DATA_DIR="$EXCLUDES_DATA" run_helper excludes set --exclude-larger-than 10G
+expect_rc 0
+RESTIC_STATION_DATA_DIR="$EXCLUDES_DATA" run_helper excludes show --json
+expect_rc 0
+jq -e '.data.excludeLargerThan == "10G"' "$OUT_FILE" >/dev/null \
+    || fail "excludes set --exclude-larger-than did not persist"
+RESTIC_STATION_DATA_DIR="$EXCLUDES_DATA" run_helper excludes set --exclude-larger-than 10GB
+expect_rc 1
+RESTIC_STATION_DATA_DIR="$EXCLUDES_DATA" run_helper excludes set --exclude-larger-than none
+expect_rc 0
+RESTIC_STATION_DATA_DIR="$EXCLUDES_DATA" run_helper excludes show --json
+expect_rc 0
+jq -e '.data | has("excludeLargerThan") and .excludeLargerThan == null' "$OUT_FILE" >/dev/null \
+    || fail "no cap must be an explicit null, not an omitted key"
+ok "the size cap is opt-in, validated on the way in, and liftable with \"none\""
+
 # A typo'd group id is refused rather than ignored: "disable this group"
 # is a request to back up MORE, so silently dropping it would leave a
 # directory unprotected while the operator believes otherwise.

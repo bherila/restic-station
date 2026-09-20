@@ -412,6 +412,7 @@ $ restic-station-helper excludes show
 global exclusion list: on
 settings file: /tmp/tmp.XXXXXXXXXX/data-excludes/global-excludes.json  (not present — built-in defaults)
 --exclude-caches: on
+--exclude-larger-than: (no cap)
 
 [x] browser-caches — Browser caches
       …
@@ -456,6 +457,7 @@ added /srv/scratch
 $ restic-station-helper excludes set --exclude-caches false
 global exclusion list: on
 --exclude-caches: off
+--exclude-larger-than: (no cap)
 
 $ restic-station-helper excludes reset
 removed /tmp/tmp.XXXXXXXXXX/data-excludes/global-excludes.json — back to the built-in defaults
@@ -468,6 +470,10 @@ sets `RESTIC_STATION_DATA_DIR=/var/lib/restic-station` keeps it machine-wide. Th
 
 A set that must keep archiving something the list skips opts out in the **shared** config with
 `"usesGlobalExcludes": false`; `config show` prints `global excludes: opted out` for such a set.
+
+`excludes set --exclude-larger-than 10G` adds restic's size cap, and `--exclude-larger-than none`
+lifts it again. It is off by default: every other rule names a folder of regenerable things,
+while a size cap can skip one irreplaceable file with nothing to point at afterwards.
 
 A `global-excludes.json` this build cannot honour — bad JSON, a group id it does not know, a
 blank pattern, a newer `version` — **fails the run** rather than falling back to the built-in

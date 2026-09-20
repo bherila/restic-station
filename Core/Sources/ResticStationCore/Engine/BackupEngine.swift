@@ -410,11 +410,11 @@ public final class BackupEngine: Sendable {
             trigger: trigger,
             groupId: nil, // this run *is* the group
             phase: "backing-up-primary",
-            // `backupExcludes(applying:)`, not `excludes`: purge patterns
-            // are ordinary excludes as far as `backup` is concerned, and
-            // this host's global list is appended to both. Passing only
-            // `excludes` here would have every run re-capture exactly what
-            // the purge phase had just rewritten out of history.
+            // `effectiveBackupExcludes`, not `excludes`: purge patterns are
+            // ordinary excludes as far as `backup` is concerned. Passing
+            // only `excludes` here would have every run re-capture exactly
+            // what the purge phase had just rewritten out of history. This
+            // host's global catalogue rides alongside as `--iexclude`.
             //
             // The flow is one-way. Nothing downstream turns a global
             // pattern into a `purgeExcludes` entry, so a pattern that
@@ -424,9 +424,11 @@ public final class BackupEngine: Sendable {
             command: .backup(
                 repo: primary.repoURL,
                 sources: set.sources,
-                excludes: set.backupExcludes(applying: globalExcludes),
+                excludes: set.effectiveBackupExcludes,
+                globalExcludes: set.globalBackupExcludes(applying: globalExcludes),
                 excludeCloudFiles: excludeCloudFiles,
-                excludeCaches: set.excludesCaches(applying: globalExcludes)
+                excludeCaches: set.excludesCaches(applying: globalExcludes),
+                excludeLargerThan: set.excludeLargerThan(applying: globalExcludes)
             ),
             invocation: ResticInvocation(destination: primary, expectedExecutableIdentity: versionBoundIdentity),
             streamProgress: true,
@@ -2485,8 +2487,11 @@ public final class BackupEngine: Sendable {
         guard !globalExcludes.isEmpty else {
             return "global excludes: none configured on this machine"
         }
-        let caches = globalExcludes.excludeCaches ? " plus --exclude-caches" : ""
-        return "global excludes: \(globalExcludes.patterns.count) pattern(s)\(caches) "
+        var extras: [String] = []
+        if globalExcludes.excludeCaches { extras.append("--exclude-caches") }
+        if let size = globalExcludes.excludeLargerThan { extras.append("--exclude-larger-than \(size)") }
+        let suffix = extras.isEmpty ? "" : " plus \(extras.joined(separator: ", "))"
+        return "global excludes: \(globalExcludes.patterns.count) pattern(s)\(suffix) "
             + "from this machine's global exclusion list"
     }
 

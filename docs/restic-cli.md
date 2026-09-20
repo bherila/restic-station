@@ -91,7 +91,7 @@ Output (`init-secondary.json`): same `initialized` message. Without `--copy-chun
 
 ### backup
 ```
-restic -r <primaryRepo> backup --json [--exclude-cloud-files] [--exclude-caches] [--exclude <pat>]... <source>...
+restic -r <primaryRepo> backup --json [--exclude-cloud-files] [--exclude-caches] [--exclude-larger-than <size>] [--exclude <pat>]... [--iexclude <pat>]... <source>...
 ```
 `--exclude-cloud-files` is included when the set's `onlineOnlyFiles` is `"skip"` (the default; `docs/data-model.md` §v3 → v4), any effective source is under macOS's iCloud Drive (`~/Library/Mobile Documents`) or File Provider (`~/Library/CloudStorage`) roots — after resolving symlinks, and ignoring case on macOS — **and** the launched restic reports version 0.19.0 or newer (`restic version --json`, run immediately before the backup). It prevents restic from opening online-only placeholders and triggering large implicit downloads. The resulting snapshot intentionally contains only files resident on the Mac; the set editor warns about that completeness boundary. restic 0.17 does not know the flag and 0.18 accepts it only on Windows, so with an older or unreadable version the backup runs without it, as before, and the run log records a warning that online-only files will be downloaded. On Linux 0.19+ accepts the flag and skips nothing. With `onlineOnlyFiles: "download"` the flag is never passed and no version is asked for; the run log notes that online-only files are downloaded.
 
@@ -102,9 +102,15 @@ Sources passed as **absolute paths**. NDJSON stream on stdout (`backup.ndjson`, 
 ```
 `status` also optionally carries `seconds_remaining`, `current_files: [String]`, `error_count` (not in the small fixture; treat all fields except `message_type` as optional). Other message types that may appear: `error` (`{"message_type":"error","error":{…},"during":"…","item":"…"}`) and `verbose_status` — ignore unknown types gracefully. `percent_done` is 0…1.
 
-Each backup passes `BackupSet.backupExcludes(applying:)`: `excludes`, then `purgeExcludes`, then this host's global exclusion list, deduplicated while preserving first-occurrence order. All three become individual `--exclude` arguments. `purgeExcludes` is the separate history-affecting list: it excludes matching files from new snapshots and is reserved for the workflow that removes matching paths from existing snapshots; removing repository space still requires a later `prune`.
+Each backup passes `BackupSet.effectiveBackupExcludes` as `--exclude`: `excludes` followed by `purgeExcludes`, deduplicated while preserving first-occurrence order. `purgeExcludes` is the separate history-affecting list: it excludes matching files from new snapshots and is reserved for the workflow that removes matching paths from existing snapshots; removing repository space still requires a later `prune`.
 
-`--exclude-caches` and the trailing block of `--exclude` patterns come from the global exclusion list (`docs/data-model.md` §global-excludes.json) — a built-in catalogue adjusted per host in `global-excludes.json`. A set with `"usesGlobalExcludes": false` gets neither. The flag is not version-gated: restic has carried `--exclude-caches` since 0.9, unlike `--exclude-cloud-files` above. The global list reaches **`backup` only**; `rewrite --forget` (§rewrite) sees `purgeExcludes` and nothing else, so a pattern that arrives because a newer build shipped a better catalogue can keep files out of the next snapshot and can never delete anything already in a repository.
+`--exclude-caches`, `--exclude-larger-than` and the `--iexclude` block come from the global exclusion list (`docs/data-model.md` §global-excludes.json) — a built-in catalogue adjusted per host in `global-excludes.json`, supplied by `BackupSet.globalBackupExcludes(applying:)`. A set with `"usesGlobalExcludes": false` gets none of them.
+
+**`--iexclude`, not `--exclude`, for the catalogue.** It is a list of well-known names rather than something a person typed, so `Library/Caches` must also skip `library/caches` and `*.dmg` must also skip `Installer.DMG`. A pattern the set already names on `--exclude` is dropped from the `--iexclude` block rather than repeated. Neither flag is version-gated: restic has carried `--exclude-caches` since 0.9 and `--iexclude`/`--exclude-larger-than` since 0.13, unlike `--exclude-cloud-files` above.
+
+Note that an unanchored pattern matches any component of the **absolute** path, including directories above the source — `--exclude tmp` against a source under `/tmp/…` excludes the source itself. `docs/data-model.md` §Pattern shape covers what that rules out of the catalogue.
+
+The global list reaches **`backup` only**; `rewrite --forget` (§rewrite) sees `purgeExcludes` and nothing else, so a pattern that arrives because a newer build shipped a better catalogue can keep files out of the next snapshot and can never delete anything already in a repository.
 
 ### copy (mirror primary → secondary)
 ```

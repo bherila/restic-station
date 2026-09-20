@@ -247,13 +247,15 @@ public struct BackupSet: Codable, Equatable, Identifiable, Sendable {
         return (excludes + purgeExcludes).filter { seen.insert($0).inserted }
     }
 
-    /// ``effectiveBackupExcludes`` followed by this host's global patterns,
-    /// deduped the same way — or exactly ``effectiveBackupExcludes`` when
-    /// the set has opted out with ``usesGlobalExcludes``.
+    /// This host's global patterns for `backup`'s `--iexclude` block — or
+    /// nothing at all when the set has opted out with
+    /// ``usesGlobalExcludes``.
     ///
-    /// The set's own patterns stay first so that adding a global list never
-    /// reorders the argv a set already produced; a reader comparing two run
-    /// logs sees the global block appended, not the whole line shuffled.
+    /// A pattern the set already names in ``effectiveBackupExcludes`` is
+    /// dropped: it would reach restic twice with the same effect, and an
+    /// argv that repeats itself is harder to read in a run log. The
+    /// comparison is case-insensitive because the global half is matched
+    /// that way (`--iexclude`).
     ///
     /// **The global list is forward-only and never becomes a purge
     /// pattern.** `purgeExcludes` is the only list `rewrite --forget` ever
@@ -261,17 +263,22 @@ public struct BackupSet: Codable, Equatable, Identifiable, Sendable {
     /// through this method or ``effectiveBackupExcludes``. That asymmetry is
     /// the point: a pattern that arrives because a build shipped a better
     /// default must never delete anything already in a repository.
-    public func backupExcludes(applying plan: GlobalExcludePlan) -> [String] {
-        let own = effectiveBackupExcludes
-        guard usesGlobalExcludes, !plan.patterns.isEmpty else { return own }
-        var seen = Set(own)
-        return own + plan.patterns.filter { seen.insert($0).inserted }
+    public func globalBackupExcludes(applying plan: GlobalExcludePlan) -> [String] {
+        guard usesGlobalExcludes else { return [] }
+        let own = Set(effectiveBackupExcludes.map { $0.lowercased() })
+        return plan.patterns.filter { !own.contains($0.lowercased()) }
     }
 
     /// Whether `backup` carries `--exclude-caches` for this set: the host
     /// asked for it **and** the set has not opted out of the global list.
     public func excludesCaches(applying plan: GlobalExcludePlan) -> Bool {
         usesGlobalExcludes && plan.excludeCaches
+    }
+
+    /// The `--exclude-larger-than` size for this set, or `nil` — the host's
+    /// cap, unless the set has opted out of the global list.
+    public func excludeLargerThan(applying plan: GlobalExcludePlan) -> String? {
+        usesGlobalExcludes ? plan.excludeLargerThan : nil
     }
 
     /// The shared ``sources`` followed by every per-machine replacement

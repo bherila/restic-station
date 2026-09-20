@@ -59,10 +59,27 @@ public struct GlobalExcludeGroup: Equatable, Sendable, Identifiable {
 /// `~`, no `$VAR`. restic matches a relative pattern against the trailing
 /// path components, so `Library/Caches` skips `~/Library/Caches` wherever
 /// the home directory is and on whichever platform, and `node_modules`
-/// skips one at any depth. That is also why there is **no platform
-/// branch**: a macOS-shaped pattern simply matches nothing on Linux, and
-/// keeping one list means `config show` on either OS describes the same
-/// rules. `GlobalExcludeCatalogTests` pins the shape rule.
+/// skips one at any depth. A `*` inside a component works
+/// (`*.photoslibrary/resources/derivatives`), as does `**` between them
+/// (`*.imovielibrary/**/Render Files`). That is also why there is **no
+/// platform branch**: a macOS-shaped pattern simply matches nothing on
+/// Linux, and keeping one list means `config show` on either OS describes
+/// the same rules.
+///
+/// **The hazard that shapes the whole list: an unanchored pattern matches
+/// any component of the *absolute* path, including directories above the
+/// source.** `--exclude tmp` against a source under `/tmp/...` excludes the
+/// source itself and produces an empty snapshot. So a single-component
+/// pattern must name something nobody has above their data — `node_modules`
+/// is safe, `tmp`, `var`, `data` and `bin` are not.
+/// ``GlobalExcludeCatalogTests`` pins both that denylist and the shape rule.
+///
+/// Patterns reach restic as **`--iexclude`**, not `--exclude`: this list is
+/// a set of well-known names rather than something a person typed, and
+/// `Library/Caches` should skip `library/caches` too. Code42's equivalent
+/// list is likewise entirely case-insensitive. A backup set's own
+/// ``BackupSet/excludes`` keep the case-sensitive `--exclude` they have
+/// always had.
 ///
 /// See `docs/data-model.md` §global-excludes.json for the normative
 /// description of this list and of the file that adjusts it.
@@ -76,7 +93,7 @@ public enum GlobalExcludeCatalog {
     /// never heard of is an error (see ``GlobalExcludeError/unknownGroup``),
     /// and a group added after the file was written takes its built-in
     /// default.
-    public static let version = 1
+    public static let version = 2
 
     /// The catalog, in the order its patterns reach argv.
     public static let groups: [GlobalExcludeGroup] = [
@@ -150,6 +167,25 @@ public enum GlobalExcludeCatalog {
                 // Sync clients' own scratch, which is re-downloaded.
                 ".dropbox.cache",
                 "Library/Application Support/Google/DriveFS",
+                // Zero-byte iCloud placeholders. `--exclude-cloud-files`
+                // (restic 0.19+) is the real answer; this catches the same
+                // files on an older restic, where they would otherwise be
+                // backed up as empty stubs.
+                "*.icloud",
+                // Backing up a backup: Time Machine's destination and its
+                // local snapshots, and the Finder/system sidecars that
+                // regenerate on sight.
+                "backups.backupdb",
+                ".MobileBackups",
+                "Network Trash Folder",
+                ".hotfiles.btree",
+                ".PKInstallSandboxManager-SystemSoftware",
+                "Desktop DB",
+                "Desktop DF",
+                ".adobeTemp",
+                // Present on an external drive that has also been used on
+                // Windows, where it is pure filesystem bookkeeping.
+                "System Volume Information",
             ]
         ),
         GlobalExcludeGroup(
@@ -168,6 +204,13 @@ public enum GlobalExcludeCatalog {
                 "*.crdownload",
                 "*.download",
                 "Temporary Items",
+                // Runtime scratch a process recreates. Deliberately **not**
+                // `*.lock`, which Code42's equivalent list does exclude:
+                // that pattern also eats `Cargo.lock`, `yarn.lock`,
+                // `poetry.lock` and `flake.lock` — the files a rebuild
+                // depends on most.
+                "*.pid",
+                "*.crash",
             ]
         ),
         GlobalExcludeGroup(
@@ -232,6 +275,11 @@ public enum GlobalExcludeCatalog {
                 "dist-newstyle",
                 ".terraform",
                 ".ccls-cache",
+                "*.class",
+                ".sonarlint",
+                // The editor's downloaded extensions, not its settings:
+                // `.vscode` itself holds a workspace's committed config.
+                ".vscode/extensions",
             ]
         ),
         GlobalExcludeGroup(
@@ -263,6 +311,38 @@ public enum GlobalExcludeCatalog {
                 ".cache/pip",
                 "Library/Caches/CocoaPods",
                 "vendor/bundle",
+                ".nvm/.cache",
+                ".cache/ms-playwright",
+                "Library/Caches/ms-playwright",
+                ".cache/huggingface",
+            ]
+        ),
+        GlobalExcludeGroup(
+            id: "media-app-caches",
+            title: "Photo and video app caches",
+            summary: "Thumbnails, previews, render and analysis files that Photos, Lightroom, "
+                + "Final Cut and iTunes rebuild from the originals. The originals themselves, and "
+                + "each library's own database, are still backed up.",
+            patterns: [
+                // Photos: the rendered derivatives, never `originals/` and
+                // never `database/`. Code42 excludes the database too, which
+                // it can afford because it restores files rather than a
+                // working library; a restic snapshot missing that database
+                // restores a library the Photos app refuses to open.
+                "*.photoslibrary/resources/derivatives",
+                "*.photoslibrary/Thumbnails",
+                "*.photolibrary/Thumbnails",
+                "iPod Photo Cache",
+                "Album Artwork/Cache",
+                // Lightroom previews, Final Cut's cache, iMovie's generated
+                // media. `**` matches the per-event directories between the
+                // library and the generated folder.
+                "*.lrprev",
+                "*Previews.lrdata",
+                "*.fcpcache",
+                "*.imovielibrary/**/Render Files",
+                "*.imovielibrary/**/Analysis Files",
+                "*.theater/**/Render Files",
             ]
         ),
         GlobalExcludeGroup(
@@ -302,6 +382,67 @@ public enum GlobalExcludeCatalog {
                 "Library/Application Support/VirtualBox",
                 ".vagrant",
                 ".vagrant.d/boxes",
+                // Suspended-VM state and firmware scratch: large, and
+                // meaningless without the machine it belongs to.
+                "*.vmem",
+                "*.vmsn",
+                "*.vmss",
+                "*.vmsd",
+                "*.vmtm",
+                "*.nvram",
+                "*.avhdx",
+                "*.vfd",
+                "*.vsv",
+                "*.hds",
+                "*.pvs",
+                "*.vmwarevm",
+                "*.xva",
+                "*.ova",
+                // Deliberately **not** `*.vmx` or `*.vmxf`: those are the
+                // few kilobytes that describe the machine, and a disk image
+                // restored without them is harder to revive, not easier.
+            ]
+        ),
+        GlobalExcludeGroup(
+            id: "installers-and-disk-images",
+            title: "Installers and disk images",
+            summary: "Downloaded installers and mountable images — .dmg, .iso, .pkg, .msi, and "
+                + "sparse/Time Machine bundles. Off by default: most are a re-download away, but "
+                + "an image you built yourself may exist nowhere else.",
+            enabledByDefault: false,
+            patterns: [
+                "*.dmg",
+                "*.iso",
+                "*.pkg",
+                "*.msi",
+                "*.msix",
+                "*.exe",
+                "*.cab",
+                "*.sparsebundle",
+                "*.sparseimage",
+                "*.backupbundle",
+                "*.mrimg",
+            ]
+        ),
+        GlobalExcludeGroup(
+            id: "game-and-media-libraries",
+            title: "Game installs and media server data",
+            summary: "Installed Steam/Epic/GOG games and a Plex server's generated metadata — "
+                + "hundreds of gigabytes that a re-download or a re-scan rebuilds. Off by "
+                + "default: rebuilding is cheap in effort and expensive in time, so it is your "
+                + "call. Save data is not in here.",
+            enabledByDefault: false,
+            patterns: [
+                "Steam/steamapps/common",
+                "Steam/steamapps/downloading",
+                "Steam/steamapps/shadercache",
+                "Steam/appcache",
+                "Epic Games",
+                "GOG Galaxy/Games",
+                "Battle.net",
+                "Plex Media Server/Cache",
+                "Plex Media Server/Media",
+                "Plex Media Server/Metadata",
             ]
         ),
     ]
@@ -327,16 +468,24 @@ public enum GlobalExcludeCatalog {
 /// able to re-resolve it, disagree about it, or read the file a second time
 /// mid-run.
 public struct GlobalExcludePlan: Equatable, Sendable {
-    /// Patterns appended to every applying set's `--exclude` list, in
-    /// catalog order followed by the host's own extra patterns.
+    /// Patterns handed to every applying set as `--iexclude`, in catalogue
+    /// order followed by the host's own extra patterns.
     public let patterns: [String]
     /// Whether `backup` also carries `--exclude-caches`, which skips any
     /// directory tagged `CACHEDIR.TAG` by the tool that created it.
     public let excludeCaches: Bool
+    /// `restic backup --exclude-larger-than <size>`, or `nil` for no cap.
+    ///
+    /// Off unless asked for. Code42 caps at 10 GB by default; here a size
+    /// cap is the one setting in this whole file that can silently drop a
+    /// single *named* file someone cared about rather than a directory full
+    /// of regenerable ones, so it is opt-in.
+    public let excludeLargerThan: String?
 
-    public init(patterns: [String], excludeCaches: Bool) {
+    public init(patterns: [String], excludeCaches: Bool, excludeLargerThan: String? = nil) {
         self.patterns = patterns
         self.excludeCaches = excludeCaches
+        self.excludeLargerThan = excludeLargerThan
     }
 
     /// Adds nothing to any backup — the value every construction site that
@@ -345,7 +494,7 @@ public struct GlobalExcludePlan: Equatable, Sendable {
     public static let none = GlobalExcludePlan(patterns: [], excludeCaches: false)
 
     public var isEmpty: Bool {
-        patterns.isEmpty && !excludeCaches
+        patterns.isEmpty && !excludeCaches && excludeLargerThan == nil
     }
 }
 
@@ -398,6 +547,14 @@ public struct GlobalExcludeSettings: Codable, Equatable, Sendable {
     /// Tagging Specification). Cargo, Go and others write that tag, so it
     /// catches build caches no pattern list knows about.
     public var excludeCaches: Bool
+    /// `restic backup --exclude-larger-than <size>` (`500M`, `10G`, …), or
+    /// `nil` — the default — for no cap.
+    ///
+    /// Opt-in, unlike Code42's 10 GB default: every other rule in this file
+    /// names a directory of regenerable things, while a size cap can drop
+    /// one irreplaceable file (a video, a disk image, a dataset) with no
+    /// pattern anyone could point at afterwards.
+    public var excludeLargerThan: String?
     /// Group decisions that differ from ``GlobalExcludeGroup/enabledByDefault``.
     /// Absent group = built-in default.
     public var groups: [String: Bool]
@@ -410,6 +567,7 @@ public struct GlobalExcludeSettings: Codable, Equatable, Sendable {
         catalogVersion: Int = GlobalExcludeCatalog.version,
         enabled: Bool = true,
         excludeCaches: Bool = true,
+        excludeLargerThan: String? = nil,
         groups: [String: Bool] = [:],
         extraPatterns: [String] = []
     ) {
@@ -417,6 +575,7 @@ public struct GlobalExcludeSettings: Codable, Equatable, Sendable {
         self.catalogVersion = catalogVersion
         self.enabled = enabled
         self.excludeCaches = excludeCaches
+        self.excludeLargerThan = excludeLargerThan
         self.groups = groups
         self.extraPatterns = extraPatterns
     }
@@ -426,7 +585,8 @@ public struct GlobalExcludeSettings: Codable, Equatable, Sendable {
     public static let `default` = GlobalExcludeSettings()
 
     private enum CodingKeys: String, CodingKey {
-        case version, catalogVersion, enabled, excludeCaches, groups, extraPatterns
+        case version, catalogVersion, enabled, excludeCaches, excludeLargerThan
+        case groups, extraPatterns
     }
 
     /// Hand-written for the same reason `BackupSet`'s is: a key added by a
@@ -438,6 +598,7 @@ public struct GlobalExcludeSettings: Codable, Equatable, Sendable {
         catalogVersion = try container.decodeIfPresent(Int.self, forKey: .catalogVersion) ?? 0
         enabled = try container.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
         excludeCaches = try container.decodeIfPresent(Bool.self, forKey: .excludeCaches) ?? true
+        excludeLargerThan = try container.decodeIfPresent(String.self, forKey: .excludeLargerThan)
         groups = try container.decodeIfPresent([String: Bool].self, forKey: .groups) ?? [:]
         extraPatterns = try container.decodeIfPresent([String].self, forKey: .extraPatterns) ?? []
     }
@@ -461,7 +622,11 @@ public struct GlobalExcludeSettings: Codable, Equatable, Sendable {
         var seen = Set<String>()
         let patterns = (enabledGroups.flatMap(\.patterns) + extraPatterns)
             .filter { seen.insert($0).inserted }
-        return GlobalExcludePlan(patterns: patterns, excludeCaches: excludeCaches)
+        return GlobalExcludePlan(
+            patterns: patterns,
+            excludeCaches: excludeCaches,
+            excludeLargerThan: excludeLargerThan
+        )
     }
 
     /// Rejects a file this build cannot honour exactly as written.
@@ -482,6 +647,22 @@ public struct GlobalExcludeSettings: Codable, Equatable, Sendable {
         for (index, pattern) in extraPatterns.enumerated() where pattern.isEmpty {
             throw GlobalExcludeError.emptyExtraPattern(index: index)
         }
+        if let excludeLargerThan, !Self.isValidSize(excludeLargerThan) {
+            throw GlobalExcludeError.invalidSize(excludeLargerThan)
+        }
+    }
+
+    /// restic's `--exclude-larger-than` grammar: digits, optionally followed
+    /// by one of `k/K m/M g/G t/T`. Checked here rather than left to restic
+    /// so a typo fails when it is saved, not silently at 3 a.m. when the
+    /// backup refuses to start.
+    public static func isValidSize(_ size: String) -> Bool {
+        guard !size.isEmpty else { return false }
+        var digits = Substring(size)
+        if let last = digits.last, "kKmMgGtT".contains(last) {
+            digits = digits.dropLast()
+        }
+        return !digits.isEmpty && digits.allSatisfy { $0.isASCII && $0.isNumber }
     }
 
     // Explicit values for every key — same convention (and reasoning) as
@@ -493,6 +674,7 @@ public struct GlobalExcludeSettings: Codable, Equatable, Sendable {
         try container.encode(catalogVersion, forKey: .catalogVersion)
         try container.encode(enabled, forKey: .enabled)
         try container.encode(excludeCaches, forKey: .excludeCaches)
+        try container.encode(excludeLargerThan, forKey: .excludeLargerThan)
         try container.encode(groups, forKey: .groups)
         try container.encode(extraPatterns, forKey: .extraPatterns)
     }
@@ -507,6 +689,8 @@ public enum GlobalExcludeError: Error, Equatable, Sendable, CustomStringConverti
     case unknownGroup(String, known: [String])
     /// An empty string in `extraPatterns`.
     case emptyExtraPattern(index: Int)
+    /// `excludeLargerThan` is not restic's `<digits>[kKmMgGtT]` size form.
+    case invalidSize(String)
     /// The file exists but could not be read or decoded. Deliberately fatal
     /// rather than "fall back to the defaults": the defaults exclude *more*
     /// than a host that had turned groups off, so guessing here silently
@@ -524,6 +708,9 @@ public enum GlobalExcludeError: Error, Equatable, Sendable, CustomStringConverti
         case .emptyExtraPattern(let index):
             return "global-excludes.json has an empty extraPatterns entry at position \(index) — "
                 + "remove it or give it a real path or glob"
+        case .invalidSize(let size):
+            return "global-excludes.json has an invalid excludeLargerThan \"\(size)\" — it must be "
+                + "a number optionally followed by k, m, g or t (for example \"500m\" or \"10G\")"
         case .unreadable(let path, let underlying):
             return "could not read \(path): \(underlying). Refusing to fall back to the built-in "
                 + "defaults, which may exclude more than this host had configured"

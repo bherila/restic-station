@@ -56,12 +56,29 @@ struct ExclusionsSettings: View {
             Toggle(ExclusionsCopy.enabledLabel, isOn: enabledBinding)
             Toggle(ExclusionsCopy.excludeCachesLabel, isOn: excludeCachesBinding)
                 .disabled(!pane.settings.enabled)
+            HStack {
+                Toggle(ExclusionsCopy.sizeCapLabel, isOn: sizeCapEnabledBinding)
+                TextField(
+                    ExclusionsCopy.sizeCapLabel,
+                    text: sizeCapBinding,
+                    prompt: Text(ExclusionsCopy.sizeCapPlaceholder)
+                )
+                .labelsHidden()
+                .frame(width: 90)
+                .disabled(pane.settings.excludeLargerThan == nil)
+            }
+            .disabled(!pane.settings.enabled)
         } header: {
             Text("Global Exclusions")
         } footer: {
             VStack(alignment: .leading, spacing: 2) {
                 Text(ExclusionsCopy.overviewFooter)
                 Text(ExclusionsCopy.cacheDirTagFooter)
+                Text(ExclusionsCopy.sizeCapFooter)
+                if pane.settings.excludeLargerThan.map({ !GlobalExcludeSettings.isValidSize($0) }) == true {
+                    Text(ExclusionsCopy.sizeCapInvalid)
+                        .foregroundStyle(.red)
+                }
             }
             .font(.footnote)
             .foregroundStyle(.secondary)
@@ -178,6 +195,23 @@ struct ExclusionsSettings: View {
         )
     }
 
+    /// The checkbox and the field are two views of one optional: `nil` is
+    /// "no cap", and turning the checkbox on seeds a valid default rather
+    /// than an empty string that would fail to save.
+    private var sizeCapEnabledBinding: Binding<Bool> {
+        Binding(
+            get: { pane.settings.excludeLargerThan != nil },
+            set: { pane.setExcludeLargerThan($0 ? ExclusionsCopy.sizeCapDefault : nil) }
+        )
+    }
+
+    private var sizeCapBinding: Binding<String> {
+        Binding(
+            get: { pane.settings.excludeLargerThan ?? "" },
+            set: { pane.setExcludeLargerThan($0.isEmpty ? nil : $0) }
+        )
+    }
+
     private func groupBinding(_ group: GlobalExcludeGroup) -> Binding<Bool> {
         Binding(
             get: { pane.settings.isEnabled(group) },
@@ -237,6 +271,17 @@ final class ExclusionsSettingsModel: ObservableObject {
 
     func setExcludeCaches(_ excludeCaches: Bool) {
         mutate { $0.excludeCaches = excludeCaches }
+    }
+
+    /// Held in memory while it is being typed — `500` is not a valid size
+    /// until its `m` arrives — and written through the moment it is. The
+    /// banner in the footer says why an in-between value has not saved.
+    func setExcludeLargerThan(_ size: String?) {
+        if let size, !GlobalExcludeSettings.isValidSize(size) {
+            settings.excludeLargerThan = size
+        } else {
+            mutate { $0.excludeLargerThan = size }
+        }
     }
 
     func setGroup(_ group: GlobalExcludeGroup, enabled: Bool) {
@@ -318,6 +363,17 @@ final class ExclusionsSettingsModel: ObservableObject {
 enum ExclusionsCopy {
     static let enabledLabel = "Apply the global exclusion list"
     static let excludeCachesLabel = "Skip directories tagged CACHEDIR.TAG"
+    static let sizeCapLabel = "Skip files larger than"
+    static let sizeCapPlaceholder = "10G"
+    static let sizeCapDefault = "10G"
+
+    static let sizeCapFooter =
+        "A size cap is off by default. Every other rule here names a folder of things that come "
+        + "back on their own; a size cap can skip one irreplaceable file — a video, a disk image — "
+        + "with nothing to point at afterwards."
+
+    static let sizeCapInvalid =
+        "Not saved: use a number followed by k, m, g or t — for example 500m or 10G."
 
     static let overviewFooter =
         "These patterns are skipped by every backup set unless the set turns off "

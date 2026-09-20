@@ -904,6 +904,106 @@ CLEAR
     log "$step OK (applied $changed, watermark lost and self-healed via a no-op rewrite)"
 }
 
+# The global exclusion catalogue, against **real restic** and a source tree
+# shaped like a home directory (`docs/data-model.md` §global-excludes.json).
+#
+# Unit tests can pin the catalogue's shape and the argv it produces; only
+# real restic can answer "does it interpret these patterns the way we think"
+# — and the answers are not obvious. An unanchored pattern matches
+# components *above* the source (`--exclude tmp` under `/tmp/...` empties
+# the snapshot), `*` works inside a component while `**` spans them, and
+# `--iexclude` is what makes `Library/Caches` also catch `library/caches`.
+#
+# So this asserts both directions on one backup: every decoy that must
+# survive does, and every file the catalogue promises to skip is absent.
+# The keep list is the load-bearing half — a catalogue that quietly ate
+# `.git`, `Cargo.lock` or a user's own `.sqlite` would pass every
+# success-only check.
+assert_global_excludes() {
+    local step="global excludes (real restic, realistic tree)"
+    log "$step"
+
+    local tree="$SOURCE_DIR/exclusion-probe"
+    rm -rf "$tree"
+
+    # Must survive. Each one is a real near-miss for some pattern in the
+    # catalogue: `Cargo.lock` for a `*.lock` rule we deliberately do not
+    # have, `model.obj` for a bare `obj`, `target-audience` for a bare
+    # `target`, `settings.json` for `.vscode/extensions`, the Photos
+    # `originals`/`database` for the derivatives rule, and `.vmx` for the
+    # disk-image rule.
+    local keep=(
+        "proj/.git/config"
+        "proj/Cargo.lock"
+        "proj/yarn.lock"
+        "proj/src/main.rs"
+        "proj/obj/model.obj"
+        "proj/bin/run.sh"
+        "work/target-audience/plan.md"
+        "Documents/my-records.sqlite"
+        "Documents/tmp/draft.txt"
+        ".vscode/settings.json"
+        "Library/Keychains/login.keychain-db"
+        "Library/Safari/Bookmarks.plist"
+        "Pictures/My Library.photoslibrary/originals/0/IMG_1.heic"
+        "Pictures/My Library.photoslibrary/database/Photos.sqlite"
+        "VMs/ubuntu.vmx"
+    )
+    # Must be skipped, including two case variants that only `--iexclude`
+    # catches and one `**` case.
+    local skip=(
+        "Library/Caches/Google/Chrome/x.bin"
+        "library/caches/lowercased.bin"
+        "proj/node_modules/left-pad/index.js"
+        "proj/target/debug/app"
+        "proj/obj/Release/app.dll"
+        "proj/__pycache__/mod.pyc"
+        ".cargo/registry/cache/x.crate"
+        ".Trash/deleted.txt"
+        "Documents/draft.tmp"
+        "Library/Application Support/Slack/GPUCache/x"
+        "Pictures/My Library.photoslibrary/resources/derivatives/1/x.jpg"
+        "Movies/Proj.imovielibrary/Event1/Render Files/clip.mov"
+        ".vscode/extensions/ms-python/x.js"
+        "Documents/report.docx.icloud"
+    )
+
+    local rel
+    for rel in "${keep[@]}" "${skip[@]}"; do
+        mkdir -p "$tree/$(dirname "$rel")"
+        printf 'probe\n' > "$tree/$rel"
+    done
+
+    run_backup
+    [[ $BACKUP_RC -eq 0 ]] || fail "$step" "run-set exited $BACKUP_RC: $BACKUP_OUT"
+
+    local listing
+    listing="$(restic_primary ls latest 2>/dev/null)" \
+        || fail "$step" "could not list the snapshot just written"
+
+    local missing=() leaked=()
+    for rel in "${keep[@]}"; do
+        grep -qxF "$tree/$rel" <<< "$listing" || missing+=("$rel")
+    done
+    for rel in "${skip[@]}"; do
+        grep -qxF "$tree/$rel" <<< "$listing" && leaked+=("$rel")
+    done
+
+    # The backup log must also say what it applied, so a surprised user can
+    # answer "why is this file missing?" without reading this script.
+    local logged
+    logged="$(grep -rl "global excludes:" "$DATA_DIR/runs" 2>/dev/null | head -1)"
+    [[ -n "$logged" ]] || fail "$step" "no run log recorded which global excludes applied"
+
+    [[ ${#missing[@]} -eq 0 ]] \
+        || fail "$step" "the catalogue excluded files it must keep: ${missing[*]}"
+    [[ ${#leaked[@]} -eq 0 ]] \
+        || fail "$step" "the catalogue failed to exclude: ${leaked[*]}"
+
+    rm -rf "$tree"
+    log "$step OK (${#keep[@]} kept, ${#skip[@]} skipped, as the catalogue promises)"
+}
+
 assert_tick_noop() {
     local step="tick (nothing due)"
     log "$step"
@@ -1415,6 +1515,7 @@ main() {
     assert_run4
     assert_retention
     assert_purge_noop_self_heals
+    assert_global_excludes
     assert_tick_noop
     assert_abandoned_run_is_not_healthy
     assert_tick_clears_wreckage_whose_metadata_is_already_terminal

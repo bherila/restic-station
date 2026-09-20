@@ -260,9 +260,22 @@ struct ExcludesSet: AsyncParsableCommand {
     )
     var excludeCaches: Bool?
 
+    @Option(
+        name: .customLong("exclude-larger-than"),
+        help: ArgumentHelp(
+            "Skip files larger than this (500m, 10G, …), or \"none\" to lift the cap. Off by default.",
+            discussion: "Every other rule here names a directory of regenerable things; a size cap "
+                + "can drop one irreplaceable file with no pattern to point at afterwards, so it "
+                + "is opt-in."
+        )
+    )
+    var excludeLargerThan: String?
+
     func run() async throws {
-        guard enabled != nil || excludeCaches != nil else {
-            throw CLIFailure.invalidArguments("pass --enabled and/or --exclude-caches")
+        guard enabled != nil || excludeCaches != nil || excludeLargerThan != nil else {
+            throw CLIFailure.invalidArguments(
+                "pass --enabled, --exclude-caches and/or --exclude-larger-than"
+            )
         }
         let context = ExcludesCLIContext.make()
         var settings = try context.load()
@@ -272,9 +285,27 @@ struct ExcludesSet: AsyncParsableCommand {
         if let excludeCaches {
             settings.excludeCaches = excludeCaches
         }
+        if let excludeLargerThan {
+            // "none" rather than an empty string: an empty `--option ""` is
+            // easy to produce by accident from a shell variable, and
+            // "silently lifted the size cap" is the wrong thing for that to
+            // mean.
+            if excludeLargerThan.lowercased() == "none" {
+                settings.excludeLargerThan = nil
+            } else {
+                guard GlobalExcludeSettings.isValidSize(excludeLargerThan) else {
+                    throw CLIFailure.invalidArguments(
+                        "\"\(excludeLargerThan)\" is not a size — use a number optionally followed "
+                            + "by k, m, g or t (for example 500m or 10G), or \"none\" to lift the cap"
+                    )
+                }
+                settings.excludeLargerThan = excludeLargerThan
+            }
+        }
         try context.save(settings)
         print("global exclusion list: \(settings.enabled ? "on" : "off")")
         print("--exclude-caches: \(settings.excludeCaches ? "on" : "off")")
+        print("--exclude-larger-than: \(settings.excludeLargerThan ?? "(no cap)")")
         HelperExit.code(0)
     }
 }
@@ -330,6 +361,8 @@ struct GlobalExcludeReport: Encodable {
     let exists: Bool
     let enabled: Bool
     let excludeCaches: Bool
+    /// `restic backup --exclude-larger-than`, or `null` for no cap.
+    let excludeLargerThan: String?
     /// The catalogue version this build carries.
     let catalogVersion: Int
     /// The catalogue version the file was last written against; `0` for a
@@ -342,6 +375,29 @@ struct GlobalExcludeReport: Encodable {
     /// Exactly what every applying backup set receives, in argv order.
     let patterns: [String]
 
+    private enum CodingKeys: String, CodingKey {
+        case path, exists, enabled, excludeCaches, excludeLargerThan, catalogVersion
+        case savedCatalogVersion, groups, extraPatterns, patterns
+    }
+
+    // Explicit `null` for `excludeLargerThan` — the house convention for a
+    // documented `--json` interface (`docs/data-model.md` preamble): the
+    // synthesized encoder would omit the key, and a consumer would have to
+    // tell "no cap" from "this build has no such field".
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(path, forKey: .path)
+        try container.encode(exists, forKey: .exists)
+        try container.encode(enabled, forKey: .enabled)
+        try container.encode(excludeCaches, forKey: .excludeCaches)
+        try container.encode(excludeLargerThan, forKey: .excludeLargerThan)
+        try container.encode(catalogVersion, forKey: .catalogVersion)
+        try container.encode(savedCatalogVersion, forKey: .savedCatalogVersion)
+        try container.encode(groups, forKey: .groups)
+        try container.encode(extraPatterns, forKey: .extraPatterns)
+        try container.encode(patterns, forKey: .patterns)
+    }
+
     static func build(settings: GlobalExcludeSettings, path: URL, exists: Bool) -> GlobalExcludeReport {
         let plan = settings.plan
         return GlobalExcludeReport(
@@ -349,6 +405,7 @@ struct GlobalExcludeReport: Encodable {
             exists: exists,
             enabled: settings.enabled,
             excludeCaches: settings.excludeCaches,
+            excludeLargerThan: settings.excludeLargerThan,
             catalogVersion: GlobalExcludeCatalog.version,
             savedCatalogVersion: exists ? settings.catalogVersion : GlobalExcludeCatalog.version,
             groups: GlobalExcludeCatalog.groups.map { group in
@@ -371,6 +428,7 @@ struct GlobalExcludeReport: Encodable {
         lines.append("global exclusion list: \(enabled ? "on" : "off")")
         lines.append("settings file: \(path)\(exists ? "" : "  (not present — built-in defaults)")")
         lines.append("--exclude-caches: \(excludeCaches ? "on" : "off")")
+        lines.append("--exclude-larger-than: \(excludeLargerThan ?? "(no cap)")")
         lines.append("")
         for group in groups {
             let mark = group.enabled ? "[x]" : "[ ]"

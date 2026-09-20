@@ -43,6 +43,33 @@ import Testing
         }
     }
 
+    /// The `/tmp` lesson, encoded.
+    ///
+    /// An unanchored pattern is matched against every component of the
+    /// **absolute** path, not just the ones below the source — so
+    /// `--exclude tmp` against a source under `/tmp/...` excludes the source
+    /// itself and produces an empty snapshot (verified against restic
+    /// 0.18.1 while this catalogue was written). A single-component pattern
+    /// must therefore name something nobody has *above* their data.
+    @Test func noSingleComponentPatternCanMatchAnAncestorDirectory() {
+        // Names that routinely appear high in a path — a source under any
+        // of them would vanish entirely.
+        let dangerous: Set<String> = [
+            "tmp", "temp", "var", "usr", "opt", "etc", "srv", "home", "users", "root",
+            "data", "src", "lib", "bin", "obj", "sbin", "mnt", "media", "volumes",
+            "target", "build", "dist", "out", "cache", "caches", "log", "logs",
+            "documents", "desktop", "downloads", "library", "backup", "backups",
+        ]
+        for group in GlobalExcludeCatalog.groups {
+            for pattern in group.patterns where !pattern.contains("/") {
+                #expect(
+                    !dangerous.contains(pattern.lowercased()),
+                    "\(group.id): \"\(pattern)\" can match a directory ABOVE the source"
+                )
+            }
+        }
+    }
+
     @Test func noPatternIsListedTwiceAcrossTheCatalogue() {
         var seen: [String: String] = [:]
         for group in GlobalExcludeCatalog.groups {
@@ -59,9 +86,43 @@ import Testing
     /// image can be the only copy of something. A change here is a change
     /// to what an upgrade silently stops backing up, so it must be
     /// deliberate enough to edit a test for.
-    @Test func onlyVirtualMachineImagesIsOffByDefault() {
+    @Test func theOffByDefaultGroupsAreTheOnesThatCanHoldAnOnlyCopy() {
         let off = GlobalExcludeCatalog.groups.filter { !$0.enabledByDefault }.map(\.id)
-        #expect(off == ["virtual-machine-images"])
+        #expect(off == ["virtual-machine-images", "installers-and-disk-images", "game-and-media-libraries"])
+    }
+
+    /// A VM's disk images are skipped; the few kilobytes that describe the
+    /// machine are not. Restoring the images without them is harder, not
+    /// easier — Code42's equivalent list drops both.
+    @Test func theVirtualMachineGroupKeepsTheMachineDefinitionFiles() {
+        let vm = GlobalExcludeCatalog.group(id: "virtual-machine-images")!
+        #expect(vm.patterns.contains("*.vmdk"))
+        #expect(!vm.patterns.contains("*.vmx"))
+        #expect(!vm.patterns.contains("*.vmxf"))
+    }
+
+    /// Lockfiles are the files a rebuild depends on most, and `*.lock`
+    /// eats every one of them. Stated as a test because the pattern is an
+    /// obvious-looking addition someone will propose again.
+    @Test func noPatternSwallowsLockfiles() {
+        let lockfiles = ["Cargo.lock", "yarn.lock", "poetry.lock", "flake.lock", "package-lock.json"]
+        for group in GlobalExcludeCatalog.groups {
+            #expect(!group.patterns.contains("*.lock"), "\(group.id) would exclude \(lockfiles)")
+            #expect(!group.patterns.contains("*.db"))
+            #expect(!group.patterns.contains("*.sqlite"))
+        }
+    }
+
+    /// Photos' `originals/` and its `database/` must never be skipped: a
+    /// library restored without the database is one the Photos app refuses
+    /// to open.
+    @Test func thePhotoGroupSkipsOnlyDerivedMedia() {
+        let media = GlobalExcludeCatalog.group(id: "media-app-caches")!
+        for pattern in media.patterns {
+            #expect(!pattern.contains("originals"))
+            #expect(!pattern.contains("database"))
+        }
+        #expect(media.patterns.contains("*.photoslibrary/resources/derivatives"))
     }
 
     @Test func groupLookupFindsEveryAdvertisedId() {
@@ -125,6 +186,8 @@ import Testing
         #expect(object?["catalogVersion"] as? Int == GlobalExcludeCatalog.version)
         #expect(object?["enabled"] as? Bool == true)
         #expect(object?["excludeCaches"] as? Bool == true)
+        #expect(object?.keys.contains("excludeLargerThan") == true)
+        #expect(object?["excludeLargerThan"] is NSNull)
         #expect(object?["groups"] as? [String: Bool] == [:])
         #expect(object?["extraPatterns"] as? [String] == [])
     }
@@ -151,6 +214,29 @@ import Testing
     @Test func anUnknownGroupIdIsRefusedRatherThanIgnored() {
         var settings = GlobalExcludeSettings()
         settings.groups = ["browser-cache": false] // singular — a real typo
+        #expect(throws: GlobalExcludeError.self) { try settings.validate() }
+    }
+
+    @Test func aSizeCapIsOffUnlessAskedFor() {
+        #expect(GlobalExcludeSettings.default.plan.excludeLargerThan == nil)
+        var settings = GlobalExcludeSettings()
+        settings.excludeLargerThan = "10G"
+        #expect(settings.plan.excludeLargerThan == "10G")
+    }
+
+    @Test(arguments: ["500m", "10G", "1", "42k", "7T"])
+    func aWellFormedSizeIsAccepted(size: String) throws {
+        var settings = GlobalExcludeSettings()
+        settings.excludeLargerThan = size
+        try settings.validate()
+    }
+
+    /// A typo fails when it is saved, not silently at 3 a.m. when the
+    /// backup refuses to start.
+    @Test(arguments: ["", "10GB", "big", "10 G", "G", "-5m", "1.5G"])
+    func aMalformedSizeIsRefused(size: String) {
+        var settings = GlobalExcludeSettings()
+        settings.excludeLargerThan = size
         #expect(throws: GlobalExcludeError.self) { try settings.validate() }
     }
 
@@ -255,29 +341,40 @@ import Testing
         )
     }
 
-    private let plan = GlobalExcludePlan(patterns: ["node_modules", ".cache"], excludeCaches: true)
+    private let plan = GlobalExcludePlan(
+        patterns: ["node_modules", ".cache"],
+        excludeCaches: true,
+        excludeLargerThan: "10G"
+    )
 
-    @Test func theSetsOwnPatternsComeFirstAndTheGlobalBlockIsAppended() {
+    @Test func theSetsOwnListAndTheGlobalListStaySeparate() {
         let set = makeSet(excludes: ["*.log"], purgeExcludes: ["secrets/"])
-        #expect(set.backupExcludes(applying: plan) == ["*.log", "secrets/", "node_modules", ".cache"])
+        #expect(set.effectiveBackupExcludes == ["*.log", "secrets/"])
+        #expect(set.globalBackupExcludes(applying: plan) == ["node_modules", ".cache"])
         #expect(set.excludesCaches(applying: plan))
+        #expect(set.excludeLargerThan(applying: plan) == "10G")
     }
 
-    @Test func aPatternTheSetAlreadyNamesIsNotRepeated() {
-        let set = makeSet(excludes: ["node_modules"])
-        #expect(set.backupExcludes(applying: plan) == ["node_modules", ".cache"])
+    /// Dropped, not duplicated — and case-insensitively, because the global
+    /// half reaches restic as `--iexclude`.
+    @Test func aPatternTheSetAlreadyNamesIsNotRepeatedInTheGlobalBlock() {
+        #expect(makeSet(excludes: ["node_modules"]).globalBackupExcludes(applying: plan) == [".cache"])
+        #expect(makeSet(excludes: ["NODE_MODULES"]).globalBackupExcludes(applying: plan) == [".cache"])
     }
 
-    @Test func anOptedOutSetGetsNeitherThePatternsNorExcludeCaches() {
+    @Test func anOptedOutSetGetsNothingFromTheGlobalList() {
         let set = makeSet(excludes: ["*.log"], usesGlobalExcludes: false)
-        #expect(set.backupExcludes(applying: plan) == ["*.log"])
+        #expect(set.effectiveBackupExcludes == ["*.log"])
+        #expect(set.globalBackupExcludes(applying: plan).isEmpty)
         #expect(!set.excludesCaches(applying: plan))
+        #expect(set.excludeLargerThan(applying: plan) == nil)
     }
 
     @Test func anEmptyPlanLeavesTheArgvExactlyAsItWasBeforeTheFeature() {
         let set = makeSet(excludes: ["*.log"], purgeExcludes: ["secrets/"])
-        #expect(set.backupExcludes(applying: .none) == set.effectiveBackupExcludes)
+        #expect(set.globalBackupExcludes(applying: .none).isEmpty)
         #expect(!set.excludesCaches(applying: .none))
+        #expect(set.excludeLargerThan(applying: .none) == nil)
     }
 
     /// The v5 decode contract, matching `purgeExcludes` and

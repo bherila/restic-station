@@ -222,9 +222,10 @@ The list has three parts, and each lives where its scope actually is:
 ```json
 {
   "version": 1,
-  "catalogVersion": 1,
+  "catalogVersion": 2,
   "enabled": true,
   "excludeCaches": true,
+  "excludeLargerThan": null,
   "groups": { "virtual-machine-images": true },
   "extraPatterns": ["*.iso"]
 }
@@ -234,6 +235,7 @@ The list has three parts, and each lives where its scope actually is:
 - **`catalogVersion`** — the `GlobalExcludeCatalog.version` this file was last written against. Diagnostic only; it gates nothing.
 - **`enabled`** — the master switch. `false` contributes no patterns at all while leaving the group decisions underneath it intact.
 - **`excludeCaches`** — pass `restic backup --exclude-caches`, which skips any directory its own creator tagged `CACHEDIR.TAG` (the Cache Directory Tagging Specification). Cargo, Go and others write that tag, so it catches caches no pattern list knows the name of. Default `true`.
+- **`excludeLargerThan`** — `restic backup --exclude-larger-than <size>` (`500m`, `10G`, …), or `null` — the default — for no cap. Validated as `<digits>[kKmMgGtT]` when it is saved, so a typo fails there rather than at 3 a.m. when the backup refuses to start. **Opt-in, deliberately.** Code42's equivalent list caps at 10 GB by default; every other rule here names a *directory* of regenerable things, while a size cap can drop one irreplaceable file — a video, a dataset, a disk image — with no pattern anyone could point at afterwards.
 - **`groups`** — **only the decisions that differ from the built-in default.** A group absent from this map takes `GlobalExcludeGroup.enabledByDefault`, which is what lets a later build add a group and have it take effect without rewriting anyone's file.
 - **`extraPatterns`** — this host's own `--exclude` patterns. Unlike the catalogue these may be absolute.
 
@@ -241,27 +243,48 @@ The list has three parts, and each lives where its scope actually is:
 
 ### Pattern shape
 
-Every catalogue pattern is **relative and unanchored**: no leading `/`, no `~`, no `$VAR`. restic matches a relative pattern against the trailing path components, so `Library/Caches` skips `~/Library/Caches` wherever the home directory is, and `node_modules` skips one at any depth. That is also why there is **no platform branch** in the catalogue: a macOS-shaped pattern simply matches nothing on Linux, and one list means `config show` on either OS describes the same rules. `extraPatterns` is exempt — a host adding one of its own may anchor it however it likes.
+Every catalogue pattern is **relative and unanchored**: no leading `/`, no `~`, no `$VAR`. restic matches a relative pattern against the trailing path components, so `Library/Caches` skips `~/Library/Caches` wherever the home directory is, and `node_modules` skips one at any depth. A `*` inside a component works (`*.photoslibrary/resources/derivatives`), as does `**` between them (`*.imovielibrary/**/Render Files`). That is also why there is **no platform branch** in the catalogue: a macOS-shaped pattern simply matches nothing on Linux, and one list means `config show` on either OS describes the same rules. `extraPatterns` is exempt — a host adding one of its own may anchor it however it likes.
 
-Generic single-component names are deliberately avoided. A bare `target`, `bin` or `obj` would also skip a folder of 3-D models or a directory someone named "target", so the catalogue names the build configuration underneath them (`target/debug`, `obj/Release`) and leaves the rest to `--exclude-caches`, which Cargo's own `CACHEDIR.TAG` already answers.
+**The hazard that shapes the whole list.** An unanchored pattern is matched against every component of the *absolute* path, **including directories above the source**. `--exclude tmp` against a source under `/tmp/…` therefore excludes the source itself and produces an empty snapshot — verified against restic 0.18.1 while this catalogue was written. A single-component pattern must name something nobody has above their data: `node_modules` is safe, `tmp`, `var`, `data`, `bin` and `target` are not. `GlobalExcludeCatalogTests` holds the denylist.
+
+That is also why generic build-directory names are avoided. A bare `target`, `bin` or `obj` would skip a folder of 3-D models or a directory someone named "target", so the catalogue names the build configuration underneath them (`target/debug`, `obj/Release`) and leaves the rest to `--exclude-caches`, which Cargo's own `CACHEDIR.TAG` already answers.
+
+**The catalogue reaches restic as `--iexclude`, not `--exclude`.** It is a list of well-known names rather than something a person typed, so `Library/Caches` should skip `library/caches` and `*.dmg` should skip `Installer.DMG`; Code42's equivalent list is entirely case-insensitive for the same reason. A backup set's own `excludes` keep the case-sensitive `--exclude` they have always had, so nothing about an existing config changes meaning.
 
 ### Groups
 
 | id | Default | What it skips |
 |---|---|---|
 | `browser-caches` | on | Cached pages, images, compiled scripts and GPU shaders for the Chromium and Gecko families, plus the same cache directory names inside Electron apps. Bookmarks, history, passwords and profile settings are not in it. |
-| `system-caches` | on | Per-user cache, log and trash directories, and the index/metadata sidecars the OS maintains. |
-| `temporary-files` | on | Editor swap files, partial downloads, anything already named as scratch. |
+| `system-caches` | on | Per-user cache, log and trash directories, the index/metadata sidecars the OS maintains, iCloud placeholder stubs, and a Time Machine destination or local snapshot store (backing up a backup). |
+| `temporary-files` | on | Editor swap files, partial downloads, crash dumps, anything already named as scratch. |
 | `developer-build-artifacts` | on | Swift, Xcode, Rust, .NET, Node, Python, JVM and CMake output trees, including the hidden framework directories (`.next`, `.nuxt`, `.vercel`, `.turbo`, …). |
-| `package-manager-caches` | on | npm/yarn/pnpm/bun, cargo, Go module, Gradle, Maven, NuGet, pip, Homebrew and CocoaPods caches. |
+| `package-manager-caches` | on | npm/yarn/pnpm/bun, cargo, Go module, Gradle, Maven, NuGet, pip, Homebrew, CocoaPods, Playwright and Hugging Face caches. |
+| `media-app-caches` | on | Thumbnails, previews and render/analysis files that Photos, Lightroom, Final Cut, iMovie and iTunes rebuild from the originals. |
 | `container-engines` | on | Docker Desktop, OrbStack, colima, podman and Lima machine storage. |
-| `virtual-machine-images` | **off** | Parallels, VMware, VirtualBox, UTM, QEMU and Vagrant disk images. Off because, unlike a container image, a VM someone built by hand may exist nowhere else. |
+| `virtual-machine-images` | **off** | Parallels, VMware, VirtualBox, UTM, QEMU and Vagrant disk images and suspended state. Off because, unlike a container image, a VM someone built by hand may exist nowhere else. |
+| `installers-and-disk-images` | **off** | `.dmg`, `.iso`, `.pkg`, `.msi`, sparse and Time Machine bundles. Off because an image you built yourself may exist nowhere else. |
+| `game-and-media-libraries` | **off** | Installed Steam/Epic/GOG/Battle.net games and a Plex server's generated metadata. Off because rebuilding is cheap in effort and expensive in time — that is a judgement call, not a default. |
 
 `excludes show` prints the catalogue this build carries, which groups apply here, and the exact resolved pattern list; `excludes show --patterns` adds every individual pattern. That command — not this table — is the authority for what a given build excludes.
 
+### What the catalogue deliberately does not exclude
+
+The list above is modelled on [Code42's default exclusions](https://mimecastsupport.zendesk.com/hc/en-us/articles/42666059024403-Files-excluded-from-backup-by-default), which is the most thoroughly exercised list of its kind. Five of its rules are **not** ported, each for the same underlying reason — Code42 preserves *files*, while a restic snapshot has to restore a *working system*:
+
+| Theirs | Why not |
+|---|---|
+| `\.lock$` | Also matches `Cargo.lock`, `yarn.lock`, `poetry.lock`, `flake.lock` — the files a rebuild depends on most. |
+| `\.db$`, `\.sqlite$` | Enormous blast radius. Plenty of a person's own data lives in a SQLite file they named themselves. |
+| `/\.git/` | `.git` *is* the history. Excluding it turns a repository into a working tree and silently drops every local branch, stash and unpushed commit. |
+| `*.photoslibrary/(database\|resources)/` | A Photos library restored without its database is one the Photos app refuses to open. Only `resources/derivatives` and `Thumbnails` are skipped. |
+| `/tmp/`, `/Temp/` | Unanchored, these match an ancestor — see §Pattern shape. |
+
+`*.vmx`/`*.vmxf` are likewise kept where Code42 drops them: they are the few kilobytes that describe a virtual machine, and a disk image restored without them is harder to revive, not easier.
+
 ### How it reaches restic
 
-`BackupSet.backupExcludes(applying:)` appends the resolved patterns to `effectiveBackupExcludes` (the set's own `excludes` followed by its `purgeExcludes`), deduplicated with first-occurrence order preserved. The set's own patterns stay first, so adding a global list appends a block to the argv a set already produced rather than reordering it. `--exclude-caches` is added when the host asked for it and the set has not opted out.
+`backup` receives two exclusion blocks. The set's own `effectiveBackupExcludes` (its `excludes` followed by its `purgeExcludes`) stay on `--exclude`, exactly as before. `BackupSet.globalBackupExcludes(applying:)` supplies the host catalogue on `--iexclude`, dropping any pattern the set already names so the argv does not repeat itself. `--exclude-caches` and `--exclude-larger-than` are added when the host asked for them and the set has not opted out. The full argv order is pinned in `docs/restic-cli.md` §backup.
 
 **The list is forward-only and never becomes a purge pattern.** `restic rewrite --forget` sees `BackupSet.purgeExcludes` and nothing else — never `effectiveBackupExcludes`, never the global list. The asymmetry is the whole safety argument: a pattern that arrives because a newer build shipped a better default can keep files out of the *next* snapshot, and can never delete anything already in a repository. Removing a global pattern likewise restores nothing to snapshots written while it applied; that is ordinary forward-only exclude behaviour, not a purge.
 
@@ -883,8 +906,9 @@ This host's global exclusion list (§global-excludes.json). Host-local — `--ma
   "exists": false,
   "enabled": true,
   "excludeCaches": true,
-  "catalogVersion": 1,
-  "savedCatalogVersion": 1,
+  "excludeLargerThan": null,
+  "catalogVersion": 2,
+  "savedCatalogVersion": 2,
   "groups": [
     {
       "id": "browser-caches",
