@@ -1229,8 +1229,13 @@ public struct GlobalExcludeStore: Sendable {
             throw GlobalExcludeError.staleWrite(path: paths.globalExcludesFile.path)
         }
         let data = try ConfigStore.makeEncoder().encode(updated)
-        try data.write(to: tempFile)
-        try AtomicFile.rename(from: tempFile, to: paths.globalExcludesFile)
+        // Durable, not merely atomic. `rename(2)` is atomic for *readers*
+        // and says nothing about a power cut: without the two `fsync`s the
+        // file can come back empty, come back as its previous bytes, or
+        // come back as if the write never happened — and each of those
+        // restores the built-in defaults, re-enabling a group the operator
+        // had disabled.
+        try DurableFile.write(data, to: paths.globalExcludesFile, via: tempFile)
         return Self.fingerprint(of: data)
     }
 
@@ -1253,7 +1258,10 @@ public struct GlobalExcludeStore: Sendable {
             guard Self.entryExists(at: paths.globalExcludesFile) else {
                 return false
             }
-            try FileManager.default.removeItem(at: paths.globalExcludesFile)
+            // Durably, for the mirror-image reason: an unlink that has not
+            // reached the disk lets a reboot resurrect the file this command
+            // just reported removing, extra patterns and size cap included.
+            try DurableFile.remove(paths.globalExcludesFile)
             return true
         }
     }

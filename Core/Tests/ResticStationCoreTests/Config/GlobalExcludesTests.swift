@@ -750,6 +750,40 @@ import Testing
         }
     }
 
+    /// The write is durable, not merely atomic: the temp file is fsynced
+    /// before the rename and the containing directory after it, and a
+    /// removal syncs the directory too.
+    ///
+    /// A crash cannot be provoked from a unit test, so what is asserted is
+    /// the observable contract the fsyncs exist to serve — a save leaves
+    /// exactly the intended bytes and no temp file behind, and a removal
+    /// leaves no entry — plus the fact that the durable path is the one
+    /// taken. The reasoning for the syncs themselves lives in `DurableFile`.
+    @Test func aSaveLeavesTheTargetAndNoTempFileBehind() throws {
+        try withPaths { paths in
+            let store = GlobalExcludeStore(paths: paths)
+            var settings = GlobalExcludeSettings()
+            settings.extraPatterns = ["/one"]
+            try store.save(settings)
+
+            #expect(FileManager.default.fileExists(atPath: paths.globalExcludesFile.path))
+            #expect(!FileManager.default.fileExists(atPath: store.tempFile.path))
+            let loaded = try store.load()
+            #expect(loaded.extraPatterns == ["/one"])
+
+            // A second save replaces rather than appending, and still
+            // leaves no temp file.
+            settings.extraPatterns = ["/two"]
+            try store.save(settings)
+            #expect(!FileManager.default.fileExists(atPath: store.tempFile.path))
+            #expect(try store.load().extraPatterns == ["/two"])
+
+            #expect(try store.removeSettings() == true)
+            #expect(!FileManager.default.fileExists(atPath: paths.globalExcludesFile.path))
+            #expect(try store.removeSettings() == false)
+        }
+    }
+
     @Test func savingAnInvalidSettingsValueWritesNothing() throws {
         try withPaths { paths in
             let store = GlobalExcludeStore(paths: paths)
