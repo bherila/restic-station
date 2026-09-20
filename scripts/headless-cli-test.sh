@@ -273,13 +273,24 @@ expect_rc 0
 jq -e '.data | has("excludeLargerThan") and .excludeLargerThan == null' "$OUT_FILE" >/dev/null \
     || fail "no cap must be an explicit null, not an omitted key"
 # The catalogue is platform-scoped, so the report has to name which scope
-# it resolved and must not carry the other platform's spellings.
-jq -e '.data.platform == "linux"' "$OUT_FILE" >/dev/null \
-    || fail "excludes show --json must name the platform it resolved"
-jq -e '[.data.patterns[] | select(startswith("Library/"))] | length == 0' "$OUT_FILE" >/dev/null \
-    || fail "a Linux host must not carry the macOS Library/ patterns"
-jq -e '[.data.patterns[] | select(. == ".cache")] | length == 1' "$OUT_FILE" >/dev/null \
-    || fail "a Linux host must carry the XDG cache pattern"
+# it resolved and must carry that platform's spellings and not the other's.
+# Asserted in both directions on whichever host is running: a check that
+# only knew about Linux would pass vacuously on macOS.
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    EXPECT_PLATFORM=macOS
+    PRESENT_PATTERN='Library/Caches'
+    ABSENT_PATTERN='.cache'
+else
+    EXPECT_PLATFORM=linux
+    PRESENT_PATTERN='.cache'
+    ABSENT_PATTERN='Library/Caches'
+fi
+jq -e --arg p "$EXPECT_PLATFORM" '.data.platform == $p' "$OUT_FILE" >/dev/null \
+    || fail "excludes show --json must name the platform it resolved ($EXPECT_PLATFORM)"
+jq -e --arg p "$PRESENT_PATTERN" '[.data.patterns[] | select(. == $p)] | length == 1' "$OUT_FILE" >/dev/null \
+    || fail "this host must carry its own platform's pattern $PRESENT_PATTERN"
+jq -e --arg p "$ABSENT_PATTERN" '[.data.patterns[] | select(. == $p)] | length == 0' "$OUT_FILE" >/dev/null \
+    || fail "this host must not carry the other platform's pattern $ABSENT_PATTERN"
 jq -e '[.data.groups[] | select(.otherPlatformPatternCount > 0)] | length > 0' "$OUT_FILE" >/dev/null \
     || fail "the report must say how many patterns belong to the other platform"
 ok "the size cap is opt-in, validated on the way in, and liftable with \"none\""

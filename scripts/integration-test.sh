@@ -949,11 +949,10 @@ assert_global_excludes() {
         "Pictures/My Library.photoslibrary/database/Photos.sqlite"
         "VMs/ubuntu.vmx"
     )
-    # Must be skipped, including two case variants that only `--iexclude`
-    # catches and one `**` case.
+    # Must be skipped. `notes.TMP` is the case variant only `--iexclude`
+    # catches; `Render Files` is the `**` case.
     local skip=(
-        "Library/Caches/Google/Chrome/x.bin"
-        "library/caches/lowercased.bin"
+        "Documents/notes.TMP"
         "proj/node_modules/left-pad/index.js"
         "proj/target/debug/app"
         "proj/obj/Release/app.dll"
@@ -967,6 +966,19 @@ assert_global_excludes() {
         ".vscode/extensions/ms-python/x.js"
         "Documents/report.docx.icloud"
     )
+
+    # The catalogue is platform-scoped (`docs/data-model.md` §Platform
+    # scoping), so the same decoy belongs on opposite lists per host: a
+    # Linux box must NOT apply `Library/Caches`, and a Mac must not apply
+    # the XDG `.cache`. Asserting both directions on whichever host runs is
+    # what makes this a real check rather than one that passes vacuously.
+    if [[ "$OS_NAME" == "Darwin" ]]; then
+        skip+=("Library/Caches/Google/Chrome/x.bin")
+        keep+=(".cache/generic/keep-me.bin")
+    else
+        keep+=("Library/Caches/Google/Chrome/x.bin")
+        skip+=(".cache/generic/drop-me.bin")
+    fi
 
     local rel
     for rel in "${keep[@]}" "${skip[@]}"; do
@@ -1001,7 +1013,7 @@ assert_global_excludes() {
         || fail "$step" "the catalogue failed to exclude: ${leaked[*]}"
 
     rm -rf "$tree"
-    log "$step OK (${#keep[@]} kept, ${#skip[@]} skipped, as the catalogue promises)"
+    log "$step OK (${#keep[@]} kept, ${#skip[@]} skipped on $OS_NAME, as the catalogue promises)"
 }
 
 assert_tick_noop() {
