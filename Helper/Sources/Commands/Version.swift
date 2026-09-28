@@ -1,5 +1,6 @@
 import ArgumentParser
 import Foundation
+import ResticStationCore
 
 /// `version [--json]` — the helper's own version.
 ///
@@ -30,6 +31,12 @@ struct Version: AsyncParsableCommand, JSONRenderable {
         /// `fda-check` means anything here, needs it — and it is otherwise
         /// only inferable from prose.
         let platform: String
+        /// The newest `config.json` schema this binary reads and writes
+        /// (`AppConfig.currentVersion`). Hosts sharing one config must all
+        /// report at least the config's version (`docs/data-model.md`
+        /// §Versioning), and the release appcast is stamped from this value
+        /// rather than from source (`docs/release.md` §Updates).
+        let configSchemaVersion: Int
     }
 
     func run() async throws {
@@ -37,8 +44,15 @@ struct Version: AsyncParsableCommand, JSONRenderable {
             print("\(Self.name) \(Self.version)")
             return
         }
-        CLIJSON.print(
-            Report(name: Self.name, version: Self.version, platform: Self.platform)
+        CLIJSON.print(Self.report)
+    }
+
+    static var report: Report {
+        Report(
+            name: name,
+            version: version,
+            platform: platform,
+            configSchemaVersion: AppConfig.currentVersion
         )
     }
 

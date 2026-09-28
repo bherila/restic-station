@@ -486,8 +486,8 @@ log "PART 2a: success envelopes and documented payloads"
 RESTIC_STATION_DATA_DIR="$FIXTURE" run_helper_split version --json
 expect_rc 0
 assert_success_envelope "version --json"
-jq -e '.data | has("name") and has("version") and has("platform")' "$OUT_FILE" >/dev/null \
-    || fail "version --json payload is not { name, version, platform }"
+jq -e '.data | has("name") and has("version") and has("platform") and (.configSchemaVersion | type == "number")' "$OUT_FILE" >/dev/null \
+    || fail "version --json payload is not { name, version, platform, configSchemaVersion }"
 mark_cmd "version"
 
 RESTIC_STATION_DATA_DIR="$FIXTURE" run_helper_split status --json
