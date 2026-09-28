@@ -79,6 +79,7 @@ final class UpdateController: NSObject, ObservableObject, SPUUpdaterDelegate {
     func updater(_ updater: SPUUpdater, shouldProceedWithUpdate item: SUAppcastItem, updateCheck: SPUUpdateCheck) throws {
         try evaluate(
             declared: item.propertiesDictionary[UpdateSchemaGate.appcastElement],
+            feedVerified: item.signingValidationStatus == .succeeded,
             version: item.displayVersionString,
             build: item.versionString,
             updateCheck: updateCheck
@@ -89,17 +90,23 @@ final class UpdateController: NSObject, ObservableObject, SPUUpdaterDelegate {
     /// stop Sparkle from offering the update: `SUInstallationCanceledError`
     /// ends the check silently (the user already said "Not Now"); any other
     /// error is shown to the user for a check they started.
-    func evaluate(declared: Any?, version: String, build: String, updateCheck: SPUUpdateCheck) throws {
+    func evaluate(
+        declared: Any?,
+        feedVerified: Bool,
+        version: String,
+        build: String,
+        updateCheck: SPUUpdateCheck
+    ) throws {
         // `.updateInformation` only probes; nothing is offered or installed.
         guard updateCheck != .updateInformation else { return }
 
-        switch UpdateSchemaGate.decision(declared: declared, running: runningSchema) {
+        switch UpdateSchemaGate.decision(declared: declared, feedVerified: feedVerified, running: runningSchema) {
         case .proceed:
             return
-        case .refuse(let declaredSchema):
+        case .refuse(let refusal):
             throw NSError(domain: SUSparkleErrorDomain, code: Int(SUError.validationError.rawValue), userInfo: [
                 NSLocalizedDescriptionKey: UpdateSchemaGate.refusalMessage(
-                    version: version, declared: declaredSchema, running: runningSchema
+                    version: version, refusal: refusal, running: runningSchema
                 ),
             ])
         case .confirm(let change):

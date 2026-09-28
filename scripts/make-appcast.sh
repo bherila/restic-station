@@ -19,6 +19,11 @@
 # helper's `version --json`, and the signature is verified against the
 # SUPublicEDKey baked into the app before anything is written.
 #
+# The appcast itself is signed too (the app sets SURequireSignedFeed): the
+# schema element is what the app's update gate trusts, and only the feed
+# signature binds it to the archive. The published feed is read the same
+# way — its build and schema count only if its signature verifies.
+#
 # macOS only (ditto, codesign, PlistBuddy); bash 3.2-compatible.
 set -euo pipefail
 
@@ -54,6 +59,34 @@ PUBLIC_KEY=$(plist SUPublicEDKey) || die "app has no SUPublicEDKey"
 MIN_OS=$(plist LSMinimumSystemVersion) || MIN_OS=14.0
 TAG=${RELEASE_TAG:-v$VERSION}
 
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
+# Ed25519 SubjectPublicKeyInfo DER: fixed 12-byte prefix + the raw 32-byte key.
+{ printf '\x30\x2a\x30\x05\x06\x03\x2b\x65\x70\x03\x21\x00'; printf '%s' "$PUBLIC_KEY" | base64 -D; } > "$WORK/pub.der"
+
+# verify_ed <file> <base64 signature>: check against the key the *app*
+# trusts, not the key we signed with — a release signed by the wrong key is
+# one every installed copy rejects.
+verify_ed() {
+    printf '%s' "$2" | base64 -D > "$WORK/sig" || return 1
+    "$OPENSSL" pkeyutl -verify -pubin -inkey "$WORK/pub.der" -keyform DER -rawin -in "$1" -sigfile "$WORK/sig" >/dev/null 2>&1
+}
+
+# signed_feed_content <appcast> <out>: write the bytes the feed signature
+# covers — everything before the last "<!-- sparkle-signatures:" block, as
+# Sparkle's SPUExtractAppcastContent does — and succeed only if the embedded
+# edSignature and length verify. Sparkle parses only those bytes, so they
+# are the only ones worth reading.
+signed_feed_content() {
+    local offset sig len
+    offset=$(LC_ALL=C grep -a -b -o '<!-- sparkle-signatures:' "$1" | tail -1 | cut -d: -f1)
+    [ -n "$offset" ] || return 1
+    head -c "$offset" "$1" > "$2"
+    sig=$(tail -c +"$((offset + 1))" "$1" | sed -n 's/^edSignature:[[:space:]]*//p' | head -1)
+    len=$(tail -c +"$((offset + 1))" "$1" | sed -n 's/^length:[[:space:]]*//p' | head -1)
+    [ -n "$sig" ] && [ "$len" = "$offset" ] && verify_ed "$2" "$sig"
+}
+
 case $BUILD in ''|*[!0-9]*) die "CFBundleVersion '$BUILD' is not a plain integer; Sparkle orders updates by it" ;; esac
 
 SCHEMA=$("$APP/Contents/MacOS/restic-station-helper" version --json | jq -er '.data.configSchemaVersion') \
@@ -69,12 +102,15 @@ PREV_BUILD=""
 PREV_SCHEMA=""
 if [ "$PREVIOUS" != none ]; then
     if [ -f "$PREVIOUS" ]; then
-        PREV_XML=$(cat "$PREVIOUS")
+        cp "$PREVIOUS" "$WORK/previous.xml"
     else
         # -f: a 404 (no appcast published yet) is an error, not an empty feed.
-        PREV_XML=$(curl -fsSL "$PREVIOUS") \
+        curl -fsSL "$PREVIOUS" -o "$WORK/previous.xml" \
             || die "could not fetch the published appcast at $PREVIOUS (first release? set PREVIOUS_APPCAST=none)"
     fi
+    signed_feed_content "$WORK/previous.xml" "$WORK/previous-content.xml" \
+        || die "the published appcast at $PREVIOUS is not signed by the app's SUPublicEDKey"
+    PREV_XML=$(cat "$WORK/previous-content.xml")
     PREV_BUILD=$(printf '%s' "$PREV_XML" | xmllint --xpath 'string(//*[local-name()="version"])' - 2>/dev/null || true)
     PREV_SCHEMA=$(printf '%s' "$PREV_XML" | xmllint --xpath 'string(//*[local-name()="configSchemaVersion"])' - 2>/dev/null || true)
     [ -n "$PREV_BUILD" ] || die "previous appcast has no sparkle:version"
@@ -96,13 +132,7 @@ else
 fi
 LENGTH=$(stat -f %z "$ZIP")
 
-# Verify against the key the *app* trusts, not the key we signed with: a
-# release signed by the wrong key is one every installed copy rejects.
-WORK=$(mktemp -d)
-trap 'rm -rf "$WORK"' EXIT
-{ printf '\x30\x2a\x30\x05\x06\x03\x2b\x65\x70\x03\x21\x00'; printf '%s' "$PUBLIC_KEY" | base64 -D; } > "$WORK/pub.der"
-printf '%s' "$SIGNATURE" | base64 -D > "$WORK/sig"
-"$OPENSSL" pkeyutl -verify -pubin -inkey "$WORK/pub.der" -keyform DER -rawin -in "$ZIP" -sigfile "$WORK/sig" >/dev/null \
+verify_ed "$ZIP" "$SIGNATURE" \
     || { rm -f "$ZIP"; die "the signature does not verify against the app's SUPublicEDKey — wrong signing key?"; }
 
 NOTES_HTML=""
@@ -133,6 +163,21 @@ cat > "$OUT/appcast.xml" <<EOF
 </rss>
 EOF
 xmllint --noout "$OUT/appcast.xml" || die "wrote malformed XML"
+
+# Sign the feed (sign_update rewrites it and appends the signature), then
+# check the result as an installed copy would: signature, and the schema it
+# now carries.
+if [ -n "${SPARKLE_KEY_FILE:-}" ]; then
+    "$SPARKLE_BIN/sign_update" --ed-key-file "$SPARKLE_KEY_FILE" "$OUT/appcast.xml" >/dev/null
+else
+    "$SPARKLE_BIN/sign_update" --account restic-station "$OUT/appcast.xml" >/dev/null
+fi
+fail_feed() { rm -f "$ZIP" "$OUT/appcast.xml"; die "$1"; }
+signed_feed_content "$OUT/appcast.xml" "$WORK/content.xml" \
+    || fail_feed "the appcast signature does not verify against the app's SUPublicEDKey"
+xmllint --noout "$WORK/content.xml" || fail_feed "the signed appcast is malformed XML"
+SIGNED_SCHEMA=$(xmllint --xpath 'string(//*[local-name()="configSchemaVersion"])' "$WORK/content.xml")
+[ "$SIGNED_SCHEMA" = "$SCHEMA" ] || fail_feed "the signed appcast declares schema '$SIGNED_SCHEMA', not $SCHEMA"
 
 echo "Wrote $ZIP ($LENGTH bytes) and $OUT/appcast.xml"
 echo "  version $VERSION (build $BUILD), config schema v$SCHEMA${PREV_SCHEMA:+ (published: v$PREV_SCHEMA, build $PREV_BUILD)}"

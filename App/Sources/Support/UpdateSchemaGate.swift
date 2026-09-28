@@ -13,6 +13,14 @@ import Foundation
 /// `<resticstation:configSchemaVersion>`. The value is read fail-closed: an
 /// item without it, or with one that is not a positive integer, is treated
 /// as an unknown schema change and asks, rather than reading as "unchanged".
+///
+/// The element is only evidence if the feed it came from is signed. Sparkle's
+/// EdDSA archive signature covers the zip, not the appcast, so an unsigned
+/// feed could pair any genuine archive — including an old release that cannot
+/// read today's config — with any schema claim. The feed is therefore signed
+/// as a whole (`SURequireSignedFeed`), which binds the schema claim to the
+/// archive's signature in the same signed document, and an item from a feed
+/// whose signature did not verify is refused outright.
 enum UpdateSchemaGate {
     /// The appcast element, exactly as Sparkle keys it in
     /// `SUAppcastItem.propertiesDictionary` (prefix as written in the feed).
@@ -23,10 +31,18 @@ enum UpdateSchemaGate {
         case proceed
         /// The update migrates the shared config to `to`, or does not say.
         case confirm(SchemaChange)
+        /// Never offered; see `Refusal`.
+        case refuse(Refusal)
+    }
+
+    enum Refusal: Equatable {
         /// The update declares an *older* schema than this app writes. It
         /// could not read the config this app has already written — the
         /// exact failure that makes every backup set vanish from the UI.
-        case refuse(declared: Int)
+        case olderSchema(declared: Int)
+        /// The appcast's own signature did not verify (or was not checked),
+        /// so nothing it says about the update can be trusted.
+        case unverifiedFeed
     }
 
     enum SchemaChange: Equatable {
@@ -34,7 +50,13 @@ enum UpdateSchemaGate {
         case undeclared
     }
 
-    static func decision(declared rawValue: Any?, running: Int) -> Decision {
+    /// `feedVerified` is true only when Sparkle verified the appcast's
+    /// signature against `SUPublicEDKey`
+    /// (`SUAppcastItem.signingValidationStatus == .succeeded`).
+    static func decision(declared rawValue: Any?, feedVerified: Bool, running: Int) -> Decision {
+        guard feedVerified else {
+            return .refuse(.unverifiedFeed)
+        }
         guard let declared = parse(rawValue) else {
             return .confirm(.undeclared)
         }
@@ -42,7 +64,7 @@ enum UpdateSchemaGate {
             return .proceed
         }
         if declared < running {
-            return .refuse(declared: declared)
+            return .refuse(.olderSchema(declared: declared))
         }
         return .confirm(.upgrade(from: running, to: declared))
     }
@@ -82,9 +104,15 @@ enum UpdateSchemaGate {
         }
     }
 
-    static func refusalMessage(version: String, declared: Int, running: Int) -> String {
-        "Restic Station \(version) uses config schema v\(declared), older than the v\(running) this "
-            + "version already writes, so it couldn't read your backup sets. The update was not "
-            + "offered. Report this — it is a release mistake."
+    static func refusalMessage(version: String, refusal: Refusal, running: Int) -> String {
+        switch refusal {
+        case .olderSchema(let declared):
+            return "Restic Station \(version) uses config schema v\(declared), older than the v\(running) this "
+                + "version already writes, so it couldn't read your backup sets. The update was not "
+                + "offered. Report this — it is a release mistake."
+        case .unverifiedFeed:
+            return "The update feed offering Restic Station \(version) is not signed with this app's update "
+                + "key, so the update was not offered. Report this — the feed may have been altered."
+        }
     }
 }

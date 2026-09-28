@@ -80,7 +80,9 @@ gh release create vX.Y.Z dist/sparkle/Restic-Station-X.Y.Z.zip dist/sparkle/appc
 
 The Sparkle zip is the macOS app download: build it with the script (it zips the
 final, stapled `$APP`) rather than zipping by hand, because its signature is
-what every installed copy checks.
+what every installed copy checks. Upload `appcast.xml` exactly as the script
+wrote it — the feed is signed, and any edit (even whitespace) makes every
+installed copy refuse it until it is re-signed.
 
 Release notes should state the signing posture (notarized / ad-hoc), the minimum macOS (14) and restic (≥ 0.18) versions, and link the FDA setup walkthrough in the README.
 
@@ -104,10 +106,20 @@ and never installs silently (`SUAllowsAutomaticUpdates` NO). Users can turn
 background checks off in Settings → General; "Check for Updates…" is in the
 app menu, the menu bar extra, and Settings.
 
+**Signed feed.** The appcast is signed as a whole, not just the archive
+(`SURequireSignedFeed`, with `SUVerifyUpdateBeforeExtraction`, which Sparkle
+requires alongside it). Sparkle's archive signature covers only the zip, so an
+unsigned feed could pair any genuine release archive — including an old one —
+with any version number or schema claim. `SUSignedFeedFailureExpirationInterval`
+is 0: by default Sparkle falls back, after 20 days of failures, to offering
+items from a feed it cannot verify; with 0 a feed that fails verification is
+always an error and nothing is downloaded.
+
 **Signing key.** Updates are signed with an Ed25519 key whose public half is
 `SUPublicEDKey`. The private key lives in the release machine's login keychain
 (generic password, account `restic-station`, service
 `https://sparkle-project.org`) with one offline backup kept by the maintainer.
+The same key signs the archive and the feed.
 **Losing it strands every installed copy**: Sparkle rejects any update not
 signed by the key the running app trusts. Rotating it requires an update signed
 by the *old* key that ships the new `SUPublicEDKey`.
@@ -125,10 +137,13 @@ survives updates.
 `<resticstation:configSchemaVersion>` — the `config.json` schema the release
 writes, read by `scripts/make-appcast.sh` from the built helper's
 `version --json`, never from source. The running app compares it with its own
-`AppConfig.currentVersion` before Sparkle may offer the update:
+`AppConfig.currentVersion` before Sparkle may offer the update. The element is
+evidence only because the feed is signed: it and the archive's signature sit in
+the same signed document, so the claim is bound to that archive.
 
 | Declared schema | Behaviour |
 |---|---|
+| any, from a feed whose signature did not verify | refused (Sparkle normally stops before this point; the gate re-checks `SUAppcastItem.signingValidationStatus` so it never trusts an unverified claim) |
 | equal | offered normally |
 | higher | an alert explains that installing migrates the shared config and that every host sharing it must upgrade together; "Not Now" cancels, "Continue to Update…" proceeds to Sparkle's window and is remembered for that build |
 | missing or malformed | treated as an unknown change: same alert |
@@ -139,7 +154,12 @@ non-Sparkle elements by their qualified name as written.
 
 **`scripts/make-appcast.sh`** takes the final signed `.app`, zips it, signs the
 zip, verifies the signature against the app's own `SUPublicEDKey` with
-OpenSSL 3, and writes a one-item `appcast.xml`. It refuses a build number not
+OpenSSL 3, and writes a one-item `appcast.xml`, which it then signs with
+`sign_update` and verifies the same way — over the bytes before the trailing
+`<!-- sparkle-signatures:` block, the only bytes Sparkle parses — including
+that the signed feed still declares the helper's schema. The published feed it
+compares against must verify too; its build and schema are read only from the
+signed bytes. It refuses a build number not
 greater than the published one (Sparkle orders by `CFBundleVersion`, so bump
 `CURRENT_PROJECT_VERSION` every release), a schema older than the published
 one, and a missing published feed unless `PREVIOUS_APPCAST=none` (first
@@ -152,7 +172,9 @@ separate bundle ID and data directory found a localhost appcast for build 2,
 downloaded and installed it, and the result passed
 `codesign --verify --deep --strict`. With the same feed declaring schema v5,
 it fetched the appcast and stopped at the confirmation without downloading the
-archive. Not yet exercised: a Developer ID-signed update, and an update of a
+archive. With the feed signed, the same build-1 copy installed build 2 from the
+signed feed, and after a one-byte edit to that feed it fetched the appcast and
+downloaded nothing. Not yet exercised: a Developer ID-signed update, and an update of a
 running copy that holds FDA.
 
 ---

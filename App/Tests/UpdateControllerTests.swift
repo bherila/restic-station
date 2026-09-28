@@ -8,18 +8,18 @@ import Testing
 struct UpdateSchemaGateTests {
     @Test("an update that writes the running schema goes straight to Sparkle")
     func sameSchemaProceeds() {
-        #expect(UpdateSchemaGate.decision(declared: "4", running: 4) == .proceed)
-        #expect(UpdateSchemaGate.decision(declared: " 4\n", running: 4) == .proceed)
+        #expect(UpdateSchemaGate.decision(declared: "4", feedVerified: true, running: 4) == .proceed)
+        #expect(UpdateSchemaGate.decision(declared: " 4\n", feedVerified: true, running: 4) == .proceed)
     }
 
     @Test("an update that migrates the shared config asks first")
     func schemaUpgradeConfirms() {
-        #expect(UpdateSchemaGate.decision(declared: "5", running: 4) == .confirm(.upgrade(from: 4, to: 5)))
+        #expect(UpdateSchemaGate.decision(declared: "5", feedVerified: true, running: 4) == .confirm(.upgrade(from: 4, to: 5)))
     }
 
     @Test("an update that couldn't read the current config is refused")
     func olderSchemaRefuses() {
-        #expect(UpdateSchemaGate.decision(declared: "3", running: 4) == .refuse(declared: 3))
+        #expect(UpdateSchemaGate.decision(declared: "3", feedVerified: true, running: 4) == .refuse(.olderSchema(declared: 3)))
     }
 
     @Test(
@@ -27,12 +27,20 @@ struct UpdateSchemaGateTests {
         arguments: [nil, "", "four", "0", "-1", "4.0", "4 5"] as [String?]
     )
     func undeclaredSchemaConfirms(raw: String?) {
-        #expect(UpdateSchemaGate.decision(declared: raw, running: 4) == .confirm(.undeclared))
+        #expect(UpdateSchemaGate.decision(declared: raw, feedVerified: true, running: 4) == .confirm(.undeclared))
     }
 
     @Test("a non-string value is treated as undeclared")
     func nonStringConfirms() {
-        #expect(UpdateSchemaGate.decision(declared: NSNumber(value: 4), running: 4) == .confirm(.undeclared))
+        #expect(UpdateSchemaGate.decision(declared: NSNumber(value: 4), feedVerified: true, running: 4) == .confirm(.undeclared))
+    }
+
+    @Test(
+        "an item from a feed whose signature didn't verify is refused, whatever it claims",
+        arguments: ["4", "5", "3", nil] as [String?]
+    )
+    func unverifiedFeedRefuses(raw: String?) {
+        #expect(UpdateSchemaGate.decision(declared: raw, feedVerified: false, running: 4) == .refuse(.unverifiedFeed))
     }
 
     @Test("the confirmation names both schema versions and the fleet consequence")
@@ -79,8 +87,8 @@ struct UpdateControllerGateTests {
     func sameSchemaDoesNotPrompt() throws {
         let prompter = Prompter([])
         let controller = makeController(defaults: makeDefaults(), prompter: prompter)
-        try controller.evaluate(declared: "4", version: "0.2.0", build: "2", updateCheck: .updates)
-        try controller.evaluate(declared: "4", version: "0.2.0", build: "2", updateCheck: .updatesInBackground)
+        try controller.evaluate(declared: "4", feedVerified: true, version: "0.2.0", build: "2", updateCheck: .updates)
+        try controller.evaluate(declared: "4", feedVerified: true, version: "0.2.0", build: "2", updateCheck: .updatesInBackground)
         #expect(prompter.titles.isEmpty)
     }
 
@@ -92,7 +100,7 @@ struct UpdateControllerGateTests {
 
         for _ in 0..<2 {
             #expect {
-                try controller.evaluate(declared: "5", version: "0.2.0", build: "2", updateCheck: .updatesInBackground)
+                try controller.evaluate(declared: "5", feedVerified: true, version: "0.2.0", build: "2", updateCheck: .updatesInBackground)
             } throws: { error in
                 let error = error as NSError
                 return error.domain == SUSparkleErrorDomain
@@ -109,11 +117,11 @@ struct UpdateControllerGateTests {
         let prompter = Prompter([true, true])
         let controller = makeController(defaults: defaults, prompter: prompter)
 
-        try controller.evaluate(declared: "5", version: "0.2.0", build: "2", updateCheck: .updates)
+        try controller.evaluate(declared: "5", feedVerified: true, version: "0.2.0", build: "2", updateCheck: .updates)
         #expect(prompter.titles.count == 1)
-        try controller.evaluate(declared: "5", version: "0.2.0", build: "2", updateCheck: .updatesInBackground)
+        try controller.evaluate(declared: "5", feedVerified: true, version: "0.2.0", build: "2", updateCheck: .updatesInBackground)
         #expect(prompter.titles.count == 1)
-        try controller.evaluate(declared: "5", version: "0.2.1", build: "3", updateCheck: .updates)
+        try controller.evaluate(declared: "5", feedVerified: true, version: "0.2.1", build: "3", updateCheck: .updates)
         #expect(prompter.titles.count == 2)
         #expect(defaults.stringArray(forKey: UpdateController.acknowledgedVersionsKey) == ["2", "3"])
     }
@@ -122,7 +130,7 @@ struct UpdateControllerGateTests {
     func undeclaredPrompts() throws {
         let prompter = Prompter([true])
         let controller = makeController(defaults: makeDefaults(), prompter: prompter)
-        try controller.evaluate(declared: nil, version: "0.2.0", build: "2", updateCheck: .updates)
+        try controller.evaluate(declared: nil, feedVerified: true, version: "0.2.0", build: "2", updateCheck: .updates)
         #expect(prompter.titles == [UpdateSchemaGate.confirmationTitle(version: "0.2.0", change: .undeclared)])
     }
 
@@ -131,7 +139,7 @@ struct UpdateControllerGateTests {
         let prompter = Prompter([true])
         let controller = makeController(defaults: makeDefaults(), prompter: prompter)
         #expect {
-            try controller.evaluate(declared: "3", version: "0.2.0", build: "2", updateCheck: .updates)
+            try controller.evaluate(declared: "3", feedVerified: true, version: "0.2.0", build: "2", updateCheck: .updates)
         } throws: { error in
             let error = error as NSError
             return error.code != Int(SUError.installationCanceledError.rawValue)
@@ -140,11 +148,33 @@ struct UpdateControllerGateTests {
         #expect(prompter.titles.isEmpty)
     }
 
+    @Test("an unsigned feed is refused even for a build the user already confirmed")
+    func unverifiedFeedIgnoresAcknowledgement() throws {
+        let defaults = makeDefaults()
+        let prompter = Prompter([true])
+        let controller = makeController(defaults: defaults, prompter: prompter)
+        try controller.evaluate(declared: "5", feedVerified: true, version: "0.2.0", build: "2", updateCheck: .updates)
+        #expect(defaults.stringArray(forKey: UpdateController.acknowledgedVersionsKey) == ["2"])
+
+        for declared in ["4", "5"] {
+            #expect {
+                try controller.evaluate(
+                    declared: declared, feedVerified: false, version: "0.2.0", build: "2", updateCheck: .updates
+                )
+            } throws: { error in
+                let error = error as NSError
+                return error.code == Int(SUError.validationError.rawValue)
+                    && error.localizedDescription.contains("not signed")
+            }
+        }
+        #expect(prompter.titles.count == 1)
+    }
+
     @Test("an information-only probe never prompts, even for a schema change")
     func informationProbeDoesNotPrompt() throws {
         let prompter = Prompter([])
         let controller = makeController(defaults: makeDefaults(), prompter: prompter)
-        try controller.evaluate(declared: "5", version: "0.2.0", build: "2", updateCheck: .updateInformation)
+        try controller.evaluate(declared: "5", feedVerified: true, version: "0.2.0", build: "2", updateCheck: .updateInformation)
         #expect(prompter.titles.isEmpty)
     }
 }
@@ -171,6 +201,17 @@ struct SparkleInfoPlistTests {
         #expect(info["SUScheduledCheckInterval"] as? Int == 86_400)
         #expect(info["SUAutomaticallyUpdate"] as? Bool == false)
         #expect(info["SUAllowsAutomaticUpdates"] as? Bool == false)
+    }
+
+    @Test("the appcast must be signed, with no grace period after a failed check")
+    func signedFeedRequired() {
+        #expect(info["SURequireSignedFeed"] as? Bool == true)
+        // Sparkle ignores SURequireSignedFeed unless archives are also
+        // verified before extraction.
+        #expect(info["SUVerifyUpdateBeforeExtraction"] as? Bool == true)
+        // Sparkle's default (20 days) falls back to *offering* items from a
+        // feed that keeps failing; 0 disables that fallback.
+        #expect((info["SUSignedFeedFailureExpirationInterval"] as? NSNumber)?.doubleValue == 0)
     }
 
     @Test("the test host never starts the real updater")
