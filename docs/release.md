@@ -37,6 +37,14 @@ The app is intentionally **not sandboxed** (see [keychain-and-fda.md §4](keycha
 IDENTITY="Developer ID Application: <Your Name> (<TEAMID>)"
 codesign --force --options runtime --timestamp --sign "$IDENTITY" \
   "$APP/Contents/MacOS/restic-station-helper"
+# Sparkle's nested helpers, innermost first (Sparkle's own documented order;
+# Downloader.xpc keeps its entitlements).
+SPK="$APP/Contents/Frameworks/Sparkle.framework"
+codesign -f -s "$IDENTITY" -o runtime --timestamp "$SPK/Versions/B/XPCServices/Installer.xpc"
+codesign -f -s "$IDENTITY" -o runtime --timestamp --preserve-metadata=entitlements "$SPK/Versions/B/XPCServices/Downloader.xpc"
+codesign -f -s "$IDENTITY" -o runtime --timestamp "$SPK/Versions/B/Autoupdate"
+codesign -f -s "$IDENTITY" -o runtime --timestamp "$SPK/Versions/B/Updater.app"
+codesign -f -s "$IDENTITY" -o runtime --timestamp "$SPK"
 codesign --force --options runtime --timestamp --sign "$IDENTITY" "$APP"
 codesign --verify --deep --strict --verbose=2 "$APP"
 ```
@@ -65,15 +73,87 @@ ditto -c -k --keepParent "$APP" "Restic-Station-vX.Y.Z.zip"
 
 ```sh
 git tag vX.Y.Z && git push origin main vX.Y.Z
-gh release create vX.Y.Z "Restic-Station-vX.Y.Z.zip" \
+scripts/make-appcast.sh "$APP" dist/sparkle release-notes.html   # see §Updates
+gh release create vX.Y.Z dist/sparkle/Restic-Station-X.Y.Z.zip dist/sparkle/appcast.xml \
   --title "Restic Station vX.Y.Z" --notes-file <release-notes.md>
 ```
+
+The Sparkle zip is the macOS app download: build it with the script (it zips the
+final, stapled `$APP`) rather than zipping by hand, because its signature is
+what every installed copy checks.
 
 Release notes should state the signing posture (notarized / ad-hoc), the minimum macOS (14) and restic (≥ 0.18) versions, and link the FDA setup walkthrough in the README.
 
 ## 7. Post-release smoke test
 
 On a machine (or account) that has never run the app: download the release zip, unzip, move to `/Applications`, launch — Gatekeeper must open it without warnings (notarized builds). Complete onboarding through the FDA step and confirm one scheduled backup fires.
+
+
+## Updates (Sparkle)
+
+The app updates itself with [Sparkle](https://sparkle-project.org) 2.10.0
+(pinned exactly in `project.yml`), reading the appcast attached to the
+**latest** GitHub release:
+`https://github.com/bherila/restic-station/releases/latest/download/appcast.xml`.
+GitHub's `latest` skips pre-releases and drafts, so a release that installed
+copies should be offered must be published as a normal release.
+
+**Policy** (Info.plist, `App/Resources/Info.plist`): checks once a day
+(`SUScheduledCheckInterval` 86400), shows Sparkle's standard update window,
+and never installs silently (`SUAllowsAutomaticUpdates` NO). Users can turn
+background checks off in Settings → General; "Check for Updates…" is in the
+app menu, the menu bar extra, and Settings.
+
+**Signing key.** Updates are signed with an Ed25519 key whose public half is
+`SUPublicEDKey`. The private key lives in the release machine's login keychain
+(generic password, account `restic-station`, service
+`https://sparkle-project.org`) with one offline backup kept by the maintainer.
+**Losing it strands every installed copy**: Sparkle rejects any update not
+signed by the key the running app trusts. Rotating it requires an update signed
+by the *old* key that ships the new `SUPublicEDKey`.
+
+**Code signing.** Sparkle accepts an update whose EdDSA signature verifies even
+when the Apple code signature differs, which is what makes ad-hoc releases
+updatable at all. The new bundle must still be validly signed (ad-hoc at
+minimum). On an ad-hoc build, macOS keys Full Disk Access to the exact binary,
+so FDA — for the app *and* the helper — must be re-granted after each update,
+and the Login Items approval may reset; Settings → Permissions shows both.
+Developer ID signing removes this, because the designated requirement then
+survives updates.
+
+**Config schema gate.** Each appcast item carries
+`<resticstation:configSchemaVersion>` — the `config.json` schema the release
+writes, read by `scripts/make-appcast.sh` from the built helper's
+`version --json`, never from source. The running app compares it with its own
+`AppConfig.currentVersion` before Sparkle may offer the update:
+
+| Declared schema | Behaviour |
+|---|---|
+| equal | offered normally |
+| higher | an alert explains that installing migrates the shared config and that every host sharing it must upgrade together; "Not Now" cancels, "Continue to Update…" proceeds to Sparkle's window and is remembered for that build |
+| missing or malformed | treated as an unknown change: same alert |
+| lower | refused — that release could not read the config this one wrote |
+
+The element prefix must stay exactly `resticstation:` — Sparkle keys
+non-Sparkle elements by their qualified name as written.
+
+**`scripts/make-appcast.sh`** takes the final signed `.app`, zips it, signs the
+zip, verifies the signature against the app's own `SUPublicEDKey` with
+OpenSSL 3, and writes a one-item `appcast.xml`. It refuses a build number not
+greater than the published one (Sparkle orders by `CFBundleVersion`, so bump
+`CURRENT_PROJECT_VERSION` every release), a schema older than the published
+one, and a missing published feed unless `PREVIOUS_APPCAST=none` (first
+Sparkle release only). On a schema bump it prepends the fleet warning to the
+release notes. Sign from another machine with
+`SPARKLE_KEY_FILE=<exported key>`.
+
+**Verified 2026-09-28** on macOS with ad-hoc builds: a build-1 copy under a
+separate bundle ID and data directory found a localhost appcast for build 2,
+downloaded and installed it, and the result passed
+`codesign --verify --deep --strict`. With the same feed declaring schema v5,
+it fetched the appcast and stopped at the confirmation without downloading the
+archive. Not yet exercised: a Developer ID-signed update, and an update of a
+running copy that holds FDA.
 
 ---
 

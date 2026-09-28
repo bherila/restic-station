@@ -106,7 +106,7 @@ Findings observed during implementation and review — not speculation:
 
 ## 4. Signing & distribution (v1 posture)
 
-Local builds: ad-hoc/dev signing, works for personal use (with the dev-workflow caveats above). CI: `CODE_SIGNING_ALLOWED=NO`, build-only. Distribution to others (later): Developer ID + hardened runtime + notarization — no entitlement exceptions needed (we load no plugins, no JIT); steps live in `docs/release.md` (T20). The app is **not sandboxed** by design: it must spawn `/usr/bin/security`, an arbitrary user-configured restic binary, `launchctl`, and take `flock`s — all incompatible with App Sandbox. Consequence: no Mac App Store; accepted.
+Local builds: ad-hoc/dev signing, works for personal use (with the dev-workflow caveats above). CI: `CODE_SIGNING_ALLOWED=NO`, build-only. Distribution to others (later): Developer ID + hardened runtime + notarization — no entitlement exceptions needed (we load no plugins, no JIT); steps live in `docs/release.md` (T20). The app is **not sandboxed** by design: it must spawn `/usr/bin/security`, an arbitrary user-configured restic binary, `launchctl`, and take `flock`s — all incompatible with App Sandbox. Consequence: no Mac App Store; accepted. The app updates itself with Sparkle (`docs/release.md` §Updates); on an ad-hoc build every update is a new binary to TCC, so Full Disk Access must be re-granted after it — Developer ID signing is what makes grants survive updates.
 
 ## 5. Linux: the `secrets.json` file backend
 
