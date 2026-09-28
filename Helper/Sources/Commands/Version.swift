@@ -18,9 +18,11 @@ struct Version: AsyncParsableCommand, JSONRenderable {
 
     /// The single source of truth for the printed version. The human line
     /// is built from this rather than the other way round, so the two can
-    /// never disagree.
+    /// never disagree. It must equal `MARKETING_VERSION` in `project.yml`,
+    /// which the app bundle carries; `VersionReportTests` enforces that,
+    /// because the Linux helper has no bundle to read it from.
     static let name = "restic-station-helper"
-    static let version = "0.1.0"
+    static let version = "0.1.1"
 
     /// `version --json`'s shape — see `docs/cli-json.md`.
     struct Report: Encodable {

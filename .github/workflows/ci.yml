@@ -332,7 +332,11 @@ jobs:
           test -x "$APP/Contents/MacOS/restic-station-helper"
           plutil -lint "$APP/Contents/Library/LaunchAgents/net.herila.ResticStation.helper.plist"
           OUT=$("$APP/Contents/MacOS/restic-station-helper" version)
-          echo "$OUT" | grep -q "restic-station-helper 0.1.0"
+          # The bundle and the helper must both report project.yml's version.
+          EXPECTED=$(sed -n 's/^[[:space:]]*MARKETING_VERSION:[[:space:]]*"\{0,1\}\([^"]*\)"\{0,1\}[[:space:]]*$/\1/p' project.yml | head -1)
+          test -n "$EXPECTED"
+          test "$OUT" = "restic-station-helper $EXPECTED"
+          test "$(plutil -extract CFBundleShortVersionString raw -o - "$APP/Contents/Info.plist")" = "$EXPECTED"
       # T26: `timer` is Linux-only. A subcommand that exists on macOS and
       # always errors would be a worse --help than one that is honestly absent.
       - name: timer is absent from --help on macOS
@@ -570,19 +574,19 @@ jobs:
           docker build -t rs-scratch-test "$WORK"
           OUT=$(docker run --rm rs-scratch-test version)
           echo "$OUT"
-          echo "$OUT" | grep -q "restic-station-helper 0.1.0"
+          echo "$OUT" | grep -Eq '^restic-station-helper [0-9]+[.][0-9]+[.][0-9]+$'
       - name: Runs on Alpine (musl userland — the SDK's own libc family)
         run: |
           docker run --rm \
             -v "$PWD/dist/restic-station-linux-${{ matrix.arch }}:/work" \
             alpine:3.19 /work/restic-station-helper version | tee /tmp/out.txt
-          grep -q "restic-station-helper 0.1.0" /tmp/out.txt
+          grep -Eq '^restic-station-helper [0-9]+[.][0-9]+[.][0-9]+$' /tmp/out.txt
       - name: Runs on Debian 12 Bookworm (glibc userland — proves no glibc need)
         run: |
           docker run --rm \
             -v "$PWD/dist/restic-station-linux-${{ matrix.arch }}:/work" \
             debian:12-slim /work/restic-station-helper version | tee /tmp/out.txt
-          grep -q "restic-station-helper 0.1.0" /tmp/out.txt
+          grep -Eq '^restic-station-helper [0-9]+[.][0-9]+[.][0-9]+$' /tmp/out.txt
       # Deliberately old glibc (CentOS 7: glibc 2.17, released 2012) — the
       # point is that this must work identically to the two checks above
       # *because* the binary carries no glibc dependency at all, static or
@@ -597,4 +601,4 @@ jobs:
           docker run --rm \
             -v "$PWD/dist/restic-station-linux-${{ matrix.arch }}:/work" \
             centos:7 /work/restic-station-helper version | tee /tmp/out.txt
-          grep -q "restic-station-helper 0.1.0" /tmp/out.txt
+          grep -Eq '^restic-station-helper [0-9]+[.][0-9]+[.][0-9]+$' /tmp/out.txt

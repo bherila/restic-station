@@ -39,8 +39,8 @@ targets:
         # Merged into the generated plist: the Sparkle keys, which have no
         # INFOPLIST_KEY_ build setting (docs/release.md §Updates).
         INFOPLIST_FILE: App/Resources/Info.plist
-        MARKETING_VERSION: "0.1.0"
-        CURRENT_PROJECT_VERSION: "1"
+        MARKETING_VERSION: "0.1.1"
+        CURRENT_PROJECT_VERSION: "2"
     dependencies:
       - package: ResticStationCore
       - package: Sparkle
