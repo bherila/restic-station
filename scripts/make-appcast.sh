@@ -51,6 +51,17 @@ for candidate in "${OPENSSL_BIN:-}" /opt/homebrew/bin/openssl /usr/local/bin/ope
 done
 [ -n "$OPENSSL" ] || die "OpenSSL 3 is required to verify the signature (brew install openssl@3)"
 
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
+
+# Snapshot the bundle first. Everything below — version, schema, code
+# signature, and the zip itself — is derived from this private copy, so a
+# build that rewrites the original mid-run cannot pair one bundle's schema
+# claim with another bundle's archive.
+mkdir "$WORK/stage"
+ditto "$APP" "$WORK/stage/$(basename "$APP")" || die "could not copy $APP"
+APP="$WORK/stage/$(basename "$APP")"
+
 plist() { /usr/libexec/PlistBuddy -c "Print :$1" "$APP/Contents/Info.plist" 2>/dev/null; }
 VERSION=$(plist CFBundleShortVersionString) || die "app has no CFBundleShortVersionString"
 BUILD=$(plist CFBundleVersion) || die "app has no CFBundleVersion"
@@ -59,8 +70,6 @@ PUBLIC_KEY=$(plist SUPublicEDKey) || die "app has no SUPublicEDKey"
 MIN_OS=$(plist LSMinimumSystemVersion) || MIN_OS=14.0
 TAG=${RELEASE_TAG:-v$VERSION}
 
-WORK=$(mktemp -d)
-trap 'rm -rf "$WORK"' EXIT
 # Ed25519 SubjectPublicKeyInfo DER: fixed 12-byte prefix + the raw 32-byte key.
 { printf '\x30\x2a\x30\x05\x06\x03\x2b\x65\x70\x03\x21\x00'; printf '%s' "$PUBLIC_KEY" | base64 -D; } > "$WORK/pub.der"
 
