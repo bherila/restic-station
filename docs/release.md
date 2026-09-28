@@ -16,6 +16,8 @@ Both fields live in `project.yml` (they flow into the app *and* embedded helper 
 | `MARKETING_VERSION` | User-visible semver, e.g. `0.2.0` |
 | `CURRENT_PROJECT_VERSION` | Monotonic build number; bump by 1 every release |
 
+Also set `Version.version` in `Helper/Sources/Commands/Version.swift` to the same `MARKETING_VERSION` — the Linux helper has no bundle to read it from, and `VersionReportTests` fails until the two match. `CURRENT_PROJECT_VERSION` is what Sparkle orders updates by, and `scripts/make-appcast.sh` refuses a build that isn't newer than the published one.
+
 After editing: `./scripts/bootstrap.sh` (re-runs `xcodegen generate`), commit as `Release vX.Y.Z`.
 
 ## 2. Build
@@ -29,45 +31,46 @@ xcodebuild -scheme "Restic Station" -configuration Release \
 APP="build/Build/Products/Release/Restic Station.app"
 ```
 
-## 3. Sign — Developer ID + hardened runtime
+## 3. Sign — ad-hoc
 
-The app is intentionally **not sandboxed** (see [keychain-and-fda.md §4](keychain-and-fda.md)); it needs no entitlement exceptions (no JIT, no plugins), so hardened runtime is enabled with no entitlements file. Sign inside-out — the embedded helper first, then the bundle:
+Restic Station is **not** signed with a Developer ID and is **not** notarized;
+this is the permanent posture, not a stopgap. Releases are ad-hoc signed and
+personal-use.
+
+The app is intentionally **not sandboxed** (see [keychain-and-fda.md §4](keychain-and-fda.md)).
+The Release build from step 2 is already ad-hoc signed. If anything in the
+bundle was changed afterwards, re-sign it inside-out — the embedded helper and
+Sparkle's nested helpers first, then the bundle:
 
 ```sh
-IDENTITY="Developer ID Application: <Your Name> (<TEAMID>)"
-codesign --force --options runtime --timestamp --sign "$IDENTITY" \
-  "$APP/Contents/MacOS/restic-station-helper"
-# Sparkle's nested helpers, innermost first (Sparkle's own documented order;
-# Downloader.xpc keeps its entitlements).
+codesign --force --sign - "$APP/Contents/MacOS/restic-station-helper"
 SPK="$APP/Contents/Frameworks/Sparkle.framework"
-codesign -f -s "$IDENTITY" -o runtime --timestamp "$SPK/Versions/B/XPCServices/Installer.xpc"
-codesign -f -s "$IDENTITY" -o runtime --timestamp --preserve-metadata=entitlements "$SPK/Versions/B/XPCServices/Downloader.xpc"
-codesign -f -s "$IDENTITY" -o runtime --timestamp "$SPK/Versions/B/Autoupdate"
-codesign -f -s "$IDENTITY" -o runtime --timestamp "$SPK/Versions/B/Updater.app"
-codesign -f -s "$IDENTITY" -o runtime --timestamp "$SPK"
-codesign --force --options runtime --timestamp --sign "$IDENTITY" "$APP"
+codesign -f -s - "$SPK/Versions/B/XPCServices/Installer.xpc"
+codesign -f -s - --preserve-metadata=entitlements "$SPK/Versions/B/XPCServices/Downloader.xpc"
+codesign -f -s - "$SPK/Versions/B/Autoupdate"
+codesign -f -s - "$SPK/Versions/B/Updater.app"
+codesign -f -s - "$SPK"
+codesign --force --sign - "$APP"
 codesign --verify --deep --strict --verbose=2 "$APP"
 ```
 
-> No Developer ID certificate? Stop after an ad-hoc sign (`codesign --force --deep -s - "$APP"`) and mark the release as **unsigned/personal-use** in the release notes — recipients must clear quarantine themselves (`xattr -dr com.apple.quarantine`). Notarization (step 4) is impossible without Developer ID; skip to step 5.
+Consequences, stated in every release's notes:
 
-## 4. Notarize and staple
+- **First install:** Gatekeeper blocks a downloaded ad-hoc app. The user
+  clears quarantine (`xattr -dr com.apple.quarantine "/Applications/Restic Station.app"`)
+  or approves it in System Settings → Privacy & Security → Open Anyway.
+  Updates installed by Sparkle don't go through this.
+- **Full Disk Access after an update:** TCC keys an ad-hoc binary to its exact
+  code, so FDA for the app *and* the helper may have to be re-granted after
+  each update; see §Updates.
 
-One-time setup: `xcrun notarytool store-credentials restic-station --apple-id <id> --team-id <TEAMID> --password <app-specific-password>`.
+## 4. Notarize
 
-```sh
-ditto -c -k --keepParent "$APP" ResticStation.zip
-xcrun notarytool submit ResticStation.zip --keychain-profile restic-station --wait
-xcrun stapler staple "$APP"
-spctl --assess --type execute --verbose "$APP"   # expect: accepted, Notarized Developer ID
-# re-zip AFTER stapling — the stapled ticket must ship in the archive
-rm ResticStation.zip
-ditto -c -k --keepParent "$APP" "Restic-Station-vX.Y.Z.zip"
-```
+Not applicable — notarization requires a Developer ID.
 
 ## 5. Release-artifact verification
 
-- [ ] Run **every** manual checklist in [testing.md §Layer 3](testing.md#layer-3--manual-checklists-docstasks-reference-these-run-before-tagging-a-release) with the final signed release artifact (stapled when notarized) copied to `/Applications`, and record the required build SHA/artifact identity with each result. This includes SMAppService, stall detection, FDA, the Keychain evidence matrix, sleep/catch-up, physical-mirror recovery, read-only retention preview, the manual-apply containment refusal, scheduled retention via a due tick, token-confirmed reclaim space, and restores from local, external-volume, and SFTP destinations. These cannot be automated — do not skip them.
+- [ ] Run **every** manual checklist in [testing.md §Layer 3](testing.md#layer-3--manual-checklists-docstasks-reference-these-run-before-tagging-a-release) with the final signed release artifact copied to `/Applications`, and record the required build SHA/artifact identity with each result. This includes SMAppService, stall detection, FDA, the Keychain evidence matrix, sleep/catch-up, physical-mirror recovery, read-only retention preview, the manual-apply containment refusal, scheduled retention via a due tick, token-confirmed reclaim space, and restores from local, external-volume, and SFTP destinations. These cannot be automated — do not skip them. A release that waives this gate anyway says so in its release notes, and names the evidence that ran instead (for example, the hosted `macOS Release Verification` workflow).
 
 ## 6. Tag and publish
 
@@ -84,11 +87,11 @@ what every installed copy checks. Upload `appcast.xml` exactly as the script
 wrote it — the feed is signed, and any edit (even whitespace) makes every
 installed copy refuse it until it is re-signed.
 
-Release notes should state the signing posture (notarized / ad-hoc), the minimum macOS (14) and restic (≥ 0.18) versions, and link the FDA setup walkthrough in the README.
+Release notes should state the signing posture (ad-hoc, not notarized, and what that means for first install and Full Disk Access), the minimum macOS (14) and restic (≥ 0.18) versions, and link the FDA setup walkthrough in the README.
 
 ## 7. Post-release smoke test
 
-On a machine (or account) that has never run the app: download the release zip, unzip, move to `/Applications`, launch — Gatekeeper must open it without warnings (notarized builds). Complete onboarding through the FDA step and confirm one scheduled backup fires.
+On a machine (or account) that has never run the app: download the release zip, unzip, move to `/Applications`, clear quarantine as the release notes say, launch. Complete onboarding through the FDA step and confirm one scheduled backup fires.
 
 
 ## Updates (Sparkle)
@@ -122,7 +125,10 @@ always an error and nothing is downloaded.
 The same key signs the archive and the feed.
 **Losing it strands every installed copy**: Sparkle rejects any update not
 signed by the key the running app trusts. Rotating it requires an update signed
-by the *old* key that ships the new `SUPublicEDKey`.
+by the *old* key that ships the new `SUPublicEDKey`. `scripts/make-appcast.sh`
+cannot package that transition yet: it verifies every signature against the
+key inside the bundle being released, which is the new one. Add a
+transitional trust-key option before attempting a rotation.
 
 **Code signing.** Sparkle accepts an update whose EdDSA signature verifies even
 when the Apple code signature differs, which is what makes ad-hoc releases
@@ -130,8 +136,9 @@ updatable at all. The new bundle must still be validly signed (ad-hoc at
 minimum). On an ad-hoc build, macOS keys Full Disk Access to the exact binary,
 so FDA — for the app *and* the helper — must be re-granted after each update,
 and the Login Items approval may reset; Settings → Permissions shows both.
-Developer ID signing removes this, because the designated requirement then
-survives updates.
+The project does not use a Developer ID, so this cost is permanent unless a
+stable self-signed identity turns out to keep grants across updates
+(untested).
 
 **Config schema gate.** Each appcast item carries
 `<resticstation:configSchemaVersion>` — the `config.json` schema the release
@@ -174,9 +181,9 @@ downloaded and installed it, and the result passed
 it fetched the appcast and stopped at the confirmation without downloading the
 archive. With the feed signed, the same build-1 copy installed build 2 from the
 signed feed, and after a one-byte edit to that feed it fetched the appcast and
-downloaded nothing. Not yet exercised: a Developer ID-signed update, and an update of a
+downloaded nothing. Not yet exercised: an update of a
 running copy that holds FDA.
 
 ---
 
-**Dry-run status (2026-07-27):** steps 1–3 verified through *ad-hoc* signing (no Developer ID certificate on the dev machine); notarization steps are written from the standard `notarytool` flow but have not been executed yet — verify on first real Developer ID release.
+**Dry-run status (2026-07-27):** steps 1–3 verified with ad-hoc signing.
