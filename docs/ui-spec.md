@@ -25,7 +25,7 @@ Menu content (top to bottom):
 2. One line per set (disabled item): `"<SetName> — <relative last backup> <✓|⚠|✕>"`, e.g. "Projects — 2 hours ago ✓". Never run: "Projects — never backed up".
 3. If a run is in flight: `"Backing up <SetName>… 42%"` (disabled, updates on menu reopen — NSMenu items don't live-update reliably while open; accepted).
 4. Divider. `Back Up Now ▸` submenu with one item per set (disabled while that set is running/busy or schedule state needs recovery).
-5. Divider. `Open Restic Station` (activates app, opens main window), `Quit Restic Station`.
+5. Divider. `Open Restic Station` (activates app, opens main window), `Check for Updates…` (Sparkle; disabled while a check or install is in flight — `docs/release.md` §Updates), `Quit Restic Station`.
 
 Quitting the app does NOT stop scheduled backups (they're launchd's job) — the Quit item's tooltip/help says so.
 
@@ -89,7 +89,7 @@ Per set (picker or sections):
 
 ## Settings
 
-- **General**: show menu-bar icon toggle; launch at login note (the *agent* runs regardless; this is only about the app UI).
+- **General**: show menu-bar icon toggle; launch at login note (the *agent* runs regardless; this is only about the app UI); **Updates** section with "Check for updates automatically" (Sparkle's daily background check) and `Check for Updates…`. An update that changes the shared config schema asks first (`docs/release.md` §Updates).
 - **restic binary**: discovered path + version chip; "Locate manually…" file picker; states: OK (green, "restic 0.18.1"), too old (yellow, "0.16 found — 0.17+ required"), missing (red, "Install with `brew install restic`").
 - **Permissions & background**:
   - FDA card: two badges — App: granted/denied; Background agent: granted/denied/unknown (from `fda-check.json`; "Re-check" button kickstarts the helper). "Open Full Disk Access settings" button (deep link). Help disclosure with the fallback instructions (add helper binary manually — path shown, copyable).

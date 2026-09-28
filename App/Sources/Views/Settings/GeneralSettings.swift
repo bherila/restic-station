@@ -2,8 +2,8 @@ import ResticStationCore
 import SwiftUI
 
 /// Settings → General (`docs/ui-spec.md` §Settings): the menu-bar icon
-/// toggle, the launch-at-login note, and the entry point back into the setup
-/// assistant.
+/// toggle, the launch-at-login note, update checks, and the entry point back
+/// into the setup assistant.
 ///
 /// The launch-at-login note is the whole point of this pane. "Show menu bar
 /// icon" looks like the switch that controls whether backups happen — it is
@@ -12,6 +12,7 @@ import SwiftUI
 /// paragraph exists to prevent.
 struct GeneralSettings: View {
     @EnvironmentObject private var model: AppModel
+    @EnvironmentObject private var updates: UpdateController
 
     /// Set by the root pane, so "Setup assistant…" presents the sheet over
     /// the whole Settings window rather than inside one tab.
@@ -41,6 +42,18 @@ struct GeneralSettings: View {
             } footer: {
                 Text("Scheduled backups run whether or not Restic Station is open — a background "
                     + "agent handles them. This setting only affects the app's own icon.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section {
+                Toggle("Check for updates automatically", isOn: $updates.automaticallyChecksForUpdates)
+                CheckForUpdatesButton()
+            } header: {
+                Text("Updates")
+            } footer: {
+                Text("Checks GitHub once a day. Nothing is installed until you click Install, and an "
+                    + "update that changes the shared configuration asks first.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }

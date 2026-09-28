@@ -7,7 +7,8 @@ import SwiftUI
 /// 1. one disabled status line per set,
 /// 2. a disabled progress line for each in-flight run,
 /// 3. divider + `Back Up Now ▸` submenu (per-set, disabled while busy),
-/// 4. divider + `Open Restic Station` / `Quit Restic Station`.
+/// 4. divider + `Open Restic Station` / `Check for Updates…` /
+///    `Quit Restic Station`.
 ///
 /// Plain `Text` items render as disabled menu items, which is exactly the
 /// "informational, not clickable" affordance the spec asks for.
@@ -66,6 +67,8 @@ struct MenuBarView: View {
             Button("Open Restic Station") {
                 openMainWindow()
             }
+
+            CheckForUpdatesButton()
 
             Button("Quit Restic Station") {
                 NSApplication.shared.terminate(nil)

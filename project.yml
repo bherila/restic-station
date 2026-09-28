@@ -11,6 +11,11 @@ packages:
   swift-argument-parser:
     url: https://github.com/apple/swift-argument-parser
     from: 1.3.0
+  # Exact pin: the generated project (and so its Package.resolved) is not
+  # committed, and the updater is on the update-signature trust path.
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle
+    exactVersion: 2.10.0
 
 targets:
   "Restic Station":
@@ -31,10 +36,14 @@ targets:
         INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.utilities
         CODE_SIGN_ENTITLEMENTS: App/ResticStation.entitlements
         GENERATE_INFOPLIST_FILE: YES
-        MARKETING_VERSION: "0.1.0"
-        CURRENT_PROJECT_VERSION: "1"
+        # Merged into the generated plist: the Sparkle keys, which have no
+        # INFOPLIST_KEY_ build setting (docs/release.md §Updates).
+        INFOPLIST_FILE: App/Resources/Info.plist
+        MARKETING_VERSION: "0.1.1"
+        CURRENT_PROJECT_VERSION: "2"
     dependencies:
       - package: ResticStationCore
+      - package: Sparkle
       - target: restic-station-helper
         embed: true
         codeSign: true

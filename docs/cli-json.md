@@ -44,7 +44,7 @@ itself, unwrapped, because its output is meant to be fed straight back into
 
 | Command | `--json` | Payload (`data`) |
 |---|---|---|
-| `version` | ✅ | `{ name, version, platform }` |
+| `version` | ✅ | `{ name, version, platform, configSchemaVersion }` — the last is the newest `config.json` schema this binary reads and writes |
 | `status` | ✅ | `StatusReport` — see `data-model.md` §`status --json` |
 | `sets list` | ✅ | array of set entries — `data-model.md` §`sets list --json` |
 | `runs list` | ✅ | array of `RunIndexEntry` |
