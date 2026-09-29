@@ -78,6 +78,11 @@ final class AppModel: ObservableObject {
     /// overwriting a config we failed to understand would destroy the user's
     /// backup definitions.
     @Published private(set) var configLoadError: String?
+    /// Why `config.json` itself failed its last load or reload (`nil` once
+    /// it loads). Unlike `configLoadError`, never set by a `machine.json`
+    /// failure — this is what tells the set list and the menu bar that the
+    /// sets they show are missing or stale, not absent.
+    @Published private(set) var configFileProblem: ConfigFileProblem?
     /// True only when config.json itself failed to load or reload. Kept
     /// separate from the combined operator-facing error, which can also
     /// contain a machine.json failure that Reload Settings cannot repair.
@@ -240,6 +245,7 @@ final class AppModel: ObservableObject {
         // branch below needs to append to whatever the config branch found.
         var loadFailures: [String] = []
         var configReloadRequired = false
+        var configFileProblem: ConfigFileProblem?
 
         let loadedConfig: AppConfig
         let loadedConfigFingerprint: String
@@ -258,6 +264,7 @@ final class AppModel: ObservableObject {
             loadedConfig = AppConfig()
             loadedConfigFingerprint = configStore.fileFingerprint()
             configReloadRequired = true
+            configFileProblem = ConfigFileProblem(error)
             loadFailures.append(Self.describe(configLoadFailure: error, path: paths.configFile.path))
         }
 
@@ -282,6 +289,7 @@ final class AppModel: ObservableObject {
 
         self.configLoadError = loadFailures.isEmpty ? nil : loadFailures.joined(separator: "\n\n")
         self.configReloadRequired = configReloadRequired
+        self.configFileProblem = configFileProblem
 
         self.machine = loadedMachine
         self.config = loadedConfig
@@ -484,6 +492,7 @@ final class AppModel: ObservableObject {
             configReloadRequired = snapshot.config.version < AppConfig.currentVersion
             configChangedOnDisk = configReloadRequired
             configLoadError = machineLoadError
+            configFileProblem = nil
             resolvedConfig = snapshot.config.resolved(for: refreshedMachine).config
             addressableConfig = snapshot.config.addressable(for: refreshedMachine)
             stateWatcher.updateConfiguredSetIds(Set(resolvedConfig.sets.map(\.id)))
@@ -502,6 +511,8 @@ final class AppModel: ObservableObject {
             guard requestGeneration == configReloadGeneration else { return }
             let detail = Self.describe(configLoadFailure: error, path: paths.configFile.path)
             configLoadError = [detail, machineLoadError].compactMap { $0 }.joined(separator: "\n\n")
+            configFileProblem = ConfigFileProblem(error)
+            recomputeDerivedState()
             configReloadRequired = true
             configChangedOnDisk = true
             lastConfigError = "Reload failed: \(error)"
@@ -677,15 +688,21 @@ final class AppModel: ObservableObject {
         // visible even when no app window survives.
         appHealth = Self.health(
             derivedHealth,
-            pendingSecretRollbackError: pendingSecretRollbackError
+            pendingSecretRollbackError: pendingSecretRollbackError,
+            configFileProblem: configFileProblem
         )
     }
 
+    /// A config this app cannot read means scheduled backups on this
+    /// machine have stopped (the helper refuses it too), so it is a warning
+    /// even though every set-level signal looks quiet.
     static func health(
         _ derivedHealth: AppHealth,
-        pendingSecretRollbackError: String?
+        pendingSecretRollbackError: String?,
+        configFileProblem: ConfigFileProblem? = nil
     ) -> AppHealth {
-        pendingSecretRollbackError == nil || derivedHealth == .critical
+        guard derivedHealth != .critical else { return derivedHealth }
+        return pendingSecretRollbackError == nil && configFileProblem == nil
             ? derivedHealth
             : .warning
     }

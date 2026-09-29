@@ -81,7 +81,9 @@ struct AppAlertBanners: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            if model.configChangedOnDisk {
+            if let problem = model.configFileProblem {
+                ConfigProblemBanner(problem: problem)
+            } else if model.configChangedOnDisk {
                 ConfigChangeBanner()
             }
             if let error = model.pendingSecretRollbackError {
@@ -152,6 +154,37 @@ struct ConfigChangeBanner: View {
             Text("Settings changed on disk. Reload before saving to avoid overwriting those changes.")
                 .fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 12)
+            Button("Reload Settings") {
+                Task { await model.reloadConfigFromDisk() }
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 9)
+        .background(.bar)
+        .overlay(alignment: .bottom) { Divider() }
+    }
+}
+
+/// `config.json` failed its last load or reload (#162). Replaces the
+/// generic "changed on disk" banner, which a failed reload also raises,
+/// because it says what is wrong: an unreadable file, or one written by a
+/// newer Restic Station.
+struct ConfigProblemBanner: View {
+    @EnvironmentObject private var model: AppModel
+    let problem: ConfigFileProblem
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.yellow)
+            // With no earlier config to show, the set list carries the full
+            // explanation; the banner only has to name the problem.
+            Text(model.config.sets.isEmpty ? problem.menuBarLine : problem.staleListBanner)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 12)
+            if problem.offersUpdateCheck {
+                CheckForUpdatesButton()
+            }
             Button("Reload Settings") {
                 Task { await model.reloadConfigFromDisk() }
             }

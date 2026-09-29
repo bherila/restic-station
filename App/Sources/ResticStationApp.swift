@@ -19,6 +19,7 @@ struct ResticStationApp: App {
         WindowGroup("Restic Station", id: AppWindowID.main) {
             MainWindow()
                 .environmentObject(model)
+                .environmentObject(updates)
                 // `StateWatcher` and `LaunchdManager` are separate
                 // `ObservableObject`s; views that render raw live state
                 // (runs list, progress bars, agent status) observe them

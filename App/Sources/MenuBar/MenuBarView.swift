@@ -37,8 +37,17 @@ struct MenuBarView: View {
                 Divider()
             }
 
+            if let problem = model.configFileProblem {
+                Text(problem.menuBarLine)
+                    .help(problem.explanation)
+                Divider()
+            }
+
             if model.setHealths.isEmpty {
-                Text("No backup sets yet")
+                // An unreadable config already said why the list is empty.
+                if model.configFileProblem == nil {
+                    Text("No backup sets yet")
+                }
             } else {
                 ForEach(model.setHealths) { health in
                     Text(MenuBarCopy.statusLine(for: health))
