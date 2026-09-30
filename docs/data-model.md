@@ -710,6 +710,10 @@ The schema change needs no data change: an absent `machines` key already means "
 
 This is the first step that does **not** preserve the older behavior: a v3 build let restic download them. That is deliberate — an unattended backup that silently pulls a cloud library down to a small disk is the failure this key exists to prevent — and a set that needs every file in its snapshots opts back in with `"download"`, or keeps the folder available offline in the provider. It changes nothing for a set with no cloud-synced source. As with v3, a v3 build refuses a v4 config (§Loader behavior), so hosts sharing a config upgrade together.
 
+### How `config.json` and `machine.json` are written
+
+Every write is atomic for readers **and** crash-durable (#159, `DurableFile`): the bytes go to a temp file beside the target (`O_NOFOLLOW`, so a symlink planted there is refused rather than written through), the temp file is `fsync`ed, `rename(2)` installs it (on Darwin, the compare-and-swap save's `RENAME_SWAP`), and then the containing directory is `fsync`ed. A failure before the rename leaves the old file in place. A directory sync that fails after the rename is `ConfigStoreError.durabilityUnconfirmed`: the new file is live, so it is reported as a possibly-committed save (the app reconciles against the live bytes rather than rolling back paired keychain changes), with a note to save again.
+
 ### Who migrates, and who is told (#161)
 
 A migration is a fleet event, so it is never silent, but who performs it differs by process:
@@ -726,8 +730,8 @@ For a file below the current version, `ConfigStore.load()`:
 
 1. Adds **no** `machines` keys.
 2. If `config.json` has a `resticPath` and `machine.json` has none, moves it into `machine.json` and clears the deprecated field. If `machine.json` already has one, that one wins and the deprecated field is still cleared. If the write fails, `resticPath` is left in `config.json`, where it still works as the documented fallback.
-3. Copies the untouched source bytes to **`config.v<source-version>.backup.json`**, beside `config.json`, with `O_EXCL` — **never** overwriting an existing backup, so a second migration cannot clobber the source's copy (or a copy the user put there by hand).
-4. Only if that backup exists, writes the current-version config atomically.
+3. Copies the untouched source bytes to **`config.v<source-version>.backup.json`**, beside `config.json`, with `O_EXCL` — **never** overwriting an existing backup, so a second migration cannot clobber the source's copy (or a copy the user put there by hand). The backup and its directory are `fsync`ed before step 4; a backup that cannot be synced counts as not written.
+4. Only if that backup exists, writes the current-version config atomically and durably.
 5. Sets `version: 4` and returns.
 
 Migration is **idempotent**: the second load sees `version: 4` and does nothing. Every persistence step is best-effort — a data directory that cannot be written must not stop the helper from running backups, and the migration is a pure function of the file, so an unwritten migration simply reruns next load. What is *not* best-effort is the ordering: **the source file is never overwritten unless a backup of it exists.**

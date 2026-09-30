@@ -337,11 +337,10 @@ public struct ConfigStore: Sendable {
             return
         }
         try paths.ensureDirectories()
-        do {
-            try original.write(to: backupFile, options: .withoutOverwriting)
-        } catch let error as NSError where error.code == NSFileWriteFileExistsError {
-            return // lost a race with another process; its copy is just as good
-        }
+        // Durable before the source is overwritten (#159): a crash must not
+        // leave a migrated config.json whose backup never reached the disk.
+        // `false` = lost an O_EXCL race; that copy is just as good.
+        _ = try DurableFile.createExclusive(original, at: backupFile)
     }
 
     /// A persisted schema bump is a fleet event (#161): say so on stderr —
@@ -399,7 +398,9 @@ public struct ConfigStore: Sendable {
 
         let data = try Self.makeEncoder().encode(config)
         return try withConfigWriteLock {
-            try data.write(to: tempConfigFile)
+            // The candidate's bytes reach the disk before it can become
+            // visible, and the directory after, as in `persist` (#159).
+            try DurableFile.writeSynced(data, to: tempConfigFile, exclusive: false)
             let installed = try AtomicFile.replaceIfMatches(
                 from: tempConfigFile,
                 to: paths.configFile,
@@ -408,8 +409,12 @@ public struct ConfigStore: Sendable {
             )
             guard installed else {
                 try? FileManager.default.removeItem(at: tempConfigFile)
+                // A rollback restored some other revision; make that durable
+                // too, best-effort — this save has already failed.
+                try? DurableFile.syncDirectory(of: paths.configFile)
                 throw ConfigStoreError.changedOnDisk
             }
+            try DurableFile.syncDirectoryAfterInstall(of: paths.configFile)
             return SHA256Digest.hex(data)
         }
     }
@@ -467,9 +472,9 @@ public struct ConfigStore: Sendable {
         }
     }
 
+    /// Crash-durable replacement (#159): see `DurableFile`.
     private func persist(_ data: Data) throws {
-        try data.write(to: tempConfigFile)
-        try AtomicFile.rename(from: tempConfigFile, to: paths.configFile)
+        try DurableFile.write(data, to: paths.configFile, via: tempConfigFile)
     }
 
     private func readConfigBytes() throws -> Data? {
@@ -814,6 +819,10 @@ public enum ConfigStoreError: Error, Equatable, Sendable, CustomStringConvertibl
     case changedOnDisk
     case writeLockBusy(path: String)
     case writeLockUnusable(LockFailure)
+    /// The file was installed under its name, but syncing its directory
+    /// failed, so the rename may not survive a power cut (#159). The live
+    /// file is the new one; this is not "not saved".
+    case durabilityUnconfirmed(path: String, errno: Int32)
 
     public var description: String {
         switch self {
@@ -838,6 +847,9 @@ public enum ConfigStoreError: Error, Equatable, Sendable, CustomStringConvertibl
             return "another process is changing config.json (lock busy: \(path)); reload and try again"
         case .writeLockUnusable(let failure):
             return "cannot safely lock config.json for writing: \(failure)"
+        case .durabilityUnconfirmed(let path, let errno):
+            return "\(path) was saved, but syncing its directory to disk failed (errno \(errno)); "
+                + "the change is live now and may not survive a power loss — save again to be sure"
         }
     }
 
@@ -858,7 +870,7 @@ public enum ConfigStoreError: Error, Equatable, Sendable, CustomStringConvertibl
     public var commitMayBeUncertain: Bool {
         switch self {
         case .replacementRollbackFailed, .rollbackArtifactPreserved,
-             .rollbackArtifactPreservationFailed:
+             .rollbackArtifactPreservationFailed, .durabilityUnconfirmed:
             return true
         default:
             return false

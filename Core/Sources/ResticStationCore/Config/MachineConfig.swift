@@ -307,8 +307,9 @@ public struct MachineStore: Sendable {
         return updated
     }
 
-    /// Validates the `machineId`, then writes atomically (temp file +
-    /// `rename(2)`), creating the data directory if needed.
+    /// Validates the `machineId`, then writes atomically and crash-durably
+    /// (`DurableFile`: synced temp file, `rename(2)`, synced directory),
+    /// creating the data directory if needed.
     ///
     /// Writes `machine` **verbatim, including its `machineId`** — so it is
     /// for creating an identity or deliberately renaming one. To persist any
@@ -319,7 +320,6 @@ public struct MachineStore: Sendable {
         }
         try paths.ensureDirectories()
         let data = try ConfigStore.makeEncoder().encode(machine)
-        try data.write(to: tempMachineFile)
-        try AtomicFile.rename(from: tempMachineFile, to: paths.machineFile)
+        try DurableFile.write(data, to: paths.machineFile, via: tempMachineFile)
     }
 }
