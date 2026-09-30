@@ -340,6 +340,45 @@ public struct FdaCheckResult: Codable, Equatable, Sendable {
     }
 }
 
+/// `state/config-migration.json` — this host rewrote the shared
+/// `config.json` at a newer schema. Every host sharing the file must now
+/// run a build that reads `toVersion`, or its backups stop; the record
+/// keeps that visible (app health, `status --json`) until acknowledged.
+public struct ConfigMigrationRecord: Codable, Equatable, Sendable {
+    public var fromVersion: Int
+    public var toVersion: Int
+    public var migratedAt: Date
+    /// The process that wrote it (`restic-station-helper`, `Restic Station`).
+    public var process: String
+    /// `machine.json`'s `machineId` at the time, when it could be read.
+    public var machineId: String?
+    public var acknowledgedAt: Date?
+
+    public init(
+        fromVersion: Int,
+        toVersion: Int,
+        migratedAt: Date,
+        process: String,
+        machineId: String?,
+        acknowledgedAt: Date? = nil
+    ) {
+        self.fromVersion = fromVersion
+        self.toVersion = toVersion
+        self.migratedAt = migratedAt
+        self.process = process
+        self.machineId = machineId
+        self.acknowledgedAt = acknowledgedAt
+    }
+
+    public var needsAcknowledgement: Bool { acknowledgedAt == nil }
+
+    /// The one sentence every surface uses for the fleet consequence.
+    public static func fleetWarning(from: Int, to: Int) -> String {
+        "config.json was upgraded from schema v\(from) to v\(to). Every machine that shares it, "
+            + "including Linux hosts, must run a Restic Station that reads v\(to), or backups stop there."
+    }
+}
+
 // MARK: - StateStoreError
 
 /// Which path under `state/` a permission refusal names. Structured rather
@@ -1434,6 +1473,28 @@ public struct StateStore: Sendable {
 
     public func writeFdaCheck(_ result: FdaCheckResult) throws {
         try write(result, to: paths.fdaCheckFile)
+    }
+
+    /// A missing or undecodable record reads as `nil` (no warning). This is
+    /// a notice, not an input to anything destructive.
+    public func readConfigMigration() -> ConfigMigrationRecord? {
+        read(ConfigMigrationRecord.self, from: paths.configMigrationFile)
+    }
+
+    public func writeConfigMigration(_ record: ConfigMigrationRecord) throws {
+        try write(record, to: paths.configMigrationFile)
+    }
+
+    /// Marks the current record acknowledged. Returns it, or `nil` when
+    /// there is nothing to acknowledge.
+    @discardableResult
+    public func acknowledgeConfigMigration(at date: Date = Date()) throws -> ConfigMigrationRecord? {
+        guard var record = readConfigMigration() else { return nil }
+        if record.acknowledgedAt == nil {
+            record.acknowledgedAt = date
+            try writeConfigMigration(record)
+        }
+        return record
     }
 
     // MARK: - state/ enumeration

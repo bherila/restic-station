@@ -378,6 +378,7 @@ public enum HealthDerivation {
         backgroundAgentEnabled: Bool?,
         lockingBroken: Bool = false,
         destructiveAuditFailure: Bool = false,
+        configMigrationUnacknowledged: Bool = false,
         runLiveness: (CurrentRunState) -> CurrentRunLiveness = { _ in .live }
     ) -> AppHealth {
         if destructiveAuditFailure {
@@ -402,6 +403,7 @@ public enum HealthDerivation {
             fullDiskAccessDenied: fullDiskAccessDenied,
             backgroundAgentEnabled: backgroundAgentEnabled,
             lockingBroken: lockingBroken,
+            configMigrationUnacknowledged: configMigrationUnacknowledged,
             runLiveness: runLiveness
         ) {
             return .warning
@@ -427,12 +429,17 @@ public enum HealthDerivation {
     ///   files are unusable, so nothing can be scheduled at all. Passed as a
     ///   live probe rather than read from recorded state, because the fault
     ///   it describes is usually the reason nothing could be recorded (#110).
+    /// - Parameter configMigrationUnacknowledged: this host rewrote the
+    ///   shared `config.json` at a newer schema and nobody has acknowledged
+    ///   it (`state/config-migration.json`, #161). Hosts that have not been
+    ///   upgraded stop backing up, and they cannot report it themselves.
     public static func hasWarningConditions(
         setHealths: [SetHealth],
         runsInFlight: [CurrentRunState],
         fullDiskAccessDenied: Bool,
         backgroundAgentEnabled: Bool?,
         lockingBroken: Bool = false,
+        configMigrationUnacknowledged: Bool = false,
         runLiveness: (CurrentRunState) -> CurrentRunLiveness = { _ in .live }
     ) -> Bool {
         // An unhealthy run for a set that is no longer configured has no
@@ -445,5 +452,6 @@ public enum HealthDerivation {
             || fullDiskAccessDenied
             || backgroundAgentEnabled == false
             || lockingBroken
+            || configMigrationUnacknowledged
     }
 }

@@ -201,7 +201,9 @@ public struct ConfigStore: Sendable {
             try persist(Self.makeEncoder().encode(migration.config))
         } catch {
             Self.warn("could not write the migrated config.json: \(error)")
+            return migration.config
         }
+        recordMigration(from: config.version, to: migration.config.version)
         return migration.config
     }
 
@@ -339,6 +341,27 @@ public struct ConfigStore: Sendable {
             try original.write(to: backupFile, options: .withoutOverwriting)
         } catch let error as NSError where error.code == NSFileWriteFileExistsError {
             return // lost a race with another process; its copy is just as good
+        }
+    }
+
+    /// A persisted schema bump is a fleet event (#161): say so on stderr —
+    /// which reaches the terminal for a CLI edit and the log for a scheduled
+    /// tick — and leave `state/config-migration.json` so app health and
+    /// `status --json` keep saying it until someone acknowledges it. Both are
+    /// best-effort: the migration itself has already succeeded.
+    private func recordMigration(from: Int, to: Int) {
+        Self.warn(ConfigMigrationRecord.fleetWarning(from: from, to: to))
+        let record = ConfigMigrationRecord(
+            fromVersion: from,
+            toVersion: to,
+            migratedAt: Date(),
+            process: ProcessInfo.processInfo.processName,
+            machineId: (try? machineStore.load())?.machineId
+        )
+        do {
+            try StateStore(paths: paths).writeConfigMigration(record)
+        } catch {
+            Self.warn("could not record the migration in \(paths.configMigrationFile.path): \(error)")
         }
     }
 

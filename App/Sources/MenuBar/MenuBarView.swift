@@ -43,6 +43,16 @@ struct MenuBarView: View {
                 Divider()
             }
 
+            if let migration = model.unacknowledgedConfigMigration {
+                Text("Upgrade every machine sharing config.json (now schema v\(migration.toVersion))")
+                    .help(ConfigMigrationRecord.fleetWarning(from: migration.fromVersion, to: migration.toVersion))
+                Divider()
+            } else if let offer = model.pendingSchemaUpgrade {
+                Text("config.json can be upgraded to schema v\(offer.toVersion)")
+                    .help(offer.bannerText)
+                Divider()
+            }
+
             if model.setHealths.isEmpty {
                 // An unreadable config already said why the list is empty.
                 if model.configFileProblem == nil {

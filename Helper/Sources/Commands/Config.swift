@@ -17,7 +17,10 @@ struct Config: AsyncParsableCommand {
         commandName: "config",
         abstract: "Move the shared config.json between machines, and inspect what it resolves to "
             + "for one. Never reads or writes machine.json or any secret. Exit 0 ok, 1 error.",
-        subcommands: [ConfigExport.self, ConfigImport.self, ConfigValidate.self, ConfigShow.self]
+        subcommands: [
+            ConfigExport.self, ConfigImport.self, ConfigValidate.self, ConfigShow.self,
+            ConfigUpgrade.self, ConfigAcknowledgeMigration.self,
+        ]
     )
 }
 
@@ -573,5 +576,160 @@ struct ConfigShow: AsyncParsableCommand, JSONRenderable {
             }
         }
         HelperExit.code(0)
+    }
+}
+
+// MARK: - config upgrade
+
+/// `config upgrade [--json]` — migrate `config.json` to this build's schema
+/// on purpose, rather than as a side effect of the next load (#161).
+///
+/// Every loader still migrates an older file (`docs/data-model.md`
+/// §Versioning & migration); this is the explicit form, for a Linux host or
+/// an agent that wants to do it at a moment of its choosing and see the
+/// fleet consequence. Like every migration it records
+/// `state/config-migration.json`, which keeps `status` at warning until
+/// `config acknowledge-migration`.
+struct ConfigUpgrade: AsyncParsableCommand, JSONRenderable {
+    static let configuration = CommandConfiguration(
+        commandName: "upgrade",
+        abstract: "Migrate config.json to this build's schema now (keeping config.v<N>.backup.json), "
+            + "and say what every other machine sharing it must do. A no-op when it is already current."
+    )
+
+    @Flag(name: .long, help: "Emit JSON. Only JSON reaches stdout in this mode.")
+    var json = false
+
+    /// `config upgrade --json`'s shape — see `docs/cli-json.md`.
+    struct Report: Encodable {
+        let fromVersion: Int
+        let toVersion: Int
+        let migrated: Bool
+        /// `config.v<from>.backup.json` when a migration ran, else `null`.
+        let backupFile: String?
+        /// The fleet warning when `migrated`, else `null`.
+        let message: String?
+
+        private enum CodingKeys: String, CodingKey {
+            case fromVersion, toVersion, migrated, backupFile, message
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(fromVersion, forKey: .fromVersion)
+            try container.encode(toVersion, forKey: .toVersion)
+            try container.encode(migrated, forKey: .migrated)
+            try container.encode(backupFile, forKey: .backupFile)
+            try container.encode(message, forKey: .message)
+        }
+    }
+
+    func run() async throws {
+        let context = ConfigCLIContext.make()
+        let before: Int
+        do {
+            // Unlocked, non-migrating read of the version as written.
+            before = try context.configStore.reconciliationSnapshot().config.version
+        } catch {
+            throw CLIFailure.configInvalid(underlying: error)
+        }
+
+        let after: Int
+        do {
+            _ = try context.configStore.load()
+            after = try context.configStore.reconciliationSnapshot().config.version
+        } catch {
+            throw CLIFailure.configInvalid(underlying: error)
+        }
+        // `load()` migrates in memory even when it cannot write; an upgrade
+        // that did not reach the file is a failure, not a success.
+        guard after == AppConfig.currentVersion else {
+            throw CLIFailure(
+                code: .internalError,
+                message: "config.json is still at schema v\(after): the migrated file could not be written "
+                    + "(see the warnings above). Nothing else was changed."
+            )
+        }
+
+        let migrated = before < AppConfig.currentVersion
+        let report = Report(
+            fromVersion: before,
+            toVersion: after,
+            migrated: migrated,
+            backupFile: migrated ? context.paths.configBackupFile(fromVersion: before).path : nil,
+            message: migrated ? ConfigMigrationRecord.fleetWarning(from: before, to: after) : nil
+        )
+        if json {
+            CLIJSON.print(report)
+        } else if migrated {
+            print("Upgraded config.json from schema v\(before) to v\(after).")
+            print("The previous file is kept at \(report.backupFile ?? "")")
+            print(report.message ?? "")
+            print("Once they are, run: restic-station-helper config acknowledge-migration")
+        } else {
+            print("config.json is already at schema v\(after); nothing to do.")
+        }
+    }
+}
+
+// MARK: - config acknowledge-migration
+
+/// `config acknowledge-migration [--json]` — the operator confirms every
+/// machine sharing the config was upgraded, which clears the warning that
+/// `state/config-migration.json` raises in `status` and the app.
+struct ConfigAcknowledgeMigration: AsyncParsableCommand, JSONRenderable {
+    static let configuration = CommandConfiguration(
+        commandName: "acknowledge-migration",
+        abstract: "Clear the warning left by the last config.json schema migration on this machine, "
+            + "once every machine sharing the config has been upgraded."
+    )
+
+    @Flag(name: .long, help: "Emit JSON. Only JSON reaches stdout in this mode.")
+    var json = false
+
+    /// `config acknowledge-migration --json`'s shape — see `docs/cli-json.md`.
+    struct Report: Encodable {
+        /// `false` when there was no migration record at all.
+        let hadMigration: Bool
+        let fromVersion: Int?
+        let toVersion: Int?
+        let acknowledgedAt: Date?
+
+        private enum CodingKeys: String, CodingKey {
+            case hadMigration, fromVersion, toVersion, acknowledgedAt
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(hadMigration, forKey: .hadMigration)
+            try container.encode(fromVersion, forKey: .fromVersion)
+            try container.encode(toVersion, forKey: .toVersion)
+            try container.encode(acknowledgedAt, forKey: .acknowledgedAt)
+        }
+    }
+
+    func run() async throws {
+        let context = ConfigCLIContext.make()
+        let record: ConfigMigrationRecord?
+        do {
+            record = try context.stateStore.acknowledgeConfigMigration()
+        } catch {
+            throw CLIFailure.stateUnreadable(
+                "could not write \(context.paths.configMigrationFile.path): \(error)"
+            )
+        }
+        let report = Report(
+            hadMigration: record != nil,
+            fromVersion: record?.fromVersion,
+            toVersion: record?.toVersion,
+            acknowledgedAt: record?.acknowledgedAt
+        )
+        if json {
+            CLIJSON.print(report)
+        } else if let record {
+            print("Acknowledged the v\(record.fromVersion) → v\(record.toVersion) config migration.")
+        } else {
+            print("No config migration has been recorded on this machine; nothing to acknowledge.")
+        }
     }
 }
