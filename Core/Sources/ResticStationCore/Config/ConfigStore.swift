@@ -199,6 +199,11 @@ public struct ConfigStore: Sendable {
         do {
             try migration.config.validate()
             try persist(Self.makeEncoder().encode(migration.config))
+        } catch ConfigStoreError.durabilityUnconfirmed(let path, let errno) {
+            // The migrated file is live — only its directory sync failed —
+            // so every later load reads the new version and never migrates
+            // again. This is the only chance to leave the fleet warning.
+            Self.warn("\(path) was migrated, but syncing its directory failed (errno \(errno))")
         } catch {
             Self.warn("could not write the migrated config.json: \(error)")
             return migration.config

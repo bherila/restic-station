@@ -217,4 +217,24 @@ import Musl
         #expect(throws: LockFailure.self) { try store.save(AppConfig()) }
         #expect(try String(contentsOf: decoy, encoding: .utf8) == "untouched")
     }
+
+    /// Codex on #165: a migration whose directory sync fails has still
+    /// replaced config.json, and no later load will migrate again — so the
+    /// fleet warning must be recorded now or never.
+    @Test func aMigrationWithUnconfirmedDurabilityIsStillRecorded() throws {
+        let (paths, root) = try makePaths()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let from = AppConfig.currentVersion - 1
+        try ConfigStore.makeEncoder().encode(AppConfig(version: from)).write(to: paths.configFile)
+        try MachineStore(paths: paths, environment: [:]).save(MachineConfig(machineId: "studio-mac"))
+
+        // backup file, backup directory, config temp, config directory ← fails
+        _ = try DurableFile.$sync.withValue(SyncProbe(failing: [4]).hook) {
+            try ConfigStore(paths: paths).load()
+        }
+
+        #expect(try ConfigStore(paths: paths).reconciliationSnapshot().config.version == AppConfig.currentVersion)
+        let record = try #require(StateStore(paths: paths).readConfigMigration())
+        #expect(record.fromVersion == from)
+    }
 }
