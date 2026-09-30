@@ -26,7 +26,7 @@ import Testing
             return
         }
         #expect(reason.contains("no password is stored"))
-        #expect(reason.contains("secret set \(T.primaryId.uuidString)"))
+        #expect(reason.contains(DestinationAttention.secretSetCommand(destId: T.primaryId)))
         #expect(env.fake.invocations.isEmpty)
         #expect(env.indexEntries.isEmpty, "no run record — a 2-minute schedule must not write one per tick")
         #expect(env.stateStore.readScheduleState() == nil)

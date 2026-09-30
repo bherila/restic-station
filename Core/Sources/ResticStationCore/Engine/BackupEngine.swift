@@ -3696,7 +3696,7 @@ public final class BackupEngine: Sendable {
         switch attention {
         case .secretNotConfigured:
             return "no password is stored for destination \"\(destination.label)\" — "
-                + "store it with `restic-station-helper secret set \(destination.id.uuidString)` or in the app"
+                + "store it with `\(DestinationAttention.secretSetCommand(destId: destination.id))` or in the app"
         case .secretStoreUnusable, .cloudRepositoryNotHydrated:
             return "the secrets for destination \"\(destination.label)\" cannot be read: \(error.description)"
         }

@@ -449,7 +449,7 @@ struct StatusReportTests {
             detail: "item not found", detectedAt: detectedAt
         ))
         #expect(missing.code == "secret_not_configured")
-        #expect(missing.detail.contains("secret set \(destId.uuidString)"))
+        #expect(missing.detail.contains(DestinationAttention.secretSetCommand(destId: destId)))
         #expect(missing.detectedAt == detectedAt)
 
         let unusable = StatusReport.SecretProblem(SecretAttentionRecord(

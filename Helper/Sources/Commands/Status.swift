@@ -573,7 +573,7 @@ struct StatusReport: Encodable {
         init(_ record: SecretAttentionRecord) {
             code = record.attention.code.rawValue
             detail = record.attention == .secretNotConfigured
-                ? "no password is stored; run `restic-station-helper secret set \(record.destId.uuidString)`"
+                ? "no password is stored; run `\(DestinationAttention.secretSetCommand(destId: record.destId))`"
                 : record.detail
             detectedAt = record.detectedAt
         }

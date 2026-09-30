@@ -89,6 +89,14 @@ public enum DestinationAttention: String, Codable, Sendable, Equatable, CaseIter
     /// Remedy: keep the repository folder available offline in the provider.
     case cloudRepositoryNotHydrated = "cloud_repository_not_hydrated"
 
+    /// The command that stores a destination's password — the repair for
+    /// ``secretNotConfigured``. One definition, because every surface that
+    /// prints it (engine reasons, helper refusals, `status`) must print a
+    /// command the CLI actually accepts (`secret set` takes `--dest`).
+    public static func secretSetCommand(destId: UUID) -> String {
+        "restic-station-helper secret set --dest \(destId.uuidString)"
+    }
+
     /// `nil` for the transient cases, which are not attention at all: they
     /// clear without anyone doing anything.
     public init?(_ error: SecretStoreError) {

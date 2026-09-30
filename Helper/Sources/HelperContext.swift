@@ -31,7 +31,7 @@ enum HelperExit {
         switch attention {
         case .secretNotConfigured:
             fail("\(operation) refused: no password is stored for destination \(id). "
-                + "Store it with `restic-station-helper secret set \(id)` or in the app.")
+                + "Store it with `\(DestinationAttention.secretSetCommand(destId: destinationId))` or in the app.")
         case .secretStoreUnusable, .cloudRepositoryNotHydrated:
             fail("\(operation) refused: the secrets for destination \(id) cannot be read — \(detail)")
         }
