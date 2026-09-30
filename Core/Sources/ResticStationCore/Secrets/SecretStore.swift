@@ -78,7 +78,7 @@ extension SecretStoreError: LocalizedError {
 /// cannot quietly pick one of them as a fallback for the other — which is
 /// how a "no password stored" refusal came to be reported as an unusable
 /// store during a pre-flight race (#96 review).
-public enum DestinationAttention: String, Sendable, Equatable, CaseIterable {
+public enum DestinationAttention: String, Codable, Sendable, Equatable, CaseIterable {
     /// Nothing is stored for this destination. Remedy: `secret set`.
     case secretNotConfigured = "secret_not_configured"
     /// The store refused to be read at all. Remedy: whatever its own

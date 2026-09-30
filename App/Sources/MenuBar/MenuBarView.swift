@@ -129,7 +129,17 @@ enum MenuBarCopy {
 
     /// `"<SetName> — <relative last backup> <✓|⚠|✕>"`, e.g.
     /// "Projects — 2 hours ago ✓". Never run: "Projects — never backed up".
+    /// A destination whose secrets cannot be produced (#95) replaces the
+    /// line: its backups are being skipped, and that is the news.
     static func statusLine(for health: SetHealth, now: Date = Date()) -> String {
+        if let problem = health.secretAttention.first {
+            switch problem.attention {
+            case .secretNotConfigured:
+                return "\(health.name) — skipped: password not stored ⚠"
+            case .secretStoreUnusable, .cloudRepositoryNotHydrated:
+                return "\(health.name) — skipped: secrets unreadable ⚠"
+            }
+        }
         guard let lastBackupAt = health.lastBackupAt else {
             return "\(health.name) — never backed up"
         }

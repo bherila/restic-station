@@ -80,6 +80,8 @@ struct Restore: AsyncParsableCommand {
                 ? "restore may have run, but its result could not be recorded or trusted: \(reason). "
                     + "Inspect the target before retrying."
                 : "this machine cannot run the restore: \(reason)")
+        case .secretRefused(let attention, let destinationId, let detail):
+            HelperExit.secretRefused("restore", attention: attention, destinationId: destinationId, detail: detail)
         case .operationNotAllowed(let reason):
             // Not reachable today: only manual retention apply is
             // contained. Exhaustive so that containing another

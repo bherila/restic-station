@@ -129,7 +129,8 @@ extension AppModel {
     func destinationStatus(setId: UUID, destId: UUID) -> DestinationStatus {
         DestinationStatus.derive(
             status: repoStatus(destId: destId),
-            isStale: isDestinationStale(setId: setId, destId: destId)
+            isStale: isDestinationStale(setId: setId, destId: destId),
+            secretAttention: setHealth(for: setId)?.secretAttention.first { $0.destId == destId }
         )
     }
 

@@ -104,6 +104,43 @@ struct AppPresentationContractTests {
         ) == .error)
     }
 
+    @Test("a secret problem outranks every reachability state and is red (#95)")
+    func secretProblemOutranksReachability() {
+        let id = UUID()
+        let now = Date(timeIntervalSince1970: 10_000)
+        let record = SecretAttentionRecord(
+            destId: id, setId: UUID(), attention: .secretNotConfigured, detail: "none", detectedAt: now
+        )
+        for repo in [nil, RepoStatus(destId: id, reachable: true, probedAt: now)] as [RepoStatus?] {
+            for stale in [false, true] {
+                let status = DestinationStatus.derive(status: repo, isStale: stale, secretAttention: record)
+                #expect(status == .secretProblem(.secretNotConfigured))
+                #expect(status.isAlarm)
+                #expect(status.label == "Password not stored")
+            }
+        }
+        var unusable = record
+        unusable.attention = .secretStoreUnusable
+        #expect(DestinationStatus.derive(status: nil, isStale: false, secretAttention: unusable).label
+            == "Secrets unreadable")
+        #expect(!DestinationStatus.notInitialized.isAlarm, "not-initialized keeps its existing styling")
+    }
+
+    @Test("the menu bar line says a set is being skipped, and why (#95)")
+    func menuLineNamesSecretProblem() {
+        let destination = UUID()
+        let set = UUID()
+        let health = SetHealth(
+            setId: set, name: "Docs", lastBackup: nil, lastRun: nil, currentRun: nil,
+            staleDestinationIds: [], nextDue: .distantPast,
+            secretAttention: [SecretAttentionRecord(
+                destId: destination, setId: set, attention: .secretNotConfigured, detail: "", detectedAt: .now
+            )]
+        )
+        #expect(MenuBarCopy.statusLine(for: health) == "Docs — skipped: password not stored ⚠")
+        #expect(health.needsAttention)
+    }
+
     @Test("set-list formatters describe every schedule and destination kind")
     func setListFormattingTables() {
         var calendar = Calendar(identifier: .gregorian)

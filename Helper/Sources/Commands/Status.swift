@@ -124,9 +124,13 @@ struct Status: AsyncParsableCommand, JSONRenderable {
         )
 
         var repoStatuses: [UUID: RepoStatus] = [:]
+        var secretAttention: [UUID: SecretAttentionRecord] = [:]
         for (_, destination) in scheduled.destinations {
             if let status = stateStore.readRepoStatus(destId: destination.id) {
                 repoStatuses[destination.id] = status
+            }
+            if let attention = stateStore.readSecretAttention(destId: destination.id) {
+                secretAttention[destination.id] = attention
             }
         }
         let scheduleState: ScheduleState?
@@ -150,6 +154,7 @@ struct Status: AsyncParsableCommand, JSONRenderable {
             now: now,
             calendar: calendar,
             visibleSince: configurationVisibleSince,
+            secretAttention: secretAttention,
             runLiveness: runLiveness
         )
 
@@ -210,7 +215,10 @@ struct Status: AsyncParsableCommand, JSONRenderable {
                     reachable: status?.reachable,
                     stale: setHealth.staleDestinationIds.contains(destination.id),
                     lastSyncedAt: status?.lastSyncedAt,
-                    lastError: status?.lastError
+                    lastError: status?.lastError,
+                    secretProblem: setHealth.secretAttention
+                        .first { $0.destId == destination.id }
+                        .map(StatusReport.SecretProblem.init)
                 )
             }
             return StatusReport.SetStatus(
@@ -531,9 +539,12 @@ struct StatusReport: Encodable {
         let stale: Bool
         let lastSyncedAt: Date?
         let lastError: String?
+        /// Why the engine cannot produce this destination's secrets, when it
+        /// will not clear on its own (#95); `null` otherwise.
+        var secretProblem: SecretProblem? = nil
 
         private enum CodingKeys: String, CodingKey {
-            case id, label, isPrimary, reachable, stale, lastSyncedAt, lastError
+            case id, label, isPrimary, reachable, stale, lastSyncedAt, lastError, secretProblem
         }
 
         // Explicit `null` for the three "unknown until probed" fields — see
@@ -547,6 +558,24 @@ struct StatusReport: Encodable {
             try container.encode(stale, forKey: .stale)
             try container.encode(lastSyncedAt, forKey: .lastSyncedAt)
             try container.encode(lastError, forKey: .lastError)
+            try container.encode(secretProblem, forKey: .secretProblem)
+        }
+    }
+
+    /// `state/secret-attention-<destId>.json`, as reported: the published
+    /// error code (`secret_not_configured` or `secret_store_unusable`), the
+    /// store's own text naming the repair, and when it was first seen.
+    struct SecretProblem: Encodable {
+        let code: String
+        let detail: String
+        let detectedAt: Date
+
+        init(_ record: SecretAttentionRecord) {
+            code = record.attention.code.rawValue
+            detail = record.attention == .secretNotConfigured
+                ? "no password is stored; run `restic-station-helper secret set \(record.destId.uuidString)`"
+                : record.detail
+            detectedAt = record.detectedAt
         }
     }
 
@@ -931,6 +960,9 @@ struct StatusReport: Encodable {
                 let error = destination.lastError.map { " (\($0))" } ?? ""
                 let staleFlag = destination.stale ? ", STALE" : ""
                 lines.append("      - \(role) \"\(destination.label)\": \(reach)\(error)\(staleFlag)")
+                if let problem = destination.secretProblem {
+                    lines.append("        SECRETS: \(problem.code) — \(problem.detail); scheduled runs skip this set until fixed")
+                }
             }
         }
 

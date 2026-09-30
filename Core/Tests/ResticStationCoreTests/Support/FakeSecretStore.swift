@@ -73,6 +73,14 @@ final class FakeSecretStore: SecretStore, @unchecked Sendable {
         withLock { _failingSecretEnvs[destId] = error }
     }
 
+    /// Clears every injected failure, as if the user had repaired the store.
+    func clearFailures() {
+        withLock {
+            _failingPasswords.removeAll()
+            _failingSecretEnvs.removeAll()
+        }
+    }
+
     // MARK: - SecretStore
 
     func setPassword(_ password: String, destId: UUID) async throws {

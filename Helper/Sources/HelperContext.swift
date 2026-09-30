@@ -19,6 +19,24 @@ extension UUID: @retroactive ExpressibleByArgument {
 enum HelperExit {
     /// Writes `message` to stderr, then exits with `code` (default 1 —
     /// "error" in the T10 contract).
+    /// The message for `ManualRunOutcome.secretRefused` (#95): a refusal
+    /// that names its repair, never "try again".
+    static func secretRefused(
+        _ operation: String,
+        attention: DestinationAttention,
+        destinationId: UUID,
+        detail: String
+    ) -> Never {
+        let id = destinationId.uuidString
+        switch attention {
+        case .secretNotConfigured:
+            fail("\(operation) refused: no password is stored for destination \(id). "
+                + "Store it with `restic-station-helper secret set \(id)` or in the app.")
+        case .secretStoreUnusable, .cloudRepositoryNotHydrated:
+            fail("\(operation) refused: the secrets for destination \(id) cannot be read — \(detail)")
+        }
+    }
+
     static func fail(_ message: String, code: Int32 = 1) -> Never {
         StandardStream.write(Data((message + "\n").utf8), to: .standardError)
         exit(code)

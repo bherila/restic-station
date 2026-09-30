@@ -718,6 +718,7 @@ final class AppModel: ObservableObject {
             now: currentDate,
             calendar: calendar,
             visibleSince: paths.configurationVisibleSince(),
+            secretAttention: stateWatcher.secretAttention,
             runLiveness: runLiveness
         )
         let derivedHealth = HealthDerivation.appHealth(

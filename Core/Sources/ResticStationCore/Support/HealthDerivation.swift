@@ -76,6 +76,12 @@ public struct SetHealth: Identifiable, Equatable, Sendable {
     /// Destinations of this set that are stale per `docs/scheduling.md`
     /// §Staleness, in the set's configured destination order.
     public let staleDestinationIds: [UUID]
+    /// Secret problems the engine recorded for this set's destinations
+    /// (`state/secret-attention-<destId>.json`, #95), in configured
+    /// destination order: a password was never stored, or the store refuses
+    /// to be read. Scheduled runs skip the set without a run record, so this
+    /// is the only place the reason appears — immediately, with no grace.
+    public let secretAttention: [SecretAttentionRecord]
     /// Display-only next fire time from `ScheduleMath.nextDue` — the app
     /// never decides when backups run (`docs/scheduling.md` §What the app
     /// does). `.distantPast` for a never-run set (i.e. due now).
@@ -91,7 +97,8 @@ public struct SetHealth: Identifiable, Equatable, Sendable {
         nextDue: Date,
         abandonedRun: CurrentRunState? = nil,
         stalledRun: CurrentRunState? = nil,
-        firstBackupOverdue: Bool = false
+        firstBackupOverdue: Bool = false,
+        secretAttention: [SecretAttentionRecord] = []
     ) {
         self.setId = setId
         self.name = name
@@ -103,6 +110,7 @@ public struct SetHealth: Identifiable, Equatable, Sendable {
         self.abandonedRun = abandonedRun
         self.stalledRun = stalledRun
         self.firstBackupOverdue = firstBackupOverdue
+        self.secretAttention = secretAttention
     }
 
     public var isRunning: Bool { currentRun != nil }
@@ -130,6 +138,7 @@ public struct SetHealth: Identifiable, Equatable, Sendable {
     /// This set contributes `.warning` to the global `AppHealth`.
     public var needsAttention: Bool {
         lastRunFailed || hasStaleDestination || hasAbandonedRun || hasStalledRun || firstBackupOverdue
+            || !secretAttention.isEmpty
     }
 
     /// 0...100, rounded, clamped — restic reports `percent_done` as a 0...1
@@ -181,6 +190,7 @@ public enum HealthDerivation {
         now: Date,
         calendar: Calendar,
         visibleSince: Date? = nil,
+        secretAttention: [UUID: SecretAttentionRecord] = [:],
         runLiveness: (CurrentRunState) -> CurrentRunLiveness = { _ in .live }
     ) -> [SetHealth] {
         config.sets.map { set in
@@ -193,6 +203,7 @@ public enum HealthDerivation {
                 now: now,
                 calendar: calendar,
                 visibleSince: visibleSince,
+                secretAttention: secretAttention,
                 runLiveness: runLiveness
             )
         }
@@ -209,6 +220,7 @@ public enum HealthDerivation {
         now: Date,
         calendar: Calendar,
         visibleSince: Date? = nil,
+        secretAttention: [UUID: SecretAttentionRecord] = [:],
         runLiveness: (CurrentRunState) -> CurrentRunLiveness = { _ in .live }
     ) -> SetHealth {
         // `recentRuns` is newest-first, so the first match in each filter is
@@ -276,7 +288,12 @@ public enum HealthDerivation {
             ),
             abandonedRun: abandonedRun,
             stalledRun: stalledRun,
-            firstBackupOverdue: firstBackupOverdue
+            firstBackupOverdue: firstBackupOverdue,
+            // Keyed by destination; a record for a destination that has
+            // left this set (or was recorded under another set) is ignored.
+            secretAttention: set.destinations.compactMap { destination in
+                secretAttention[destination.id].flatMap { $0.setId == set.id ? $0 : nil }
+            }
         )
     }
 

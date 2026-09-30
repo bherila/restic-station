@@ -190,7 +190,21 @@ struct DestinationTable: View {
             }
         }
         .font(.caption)
-        .foregroundStyle(status == .error ? Color.red : .secondary)
+        .foregroundStyle(status.isAlarm ? Color.red : .secondary)
+        .help(secretProblemHelp(destination) ?? "")
+    }
+
+    /// The repair, for a destination whose secrets the engine cannot produce.
+    private func secretProblemHelp(_ destination: Destination) -> String? {
+        guard let record = model.setHealth(for: set.id)?.secretAttention.first(where: { $0.destId == destination.id })
+        else { return nil }
+        switch record.attention {
+        case .secretNotConfigured:
+            return "No password is stored for this destination, so its backups are skipped. "
+                + "Edit the destination and enter the repository password."
+        case .secretStoreUnusable, .cloudRepositoryNotHydrated:
+            return "Restic Station cannot read this destination's secrets, so its backups are skipped: \(record.detail)"
+        }
     }
 
     // MARK: - Actions

@@ -218,6 +218,13 @@ public struct AppPaths: Equatable, Sendable {
         stateDir.appendingPathComponent("repo-status-\(destId.uuidString).json", isDirectory: false)
     }
 
+    /// `state/secret-attention-<destId>.json` — the engine's secret pre-flight
+    /// found a permanent reason this destination's secrets cannot be
+    /// produced (#95). Present only while that is true.
+    public func secretAttentionFile(destId: UUID) -> URL {
+        stateDir.appendingPathComponent("secret-attention-\(destId.uuidString).json", isDirectory: false)
+    }
+
     /// `state/fda-check.json` — result of the helper's Full Disk Access probe.
     public var fdaCheckFile: URL {
         stateDir.appendingPathComponent("fda-check.json", isDirectory: false)
