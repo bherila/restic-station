@@ -176,4 +176,34 @@ import Testing
         }
         #expect(attention == .secretStoreUnusable)
     }
+
+    /// Codex on #165: a password-only pre-flight must not clear a problem it
+    /// never re-checked — the malformed environment is still there and the
+    /// next scheduled backup still refuses over it.
+    @Test("a password-only pre-flight keeps an environment problem, and clears a missing-password one")
+    func passwordOnlyPreflightClearsOnlyWhatItChecked() async throws {
+        let env = T.makeEnv(script: [], retention: nil)
+        defer { env.cleanUp() }
+        env.secrets.failSecretEnv(for: T.primaryId, with: .storeUnusable("failed to decode secret env JSON"))
+        _ = await env.engine.runSet(env.set, trigger: .scheduled)
+        #expect(env.stateStore.readSecretAttention(destId: T.primaryId)?.attention == .secretStoreUnusable)
+
+        env.fake.script = Self.anything
+        var remote = env.primary
+        remote.repoURL = "sftp:backup@example:/srv/repo"
+        remote.remoteMaintenance = RemoteMaintenance(enabled: true, remoteResticPath: "/opt/restic")
+        var set = env.set
+        set.destinations[0] = remote
+        _ = await env.engine.runPruneRepository(set: set, destination: remote)
+        #expect(env.stateStore.readSecretAttention(destId: T.primaryId)?.attention == .secretStoreUnusable)
+
+        // A missing password, by contrast, is disproved by any password read.
+        try env.stateStore.clearSecretAttention(destId: T.primaryId)
+        try env.stateStore.recordSecretAttention(SecretAttentionRecord(
+            destId: T.primaryId, setId: T.setId, attention: .secretNotConfigured, detail: "", detectedAt: .now
+        ))
+        env.fake.script = Self.anything
+        _ = await env.engine.runPruneRepository(set: set, destination: remote)
+        #expect(env.stateStore.readSecretAttention(destId: T.primaryId) == nil)
+    }
 }

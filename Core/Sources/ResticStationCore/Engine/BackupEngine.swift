@@ -3732,7 +3732,7 @@ public final class BackupEngine: Sendable {
                 if readingEnvironment {
                     _ = try await secrets.secretEnv(destId: destination.id)
                 }
-                clearSecretAttention(for: destination)
+                clearSecretAttention(for: destination, environmentValidated: readingEnvironment)
             } catch let error as SecretStoreError {
                 // Exhaustive, no `default:` — a new `SecretStoreError` case
                 // must be judged here rather than inheriting the retryable
@@ -3790,7 +3790,17 @@ public final class BackupEngine: Sendable {
         }
     }
 
-    private func clearSecretAttention(for destination: Destination) {
+    /// Clears only what this pre-flight actually re-checked. A password-only
+    /// read (remote maintenance, or a caller-supplied environment) proves a
+    /// password is stored, which resolves `secretNotConfigured` — but says
+    /// nothing about a malformed stored environment, which every scheduled
+    /// backup will still refuse over, so that record stays.
+    private func clearSecretAttention(for destination: Destination, environmentValidated: Bool) {
+        if !environmentValidated,
+           let existing = stateStore.readSecretAttention(destId: destination.id),
+           existing.attention != .secretNotConfigured {
+            return
+        }
         do {
             try stateStore.clearSecretAttention(destId: destination.id)
         } catch {
