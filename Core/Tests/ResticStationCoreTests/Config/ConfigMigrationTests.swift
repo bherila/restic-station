@@ -54,7 +54,7 @@ private func installMachine(at paths: AppPaths, resticPath: String? = nil) throw
 
         let migrated = try store.load()
 
-        #expect(migrated.version == 4)
+        #expect(migrated.version == 5)
         // Moved, not copied: the deprecated field is cleared once the value
         // is safely recorded host-locally.
         #expect(migrated.resticPath == nil)
@@ -62,7 +62,7 @@ private func installMachine(at paths: AppPaths, resticPath: String? = nil) throw
 
         // …and it was persisted, so the next load is a plain v2 read.
         let onDisk = try ConfigStore.makeDecoder().decode(AppConfig.self, from: Data(contentsOf: paths.configFile))
-        #expect(onDisk.version == 4)
+        #expect(onDisk.version == 5)
         #expect(onDisk.resticPath == nil)
     }
 
@@ -157,7 +157,7 @@ private func installMachine(at paths: AppPaths, resticPath: String? = nil) throw
         #expect(try Data(contentsOf: paths.configV1BackupFile) == sentinel)
         // The migration still happened.
         let onDisk = try ConfigStore.makeDecoder().decode(AppConfig.self, from: Data(contentsOf: paths.configFile))
-        #expect(onDisk.version == 4)
+        #expect(onDisk.version == 5)
     }
 
     /// A v1 config that is *invalid* is a hard error at its own version — it
@@ -211,7 +211,7 @@ private func installMachine(at paths: AppPaths, resticPath: String? = nil) throw
 
         let migrated = try store.load()
 
-        #expect(migrated.version == 4)
+        #expect(migrated.version == 5)
         #expect(migrated.resticPath == nil)
         #expect(try MachineStore(paths: paths, environment: [:]).load().resticPath == nil)
     }
@@ -255,7 +255,7 @@ private func installMachine(at paths: AppPaths, resticPath: String? = nil) throw
 
         let loaded = try store.load()
 
-        #expect(loaded.version == 4)
+        #expect(loaded.version == 5)
         // Nothing else about the config changed — every set's purgeExcludes
         // decoded to [] and every other field is untouched.
         for set in loaded.sets {
@@ -275,12 +275,13 @@ private func installMachine(at paths: AppPaths, resticPath: String? = nil) throw
 
         // ...and config.json itself now holds the migrated (v3) content.
         let onDisk = try ConfigStore.makeDecoder().decode(AppConfig.self, from: Data(contentsOf: paths.configFile))
-        #expect(onDisk.version == 4)
+        #expect(onDisk.version == 5)
     }
 
-    /// v3 → v4: a pure version bump whose absent `onlineOnlyFiles` reads as
-    /// `.skip`, with the v3 bytes kept in their own `config.v3.backup.json`.
-    @Test func aV3ConfigIsMigratedToV4AndBacksUpTheV3Bytes() throws {
+    /// v3 → current: a pure version bump whose absent `onlineOnlyFiles`
+    /// reads as `.skip`, with the v3 bytes kept in their own
+    /// `config.v3.backup.json`.
+    @Test func aV3ConfigIsMigratedAndBacksUpTheV3Bytes() throws {
         let (store, paths, cleanup) = try makeStore()
         defer { cleanup() }
         guard var object = try JSONSerialization.jsonObject(with: FixtureLoader.data("config-v2.json")) as? [String: Any],
@@ -299,7 +300,7 @@ private func installMachine(at paths: AppPaths, resticPath: String? = nil) throw
 
         let loaded = try store.load()
 
-        #expect(loaded.version == 4)
+        #expect(loaded.version == 5)
         #expect(!loaded.sets.isEmpty)
         for set in loaded.sets {
             #expect(set.onlineOnlyFiles == .skip)
@@ -309,7 +310,7 @@ private func installMachine(at paths: AppPaths, resticPath: String? = nil) throw
         #expect(v3Backup.lastPathComponent == "config.v3.backup.json")
         #expect(try Data(contentsOf: v3Backup) == original)
         let onDisk = try JSONSerialization.jsonObject(with: Data(contentsOf: paths.configFile)) as? [String: Any]
-        #expect(onDisk?["version"] as? Int == 4)
+        #expect(onDisk?["version"] as? Int == 5)
         let onDiskSets = onDisk?["sets"] as? [[String: Any]] ?? []
         #expect(!onDiskSets.isEmpty && onDiskSets.allSatisfy { $0["onlineOnlyFiles"] as? String == "skip" })
     }
@@ -332,7 +333,7 @@ private func installMachine(at paths: AppPaths, resticPath: String? = nil) throw
 
         let loaded = try store.load()
 
-        #expect(loaded.version == 4)
+        #expect(loaded.version == 5)
         // The v1 backup is untouched...
         #expect(try Data(contentsOf: paths.configV1BackupFile) == preexistingV1Backup)
         // ...and a *separate*, correct v2 backup was written alongside it,
@@ -424,7 +425,7 @@ private func installMachine(at paths: AppPaths, resticPath: String? = nil) throw
         let result = store.migrateToCurrentVersion(decoded, originalBytes: original)
 
         #expect(result.backupWritten)
-        #expect(result.config.version == 4)
+        #expect(result.config.version == 5)
         #expect(result.config.resticPath == nil)
         // Side effects (v1 backup, machine.json adoption) happened...
         #expect(FileManager.default.fileExists(atPath: paths.configV1BackupFile.path))
@@ -450,6 +451,49 @@ private func installMachine(at paths: AppPaths, resticPath: String? = nil) throw
         // a fake positive.)
     }
 
+    /// v4 → v5: a pure version bump whose absent `usesGlobalExcludes` reads
+    /// as `true`, with the v4 bytes kept in their own
+    /// `config.v4.backup.json`.
+    ///
+    /// The assertion that matters is the *default*, not the number: a v4
+    /// file says nothing about the global exclusion list, and the migrated
+    /// config must opt every set **in**. Reading absent as `false` would
+    /// leave every existing install permanently outside the feature while
+    /// looking migrated.
+    @Test func aV4ConfigIsMigratedToV5AndOptsEverySetIntoTheGlobalList() throws {
+        let (store, paths, cleanup) = try makeStore()
+        defer { cleanup() }
+        guard var object = try JSONSerialization.jsonObject(with: FixtureLoader.data("config-v2.json")) as? [String: Any],
+              var sets = object["sets"] as? [[String: Any]] else {
+            Issue.record("could not parse config-v2.json fixture as a JSON object with a sets array")
+            return
+        }
+        for index in sets.indices {
+            sets[index]["purgeExcludes"] = [String]()
+            sets[index]["onlineOnlyFiles"] = "skip"
+            #expect(sets[index]["usesGlobalExcludes"] == nil)
+        }
+        object["sets"] = sets
+        object["version"] = 4
+        let original = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+        try original.write(to: paths.configFile)
+
+        let loaded = try store.load()
+
+        #expect(loaded.version == 5)
+        #expect(!loaded.sets.isEmpty)
+        for set in loaded.sets {
+            #expect(set.usesGlobalExcludes)
+        }
+        let v4Backup = paths.configBackupFile(fromVersion: 4)
+        #expect(v4Backup.lastPathComponent == "config.v4.backup.json")
+        #expect(try Data(contentsOf: v4Backup) == original)
+        let onDisk = try JSONSerialization.jsonObject(with: Data(contentsOf: paths.configFile)) as? [String: Any]
+        #expect(onDisk?["version"] as? Int == 5)
+        let onDiskSets = onDisk?["sets"] as? [[String: Any]] ?? []
+        #expect(!onDiskSets.isEmpty && onDiskSets.allSatisfy { $0["usesGlobalExcludes"] as? Bool == true })
+    }
+
     /// `previewMigration` is a pure version bump: no `machine.json` access,
     /// no `resticPath` relocation, no disk I/O of any kind — the property
     /// `config import --dry-run` depends on.
@@ -458,7 +502,7 @@ private func installMachine(at paths: AppPaths, resticPath: String? = nil) throw
 
         let preview = ConfigStore.previewMigration(decoded)
 
-        #expect(preview.version == 4)
+        #expect(preview.version == 5)
         // resticPath is left exactly as decoded — previewMigration does not
         // simulate the relocation.
         #expect(preview.resticPath == decoded.resticPath)

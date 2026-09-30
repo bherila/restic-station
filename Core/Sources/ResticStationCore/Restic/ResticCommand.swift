@@ -82,22 +82,52 @@ public struct ResticCommand: Equatable, Sendable {
 
     // MARK: - backup / copy
 
-    /// `restic -r <primaryRepo> backup --json [--exclude-cloud-files] [--exclude <pat>]... <source>...`
+    /// `restic -r <primaryRepo> backup --json [--exclude-cloud-files]
+    /// [--exclude-caches] [--exclude-larger-than <size>] [--exclude <pat>]...
+    /// [--iexclude <pat>]... <source>...`
     ///
     /// Sources must be absolute paths (enforced by `AppConfig.validate()`).
+    ///
+    /// **Two exclusion flags, on purpose.** `excludes` is the backup set's
+    /// own list and keeps the case-sensitive `--exclude` it has always had.
+    /// `globalExcludes` is the host's catalogue
+    /// (`docs/data-model.md` §global-excludes.json) and uses `--iexclude`,
+    /// because it is a list of well-known names rather than something a
+    /// person typed: `Library/Caches` should skip `library/caches` too.
+    ///
+    /// `excludeCaches` skips any directory whose creator tagged it
+    /// `CACHEDIR.TAG`, which catches build and package caches no pattern
+    /// list knows the name of. restic has carried the flag since 0.9, so
+    /// unlike `--exclude-cloud-files` it needs no version probe.
+    /// `excludeLargerThan` is restic's size cap (`500m`, `10G`, …), off
+    /// unless the host asked for it.
     public static func backup(
         repo: String,
         sources: [String],
         excludes: [String] = [],
-        excludeCloudFiles: Bool = false
+        globalExcludes: [String] = [],
+        excludeCloudFiles: Bool = false,
+        excludeCaches: Bool = false,
+        excludeLargerThan: String? = nil
     ) -> ResticCommand {
         precondition(!sources.isEmpty, "ResticCommand.backup requires at least one source path")
         var argv = ["-r", repo, "backup", "--json"]
         if excludeCloudFiles {
             argv.append("--exclude-cloud-files")
         }
+        if excludeCaches {
+            argv.append("--exclude-caches")
+        }
+        if let excludeLargerThan {
+            argv.append("--exclude-larger-than")
+            argv.append(excludeLargerThan)
+        }
         for exclude in excludes {
             argv.append("--exclude")
+            argv.append(exclude)
+        }
+        for exclude in globalExcludes {
+            argv.append("--iexclude")
             argv.append(exclude)
         }
         argv.append(contentsOf: sources)

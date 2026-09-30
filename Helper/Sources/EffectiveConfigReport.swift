@@ -40,6 +40,12 @@ struct EffectiveConfigReport: Encodable {
         let excludes: [String]
         let purgeExcludes: [String]
         let onlineOnlyFiles: OnlineOnlyFiles
+        /// Whether this machine's global exclusion list reaches the set.
+        /// The *contents* of that list are host-local and are not reported
+        /// here — `config show --machine <other>` would otherwise describe
+        /// this host's patterns as if they were that host's. `excludes
+        /// show` is the command for the list itself.
+        let usesGlobalExcludes: Bool
         let schedule: Schedule
         let retention: RetentionPolicy?
         let checkPolicy: CheckPolicy?
@@ -47,7 +53,8 @@ struct EffectiveConfigReport: Encodable {
         let destinations: [DestinationEntry]
 
         private enum CodingKeys: String, CodingKey {
-            case id, name, enabledHere, sources, excludes, purgeExcludes, onlineOnlyFiles, schedule, retention, checkPolicy
+            case id, name, enabledHere, sources, excludes, purgeExcludes, onlineOnlyFiles
+            case usesGlobalExcludes, schedule, retention, checkPolicy
             case stalenessWarningDays, destinations
         }
 
@@ -65,6 +72,7 @@ struct EffectiveConfigReport: Encodable {
             try container.encode(excludes, forKey: .excludes)
             try container.encode(purgeExcludes, forKey: .purgeExcludes)
             try container.encode(onlineOnlyFiles, forKey: .onlineOnlyFiles)
+            try container.encode(usesGlobalExcludes, forKey: .usesGlobalExcludes)
             try container.encode(schedule, forKey: .schedule)
             try container.encode(retention, forKey: .retention)
             try container.encode(checkPolicy, forKey: .checkPolicy)
@@ -146,6 +154,7 @@ struct EffectiveConfigReport: Encodable {
                 excludes: set.excludes,
                 purgeExcludes: set.purgeExcludes,
                 onlineOnlyFiles: set.onlineOnlyFiles,
+                usesGlobalExcludes: set.usesGlobalExcludes,
                 schedule: set.schedule,
                 retention: set.retention,
                 checkPolicy: set.checkPolicy,
@@ -210,6 +219,13 @@ struct EffectiveConfigReport: Encodable {
             // (every Linux host) reads exactly as it did before v4.
             if CloudStorageSafety.containsCloudBackedSource(set.sources) {
                 lines.append("    online-only files: \(set.onlineOnlyFiles.rawValue)")
+            }
+            // Printed only for a set that has opted out. The list applies
+            // everywhere by default, so saying so on every set would be
+            // noise; saying nothing when a set has opted out would hide the
+            // one case where a person is surprised by what was backed up.
+            if !set.usesGlobalExcludes {
+                lines.append("    global excludes: opted out (usesGlobalExcludes: false)")
             }
             lines.append("    schedule: \(Self.describe(set.schedule))")
             for destination in set.destinations {

@@ -9,12 +9,12 @@ import Testing
 /// doc's recognizable prefix. Every other byte — keys, values, nesting,
 /// including the `retention` block's explicit `null`s — matches the doc.
 ///
-/// It is a schema-v3 config with **no** `machines` keys — the shape the vast
+/// It is a schema-v5 config with **no** `machines` keys — the shape the vast
 /// majority of installs have, and the one the compatibility guarantee is
 /// about: absent `machines` means inherit and run everywhere.
 let dataModelExampleConfigJSON = """
 {
-  "version": 4,
+  "version": 5,
   "resticPath": "/opt/homebrew/bin/restic",
   "showMenuBarIcon": true,
   "sets": [
@@ -25,6 +25,7 @@ let dataModelExampleConfigJSON = """
       "excludes": ["node_modules", ".build", "*.tmp"],
       "purgeExcludes": ["DerivedData"],
       "onlineOnlyFiles": "skip",
+      "usesGlobalExcludes": true,
       "schedule": { "kind": "daily", "hour": 2, "minute": 30 },
       "retention": {
         "keepLast": null, "keepHourly": null, "keepDaily": 7,
@@ -67,7 +68,7 @@ let dataModelExampleConfigJSON = """
         try config.validate()
 
         // Field-for-field checks against the documented example.
-        #expect(config.version == 4)
+        #expect(config.version == 5)
         #expect(config.resticPath == "/opt/homebrew/bin/restic")
         #expect(config.showMenuBarIcon == true)
         #expect(config.sets.count == 1)
@@ -236,6 +237,7 @@ let dataModelExampleConfigJSON = """
               "excludes": [],
               "purgeExcludes": [],
               "onlineOnlyFiles": "skip",
+              "usesGlobalExcludes": true,
               "schedule": { "kind": "everyMinutes", "minutes": 30 },
               "retention": null,
               "checkPolicy": null,
@@ -257,6 +259,7 @@ let dataModelExampleConfigJSON = """
               "excludes": ["*.tmp"],
               "purgeExcludes": [],
               "onlineOnlyFiles": "skip",
+              "usesGlobalExcludes": true,
               "schedule": { "kind": "hourly", "minute": 15 },
               "retention": { "keepLast": 5, "keepHourly": null, "keepDaily": null, "keepWeekly": null, "keepMonthly": null, "keepYearly": null },
               "checkPolicy": { "enabled": false, "readDataSubsetSlices": 10 },
@@ -285,6 +288,7 @@ let dataModelExampleConfigJSON = """
               "excludes": [],
               "purgeExcludes": [],
               "onlineOnlyFiles": "skip",
+              "usesGlobalExcludes": true,
               "schedule": { "kind": "daily", "hour": 2, "minute": 30 },
               "retention": { "keepLast": null, "keepHourly": null, "keepDaily": null, "keepWeekly": null, "keepMonthly": null, "keepYearly": null },
               "checkPolicy": null,
@@ -306,6 +310,7 @@ let dataModelExampleConfigJSON = """
               "excludes": [],
               "purgeExcludes": [],
               "onlineOnlyFiles": "skip",
+              "usesGlobalExcludes": true,
               "schedule": { "kind": "weekly", "weekday": 7, "hour": 23, "minute": 59 },
               "retention": null,
               "checkPolicy": null,
@@ -353,6 +358,7 @@ let dataModelMachinesExampleJSON = """
       "excludes": [],
       "purgeExcludes": [],
       "onlineOnlyFiles": "skip",
+      "usesGlobalExcludes": true,
       "schedule": { "kind": "daily", "hour": 2, "minute": 30 },
       "retention": null,
       "checkPolicy": null,

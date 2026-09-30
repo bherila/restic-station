@@ -499,6 +499,61 @@ struct ConfigValidate: AsyncParsableCommand, JSONRenderable {
             }
         }
 
+        // This host's global exclusion list. A warning rather than a hard
+        // error because `validate` is about `config.json` and may be run
+        // with `--machine <other>`, where the file belongs to *this* host
+        // and not to the machine being described — but it is worded as the
+        // blocker it is, rather than falling back to defaults that may skip
+        // more than this host had configured (`docs/data-model.md`
+        // §global-excludes.json).
+        //
+        // Scoped to the sets it actually blocks. `BackupEngine` refuses only
+        // a set that uses the list, so a host whose sets all carry
+        // `usesGlobalExcludes: false` keeps backing up normally — and
+        // telling that operator "every backup refuses" would send them
+        // hunting a fleet-wide outage that is not happening. The count is
+        // over the sets that run *here*: a set this machine does not back up
+        // is not blocked by anything.
+        do {
+            _ = try GlobalExcludeStore(paths: context.paths).load()
+        } catch {
+            // Only when `report` describes **this** machine. It was resolved
+            // for `targetMachineId`, and `--machine other-host` makes
+            // `enabledHere` mean "enabled on that host" — naming its sets,
+            // or announcing that nothing here is blocked, would describe a
+            // machine whose `global-excludes.json` this is not. The file is
+            // always the local one, so when the two identities differ (or
+            // the local one could not be read at all) the warning stays
+            // deliberately unscoped.
+            let describesThisMachine = localMachineId != nil && targetMachineId == localMachineId
+            let affected = describesThisMachine
+                ? report.sets.filter { $0.enabledHere && $0.usesGlobalExcludes }
+                : []
+            let scope: String
+            if !describesThisMachine {
+                scope = "Every backup on the host running this command refuses until it is fixed, "
+                    + "except any set with usesGlobalExcludes: false — this plan describes "
+                    + "\"\(targetMachineId)\", so it cannot say which of that host's sets those are"
+            } else {
+                switch affected.count {
+                case 0:
+                    scope = "No backup here is blocked by it: every set that runs on this machine "
+                        + "has usesGlobalExcludes: false"
+                case report.sets.filter(\.enabledHere).count:
+                    scope = "Every backup on this host refuses to run until it is fixed"
+                default:
+                    let names = affected.map { "\"\($0.name)\"" }.joined(separator: ", ")
+                    scope = "\(affected.count) of the sets that run here refuse to back up until it "
+                        + "is fixed (\(names)); the rest have usesGlobalExcludes: false and are "
+                        + "unaffected"
+                }
+            }
+            warnings.append(
+                "this machine's global exclusion list cannot be read: \(error). \(scope) — "
+                    + "see `excludes show`"
+            )
+        }
+
         let nothingRunsHere = report.sets.allSatisfy { !$0.enabledHere }
 
         if json {

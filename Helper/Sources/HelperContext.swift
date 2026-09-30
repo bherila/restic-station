@@ -132,15 +132,39 @@ struct HelperContext {
         case noRestic(ResticDiscoveryResult)
     }
 
-    /// - Throws: only ``CLIFailure`` from ``makeSecretStore(paths:runner:)``,
+    /// - Throws: ``CLIFailure`` from ``makeSecretStore(paths:runner:)``,
     ///   which is a misconfigured backend selection — a hard error in every
     ///   caller including `tick`, and one that exited 1 here before it was
     ///   made throwable.
+    ///
+    ///   An unusable `global-excludes.json` is **not** thrown here. It is
+    ///   fatal, but only to `backup`: the failure is carried into the engine
+    ///   and refuses there (``BackupEngine``'s step 3b), so `restore`,
+    ///   `unlock`, `probe`, `purge`, `check` and `init` — none of which the
+    ///   exclusion list ever reaches — keep working on a host whose file has
+    ///   a typo in it. Refusing them too would put a mistyped exclusion file
+    ///   between someone and their data in an emergency, which is a worse
+    ///   failure than the one being guarded against.
     static func makeTolerant(
         paths: AppPaths,
         views: Views,
         configStore: ConfigStore
     ) async throws -> TolerantOutcome {
+        // Resolved once, here, for the same reason the two per-machine
+        // config views are: nothing downstream re-reads the file, so a
+        // mid-run edit cannot make two children of one run disagree about
+        // what was skipped.
+        //
+        // **Before** the restic search, deliberately. This is a cheap local
+        // read, while discovery can take seconds; resolving it here also
+        // means the answer — success *or* failure — is fixed before anything
+        // slow happens, rather than depending on when the engine first asks.
+        //
+        // The failure travels as a value rather than a `throw`. Every
+        // command in this process goes through here, but only `backup`
+        // consumes the exclusion list, so only `backup` may refuse on it;
+        // see the `Throws` note above and `BackupEngine`'s step 3b.
+        let globalExcludes = Result { try GlobalExcludeStore(paths: paths).load().plan() }
         let resticPath: String
         switch await resolveResticPath(resolved: views.scheduled) {
         case .resolved(let path):
@@ -195,6 +219,7 @@ struct HelperContext {
             reachability: reachability,
             purgeSourcePaths: purgeSourcePaths,
             purgeHostnames: purgeHostnames,
+            globalExcludes: globalExcludes,
             machineId: views.addressable.machineId
         )
         return .ready(HelperContext(

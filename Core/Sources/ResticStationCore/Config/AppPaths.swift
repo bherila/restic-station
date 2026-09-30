@@ -147,6 +147,26 @@ public struct AppPaths: Equatable, Sendable {
         }.max()
     }
 
+    // MARK: - global-excludes.json
+
+    /// `global-excludes.json` — this host's adjustments to the built-in
+    /// exclusion catalogue (`docs/data-model.md` §global-excludes.json).
+    ///
+    /// **Host-local, like `machine.json` and for the same reason**: a cache
+    /// path is a property of a machine and of how Restic Station was
+    /// installed on it, not of the fleet. Because it is `root`-relative, a
+    /// per-user install keeps it under that user's data directory while a
+    /// system-wide one (`RESTIC_STATION_DATA_DIR` pointed at, say,
+    /// `/var/lib/restic-station`) keeps it machine-wide — no second search
+    /// path, and no way for the two to disagree. `config export` never
+    /// includes it.
+    ///
+    /// Absent is a defined state, not an error: it means "the built-in
+    /// defaults, unmodified".
+    public var globalExcludesFile: URL {
+        root.appendingPathComponent("global-excludes.json", isDirectory: false)
+    }
+
     // MARK: - runs/
 
     public var runsDir: URL {
@@ -297,6 +317,17 @@ public struct AppPaths: Equatable, Sendable {
     }
 
     /// Serializes Linux file-secret read-modify-write operations.
+    /// `locks/global-excludes.lock` — serialises the compare-and-swap in
+    /// ``GlobalExcludeStore/save(_:ifUnchangedFrom:)`` with the rename it
+    /// guards, and the fixed `.tmp` file both writers would otherwise share.
+    ///
+    /// Separate from ``configLockFile`` because contention on one must not
+    /// be reported as the other: `global-excludes.json` is host-local state
+    /// and nothing that edits it touches `config.json`.
+    public var globalExcludesLockFile: URL {
+        locksDir.appendingPathComponent("global-excludes.lock", isDirectory: false)
+    }
+
     public var secretsLockFile: URL {
         locksDir.appendingPathComponent("secrets.lock", isDirectory: false)
     }

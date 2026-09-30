@@ -69,6 +69,22 @@ enum SetsCopy {
         }
     }
 
+    // MARK: - Global exclusions (docs/ui-spec.md §Backup Sets)
+
+    /// The per-set opt-out for Settings → Exclusions.
+    static let usesGlobalExcludesLabel = "Apply global exclusions"
+
+    static let excludesEmptyStateWithGlobalList =
+        "Everything under the sources is backed up, apart from the global exclusions."
+
+    static func usesGlobalExcludesFooter(_ usesGlobalExcludes: Bool) -> String {
+        usesGlobalExcludes
+            ? "This set also skips the global exclusions from Settings → Exclusions."
+            : "This set ignores the global exclusions from Settings → Exclusions, including "
+                + "CACHEDIR.TAG directories. Only this set's own patterns are skipped — the ones "
+                + "above, plus anything listed under Purge."
+    }
+
     /// Local destination under `/Volumes`.
     static let removableVolumeNote = "Removable volume — will be skipped when not mounted"
 

@@ -226,6 +226,12 @@ public struct ConfigStore: Sendable {
     ///   let restic download online-only cloud files. It is still a pure
     ///   version bump — no value is written — and the change is deliberate
     ///   (`docs/data-model.md` §v3 → v4).
+    /// - **v4 → v5.** An absent `usesGlobalExcludes` decodes as `true`.
+    ///   Like v3 → v4 that is *not* the pre-v5 behaviour — a v4 build had no
+    ///   global exclusion list at all — and it is deliberate: the list
+    ///   exists precisely so a cache directory does not have to be named in
+    ///   every set on every machine (`docs/data-model.md` §v4 → v5). Still a
+    ///   pure version bump; no value is written.
     ///
     /// The pre-migration bytes are copied to `config.v<from>.backup.json`,
     /// keyed by the version being migrated *from*, so each step of the chain
@@ -551,6 +557,94 @@ public struct ConfigStore: Sendable {
 }
 
 // MARK: - AtomicFile
+
+/// The durability half of that same convention: the parts a plain
+/// `Data.write(to:)` followed by `rename(2)` leaves out.
+///
+/// `rename(2)` is atomic with respect to *readers*, and that is all it is.
+/// It says nothing about what survives a power cut: the temp file's bytes
+/// may still be in the page cache when the rename becomes durable, and the
+/// rename itself may not be durable at all until the containing directory
+/// is synced. After a crash the target can therefore come back empty, come
+/// back as its previous contents, or come back as if the write never
+/// happened.
+///
+/// For `global-excludes.json` each of those restores the built-in defaults,
+/// which is the dangerous direction: a group the operator had *disabled*
+/// re-enables itself and every later backup skips paths they meant to keep
+/// (`docs/data-model.md` §global-excludes.json).
+enum DurableFile {
+    /// Writes `data` to `url` so that a crash leaves either the old file or
+    /// the new one, and the survivor's bytes are the ones that were written:
+    /// temp file → `fsync` its descriptor → `rename(2)` → `fsync` the
+    /// containing directory.
+    ///
+    /// `0600` and `O_NOFOLLOW` for the same reasons the lock files use them:
+    /// this is owner-only host-local state, and a symlink planted at the
+    /// temp path must not redirect the write somewhere else.
+    static func write(_ data: Data, to url: URL, via tempFile: URL) throws {
+        let flags = O_CREAT | O_WRONLY | O_TRUNC | O_NOFOLLOW | O_CLOEXEC
+        let descriptor = tempFile.path.withCString { open($0, flags, 0o600) }
+        guard descriptor >= 0 else {
+            throw LockFailure(path: tempFile.path, operation: "open temp file", errnoValue: errno)
+        }
+        var closed = false
+        defer { if !closed { close(descriptor) } }
+
+        try data.withUnsafeBytes { buffer in
+            var offset = 0
+            while offset < buffer.count {
+                let written = buffer.baseAddress!.advanced(by: offset)
+                    .withMemoryRebound(to: UInt8.self, capacity: buffer.count - offset) { pointer in
+                        Foundation.write(descriptor, pointer, buffer.count - offset)
+                    }
+                if written < 0 {
+                    if errno == EINTR { continue }
+                    throw LockFailure(path: tempFile.path, operation: "write", errnoValue: errno)
+                }
+                offset += written
+            }
+        }
+
+        while fsync(descriptor) != 0 {
+            if errno == EINTR { continue }
+            throw LockFailure(path: tempFile.path, operation: "fsync temp file", errnoValue: errno)
+        }
+        close(descriptor)
+        closed = true
+
+        try AtomicFile.rename(from: tempFile, to: url)
+        try syncContainingDirectory(of: url)
+    }
+
+    /// Removes `url` durably: the unlink is only guaranteed to survive a
+    /// crash once the containing directory is synced. Without it a
+    /// successful `excludes reset` can resurrect the removed file's extra
+    /// patterns or size cap after a reboot.
+    static func remove(_ url: URL) throws {
+        if unlink(url.path) != 0, errno != ENOENT {
+            throw LockFailure(path: url.path, operation: "unlink", errnoValue: errno)
+        }
+        try syncContainingDirectory(of: url)
+    }
+
+    private static func syncContainingDirectory(of url: URL) throws {
+        let directory = url.deletingLastPathComponent()
+        let descriptor = directory.path.withCString {
+            open($0, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        }
+        guard descriptor >= 0 else {
+            throw LockFailure(
+                path: directory.path, operation: "open directory for fsync", errnoValue: errno
+            )
+        }
+        defer { close(descriptor) }
+        while fsync(descriptor) != 0 {
+            if errno == EINTR { continue }
+            throw LockFailure(path: directory.path, operation: "fsync directory", errnoValue: errno)
+        }
+    }
+}
 
 /// The `rename(2)` half of the "write a temp file in the same directory,
 /// then rename over the target" convention every writer in this package

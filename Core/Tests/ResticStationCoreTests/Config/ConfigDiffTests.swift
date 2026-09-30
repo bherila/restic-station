@@ -283,6 +283,17 @@ private func baseConfig() -> AppConfig {
         let summary = ConfigDiff.summarize(from: baseConfig(), to: new)
         #expect(summary.changed.map(\.changedFields) == [["onlineOnlyFiles"]])
     }
+
+    /// Schedule-relevant because it decides whether this host's global
+    /// exclusion list reaches the next `backup` at all — the same reason
+    /// `excludes` and `onlineOnlyFiles` are.
+    @Test func usesGlobalExcludesChangeIsReportedAsAChangedField() {
+        var new = baseConfig()
+        new.sets[0].usesGlobalExcludes = false
+        let summary = ConfigDiff.summarize(from: baseConfig(), to: new)
+        #expect(summary.changed.map(\.changedFields) == [["usesGlobalExcludes"]])
+        #expect(ConfigDiff.isScheduleRelevantChange(from: baseConfig(), to: new))
+    }
 }
 
 @Suite struct ConfigDiffIrrelevantTests {

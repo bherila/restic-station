@@ -1,9 +1,9 @@
 import ResticStationCore
 import SwiftUI
 
-/// The `Settings` scene's content (`docs/ui-spec.md` §Settings): three panes
-/// in the standard macOS tabbed shape — General, restic binary, Permissions
-/// & background — plus the setup assistant.
+/// The `Settings` scene's content (`docs/ui-spec.md` §Settings): four panes
+/// in the standard macOS tabbed shape — General, restic binary, Exclusions,
+/// Permissions & background — plus the setup assistant.
 ///
 /// Settings is a single surface reachable two ways (⌘, and the sidebar's
 /// `SettingsLink`), and it is where every "this looks fine but nothing is
@@ -20,7 +20,7 @@ struct SettingsRootView: View {
     @State private var showOnboarding = false
 
     private enum Pane: String, CaseIterable, Identifiable {
-        case general, restic, permissions
+        case general, restic, exclusions, permissions
         var id: String { rawValue }
     }
 
@@ -33,6 +33,10 @@ struct SettingsRootView: View {
             ResticSettings()
                 .tabItem { Label("restic", systemImage: "terminal") }
                 .tag(Pane.restic)
+
+            ExclusionsSettings()
+                .tabItem { Label("Exclusions", systemImage: "minus.circle") }
+                .tag(Pane.exclusions)
 
             PermissionsView()
                 .tabItem { Label("Permissions", systemImage: "lock.shield") }

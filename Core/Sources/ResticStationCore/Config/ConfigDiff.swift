@@ -146,6 +146,7 @@ public enum ConfigDiff {
             if oldSet.excludes != newSet.excludes { fields.append("excludes") }
             if oldSet.purgeExcludes != newSet.purgeExcludes { fields.append("purgeExcludes") }
             if oldSet.onlineOnlyFiles != newSet.onlineOnlyFiles { fields.append("onlineOnlyFiles") }
+            if oldSet.usesGlobalExcludes != newSet.usesGlobalExcludes { fields.append("usesGlobalExcludes") }
             if oldSet.schedule != newSet.schedule { fields.append("schedule") }
             if oldSet.retention != newSet.retention { fields.append("retention") }
             if oldSet.checkPolicy != newSet.checkPolicy { fields.append("checkPolicy") }
@@ -171,6 +172,7 @@ public enum ConfigDiff {
                 excludes: set.excludes,
                 purgeExcludes: set.purgeExcludes,
                 onlineOnlyFiles: set.onlineOnlyFiles,
+                usesGlobalExcludes: set.usesGlobalExcludes,
                 retention: set.retention,
                 checkPolicy: set.checkPolicy,
                 destinations: set.destinations,
@@ -197,6 +199,9 @@ public enum ConfigDiff {
         /// Changes the argv of the next `backup` (`--exclude-cloud-files`),
         /// the same way an exclude does.
         let onlineOnlyFiles: OnlineOnlyFiles
+        /// Decides whether this host's global exclusion list reaches the
+        /// next `backup` at all, so it changes that argv too.
+        let usesGlobalExcludes: Bool
         let retention: RetentionPolicy?
         let checkPolicy: CheckPolicy?
         /// Whole destinations, not just ids: a changed `repoURL` or a moved
