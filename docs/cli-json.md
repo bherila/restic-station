@@ -51,6 +51,8 @@ itself, unwrapped, because its output is meant to be fed straight back into
 | `runs show <id>` | ✅ | `RunMetadata` |
 | `config show` | ✅ | effective-config report |
 | `config validate` | ✅ | `{ machineId, errors, warnings, effective, nothingRunsHere }` |
+| `config upgrade` | ✅ | `{ fromVersion, toVersion, migrated, backupFile, message }` — migrates `config.json` to this binary's schema now; `migrated: false` (with `backupFile`/`message` `null`) when it was already current. A migration that could not be written is `internal_error` |
+| `config acknowledge-migration` | ✅ | `{ hadMigration, fromVersion, toVersion, acknowledgedAt }` — clears the warning `status` raises for this machine's last schema migration (`configMigration`); `hadMigration: false` and nulls when none was recorded |
 | `probe-repo` | ✅ | `{ setId, destinationId, label, outcome, reachable, reason }` |
 | `secret list` | ✅ | array of `{ destId, label, setName, hasPassword, secretEnvCount }` — only destinations that have something stored, the same set human mode prints |
 | `cli status` | ✅ | `CLIInstaller.Status` |

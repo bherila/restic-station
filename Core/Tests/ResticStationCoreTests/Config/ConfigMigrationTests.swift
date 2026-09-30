@@ -44,6 +44,60 @@ private func installMachine(at paths: AppPaths, resticPath: String? = nil) throw
 
 @Suite struct ConfigMigrationTests {
 
+    // MARK: - #161: a persisted migration is recorded
+
+    @Test func aPersistedMigrationRecordsItselfUntilAcknowledged() throws {
+        let (store, paths, cleanup) = try makeStore()
+        defer { cleanup() }
+        try installV1Fixture(at: paths)
+        try installMachine(at: paths)
+        let state = StateStore(paths: paths)
+        #expect(state.readConfigMigration() == nil)
+
+        _ = try store.load()
+
+        let record = try #require(state.readConfigMigration())
+        #expect(record.fromVersion == 1)
+        #expect(record.toVersion == AppConfig.currentVersion)
+        #expect(record.machineId == "studio-mac")
+        #expect(record.needsAcknowledgement)
+
+        // A second load of the now-current file is not a migration and
+        // must not replace (or re-arm) the record.
+        let acknowledged = try #require(try state.acknowledgeConfigMigration(at: Date(timeIntervalSince1970: 1)))
+        _ = try store.load()
+        #expect(state.readConfigMigration() == acknowledged)
+        #expect(state.readConfigMigration()?.needsAcknowledgement == false)
+    }
+
+    @Test func aCurrentConfigRecordsNoMigration() throws {
+        let (store, paths, cleanup) = try makeStore()
+        defer { cleanup() }
+        try store.save(AppConfig())
+        _ = try store.load()
+        #expect(StateStore(paths: paths).readConfigMigration() == nil)
+    }
+
+    @Test func anUnwrittenMigrationRecordsNothing() throws {
+        let (store, paths, cleanup) = try makeStore()
+        defer { cleanup() }
+        let original = try installV1Fixture(at: paths)
+        try installMachine(at: paths)
+        // An existing file where the backup must go makes the O_EXCL backup
+        // "already exist" — so block the overwrite instead: a directory in
+        // config.json's place for the temp file cannot be made read-only
+        // portably, so drop write permission on the data directory.
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: paths.root.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: paths.root.path) }
+        guard access(paths.root.path, W_OK) != 0 else { return } // root ignores modes (Linux CI container)
+
+        let migrated = try store.load()
+
+        #expect(migrated.version == AppConfig.currentVersion)
+        #expect(try Data(contentsOf: paths.configFile) == original)
+        #expect(StateStore(paths: paths).readConfigMigration() == nil)
+    }
+
     // MARK: - The happy path
 
     @Test func loadingAV1ConfigBumpsTheVersionAndMovesResticPathIntoMachineJSON() throws {

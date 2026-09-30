@@ -4,7 +4,10 @@ import SwiftUI
 /// The set list (`docs/ui-spec.md` §Backup Sets, **List**): name, source
 /// count, primary destination label + kind icon, schedule summary, last run
 /// status badge, next due time. Toolbar: add set, delete set. Empty state:
-/// short explainer + "Create your first backup set".
+/// short explainer + "Create your first backup set" — unless `config.json`
+/// could not be read, which gets its own state (#162): an unreadable config
+/// is not an empty one, and offering to create a set there invites a write
+/// that is refused.
 ///
 /// `Table` rather than a hand-rolled `List` of `HStack`s: it gives real
 /// column headers, resizing and keyboard selection for free, which is what
@@ -24,7 +27,11 @@ struct SetListView: View {
     var body: some View {
         Group {
             if model.config.sets.isEmpty {
-                emptyState
+                if let problem = model.configFileProblem {
+                    problemState(problem)
+                } else {
+                    emptyState
+                }
             } else {
                 table
             }
@@ -38,7 +45,10 @@ struct SetListView: View {
                 } label: {
                     Label("Add Backup Set", systemImage: "plus")
                 }
-                .help("Create a backup set")
+                .disabled(model.configFileProblem != nil)
+                .help(model.configFileProblem == nil
+                    ? "Create a backup set"
+                    : "Unavailable until config.json can be read")
 
                 Button {
                     if let selected = selectedSet {
@@ -89,6 +99,25 @@ struct SetListView: View {
         } actions: {
             Button(SetsCopy.createFirstSet) { onCreate() }
                 .buttonStyle(.borderedProminent)
+        }
+    }
+
+    // MARK: - Config problem
+
+    private func problemState(_ problem: ConfigFileProblem) -> some View {
+        ContentUnavailableView {
+            Label(problem.title, systemImage: "exclamationmark.triangle")
+        } description: {
+            VStack(spacing: 8) {
+                Text(problem.explanation)
+                CopyablePath(text: model.paths.configFile.path, helpText: "Copy the path to config.json")
+            }
+        } actions: {
+            // Reload Settings is in the window's banner.
+            if problem.offersUpdateCheck {
+                CheckForUpdatesButton()
+                    .buttonStyle(.borderedProminent)
+            }
         }
     }
 

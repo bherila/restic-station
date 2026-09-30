@@ -469,7 +469,9 @@ struct AppModelMachineOverrideTests {
         let legacyBytes = try ConfigStore.makeEncoder().encode(legacy)
         try legacyBytes.write(to: paths.configFile, options: .atomic)
 
-        await model.reloadConfigFromDisk()
+        // #161: a reload alone no longer rewrites an older schema; the
+        // confirmed upgrade does, through the same migrating reload.
+        await model.upgradeConfigSchema()
 
         #expect(model.config.version == AppConfig.currentVersion)
         #expect(model.config.resticPath == nil)
@@ -528,8 +530,8 @@ struct AppModelMachineOverrideTests {
         #expect(model.config == installed)
     }
 
-    @Test("legacy config migration is deferred from startup initialization")
-    func legacyConfigMigratesAfterStart() async throws {
+    @Test("a legacy config is migrated only after the user confirms the upgrade")
+    func legacyConfigMigratesAfterConfirmation() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("restic-station-deferred-migration-app-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -540,16 +542,23 @@ struct AppModelMachineOverrideTests {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         try ConfigStore.makeEncoder().encode(legacy).write(to: paths.configFile, options: .atomic)
 
+        let legacyBytes = try Data(contentsOf: paths.configFile)
         let model = AppModel(paths: paths)
         #expect(model.config.version == 1)
+        #expect(model.pendingSchemaUpgrade == SchemaUpgradeOffer(fileVersion: 1))
         model.start()
         defer { model.stop() }
-        for _ in 0..<80 {
-            if model.config.version == AppConfig.currentVersion { break }
-            try await Task.sleep(for: .milliseconds(10))
-        }
+        // start() reloads a legacy config; give it the time the old
+        // auto-migration took, then prove the shared file was not touched.
+        try await Task.sleep(for: .milliseconds(300))
+        #expect(model.config.version == 1)
+        #expect(try Data(contentsOf: paths.configFile) == legacyBytes)
+        #expect(StateStore(paths: paths).readConfigMigration() == nil)
+
+        await model.upgradeConfigSchema()
 
         #expect(model.config.version == AppConfig.currentVersion)
+        #expect(model.pendingSchemaUpgrade == nil)
         #expect(model.machine.resticPath == migratedPath)
         #expect(model.configLoadError == nil)
     }
@@ -696,7 +705,9 @@ struct AppModelMachineOverrideTests {
             configRevisionLoader: { "legacy" }
         )
 
-        await model.reloadConfigFromDisk()
+        // Confirmed, so the migrating loader runs — and returns an
+        // unmigrated snapshot, as it does when config.lock is unavailable.
+        await model.upgradeConfigSchema()
 
         #expect(model.config.version == 1)
         #expect(model.configChangedOnDisk)

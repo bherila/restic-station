@@ -44,6 +44,9 @@ public final class StateWatcher: ObservableObject {
     /// same way as `currentRuns`.
     @Published public private(set) var repoStatuses: [UUID: RepoStatus] = [:]
     @Published public private(set) var fdaCheck: FdaCheckResult?
+    /// `state/config-migration.json`: the last schema migration this host
+    /// wrote to the shared config (#161).
+    @Published public private(set) var configMigration: ConfigMigrationRecord?
     /// `RunStore.recentRuns(limit: 200)`, newest first.
     @Published public private(set) var recentRuns: [RunIndexEntry] = []
     /// Destructive runs whose launch marker has no complete terminal
@@ -375,6 +378,7 @@ public final class StateWatcher: ObservableObject {
                 : nil
         }
         fdaCheck = stateStore.readFdaCheck()
+        configMigration = stateStore.readConfigMigration()
 
         let discovered = enumerateStateDirectory()
         currentRuns = discovered.currentRuns

@@ -87,11 +87,11 @@ import Testing
     }
 }
 
-@Test func configExposesItsFourSubcommands() {
+@Test func configExposesItsSubcommands() {
     let names: [String?] = Config.configuration.subcommands.map { subcommand in
         subcommand.configuration.commandName
     }
-    #expect(names == ["export", "import", "validate", "show"])
+    #expect(names == ["export", "import", "validate", "show", "upgrade", "acknowledge-migration"])
 }
 
 @Test func setsExposesListOnly() {

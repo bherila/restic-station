@@ -223,6 +223,14 @@ public struct AppPaths: Equatable, Sendable {
         stateDir.appendingPathComponent("fda-check.json", isDirectory: false)
     }
 
+    /// `state/config-migration.json` — the last schema migration this host
+    /// wrote to `config.json`, kept until someone acknowledges it
+    /// (`docs/data-model.md` §Versioning & migration). Host-local state: the
+    /// host that migrated a shared config is the one that must say so.
+    public var configMigrationFile: URL {
+        stateDir.appendingPathComponent("config-migration.json", isDirectory: false)
+    }
+
     /// `state/preview-tokens.json` — the local, owner-only index behind
     /// short-lived destructive-operation preview tokens.  This is state,
     /// not shared configuration: a token is bound to one machine and must

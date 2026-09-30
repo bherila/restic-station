@@ -858,4 +858,24 @@ private func currentRun(percentDone: Double, phase: String = "backing-up-primary
         #expect(!healths[1].isRunning)
         #expect(healths[1].nextDue == .distantPast)
     }
+
+    // #161: the host that migrated a shared config warns until acknowledged,
+    // for both the menu bar glyph and `status`'s exit code.
+    @Test func anUnacknowledgedConfigMigrationIsAWarning() {
+        #expect(HealthDerivation.hasWarningConditions(
+            setHealths: [], runsInFlight: [], fullDiskAccessDenied: false, backgroundAgentEnabled: true,
+            configMigrationUnacknowledged: true
+        ))
+        #expect(!HealthDerivation.hasWarningConditions(
+            setHealths: [], runsInFlight: [], fullDiskAccessDenied: false, backgroundAgentEnabled: true
+        ))
+        #expect(HealthDerivation.appHealth(
+            setHealths: [], runsInFlight: [], fullDiskAccessDenied: false, backgroundAgentEnabled: true,
+            configMigrationUnacknowledged: true
+        ) == .warning)
+        #expect(HealthDerivation.appHealth(
+            setHealths: [], runsInFlight: [], fullDiskAccessDenied: false, backgroundAgentEnabled: true,
+            destructiveAuditFailure: true, configMigrationUnacknowledged: true
+        ) == .critical)
+    }
 }
