@@ -206,4 +206,26 @@ import Testing
         _ = await env.engine.runPruneRepository(set: set, destination: remote)
         #expect(env.stateStore.readSecretAttention(destId: T.primaryId) == nil)
     }
+
+    /// Codex on #165: a secondary's permanent secret problem is recorded on
+    /// the due run too, without blocking the primary backup.
+    @Test("a secondary with no stored password is recorded, and the primary still backs up")
+    func secondarySecretProblemIsRecorded() async throws {
+        let env = T.makeEnv(secretsUnavailableFor: [T.secondaryAId], secretFailure: .itemNotFound, script: [])
+        defer { env.cleanUp() }
+        env.fake.script = Self.anything
+
+        let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
+
+        if case .misconfigured = outcome { Issue.record("a secondary must not block the primary: \(outcome)") }
+        if case .retryable = outcome { Issue.record("a secondary must not defer the primary: \(outcome)") }
+        #expect(env.stateStore.readSecretAttention(destId: T.secondaryAId)?.attention == .secretNotConfigured)
+        #expect(env.stateStore.readSecretAttention(destId: T.primaryId) == nil)
+
+        env.secrets.clearFailures()
+        env.secrets.store(password: "mirror", for: T.secondaryAId)
+        env.fake.script = Self.anything
+        _ = await env.engine.runCheck(env.set, trigger: .scheduled)
+        #expect(env.stateStore.readSecretAttention(destId: T.secondaryAId) == nil)
+    }
 }

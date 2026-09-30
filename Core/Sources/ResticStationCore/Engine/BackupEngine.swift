@@ -323,6 +323,7 @@ public final class BackupEngine: Sendable {
             let reason = "\(secretStoreDescription) could not be read for destination \"\(primary.label)\""
             return .retryable(reason: reason)
         }
+        await refreshSecondarySecretAttention(of: set)
 
         // ── Step 2: per-set lock ────────────────────────────────────────
         let (lock, acquisition) = acquireSetLock(setId: set.id)
@@ -778,6 +779,7 @@ public final class BackupEngine: Sendable {
             }
             return .retryable(reason: "the secret store is unavailable")
         }
+        await refreshSecondarySecretAttention(of: set)
 
         let (lock, acquisition) = acquireSetLock(setId: set.id)
         switch acquisition {
@@ -3787,6 +3789,18 @@ public final class BackupEngine: Sendable {
             ))
         } catch {
             logWarning("BackupEngine: could not record the secret problem for \"\(destination.label)\": \(error)")
+        }
+    }
+
+    /// Keeps each secondary's secret-attention record true on every due
+    /// backup and check (Codex on #165). Only the primary gates the run — a
+    /// mirror whose password is missing must not stop the primary backup,
+    /// and its copy step already fails or skips on its own — but without
+    /// this, a secondary's permanent problem would only ever surface as
+    /// staleness, days later and without the reason.
+    private func refreshSecondarySecretAttention(of set: BackupSet) async {
+        for destination in set.destinations where !destination.isPrimary {
+            _ = await secretStoreRefusal(for: [destination])
         }
     }
 
