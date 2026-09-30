@@ -106,7 +106,7 @@ Findings observed during implementation and review — not speculation:
 
 ## 4. Signing & distribution (v1 posture)
 
-Builds and releases are ad-hoc signed and not notarized; the project does not use a Developer ID, and that is permanent (`docs/release.md` §3). CI: `CODE_SIGNING_ALLOWED=NO`, build-only. The app is **not sandboxed** by design: it must spawn `/usr/bin/security`, an arbitrary user-configured restic binary, `launchctl`, and take `flock`s — all incompatible with App Sandbox. Consequence: no Mac App Store; accepted. The app updates itself with Sparkle (`docs/release.md` §Updates); on an ad-hoc build every update is a new binary to TCC, so Full Disk Access may have to be re-granted after it.
+Development builds are ad-hoc signed. Releases are signed with the project's self-signed release identity and are not notarized; the project does not use a Developer ID, and that is permanent (`docs/release.md` §3). CI: `CODE_SIGNING_ALLOWED=NO`, build-only. The app is **not sandboxed** by design: it must spawn `/usr/bin/security`, an arbitrary user-configured restic binary, `launchctl`, and take `flock`s — all incompatible with App Sandbox. Consequence: no Mac App Store; accepted. The app updates itself with Sparkle (`docs/release.md` §Updates); releases share one designated requirement (`identifier` + the release certificate), so a Full Disk Access grant to the app or the helper survives updates. An ad-hoc build's requirement is its own `cdhash`, so switching between an ad-hoc build and a release (or between two ad-hoc builds) is a new identity to TCC and needs the grant again.
 
 ## 5. Linux: the `secrets.json` file backend
 

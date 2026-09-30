@@ -31,38 +31,53 @@ xcodebuild -scheme "Restic Station" -configuration Release \
 APP="build/Build/Products/Release/Restic Station.app"
 ```
 
-## 3. Sign — ad-hoc
+## 3. Sign — the release identity
 
 Restic Station is **not** signed with a Developer ID and is **not** notarized;
-this is the permanent posture, not a stopgap. Releases are ad-hoc signed and
-personal-use.
+that is permanent. Releases are signed with the project's own **self-signed
+code-signing certificate** (SHA-1 `8c6fa76a26165b3aee42279c994b949f745bd00d`,
+pinned in `scripts/sign-release.sh`), held by the maintainer in a dedicated
+keychain file outside the login keychain.
 
-The app is intentionally **not sandboxed** (see [keychain-and-fda.md §4](keychain-and-fda.md)).
-The Release build from step 2 is already ad-hoc signed. If anything in the
-bundle was changed afterwards, re-sign it inside-out — the embedded helper and
-Sparkle's nested helpers first, then the bundle:
+macOS does not trust that certificate, and does not need to. What it buys is
+a designated requirement that is the same for every release —
+`identifier "net.herila.ResticStation" and certificate root = H"8c6f…d00d"`
+(and `net.herila.ResticStation.helper` for the embedded helper) — which is
+what TCC keys a Full Disk Access grant to. An ad-hoc signature's requirement
+is the build's own `cdhash`, which changes every release, so an ad-hoc update
+loses the grant; a release-identity update keeps it (verified 2026-09-30:
+a same-certificate rebuild kept its grant, an ad-hoc build of the same bundle
+ID was denied). Sparkle checks code signatures without asking macOS to trust
+the certificate, so updates are unaffected (§Updates).
 
 ```sh
-codesign --force --sign - "$APP/Contents/MacOS/restic-station-helper"
-SPK="$APP/Contents/Frameworks/Sparkle.framework"
-codesign -f -s - "$SPK/Versions/B/XPCServices/Installer.xpc"
-codesign -f -s - --preserve-metadata=entitlements "$SPK/Versions/B/XPCServices/Downloader.xpc"
-codesign -f -s - "$SPK/Versions/B/Autoupdate"
-codesign -f -s - "$SPK/Versions/B/Updater.app"
-codesign -f -s - "$SPK"
-codesign --force --sign - "$APP"
-codesign --verify --deep --strict --verbose=2 "$APP"
+RESTIC_STATION_SIGNING_KEYCHAIN=<keychain file> \
+RESTIC_STATION_SIGNING_KEYCHAIN_PASSWORD_FILE=<its password file> \
+scripts/sign-release.sh "$APP"
 ```
+
+The script signs inside-out — the embedded helper (with the stable identifier
+`net.herila.ResticStation.helper`; the linker's default embeds a per-build
+UUID), Sparkle's nested helpers in Sparkle's documented order, then the app
+with `App/ResticStation.entitlements`, which drops Xcode's debug-only
+`get-task-allow` — and refuses to finish unless both designated requirements
+are exactly the pinned ones. `scripts/sign-release.sh --verify "$APP"` checks a
+bundle without signing it; `make-appcast.sh` runs it and refuses any other
+signature, ad-hoc included.
 
 Consequences, stated in every release's notes:
 
-- **First install:** Gatekeeper blocks a downloaded ad-hoc app. The user
-  clears quarantine (`xattr -dr com.apple.quarantine "/Applications/Restic Station.app"`)
+- **First install:** Gatekeeper blocks a downloaded app that isn't notarized.
+  The user clears quarantine (`xattr -dr com.apple.quarantine "/Applications/Restic Station.app"`)
   or approves it in System Settings → Privacy & Security → Open Anyway.
   Updates installed by Sparkle don't go through this.
-- **Full Disk Access after an update:** TCC keys an ad-hoc binary to its exact
-  code, so FDA for the app *and* the helper may have to be re-granted after
-  each update; see §Updates.
+- **Full Disk Access:** granted once to the app and to `restic-station-helper`,
+  it survives updates signed with the release identity. The first
+  release-identity build after an ad-hoc one (v0.1.2, after v0.1.1) is a new
+  identity to TCC, so that one update needs the grants again.
+- **If the certificate is lost,** a new one works the same way, but the first
+  release signed with it costs every installed copy one more re-grant, and the
+  pin in `scripts/sign-release.sh` changes.
 
 ## 4. Notarize
 
@@ -76,6 +91,7 @@ Not applicable — notarization requires a Developer ID.
 
 ```sh
 git tag vX.Y.Z && git push origin main vX.Y.Z
+scripts/sign-release.sh --verify "$APP"                          # step 3 must have run
 scripts/make-appcast.sh "$APP" dist/sparkle release-notes.html   # see §Updates
 gh release create vX.Y.Z dist/sparkle/Restic-Station-X.Y.Z.zip dist/sparkle/appcast.xml \
   --title "Restic Station vX.Y.Z" --notes-file <release-notes.md>
@@ -87,7 +103,7 @@ what every installed copy checks. Upload `appcast.xml` exactly as the script
 wrote it — the feed is signed, and any edit (even whitespace) makes every
 installed copy refuse it until it is re-signed.
 
-Release notes should state the signing posture (ad-hoc, not notarized, and what that means for first install and Full Disk Access), the minimum macOS (14) and restic (≥ 0.18) versions, and link the FDA setup walkthrough in the README.
+Release notes should state the signing posture (self-signed release identity, not notarized, and what that means for first install and Full Disk Access), the minimum macOS (14) and restic (≥ 0.18) versions, and link the FDA setup walkthrough in the README.
 
 ## 7. Post-release smoke test
 
@@ -130,15 +146,16 @@ cannot package that transition yet: it verifies every signature against the
 key inside the bundle being released, which is the new one. Add a
 transitional trust-key option before attempting a rotation.
 
-**Code signing.** Sparkle accepts an update whose EdDSA signature verifies even
-when the Apple code signature differs, which is what makes ad-hoc releases
-updatable at all. The new bundle must still be validly signed (ad-hoc at
-minimum). On an ad-hoc build, macOS keys Full Disk Access to the exact binary,
-so FDA — for the app *and* the helper — must be re-granted after each update,
-and the Login Items approval may reset; Settings → Permissions shows both.
-The project does not use a Developer ID, so this cost is permanent unless a
-stable self-signed identity turns out to keep grants across updates
-(untested).
+**Code signing.** Sparkle accepts an update whose EdDSA signature verifies,
+and additionally requires a code-signed update to be *validly* signed — a
+static validity check with no anchor requirement, which the untrusted release
+certificate passes. When the installed copy is signed with the same
+certificate, the designated requirements match as well. Releases are signed
+with the release identity (§3), so Full Disk Access for the app and the helper
+survives updates; the one exception is the first such release after an ad-hoc
+one. Verified 2026-09-30 with real Sparkle and a localhost feed: an ad-hoc
+build 2 and a release-identity build 2 each installed a release-identity
+build 3, whose signature then verified.
 
 **Config schema gate.** Each appcast item carries
 `<resticstation:configSchemaVersion>` — the `config.json` schema the release

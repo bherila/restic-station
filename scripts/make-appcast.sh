@@ -102,7 +102,11 @@ SCHEMA=$("$APP/Contents/MacOS/restic-station-helper" version --json | jq -er '.d
     || die "the embedded helper does not report configSchemaVersion"
 case $SCHEMA in ''|*[!0-9]*|0) die "configSchemaVersion '$SCHEMA' is not a positive integer" ;; esac
 
-codesign --verify --deep --strict "$APP" || die "$APP is not validly signed (Sparkle requires at least an ad-hoc signature)"
+# Releases carry the pinned self-signed identity, never an ad-hoc signature:
+# its stable designated requirement is what keeps Full Disk Access across
+# updates (docs/release.md §3). The check lives in sign-release.sh.
+"$REPO_ROOT/scripts/sign-release.sh" --verify "$APP" >/dev/null \
+    || die "$APP is not signed with the release identity — run scripts/sign-release.sh first"
 
 # The previous release: its build must be lower (Sparkle ignores anything
 # else), and a schema change gets a fleet warning in the notes.
