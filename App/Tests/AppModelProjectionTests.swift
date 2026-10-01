@@ -126,19 +126,26 @@ struct AppPresentationContractTests {
         #expect(!DestinationStatus.notInitialized.isAlarm, "not-initialized keeps its existing styling")
     }
 
-    @Test("the menu bar line says a set is being skipped, and why (#95)")
+    @Test("the menu bar line says a set is skipped only when its primary is affected (#95)")
     func menuLineNamesSecretProblem() {
-        let destination = UUID()
+        let primary = UUID()
+        let mirror = UUID()
         let set = UUID()
-        let health = SetHealth(
-            setId: set, name: "Docs", lastBackup: nil, lastRun: nil, currentRun: nil,
-            staleDestinationIds: [], nextDue: .distantPast,
-            secretAttention: [SecretAttentionRecord(
-                destId: destination, setId: set, attention: .secretNotConfigured, detail: "", detectedAt: .now
-            )]
-        )
-        #expect(MenuBarCopy.statusLine(for: health) == "Docs — skipped: password not stored ⚠")
-        #expect(health.needsAttention)
+        func health(problemOn destination: UUID) -> SetHealth {
+            SetHealth(
+                setId: set, name: "Docs", lastBackup: nil, lastRun: nil, currentRun: nil,
+                staleDestinationIds: [], nextDue: .distantPast,
+                secretAttention: [SecretAttentionRecord(
+                    destId: destination, setId: set, attention: .secretNotConfigured, detail: "", detectedAt: .now
+                )],
+                primaryDestinationId: primary
+            )
+        }
+        #expect(MenuBarCopy.statusLine(for: health(problemOn: primary)) == "Docs — skipped: password not stored ⚠")
+        // A mirror's problem does not stop the backup, so the set is not "skipped".
+        let mirrorLine = MenuBarCopy.statusLine(for: health(problemOn: mirror))
+        #expect(mirrorLine == "Docs — never backed up · mirror password not stored ⚠")
+        #expect(health(problemOn: mirror).needsAttention)
     }
 
     @Test("set-list formatters describe every schedule and destination kind")

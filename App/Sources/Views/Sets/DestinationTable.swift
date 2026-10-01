@@ -198,12 +198,15 @@ struct DestinationTable: View {
     private func secretProblemHelp(_ destination: Destination) -> String? {
         guard let record = model.setHealth(for: set.id)?.secretAttention.first(where: { $0.destId == destination.id })
         else { return nil }
+        let consequence = destination.isPrimary
+            ? "so this set's backups are skipped"
+            : "so copies to this mirror fail; the primary still backs up"
         switch record.attention {
         case .secretNotConfigured:
-            return "No password is stored for this destination, so its backups are skipped. "
+            return "No password is stored for this destination, \(consequence). "
                 + "Edit the destination and enter the repository password."
         case .secretStoreUnusable, .cloudRepositoryNotHydrated:
-            return "Restic Station cannot read this destination's secrets, so its backups are skipped: \(record.detail)"
+            return "Restic Station cannot read this destination's secrets, \(consequence): \(record.detail)"
         }
     }
 

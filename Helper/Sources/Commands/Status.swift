@@ -961,7 +961,10 @@ struct StatusReport: Encodable {
                 let staleFlag = destination.stale ? ", STALE" : ""
                 lines.append("      - \(role) \"\(destination.label)\": \(reach)\(error)\(staleFlag)")
                 if let problem = destination.secretProblem {
-                    lines.append("        SECRETS: \(problem.code) — \(problem.detail); scheduled runs skip this set until fixed")
+                    let consequence = destination.isPrimary
+                        ? "scheduled runs skip this set until fixed"
+                        : "the primary still backs up; copies to this mirror fail until fixed"
+                    lines.append("        SECRETS: \(problem.code) — \(problem.detail); \(consequence)")
                 }
             }
         }
