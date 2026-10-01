@@ -20,11 +20,16 @@ import Musl
 /// `StateStore.writeDurably` already does for schedule state.
 ///
 /// Errors before the rename leave the target untouched and are ordinary
-/// failures (`LockFailure`, the package's errno-carrying I/O failure). A
-/// directory sync that fails *after* the rename cannot un-install the file,
-/// so it is reported as `ConfigStoreError.durabilityUnconfirmed`, which is a
-/// possibly-committed outcome: callers reconcile against the live bytes
-/// rather than rolling back side effects paired with a save that happened.
+/// failures (`LockFailure`, the package's errno-carrying I/O failure).
+///
+/// **After the rename, nothing throws.** The new file is live, and every
+/// caller's notion of "the write failed" means "the old file is still
+/// there" — a third, possibly-committed outcome leaked into each of them in
+/// turn (#165 review). So a directory sync that fails after the rename is
+/// reported on stderr and the write counts as done: the file is installed,
+/// and the only exposure is to a power cut in the next moments, which an
+/// `EIO` on the directory has already made the least of this disk's
+/// problems.
 enum DurableFile {
     /// `fsync(2)`, replaceable only by tests (task-local, so a test's
     /// injected failure cannot leak into a concurrently running test).
@@ -44,19 +49,27 @@ enum DurableFile {
     static func write(_ data: Data, to url: URL, via tempFile: URL, mode: mode_t = 0o644) throws {
         try writeSynced(data, to: tempFile, exclusive: false, mode: mode)
         try AtomicFile.rename(from: tempFile, to: url)
-        try syncDirectoryAfterInstall(of: url)
+        syncDirectoryAfterInstall(of: url)
     }
 
     /// Creates `url` only if it does not exist (`O_EXCL`), durably. Returns
     /// `false` when it already existed. The migration backup uses this: the
-    /// source config is only overwritten once its backup is on disk.
+    /// source config is only overwritten once its backup is on disk, so —
+    /// unlike an install — a directory sync failure here is a failure, and
+    /// the unconfirmed entry is removed so no later run can mistake it for
+    /// a durable backup.
     static func createExclusive(_ data: Data, at url: URL, mode: mode_t = 0o644) throws -> Bool {
         do {
             try writeSynced(data, to: url, exclusive: true, mode: mode)
         } catch let failure as LockFailure where failure.errnoValue == EEXIST {
             return false
         }
-        try syncDirectory(of: url)
+        do {
+            try syncDirectory(of: url)
+        } catch {
+            unlink(url.path)
+            throw error
+        }
         return true
     }
 
@@ -101,13 +114,17 @@ enum DurableFile {
         }
     }
 
-    /// Syncs the directory holding an already-installed file. A failure
-    /// here means "installed, durability unconfirmed", never "not saved".
-    static func syncDirectoryAfterInstall(of url: URL) throws {
+    /// Syncs the directory holding an already-installed file, reporting a
+    /// failure on stderr instead of throwing (see the type's note).
+    static func syncDirectoryAfterInstall(of url: URL) {
         do {
             try syncDirectory(of: url)
-        } catch let failure as LockFailure {
-            throw ConfigStoreError.durabilityUnconfirmed(path: url.path, errno: failure.errnoValue)
+        } catch {
+            StandardStream.write(
+                Data(("restic-station: \(url.path) is saved, but syncing its directory to disk failed "
+                    + "(\(error)); it may not survive a power loss\n").utf8),
+                to: .standardError
+            )
         }
     }
 

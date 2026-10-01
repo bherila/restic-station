@@ -412,7 +412,6 @@ final class AppModel: ObservableObject {
         }
         let editFingerprint = expectedFingerprint ?? configFingerprint
         let installedFingerprint: String
-        var noticeAfterSave: String?
         do {
             try newConfig.validate()
             installedFingerprint = try configStore.save(
@@ -428,7 +427,6 @@ final class AppModel: ObservableObject {
                     // live. Adopt it so callers commit their paired secret
                     // mutations instead of rolling them back underneath it.
                     installedFingerprint = fingerprint
-                    noticeAfterSave = Self.noticeAfterAdoptedSave(error)
                 case .differentRevisionInstalled:
                     configChangedOnDisk = true
                     lastConfigError = "\(ConfigStoreError.changedOnDisk)"
@@ -459,7 +457,7 @@ final class AppModel: ObservableObject {
         resolvedConfig = newConfig.resolved(for: machine).config
         addressableConfig = newConfig.addressable(for: machine)
         stateWatcher.updateConfiguredSetIds(Set(resolvedConfig.sets.map(\.id)))
-        lastConfigError = noticeAfterSave
+        lastConfigError = nil
         recomputeDerivedState()
 
         if ConfigDiff.isScheduleRelevantChange(from: previous, to: newConfig) {
@@ -761,17 +759,6 @@ final class AppModel: ObservableObject {
     /// A config this app cannot read means scheduled backups on this
     /// machine have stopped (the helper refuses it too), so it is a warning
     /// even though every set-level signal looks quiet.
-    /// What to keep showing after an uncertain save was reconciled into a
-    /// success (Codex on #165). A save whose directory sync failed *is*
-    /// installed — adopting it keeps paired keychain changes — but it may
-    /// not survive a power cut, and the user must be told to save again
-    /// rather than see the error quietly cleared. Other uncertain outcomes
-    /// that turned out installed need no notice.
-    static func noticeAfterAdoptedSave(_ error: Error) -> String? {
-        guard case ConfigStoreError.durabilityUnconfirmed = error else { return nil }
-        return "\(error)"
-    }
-
     static func health(
         _ derivedHealth: AppHealth,
         pendingSecretRollbackError: String?,

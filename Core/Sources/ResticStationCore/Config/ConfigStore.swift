@@ -199,11 +199,6 @@ public struct ConfigStore: Sendable {
         do {
             try migration.config.validate()
             try persist(Self.makeEncoder().encode(migration.config))
-        } catch ConfigStoreError.durabilityUnconfirmed(let path, let errno) {
-            // The migrated file is live — only its directory sync failed —
-            // so every later load reads the new version and never migrates
-            // again. This is the only chance to leave the fleet warning.
-            Self.warn("\(path) was migrated, but syncing its directory failed (errno \(errno))")
         } catch {
             Self.warn("could not write the migrated config.json: \(error)")
             return migration.config
@@ -339,6 +334,10 @@ public struct ConfigStore: Sendable {
     private func writeBackupIfAbsent(_ original: Data, fromVersion version: Int) throws {
         let backupFile = paths.configBackupFile(fromVersion: version)
         guard !FileManager.default.fileExists(atPath: backupFile.path) else {
+            // An existing backup may be one an interrupted run left with its
+            // directory entry unsynced; confirm it before it licenses
+            // overwriting the source.
+            try DurableFile.syncDirectory(of: backupFile)
             return
         }
         try paths.ensureDirectories()
@@ -415,11 +414,12 @@ public struct ConfigStore: Sendable {
             guard installed else {
                 try? FileManager.default.removeItem(at: tempConfigFile)
                 // A rollback restored some other revision; make that durable
-                // too, best-effort — this save has already failed.
-                try? DurableFile.syncDirectory(of: paths.configFile)
+                // too. Best-effort, like any post-install sync: reported, and
+                // this save has failed either way.
+                DurableFile.syncDirectoryAfterInstall(of: paths.configFile)
                 throw ConfigStoreError.changedOnDisk
             }
-            try DurableFile.syncDirectoryAfterInstall(of: paths.configFile)
+            DurableFile.syncDirectoryAfterInstall(of: paths.configFile)
             return SHA256Digest.hex(data)
         }
     }
@@ -824,10 +824,6 @@ public enum ConfigStoreError: Error, Equatable, Sendable, CustomStringConvertibl
     case changedOnDisk
     case writeLockBusy(path: String)
     case writeLockUnusable(LockFailure)
-    /// The file was installed under its name, but syncing its directory
-    /// failed, so the rename may not survive a power cut (#159). The live
-    /// file is the new one; this is not "not saved".
-    case durabilityUnconfirmed(path: String, errno: Int32)
 
     public var description: String {
         switch self {
@@ -852,9 +848,6 @@ public enum ConfigStoreError: Error, Equatable, Sendable, CustomStringConvertibl
             return "another process is changing config.json (lock busy: \(path)); reload and try again"
         case .writeLockUnusable(let failure):
             return "cannot safely lock config.json for writing: \(failure)"
-        case .durabilityUnconfirmed(let path, let errno):
-            return "\(path) was saved, but syncing its directory to disk failed (errno \(errno)); "
-                + "the change is live now and may not survive a power loss — save again to be sure"
         }
     }
 
@@ -875,7 +868,7 @@ public enum ConfigStoreError: Error, Equatable, Sendable, CustomStringConvertibl
     public var commitMayBeUncertain: Bool {
         switch self {
         case .replacementRollbackFailed, .rollbackArtifactPreserved,
-             .rollbackArtifactPreservationFailed, .durabilityUnconfirmed:
+             .rollbackArtifactPreservationFailed:
             return true
         default:
             return false

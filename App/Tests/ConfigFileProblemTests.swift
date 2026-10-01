@@ -124,12 +124,4 @@ struct ConfigFileProblemTests {
         #expect(problem.title != SetsCopy.emptyStateTitle)
         #expect(ConfigFileProblem(ConfigError.newerVersion(found: 5, supported: 4)) == problem)
     }
-
-    @Test("a save adopted despite an unconfirmed directory sync keeps its warning (#159 review)")
-    func durabilityNoticeSurvivesReconciliation() {
-        let unconfirmed = ConfigStoreError.durabilityUnconfirmed(path: "/tmp/config.json", errno: EIO)
-        let notice = AppModel.noticeAfterAdoptedSave(unconfirmed)
-        #expect(notice?.contains("save again") == true)
-        #expect(AppModel.noticeAfterAdoptedSave(ConfigStoreError.rollbackArtifactPreserved(path: "/tmp/x")) == nil)
-    }
 }

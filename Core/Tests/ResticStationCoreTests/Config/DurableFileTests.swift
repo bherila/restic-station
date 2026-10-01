@@ -114,35 +114,76 @@ import Musl
         #expect(!FileManager.default.fileExists(atPath: store.tempConfigFile.path))
     }
 
-    /// The nearest constraint to the fix: the app rolls back paired secret
-    /// changes on a failed save. A directory-sync failure comes *after* the
-    /// new file is live, so it must read as possibly committed — never as a
-    /// failure that leaves the old config in place.
-    @Test func aDirectorySyncFailureIsInstalledButUnconfirmed() throws {
+    /// The #165 restructure: once the rename has happened the new file is
+    /// live, and every caller's "the write failed" means "the old file is
+    /// still there". A directory sync that fails afterwards must therefore
+    /// not throw — for config.json (both save paths) and machine.json — or a
+    /// caller rolls back state paired with a write that took effect.
+    @Test func aDirectorySyncFailureAfterTheRenameStillCountsAsSaved() throws {
         let (paths, root) = try makePaths()
         defer { try? FileManager.default.removeItem(at: root) }
         let store = ConfigStore(paths: paths)
         try store.save(config(named: "A"))
-        let fingerprint = try store.currentFileFingerprint()
 
-        for save in [
-            { try store.save(self.config(named: "B")) },
-            { _ = try store.save(self.config(named: "C"), ifUnchangedFrom: try store.currentFileFingerprint()) },
-        ] as [() throws -> Void] {
-            do {
-                try DurableFile.$sync.withValue(SyncProbe(failing: [2]).hook) { try save() }
-                Issue.record("expected durabilityUnconfirmed")
-            } catch let error as ConfigStoreError {
-                guard case .durabilityUnconfirmed = error else {
-                    Issue.record("unexpected \(error)")
-                    continue
-                }
-                #expect(error.commitMayBeUncertain)
-                #expect(!error.isRevisionConflict)
-            }
+        try DurableFile.$sync.withValue(SyncProbe(failing: [2]).hook) {
+            try store.save(config(named: "B"))
         }
+        #expect(try store.load().sets.map(\.name) == ["B"])
+
+        let fingerprint = try store.currentFileFingerprint()
+        let installed = try DurableFile.$sync.withValue(SyncProbe(failing: [2]).hook) {
+            try store.save(config(named: "C"), ifUnchangedFrom: fingerprint)
+        }
+        #expect(installed == (try store.currentFileFingerprint()))
         #expect(try store.load().sets.map(\.name) == ["C"])
-        #expect(try store.currentFileFingerprint() != fingerprint)
+
+        let machines = MachineStore(paths: paths, environment: [:])
+        try DurableFile.$sync.withValue(SyncProbe(failing: [2]).hook) {
+            try machines.save(MachineConfig(machineId: "after-rename"))
+        }
+        #expect(try machines.load().machineId == "after-rename")
+    }
+
+    /// The migration backup is the exception: it licenses overwriting the
+    /// source, so an entry whose directory did not sync is removed and the
+    /// source stays at its old version.
+    @Test func aBackupWhoseDirectoryDidNotSyncIsNotTrusted() throws {
+        let (paths, root) = try makePaths()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let from = AppConfig.currentVersion - 1
+        let legacy = try ConfigStore.makeEncoder().encode(AppConfig(version: from))
+        try legacy.write(to: paths.configFile)
+        try MachineStore(paths: paths, environment: [:]).save(MachineConfig(machineId: "studio-mac"))
+
+        // backup file, then backup directory ← fails
+        _ = try DurableFile.$sync.withValue(SyncProbe(failing: [2]).hook) {
+            try ConfigStore(paths: paths).load()
+        }
+
+        #expect(try Data(contentsOf: paths.configFile) == legacy)
+        #expect(!FileManager.default.fileExists(atPath: paths.configBackupFile(fromVersion: from).path))
+    }
+
+    /// An interrupted earlier run may have left a backup whose directory
+    /// entry never synced; it is confirmed before it is relied on.
+    @Test func anExistingBackupIsConfirmedBeforeItIsTrusted() throws {
+        let (paths, root) = try makePaths()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let from = AppConfig.currentVersion - 1
+        let legacy = try ConfigStore.makeEncoder().encode(AppConfig(version: from))
+        try legacy.write(to: paths.configFile)
+        try legacy.write(to: paths.configBackupFile(fromVersion: from))
+        try MachineStore(paths: paths, environment: [:]).save(MachineConfig(machineId: "studio-mac"))
+
+        _ = try DurableFile.$sync.withValue(SyncProbe(failing: [1]).hook) {
+            try ConfigStore(paths: paths).load()
+        }
+        #expect(try Data(contentsOf: paths.configFile) == legacy, "an unconfirmable backup must not license the overwrite")
+
+        let probe = SyncProbe()
+        _ = try DurableFile.$sync.withValue(probe.hook) { try ConfigStore(paths: paths).load() }
+        #expect(try ConfigStore(paths: paths).reconciliationSnapshot().config.version == AppConfig.currentVersion)
+        #expect(probe.calls >= 3, "existing backup's directory, then the config temp and its directory")
     }
 
     @Test func machineJSONIsWrittenDurably() throws {
