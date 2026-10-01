@@ -87,15 +87,38 @@ Not applicable — notarization requires a Developer ID.
 
 - [ ] Run **every** manual checklist in [testing.md §Layer 3](testing.md#layer-3--manual-checklists-docstasks-reference-these-run-before-tagging-a-release) with the final signed release artifact copied to `/Applications`, and record the required build SHA/artifact identity with each result. This includes SMAppService, stall detection, FDA, the Keychain evidence matrix, sleep/catch-up, physical-mirror recovery, read-only retention preview, the manual-apply containment refusal, scheduled retention via a due tick, token-confirmed reclaim space, and restores from local, external-volume, and SFTP destinations. These cannot be automated — do not skip them. A release that waives this gate anyway says so in its release notes, and names the evidence that ran instead (for example, the hosted `macOS Release Verification` workflow).
 
-## 6. Tag and publish
+## 6. Build, tag and publish — `scripts/release.sh`
+
+Steps 2 and 3 and everything below are one script, in two phases, so that
+publishing is always a separate, deliberate step:
 
 ```sh
-git tag vX.Y.Z && git push origin main vX.Y.Z
-scripts/sign-release.sh --verify "$APP"                          # step 3 must have run
-scripts/make-appcast.sh "$APP" dist/sparkle release-notes.html   # see §Updates
-gh release create vX.Y.Z dist/sparkle/Restic-Station-X.Y.Z.zip dist/sparkle/appcast.xml \
-  --title "Restic Station vX.Y.Z" --notes-file <release-notes.md>
+export RELEASE_GPG_KEY=<OpenPGP fingerprint>                       # signs tarballs, SHA256SUMS, tag
+export RESTIC_STATION_SIGNING_KEYCHAIN=… RESTIC_STATION_SIGNING_KEYCHAIN_PASSWORD_FILE=…   # §3
+export SPARKLE_KEY_FILE=…                                         # §Updates (or the login keychain)
+scripts/release.sh build   X.Y.Z                                 # → dist/vX.Y.Z/, nothing published
+scripts/release.sh publish X.Y.Z --notes release-notes.md
 ```
+
+`build` requires a clean tree at `origin/main` whose `project.yml` says
+`X.Y.Z`, no existing `vX.Y.Z` tag, and a successful `ci.yml` run for that
+commit. It builds the universal Release app and refuses unless the app, the
+helper and Sparkle all carry arm64 and x86_64 slices and the helper reports
+`X.Y.Z`. It then signs the app (§3), makes the Sparkle zip and signed
+appcast (`make-appcast.sh`), and writes the macOS tarball (no AppleDouble
+files). It takes the Linux tarballs from that CI run's `release-linux`
+artifact after verifying its `SHA256SUMS`, and writes `SHA256SUMS` plus a
+verified armored OpenPGP signature for every tarball and the checksums.
+`RELEASE_SKIP_PRECHECKS=1` builds from any tree for a rehearsal; `publish`
+always re-checks.
+
+`publish` refuses unless `dist/vX.Y.Z` was built from the current `HEAD`.
+It creates an **OpenPGP**-signed tag (forced with
+`-c gpg.format=openpgp`, since git's default may be ssh) and verifies it,
+pushes it, and creates the GitHub release as `--latest`, never as a
+pre-release, because Sparkle's feed follows `latest`. Finally it downloads
+the live `latest/download/appcast.xml` and the update zip and requires both
+to be byte-identical to what was built.
 
 The Sparkle zip is the macOS app download: build it with the script (it zips the
 final, stapled `$APP`) rather than zipping by hand, because its signature is
