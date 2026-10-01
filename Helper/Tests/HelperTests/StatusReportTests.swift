@@ -438,5 +438,25 @@ struct StatusReportTests {
         #expect(text.contains("\"reachable\" : null"))
         #expect(text.contains("\"lastSyncedAt\" : null"))
         #expect(text.contains("\"lastError\" : null"))
+        #expect(text.contains("\"secretProblem\" : null"))
+    }
+
+    @Test("a recorded secret problem is reported with its code, repair and first-seen time (#95)")
+    func secretProblemIsReported() throws {
+        let detectedAt = Date(timeIntervalSince1970: 1_000)
+        let missing = StatusReport.SecretProblem(SecretAttentionRecord(
+            destId: destId, setId: setId, attention: .secretNotConfigured,
+            detail: "item not found", detectedAt: detectedAt
+        ))
+        #expect(missing.code == "secret_not_configured")
+        #expect(missing.detail.contains(DestinationAttention.secretSetCommand(destId: destId)))
+        #expect(missing.detectedAt == detectedAt)
+
+        let unusable = StatusReport.SecretProblem(SecretAttentionRecord(
+            destId: destId, setId: setId, attention: .secretStoreUnusable,
+            detail: "chmod 600 secrets.json", detectedAt: detectedAt
+        ))
+        #expect(unusable.code == "secret_store_unusable")
+        #expect(unusable.detail == "chmod 600 secrets.json")
     }
 }

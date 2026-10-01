@@ -1195,6 +1195,42 @@ else
     echo "  (skipped per-set lock assertion: could not resolve a set id from the fixture)"
 fi
 
+# #95: a destination whose password was never stored. The tick must skip
+# the set without failing the unit (this is not an infrastructure fault) and
+# without writing a run record, and status must say why immediately — not
+# after the first-backup grace or the staleness window.
+NO_SECRET="$WORK/no-secret"
+mkdir -p "$NO_SECRET"
+cp -R "$HEALTHY/." "$NO_SECRET/" 2>/dev/null || true
+if [[ -n "${SET_UUID:-}" && "$SET_UUID" != "null" ]]; then
+    # The tick resolves its configured binary before the engine's
+    # pre-flight; the pre-flight refuses before anything is launched.
+    jq --arg restic_path "$HELPER" '.resticPath = $restic_path' \
+        "$NO_SECRET/machine.json" > "$NO_SECRET/machine.json.tmp"
+    mv "$NO_SECRET/machine.json.tmp" "$NO_SECRET/machine.json"
+    RESTIC_STATION_DATA_DIR="$NO_SECRET" run_helper_split runs list --json
+    RUNS_BEFORE="$(jq -r '.data | length' "$OUT_FILE")"
+    RESTIC_STATION_DATA_DIR="$NO_SECRET" run_helper tick
+    [[ "$RC" -eq 0 ]] \
+        || fail "tick failed the unit over a missing password (#95 keeps it at exit 0): $(cat "$OUT_FILE")"
+    grep -q "no password is stored" "$OUT_FILE" \
+        || fail "tick did not say the password is missing: $(cat "$OUT_FILE")"
+    RESTIC_STATION_DATA_DIR="$NO_SECRET" run_helper_split runs list --json
+    [[ "$(jq -r '.data | length' "$OUT_FILE")" == "$RUNS_BEFORE" ]] \
+        || fail "a missing password wrote a run record: $(jq -c '.data' "$OUT_FILE")"
+    RESTIC_STATION_DATA_DIR="$NO_SECRET" run_helper_split status --json
+    [[ "$RC" -ne 0 ]] || fail "status --json exited 0 while a set's password is missing"
+    jq -e --arg id "$PRIMARY_ID" '.data.health == "warning"
+        and (.data.sets[0].needsAttention == true)
+        and ([.data.sets[0].destinations[] | select(.id == $id) | .secretProblem.code][0] == "secret_not_configured")' \
+        "$OUT_FILE" >/dev/null \
+        || fail "status --json did not report the missing password: $(jq -c '.data.sets' "$OUT_FILE")"
+    RESTIC_STATION_DATA_DIR="$NO_SECRET" run_helper status
+    grep -q "SECRETS: secret_not_configured" "$OUT_FILE" \
+        || fail "human status did not name the missing password: $(cat "$OUT_FILE")"
+    ok "a never-stored password is skipped without a run record and reported at once (#95)"
+fi
+
 # The control: the same commands on a healthy fixture must not trip any of
 # the above. A check that fires everywhere is not a check.
 RESTIC_STATION_DATA_DIR="$HEALTHY" run_helper_split status --json

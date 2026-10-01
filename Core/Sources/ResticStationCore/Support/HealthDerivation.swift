@@ -76,6 +76,16 @@ public struct SetHealth: Identifiable, Equatable, Sendable {
     /// Destinations of this set that are stale per `docs/scheduling.md`
     /// §Staleness, in the set's configured destination order.
     public let staleDestinationIds: [UUID]
+    /// Secret problems the engine recorded for this set's destinations
+    /// (`state/secret-attention-<destId>.json`, #95), in configured
+    /// destination order: a password was never stored, or the store refuses
+    /// to be read. Scheduled runs skip the set without a run record, so this
+    /// is the only place the reason appears — immediately, with no grace.
+    public let secretAttention: [SecretAttentionRecord]
+    /// The set's primary destination, so a surface can tell a refused set
+    /// (primary secrets missing: nothing backs up) from a failing mirror
+    /// (the primary still backs up; copies to that secondary fail).
+    public let primaryDestinationId: UUID?
     /// Display-only next fire time from `ScheduleMath.nextDue` — the app
     /// never decides when backups run (`docs/scheduling.md` §What the app
     /// does). `.distantPast` for a never-run set (i.e. due now).
@@ -91,7 +101,9 @@ public struct SetHealth: Identifiable, Equatable, Sendable {
         nextDue: Date,
         abandonedRun: CurrentRunState? = nil,
         stalledRun: CurrentRunState? = nil,
-        firstBackupOverdue: Bool = false
+        firstBackupOverdue: Bool = false,
+        secretAttention: [SecretAttentionRecord] = [],
+        primaryDestinationId: UUID? = nil
     ) {
         self.setId = setId
         self.name = name
@@ -103,6 +115,15 @@ public struct SetHealth: Identifiable, Equatable, Sendable {
         self.abandonedRun = abandonedRun
         self.stalledRun = stalledRun
         self.firstBackupOverdue = firstBackupOverdue
+        self.secretAttention = secretAttention
+        self.primaryDestinationId = primaryDestinationId
+    }
+
+    /// The primary's secret problem, which is what makes scheduled runs of
+    /// the whole set skip. `nil` when only secondaries have one.
+    public var primarySecretProblem: SecretAttentionRecord? {
+        guard let primaryDestinationId else { return nil }
+        return secretAttention.first { $0.destId == primaryDestinationId }
     }
 
     public var isRunning: Bool { currentRun != nil }
@@ -130,6 +151,7 @@ public struct SetHealth: Identifiable, Equatable, Sendable {
     /// This set contributes `.warning` to the global `AppHealth`.
     public var needsAttention: Bool {
         lastRunFailed || hasStaleDestination || hasAbandonedRun || hasStalledRun || firstBackupOverdue
+            || !secretAttention.isEmpty
     }
 
     /// 0...100, rounded, clamped — restic reports `percent_done` as a 0...1
@@ -181,6 +203,7 @@ public enum HealthDerivation {
         now: Date,
         calendar: Calendar,
         visibleSince: Date? = nil,
+        secretAttention: [UUID: SecretAttentionRecord] = [:],
         runLiveness: (CurrentRunState) -> CurrentRunLiveness = { _ in .live }
     ) -> [SetHealth] {
         config.sets.map { set in
@@ -193,6 +216,7 @@ public enum HealthDerivation {
                 now: now,
                 calendar: calendar,
                 visibleSince: visibleSince,
+                secretAttention: secretAttention,
                 runLiveness: runLiveness
             )
         }
@@ -209,6 +233,7 @@ public enum HealthDerivation {
         now: Date,
         calendar: Calendar,
         visibleSince: Date? = nil,
+        secretAttention: [UUID: SecretAttentionRecord] = [:],
         runLiveness: (CurrentRunState) -> CurrentRunLiveness = { _ in .live }
     ) -> SetHealth {
         // `recentRuns` is newest-first, so the first match in each filter is
@@ -276,7 +301,13 @@ public enum HealthDerivation {
             ),
             abandonedRun: abandonedRun,
             stalledRun: stalledRun,
-            firstBackupOverdue: firstBackupOverdue
+            firstBackupOverdue: firstBackupOverdue,
+            // Keyed by destination; a record for a destination that has
+            // left this set (or was recorded under another set) is ignored.
+            secretAttention: set.destinations.compactMap { destination in
+                secretAttention[destination.id].flatMap { $0.setId == set.id ? $0 : nil }
+            },
+            primaryDestinationId: set.destinations.first(where: \.isPrimary)?.id
         )
     }
 

@@ -104,6 +104,50 @@ struct AppPresentationContractTests {
         ) == .error)
     }
 
+    @Test("a secret problem outranks every reachability state and is red (#95)")
+    func secretProblemOutranksReachability() {
+        let id = UUID()
+        let now = Date(timeIntervalSince1970: 10_000)
+        let record = SecretAttentionRecord(
+            destId: id, setId: UUID(), attention: .secretNotConfigured, detail: "none", detectedAt: now
+        )
+        for repo in [nil, RepoStatus(destId: id, reachable: true, probedAt: now)] as [RepoStatus?] {
+            for stale in [false, true] {
+                let status = DestinationStatus.derive(status: repo, isStale: stale, secretAttention: record)
+                #expect(status == .secretProblem(.secretNotConfigured))
+                #expect(status.isAlarm)
+                #expect(status.label == "Password not stored")
+            }
+        }
+        var unusable = record
+        unusable.attention = .secretStoreUnusable
+        #expect(DestinationStatus.derive(status: nil, isStale: false, secretAttention: unusable).label
+            == "Secrets unreadable")
+        #expect(!DestinationStatus.notInitialized.isAlarm, "not-initialized keeps its existing styling")
+    }
+
+    @Test("the menu bar line says a set is skipped only when its primary is affected (#95)")
+    func menuLineNamesSecretProblem() {
+        let primary = UUID()
+        let mirror = UUID()
+        let set = UUID()
+        func health(problemOn destination: UUID) -> SetHealth {
+            SetHealth(
+                setId: set, name: "Docs", lastBackup: nil, lastRun: nil, currentRun: nil,
+                staleDestinationIds: [], nextDue: .distantPast,
+                secretAttention: [SecretAttentionRecord(
+                    destId: destination, setId: set, attention: .secretNotConfigured, detail: "", detectedAt: .now
+                )],
+                primaryDestinationId: primary
+            )
+        }
+        #expect(MenuBarCopy.statusLine(for: health(problemOn: primary)) == "Docs — skipped: password not stored ⚠")
+        // A mirror's problem does not stop the backup, so the set is not "skipped".
+        let mirrorLine = MenuBarCopy.statusLine(for: health(problemOn: mirror))
+        #expect(mirrorLine == "Docs — never backed up · mirror password not stored ⚠")
+        #expect(health(problemOn: mirror).needsAttention)
+    }
+
     @Test("set-list formatters describe every schedule and destination kind")
     func setListFormattingTables() {
         var calendar = Calendar(identifier: .gregorian)

@@ -210,3 +210,14 @@ import Testing
     }
     #expect(names == ["set", "set-env", "rm", "list"])
 }
+
+/// #95 review: the repair every secret refusal prints must be a command the
+/// CLI accepts — it once omitted the required `--dest`.
+@Test func theSecretSetRepairCommandParses() throws {
+    let destId = UUID()
+    let words = DestinationAttention.secretSetCommand(destId: destId).split(separator: " ").map(String.init)
+    #expect(words.first == "restic-station-helper")
+    let command = try HelperMain.parseAsRoot(Array(words.dropFirst()))
+    let secretSet = try #require(command as? SecretSet)
+    #expect(secretSet.dest == destId)
+}

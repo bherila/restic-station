@@ -120,6 +120,10 @@ public enum ManualRunOutcome: Equatable, Sendable {
     /// retry, and no state was touched. See
     /// ``ManualRetentionApplyAvailability``.
     case operationNotAllowed(reason: String)
+    /// A secret this operation needs cannot be produced, and will not start
+    /// working on a retry (#95): nothing is stored, or the store refuses to
+    /// be read. Unlike ``skipped``, the caller must show the repair.
+    case secretRefused(attention: DestinationAttention, destinationId: UUID, detail: String)
 }
 
 /// The standalone-prune result keeps non-destructive refusals distinct from
@@ -304,15 +308,22 @@ public final class BackupEngine: Sendable {
         // Deliberately the engine's own read, *before* the lock and before
         // any state mutation: `ResticRunner` performs the same pre-flight,
         // but only once a run record and `lastBackupStart` would already
-        // have been written. An unreadable secret store must leave no trace
-        // at all.
-        do {
-            _ = try await secrets.password(destId: primary.id)
-        } catch {
+        // have been written. A transient failure (a locked keychain before
+        // login) leaves no trace at all and retries next tick. A permanent
+        // one — nothing stored, or a store that refuses to be read — is
+        // `.misconfigured`: still no run record, but
+        // `state/secret-attention-<destId>.json` makes the set need
+        // attention now, with the reason (#95).
+        if let refusal = await secretStoreRefusal(for: [primary]) {
+            if let attention = DestinationAttention(refusal.error) {
+                return .misconfigured(reason: Self.secretRefusalReason(
+                    attention: attention, destination: refusal.destination, error: refusal.error
+                ))
+            }
             let reason = "\(secretStoreDescription) could not be read for destination \"\(primary.label)\""
-            logWarning("BackupEngine: \(reason) — skipping this run (retryable, nothing recorded)")
             return .retryable(reason: reason)
         }
+        await refreshSecondarySecretAttention(of: set)
 
         // ── Step 2: per-set lock ────────────────────────────────────────
         let (lock, acquisition) = acquireSetLock(setId: set.id)
@@ -760,9 +771,15 @@ public final class BackupEngine: Sendable {
             logWarning("BackupEngine: \(reason) — cannot check")
             return .misconfigured(reason: reason)
         }
-        guard await secretsAvailable(for: [primary]) else {
+        if let refusal = await secretStoreRefusal(for: [primary]) {
+            if let attention = DestinationAttention(refusal.error) {
+                return .misconfigured(reason: Self.secretRefusalReason(
+                    attention: attention, destination: refusal.destination, error: refusal.error
+                ))
+            }
             return .retryable(reason: "the secret store is unavailable")
         }
+        await refreshSecondarySecretAttention(of: set)
 
         let (lock, acquisition) = acquireSetLock(setId: set.id)
         switch acquisition {
@@ -960,7 +977,7 @@ public final class BackupEngine: Sendable {
             )
             return .skipped
         }
-        guard await secretsAvailable(for: [primary]) else { return .skipped }
+        if let refused = await manualSecretPreflight(for: [primary]) { return refused }
 
         let (lock, acquisition) = acquireSetLock(setId: set.id)
         switch acquisition {
@@ -1109,7 +1126,11 @@ public final class BackupEngine: Sendable {
             logWarning("BackupEngine: destination \(destination.id) is not in backup set \(set.id) — cannot prune")
             return .failed(.didNotRun)
         }
-        switch await secretStoreRefusal(for: [destination]) {
+        // Remote maintenance reads only the password and spawns with no
+        // environment, and a caller-supplied environment replaces the stored
+        // one — so neither may be refused over the stored secret env.
+        let readsStoredEnvironment = destination.remoteMaintenance?.enabled != true && destinationSecretEnv == nil
+        switch await secretStoreRefusal(for: [destination], readingEnvironment: readsStoredEnvironment) {
         case .none:
             break
         case .some(let refusal):
@@ -2581,7 +2602,7 @@ public final class BackupEngine: Sendable {
             logWarning("BackupEngine: no configured destination with id \(request.destId) — cannot restore")
             return .completed(.failed)
         }
-        guard await secretsAvailable(for: [destination]) else { return .skipped }
+        if let refused = await manualSecretPreflight(for: [destination]) { return refused }
 
         let (lock, acquisition) = acquireSetLock(setId: set.id)
         switch acquisition {
@@ -2656,7 +2677,7 @@ public final class BackupEngine: Sendable {
         }
         // Both repositories' passwords are needed (`RESTIC_PASSWORD_COMMAND`
         // and `RESTIC_FROM_PASSWORD_COMMAND`).
-        guard await secretsAvailable(for: [dest, primary]) else { return .skipped }
+        if let refused = await manualSecretPreflight(for: [dest, primary]) { return refused }
 
         let (lock, acquisition) = acquireSetLock(setId: set.id)
         switch acquisition {
@@ -3652,39 +3673,68 @@ public final class BackupEngine: Sendable {
         secrets.backend.displayName
     }
 
-    /// The engine's own pre-flight for the non-`runSet` entry points: an
-    /// unreadable secret store is retryable, so those methods return
-    /// `.skipped` without writing a run record (`docs/architecture.md`
-    /// §Error taxonomy).
-    private func secretsAvailable(for destinations: [Destination]) async -> Bool {
-        await secretStoreRefusal(for: destinations) == nil
+    /// Pre-flight for the directly requested operations (manual prune,
+    /// restore, init-secondary). A transient failure is the retryable
+    /// `.skipped` it always was; a permanent one is `.secretRefused`, which
+    /// the helper publishes with the store's own repair text instead of
+    /// "try again" (#95).
+    private func manualSecretPreflight(for destinations: [Destination]) async -> ManualRunOutcome? {
+        guard let refusal = await secretStoreRefusal(for: destinations) else { return nil }
+        guard let attention = DestinationAttention(refusal.error) else { return .skipped }
+        return .secretRefused(
+            attention: attention,
+            destinationId: refusal.destination.id,
+            detail: refusal.error.description
+        )
     }
 
-    /// The first destination whose secret read failed, with its failure,
-    /// or `nil` if every read succeeded.
+    /// The `.misconfigured` reason for a permanent secret refusal: which
+    /// destination, what is wrong, and the repair.
+    static func secretRefusalReason(
+        attention: DestinationAttention,
+        destination: Destination,
+        error: SecretStoreError
+    ) -> String {
+        switch attention {
+        case .secretNotConfigured:
+            return "no password is stored for destination \"\(destination.label)\" — "
+                + "store it with `\(DestinationAttention.secretSetCommand(destId: destination.id))` or in the app"
+        case .secretStoreUnusable, .cloudRepositoryNotHydrated:
+            return "the secrets for destination \"\(destination.label)\" cannot be read: \(error.description)"
+        }
+    }
+
+    /// The engine's secret pre-flight: the first destination whose secrets
+    /// cannot be produced, with the failure, or `nil` if every read
+    /// succeeded.
     ///
-    /// Returned typed rather than as a `Bool` so a caller can tell a
-    /// permanent refusal from a locked keychain — and paired with the
-    /// destination, because an operation can span several and the repair a
-    /// permanent refusal prescribes has to name one. Every caller that
-    /// only needs "did it work" keeps using ``secretsAvailable(for:)``.
+    /// Reads the password and — unless `readingEnvironment` is `false` —
+    /// the secret environment, because every local restic launch passes
+    /// that environment: a good password beside an unparseable
+    /// `<uuid>-env` blob must be refused here as `storeUnusable`, not
+    /// surface later as a generic restic failure (#95). Remote maintenance
+    /// reads only the password and spawns with no environment, so it opts
+    /// out.
+    ///
+    /// Also keeps `state/secret-attention-<destId>.json` true: a permanent
+    /// refusal records it, a destination whose reads succeeded clears it.
+    /// Transient failures leave it alone. Both writes are best-effort — the
+    /// pre-flight's answer does not depend on them.
+    ///
+    /// Returned typed, and paired with the destination, so a caller can
+    /// tell a permanent refusal from a locked keychain and name the
+    /// destination the repair applies to.
     private func secretStoreRefusal(
-        for destinations: [Destination]
+        for destinations: [Destination],
+        readingEnvironment: Bool = true
     ) async -> (destination: Destination, error: SecretStoreError)? {
         for destination in destinations {
             do {
                 _ = try await secrets.password(destId: destination.id)
-                // Deliberately the password only. Reading the secret
-                // *environment* here too would classify a malformed
-                // `<uuid>-env` blob at the pre-flight — which is right for
-                // the paths that pass that environment to local restic, and
-                // wrong for the two that do not: remote maintenance reads
-                // only the password and spawns with `env: nil`, and the
-                // `Bool`-shaped callers below would turn a permanent fault
-                // into a silent forever-deferral. Scoping the read to the
-                // paths that consume it belongs with the engine pre-flight
-                // rework in #95, not in a classification change. Tracked
-                // there; see the note in `architecture.md` §Error taxonomy.
+                if readingEnvironment {
+                    _ = try await secrets.secretEnv(destId: destination.id)
+                }
+                clearSecretAttention(for: destination, environmentValidated: readingEnvironment)
             } catch let error as SecretStoreError {
                 // Exhaustive, no `default:` — a new `SecretStoreError` case
                 // must be judged here rather than inheriting the retryable
@@ -3695,11 +3745,19 @@ public final class BackupEngine: Sendable {
                         "BackupEngine: \(secretStoreDescription) refused to be read for destination "
                             + "\"\(destination.label)\" — \(detail)"
                     )
-                case .itemNotFound, .backendFailed, .lockUnusable:
+                case .itemNotFound:
+                    logWarning(
+                        "BackupEngine: no password is stored for destination \"\(destination.label)\" "
+                            + "— skipping, nothing recorded; the set needs attention"
+                    )
+                case .backendFailed, .lockUnusable:
                     logWarning(
                         "BackupEngine: \(secretStoreDescription) could not be read for destination "
                             + "\"\(destination.label)\" — skipping (retryable, nothing recorded)"
                     )
+                }
+                if let attention = DestinationAttention(error) {
+                    recordSecretAttention(attention, error: error, for: destination)
                 }
                 return (destination, error)
             } catch {
@@ -3713,6 +3771,55 @@ public final class BackupEngine: Sendable {
             }
         }
         return nil
+    }
+
+    private func recordSecretAttention(
+        _ attention: DestinationAttention,
+        error: SecretStoreError,
+        for destination: Destination
+    ) {
+        guard let (set, _) = locate(destId: destination.id) else { return }
+        do {
+            try stateStore.recordSecretAttention(SecretAttentionRecord(
+                destId: destination.id,
+                setId: set.id,
+                attention: attention,
+                detail: error.description,
+                detectedAt: now()
+            ))
+        } catch {
+            logWarning("BackupEngine: could not record the secret problem for \"\(destination.label)\": \(error)")
+        }
+    }
+
+    /// Keeps each secondary's secret-attention record true on every due
+    /// backup and check (Codex on #165). Only the primary gates the run — a
+    /// mirror whose password is missing must not stop the primary backup,
+    /// and its copy step already fails or skips on its own — but without
+    /// this, a secondary's permanent problem would only ever surface as
+    /// staleness, days later and without the reason.
+    private func refreshSecondarySecretAttention(of set: BackupSet) async {
+        for destination in set.destinations where !destination.isPrimary {
+            _ = await secretStoreRefusal(for: [destination])
+        }
+    }
+
+    /// Clears only what this pre-flight actually re-checked. A password-only
+    /// read (remote maintenance, or a caller-supplied environment) proves a
+    /// password is stored, which resolves `secretNotConfigured` — but says
+    /// nothing about a malformed stored environment, which every scheduled
+    /// backup will still refuse over, so that record stays.
+    private func clearSecretAttention(for destination: Destination, environmentValidated: Bool) {
+        if !environmentValidated,
+           let existing = stateStore.readSecretAttention(destId: destination.id),
+           existing.attention != .secretNotConfigured {
+            return
+        }
+        do {
+            try stateStore.clearSecretAttention(destId: destination.id)
+        } catch {
+            logWarning("BackupEngine: could not clear the secret problem for \"\(destination.label)\": \(error)")
+        }
     }
 
     /// Finds the set that owns `destId` (a destination id is unique across

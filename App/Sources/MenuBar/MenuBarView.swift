@@ -129,7 +129,29 @@ enum MenuBarCopy {
 
     /// `"<SetName> — <relative last backup> <✓|⚠|✕>"`, e.g.
     /// "Projects — 2 hours ago ✓". Never run: "Projects — never backed up".
+    /// A primary whose secrets cannot be produced (#95) replaces the line:
+    /// the set's backups are being skipped, and that is the news. A mirror's
+    /// problem does not stop the backup, so it is appended to the usual line.
     static func statusLine(for health: SetHealth, now: Date = Date()) -> String {
+        if let problem = health.primarySecretProblem {
+            switch problem.attention {
+            case .secretNotConfigured:
+                return "\(health.name) — skipped: password not stored ⚠"
+            case .secretStoreUnusable, .cloudRepositoryNotHydrated:
+                return "\(health.name) — skipped: secrets unreadable ⚠"
+            }
+        }
+        let line = backupLine(for: health, now: now)
+        guard let mirror = health.secretAttention.first else { return line }
+        switch mirror.attention {
+        case .secretNotConfigured:
+            return "\(line) · mirror password not stored ⚠"
+        case .secretStoreUnusable, .cloudRepositoryNotHydrated:
+            return "\(line) · mirror secrets unreadable ⚠"
+        }
+    }
+
+    private static func backupLine(for health: SetHealth, now: Date) -> String {
         guard let lastBackupAt = health.lastBackupAt else {
             return "\(health.name) — never backed up"
         }

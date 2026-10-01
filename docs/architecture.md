@@ -131,24 +131,28 @@ the trust boundary, or does not decode is permanent. The keychain backend's
 in `keychain-and-fda.md` §2 depends on it, and marking a transient failure
 permanent is the more damaging error. See `cli-json.md` §`retryable`.
 
-**The engine has not yet followed.** `BackupEngine.runSet`'s own pre-flight
-and `secretsAvailable` still collapse both into the retryable row: a
-destination with no password stored is skipped silently, forever, with
-nothing recorded. That is a behaviour change with health and badge
-consequences — whether it should become a `.failed` run every tick, a
-`.misconfigured` result, or a health warning that is not a run at all — so
-it is issue #95 rather than a side effect of the CLI contract. Until then,
-the classification is honest and the scheduling behaviour is unchanged.
+**The engine follows the same split (#95).** Its own pre-flight — before
+the set lock and before any state is written — reads the password and, on
+every path that passes it to local restic, the secret environment (remote
+maintenance reads only the password, since it spawns with no environment).
+A transient failure is still traceless and retried next tick. A permanent
+one — `itemNotFound` or `storeUnusable`, which includes an unparseable
+`<uuid>-env` blob — is:
 
-**Two known gaps in that classification, both tracked rather than hidden.**
-The engine's pre-flight reads a destination's *password* only, so a stored
-secret-environment blob that does not parse is not refused there and
-surfaces later as a restic failure; closing it means reading the
-environment on exactly the paths that pass it to local restic, since remote
-maintenance spawns with no environment at all (#95). And the pre-flight is
-not atomic with the reads that follow it, so a `secret rm` or `chmod` in
-the window between it and the restic spawn is still published as retryable
-by the later generic catches — the evidence-binding rule in `AGENTS.md`,
+- for a **scheduled** backup or check, `.misconfigured`: no run record (a
+  2-minute schedule must not write a failed run every tick), the tick still
+  exits 0, and `state/secret-attention-<destId>.json` makes the set need
+  attention at once, with the reason, in the app, the menu bar and
+  `status --json` (`destinations[].secretProblem`). The next pre-flight
+  that succeeds removes it;
+- for a **manual** restore, prune or init-secondary,
+  `ManualRunOutcome.secretRefused`, which the helper reports with the
+  repair instead of "try again".
+
+**One known gap, tracked rather than hidden.** The pre-flight is not atomic
+with the reads that follow it, so a `secret rm` or `chmod` in the window
+between it and the restic spawn is still published as retryable by the
+later generic catches (#152) — the evidence-binding rule in `AGENTS.md`,
 applied to secrets.
 
 restic exit code mapping (verified against restic 0.18.1 — see `restic-cli.md`): `0` success, `1` fatal, `2` Go runtime error, `3` backup incomplete-read warning, `10` repository does not exist, `11` repository locked, `12` wrong password. Exit 11 on a *scheduled* run: attempt `restic unlock` once (removes only stale locks of dead processes), retry the operation once, then fail terminal if still locked.

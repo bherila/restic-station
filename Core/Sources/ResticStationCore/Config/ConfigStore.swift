@@ -334,14 +334,17 @@ public struct ConfigStore: Sendable {
     private func writeBackupIfAbsent(_ original: Data, fromVersion version: Int) throws {
         let backupFile = paths.configBackupFile(fromVersion: version)
         guard !FileManager.default.fileExists(atPath: backupFile.path) else {
+            // An existing backup may be one an interrupted run left with its
+            // directory entry unsynced; confirm it before it licenses
+            // overwriting the source.
+            try DurableFile.syncDirectory(of: backupFile)
             return
         }
         try paths.ensureDirectories()
-        do {
-            try original.write(to: backupFile, options: .withoutOverwriting)
-        } catch let error as NSError where error.code == NSFileWriteFileExistsError {
-            return // lost a race with another process; its copy is just as good
-        }
+        // Durable before the source is overwritten (#159): a crash must not
+        // leave a migrated config.json whose backup never reached the disk.
+        // `false` = lost an O_EXCL race; that copy is just as good.
+        _ = try DurableFile.createExclusive(original, at: backupFile)
     }
 
     /// A persisted schema bump is a fleet event (#161): say so on stderr —
@@ -399,7 +402,9 @@ public struct ConfigStore: Sendable {
 
         let data = try Self.makeEncoder().encode(config)
         return try withConfigWriteLock {
-            try data.write(to: tempConfigFile)
+            // The candidate's bytes reach the disk before it can become
+            // visible, and the directory after, as in `persist` (#159).
+            try DurableFile.writeSynced(data, to: tempConfigFile, exclusive: false)
             let installed = try AtomicFile.replaceIfMatches(
                 from: tempConfigFile,
                 to: paths.configFile,
@@ -408,8 +413,13 @@ public struct ConfigStore: Sendable {
             )
             guard installed else {
                 try? FileManager.default.removeItem(at: tempConfigFile)
+                // A rollback restored some other revision; make that durable
+                // too. Best-effort, like any post-install sync: reported, and
+                // this save has failed either way.
+                DurableFile.syncDirectoryAfterInstall(of: paths.configFile)
                 throw ConfigStoreError.changedOnDisk
             }
+            DurableFile.syncDirectoryAfterInstall(of: paths.configFile)
             return SHA256Digest.hex(data)
         }
     }
@@ -467,9 +477,9 @@ public struct ConfigStore: Sendable {
         }
     }
 
+    /// Crash-durable replacement (#159): see `DurableFile`.
     private func persist(_ data: Data) throws {
-        try data.write(to: tempConfigFile)
-        try AtomicFile.rename(from: tempConfigFile, to: paths.configFile)
+        try DurableFile.write(data, to: paths.configFile, via: tempConfigFile)
     }
 
     private func readConfigBytes() throws -> Data? {

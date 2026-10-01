@@ -688,6 +688,10 @@ The tick clears it: `recoverInterrupted()` returns the `setId` alongside the
 
 **macOS only, and absence is meaningful.** The file is written only by the macOS `fda-check` probe; on other platforms the subcommand writes nothing at all. An absent file means "not applicable / not yet known", **never** "denied" — see `keychain-and-fda.md` §2 for the normative rule and `HealthDerivation.fullDiskAccessDenied(from:)` for its single implementation.
 
+## state/secret-attention-<destId>.json
+
+`{ destId, setId, attention, detail, detectedAt }` — the engine's secret pre-flight found a reason this destination's secrets cannot be produced that will not clear on its own (#95): `attention` is `secret_not_configured` (nothing stored; run `secret set`) or `secret_store_unusable` (the store, or the destination's secret-environment blob, refuses to be read; `detail` is the store's own refusal, naming the repair — never a secret). Written instead of a run record when a scheduled backup or check is refused, so the set needs attention immediately and says why, with no first-backup grace; `detectedAt` is when the condition was first seen and is kept across ticks. Removed by the next pre-flight for this destination that succeeds. Transient conditions (a locked keychain before login) never write it. Read by `HealthDerivation` for the destinations of the set it names; a record for a destination no longer in that set is ignored. A missing or undecodable file reads as no problem.
+
 ## state/config-migration.json
 
 The last schema migration **this host** wrote to `config.json` (#161): `{ fromVersion, toVersion, migratedAt, process, machineId, acknowledgedAt }`. Written best-effort by `ConfigStore` right after it persists a migrated file, by whichever process did it (a scheduled tick, a CLI command, `config upgrade`, or the app after its confirmation). While `acknowledgedAt` is `null` it is a warning in `HealthDerivation` — app health, the menu bar, and `status` (exit 1, `configMigration`) — because the hosts left behind stop backing up and cannot report it themselves. `config acknowledge-migration`, or **They're Upgraded** in the app, sets `acknowledgedAt`. It is a notice, not an input to any decision: a missing or undecodable file reads as no record. A later migration replaces it.
@@ -710,6 +714,10 @@ The schema change needs no data change: an absent `machines` key already means "
 
 This is the first step that does **not** preserve the older behavior: a v3 build let restic download them. That is deliberate — an unattended backup that silently pulls a cloud library down to a small disk is the failure this key exists to prevent — and a set that needs every file in its snapshots opts back in with `"download"`, or keeps the folder available offline in the provider. It changes nothing for a set with no cloud-synced source. As with v3, a v3 build refuses a v4 config (§Loader behavior), so hosts sharing a config upgrade together.
 
+### How `config.json` and `machine.json` are written
+
+Every write is atomic for readers **and** crash-durable (#159, `DurableFile`): the bytes go to a temp file beside the target (`O_NOFOLLOW`, so a symlink planted there is refused rather than written through), the temp file is `fsync`ed, `rename(2)` installs it (on Darwin, the compare-and-swap save's `RENAME_SWAP`), and then the containing directory is `fsync`ed. A failure before the rename is an error and leaves the old file in place. **After the rename nothing throws**: the new file is live, so a directory sync that fails there is reported on stderr and the write counts as done — every caller's "the write failed" means "the old file is still there", and a third, possibly-committed outcome was a source of wrong rollbacks (#165 review). The migration backup is the exception, because it licenses overwriting the source: one whose directory cannot be synced is removed and counts as not written, and an existing backup's directory is synced before the backup is relied on.
+
 ### Who migrates, and who is told (#161)
 
 A migration is a fleet event, so it is never silent, but who performs it differs by process:
@@ -726,8 +734,8 @@ For a file below the current version, `ConfigStore.load()`:
 
 1. Adds **no** `machines` keys.
 2. If `config.json` has a `resticPath` and `machine.json` has none, moves it into `machine.json` and clears the deprecated field. If `machine.json` already has one, that one wins and the deprecated field is still cleared. If the write fails, `resticPath` is left in `config.json`, where it still works as the documented fallback.
-3. Copies the untouched source bytes to **`config.v<source-version>.backup.json`**, beside `config.json`, with `O_EXCL` — **never** overwriting an existing backup, so a second migration cannot clobber the source's copy (or a copy the user put there by hand).
-4. Only if that backup exists, writes the current-version config atomically.
+3. Copies the untouched source bytes to **`config.v<source-version>.backup.json`**, beside `config.json`, with `O_EXCL` — **never** overwriting an existing backup, so a second migration cannot clobber the source's copy (or a copy the user put there by hand). The backup and its directory are `fsync`ed before step 4; a backup that cannot be synced counts as not written.
+4. Only if that backup exists, writes the current-version config atomically and durably.
 5. Sets `version: 4` and returns.
 
 Migration is **idempotent**: the second load sees `version: 4` and does nothing. Every persistence step is best-effort — a data directory that cannot be written must not stop the helper from running backups, and the migration is a pure function of the file, so an unwritten migration simply reruns next load. What is *not* best-effort is the ordering: **the source file is never overwritten unless a backup of it exists.**
@@ -856,7 +864,8 @@ Five things `status` will **not** do quietly, all of which would make it report 
           "reachable": true,
           "stale": false,
           "lastSyncedAt": "2026-07-25T02:31:00.000Z",
-          "lastError": null
+          "lastError": null,
+          "secretProblem": null
         }
       ]
     }
@@ -868,7 +877,7 @@ Five things `status` will **not** do quietly, all of which would make it report 
 }
 ```
 
-`health`: `"idle"` | `"running"` | `"warning"` | `"critical"` (`AppHealth.rawValue`). Exit code: **0** for `idle`/`running`, **1** for `warning`/`critical` — usable directly as a Nagios/Icinga-style check. `critical` is reserved for unresolved destructive audit failures and outranks a concurrently running backup. `auditFailures` is always present; each entry carries `code: "operation_completed_audit_failed"`, the run/set/destination identifiers, the bounded reason enum, and `retryable: false`. `lastBackup`/`lastCheck`/`lastPrune` are `null` before any attempt of that kind; `reachable` is `null` — never `false` — for a destination that has not been probed yet (`state/repo-status-<destId>.json` absent), the same "absent means not yet known, never a definite negative" rule `fda-check.json` uses. `firstBackupOverdue` explains the otherwise-empty warning for a never-attempted set. `configMigration` is always present: `null` when this host never migrated the shared config, otherwise `{ fromVersion, toVersion, migratedAt, process, machineId, acknowledged, acknowledgedAt, message }` from `state/config-migration.json`; while `acknowledged` is `false` it makes `health` at least `warning` and the exit code 1. `excludedHere` has the same shape as `config show`'s.
+`health`: `"idle"` | `"running"` | `"warning"` | `"critical"` (`AppHealth.rawValue`). Exit code: **0** for `idle`/`running`, **1** for `warning`/`critical` — usable directly as a Nagios/Icinga-style check. `critical` is reserved for unresolved destructive audit failures and outranks a concurrently running backup. `auditFailures` is always present; each entry carries `code: "operation_completed_audit_failed"`, the run/set/destination identifiers, the bounded reason enum, and `retryable: false`. `lastBackup`/`lastCheck`/`lastPrune` are `null` before any attempt of that kind; `reachable` is `null` — never `false` — for a destination that has not been probed yet (`state/repo-status-<destId>.json` absent), the same "absent means not yet known, never a definite negative" rule `fda-check.json` uses. `firstBackupOverdue` explains the otherwise-empty warning for a never-attempted set. Each destination's `secretProblem` is `null`, or `{ code, detail, detectedAt }` from `state/secret-attention-<destId>.json` (#95) — `code` is `secret_not_configured` or `secret_store_unusable` — and makes its set `needsAttention` and `health` at least `warning`. `configMigration` is always present: `null` when this host never migrated the shared config, otherwise `{ fromVersion, toVersion, migratedAt, process, machineId, acknowledged, acknowledgedAt, message }` from `state/config-migration.json`; while `acknowledged` is `false` it makes `health` at least `warning` and the exit code 1. `excludedHere` has the same shape as `config show`'s.
 
 `unattributedRuns` contains any `current-run-<setId>.json` whose set is no longer in this machine's resolved configuration. Each entry carries the missing `setId`, `liveness` (`"live"`, `"stalled"`, or `"abandoned"`), the usual `currentRun` summary, and the exact `currentRunFile`. These runs still determine top-level health and the exit code, so an empty `sets` array never leaves their effect unexplained. Human output names the same run; abandoned entries print a shell-quoted cleanup command, while stalled entries direct the operator to the run log.
 
