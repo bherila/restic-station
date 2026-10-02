@@ -49,12 +49,23 @@ project_version() {
     sed -n 's/^[[:space:]]*MARKETING_VERSION:[[:space:]]*"\{0,1\}\([^"]*\)"\{0,1\}[[:space:]]*$/\1/p' project.yml | head -1
 }
 
+# prechecks [allow-tag]: a clean tree at origin/main declaring $VERSION. A
+# build also requires that the tag does not exist yet; publish may resume
+# after it pushed the tag (see publish).
 prechecks() {
-    git fetch -q origin
+    git fetch -q --tags origin
     [ -z "$(git status --porcelain)" ] || die "the working tree is not clean"
     [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ] || die "HEAD is not origin/main"
     [ "$(project_version)" = "$VERSION" ] || die "project.yml says $(project_version), not $VERSION — merge the version bump first"
-    ! git rev-parse -q --verify "refs/tags/$TAG" >/dev/null || die "tag $TAG already exists"
+    if [ "${1:-}" != allow-tag ]; then
+        ! git rev-parse -q --verify "refs/tags/$TAG" >/dev/null || die "tag $TAG already exists"
+    fi
+}
+
+# The files a release ships, in a stable order (everything in $DIST except
+# the build records, which start with a dot).
+release_files() {
+    find "$REPO_ROOT/$DIST" -maxdepth 1 -type f ! -name '.*' -exec basename {} \; | LC_ALL=C sort
 }
 
 ci_run_for_head() {
@@ -66,7 +77,9 @@ ci_run_for_head() {
 }
 
 build() {
+    local rehearsal=0
     if [ "${RELEASE_SKIP_PRECHECKS:-}" = 1 ]; then
+        rehearsal=1
         echo "release: RELEASE_SKIP_PRECHECKS=1 — rehearsal build, not publishable" >&2
         [ "$(project_version)" = "$VERSION" ] || die "project.yml says $(project_version), not $VERSION"
     else
@@ -74,6 +87,20 @@ build() {
     fi
     local run=${RELEASE_CI_RUN:-$(ci_run_for_head)}
     [ -n "$run" ] || die "no successful ci.yml run on main for HEAD; wait for CI or set RELEASE_CI_RUN"
+    # An override is checked like the default: the CI workflow, finished
+    # successfully, for this exact commit — or the Linux binaries would come
+    # from some other build while .commit records HEAD.
+    local run_meta
+    run_meta=$(gh run view "$run" -R "$REPO" --json workflowName,conclusion,headSha \
+        --jq '"\(.workflowName) \(.conclusion) \(.headSha)"') || die "cannot read CI run $run"
+    case $run_meta in
+        "CI success $(git rev-parse HEAD)") ;;
+        *) if [ "$rehearsal" = 1 ]; then
+               echo "release: rehearsal using CI run $run ($run_meta), which is not this commit's" >&2
+           else
+               die "CI run $run is '$run_meta', not a successful CI run of $(git rev-parse HEAD)"
+           fi ;;
+    esac
 
     rm -rf "$DIST" "dist/linux-$TAG"
     mkdir -p "$DIST" "dist/linux-$TAG"
@@ -132,6 +159,18 @@ build() {
     )
     echo "$run" > "$DIST/.ci-run"
     git rev-parse HEAD > "$DIST/.commit"
+    # A rehearsal (or a tree that changed during the build) can contain
+    # source that HEAD does not: mark it so publish refuses it for good.
+    if [ "$rehearsal" = 1 ] || [ -n "$(git status --porcelain)" ]; then
+        echo "built with RELEASE_SKIP_PRECHECKS or from a modified tree" > "$DIST/.rehearsal"
+    fi
+    # Every shipped file's checksum, which publish re-verifies before it
+    # uploads anything: the build directory is not trusted across phases.
+    local shipped
+    shipped=$(release_files)
+    (cd "$DIST" && printf '%s\n' "$shipped" | while IFS= read -r file; do shasum -a 256 "$file"; done) \
+        > "$DIST/.manifest"
+    [ -s "$DIST/.manifest" ] || die "could not write $DIST/.manifest"
 
     step "Done"
     ls -1 "$DIST"
@@ -144,19 +183,45 @@ publish() {
     local notes=$2
     [ -f "$notes" ] || die "no notes file at $notes"
     [ -f "$DIST/appcast.xml" ] || die "nothing built at $DIST — run: $0 build $VERSION"
-    prechecks
+    prechecks allow-tag
+    [ ! -e "$DIST/.rehearsal" ] || die "$DIST is a rehearsal build ($(cat "$DIST/.rehearsal")) — rebuild without it"
     [ "$(cat "$DIST/.commit")" = "$(git rev-parse HEAD)" ] \
         || die "$DIST was built from $(cat "$DIST/.commit"), not HEAD — rebuild"
 
+    step "Verify the build output"
+    [ -f "$DIST/.manifest" ] || die "$DIST has no manifest — rebuild"
+    (cd "$DIST" && shasum -a 256 -c .manifest >/dev/null) || die "a file in $DIST changed since it was built"
+    [ "$(release_files)" = "$(sed 's/^[0-9a-f]*  //' "$DIST/.manifest")" ] \
+        || die "$DIST has files that were not part of the build"
+    local asc
+    for asc in "$DIST"/*.asc; do
+        [ "$(basename "$asc")" = release-key.asc ] && continue
+        gpg --verify "$asc" "${asc%.asc}" 2>/dev/null || die "the signature $asc does not verify"
+    done
+
+    # Resumable after this point: a tag that already exists must be ours —
+    # pointing at HEAD with a good signature — and is not created again.
     step "Signed tag $TAG"
-    git -c gpg.format=openpgp -c gpg.program=gpg tag -s -u "$KEY" -m "Restic Station $TAG" "$TAG" HEAD
+    if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+        [ "$(git rev-parse "$TAG^{commit}")" = "$(git rev-parse HEAD)" ] || die "tag $TAG exists and is not HEAD"
+        echo "tag $TAG already exists at HEAD; resuming"
+    else
+        git -c gpg.format=openpgp -c gpg.program=gpg tag -s -u "$KEY" -m "Restic Station $TAG" "$TAG" HEAD
+    fi
     git -c gpg.format=openpgp tag -v "$TAG" >/dev/null 2>&1 || die "the tag signature does not verify"
-    git push origin "$TAG"
+    git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1 || git push origin "$TAG"
 
     step "GitHub release"
-    gh release create "$TAG" -R "$REPO" --verify-tag --latest --title "Restic Station $TAG" --notes-file "$notes" \
-        "$DIST"/*.tar.gz "$DIST"/*.tar.gz.asc "$DIST/SHA256SUMS" "$DIST/SHA256SUMS.asc" \
-        "$DIST/release-key.asc" "$DIST/Restic-Station-$VERSION.zip" "$DIST/appcast.xml"
+    local assets=()
+    local file
+    while IFS= read -r file; do assets+=("$DIST/$file"); done < <(release_files)
+    if gh release view "$TAG" -R "$REPO" >/dev/null 2>&1; then
+        echo "release $TAG already exists; re-uploading the verified assets"
+        gh release upload "$TAG" -R "$REPO" --clobber "${assets[@]}"
+    else
+        gh release create "$TAG" -R "$REPO" --verify-tag --latest --title "Restic Station $TAG" \
+            --notes-file "$notes" "${assets[@]}"
+    fi
 
     step "What installed copies will see"
     local live
