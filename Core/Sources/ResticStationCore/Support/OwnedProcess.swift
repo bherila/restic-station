@@ -289,7 +289,7 @@ final class OwnedProcess: @unchecked Sendable {
         var pid: pid_t = 0
         let result = argvC.withUnsafeBufferPointer { argvBuffer in
             envC.withUnsafeBufferPointer { envBuffer in
-                posix_spawn(&pid, argv[0], &actions, &attributes, argvBuffer.baseAddress, envBuffer.baseAddress)
+                posix_spawn(&pid, argv[0], &actions, &attributes, argvBuffer.baseAddress!, envBuffer.baseAddress!)
             }
         }
         guard result == 0 else {
@@ -312,18 +312,17 @@ final class OwnedProcess: @unchecked Sendable {
     #endif
 
     private static func makePipe() throws -> (read: Int32, write: Int32) {
+        // `pipe2` is not exported by every Glibc overlay this builds with, so
+        // close-on-exec is set right after. A child spawned concurrently in
+        // that instant could see these ends without it — but every spawn here
+        // closes such descriptors in the child (CLOEXEC_DEFAULT on Darwin, the
+        // explicit close actions on Linux), so nothing is inherited either way.
         var ends: [Int32] = [-1, -1]
-        #if canImport(Darwin)
         guard pipe(&ends) == 0 else {
             throw ProcessRunnerError.launchFailed("pipe failed: errno \(errno)")
         }
         _ = fcntl(ends[0], F_SETFD, FD_CLOEXEC)
         _ = fcntl(ends[1], F_SETFD, FD_CLOEXEC)
-        #else
-        guard pipe2(&ends, Int32(O_CLOEXEC)) == 0 else {
-            throw ProcessRunnerError.launchFailed("pipe2 failed: errno \(errno)")
-        }
-        #endif
         return (ends[0], ends[1])
     }
 
