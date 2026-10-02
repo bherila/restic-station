@@ -20,16 +20,22 @@ Also set `Version.version` in `Helper/Sources/Commands/Version.swift` to the sam
 
 After editing: `./scripts/bootstrap.sh` (re-runs `xcodegen generate`), commit as `Release vX.Y.Z`.
 
-## 2. Build
+## 2. Build — `scripts/release.sh build`
 
-Requires a machine with full Xcode (not CLT-only):
+Requires a machine with full Xcode (not CLT-only). Build the release
+artifacts **before** step 5, so the manual verification runs against the
+exact files that will be published:
 
 ```sh
-./scripts/bootstrap.sh
-xcodebuild -scheme "Restic Station" -configuration Release \
-  -derivedDataPath build build
-APP="build/Build/Products/Release/Restic Station.app"
+export RELEASE_GPG_KEY=<OpenPGP fingerprint>                       # signs tarballs, SHA256SUMS, tag
+export RESTIC_STATION_SIGNING_KEYCHAIN=… RESTIC_STATION_SIGNING_KEYCHAIN_PASSWORD_FILE=…   # §3
+export SPARKLE_KEY_FILE=…                                         # §Updates (or the login keychain)
+scripts/release.sh build X.Y.Z                                    # → dist/vX.Y.Z/, nothing published
 ```
+
+This builds the universal app, signs it (§3), and produces everything §6
+publishes; see §6 for its checks. Nothing in `dist/vX.Y.Z` may change after
+this step — `publish` verifies every file against the manifest written here.
 
 ## 3. Sign — the release identity
 
@@ -85,18 +91,13 @@ Not applicable — notarization requires a Developer ID.
 
 ## 5. Release-artifact verification
 
-- [ ] Run **every** manual checklist in [testing.md §Layer 3](testing.md#layer-3--manual-checklists-docstasks-reference-these-run-before-tagging-a-release) with the final signed release artifact copied to `/Applications`, and record the required build SHA/artifact identity with each result. This includes SMAppService, stall detection, FDA, the Keychain evidence matrix, sleep/catch-up, physical-mirror recovery, read-only retention preview, the manual-apply containment refusal, scheduled retention via a due tick, token-confirmed reclaim space, and restores from local, external-volume, and SFTP destinations. These cannot be automated — do not skip them. A release that waives this gate anyway says so in its release notes, and names the evidence that ran instead (for example, the hosted `macOS Release Verification` workflow).
+- [ ] Run **every** manual checklist in [testing.md §Layer 3](testing.md#layer-3--manual-checklists-docstasks-reference-these-run-before-tagging-a-release) with the app from `dist/vX.Y.Z/restic-station-macos-universal-vX.Y.Z.tar.gz` (step 2's output — the exact archive `publish` uploads; its SHA-256 is in `dist/vX.Y.Z/.manifest`) copied to `/Applications`, and record the required build SHA/artifact identity with each result. This includes SMAppService, stall detection, FDA, the Keychain evidence matrix, sleep/catch-up, physical-mirror recovery, read-only retention preview, the manual-apply containment refusal, scheduled retention via a due tick, token-confirmed reclaim space, and restores from local, external-volume, and SFTP destinations. These cannot be automated — do not skip them. A release that waives this gate anyway says so in its release notes, and names the evidence that ran instead (for example, the hosted `macOS Release Verification` workflow).
 
-## 6. Build, tag and publish — `scripts/release.sh`
+## 6. Tag and publish — `scripts/release.sh publish`
 
-Steps 2 and 3 and everything below are one script, in two phases, so that
-publishing is always a separate, deliberate step:
+The second phase of the script whose first phase ran in step 2:
 
 ```sh
-export RELEASE_GPG_KEY=<OpenPGP fingerprint>                       # signs tarballs, SHA256SUMS, tag
-export RESTIC_STATION_SIGNING_KEYCHAIN=… RESTIC_STATION_SIGNING_KEYCHAIN_PASSWORD_FILE=…   # §3
-export SPARKLE_KEY_FILE=…                                         # §Updates (or the login keychain)
-scripts/release.sh build   X.Y.Z                                 # → dist/vX.Y.Z/, nothing published
 scripts/release.sh publish X.Y.Z --notes release-notes.md
 ```
 
@@ -112,7 +113,16 @@ verified armored OpenPGP signature for every tarball and the checksums.
 `RELEASE_SKIP_PRECHECKS=1` builds from any tree for a rehearsal; `publish`
 always re-checks.
 
-`publish` refuses unless `dist/vX.Y.Z` was built from the current `HEAD`.
+`build` also records the CI run used, the commit, and a SHA-256 manifest of
+every shipped file; a `RELEASE_CI_RUN` override must be a successful CI run of
+`HEAD` too. A rehearsal build is marked and can never be published.
+
+`publish` refuses unless `dist/vX.Y.Z` was built from the current `HEAD`, is
+not a rehearsal, still matches its manifest exactly (no changed, missing or
+extra files), and every OpenPGP signature in it verifies. It can be re-run
+after a failure past the tag push: an existing tag pointing at `HEAD` with a
+good signature is reused, and an existing release has the verified assets
+re-uploaded.
 It creates an **OpenPGP**-signed tag (forced with
 `-c gpg.format=openpgp`, since git's default may be ssh) and verifies it,
 pushes it, and creates the GitHub release as `--latest`, never as a
