@@ -102,16 +102,19 @@ import Testing
             }
         })
 
-        DispatchQueue.global().async { writer.appendLine("in flight") }
-        #expect(entered.wait(timeout: .now() + 5) == .success)
-        DispatchQueue.global().async {
+        // Dedicated threads, not GCD's shared pool: under a parallel test
+        // run on a small CI runner the pool can be saturated for seconds,
+        // which made this test time out before the race was even staged.
+        Thread { writer.appendLine("in flight") }.start()
+        #expect(entered.wait(timeout: .now() + 30) == .success)
+        Thread {
             writer.close()
             closed.signal()
-        }
+        }.start()
 
         #expect(closed.wait(timeout: .now() + 0.3) == .timedOut, "close() returned while a write was in flight")
         release.signal()
-        #expect(closed.wait(timeout: .now() + 5) == .success)
+        #expect(closed.wait(timeout: .now() + 30) == .success)
         #expect(try String(contentsOf: url, encoding: .utf8).contains("in flight"))
 
         // And after close, a late line goes nowhere.
