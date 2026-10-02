@@ -15,14 +15,32 @@ import Musl
 @Suite struct ProcessGroupOwnershipTests {
     private let runner = DefaultProcessRunner(terminationGrace: 10, drainGrace: 2)
 
-    /// Polls until `pid` no longer exists (or `seconds` pass).
+    /// Polls until `pid` is gone or dead (or `seconds` pass).
+    ///
+    /// Dead includes a zombie. An orphaned descendant is reparented to PID 1,
+    /// and in a CI container PID 1 is often not an init that reaps, so a
+    /// killed grandchild can stay a zombie indefinitely — `kill(pid, 0)`
+    /// still succeeds on it although it has stopped running.
     private func waitForExit(_ pid: pid_t, seconds: Double = 5) async -> Bool {
         let deadline = ContinuousClock.now.advanced(by: .seconds(seconds))
         while ContinuousClock.now < deadline {
             if kill(pid, 0) != 0 && errno == ESRCH { return true }
+            if isZombie(pid) { return true }
             try? await Task.sleep(nanoseconds: 50_000_000)
         }
         return false
+    }
+
+    private func isZombie(_ pid: pid_t) -> Bool {
+        #if os(Linux)
+        // /proc/<pid>/stat: "pid (comm) S ..." — the state follows the last ')'.
+        guard let stat = try? String(contentsOfFile: "/proc/\(pid)/stat", encoding: .utf8),
+              let close = stat.lastIndex(of: ")") else { return false }
+        return stat[stat.index(after: close)...].trimmingCharacters(in: .whitespaces).hasPrefix("Z")
+        #else
+        // macOS: launchd reaps orphans promptly, so ESRCH is the signal.
+        return false
+        #endif
     }
 
     private final class Lines: @unchecked Sendable {
