@@ -110,10 +110,11 @@ public final class FileLock: @unchecked Sendable {
     ///   containing the lock's direct parent (`locks/`, `state/`, or
     ///   `runs/`). Production callers provide it so both directories are
     ///   opened and verified before `openat(2)` resolves the lock filename.
-    public init(path: URL, trustedRoot: URL? = nil) {
+    public init(path: URL, trustedRoot: URL? = nil, leaseToChildren: Bool = false) {
         self.path = path
         self.trustedRoot = trustedRoot
         self.directory = nil
+        self.leaseToChildren = leaseToChildren
     }
 
     /// Locks `name` inside an already-open, already-verified directory.
@@ -126,7 +127,16 @@ public final class FileLock: @unchecked Sendable {
         self.path = directory.path.appendingPathComponent(name)
         self.trustedRoot = nil
         self.directory = directory
+        self.leaseToChildren = false
     }
+
+    /// While held, the lock's descriptor is a `ProcessLeases` entry, so every
+    /// subprocess launched meanwhile inherits it and the lock outlives this
+    /// process if it dies mid-operation (#114). `release()` still frees it at
+    /// once: `LOCK_UN` unlocks the open file description every inherited copy
+    /// shares.
+    private let leaseToChildren: Bool
+    private var leaseToken: ProcessLeases.Token?
 
     /// Opens (creating if necessary) and attempts a non-blocking exclusive
     /// lock. Safe to call repeatedly (e.g. to poll).
@@ -184,6 +194,9 @@ public final class FileLock: @unchecked Sendable {
                 return .busy
             }
             return .failed(LockFailure(path: path.path, operation: "flock", errnoValue: code))
+        }
+        if leaseToChildren, leaseToken == nil {
+            leaseToken = ProcessLeases.shared.hold(fd)
         }
         return .acquired
     }
@@ -776,6 +789,10 @@ public final class FileLock: @unchecked Sendable {
     /// Releases the lock (if held) and closes the file descriptor. Safe to
     /// call multiple times.
     public func release() {
+        if let leaseToken {
+            ProcessLeases.shared.release(leaseToken)
+            self.leaseToken = nil
+        }
         guard fd >= 0 else { return }
         flock(fd, LOCK_UN)
         close(fd)

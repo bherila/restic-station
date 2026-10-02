@@ -97,10 +97,12 @@ public extension ProcessRunning {
     }
 }
 
-/// Production `ProcessRunning` implementation backed by `Foundation.Process`
-/// and `Pipe`. Portable: relies only on `Process`/`Pipe`/`FileHandle` (which
-/// work on Linux via swift-corelibs-foundation) plus `kill(2)` for signaling,
-/// imported from `Darwin` or `Glibc` depending on platform.
+/// Production `ProcessRunning` implementation. Spawns with `posix_spawn` and
+/// reaps the child itself (`OwnedProcess`, #114): the child leads its own
+/// process group, so the stop sequence reaches its descendants, and owning
+/// the reap is what proves a pid is still ours when a signal is sent.
+/// `ProcessLease.descriptors` are handed to the child so a set lock outlives
+/// a helper that dies mid-run.
 public struct DefaultProcessRunner: ProcessRunning {
     /// How long SIGINT is given to work before SIGKILL (`terminationGrace`,
     /// the documented 10 s), and how long a run keeps waiting for termination
@@ -132,22 +134,6 @@ public struct DefaultProcessRunner: ProcessRunning {
         SIGPIPEGuard.ensureInstalled()
     }
 
-    private static func withSIGPIPEIgnored<T>(_ body: () -> T) -> T {
-        SIGPIPEGuard.withIgnored(body)
-    }
-
-    private static func launch(_ process: Process) throws {
-        try SIGPIPEGuard.launch(process)
-    }
-
-    /// One successfully spawned child and the pipes wired to it.
-    private struct Spawned {
-        let process: Process
-        let stdout: Pipe
-        let stderr: Pipe
-        let stdin: Pipe
-    }
-
     /// Spawn attempts before giving up (#116).
     ///
     /// `posix_spawn` intermittently fails with `EFAULT` under concurrent
@@ -157,58 +143,21 @@ public struct DefaultProcessRunner: ProcessRunning {
     /// when `posix_spawn` reports an error, so a retry cannot double-spawn.
     /// That matters here, because some of what this runner launches is
     /// destructive.
-    ///
-    /// Retrying is the right production behaviour and not merely a test fix:
-    /// a spurious spawn failure should not fail a backup. It is measurable
-    /// because the test suite spawns hard enough to hit it — at roughly
-    /// 4 runs in 20 once this PR made the suite five times faster, against a
-    /// base rate near zero at the same concurrency spread over five times
-    /// the wall clock.
     private static let spawnAttempts = 3
 
-    /// Fresh `Process` and pipes per attempt: a `Process` cannot be re-run,
-    /// and pipes that were handed to a failed launch are not reused.
-    private static func launchWithRetry(
+    private static func spawnWithRetry(
         argv: [String],
         env: [String: String]?,
-        currentDirectory: String?,
         terminationSignal: TerminationSignal
-    ) throws -> Spawned {
+    ) throws -> OwnedProcess {
         var lastError: Error?
+        let leases = ProcessLeases.shared.current
         for attempt in 1...spawnAttempts {
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: argv[0])
-            process.arguments = Array(argv.dropFirst())
-            if let env {
-                process.environment = env
-            }
-            if let currentDirectory {
-                process.currentDirectoryURL = URL(fileURLWithPath: currentDirectory)
-            }
-
-            let stdoutPipe = Pipe()
-            let stderrPipe = Pipe()
-            let stdinPipe = Pipe()
-            process.standardOutput = stdoutPipe
-            process.standardError = stderrPipe
-            process.standardInput = stdinPipe
-            process.terminationHandler = { _ in
-                terminationSignal.fire()
-            }
-
             do {
-                // Forces `SIGPIPEGuard`'s one-time installation before any
-                // child can exist. It installs a no-op *handler* rather than
-                // `SIG_IGN` exactly so a child does not inherit it — see
-                // `SIGPIPEGuard` — so there is no window to serialise and
-                // nothing here to lock.
-                try launch(process)
-                return Spawned(
-                    process: process,
-                    stdout: stdoutPipe,
-                    stderr: stderrPipe,
-                    stdin: stdinPipe
-                )
+                SIGPIPEGuard.ensureInstalled()
+                return try OwnedProcess.spawn(argv: argv, env: env, inherit: leases) {
+                    terminationSignal.fire()
+                }
             } catch {
                 lastError = error
                 guard attempt < spawnAttempts, isTransientSpawnFailure(error) else {
@@ -216,9 +165,6 @@ public struct DefaultProcessRunner: ProcessRunning {
                 }
             }
         }
-        // Unreachable: the final iteration's `guard` always throws, since
-        // `attempt < spawnAttempts` is false there. Swift still needs the
-        // function to end in a throw or a return.
         throw lastError ?? ProcessRunnerError.launchFailed("spawn failed with no reported error")
     }
 
@@ -226,6 +172,9 @@ public struct DefaultProcessRunner: ProcessRunning {
     /// about the moment it was attempted. `EFAULT` is #116's signature;
     /// `EAGAIN` is the ordinary "out of process slots right now".
     static func isTransientSpawnFailure(_ error: Error) -> Bool {
+        if let failure = error as? SpawnFailure {
+            return failure.errnoValue == EFAULT || failure.errnoValue == EAGAIN
+        }
         guard let code = spawnErrno(of: error) else { return false }
         return code == EFAULT || code == EAGAIN
     }
@@ -284,21 +233,20 @@ public struct DefaultProcessRunner: ProcessRunning {
         // be installed before `run()` so a fast-exiting child can't race it.
         let terminationSignal = TerminationSignal()
 
-        let spawned: Spawned
+        // No caller sets a working directory, and `posix_spawn`'s chdir
+        // action is not portable to every libc this ships against; refusing
+        // beats silently running somewhere else.
+        guard currentDirectory == nil else {
+            throw ProcessRunnerError.launchFailed("a working directory is not supported")
+        }
+        let process: OwnedProcess
         do {
-            spawned = try Self.launchWithRetry(
-                argv: argv,
-                env: env,
-                currentDirectory: currentDirectory,
-                terminationSignal: terminationSignal
-            )
+            process = try Self.spawnWithRetry(argv: argv, env: env, terminationSignal: terminationSignal)
+        } catch let error as ProcessRunnerError {
+            throw error
         } catch {
             throw ProcessRunnerError.launchFailed(String(describing: error))
         }
-        let process = spawned.process
-        let stdoutPipe = spawned.stdout
-        let stderrPipe = spawned.stderr
-        let stdinPipe = spawned.stdin
         // Plain `Task`s (not `async let`) so they can be captured by the
         // nested task-group closure below.
         //
@@ -312,28 +260,23 @@ public struct DefaultProcessRunner: ProcessRunning {
         // them rather than abandon them; see `readPipeToCompletion`.
         let readerStop = AtomicFlag()
         let stdoutTask = Task {
-            await Self.readPipeToCompletion(stdoutPipe, onLine: onStdoutLine, stop: readerStop)
+            await Self.readPipeToCompletion(process.stdoutRead, onLine: onStdoutLine, stop: readerStop)
         }
         let stderrTask = Task {
-            await Self.readPipeToCompletion(stderrPipe, onLine: onStderrLine, stop: readerStop)
+            await Self.readPipeToCompletion(process.stderrRead, onLine: onStderrLine, stop: readerStop)
         }
 
         if let stdin {
-            // `write(contentsOf:)`, never `write(_:)`: the latter raises an
-            // uncatchable ObjC exception when the child has already closed
-            // its stdin, which for a fast-failing `ssh` (BatchMode, rejected
-            // key) is a live race against the password write. With SIGPIPE
-            // ignored, an early exit now surfaces as the child's real exit
-            // status instead of killing the helper mid-operation.
-            Self.withSIGPIPEIgnored {
-                try? stdinPipe.fileHandleForWriting.write(contentsOf: stdin)
-            }
+            // A child that has already closed its stdin (a fast-failing
+            // `ssh`: BatchMode, rejected key) makes this write fail with
+            // `EPIPE` rather than kill the helper — `SIGPIPEGuard` — and the
+            // early exit then surfaces as the child's real exit status.
+            Self.writeAll(stdin, to: process.stdinWrite)
         }
-        try? stdinPipe.fileHandleForWriting.close()
+        close(process.stdinWrite)
 
         let timeoutFlag = TimeoutFlag()
         let cancellationFlag = AtomicFlag()
-        let processBox = ProcessBox(process: process)
 
         // Task cancellation is handled with the same stop sequence as a
         // timeout (SIGINT, 10 s grace, SIGKILL). SIGINT rather than SIGTERM
@@ -367,7 +310,7 @@ public struct DefaultProcessRunner: ProcessRunning {
                 if !terminationSignal.hasFired && !cancellationFlag.isSet {
                     await timeoutFlag.trigger()
                     await Self.stopAfterGracePeriod(
-                        processBox,
+                        process,
                         terminated: terminationSignal,
                         grace: terminationGrace
                     )
@@ -410,15 +353,17 @@ public struct DefaultProcessRunner: ProcessRunning {
                 readerStop.set()
             }
             defer { stopper.cancel() }
-            return (await stdoutTask.value, await stderrTask.value)
+            let collected = (await stdoutTask.value, await stderrTask.value)
+            OwnedProcess.closeAll([process.stdoutRead, process.stderrRead])
+            return collected
         } onCancel: {
             cancellationFlag.set()
             // Synchronous part first so the signal lands immediately; the
             // grace period + SIGKILL run detached (this closure cannot await).
-            Self.sendSignal(SIGINT, to: processBox, unlessTerminated: terminationSignal)
+            process.signalGroup(SIGINT)
             Task.detached {
                 await Self.stopAfterGracePeriod(
-                    processBox,
+                    process,
                     terminated: terminationSignal,
                     grace: terminationGrace,
                     sendInitialInterrupt: false
@@ -445,6 +390,24 @@ public struct DefaultProcessRunner: ProcessRunning {
         return ProcessResult(exitCode: process.terminationStatus, stdout: outData, stderr: errData)
     }
 
+    /// Writes all of `data`, giving up quietly on any error other than
+    /// `EINTR` — a child that stopped reading is reported through its exit
+    /// status, not here.
+    private static func writeAll(_ data: Data, to descriptor: Int32) {
+        data.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress else { return }
+            var offset = 0
+            while offset < raw.count {
+                let written = write(descriptor, base.advanced(by: offset), raw.count - offset)
+                if written < 0 {
+                    if errno == EINTR { continue }
+                    return
+                }
+                offset += written
+            }
+        }
+    }
+
     /// SIGINT (optional — already sent by the cancellation handler), then up
     /// to 10 s of grace, then SIGKILL.
     ///
@@ -453,13 +416,13 @@ public struct DefaultProcessRunner: ProcessRunning {
     /// requested durations would then escalate to SIGKILL long before ten
     /// real seconds of grace had passed.
     private static func stopAfterGracePeriod(
-        _ box: ProcessBox,
+        _ process: OwnedProcess,
         terminated: TerminationSignal,
         grace: TimeInterval,
         sendInitialInterrupt: Bool = true
     ) async {
         if sendInitialInterrupt {
-            sendSignal(SIGINT, to: box, unlessTerminated: terminated)
+            process.signalGroup(SIGINT)
         }
         // `ContinuousClock`, not `Date`: this is an elapsed-duration bound,
         // and a wall clock stepped backwards by NTP would extend the grace
@@ -480,32 +443,8 @@ public struct DefaultProcessRunner: ProcessRunning {
                 return
             }
         }
-        sendSignal(SIGKILL, to: box, unlessTerminated: terminated)
+        process.signalGroup(SIGKILL)
     }
-
-    /// Signals the child unless it is already known to have terminated.
-    ///
-    /// The liveness guard is **our own** termination latch, never
-    /// `Process.isRunning`. Foundation's flag is bookkeeping we have already
-    /// learned not to trust on Linux — the same distrust that makes this file
-    /// observe exit through `terminationHandler` and never `waitUntilExit()`.
-    /// A guard that wrongly reads "not running" silently swallows both SIGINT
-    /// and SIGKILL, which leaves the deadline enforced in name only: `run`
-    /// throws `.timeout` on schedule while the child keeps going and the
-    /// caller keeps holding the set lock.
-    ///
-    /// A latch that has not fired means Foundation has not reaped the child,
-    /// so the pid is still ours and cannot have been reused. Signalling a
-    /// not-yet-reaped zombie is harmless.
-    private static func sendSignal(
-        _ signal: Int32,
-        to box: ProcessBox,
-        unlessTerminated terminated: TerminationSignal
-    ) {
-        guard !terminated.hasFired else { return }
-        kill(box.process.processIdentifier, signal)
-    }
-
 
     /// Reads a pipe on a background dispatch queue (never blocks the Swift
     /// concurrency cooperative thread pool), streaming complete lines to
@@ -522,14 +461,12 @@ public struct DefaultProcessRunner: ProcessRunning {
     /// already thrown — into, for the engine's callers, a `LogWriter` the
     /// same return path has just closed.
     private static func readPipeToCompletion(
-        _ pipe: Pipe,
+        _ fd: Int32,
         onLine: (@Sendable (String) -> Void)?,
         stop: AtomicFlag
     ) async -> Data {
         await withCheckedContinuation { (continuation: CheckedContinuation<Data, Never>) in
-            let box = PipeBox(pipe: pipe)
             DispatchQueue.global(qos: .utility).async {
-                let fd = box.pipe.fileHandleForReading.fileDescriptor
                 var accumulated = Data()
                 var lineBuffer = Data()
                 let newline = UInt8(ascii: "\n")
@@ -574,19 +511,6 @@ public struct DefaultProcessRunner: ProcessRunning {
             }
         }
     }
-}
-
-private struct PipeBox: @unchecked Sendable {
-    let pipe: Pipe
-}
-
-/// Same reasoning as `PipeBox`: `Process` is not `Sendable`, but the only
-/// member touched across concurrency domains here is `processIdentifier`,
-/// which is safe to read from the cancellation handler while the launching
-/// task awaits the process. Liveness is deliberately *not* read from
-/// `Process` — see `sendSignal(_:to:unlessTerminated:)`.
-private struct ProcessBox: @unchecked Sendable {
-    let process: Process
 }
 
 /// Records — synchronously, from `withTaskCancellationHandler`'s handler —
@@ -808,8 +732,4 @@ enum SIGPIPEGuard {
         return body()
     }
 
-    static func launch(_ process: Process) throws {
-        _ = installed
-        try process.run()
-    }
 }

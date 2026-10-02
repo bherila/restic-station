@@ -107,14 +107,16 @@ exists when `posix_spawn` reports an error, so it cannot double-spawn a
 destructive command; `onlyTransientSpawnFailuresAreRetried` pins the boundary
 so a real `ENOENT` or `EACCES` still fails on the first attempt.
 
-**Signal delivery to children is not portable, and CI is the only place that
-shows it.** On the `linux` job, a child does not stop on SIGINT and is ended
-by the SIGKILL escalation behind it — an ignored disposition is inherited
-across `exec` there, while macOS's Foundation resets child dispositions (cf.
-the same divergence behind `SIGPIPEGuard`'s no-op handler). One further
-Linux-only observation came out of #114 and is recorded in #149 alongside it: a
-`/bin/sh -c` child's termination is not observed after SIGKILL the way a
-direct `/bin/sleep` child's is. None of it is visible from a green macOS run.
+**Signal delivery to children used to differ by platform.** Under
+`Foundation.Process`, a child on the `linux` job did not stop on SIGINT —
+an ignored disposition was inherited across `exec` there, while macOS's
+Foundation reset it — and a `/bin/sh -c` child's termination was not
+observed after SIGKILL the way a direct child's was (#149). The runner now
+spawns with `POSIX_SPAWN_SETSIGDEF` and an empty mask on every platform and
+reaps with its own `waitid`/`waitpid` (#114), which removes both causes;
+`ProcessGroupOwnershipTests` pins group signalling, the post-exit straggler
+SIGTERM, opt-in inheritance, the lease, and that nothing is signalled after
+the reap. Only the Linux CI jobs can confirm the Linux half.
 
 **An elapsed bound is necessary and not sufficient.** Two independent reviews
 of #147 built the same counterexample: delete the runner's entire kill path,
