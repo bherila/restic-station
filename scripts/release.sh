@@ -5,6 +5,7 @@
 #
 #   scripts/release.sh build   X.Y.Z               # → dist/vX.Y.Z/, verified, nothing published
 #   scripts/release.sh publish X.Y.Z --notes FILE  # signed tag + GitHub release from dist/vX.Y.Z/
+#                                                  # (FILE outside the repo: publish needs a clean tree)
 #
 # Environment:
 #   RELEASE_GPG_KEY                                 fingerprint of the OpenPGP key that signs the
@@ -54,12 +55,30 @@ project_version() {
 # after it pushed the tag (see publish).
 prechecks() {
     git fetch -q --tags origin
-    [ -z "$(git status --porcelain)" ] || die "the working tree is not clean"
+    [ -z "$(git status --porcelain)" ] \
+        || die "the working tree is not clean (keep the release notes file outside the repository)"
     [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ] || die "HEAD is not origin/main"
     [ "$(project_version)" = "$VERSION" ] || die "project.yml says $(project_version), not $VERSION — merge the version bump first"
     if [ "${1:-}" != allow-tag ]; then
         ! git rev-parse -q --verify "refs/tags/$TAG" >/dev/null || die "tag $TAG already exists"
     fi
+}
+
+# signed_by_key: reads gpg --status-fd output and succeeds only if it holds
+# a VALIDSIG whose signing-key or primary-key fingerprint is $KEY.
+# `gpg --verify` alone accepts any key in the keyring, and `--local-user`
+# only chooses the key when signing. The comparison is forced to strings: awk
+# compares numerically when both sides look numeric, and an all-digit
+# "fingerprint" then matched an unrelated `0` field. awk reads everything,
+# so no producer is cut off mid-pipe.
+signed_by_key() {
+    awk -v key="$(echo "$KEY" | tr 'abcdef' 'ABCDEF')" \
+        '$1 == "[GNUPG:]" && $2 == "VALIDSIG" && (($3 "") == (key "") || ($NF "") == (key "")) { found = 1 }
+         END { exit !found }'
+}
+
+verify_signed_by() {
+    gpg --batch --status-fd 1 --verify "$1" "$2" 2>/dev/null | signed_by_key
 }
 
 # The files a release ships, in a stable order (everything in $DIST except
@@ -85,6 +104,10 @@ build() {
     else
         prechecks
     fi
+    # Every piece of evidence below is bound to this one commit; the build
+    # refuses at the end if the checkout moved underneath it.
+    local commit
+    commit=$(git rev-parse HEAD)
     local run=${RELEASE_CI_RUN:-$(ci_run_for_head)}
     [ -n "$run" ] || die "no successful ci.yml run on main for HEAD; wait for CI or set RELEASE_CI_RUN"
     # An override is checked like the default: the CI workflow, finished
@@ -94,11 +117,11 @@ build() {
     run_meta=$(gh run view "$run" -R "$REPO" --json workflowName,conclusion,headSha \
         --jq '"\(.workflowName) \(.conclusion) \(.headSha)"') || die "cannot read CI run $run"
     case $run_meta in
-        "CI success $(git rev-parse HEAD)") ;;
+        "CI success $commit") ;;
         *) if [ "$rehearsal" = 1 ]; then
                echo "release: rehearsal using CI run $run ($run_meta), which is not this commit's" >&2
            else
-               die "CI run $run is '$run_meta', not a successful CI run of $(git rev-parse HEAD)"
+               die "CI run $run is '$run_meta', not a successful CI run of $commit"
            fi ;;
     esac
 
@@ -126,15 +149,27 @@ build() {
 
     step "Code signing"
     ./scripts/sign-release.sh "$app" >/dev/null
+    # One private copy, verified, from which both archives are made: the
+    # shared build directory can be rewritten by another xcodebuild while
+    # this runs, and each archive must contain bytes that were verified.
+    local stage="dist/stage-$TAG"
+    rm -rf "$stage"
+    mkdir -p "$stage"
+    ditto "$app" "$stage/$APP_NAME"
+    app="$stage/$APP_NAME"
     ./scripts/sign-release.sh --verify "$app"
 
     step "Sparkle zip and signed appcast"
     ./scripts/make-appcast.sh "$app" "$DIST" ${RELEASE_NOTES_HTML:+"$RELEASE_NOTES_HTML"}
 
     step "macOS tarball"
-    COPYFILE_DISABLE=1 tar -C "$(dirname "$app")" -czf "$DIST/restic-station-macos-universal-$TAG.tar.gz" "$APP_NAME"
-    ! tar tzf "$DIST/restic-station-macos-universal-$TAG.tar.gz" | grep -q '/\._' \
-        || die "the macOS tarball contains AppleDouble files"
+    COPYFILE_DISABLE=1 tar -C "$stage" -czf "$DIST/restic-station-macos-universal-$TAG.tar.gz" "$APP_NAME"
+    # Listed to a file first: `tar … | grep -q` lets grep exit at the first
+    # match, tar dies of SIGPIPE, and under pipefail the negated pipeline
+    # then *succeeds* — the check would pass exactly when it should fail.
+    tar tzf "$DIST/restic-station-macos-universal-$TAG.tar.gz" > "$stage/listing" \
+        || die "cannot list the macOS tarball"
+    ! grep -q '/\._' "$stage/listing" || die "the macOS tarball contains AppleDouble files"
 
     step "Linux tarballs from CI run $run"
     gh run download "$run" -R "$REPO" -n restic-station-linux -D "dist/linux-$TAG"
@@ -152,13 +187,15 @@ build() {
         local file
         for file in ./*.tar.gz SHA256SUMS; do
             gpg --batch --yes --local-user "$KEY" --armor --detach-sign "$file"
-            gpg --verify "$file.asc" "$file" 2>/dev/null || die "signature on $file does not verify"
+            verify_signed_by "$file.asc" "$file" || die "$file is not signed by $KEY"
         done
         gpg --armor --export "$KEY" > release-key.asc
         [ -s release-key.asc ] || die "could not export the public key for $KEY"
     )
+    [ "$(git rev-parse HEAD)" = "$commit" ] || die "HEAD moved from $commit during the build — rebuild"
+    rm -rf "$stage"
     echo "$run" > "$DIST/.ci-run"
-    git rev-parse HEAD > "$DIST/.commit"
+    echo "$commit" > "$DIST/.commit"
     # A rehearsal (or a tree that changed during the build) can contain
     # source that HEAD does not: mark it so publish refuses it for good.
     if [ "$rehearsal" = 1 ] || [ -n "$(git status --porcelain)" ]; then
@@ -196,7 +233,7 @@ publish() {
     local asc
     for asc in "$DIST"/*.asc; do
         [ "$(basename "$asc")" = release-key.asc ] && continue
-        gpg --verify "$asc" "${asc%.asc}" 2>/dev/null || die "the signature $asc does not verify"
+        verify_signed_by "$asc" "${asc%.asc}" || die "$asc is not a good signature by $KEY"
     done
 
     # Resumable after this point: a tag that already exists must be ours —
@@ -208,7 +245,8 @@ publish() {
     else
         git -c gpg.format=openpgp -c gpg.program=gpg tag -s -u "$KEY" -m "Restic Station $TAG" "$TAG" HEAD
     fi
-    git -c gpg.format=openpgp tag -v "$TAG" >/dev/null 2>&1 || die "the tag signature does not verify"
+    git -c gpg.format=openpgp verify-tag --raw "$TAG" 2>&1 >/dev/null | signed_by_key \
+        || die "tag $TAG is not a good signature by $KEY"
     git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1 || git push origin "$TAG"
 
     step "GitHub release"
@@ -218,6 +256,9 @@ publish() {
     if gh release view "$TAG" -R "$REPO" >/dev/null 2>&1; then
         echo "release $TAG already exists; re-uploading the verified assets"
         gh release upload "$TAG" -R "$REPO" --clobber "${assets[@]}"
+        # An interrupted create leaves a draft, which `latest` — and so
+        # Sparkle's feed — ignores. Finish it the way create would have.
+        gh release edit "$TAG" -R "$REPO" --draft=false --prerelease=false --latest >/dev/null
     else
         gh release create "$TAG" -R "$REPO" --verify-tag --latest --title "Restic Station $TAG" \
             --notes-file "$notes" "${assets[@]}"

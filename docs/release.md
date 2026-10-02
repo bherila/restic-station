@@ -98,7 +98,7 @@ Not applicable — notarization requires a Developer ID.
 The second phase of the script whose first phase ran in step 2:
 
 ```sh
-scripts/release.sh publish X.Y.Z --notes release-notes.md
+scripts/release.sh publish X.Y.Z --notes ~/release-notes-vX.Y.Z.md   # outside the repo: publish needs a clean tree
 ```
 
 `build` requires a clean tree at `origin/main` whose `project.yml` says
