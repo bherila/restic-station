@@ -14,32 +14,50 @@ import Musl
 /// `write(2)` syscall per line with no userspace buffering, so a reader
 /// that opens the same file concurrently (e.g. a "tail the running log" UI)
 /// sees each line as soon as it's appended.
+///
+/// **Thread safety (#148).** `appendLine` runs on a process runner's pipe
+/// reader queues and `close()` on the engine's thread. `fd` is only read or
+/// changed while holding `lock`, and the lock is held across the whole
+/// `write(2)`, so `close()` waits for an in-flight write and a line can
+/// never be written to a descriptor number that was closed and reused by
+/// an unrelated file. That is what makes `@unchecked Sendable` true.
 public final class LogWriter: @unchecked Sendable {
+    private let lock = NSLock()
     private var fd: Int32
     private let now: () -> Date
+    /// Test seam: runs under the lock just before each `write(2)`.
+    private let beforeWrite: (@Sendable () -> Void)?
 
     /// Opens (creating if necessary) `url` for appending. Existing content,
     /// if any, is preserved (`O_APPEND`).
-    public init(url: URL, now: @escaping () -> Date = Date.init) throws {
-        let opened = url.path.withCString { open($0, O_CREAT | O_WRONLY | O_APPEND, 0o644) }
+    public convenience init(url: URL, now: @escaping () -> Date = Date.init) throws {
+        try self.init(url: url, now: now, beforeWrite: nil)
+    }
+
+    init(url: URL, now: @escaping () -> Date, beforeWrite: (@Sendable () -> Void)?) throws {
+        let opened = url.path.withCString { open($0, O_CREAT | O_WRONLY | O_APPEND | O_CLOEXEC, 0o644) }
         guard opened >= 0 else {
             throw LogWriterError.openFailed(errno: errno, path: url.path)
         }
         self.fd = opened
         self.now = now
+        self.beforeWrite = beforeWrite
     }
 
     /// Appends one `[HH:mm:ss] <line>\n` record. A trailing newline is
     /// added if `line` doesn't already end in one; embedded newlines in
     /// `line` are written verbatim (only the leading timestamp is added).
     public func appendLine(_ line: String) {
-        guard fd >= 0 else { return }
         let timestamp = Self.timestampFormatter.string(from: now())
         var text = "[\(timestamp)] \(line)"
         if !text.hasSuffix("\n") {
             text += "\n"
         }
         let bytes = Array(text.utf8)
+        lock.lock()
+        defer { lock.unlock() }
+        guard fd >= 0 else { return }
+        beforeWrite?()
         bytes.withUnsafeBufferPointer { buffer in
             guard var base = buffer.baseAddress else { return }
             var remaining = buffer.count
@@ -55,6 +73,8 @@ public final class LogWriter: @unchecked Sendable {
 
     /// Closes the underlying file descriptor. Safe to call multiple times.
     public func close() {
+        lock.lock()
+        defer { lock.unlock() }
         guard fd >= 0 else { return }
         #if canImport(Darwin)
         _ = Darwin.close(fd)

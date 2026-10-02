@@ -81,4 +81,58 @@ import Testing
         writer?.close() // idempotent
         writer = nil // deinit should not crash on an already-closed fd
     }
+
+    /// #148: `close()` runs on the engine's thread while `appendLine` runs
+    /// on a pipe-reader queue. A close that lands mid-write would let the
+    /// write hit a descriptor number already reused by an unrelated file, so
+    /// close must wait for the in-flight write. Deterministic: the hook holds
+    /// the first write open under the writer's lock.
+    @Test func closeWaitsForAnInFlightWrite() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("logwriter-race-\(UUID().uuidString).txt")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let closed = DispatchSemaphore(value: 0)
+        let first = OnceFlag()
+        let writer = try LogWriter(url: url, now: Date.init, beforeWrite: {
+            if first.take() {
+                entered.signal()
+                release.wait()
+            }
+        })
+
+        // Dedicated threads, not GCD's shared pool: under a parallel test
+        // run on a small CI runner the pool can be saturated for seconds,
+        // which made this test time out before the race was even staged.
+        Thread { writer.appendLine("in flight") }.start()
+        #expect(entered.wait(timeout: .now() + 30) == .success)
+        Thread {
+            writer.close()
+            closed.signal()
+        }.start()
+
+        #expect(closed.wait(timeout: .now() + 0.3) == .timedOut, "close() returned while a write was in flight")
+        release.signal()
+        #expect(closed.wait(timeout: .now() + 30) == .success)
+        #expect(try String(contentsOf: url, encoding: .utf8).contains("in flight"))
+
+        // And after close, a late line goes nowhere.
+        writer.appendLine("too late")
+        #expect(!(try String(contentsOf: url, encoding: .utf8).contains("too late")))
+    }
+}
+
+/// Thread-safe one-shot flag for the test hook above.
+private final class OnceFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var taken = false
+
+    func take() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if taken { return false }
+        taken = true
+        return true
+    }
 }
