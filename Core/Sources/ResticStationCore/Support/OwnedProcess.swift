@@ -241,13 +241,21 @@ final class OwnedProcess: @unchecked Sendable {
         }
         defer { posix_spawnattr_destroy(&attributes) }
 
-        posix_spawn_file_actions_adddup2(&actions, stdio.in, 0)
-        posix_spawn_file_actions_adddup2(&actions, stdio.out, 1)
-        posix_spawn_file_actions_adddup2(&actions, stdio.err, 2)
+        // Every setup call is checked: `posix_spawn` would happily launch a
+        // child missing an action that failed to register — and a missing
+        // lease is a set lock that does not survive the helper (#114).
+        func check(_ result: Int32, _ what: String) throws {
+            guard result == 0 else {
+                throw ProcessRunnerError.launchFailed("\(what) failed: errno \(result)")
+            }
+        }
+        try check(posix_spawn_file_actions_adddup2(&actions, stdio.in, 0), "adddup2 stdin")
+        try check(posix_spawn_file_actions_adddup2(&actions, stdio.out, 1), "adddup2 stdout")
+        try check(posix_spawn_file_actions_adddup2(&actions, stdio.err, 2), "adddup2 stderr")
         // `dup2` clears close-on-exec on the target, which is what makes a
         // lease survive `exec`.
         for (index, source) in leases.enumerated() {
-            posix_spawn_file_actions_adddup2(&actions, source, Int32(3 + index))
+            try check(posix_spawn_file_actions_adddup2(&actions, source, Int32(3 + index)), "adddup2 lease")
         }
 
         var flags = Int32(POSIX_SPAWN_SETPGROUP) | Int32(POSIX_SPAWN_SETSIGDEF) | Int32(POSIX_SPAWN_SETSIGMASK)
@@ -259,12 +267,12 @@ final class OwnedProcess: @unchecked Sendable {
         // No CLOEXEC_DEFAULT on Linux: close, in the child, every inherited
         // descriptor at or above the first free slot. Close-on-exec ones go
         // at `exec` anyway, so only the others need an action.
-        for descriptor in inheritableDescriptors() where descriptor >= 3 + Int32(leases.count) {
-            posix_spawn_file_actions_addclose(&actions, descriptor)
+        for descriptor in try inheritableDescriptors() where descriptor >= 3 + Int32(leases.count) {
+            try check(posix_spawn_file_actions_addclose(&actions, descriptor), "addclose")
         }
         #endif
-        posix_spawnattr_setflags(&attributes, Int16(flags))
-        posix_spawnattr_setpgroup(&attributes, 0)
+        try check(posix_spawnattr_setflags(&attributes, Int16(flags)), "setflags")
+        try check(posix_spawnattr_setpgroup(&attributes, 0), "setpgroup")
 
         // Default dispositions and an empty mask in the child on every
         // platform. macOS's Foundation reset them; swift-corelibs does not,
@@ -274,10 +282,10 @@ final class OwnedProcess: @unchecked Sendable {
         for signal in Int32(1)..<Int32(32) where signal != SIGKILL && signal != SIGSTOP {
             sigaddset(&defaults, signal)
         }
-        posix_spawnattr_setsigdefault(&attributes, &defaults)
+        try check(posix_spawnattr_setsigdefault(&attributes, &defaults), "setsigdefault")
         var emptyMask = sigset_t()
         sigemptyset(&emptyMask)
-        posix_spawnattr_setsigmask(&attributes, &emptyMask)
+        try check(posix_spawnattr_setsigmask(&attributes, &emptyMask), "setsigmask")
 
         let argvC = argv.map { strdup($0) } + [nil]
         let envC = env.map { strdup("\($0.key)=\($0.value)") } + [nil]
