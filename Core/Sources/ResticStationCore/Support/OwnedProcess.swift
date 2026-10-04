@@ -223,12 +223,18 @@ final class OwnedProcess: @unchecked Sendable {
             }
         }
 
+        // The reap and the `reaped` transition happen under the same lock as
+        // every signal: otherwise a concurrent stop could pass the guard in
+        // the instant after `waitpid` freed the pid and before `reaped` was
+        // set, and signal whatever reused it. Holding the lock here costs
+        // nothing — the leader is already a zombie, so `waitpid` returns at
+        // once.
+        lock.lock()
         var status: Int32 = 0
         var result: pid_t
         repeat {
             result = waitpid(pid, &status, 0)
         } while result < 0 && errno == EINTR
-        lock.lock()
         waitStatus = result == pid ? status : (0x7f00 | 0) // unknown: report as exit 127
         reaped = true
         lock.unlock()
