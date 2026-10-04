@@ -43,8 +43,16 @@ import Musl
               let close = stat.lastIndex(of: ")") else { return false }
         return stat[stat.index(after: close)...].trimmingCharacters(in: .whitespaces).hasPrefix("Z")
         #else
-        // macOS: launchd reaps orphans promptly, so ESRCH is the signal.
-        return false
+        // A SIGKILLed orphan is a zombie until launchd reaps it, which under a
+        // loaded parallel run is not instant. Called only for a pid that
+        // `kill(pid, 0)` says still exists: `proc_pidinfo` cannot describe a
+        // zombie (it has no task), so an unreadable one is not running —
+        // the same reading the runner uses. Observed under the full suite:
+        // kill succeeded, pidinfo failed, and the pid was gone moments later.
+        var info = proc_bsdinfo()
+        let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+        guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size else { return true }
+        return info.pbi_status == UInt32(SZOMB)
         #endif
     }
 
@@ -125,10 +133,27 @@ import Musl
     /// The property is the waiter's: no grace when nothing is left over.
     @Test("a run that leaves no stragglers pays no grace period")
     func noStragglersNoDelay() async throws {
+        // Both instants are taken on dedicated threads (this one, before the
+        // first await, and the waiter's, inside onExit): reading the clock
+        // after an await measured the loaded runner's shared pool instead
+        // (6 s on CI with the waiter itself idle).
+        final class Instant: @unchecked Sendable {
+            private let lock = NSLock()
+            private var value: ContinuousClock.Instant?
+            func set() { lock.lock(); value = .now; lock.unlock() }
+            var read: ContinuousClock.Instant? { lock.lock(); defer { lock.unlock() }; return value }
+        }
+        let exitedAt = Instant()
+        let exited = DispatchSemaphore(value: 0)
         let started = ContinuousClock.now
-        let (process, exited) = try spawnAndWait(["/bin/sh", "-c", "true"])
+        let process = try OwnedProcess.spawn(argv: ["/bin/sh", "-c", "true"], env: nil, inherit: []) {
+            exitedAt.set()
+            exited.signal()
+        }
+        close(process.stdinWrite)
         #expect(await wait(exited, seconds: 30))
-        #expect(ContinuousClock.now - started < .seconds(OwnedProcess.stragglerGrace))
+        let elapsed = try #require(exitedAt.read) - started
+        #expect(elapsed < .seconds(OwnedProcess.stragglerGrace), "spawn to reap took \(elapsed)")
         #expect(!process.hasOtherGroupMembers())
         OwnedProcess.closeAll([process.stdoutRead, process.stderrRead])
     }
@@ -260,5 +285,52 @@ import Musl
         #expect(plain.acquire() == .acquired)
         #expect(plain.leaseToken == nil)
         plain.release()
+    }
+
+    /// Found by the full suite: spawn read the lease registry and then
+    /// duplicated each descriptor, and a lock released in between (another
+    /// operation, another test) was already closed — the spawn failed with
+    /// EBADF. Duplication now happens under the registry lock that release
+    /// also takes.
+    @Test("leases released concurrently never fail a spawn")
+    func concurrentLeaseReleaseNeverFailsSpawn() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("lease-churn-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let stop = DispatchSemaphore(value: 0)
+        let finished = DispatchSemaphore(value: 0)
+        // Several locks held at once on different files, so released
+        // descriptor numbers are not simply reused by the next acquire —
+        // a reused number would make the old bug's dup succeed silently.
+        Thread {
+            var index = 0
+            while stop.wait(timeout: .now()) == .timedOut {
+                let locks = (0..<4).map { FileLock(path: root.appendingPathComponent("churn-\($0).lock"), leaseToChildren: true) }
+                locks.forEach { _ = $0.acquire() }
+                let shift = index % 2 == 0 ? open("/dev/null", O_RDONLY | O_CLOEXEC) : -1 // shift fd numbers
+                locks.forEach { $0.release() }
+                if shift >= 0 { close(shift) }
+                index += 1
+            }
+            finished.signal()
+        }.start()
+        var failure: Error?
+        do {
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                for _ in 0..<200 {
+                    group.addTask {
+                        _ = try await runner.run(["/bin/sh", "-c", "true"], env: nil, currentDirectory: nil,
+                                                 onStdoutLine: nil, onStderrLine: nil, timeout: 30)
+                    }
+                }
+                try await group.waitForAll()
+            }
+        } catch {
+            failure = error
+        }
+        stop.signal()
+        #expect(await wait(finished, seconds: 30))
+        #expect(failure == nil, "a spawn failed while leases churned: \(String(describing: failure))")
     }
 }

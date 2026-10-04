@@ -151,10 +151,13 @@ public struct DefaultProcessRunner: ProcessRunning {
         terminationSignal: TerminationSignal
     ) throws -> OwnedProcess {
         var lastError: Error?
-        let leases = ProcessLeases.shared.current
         for attempt in 1...spawnAttempts {
             do {
                 SIGPIPEGuard.ensureInstalled()
+                // Duplicated atomically with respect to every release, and
+                // owned here until the spawn has made its own copies.
+                let leases = try ProcessLeases.shared.duplicates()
+                defer { OwnedProcess.closeAll(leases) }
                 return try OwnedProcess.spawn(argv: argv, env: env, inherit: leases) {
                     terminationSignal.fire()
                 }

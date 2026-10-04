@@ -59,6 +59,30 @@ public final class ProcessLeases: @unchecked Sendable {
         defer { lock.unlock() }
         return held.sorted { $0.key < $1.key }.map(\.value)
     }
+
+    /// Close-on-exec duplicates of every held lease, in acquisition order,
+    /// made **under the registry lock**. `release(_:)` takes the same lock
+    /// before its caller closes the descriptor, so a lease can never be
+    /// closed between being read here and being duplicated — which, read
+    /// and duplicated separately, failed a concurrent spawn with `EBADF`.
+    /// The caller owns the returned descriptors.
+    func duplicates() throws -> [Int32] {
+        lock.lock()
+        defer { lock.unlock() }
+        var copies: [Int32] = []
+        for descriptor in held.sorted(by: { $0.key < $1.key }).map(\.value) {
+            // Above any slot a child's `dup2` targets, so placing leases at
+            // 3, 4, … can never overwrite another source first.
+            let copy = fcntl(descriptor, F_DUPFD_CLOEXEC, 64)
+            guard copy >= 0 else {
+                let code = errno
+                OwnedProcess.closeAll(copies)
+                throw ProcessRunnerError.launchFailed("could not duplicate lease descriptor \(descriptor): errno \(code)")
+            }
+            copies.append(copy)
+        }
+        return copies
+    }
 }
 
 /// A child process this process spawned and reaps itself (#114), in its own
@@ -166,7 +190,9 @@ final class OwnedProcess: @unchecked Sendable {
             throw error
         }
         // Lease sources moved above any target slot, close-on-exec, so
-        // `dup2` onto 3, 4, … can never overwrite another source first.
+        // `dup2` onto 3, 4, … can never overwrite another source first. The
+        // caller's descriptors are its own to keep open for this call; the
+        // registry's are duplicated under its lock (`ProcessLeases`).
         var leaseSources: [Int32] = []
         for descriptor in inherit {
             let copy = fcntl(descriptor, F_DUPFD_CLOEXEC, 64)
