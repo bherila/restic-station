@@ -307,10 +307,15 @@ final class OwnedProcess: @unchecked Sendable {
     }
 
     #if !canImport(Darwin)
-    /// Open descriptors without close-on-exec, from `/proc/self/fd`.
-    private static func inheritableDescriptors() -> [Int32] {
-        guard let names = try? FileManager.default.contentsOfDirectory(atPath: "/proc/self/fd") else {
-            return []
+    /// Open descriptors without close-on-exec, from `/proc/self/fd`. Throws
+    /// if the list cannot be read: an empty answer would launch the child
+    /// with every ambient descriptor, against the opt-in contract.
+    private static func inheritableDescriptors() throws -> [Int32] {
+        let names: [String]
+        do {
+            names = try FileManager.default.contentsOfDirectory(atPath: "/proc/self/fd")
+        } catch {
+            throw ProcessRunnerError.launchFailed("cannot enumerate /proc/self/fd to close inherited descriptors: \(error)")
         }
         return names.compactMap { Int32($0) }.filter { descriptor in
             let flags = fcntl(descriptor, F_GETFD)
