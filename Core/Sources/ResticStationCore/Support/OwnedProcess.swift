@@ -135,6 +135,15 @@ final class OwnedProcess: @unchecked Sendable {
         onExit: @escaping @Sendable () -> Void
     ) throws -> OwnedProcess {
         precondition(!argv.isEmpty)
+        // Held from pipe creation to the spawn. Pipe ends get close-on-exec
+        // just after `pipe()` (`pipe2` is not in every Glibc overlay), and on
+        // Linux a spawn closes only the non-close-on-exec descriptors it
+        // enumerated — so without this, one spawn could enumerate, another
+        // create a pipe, and the first child inherit that pipe's end. Every
+        // spawn in this process comes through here, so serializing them
+        // closes the window.
+        spawnLock.lock()
+        defer { spawnLock.unlock() }
         let stdinPipe = try makePipe()
         let stdoutPipe: (read: Int32, write: Int32)
         let stderrPipe: (read: Int32, write: Int32)
@@ -218,6 +227,8 @@ final class OwnedProcess: @unchecked Sendable {
     }
 
     // MARK: - posix_spawn
+
+    private static let spawnLock = NSLock()
 
     private static func posixSpawn(
         argv: [String],
@@ -326,10 +337,8 @@ final class OwnedProcess: @unchecked Sendable {
 
     private static func makePipe() throws -> (read: Int32, write: Int32) {
         // `pipe2` is not exported by every Glibc overlay this builds with, so
-        // close-on-exec is set right after. A child spawned concurrently in
-        // that instant could see these ends without it — but every spawn here
-        // closes such descriptors in the child (CLOEXEC_DEFAULT on Darwin, the
-        // explicit close actions on Linux), so nothing is inherited either way.
+        // close-on-exec is set right after. That gap is safe only because
+        // `spawn` holds `spawnLock` around it (see there).
         var ends: [Int32] = [-1, -1]
         guard pipe(&ends) == 0 else {
             throw ProcessRunnerError.launchFailed("pipe failed: errno \(errno)")
