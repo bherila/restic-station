@@ -245,17 +245,20 @@ import Musl
             .appendingPathComponent("lease-lock-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
-        let before = Set(ProcessLeases.shared.current)
+        // Asserted on this lock's own registration, never by diffing the
+        // process-wide registry: parallel engine tests take set locks, which
+        // register and release leases at any moment.
         let lock = FileLock(path: root.appendingPathComponent("set.lock"), leaseToChildren: true)
         #expect(lock.acquire() == .acquired)
-        let during = Set(ProcessLeases.shared.current).subtracting(before)
-        #expect(during.count == 1)
+        let token = try #require(lock.leaseToken)
+        #expect(ProcessLeases.shared.contains(token))
         lock.release()
-        #expect(Set(ProcessLeases.shared.current).isDisjoint(with: during))
+        #expect(!ProcessLeases.shared.contains(token))
+        #expect(lock.leaseToken == nil)
 
         let plain = FileLock(path: root.appendingPathComponent("other.lock"))
         #expect(plain.acquire() == .acquired)
-        #expect(Set(ProcessLeases.shared.current).subtracting(before).isEmpty)
+        #expect(plain.leaseToken == nil)
         plain.release()
     }
 }

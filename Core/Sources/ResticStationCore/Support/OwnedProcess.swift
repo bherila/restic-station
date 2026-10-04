@@ -47,6 +47,12 @@ public final class ProcessLeases: @unchecked Sendable {
         held.removeValue(forKey: token.id)
     }
 
+    func contains(_ token: Token) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return held[token.id] != nil
+    }
+
     /// In acquisition order.
     var current: [Int32] {
         lock.lock()

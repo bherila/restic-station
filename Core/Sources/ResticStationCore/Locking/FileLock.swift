@@ -136,7 +136,7 @@ public final class FileLock: @unchecked Sendable {
     /// once: `LOCK_UN` unlocks the open file description every inherited copy
     /// shares.
     private let leaseToChildren: Bool
-    private var leaseToken: ProcessLeases.Token?
+    private(set) var leaseToken: ProcessLeases.Token?
 
     /// Opens (creating if necessary) and attempts a non-blocking exclusive
     /// lock. Safe to call repeatedly (e.g. to poll).
