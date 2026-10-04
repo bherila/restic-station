@@ -245,9 +245,12 @@ final class OwnedProcess: @unchecked Sendable {
     /// the leader is reaped anyway.
     static let stragglerGrace: TimeInterval = 5
 
+    /// `ContinuousClock`, not `Date`: an elapsed bound. A wall clock stepped
+    /// backwards would hold the reap (and the caller's set lock) for the
+    /// size of the step; stepped forwards, it would skip the SIGTERM grace.
     private func waitForGroupToEmpty(seconds: TimeInterval) -> Bool {
-        let deadline = Date().addingTimeInterval(seconds)
-        while Date() < deadline {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(seconds))
+        while ContinuousClock.now < deadline {
             if !hasOtherGroupMembers() { return true }
             usleep(20_000)
         }
