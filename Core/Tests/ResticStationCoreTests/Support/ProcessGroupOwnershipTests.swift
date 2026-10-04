@@ -119,12 +119,18 @@ import Musl
         #expect(gone, "a TERM-ignoring descendant was still running when run() returned")
     }
 
+    /// Measured from spawn to `onExit` — the waiter's own dedicated thread —
+    /// rather than around `run()`, whose pipe readers sit on GCD's shared
+    /// queue and were delayed ~9 s on the loaded 3-core macOS CI runner.
+    /// The property is the waiter's: no grace when nothing is left over.
     @Test("a run that leaves no stragglers pays no grace period")
     func noStragglersNoDelay() async throws {
         let started = ContinuousClock.now
-        _ = try await runner.run(["/bin/sh", "-c", "true"], env: nil, currentDirectory: nil,
-                                 onStdoutLine: nil, onStderrLine: nil, timeout: 30)
+        let (process, exited) = try spawnAndWait(["/bin/sh", "-c", "true"])
+        #expect(await wait(exited, seconds: 30))
         #expect(ContinuousClock.now - started < .seconds(OwnedProcess.stragglerGrace))
+        #expect(!process.hasOtherGroupMembers())
+        OwnedProcess.closeAll([process.stdoutRead, process.stderrRead])
     }
 
     @Test("exit status matches Foundation's convention: exit code, or the signal number")
