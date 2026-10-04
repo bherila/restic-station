@@ -3394,7 +3394,10 @@ public final class BackupEngine: Sendable {
     /// directory that cannot be created is now a ``LockAcquireResult/failed``
     /// like any other, carrying the reason (#110).
     private func acquireSetLock(setId: UUID) -> (lock: FileLock, result: LockAcquireResult) {
-        let lock = FileLock(path: paths.setLockFile(setId: setId), trustedRoot: paths.root)
+        // Leased to every subprocess while held, so a set lock outlives a
+        // helper killed mid-run instead of letting the next tick overlap the
+        // surviving restic (#114).
+        let lock = FileLock(path: paths.setLockFile(setId: setId), trustedRoot: paths.root, leaseToChildren: true)
         do {
             try paths.ensureDirectories()
         } catch {
