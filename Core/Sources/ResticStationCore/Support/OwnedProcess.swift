@@ -209,10 +209,19 @@ final class OwnedProcess: @unchecked Sendable {
             break // ECHILD cannot happen for our own unreaped child; reap below regardless
         }
         // The leader is a zombie: its pid, and so the group id, is still
-        // ours. Anything still in the group is a descendant that would
-        // otherwise outlive its run. SIGTERM, not SIGKILL: a run that ended
-        // on its own gets the polite version.
-        signalGroup(SIGTERM)
+        // ours — and stays ours until the reap below. Anything else still in
+        // the group is a descendant that would otherwise outlive its run,
+        // and the caller releases the set lock as soon as `run` returns. So
+        // the stragglers are stopped *before* the reap: SIGTERM, a bounded
+        // grace, then SIGKILL for any that ignored it. A run with no
+        // stragglers (the normal case) skips all of it and pays nothing.
+        if hasOtherGroupMembers() {
+            signalGroup(SIGTERM)
+            if !waitForGroupToEmpty(seconds: Self.stragglerGrace) {
+                signalGroup(SIGKILL)
+                _ = waitForGroupToEmpty(seconds: Self.stragglerGrace)
+            }
+        }
 
         var status: Int32 = 0
         var result: pid_t
@@ -225,6 +234,58 @@ final class OwnedProcess: @unchecked Sendable {
         lock.unlock()
         onExit()
     }
+
+    /// How long stragglers get after SIGTERM, and after SIGKILL, before
+    /// the leader is reaped anyway.
+    static let stragglerGrace: TimeInterval = 5
+
+    private func waitForGroupToEmpty(seconds: TimeInterval) -> Bool {
+        let deadline = Date().addingTimeInterval(seconds)
+        while Date() < deadline {
+            if !hasOtherGroupMembers() { return true }
+            usleep(20_000)
+        }
+        return !hasOtherGroupMembers()
+    }
+
+    /// Whether any live process other than the (zombie) leader is still in
+    /// the group. A zombie straggler has already stopped running and does
+    /// not count. Unknown is answered "yes": the cost of a wrong yes is a
+    /// grace period, of a wrong no a straggler outliving the set lock.
+    func hasOtherGroupMembers() -> Bool {
+        #if canImport(Darwin)
+        var members = [pid_t](repeating: 0, count: 512)
+        let count = proc_listpgrppids(pid, &members, Int32(members.count * MemoryLayout<pid_t>.size))
+        guard count >= 0 else { return true }
+        return members.prefix(Int(count)).contains { member in
+            guard member != 0, member != pid else { return false }
+            return !Self.isZombie(member)
+        }
+        #else
+        guard let entries = try? FileManager.default.contentsOfDirectory(atPath: "/proc") else { return true }
+        for entry in entries {
+            guard let member = pid_t(entry), member != pid,
+                  let stat = try? String(contentsOfFile: "/proc/\(entry)/stat", encoding: .utf8),
+                  let close = stat.lastIndex(of: ")") else { continue }
+            // After "(comm)": state, ppid, pgrp, …
+            let fields = stat[stat.index(after: close)...].split(separator: " ")
+            guard fields.count > 2, let group = pid_t(fields[2]) else { continue }
+            if group == pid && fields[0] != "Z" { return true }
+        }
+        return false
+        #endif
+    }
+
+    #if canImport(Darwin)
+    private static func isZombie(_ member: pid_t) -> Bool {
+        var info = proc_bsdinfo()
+        let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+        guard proc_pidinfo(member, PROC_PIDTBSDINFO, 0, &info, size) == size else {
+            return true // gone (or unreadable): not running
+        }
+        return info.pbi_status == UInt32(SZOMB)
+    }
+    #endif
 
     // MARK: - posix_spawn
 

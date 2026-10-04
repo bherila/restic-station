@@ -100,6 +100,33 @@ import Musl
         #expect(await waitForExit(stray), "a descendant outlived its run inside our process group")
     }
 
+    /// Codex on #168: the caller releases the set lock when `run` returns,
+    /// so a descendant that ignores SIGTERM must be gone by then — SIGKILL
+    /// after a bounded grace — not merely asked once. Its pipes are
+    /// redirected, so the drain bound cannot be what stops it.
+    @Test("a straggler that ignores SIGTERM is killed before the run returns")
+    func termIgnoringStragglerIsKilledBeforeReturn() async throws {
+        let lines = Lines()
+        let result = try await runner.run(
+            ["/bin/sh", "-c", "(trap '' TERM; exec sleep 60) </dev/null >/dev/null 2>&1 & echo $!"],
+            env: nil, currentDirectory: nil,
+            onStdoutLine: { lines.append($0) }, onStderrLine: nil, timeout: 30
+        )
+        #expect(result.exitCode == 0)
+        let straggler = try #require(lines.all.first.flatMap { pid_t($0) })
+        // Immediately, not after polling: the guarantee is "before return".
+        let gone = (kill(straggler, 0) != 0 && errno == ESRCH) || isZombie(straggler)
+        #expect(gone, "a TERM-ignoring descendant was still running when run() returned")
+    }
+
+    @Test("a run that leaves no stragglers pays no grace period")
+    func noStragglersNoDelay() async throws {
+        let started = ContinuousClock.now
+        _ = try await runner.run(["/bin/sh", "-c", "true"], env: nil, currentDirectory: nil,
+                                 onStdoutLine: nil, onStderrLine: nil, timeout: 30)
+        #expect(ContinuousClock.now - started < .seconds(OwnedProcess.stragglerGrace))
+    }
+
     @Test("exit status matches Foundation's convention: exit code, or the signal number")
     func exitStatusConvention() async throws {
         let exited = try await runner.run(["/bin/sh", "-c", "exit 7"], env: nil, currentDirectory: nil,
