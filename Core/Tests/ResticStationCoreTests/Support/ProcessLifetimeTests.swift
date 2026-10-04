@@ -335,16 +335,10 @@ struct ProcessLifetimeTests {
     /// Every other test here uses a child that survives to the deadline, so
     /// this interleaving was untested until a review constructed it.
     ///
-    /// macOS only, and for a sharper reason than the other gate in this file:
-    /// the *precondition* is unreachable on Linux. This needs the child's
-    /// exit to be observed before the deadline, and there a `/bin/sh -c`
-    /// child's termination is not observed at all while a descendant lives
-    /// (#149) — so the deadline fires and the run ends as a bounded
-    /// `.timeout` instead, at 26.97 s against a 20 s deadline. That is the
-    /// runner behaving correctly; it simply is not this scenario. A bound
-    /// loose enough to pass there would be satisfied with the fix reverted,
-    /// which is worse than not running the test.
-    #if canImport(Darwin)
+    /// Runs on every platform since the runner owns its reap (#114). Under
+    /// `Foundation.Process` it was macOS-only: on Linux a `/bin/sh -c`
+    /// child's termination was not observed while a descendant lived (#149),
+    /// so the scenario could not even be set up there.
     @Test("a descendant cannot extend a run whose child already exited", .timeLimit(.minutes(1)))
     func descendantCannotExtendARunWhoseChildExited() async throws {
         let started = Date()
@@ -366,7 +360,6 @@ struct ProcessLifetimeTests {
             "returned after \(elapsed)s; the descendant was waited out, and because the deadline never fired this came back as a late success"
         )
     }
-    #endif
 
     /// The mirror image: the deadline fires and the direct child is stopped,
     /// but a descendant still holds the inherited stdout/stderr write ends.

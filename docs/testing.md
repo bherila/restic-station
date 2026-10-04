@@ -125,22 +125,15 @@ satisfies the bounds on its own — leaving eight children running. A timeout
 test must therefore assert *liveness* too. `deadlineEndsTheChild` does it
 portably, by having the child append to a file on a loop and requiring that
 file to stop growing; a pid probe would not work, since `kill(pid, 0)`
-succeeds against a zombie and a child ended on Linux may not be reaped
-promptly (#149). `descendantCannotExtendARunWhoseChildExited` covers the
+succeeds against a zombie, which an orphan in a CI container (whose PID 1
+does not reap) can stay. `descendantCannotExtendARunWhoseChildExited` covers the
 interleaving every other test structurally cannot reach — the child exits
 *before* the deadline, so no stop sequence runs, and an unbounded drain then
-returns **success** a descendant's lifetime late. It is macOS-gated because
-its *precondition* is unreachable on Linux, not merely its mechanism: there
-a `/bin/sh -c` child's termination is not observed while a descendant lives
-(#149), so the deadline fires and the run ends as a bounded `.timeout`
-instead. A bound loose enough to pass on Linux would also pass with the fix
-reverted, which is worse than not running the test there.
-
-One thing the Linux runs did settle: `deadlineEndsTheChild` passes there. So
-SIGKILL genuinely reaches and ends the child on Linux — it is only the
-*observation* of that death that does not arrive, which narrows #149 from
-"the signal may not be landing" to "the signal lands and corelibs does not
-report it".
+returns **success** a descendant's lifetime late. It runs on every
+platform since the runner owns its reap (#114); under `Foundation.Process`
+it was macOS-only, because on Linux a `/bin/sh -c` child's termination was
+not observed while a descendant lived (#149) and the scenario could not be
+set up.
 
 ### Fixture conventions
 `Core/Tests/ResticStationCoreTests/Fixtures/` — restic output fixtures are copied verbatim from `docs/fixtures/` (captured from restic 0.18.1; see restic-cli.md). Load via `Bundle.module` (declare `resources: [.copy("Fixtures")]` in Package.swift). Every parser has a test decoding its fixture; NDJSON parsers additionally get a partial-line-buffering test (feed the fixture in random-sized chunks, expect identical parse) and an unknown-`message_type` tolerance test.
