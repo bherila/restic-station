@@ -23,6 +23,8 @@ final class FakeSecretStore: SecretStore, @unchecked Sendable {
     private var _secretEnvs: [UUID: [String: String]] = [:]
     private var _failingPasswords: [UUID: SecretStoreError] = [:]
     private var _failingSecretEnvs: [UUID: SecretStoreError] = [:]
+    private var _secretEnvReads: [UUID: Int] = [:]
+    private var _failingSecretEnvsAfter: [UUID: (reads: Int, error: SecretStoreError)] = [:]
     private let defaultPassword: String?
     private let onPasswordRead: (@Sendable (UUID) -> Void)?
 
@@ -73,6 +75,13 @@ final class FakeSecretStore: SecretStore, @unchecked Sendable {
         withLock { _failingSecretEnvs[destId] = error }
     }
 
+    /// Lets the first `reads` secret-environment reads of `destId` succeed
+    /// and fails every later one — a store changed *between* the engine's
+    /// pre-flight and the runner's own read just before the spawn (#152).
+    func failSecretEnv(for destId: UUID, afterReads reads: Int, with error: SecretStoreError) {
+        withLock { _failingSecretEnvsAfter[destId] = (reads, error) }
+    }
+
     /// Clears every injected failure, as if the user had repaired the store.
     func clearFailures() {
         withLock {
@@ -116,6 +125,11 @@ final class FakeSecretStore: SecretStore, @unchecked Sendable {
         let outcome: Result<[String: String], SecretStoreError> = withLock {
             if let failure = _failingSecretEnvs[destId] {
                 return .failure(failure)
+            }
+            let reads = (_secretEnvReads[destId] ?? 0) + 1
+            _secretEnvReads[destId] = reads
+            if let after = _failingSecretEnvsAfter[destId], reads > after.reads {
+                return .failure(after.error)
             }
             return .success(_secretEnvs[destId] ?? [:])
         }

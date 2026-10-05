@@ -1281,6 +1281,12 @@ public final class BackupEngine: Sendable {
                 return .skipped(.previewUnavailable)
             case .storeUnusable(let detail):
                 return .failed(.infrastructure("preview-token store unusable — \(detail)"))
+            case .secret(.attention(let attention, _), let message):
+                // Seen after the pre-flight passed (#152): published as the
+                // pre-flight would have, never as a restic failure.
+                return .skipped(.secretRefused(attention, message))
+            case .secret(.secretUnavailable, _):
+                return .skipped(.secretUnavailable)
             case .reason, .none:
                 break
             }
@@ -1338,6 +1344,11 @@ public final class BackupEngine: Sendable {
                     // `ResticExitClass` case must choose a lane here.
                     return .failed(.restic(outcome.status))
                 }
+            case .didNotRun(_, .secret(.attention(let attention, _), let message), _):
+                // Seen after the pre-flight passed (#152).
+                return .skipped(.secretRefused(attention, message))
+            case .didNotRun(_, .secret(.secretUnavailable, _), _):
+                return .skipped(.secretUnavailable)
             case .didNotRun:
                 return .failed(.didNotRun)
             }
@@ -1389,6 +1400,11 @@ public final class BackupEngine: Sendable {
             return .skipped(.previewUnavailable)
         case .storeUnusable(let detail):
             return .failed(.infrastructure("preview-token store unusable — \(detail)"))
+        case .secret(.attention(let attention, _), let message):
+            // Seen after the pre-flight passed (#152).
+            return .skipped(.secretRefused(attention, message))
+        case .secret(.secretUnavailable, _):
+            return .skipped(.secretUnavailable)
         case .reason, .none:
             break
         }
@@ -1523,6 +1539,14 @@ public final class BackupEngine: Sendable {
                     expectedExecutableIdentity: executable.identity
                 )
             )
+        } catch let error as ResticRunnerError where error.preflightEquivalent != nil {
+            // A secret or hydration problem seen after the pre-flight (#152)
+            // gets the pre-flight's status, not `.failed`, which publishes
+            // `restic_failed` for a restic that never ran.
+            if let equivalent = error.preflightEquivalent {
+                recordPostPreflight(equivalent, message: error.userFacingMessage)
+            }
+            return Self.purgePlanResult(for: error, plan: emptyPlan)
         } catch {
             return PurgePlanResult(plan: emptyPlan, status: .failed, message: "could not list snapshots: \(error)")
         }
@@ -1579,6 +1603,14 @@ public final class BackupEngine: Sendable {
                     expectedExecutableIdentity: executable.identity
                 )
             )
+        } catch let error as ResticRunnerError where error.preflightEquivalent != nil {
+            // A secret or hydration problem seen after the pre-flight (#152)
+            // gets the pre-flight's status, not `.failed`, which publishes
+            // `restic_failed` for a restic that never ran.
+            if let equivalent = error.preflightEquivalent {
+                recordPostPreflight(equivalent, message: error.userFacingMessage)
+            }
+            return Self.purgePlanResult(for: error, plan: plan)
         } catch {
             return PurgePlanResult(plan: plan, status: .failed, message: "could not preview rewrite: \(error)")
         }
@@ -1922,7 +1954,9 @@ public final class BackupEngine: Sendable {
             do {
                 destinationSecretEnv = try await restic.maintenanceSecretEnvironment(for: destination)
             } catch {
-                throw PurgeApplyError.unavailable
+                // The maintenance environment read is the post-pre-flight
+                // read #152 is about: a refusal here keeps its code.
+                throw Self.purgeApplyError(for: error)
             }
             let current = try await currentPurgePlan(
                 set: set,
@@ -2065,6 +2099,16 @@ public final class BackupEngine: Sendable {
                 // twice is harmless because the second exact-match attempt
                 // fails closed once `usedAt` is already nil.
                 restorePurgeToken()
+                // A secret problem seen after the pre-flight is refused the
+                // way the pre-flight refuses it (#152).
+                if case .secret(let equivalent, let message) = purge.preflightFailure {
+                    switch equivalent {
+                    case .attention(let attention, let destinationId):
+                        throw PurgeApplyError.secretRefused(attention, destinationId: destinationId, message)
+                    case .secretUnavailable:
+                        throw PurgeApplyError.unavailable
+                    }
+                }
                 throw PurgeApplyError.infrastructureFailure(
                     reason: purge.preflightFailure?.message
                         ?? "the first purge process could not be launched",
@@ -2169,7 +2213,8 @@ public final class BackupEngine: Sendable {
                 )
             )
         } catch {
-            throw PurgeApplyError.unavailable
+            // A secret refusal seen after the pre-flight keeps its code (#152).
+            throw Self.purgeApplyError(for: error)
         }
         guard outcome.status == .success else {
             throw PurgeApplyError.unavailable
@@ -2219,7 +2264,8 @@ public final class BackupEngine: Sendable {
                 )
             )
         } catch {
-            throw PurgeApplyError.unavailable
+            // A secret refusal seen after the pre-flight keeps its code (#152).
+            throw Self.purgeApplyError(for: error)
         }
         guard outcome.status == .success else {
             throw PurgeApplyError.unavailable
@@ -2258,7 +2304,8 @@ public final class BackupEngine: Sendable {
                 )
             )
         } catch {
-            throw PurgeApplyError.unavailable
+            // A secret refusal seen after the pre-flight keeps its code (#152).
+            throw Self.purgeApplyError(for: error)
         }
         guard outcome.status == .success else {
             throw PurgeApplyError.unavailable
@@ -2554,7 +2601,8 @@ public final class BackupEngine: Sendable {
         do {
             destinationSecretEnv = try await restic.maintenanceSecretEnvironment(for: destination)
         } catch {
-            throw PurgeApplyError.unavailable
+            // Post-pre-flight read (#152): a refusal keeps its code.
+            throw Self.purgeApplyError(for: error)
         }
         let current = try await currentPurgePlan(
             set: set,
@@ -2657,6 +2705,7 @@ public final class BackupEngine: Sendable {
         if let reason = restore.infrastructureFailureReason {
             return .infrastructureFailure(reason: reason, operationMayHaveRun: true)
         }
+        if let refused = Self.manualSecretOutcome(restore.preflightFailure) { return refused }
         return .completed(restore.child.status)
     }
 
@@ -2731,6 +2780,7 @@ public final class BackupEngine: Sendable {
         if let reason = initRun.infrastructureFailureReason {
             return .infrastructureFailure(reason: reason, operationMayHaveRun: true)
         }
+        if let refused = Self.manualSecretOutcome(initRun.preflightFailure) { return refused }
         return .completed(initRun.child.status)
     }
 
@@ -2839,10 +2889,15 @@ public final class BackupEngine: Sendable {
         case previewExpired
         case previewUnavailable
         case storeUnusable(String)
+        /// A secret or hydration failure observed after the pre-flight
+        /// (#152): carried typed so every caller publishes what the
+        /// pre-flight itself would have.
+        case secret(ResticRunnerError.PreflightEquivalent, message: String)
 
         var message: String {
             switch self {
             case .reason(let reason): return reason
+            case .secret(_, let message): return message
             case .previewChanged:
                 return "Destination configuration changed after the reclaim preview. Run a new dry run before pruning."
             case .previewExpired:
@@ -3279,6 +3334,13 @@ public final class BackupEngine: Sendable {
             return .didNotRun(reason: failure.message, preflightFailure: failure)
         } catch let error as ResticRunnerError {
             logWriter?.appendLine("restic did not run: \(error.description)")
+            if let equivalent = error.preflightEquivalent {
+                recordPostPreflight(equivalent, message: error.userFacingMessage)
+                return .didNotRun(
+                    reason: error.userFacingMessage,
+                    preflightFailure: .secret(equivalent, message: error.userFacingMessage)
+                )
+            }
             return .didNotRun(
                 reason: error.userFacingMessage,
                 operationMayHaveRun: error == .timedOut
@@ -3321,6 +3383,13 @@ public final class BackupEngine: Sendable {
             return .didNotRun(reason: failure.message, preflightFailure: failure)
         } catch let error as ResticRunnerError {
             logWriter?.appendLine("remote maintenance did not run: \(error.description)")
+            if let equivalent = error.preflightEquivalent {
+                recordPostPreflight(equivalent, message: error.userFacingMessage)
+                return .didNotRun(
+                    reason: error.userFacingMessage,
+                    preflightFailure: .secret(equivalent, message: error.userFacingMessage)
+                )
+            }
             return .didNotRun(
                 reason: error.userFacingMessage,
                 operationMayHaveRun: error == .timedOut
@@ -3792,6 +3861,60 @@ public final class BackupEngine: Sendable {
             ))
         } catch {
             logWarning("BackupEngine: could not record the secret problem for \"\(destination.label)\": \(error)")
+        }
+    }
+
+    /// A purge-apply query failure: a secret refusal keeps the code the
+    /// pre-flight would have published; anything else stays the
+    /// cause-neutral, retryable `unavailable` (#152).
+    private static func purgeApplyError(for error: any Error) -> PurgeApplyError {
+        if let runnerError = error as? ResticRunnerError,
+           case .attention(let attention, let destinationId) = runnerError.preflightEquivalent {
+            return .secretRefused(attention, destinationId: destinationId, runnerError.userFacingMessage)
+        }
+        return .unavailable
+    }
+
+    private static func purgePlanResult(for error: ResticRunnerError, plan: PurgePlan) -> PurgePlanResult {
+        let message = error.userFacingMessage
+        switch error.preflightEquivalent {
+        case .attention(.secretNotConfigured, _):
+            return PurgePlanResult(plan: plan, status: .secretNotConfigured, message: message)
+        case .attention(.secretStoreUnusable, _):
+            return PurgePlanResult(plan: plan, status: .secretStoreUnusable, message: message)
+        case .attention(.cloudRepositoryNotHydrated, _):
+            return PurgePlanResult(plan: plan, status: .cloudRepositoryNotHydrated, message: message)
+        case .secretUnavailable, nil:
+            return PurgePlanResult(plan: plan, status: .failed, message: "secret store unavailable")
+        }
+    }
+
+    /// A secret problem seen after the pre-flight is the same fact about
+    /// the destination, so it updates `state/secret-attention` the same way
+    /// (#152). Transient failures, like the pre-flight's, record nothing.
+    private func recordPostPreflight(_ equivalent: ResticRunnerError.PreflightEquivalent, message: String) {
+        guard case .attention(let attention, let destinationId) = equivalent,
+              attention != .cloudRepositoryNotHydrated,
+              let (set, _) = locate(destId: destinationId) else { return }
+        do {
+            try stateStore.recordSecretAttention(SecretAttentionRecord(
+                destId: destinationId, setId: set.id, attention: attention, detail: message, detectedAt: now()
+            ))
+        } catch {
+            logWarning("BackupEngine: could not record the secret problem for destination \(destinationId): \(error)")
+        }
+    }
+
+    /// The manual outcome for a child whose restic never ran because of a
+    /// secret problem seen after the pre-flight — the same answer the
+    /// pre-flight would have given (#152).
+    private static func manualSecretOutcome(_ failure: PreflightFailure?) -> ManualRunOutcome? {
+        guard case .secret(let equivalent, let message) = failure else { return nil }
+        switch equivalent {
+        case .attention(let attention, let destinationId):
+            return .secretRefused(attention: attention, destinationId: destinationId, detail: message)
+        case .secretUnavailable:
+            return .skipped
         }
     }
 

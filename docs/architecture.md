@@ -156,11 +156,7 @@ one — `itemNotFound` or `storeUnusable`, which includes an unparseable
   `ManualRunOutcome.secretRefused`, which the helper reports with the
   repair instead of "try again".
 
-**One known gap, tracked rather than hidden.** The pre-flight is not atomic
-with the reads that follow it, so a `secret rm` or `chmod` in the window
-between it and the restic spawn is still published as retryable by the
-later generic catches (#152) — the evidence-binding rule in `AGENTS.md`,
-applied to secrets.
+**After the pre-flight, too (#152).** The pre-flight is not atomic with the reads that follow it — the maintenance environment, the runner's own pre-flight and environment assembly — so a `secret rm` or a `chmod` can land in between. Those reads throw typed `ResticRunnerError`s, and `ResticRunnerError.preflightEquivalent` (exhaustive, no `default:`) maps each one to what the pre-flight would have published. Every consumer carries that through instead of a generic failure: manual restore and init-secondary return `secretRefused`, prune publishes the same skip reason as its pre-flight, purge apply throws `secretRefused` rather than retryable `unavailable`, purge preview reports the secret status rather than `restic_failed`, and the secret-attention state is updated as the pre-flight would. Transient failures stay retryable.
 
 restic exit code mapping (verified against restic 0.18.1 — see `restic-cli.md`): `0` success, `1` fatal, `2` Go runtime error, `3` backup incomplete-read warning, `10` repository does not exist, `11` repository locked, `12` wrong password. Exit 11 on a *scheduled* run: attempt `restic unlock` once (removes only stale locks of dead processes), retry the operation once, then fail terminal if still locked.
 
