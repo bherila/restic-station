@@ -130,7 +130,7 @@ never match on it. `details` is omitted entirely when empty.
 | `preview_expired` | no | 1 | A destructive preview token has expired. Run a fresh preview; the old token can never be applied. |
 | `operation_not_allowed` | no | 1 | Refused by a safety invariant — `forget` with an empty retention policy, `prune` on a mirror behind its primary (`architecture.md` §Invariants). |
 | `operation_completed_audit_failed` | no | 1 | A destructive launch crossed its audit boundary, but complete terminal metadata plus its index projection could not be proven. Inspect repository state and reconcile run history; never retry the destructive request automatically. |
-| `internal_error` | no | 1 | An unexpected or structurally unrecoverable local failure, including an unusable process-control lock. Bounded; never a serialized object description. |
+| `internal_error` | no | 1 | An unexpected or structurally unrecoverable local failure, including an unusable process-control lock. Also restic exiting 0 when its output, which the command needed, was cut because a descendant kept writing past the drain bound (`resticExitCode: 0`, `architecture.md` §Process model, #150). Bounded; never a serialized object description. |
 
 ### `retryable`
 

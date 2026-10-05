@@ -31,6 +31,13 @@ public enum ResticErrorCategory: String, Equatable, Sendable {
 /// | other | ``other(_:)`` |
 public enum ResticExitClass: Equatable, Sendable {
     case success
+    /// Exit 0, but restic's output was not read to the end (#150): a
+    /// descendant held a pipe past the bounded drain after restic exited,
+    /// or a read failed. The exit code is real, but the transcript is only
+    /// a prefix and cannot vouch for the run. Never equal to `.success`, so
+    /// every check written as `status == .success` treats it as not
+    /// succeeded; a run record reports it as a warning.
+    case successUnverified
     /// Exit 3: backup finished but some source files could not be read. The
     /// snapshot exists, so mirroring and retention still run.
     case warningIncompleteRead
@@ -84,7 +91,7 @@ public enum ResticExitClass: Equatable, Sendable {
         switch self {
         case .success:
             return .success
-        case .warningIncompleteRead:
+        case .warningIncompleteRead, .successUnverified:
             return .warning
         case .fatal, .repoDoesNotExist, .wrongPassword:
             return .terminal
@@ -115,6 +122,9 @@ public enum ResticExitClass: Equatable, Sendable {
         case .warningIncompleteRead:
             return "Some files could not be read and are missing from this snapshot; "
                 + "everything else was backed up. Open the run log to see which files were skipped."
+        case .successUnverified:
+            return "restic reported success, but its output was cut off, so the result could not be verified. "
+                + "Open the run log, and run it again if anything looks incomplete."
         case .fatal(let stderrSummary):
             let trimmed = stderrSummary.trimmingCharacters(in: CharacterSet(charactersIn: ". \n"))
             let detail = trimmed.isEmpty ? "restic reported a fatal error" : trimmed

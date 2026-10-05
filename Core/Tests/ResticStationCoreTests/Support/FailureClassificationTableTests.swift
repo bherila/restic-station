@@ -205,6 +205,8 @@ struct ResticExitClassTableTests {
             return (.internalError, nil, .success)
         case .warningIncompleteRead:
             return (.internalError, nil, .warning)
+        case .successUnverified:
+            return (.internalError, 0, .warning)
         case .fatal:
             return (.resticFailed, 1, .terminal)
         case .repoDoesNotExist:
@@ -221,6 +223,7 @@ struct ResticExitClassTableTests {
     private static let cases: [ResticExitClass] = [
         .success,
         .warningIncompleteRead,
+        .successUnverified,
         .fatal(stderrSummary: "repository is damaged"),
         .repoDoesNotExist,
         .repoLocked,

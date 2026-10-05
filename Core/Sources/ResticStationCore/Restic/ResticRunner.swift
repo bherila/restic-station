@@ -327,7 +327,7 @@ public final class ResticRunner: Sendable {
         }
         let stdout = String(decoding: result.stdout, as: UTF8.self)
         let stderr = String(decoding: result.stderr, as: UTF8.self)
-        return ResticOutcome(exitCode: result.exitCode, status: Self.status(exitCode: result.exitCode, messages: collector.messages, stderr: stderr), messages: collector.messages, rawOutput: stdout + stderr)
+        return ResticOutcome(exitCode: result.exitCode, status: Self.status(exitCode: result.exitCode, messages: collector.messages, stderr: stderr, outputComplete: result.outputComplete), messages: collector.messages, rawOutput: stdout + stderr)
     }
 
     public func verifyRemoteMaintenance(_ command: RemoteResticCommand) async throws -> VersionInfo {
@@ -585,7 +585,12 @@ public final class ResticRunner: Sendable {
         let stderrText = String(decoding: result.stderr, as: UTF8.self)
         return ResticOutcome(
             exitCode: result.exitCode,
-            status: Self.status(exitCode: result.exitCode, messages: messages, stderr: stderrText),
+            status: Self.status(
+                exitCode: result.exitCode,
+                messages: messages,
+                stderr: stderrText,
+                outputComplete: result.outputComplete
+            ),
             messages: messages,
             rawOutput: stdoutText + stderrText
         )
@@ -621,9 +626,18 @@ public final class ResticRunner: Sendable {
     /// precise one — the process exit status is sometimes the generic 1 — so
     /// when the run failed and an `exit_error` was streamed, the message's
     /// code and text drive the classification.
-    static func status(exitCode: Int32, messages: [ResticMessage], stderr: String) -> ResticExitClass {
+    ///
+    /// An exit 0 whose output was not read to the end is
+    /// ``ResticExitClass/successUnverified``, never `.success` (#150): the
+    /// exit code is real, but what restic said about the run was cut.
+    static func status(
+        exitCode: Int32,
+        messages: [ResticMessage],
+        stderr: String,
+        outputComplete: Bool = true
+    ) -> ResticExitClass {
         guard exitCode != 0 else {
-            return .success
+            return outputComplete ? .success : .successUnverified
         }
         let exitErrors = messages.compactMap { message -> (code: Int, message: String)? in
             guard case .exitError(let code, let text) = message else { return nil }
