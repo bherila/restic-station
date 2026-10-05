@@ -1256,6 +1256,17 @@ public final class BackupEngine: Sendable {
                 do {
                     let outcome = try await restic.runRemoteMaintenance(remote, destination: destination)
                     return outcome.status == .success ? .completed(.success) : .failed(.restic(outcome.status))
+                } catch let error as ResticRunnerError where error.preflightEquivalent != nil {
+                    // The password read inside runRemoteMaintenance is after
+                    // the pre-flight (#152): same code it would publish.
+                    let equivalent = error.preflightEquivalent!
+                    recordPostPreflight(equivalent, message: error.userFacingMessage)
+                    switch equivalent {
+                    case .attention(let attention, _):
+                        return .skipped(.secretRefused(attention, error.userFacingMessage))
+                    case .secretUnavailable:
+                        return .skipped(.secretUnavailable)
+                    }
                 } catch {
                     return .failed(.didNotRun)
                 }

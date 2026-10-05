@@ -386,4 +386,34 @@ import Testing
         #expect(result.status == .secretUnavailable, "got \(result.status)")
     }
 
+    @Test("remote prune dry run: a refusal of the password after the pre-flight keeps its code")
+    func remotePruneDryRunAfterPreflight() async throws {
+        let env = T.makeEnv(script: [], retention: nil)
+        defer { env.cleanUp() }
+        // The remote restic's version check must pass for the dry run to
+        // reach its own password read.
+        env.fake.script = [
+            .init(
+                argvPrefix: RemoteResticCommand.version(sshTarget: "backup@example", resticPath: "/opt/restic").argv,
+                stdoutLines: ["{\"version\":\"0.18.1\"}"]
+            ),
+        ] + Self.anything
+        var destination = env.primary
+        destination.repoURL = "sftp:backup@example:/srv/repo"
+        destination.remoteMaintenance = RemoteMaintenance(enabled: true, remoteResticPath: "/opt/restic")
+        var set = env.set
+        set.destinations[0] = destination
+        // The engine pre-flight reads the password once; the remote command's
+        // own read is the next.
+        env.secrets.failPassword(for: T.primaryId, afterReads: 1, with: .itemNotFound)
+
+        let result = await env.engine.runPruneRepository(set: set, destination: destination, dryRun: true)
+
+        guard case .skipped(.secretRefused(let attention, _)) = result else {
+            Issue.record("expected .skipped(.secretRefused), got \(result)")
+            return
+        }
+        #expect(attention == .secretNotConfigured)
+    }
+
 }
