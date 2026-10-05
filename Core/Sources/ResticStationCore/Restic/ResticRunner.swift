@@ -20,8 +20,10 @@ public struct ResticInvocation: Sendable {
     /// The runner rechecks it immediately before the child is spawned.
     public let expectedExecutableIdentity: String?
     /// Whether restic may download online-only files by reading them (#156).
-    /// Only a backup of a set whose `onlineOnlyFiles` is `.download` asks
-    /// for it. Every other restic process reads only repositories and the
+    /// Only a backup of a set whose `onlineOnlyFiles` is `.download`, and
+    /// whose primary repository is not itself in cloud storage, asks for it
+    /// (`BackupEngine.backupDownloadsOnlineOnlyFiles`), because the policy
+    /// covers the repository reads too. Every other restic process reads only repositories and the
     /// restore target, and a repository's online-only files are never
     /// downloaded implicitly. So by default the kernel refuses such a read
     /// for the child's whole life, including a file evicted after the

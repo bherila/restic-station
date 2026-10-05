@@ -381,7 +381,10 @@ public final class BackupEngine: Sendable {
             versionBoundIdentity = nil
         } else if set.onlineOnlyFiles == .download {
             excludeCloudFiles = false
-            cloudSourceNote = "cloud-synced source: online-only files are downloaded (set policy)"
+            cloudSourceNote = Self.backupDownloadsOnlineOnlyFiles(set: set, primary: primary)
+                ? "cloud-synced source: online-only files are downloaded (set policy)"
+                : "cloud-synced source: online-only files are not downloaded, despite the set policy — "
+                    + "the repository is in cloud storage too, and its files are never downloaded implicitly"
             versionBoundIdentity = nil
         } else {
             let bound = await restic.boundResticVersion()
@@ -424,7 +427,7 @@ public final class BackupEngine: Sendable {
                 expectedExecutableIdentity: versionBoundIdentity,
                 // The only restic process allowed to download online-only
                 // files (#156); every other one is refused them by the kernel.
-                downloadsOnlineOnlyFiles: set.onlineOnlyFiles == .download
+                downloadsOnlineOnlyFiles: Self.backupDownloadsOnlineOnlyFiles(set: set, primary: primary)
             ),
             streamProgress: true,
             preflightPhase: "probing",
@@ -4083,6 +4086,22 @@ public final class BackupEngine: Sendable {
         case .secretUnavailable:
             return .retryable(reason: message)
         }
+    }
+
+    /// Whether `set`'s backup may download online-only files (#156): only
+    /// when the set asks for it, and only when the primary repository is not
+    /// in cloud storage itself. The policy covers the whole restic process,
+    /// repository reads included, so a repository pack evicted mid-backup
+    /// would be downloaded too. Repository safety wins over source
+    /// completeness; the run log says so.
+    static func backupDownloadsOnlineOnlyFiles(
+        set: BackupSet,
+        primary: Destination,
+        homeDirectory: String = NSHomeDirectory()
+    ) -> Bool {
+        guard set.onlineOnlyFiles == .download else { return false }
+        return !(primary.kind == .localPath
+            && CloudStorageSafety.isCloudSyncedPath(primary.repoURL, homeDirectory: homeDirectory))
     }
 
     /// The prune skip for a child whose restic never ran because of a
