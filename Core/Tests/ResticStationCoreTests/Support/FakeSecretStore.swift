@@ -24,6 +24,8 @@ final class FakeSecretStore: SecretStore, @unchecked Sendable {
     private var _failingPasswords: [UUID: SecretStoreError] = [:]
     private var _failingSecretEnvs: [UUID: SecretStoreError] = [:]
     private var _secretEnvReads: [UUID: Int] = [:]
+    private var _passwordReads: [UUID: Int] = [:]
+    private var _failingPasswordsAfter: [UUID: (reads: Int, error: SecretStoreError)] = [:]
     private var _failingSecretEnvsAfter: [UUID: (reads: Int, error: SecretStoreError)] = [:]
     private let defaultPassword: String?
     private let onPasswordRead: (@Sendable (UUID) -> Void)?
@@ -82,11 +84,21 @@ final class FakeSecretStore: SecretStore, @unchecked Sendable {
         withLock { _failingSecretEnvsAfter[destId] = (reads, error) }
     }
 
+    /// Lets the first `reads` password reads of `destId` succeed and fails
+    /// every later one (#152).
+    func failPassword(for destId: UUID, afterReads reads: Int, with error: SecretStoreError) {
+        withLock { _failingPasswordsAfter[destId] = (reads, error) }
+    }
+
     /// Clears every injected failure, as if the user had repaired the store.
     func clearFailures() {
         withLock {
             _failingPasswords.removeAll()
             _failingSecretEnvs.removeAll()
+            _failingSecretEnvsAfter.removeAll()
+            _secretEnvReads.removeAll()
+            _failingPasswordsAfter.removeAll()
+            _passwordReads.removeAll()
         }
     }
 
@@ -101,6 +113,11 @@ final class FakeSecretStore: SecretStore, @unchecked Sendable {
         let outcome: Result<String, SecretStoreError> = withLock {
             if let failure = _failingPasswords[destId] {
                 return .failure(failure)
+            }
+            let reads = (_passwordReads[destId] ?? 0) + 1
+            _passwordReads[destId] = reads
+            if let after = _failingPasswordsAfter[destId], reads > after.reads {
+                return .failure(after.error)
             }
             if let stored = _passwords[destId] {
                 return .success(stored)
