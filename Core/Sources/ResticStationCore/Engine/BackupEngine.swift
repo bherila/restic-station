@@ -1956,7 +1956,7 @@ public final class BackupEngine: Sendable {
             } catch {
                 // The maintenance environment read is the post-pre-flight
                 // read #152 is about: a refusal here keeps its code.
-                throw Self.purgeApplyError(for: error)
+                throw purgeApplyError(for: error)
             }
             let current = try await currentPurgePlan(
                 set: set,
@@ -2214,7 +2214,7 @@ public final class BackupEngine: Sendable {
             )
         } catch {
             // A secret refusal seen after the pre-flight keeps its code (#152).
-            throw Self.purgeApplyError(for: error)
+            throw purgeApplyError(for: error)
         }
         guard outcome.status == .success else {
             throw PurgeApplyError.unavailable
@@ -2265,7 +2265,7 @@ public final class BackupEngine: Sendable {
             )
         } catch {
             // A secret refusal seen after the pre-flight keeps its code (#152).
-            throw Self.purgeApplyError(for: error)
+            throw purgeApplyError(for: error)
         }
         guard outcome.status == .success else {
             throw PurgeApplyError.unavailable
@@ -2305,7 +2305,7 @@ public final class BackupEngine: Sendable {
             )
         } catch {
             // A secret refusal seen after the pre-flight keeps its code (#152).
-            throw Self.purgeApplyError(for: error)
+            throw purgeApplyError(for: error)
         }
         guard outcome.status == .success else {
             throw PurgeApplyError.unavailable
@@ -2602,7 +2602,7 @@ public final class BackupEngine: Sendable {
             destinationSecretEnv = try await restic.maintenanceSecretEnvironment(for: destination)
         } catch {
             // Post-pre-flight read (#152): a refusal keeps its code.
-            throw Self.purgeApplyError(for: error)
+            throw purgeApplyError(for: error)
         }
         let current = try await currentPurgePlan(
             set: set,
@@ -3867,10 +3867,15 @@ public final class BackupEngine: Sendable {
     /// A purge-apply query failure: a secret refusal keeps the code the
     /// pre-flight would have published; anything else stays the
     /// cause-neutral, retryable `unavailable` (#152).
-    private static func purgeApplyError(for error: any Error) -> PurgeApplyError {
+    private func purgeApplyError(for error: any Error) -> PurgeApplyError {
         if let runnerError = error as? ResticRunnerError,
-           case .attention(let attention, let destinationId) = runnerError.preflightEquivalent {
-            return .secretRefused(attention, destinationId: destinationId, runnerError.userFacingMessage)
+           let equivalent = runnerError.preflightEquivalent {
+            // The same fact about the destination the pre-flight would have
+            // recorded — it has just cleared any earlier record (#152).
+            recordPostPreflight(equivalent, message: runnerError.userFacingMessage)
+            if case .attention(let attention, let destinationId) = equivalent {
+                return .secretRefused(attention, destinationId: destinationId, runnerError.userFacingMessage)
+            }
         }
         return .unavailable
     }

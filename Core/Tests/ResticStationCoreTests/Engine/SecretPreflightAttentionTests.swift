@@ -340,5 +340,8 @@ import Testing
             #expect(destinationId == T.primaryId)
         }
         #expect(!env.resticArgvs.contains { $0.contains("rewrite") })
+        // Codex on #169: the pre-flight cleared any earlier record, so the
+        // refusal must leave one behind for health and status.
+        #expect(env.stateStore.readSecretAttention(destId: T.primaryId)?.attention == .secretStoreUnusable)
     }
 }
