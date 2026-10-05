@@ -201,7 +201,8 @@ struct PurgePreview: AsyncParsableCommand, JSONRenderable {
         case .secretStoreUnusable:
             throw Self.attentionFailure(.secretStoreUnusable, result: result, setId: setId, destination: destination)
         case .cloudRepositoryNotHydrated:
-            throw Self.attentionFailure(.cloudRepositoryNotHydrated, result: result, setId: setId, destination: destination)        case .secretUnavailable:
+            throw Self.attentionFailure(.cloudRepositoryNotHydrated, result: result, setId: setId, destination: destination)
+        case .secretUnavailable:
             // Restic never ran and a retry may succeed (#152).
             throw CLIFailure(
                 code: .secretUnavailable,
