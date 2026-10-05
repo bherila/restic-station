@@ -2143,6 +2143,20 @@ public final class BackupEngine: Sendable {
                 )
             }
             children.append(purge.child)
+            // A later destination whose restic never ran because its secret
+            // changed after the pre-flight (#152). Earlier destinations may
+            // already be rewritten, so the refusal says so; a fresh preview
+            // is needed either way, since the token is spent.
+            if purge.outcome == nil, case .secret(let equivalent, let message) = purge.preflightFailure {
+                let earlier = "Earlier destinations in this purge were already rewritten; "
+                    + "preview again after fixing this one."
+                switch equivalent {
+                case .attention(let attention, let destinationId):
+                    throw PurgeApplyError.secretRefused(attention, destinationId: destinationId, "\(message) \(earlier)")
+                case .secretUnavailable:
+                    throw PurgeApplyError.infrastructureFailure(reason: "\(message) \(earlier)", operationMayHaveRun: true)
+                }
+            }
             if let failure = purge.infrastructureFailure {
                 if let runId = failure.auditRunId {
                     throw PurgeApplyError.auditFailure(
