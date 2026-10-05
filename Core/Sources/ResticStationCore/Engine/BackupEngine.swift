@@ -1379,8 +1379,13 @@ public final class BackupEngine: Sendable {
                 switch outcome.status {
                 case .success:
                     return .completed(.success)
-                case .warningIncompleteRead, .successUnverified:
+                case .warningIncompleteRead:
                     return .completed(.warning)
+                case .successUnverified:
+                    // A preview is its transcript, and the helper mints the
+                    // destructive confirmation from any completed dry run.
+                    // A cut one must not authorize anything (#150).
+                    return .failed(.restic(outcome.status))
                 case .fatal, .repoDoesNotExist, .repoLocked, .wrongPassword, .other:
                     // Every failing exit class keeps its own identity in the
                     // typed result; enumerated (no `default`) so a new

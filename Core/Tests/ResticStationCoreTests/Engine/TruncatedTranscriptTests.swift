@@ -95,4 +95,19 @@ import Testing
         #expect(metadata.auditFailureReason == .repositoryOutcomeUnknown)
         #expect(metadata.purgeSnapshotRewrites == nil, "a cut transcript must not record a rewrite mapping")
     }
+
+    /// Codex on #175: the helper issues the prune confirmation from any
+    /// completed dry run, so a cut preview must not complete.
+    @Test("a prune preview whose transcript was cut fails, so it can authorize nothing")
+    func prunePreviewFails() async throws {
+        let env = T.makeEnv(script: [], retention: nil, reachableSecondaries: [])
+        defer { env.cleanUp() }
+        env.fake.script = [
+            .init(argvPrefix: [env.resticPath, "-r", env.primary.repoURL, "prune", "--dry-run"], outputComplete: false),
+        ]
+
+        let result = await env.engine.runPruneRepository(set: env.set, destination: env.primary, dryRun: true)
+
+        #expect(result == .failed(.restic(.successUnverified)), "got \(result)")
+    }
 }
