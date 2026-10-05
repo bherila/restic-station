@@ -27,6 +27,9 @@ final class FakeSecretStore: SecretStore, @unchecked Sendable {
     private var _passwordReads: [UUID: Int] = [:]
     private var _failingPasswordsAfter: [UUID: (reads: Int, error: SecretStoreError)] = [:]
     private var _failingSecretEnvsAfter: [UUID: (reads: Int, error: SecretStoreError)] = [:]
+    /// Password and environment reads together, for ``failReads(for:afterReads:with:onFailure:)``.
+    private var _reads: [UUID: Int] = [:]
+    private var _failingReadsAfter: [UUID: (reads: Int, error: SecretStoreError, onFailure: (@Sendable () -> Void)?)] = [:]
     private let defaultPassword: String?
     private let onPasswordRead: (@Sendable (UUID) -> Void)?
 
@@ -90,6 +93,26 @@ final class FakeSecretStore: SecretStore, @unchecked Sendable {
         withLock { _failingPasswordsAfter[destId] = (reads, error) }
     }
 
+    /// Lets the first `reads` reads of `destId` — password and environment
+    /// counted together — succeed, and fails every later one. `onFailure`
+    /// runs on each failing read, before it throws. The sweep in
+    /// `PostPreflightSecretSweepTests` uses it to fail every read an
+    /// operation makes, one at a time (#152).
+    func failReads(
+        for destId: UUID,
+        afterReads reads: Int,
+        with error: SecretStoreError,
+        onFailure: (@Sendable () -> Void)? = nil
+    ) {
+        withLock { _failingReadsAfter[destId] = (reads, error, onFailure) }
+    }
+
+    /// How many reads of `destId`, password and environment together, the
+    /// store has answered or refused since the last ``clearFailures()``.
+    func reads(for destId: UUID) -> Int {
+        withLock { _reads[destId] ?? 0 }
+    }
+
     /// Clears every injected failure, as if the user had repaired the store.
     func clearFailures() {
         withLock {
@@ -99,6 +122,8 @@ final class FakeSecretStore: SecretStore, @unchecked Sendable {
             _secretEnvReads.removeAll()
             _failingPasswordsAfter.removeAll()
             _passwordReads.removeAll()
+            _failingReadsAfter.removeAll()
+            _reads.removeAll()
         }
     }
 
@@ -110,6 +135,7 @@ final class FakeSecretStore: SecretStore, @unchecked Sendable {
 
     func password(destId: UUID) async throws -> String {
         onPasswordRead?(destId)
+        if let failure = countRead(destId) { throw failure }
         let outcome: Result<String, SecretStoreError> = withLock {
             if let failure = _failingPasswords[destId] {
                 return .failure(failure)
@@ -139,6 +165,7 @@ final class FakeSecretStore: SecretStore, @unchecked Sendable {
     }
 
     func secretEnv(destId: UUID) async throws -> [String: String] {
+        if let failure = countRead(destId) { throw failure }
         let outcome: Result<[String: String], SecretStoreError> = withLock {
             if let failure = _failingSecretEnvs[destId] {
                 return .failure(failure)
@@ -169,6 +196,20 @@ final class FakeSecretStore: SecretStore, @unchecked Sendable {
     }
 
     // MARK: - Plumbing
+
+    /// Counts one read of `destId` and returns the armed failure, if this
+    /// read is past ``failReads(for:afterReads:with:onFailure:)``'s count.
+    private func countRead(_ destId: UUID) -> SecretStoreError? {
+        let armed: (error: SecretStoreError, onFailure: (@Sendable () -> Void)?)? = withLock {
+            let reads = (_reads[destId] ?? 0) + 1
+            _reads[destId] = reads
+            guard let after = _failingReadsAfter[destId], reads > after.reads else { return nil }
+            return (after.error, after.onFailure)
+        }
+        guard let armed else { return nil }
+        armed.onFailure?()
+        return armed.error
+    }
 
     private func withLock<T>(_ body: () -> T) -> T {
         lock.lock()

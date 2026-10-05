@@ -460,7 +460,7 @@ public final class BackupEngine: Sendable {
             // pre-flight (#152): the outcome the pre-flight would have
             // given. The run record stays — an attempt was made — and its
             // summary names the secret problem.
-            if let outcome = Self.scheduledSecretOutcome(backup.preflightFailure) {
+            if let outcome = Self.scheduledSecretOutcome(backup.verdict) {
                 return outcome
             }
             return .completed(status: .failed, groupId: groupId, children: children)
@@ -853,8 +853,9 @@ public final class BackupEngine: Sendable {
         case .infrastructureFailure(let failure):
             return .infrastructureFailure(reason: failure.reason)
         }
-        if case .secret(let equivalent, let message) = primaryCheck.preflightFailure {
-            // Seen after the pre-flight (#152); same outcome it would give.
+        // Seen after the pre-flight (#152): the outcome it would give —
+        // unless the run record itself failed, which `verdict` puts first.
+        if case .secret(let equivalent, let message) = primaryCheck.verdict {
             switch equivalent {
             case .attention:
                 return .misconfigured(reason: message)
@@ -1299,7 +1300,12 @@ public final class BackupEngine: Sendable {
                 }
                 return .failed(.infrastructure(failure.reason))
             }
-            switch prune.preflightFailure {
+            if case .secret(let equivalent, let message) = prune.verdict {
+                // Seen after the pre-flight passed (#152): published as the
+                // pre-flight would have, never as a restic failure.
+                return .skipped(Self.pruneSkip(equivalent, message: message))
+            }
+            switch prune.nonSecretPreflightFailure {
             case .previewChanged:
                 return .skipped(.previewChanged)
             case .previewExpired:
@@ -1308,13 +1314,7 @@ public final class BackupEngine: Sendable {
                 return .skipped(.previewUnavailable)
             case .storeUnusable(let detail):
                 return .failed(.infrastructure("preview-token store unusable — \(detail)"))
-            case .secret(.attention(let attention, _), let message):
-                // Seen after the pre-flight passed (#152): published as the
-                // pre-flight would have, never as a restic failure.
-                return .skipped(.secretRefused(attention, message))
-            case .secret(.secretUnavailable, _):
-                return .skipped(.secretUnavailable)
-            case .reason, .none:
+            case .secret, .reason, .none:
                 break
             }
             guard prune.child.status == .failed else { return .completed(prune.child.status) }
@@ -1418,7 +1418,11 @@ public final class BackupEngine: Sendable {
             }
             return .failed(.infrastructure(failure.reason))
         }
-        switch prune.preflightFailure {
+        if case .secret(let equivalent, let message) = prune.verdict {
+            // Seen after the pre-flight passed (#152).
+            return .skipped(Self.pruneSkip(equivalent, message: message))
+        }
+        switch prune.nonSecretPreflightFailure {
         case .previewChanged:
             return .skipped(.previewChanged)
         case .previewExpired:
@@ -1427,12 +1431,7 @@ public final class BackupEngine: Sendable {
             return .skipped(.previewUnavailable)
         case .storeUnusable(let detail):
             return .failed(.infrastructure("preview-token store unusable — \(detail)"))
-        case .secret(.attention(let attention, _), let message):
-            // Seen after the pre-flight passed (#152).
-            return .skipped(.secretRefused(attention, message))
-        case .secret(.secretUnavailable, _):
-            return .skipped(.secretUnavailable)
-        case .reason, .none:
+        case .secret, .reason, .none:
             break
         }
         guard prune.child.status == .failed else { return .completed(prune.child.status) }
@@ -2128,7 +2127,7 @@ public final class BackupEngine: Sendable {
                 restorePurgeToken()
                 // A secret problem seen after the pre-flight is refused the
                 // way the pre-flight refuses it (#152).
-                if case .secret(let equivalent, let message) = purge.preflightFailure {
+                if case .secret(let equivalent, let message) = purge.verdict {
                     switch equivalent {
                     case .attention(let attention, let destinationId):
                         throw PurgeApplyError.secretRefused(attention, destinationId: destinationId, message)
@@ -2137,7 +2136,7 @@ public final class BackupEngine: Sendable {
                     }
                 }
                 throw PurgeApplyError.infrastructureFailure(
-                    reason: purge.preflightFailure?.message
+                    reason: purge.nonSecretPreflightFailure?.message
                         ?? "the first purge process could not be launched",
                     operationMayHaveRun: false
                 )
@@ -2147,7 +2146,7 @@ public final class BackupEngine: Sendable {
             // changed after the pre-flight (#152). Earlier destinations may
             // already be rewritten, so the refusal says so; a fresh preview
             // is needed either way, since the token is spent.
-            if purge.outcome == nil, case .secret(let equivalent, let message) = purge.preflightFailure {
+            if purge.outcome == nil, case .secret(let equivalent, let message) = purge.verdict {
                 let earlier = "Earlier destinations in this purge were already rewritten; "
                     + "preview again after fixing this one."
                 switch equivalent {
@@ -2757,7 +2756,7 @@ public final class BackupEngine: Sendable {
         if let reason = restore.infrastructureFailureReason {
             return .infrastructureFailure(reason: reason, operationMayHaveRun: true)
         }
-        if let refused = Self.manualSecretOutcome(restore.preflightFailure) { return refused }
+        if let refused = Self.manualSecretOutcome(restore.verdict) { return refused }
         return .completed(restore.child.status)
     }
 
@@ -2832,7 +2831,7 @@ public final class BackupEngine: Sendable {
         if let reason = initRun.infrastructureFailureReason {
             return .infrastructureFailure(reason: reason, operationMayHaveRun: true)
         }
-        if let refused = Self.manualSecretOutcome(initRun.preflightFailure) { return refused }
+        if let refused = Self.manualSecretOutcome(initRun.verdict) { return refused }
         return .completed(initRun.child.status)
     }
 
@@ -2895,15 +2894,57 @@ public final class BackupEngine: Sendable {
     private struct ChildRun {
         let child: SetRunChild
         let outcome: ResticOutcome?
-        let preflightFailure: PreflightFailure?
+        /// Private so a secret problem is read only through ``verdict``,
+        /// which orders it after a run-history failure (#169 review).
+        private let preflightFailure: PreflightFailure?
         /// The child may have completed and its terminal metadata may exist,
         /// while the append-only index write failed. Every caller must
         /// surface that as machine infrastructure failure, never success.
         let infrastructureFailure: ChildInfrastructureFailure?
 
+        init(
+            child: SetRunChild,
+            outcome: ResticOutcome?,
+            preflightFailure: PreflightFailure?,
+            infrastructureFailure: ChildInfrastructureFailure?
+        ) {
+            self.child = child
+            self.outcome = outcome
+            self.preflightFailure = preflightFailure
+            self.infrastructureFailure = infrastructureFailure
+        }
+
         var infrastructureFailureReason: String? {
             infrastructureFailure?.reason
         }
+
+        /// Any pre-flight failure except a secret one.
+        var nonSecretPreflightFailure: PreflightFailure? {
+            if case .secret = preflightFailure { return nil }
+            return preflightFailure
+        }
+
+        /// What this child means to its caller, in the one precedence every
+        /// caller uses (#152):
+        /// 1. a run-history failure: a machine fault, even when restic
+        ///    never ran;
+        /// 2. a secret problem seen after the pre-flight, published as the
+        ///    pre-flight would have published it;
+        /// 3. otherwise the child's own status, outcome and
+        ///    ``nonSecretPreflightFailure``.
+        var verdict: ChildVerdict {
+            if let infrastructureFailure { return .infrastructureFailure(infrastructureFailure) }
+            if case .secret(let equivalent, let message) = preflightFailure {
+                return .secret(equivalent, message: message)
+            }
+            return .ordinary
+        }
+    }
+
+    private enum ChildVerdict {
+        case infrastructureFailure(ChildInfrastructureFailure)
+        case secret(ResticRunnerError.PreflightEquivalent, message: String)
+        case ordinary
     }
 
     private struct ChildInfrastructureFailure {
@@ -3966,8 +4007,8 @@ public final class BackupEngine: Sendable {
 
     /// The scheduled-backup outcome for a primary whose restic never ran
     /// because of a secret problem seen after the pre-flight (#152).
-    private static func scheduledSecretOutcome(_ failure: PreflightFailure?) -> SetRunOutcome? {
-        guard case .secret(let equivalent, let message) = failure else { return nil }
+    private static func scheduledSecretOutcome(_ verdict: ChildVerdict) -> SetRunOutcome? {
+        guard case .secret(let equivalent, let message) = verdict else { return nil }
         switch equivalent {
         case .attention:
             return .misconfigured(reason: message)
@@ -3976,11 +4017,25 @@ public final class BackupEngine: Sendable {
         }
     }
 
+    /// The prune skip for a child whose restic never ran because of a
+    /// secret problem seen after the pre-flight (#152).
+    private static func pruneSkip(
+        _ equivalent: ResticRunnerError.PreflightEquivalent,
+        message: String
+    ) -> PruneRepositorySkipReason {
+        switch equivalent {
+        case .attention(let attention, _):
+            return .secretRefused(attention, message)
+        case .secretUnavailable:
+            return .secretUnavailable
+        }
+    }
+
     /// The manual outcome for a child whose restic never ran because of a
     /// secret problem seen after the pre-flight — the same answer the
     /// pre-flight would have given (#152).
-    private static func manualSecretOutcome(_ failure: PreflightFailure?) -> ManualRunOutcome? {
-        guard case .secret(let equivalent, let message) = failure else { return nil }
+    private static func manualSecretOutcome(_ verdict: ChildVerdict) -> ManualRunOutcome? {
+        guard case .secret(let equivalent, let message) = verdict else { return nil }
         switch equivalent {
         case .attention(let attention, let destinationId):
             return .secretRefused(attention: attention, destinationId: destinationId, detail: message)
