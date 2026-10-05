@@ -416,4 +416,41 @@ import Testing
         #expect(attention == .secretNotConfigured)
     }
 
+    @Test("purge apply: a refusal seen by the revalidation probe is not 'offline'")
+    func purgeApplyProbeRefusalAfterPreflight() async throws {
+        let sourcePaths = [T.setId: Set(["/Users/user/example/src"])]
+        let hostnames = [T.setId: Set(["example-mac.local"])]
+        // A remote repository, so the revalidation probe runs restic and
+        // reads the store itself (a local probe checks the filesystem only).
+        let env = T.makeEnv(
+            script: [], retention: nil, purgeExcludes: ["build/**"], reachableSecondaries: [],
+            purgeSourcePaths: sourcePaths, purgeHostnames: hostnames,
+            primaryRepoURL: "sftp:backup@example:/srv/repo"
+        )
+        defer { env.cleanUp() }
+        let snapshots = try parseSnapshots(Data(try FixtureLoader.string("snapshots.json").utf8))
+        let plan = PurgePlan(
+            destinationId: env.primary.id, snapshots: snapshots,
+            sourcePaths: sourcePaths[T.setId]!, hostnames: hostnames[T.setId]!,
+            patterns: env.set.purgeExcludes
+        )
+        let token = try #require(try env.engine.issuePurgeToken(
+            set: env.set, destinations: [env.primary], plans: [plan],
+            executable: try env.requireResticExecutable()
+        ))
+        env.fake.script = Self.anything
+        // Pre-flight and maintenance environment pass; the probe's read fails.
+        env.secrets.failSecretEnv(for: T.primaryId, afterReads: 2, with: .itemNotFound)
+
+        do {
+            _ = try await env.engine.runPurge(set: env.set, destinations: [env.primary], token: token.value)
+            Issue.record("expected a refusal")
+        } catch let error as PurgeApplyError {
+            guard case .secretRefused(let attention, _, _) = error else {
+                Issue.record("expected .secretRefused, got \(error)")
+                return
+            }
+            #expect(attention == .secretNotConfigured)
+        }
+    }
 }

@@ -2221,7 +2221,18 @@ public final class BackupEngine: Sendable {
             destination,
             expectedExecutableIdentity: executable.identity
         )
-        guard probe == .reachable else {
+        switch probe {
+        case .reachable:
+            break
+        case .needsAttention(let attention, let reason):
+            // A store changed after the pre-flight, seen by the revalidation
+            // probe (#152): refused as the pre-flight would, not reported as
+            // a retryable offline repository.
+            if attention != .cloudRepositoryNotHydrated {
+                recordPostPreflight(.attention(attention, destinationId: destination.id), message: reason)
+            }
+            throw PurgeApplyError.secretRefused(attention, destinationId: destination.id, reason)
+        case .offline, .error:
             throw PurgeApplyError.destinationOffline(destinationId: destination.id)
         }
         let repositoryId = try await purgeRepositoryId(
