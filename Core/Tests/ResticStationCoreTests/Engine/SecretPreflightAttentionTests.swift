@@ -347,6 +347,31 @@ import Testing
 
     // MARK: - #169 review: the remaining post-pre-flight sites
 
+    @Test("scheduled backup: a refusal after the pre-flight is misconfigured, a transient one retryable")
+    func scheduledBackupAfterPreflight() async throws {
+        for (error, expectMisconfigured) in [
+            (SecretStoreError.storeUnusable("chmod 600 secrets.json"), true),
+            (SecretStoreError.backendFailed("locked"), false),
+        ] {
+            let env = T.makeEnv(script: [])
+            defer { env.cleanUp() }
+            env.fake.script = Self.anything
+            env.secrets.failSecretEnv(for: T.primaryId, afterReads: 1, with: error)
+
+            let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
+
+            switch outcome {
+            case .misconfigured:
+                #expect(expectMisconfigured, "transient \(error) must be retryable")
+                #expect(env.stateStore.readSecretAttention(destId: T.primaryId)?.attention == .secretStoreUnusable)
+            case .retryable:
+                #expect(!expectMisconfigured, "permanent \(error) must be misconfigured")
+            default:
+                Issue.record("expected the pre-flight's outcome for \(error), got \(outcome)")
+            }
+        }
+    }
+
     @Test("purge preview: a transient failure after the pre-flight is secret_unavailable, not failed")
     func purgePreviewTransientAfterPreflight() async throws {
         let env = T.makeEnv(script: [], purgeExcludes: ["secret.key"])

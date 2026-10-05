@@ -456,6 +456,13 @@ public final class BackupEngine: Sendable {
             if !infrastructureFailures.isEmpty {
                 return .infrastructureFailure(reason: infrastructureFailures.joined(separator: "; "))
             }
+            // restic never ran because the store changed after the
+            // pre-flight (#152): the outcome the pre-flight would have
+            // given. The run record stays — an attempt was made — and its
+            // summary names the secret problem.
+            if let outcome = Self.scheduledSecretOutcome(backup.preflightFailure) {
+                return outcome
+            }
             return .completed(status: .failed, groupId: groupId, children: children)
         }
 
@@ -845,6 +852,15 @@ public final class BackupEngine: Sendable {
             return .infrastructureFailure(reason: reason)
         case .infrastructureFailure(let failure):
             return .infrastructureFailure(reason: failure.reason)
+        }
+        if case .secret(let equivalent, let message) = primaryCheck.preflightFailure {
+            // Seen after the pre-flight (#152); same outcome it would give.
+            switch equivalent {
+            case .attention:
+                return .misconfigured(reason: message)
+            case .secretUnavailable:
+                return .retryable(reason: message)
+            }
         }
         var statuses = [primaryCheck.child.status]
         var infrastructureFailures: [String] = []
@@ -3909,6 +3925,18 @@ public final class BackupEngine: Sendable {
             ))
         } catch {
             logWarning("BackupEngine: could not record the secret problem for destination \(destinationId): \(error)")
+        }
+    }
+
+    /// The scheduled-backup outcome for a primary whose restic never ran
+    /// because of a secret problem seen after the pre-flight (#152).
+    private static func scheduledSecretOutcome(_ failure: PreflightFailure?) -> SetRunOutcome? {
+        guard case .secret(let equivalent, let message) = failure else { return nil }
+        switch equivalent {
+        case .attention:
+            return .misconfigured(reason: message)
+        case .secretUnavailable:
+            return .retryable(reason: message)
         }
     }
 
