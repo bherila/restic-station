@@ -19,19 +19,31 @@ public struct ResticInvocation: Sendable {
     /// Opaque digest binding for a helper-confirmed maintenance executable.
     /// The runner rechecks it immediately before the child is spawned.
     public let expectedExecutableIdentity: String?
+    /// Whether restic may download online-only files by reading them (#156).
+    /// Only a backup of a set whose `onlineOnlyFiles` is `.download`, and
+    /// whose primary repository is not itself in cloud storage, asks for it
+    /// (`BackupEngine.backupDownloadsOnlineOnlyFiles`), because the policy
+    /// covers the repository reads too. Every other restic process reads only repositories and the
+    /// restore target, and a repository's online-only files are never
+    /// downloaded implicitly. So by default the kernel refuses such a read
+    /// for the child's whole life, including a file evicted after the
+    /// pre-flight's scan.
+    public let downloadsOnlineOnlyFiles: Bool
 
     public init(
         destination: Destination,
         fromDestination: Destination? = nil,
         destinationSecretEnv: [String: String]? = nil,
         resticPathOverride: String? = nil,
-        expectedExecutableIdentity: String? = nil
+        expectedExecutableIdentity: String? = nil,
+        downloadsOnlineOnlyFiles: Bool = false
     ) {
         self.destination = destination
         self.fromDestination = fromDestination
         self.destinationSecretEnv = destinationSecretEnv
         self.resticPathOverride = resticPathOverride
         self.expectedExecutableIdentity = expectedExecutableIdentity
+        self.downloadsOnlineOnlyFiles = downloadsOnlineOnlyFiles
     }
 }
 
@@ -190,6 +202,7 @@ public final class ResticRunner: Sendable {
             beforeLaunch: beforeLaunch,
             auditBeforeLaunch: auditBeforeLaunch,
             afterLaunchFailure: afterLaunchFailure,
+            datalessFiles: inv.downloadsOnlineOnlyFiles ? .download : .refuse,
             onLine: onLine,
             onRawLine: onRawLine,
             timeout: timeout
@@ -489,6 +502,7 @@ public final class ResticRunner: Sendable {
         beforeLaunch: (@Sendable () throws -> Void)? = nil,
         auditBeforeLaunch: (@Sendable () throws -> Void)? = nil,
         afterLaunchFailure: (@Sendable () -> Void)? = nil,
+        datalessFiles: DatalessFileReads = .refuse,
         onLine: (@Sendable (ResticMessage) -> Void)?,
         onRawLine: (@Sendable (String) -> Void)?,
         timeout: TimeInterval?
@@ -546,7 +560,8 @@ public final class ResticRunner: Sendable {
                 onStderrLine: { line in
                     onRawLine?(line)
                 },
-                timeout: timeout
+                timeout: timeout,
+                datalessFiles: datalessFiles
             )
         } catch let error as ProcessRunnerError {
             // `DefaultProcessRunner` emits `.launchFailed` only from

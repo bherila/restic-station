@@ -85,6 +85,21 @@ public final class ProcessLeases: @unchecked Sendable {
     }
 }
 
+/// For a launch this process makes outside ``DefaultProcessRunner``, such
+/// as the app's `Foundation.Process` children (#156).
+///
+/// A ``DefaultProcessRunner`` spawn briefly changes this *process's*
+/// dataless-file policy, and any child launched in that window inherits it
+/// for life. A launch made inside ``run(_:)`` holds the same lock as those
+/// spawns, so it never lands in that window. `body` must only launch: it
+/// must not itself spawn through ``DefaultProcessRunner``, because the lock
+/// is not reentrant.
+public enum SpawnSerialization {
+    public static func run<T>(_ body: () throws -> T) rethrows -> T {
+        try OwnedProcess.withSpawnLock(body)
+    }
+}
+
 /// A child process this process spawned and reaps itself (#114), in its own
 /// process group.
 ///
@@ -158,10 +173,15 @@ final class OwnedProcess: @unchecked Sendable {
     /// group, with stdin/stdout/stderr on fresh pipes and `inherit` as fds
     /// 3, 4, …; every other descriptor is closed in the child. `onExit` runs
     /// once, on the waiter thread, after the child has been reaped.
+    ///
+    /// `datalessFiles`, when set, decides whether the child may download an
+    /// online-only file by reading it (#156); nil leaves this process's own
+    /// policy to be inherited.
     static func spawn(
         argv: [String],
         env: [String: String]?,
         inherit: [Int32],
+        datalessFiles: DatalessFileReads? = nil,
         onExit: @escaping @Sendable () -> Void
     ) throws -> OwnedProcess {
         precondition(!argv.isEmpty)
@@ -213,7 +233,8 @@ final class OwnedProcess: @unchecked Sendable {
                 argv: argv,
                 env: env ?? ProcessInfo.processInfo.environment,
                 stdio: (stdinPipe.read, stdoutPipe.write, stderrPipe.write),
-                leases: leaseSources
+                leases: leaseSources,
+                datalessFiles: datalessFiles
             )
         } catch {
             closeAll([stdinPipe.write, stdoutPipe.read, stderrPipe.read])
@@ -332,11 +353,68 @@ final class OwnedProcess: @unchecked Sendable {
 
     private static let spawnLock = NSLock()
 
+    static func withSpawnLock<T>(_ body: () throws -> T) rethrows -> T {
+        spawnLock.lock()
+        defer { spawnLock.unlock() }
+        return try body()
+    }
+
+    /// Runs `spawn` with this process's dataless-file policy set as `reads`
+    /// asks, then puts back the policy it found (#156).
+    ///
+    /// macOS has no spawn attribute for the policy, and a thread-scope
+    /// policy is not inherited, but a child does inherit its parent's
+    /// *process* policy. So the policy is set on this process for the length
+    /// of one `posix_spawn`. `spawnLock` is held around it, so no other
+    /// spawn can launch a child under the wrong policy.
+    ///
+    /// Another thread of this process that reads an online-only file during
+    /// the window is affected too:
+    /// - under `.refuse` the read fails instead of downloading, which is the
+    ///   fail-safe direction;
+    /// - under `.download` it downloads the file, as the helper's own reads
+    ///   already may.
+    ///
+    /// A policy that cannot be set refuses the launch. A policy that cannot
+    /// be put back is logged. Elsewhere there are no dataless files, and
+    /// this is just `spawn()`.
+    private static func withDatalessPolicy(
+        _ reads: DatalessFileReads?,
+        _ spawn: () -> Int32
+    ) throws -> Int32 {
+        #if os(macOS)
+        guard let reads else { return spawn() }
+        let type = IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES
+        let previous = getiopolicy_np(type, IOPOL_SCOPE_PROCESS)
+        guard previous >= 0 else {
+            throw ProcessRunnerError.launchFailed("could not read the dataless-file policy: errno \(errno)")
+        }
+        let wanted: Int32
+        switch reads {
+        case .refuse: wanted = IOPOL_MATERIALIZE_DATALESS_FILES_OFF
+        case .download: wanted = IOPOL_MATERIALIZE_DATALESS_FILES_ON
+        }
+        guard setiopolicy_np(type, IOPOL_SCOPE_PROCESS, wanted) == 0 else {
+            throw ProcessRunnerError.launchFailed("could not set the dataless-file policy: errno \(errno)")
+        }
+        defer {
+            if setiopolicy_np(type, IOPOL_SCOPE_PROCESS, previous) != 0 {
+                let message = "OwnedProcess: could not restore the dataless-file policy \(previous): errno \(errno)\n"
+                StandardStream.write(Data(message.utf8), to: .standardError)
+            }
+        }
+        return spawn()
+        #else
+        return spawn()
+        #endif
+    }
+
     private static func posixSpawn(
         argv: [String],
         env: [String: String],
         stdio: (in: Int32, out: Int32, err: Int32),
-        leases: [Int32]
+        leases: [Int32],
+        datalessFiles: DatalessFileReads?
     ) throws -> pid_t {
         #if canImport(Darwin)
         var actions: posix_spawn_file_actions_t?
@@ -408,9 +486,11 @@ final class OwnedProcess: @unchecked Sendable {
         }
 
         var pid: pid_t = 0
-        let result = argvC.withUnsafeBufferPointer { argvBuffer in
-            envC.withUnsafeBufferPointer { envBuffer in
-                posix_spawn(&pid, argv[0], &actions, &attributes, argvBuffer.baseAddress!, envBuffer.baseAddress!)
+        let result = try withDatalessPolicy(datalessFiles) {
+            argvC.withUnsafeBufferPointer { argvBuffer in
+                envC.withUnsafeBufferPointer { envBuffer in
+                    posix_spawn(&pid, argv[0], &actions, &attributes, argvBuffer.baseAddress!, envBuffer.baseAddress!)
+                }
             }
         }
         guard result == 0 else {

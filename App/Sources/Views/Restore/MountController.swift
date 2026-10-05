@@ -166,7 +166,8 @@ final class MountController: ObservableObject {
         }
 
         do {
-            try process.run()
+            // Outside any DefaultProcessRunner policy window (#156).
+            try SpawnSerialization.run { try process.run() }
         } catch {
             fail("restic could not be started: \(error.localizedDescription). "
                 + "Check the restic path in Settings.")
@@ -309,7 +310,7 @@ final class MountController: ObservableObject {
         diskutil.arguments = ["unmount", "force", directory.path]
         diskutil.standardOutput = FileHandle.nullDevice
         diskutil.standardError = FileHandle.nullDevice
-        try? diskutil.run()
+        try? SpawnSerialization.run { try diskutil.run() }
         diskutil.waitUntilExit()
     }
 

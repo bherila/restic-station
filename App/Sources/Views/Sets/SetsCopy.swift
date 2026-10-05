@@ -65,7 +65,9 @@ enum SetsCopy {
                 + "provider if every file must be backed up."
         case .download:
             return "restic reads every file, so the cloud provider downloads each online-only file "
-                + "first. Snapshots are complete, at the cost of the download and the disk space."
+                + "first. Snapshots are complete, at the cost of the download and the disk space — "
+                + "unless the primary repository is in cloud storage too: then nothing is downloaded, "
+                + "so the repository is never downloaded implicitly either."
         }
     }
 

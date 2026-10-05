@@ -60,6 +60,28 @@ final class ObservingProcessRunner: ProcessRunning, @unchecked Sendable {
         onStderrLine: (@Sendable (String) -> Void)?,
         timeout: TimeInterval?
     ) async throws -> ProcessResult {
+        try await run(
+            argv,
+            env: env,
+            stdin: stdin,
+            currentDirectory: currentDirectory,
+            onStdoutLine: onStdoutLine,
+            onStderrLine: onStderrLine,
+            timeout: timeout,
+            datalessFiles: nil
+        )
+    }
+
+    func run(
+        _ argv: [String],
+        env: [String: String]?,
+        stdin: Data?,
+        currentDirectory: String?,
+        onStdoutLine: (@Sendable (String) -> Void)?,
+        onStderrLine: (@Sendable (String) -> Void)?,
+        timeout: TimeInterval?,
+        datalessFiles: DatalessFileReads?
+    ) async throws -> ProcessResult {
         onSpawn(argv)
         return try await inner.run(
             argv,
@@ -68,7 +90,8 @@ final class ObservingProcessRunner: ProcessRunning, @unchecked Sendable {
             currentDirectory: currentDirectory,
             onStdoutLine: onStdoutLine,
             onStderrLine: onStderrLine,
-            timeout: timeout
+            timeout: timeout,
+            datalessFiles: datalessFiles
         )
     }
 }

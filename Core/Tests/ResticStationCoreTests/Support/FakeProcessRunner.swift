@@ -49,6 +49,7 @@ final class FakeProcessRunner: ProcessRunning, @unchecked Sendable {
     private let lock = NSLock()
     private var _script: [Expectation]
     private var _invocations: [(argv: [String], env: [String: String]?, stdin: Data?)] = []
+    private var _datalessPolicies: [(argv: [String], policy: DatalessFileReads?)] = []
 
     init(script: [Expectation] = []) {
         self._script = script
@@ -64,6 +65,12 @@ final class FakeProcessRunner: ProcessRunning, @unchecked Sendable {
         set { withLock { _invocations = newValue } }
     }
 
+    /// The ``DatalessFileReads`` each call asked for, nil for a call that
+    /// left the child to inherit this process's policy (#156).
+    var datalessPolicies: [(argv: [String], policy: DatalessFileReads?)] {
+        withLock { _datalessPolicies }
+    }
+
     func run(
         _ argv: [String],
         env: [String: String]?,
@@ -73,7 +80,32 @@ final class FakeProcessRunner: ProcessRunning, @unchecked Sendable {
         onStderrLine: (@Sendable (String) -> Void)?,
         timeout: TimeInterval?
     ) async throws -> ProcessResult {
-        withLock { _invocations.append((argv, env, stdin)) }
+        try await run(
+            argv,
+            env: env,
+            stdin: stdin,
+            currentDirectory: currentDirectory,
+            onStdoutLine: onStdoutLine,
+            onStderrLine: onStderrLine,
+            timeout: timeout,
+            datalessFiles: nil
+        )
+    }
+
+    func run(
+        _ argv: [String],
+        env: [String: String]?,
+        stdin: Data?,
+        currentDirectory: String?,
+        onStdoutLine: (@Sendable (String) -> Void)?,
+        onStderrLine: (@Sendable (String) -> Void)?,
+        timeout: TimeInterval?,
+        datalessFiles: DatalessFileReads?
+    ) async throws -> ProcessResult {
+        withLock {
+            _invocations.append((argv, env, stdin))
+            _datalessPolicies.append((argv, datalessFiles))
+        }
 
         guard let expectation = withLock({ () -> Expectation? in
             guard !_script.isEmpty else { return nil }
