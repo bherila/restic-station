@@ -228,4 +228,229 @@ import Testing
         _ = await env.engine.runCheck(env.set, trigger: .scheduled)
         #expect(env.stateStore.readSecretAttention(destId: T.secondaryAId) == nil)
     }
+
+    // MARK: - #152: a store changed between the pre-flight and the spawn
+
+    /// The engine's pre-flight reads the environment once; the runner's read
+    /// just before the spawn is the second. Failing from the second read is
+    /// a `chmod` or a malformed write landing in exactly that window.
+    @Test("restore: a store refusal after the pre-flight is refused like the pre-flight, not a failed run")
+    func restoreRefusalAfterPreflight() async throws {
+        let env = T.makeEnv(script: [])
+        defer { env.cleanUp() }
+        env.fake.script = Self.anything
+        env.secrets.failSecretEnv(for: T.primaryId, afterReads: 1, with: .storeUnusable("chmod 600 secrets.json"))
+
+        let outcome = await env.engine.runRestore(request: RestoreRequest(
+            destId: T.primaryId, snapshotID: "abc123", targetPath: "/tmp/target"
+        ))
+
+        guard case .secretRefused(let attention, let destinationId, _) = outcome else {
+            Issue.record("expected .secretRefused, got \(outcome)")
+            return
+        }
+        #expect(attention == .secretStoreUnusable)
+        #expect(destinationId == T.primaryId)
+        #expect(env.stateStore.readSecretAttention(destId: T.primaryId)?.attention == .secretStoreUnusable)
+    }
+
+    @Test("restore: a transient failure after the pre-flight stays a retryable skip")
+    func restoreTransientAfterPreflight() async throws {
+        let env = T.makeEnv(script: [])
+        defer { env.cleanUp() }
+        env.fake.script = Self.anything
+        env.secrets.failSecretEnv(for: T.primaryId, afterReads: 1, with: .backendFailed("locked"))
+
+        let outcome = await env.engine.runRestore(request: RestoreRequest(
+            destId: T.primaryId, snapshotID: "abc123", targetPath: "/tmp/target"
+        ))
+
+        #expect(outcome == .skipped)
+        #expect(env.stateStore.readSecretAttention(destId: T.primaryId) == nil)
+    }
+
+    @Test("standalone prune: a store refusal after the pre-flight is published with the pre-flight's code")
+    func pruneRefusalAfterPreflight() async throws {
+        let env = T.makeEnv(script: [], retention: nil)
+        defer { env.cleanUp() }
+        env.fake.script = Self.anything
+        env.secrets.failSecretEnv(for: T.primaryId, afterReads: 1, with: .storeUnusable("chmod 600 secrets.json"))
+
+        let result = await env.engine.runPruneRepository(set: env.set, destination: env.primary, dryRun: true)
+
+        guard case .skipped(.secretRefused(let attention, _)) = result else {
+            Issue.record("expected .skipped(.secretRefused), got \(result)")
+            return
+        }
+        #expect(attention == .secretStoreUnusable)
+    }
+
+    @Test("purge preview: a store refusal after the pre-flight is not restic_failed")
+    func purgePreviewRefusalAfterPreflight() async throws {
+        let env = T.makeEnv(script: [], purgeExcludes: ["secret.key"])
+        defer { env.cleanUp() }
+        env.fake.script = Self.anything
+        env.secrets.failSecretEnv(for: T.primaryId, afterReads: 1, with: .storeUnusable("chmod 600 secrets.json"))
+
+        let result = await env.engine.previewPurge(
+            set: env.set, destination: env.primary, executable: try env.requireResticExecutable()
+        )
+
+        #expect(result.status == .secretStoreUnusable, "got \(result.status): \(result.message ?? "")")
+    }
+
+    @Test("purge apply: a store refusal in a query after the pre-flight is refused, not 'unavailable'")
+    func purgeApplyRefusalAfterPreflight() async throws {
+        let sourcePaths = [T.setId: Set(["/Users/user/example/src"])]
+        let hostnames = [T.setId: Set(["example-mac.local"])]
+        let env = T.makeEnv(
+            script: [], retention: nil, purgeExcludes: ["build/**"], reachableSecondaries: [],
+            purgeSourcePaths: sourcePaths, purgeHostnames: hostnames
+        )
+        defer { env.cleanUp() }
+        let snapshots = try parseSnapshots(Data(try FixtureLoader.string("snapshots.json").utf8))
+        let plan = PurgePlan(
+            destinationId: env.primary.id, snapshots: snapshots,
+            sourcePaths: sourcePaths[T.setId]!, hostnames: hostnames[T.setId]!,
+            patterns: env.set.purgeExcludes
+        )
+        let token = try #require(try env.engine.issuePurgeToken(
+            set: env.set, destinations: [env.primary], plans: [plan],
+            executable: try env.requireResticExecutable()
+        ))
+        env.fake.script = [
+            .init(
+                argvPrefix: [env.resticPath, "-r", env.primary.repoURL, "cat", "config"],
+                stdoutLines: ["{\"version\":2,\"id\":\"\(T.repositoryId)\"}"]
+            ),
+        ] + Self.anything
+        // Pre-flight and reachability probe read the environment; the
+        // repository query inside apply is the third read.
+        env.secrets.failSecretEnv(for: T.primaryId, afterReads: 1, with: .storeUnusable("chmod 600 secrets.json"))
+
+        do {
+            _ = try await env.engine.runPurge(set: env.set, destinations: [env.primary], token: token.value)
+            Issue.record("expected a refusal")
+        } catch let error as PurgeApplyError {
+            guard case .secretRefused(let attention, let destinationId, _) = error else {
+                Issue.record("expected .secretRefused, got \(error)")
+                return
+            }
+            #expect(attention == .secretStoreUnusable)
+            #expect(destinationId == T.primaryId)
+        }
+        #expect(!env.resticArgvs.contains { $0.contains("rewrite") })
+        // Codex on #169: the pre-flight cleared any earlier record, so the
+        // refusal must leave one behind for health and status.
+        #expect(env.stateStore.readSecretAttention(destId: T.primaryId)?.attention == .secretStoreUnusable)
+    }
+
+    // MARK: - #169 review: the remaining post-pre-flight sites
+
+    @Test("scheduled backup: a refusal after the pre-flight is misconfigured, a transient one retryable")
+    func scheduledBackupAfterPreflight() async throws {
+        for (error, expectMisconfigured) in [
+            (SecretStoreError.storeUnusable("chmod 600 secrets.json"), true),
+            (SecretStoreError.backendFailed("locked"), false),
+        ] {
+            let env = T.makeEnv(script: [])
+            defer { env.cleanUp() }
+            env.fake.script = Self.anything
+            env.secrets.failSecretEnv(for: T.primaryId, afterReads: 1, with: error)
+
+            let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
+
+            switch outcome {
+            case .misconfigured:
+                #expect(expectMisconfigured, "transient \(error) must be retryable")
+                #expect(env.stateStore.readSecretAttention(destId: T.primaryId)?.attention == .secretStoreUnusable)
+            case .retryable:
+                #expect(!expectMisconfigured, "permanent \(error) must be misconfigured")
+            default:
+                Issue.record("expected the pre-flight's outcome for \(error), got \(outcome)")
+            }
+        }
+    }
+
+    @Test("purge preview: a transient failure after the pre-flight is secret_unavailable, not failed")
+    func purgePreviewTransientAfterPreflight() async throws {
+        let env = T.makeEnv(script: [], purgeExcludes: ["secret.key"])
+        defer { env.cleanUp() }
+        env.fake.script = Self.anything
+        env.secrets.failSecretEnv(for: T.primaryId, afterReads: 1, with: .backendFailed("locked"))
+
+        let result = await env.engine.previewPurge(
+            set: env.set, destination: env.primary, executable: try env.requireResticExecutable()
+        )
+
+        #expect(result.status == .secretUnavailable, "got \(result.status)")
+    }
+
+    @Test("remote prune dry run: a refusal of the password after the pre-flight keeps its code")
+    func remotePruneDryRunAfterPreflight() async throws {
+        let env = T.makeEnv(script: [], retention: nil)
+        defer { env.cleanUp() }
+        // The remote restic's version check must pass for the dry run to
+        // reach its own password read.
+        env.fake.script = [
+            .init(
+                argvPrefix: RemoteResticCommand.version(sshTarget: "backup@example", resticPath: "/opt/restic").argv,
+                stdoutLines: ["{\"version\":\"0.18.1\"}"]
+            ),
+        ] + Self.anything
+        var destination = env.primary
+        destination.repoURL = "sftp:backup@example:/srv/repo"
+        destination.remoteMaintenance = RemoteMaintenance(enabled: true, remoteResticPath: "/opt/restic")
+        var set = env.set
+        set.destinations[0] = destination
+        // The engine pre-flight reads the password once; the remote command's
+        // own read is the next.
+        env.secrets.failPassword(for: T.primaryId, afterReads: 1, with: .itemNotFound)
+
+        let result = await env.engine.runPruneRepository(set: set, destination: destination, dryRun: true)
+
+        guard case .skipped(.secretRefused(let attention, _)) = result else {
+            Issue.record("expected .skipped(.secretRefused), got \(result)")
+            return
+        }
+        #expect(attention == .secretNotConfigured)
+    }
+
+    @Test("purge apply: a refusal seen by the revalidation probe is not 'offline'")
+    func purgeApplyProbeRefusalAfterPreflight() async throws {
+        let sourcePaths = [T.setId: Set(["/Users/user/example/src"])]
+        let hostnames = [T.setId: Set(["example-mac.local"])]
+        // A remote repository, so the revalidation probe runs restic and
+        // reads the store itself (a local probe checks the filesystem only).
+        let env = T.makeEnv(
+            script: [], retention: nil, purgeExcludes: ["build/**"], reachableSecondaries: [],
+            purgeSourcePaths: sourcePaths, purgeHostnames: hostnames,
+            primaryRepoURL: "sftp:backup@example:/srv/repo"
+        )
+        defer { env.cleanUp() }
+        let snapshots = try parseSnapshots(Data(try FixtureLoader.string("snapshots.json").utf8))
+        let plan = PurgePlan(
+            destinationId: env.primary.id, snapshots: snapshots,
+            sourcePaths: sourcePaths[T.setId]!, hostnames: hostnames[T.setId]!,
+            patterns: env.set.purgeExcludes
+        )
+        let token = try #require(try env.engine.issuePurgeToken(
+            set: env.set, destinations: [env.primary], plans: [plan],
+            executable: try env.requireResticExecutable()
+        ))
+        env.fake.script = Self.anything
+        // Pre-flight and maintenance environment pass; the probe's read fails.
+        env.secrets.failSecretEnv(for: T.primaryId, afterReads: 2, with: .itemNotFound)
+
+        do {
+            _ = try await env.engine.runPurge(set: env.set, destinations: [env.primary], token: token.value)
+            Issue.record("expected a refusal")
+        } catch let error as PurgeApplyError {
+            guard case .secretRefused(let attention, _, _) = error else {
+                Issue.record("expected .secretRefused, got \(error)")
+                return
+            }
+            #expect(attention == .secretNotConfigured)
+        }
+    }
 }

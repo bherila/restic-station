@@ -126,6 +126,10 @@ public struct PurgePlanResult: Equatable, Sendable {
         /// The destination is a cloud-synced local repository with
         /// online-only files; reading it would download them.
         case cloudRepositoryNotHydrated
+        /// The secret store failed transiently after the pre-flight passed
+        /// (#152): restic never ran, and a retry may succeed. Publishes the
+        /// retryable `secret_unavailable`, never `restic_failed`.
+        case secretUnavailable
     }
 
     public let plan: PurgePlan

@@ -30,6 +30,20 @@ public enum RepoProbeResult: Equatable, Sendable {
     case needsAttention(DestinationAttention, reason: String)
 }
 
+/// A probe's result, plus the secret-store error behind it when the probe
+/// failed reading the destination's secrets.
+///
+/// ``RepoProbeResult`` folds a transient secret failure into ``RepoProbeResult/offline(reason:)``,
+/// whose reason is persisted to `repo-status-<destId>.json` and matched by
+/// the app's badges, so it cannot grow a case for it. The engine needs
+/// the distinction: a probe that runs after the secret pre-flight must
+/// publish what the pre-flight would have (#152).
+struct ClassifiedProbe: Equatable, Sendable {
+    let result: RepoProbeResult
+    /// A `secrets*` runner error, never a hydration or launch failure.
+    let secretError: ResticRunnerError?
+}
+
 /// Destination reachability probing — see `docs/data-model.md`
 /// §state/repo-status and `docs/architecture.md` §Process model.
 ///
@@ -64,8 +78,25 @@ public struct Reachability: Sendable {
         destinationSecretEnv: [String: String]? = nil,
         expectedExecutableIdentity: String? = nil
     ) async -> RepoProbeResult {
+        await classifiedProbe(
+            dest,
+            destinationSecretEnv: destinationSecretEnv,
+            expectedExecutableIdentity: expectedExecutableIdentity
+        ).result
+    }
+
+    /// ``probe(_:destinationSecretEnv:expectedExecutableIdentity:)`` with the
+    /// secret-store error kept beside the result (see ``ClassifiedProbe``).
+    func classifiedProbe(
+        _ dest: Destination,
+        destinationSecretEnv: [String: String]? = nil,
+        expectedExecutableIdentity: String? = nil
+    ) async -> ClassifiedProbe {
         if dest.kind == .localPath {
-            return Self.probeLocal(dest, datalessEntry: datalessRepositoryEntry)
+            return ClassifiedProbe(
+                result: Self.probeLocal(dest, datalessEntry: datalessRepositoryEntry),
+                secretError: nil
+            )
         }
         return await probeRemote(
             dest,
@@ -120,7 +151,7 @@ public struct Reachability: Sendable {
         _ dest: Destination,
         destinationSecretEnv: [String: String]?,
         expectedExecutableIdentity: String?
-    ) async -> RepoProbeResult {
+    ) async -> ClassifiedProbe {
         do {
             let outcome = try await restic.run(
                 .catConfig(repo: dest.repoURL),
@@ -132,62 +163,73 @@ public struct Reachability: Sendable {
                 timeout: Self.probeTimeout
             )
             if outcome.status == .success {
-                return .reachable
+                return ClassifiedProbe(result: .reachable, secretError: nil)
             }
             // restic ran and reported a problem with the repository itself
             // (wrong password, missing repo, locked, fatal, ...) — that is
             // NOT "offline", it needs user attention.
-            return .error(outcome.status)
+            return ClassifiedProbe(result: .error(outcome.status), secretError: nil)
         } catch let error as ResticRunnerError {
+            let secretError: ResticRunnerError?
             switch error {
-            case .secretsUnavailable:
-                // Retryable, not alarming — see docs/architecture.md
-                // §Error taxonomy and ResticRunnerError.secretsUnavailable.
-                // This string is persisted to `repo-status-<destId>.json` and
-                // matched by the app's badge heuristic (`SetsBadges`). Taken
-                // from the store actually in use, so a macOS host running the
-                // file backend does not record "keychain locked"; the
-                // keychain backend's string is unchanged from before T23.
-                return .offline(reason: restic.secretBackend.unavailableProbeReason)
-            case .secretsNotConfigured:
-                // Not environmental: nothing is stored, and no amount of
-                // waiting changes that. The reason string is deliberately
-                // outside `SetsBadges`'s environmental list, so the badge
-                // reads "Error" (needs attention) rather than "Offline"
-                // (try later) — and it is unchanged from when this case
-                // returned `.offline`, because that string is persisted
-                // and matched.
-                return .needsAttention(
-                    .secretNotConfigured,
-                    reason: "no password stored for this destination"
-                )
-            case .secretsStoreUnusable:
-                // Also not environmental, and for a stronger reason than
-                // `secretsNotConfigured`: the store refused to be read at
-                // all and its refusal already names the fix. The reason
-                // string is deliberately outside `SetsBadges`'s
-                // environmental list — note that list matches the bare
-                // substring "could not", which is why this wording avoids
-                // it — so the badge reads "Error" rather than "Offline".
-                return .needsAttention(
-                    .secretStoreUnusable,
-                    reason: "the secret store is not usable as configured"
-                )
-            case .cloudRepositoryNotHydrated:
-                // Not reached by today's probes: the dataless pre-flight only
-                // examines local-path repositories, and those are probed with
-                // an existence check that never runs restic. Mapped rather
-                // than defaulted so the switch stays exhaustive.
-                return .offline(reason: error.userFacingMessage)
-            case .timedOut:
-                return .offline(reason: "timed out")
-            case .launchFailed(let reason):
-                return .offline(reason: reason)
+            case .secretsUnavailable, .secretsNotConfigured, .secretsStoreUnusable:
+                secretError = error
+            case .cloudRepositoryNotHydrated, .timedOut, .launchFailed:
+                secretError = nil
             }
+            return ClassifiedProbe(result: Self.result(for: error, restic: restic), secretError: secretError)
         } catch {
             // CancellationError or anything else unexpected: treat as an
             // offline probe rather than crashing a non-throwing API.
-            return .offline(reason: "\(error)")
+            return ClassifiedProbe(result: .offline(reason: "\(error)"), secretError: nil)
+        }
+    }
+
+    private static func result(for error: ResticRunnerError, restic: ResticRunner) -> RepoProbeResult {
+        switch error {
+        case .secretsUnavailable:
+            // Retryable, not alarming — see docs/architecture.md
+            // §Error taxonomy and ResticRunnerError.secretsUnavailable.
+            // This string is persisted to `repo-status-<destId>.json` and
+            // matched by the app's badge heuristic (`SetsBadges`). Taken
+            // from the store actually in use, so a macOS host running the
+            // file backend does not record "keychain locked"; the
+            // keychain backend's string is unchanged from before T23.
+            return .offline(reason: restic.secretBackend.unavailableProbeReason)
+        case .secretsNotConfigured:
+            // Not environmental: nothing is stored, and no amount of
+            // waiting changes that. The reason string is deliberately
+            // outside `SetsBadges`'s environmental list, so the badge
+            // reads "Error" (needs attention) rather than "Offline"
+            // (try later) — and it is unchanged from when this case
+            // returned `.offline`, because that string is persisted
+            // and matched.
+            return .needsAttention(
+                .secretNotConfigured,
+                reason: "no password stored for this destination"
+            )
+        case .secretsStoreUnusable:
+            // Also not environmental, and for a stronger reason than
+            // `secretsNotConfigured`: the store refused to be read at
+            // all and its refusal already names the fix. The reason
+            // string is deliberately outside `SetsBadges`'s
+            // environmental list — note that list matches the bare
+            // substring "could not", which is why this wording avoids
+            // it — so the badge reads "Error" rather than "Offline".
+            return .needsAttention(
+                .secretStoreUnusable,
+                reason: "the secret store is not usable as configured"
+            )
+        case .cloudRepositoryNotHydrated:
+            // Not reached by today's probes: the dataless pre-flight only
+            // examines local-path repositories, and those are probed with
+            // an existence check that never runs restic. Mapped rather
+            // than defaulted so the switch stays exhaustive.
+            return .offline(reason: error.userFacingMessage)
+        case .timedOut:
+            return .offline(reason: "timed out")
+        case .launchFailed(let reason):
+            return .offline(reason: reason)
         }
     }
 }
