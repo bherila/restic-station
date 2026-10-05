@@ -33,6 +33,20 @@ public enum ProcessRunnerError: Error, Sendable, Equatable {
     case timeout
 }
 
+/// Whether a child may make the system download an online-only ("dataless")
+/// file by reading it (#156): a file a cloud provider such as iCloud Drive
+/// has evicted to a placeholder.
+///
+/// On macOS this is the child's `IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES`
+/// policy, enforced by the kernel for the child's whole life. Elsewhere
+/// there are no dataless files and it has no effect.
+public enum DatalessFileReads: Sendable, Equatable {
+    /// Reading one downloads it first.
+    case download
+    /// Reading one fails instead of downloading it.
+    case refuse
+}
+
 /// Abstraction over subprocess execution. No code in `ResticStationCore`
 /// calls `Process` directly — everything goes through this protocol so
 /// tests can inject a fake (see `docs/testing.md` §FakeProcessRunner).
@@ -73,9 +87,46 @@ public protocol ProcessRunning: Sendable {
         onStderrLine: (@Sendable (String) -> Void)?,
         timeout: TimeInterval?
     ) async throws -> ProcessResult
+
+    /// ``run(_:env:stdin:currentDirectory:onStdoutLine:onStderrLine:timeout:)``
+    /// with the child's ``DatalessFileReads`` policy decided by the caller.
+    /// nil means the child inherits this process's policy.
+    func run(
+        _ argv: [String],
+        env: [String: String]?,
+        stdin: Data?,
+        currentDirectory: String?,
+        onStdoutLine: (@Sendable (String) -> Void)?,
+        onStderrLine: (@Sendable (String) -> Void)?,
+        timeout: TimeInterval?,
+        datalessFiles: DatalessFileReads?
+    ) async throws -> ProcessResult
 }
 
 public extension ProcessRunning {
+    /// For runners that spawn nothing real (test doubles): the policy has
+    /// nothing to apply to. ``DefaultProcessRunner`` implements it.
+    func run(
+        _ argv: [String],
+        env: [String: String]?,
+        stdin: Data?,
+        currentDirectory: String?,
+        onStdoutLine: (@Sendable (String) -> Void)?,
+        onStderrLine: (@Sendable (String) -> Void)?,
+        timeout: TimeInterval?,
+        datalessFiles: DatalessFileReads?
+    ) async throws -> ProcessResult {
+        try await run(
+            argv,
+            env: env,
+            stdin: stdin,
+            currentDirectory: currentDirectory,
+            onStdoutLine: onStdoutLine,
+            onStderrLine: onStderrLine,
+            timeout: timeout
+        )
+    }
+
     /// Convenience for the overwhelmingly common no-stdin subprocess.
     func run(
         _ argv: [String],
@@ -148,6 +199,7 @@ public struct DefaultProcessRunner: ProcessRunning {
     private static func spawnWithRetry(
         argv: [String],
         env: [String: String]?,
+        datalessFiles: DatalessFileReads?,
         terminationSignal: TerminationSignal
     ) throws -> OwnedProcess {
         var lastError: Error?
@@ -158,7 +210,7 @@ public struct DefaultProcessRunner: ProcessRunning {
                 // owned here until the spawn has made its own copies.
                 let leases = try ProcessLeases.shared.duplicates()
                 defer { OwnedProcess.closeAll(leases) }
-                return try OwnedProcess.spawn(argv: argv, env: env, inherit: leases) {
+                return try OwnedProcess.spawn(argv: argv, env: env, inherit: leases, datalessFiles: datalessFiles) {
                     terminationSignal.fire()
                 }
             } catch {
@@ -222,6 +274,28 @@ public struct DefaultProcessRunner: ProcessRunning {
         onStderrLine: (@Sendable (String) -> Void)?,
         timeout: TimeInterval?
     ) async throws -> ProcessResult {
+        try await run(
+            argv,
+            env: env,
+            stdin: stdin,
+            currentDirectory: currentDirectory,
+            onStdoutLine: onStdoutLine,
+            onStderrLine: onStderrLine,
+            timeout: timeout,
+            datalessFiles: nil
+        )
+    }
+
+    public func run(
+        _ argv: [String],
+        env: [String: String]?,
+        stdin: Data?,
+        currentDirectory: String?,
+        onStdoutLine: (@Sendable (String) -> Void)?,
+        onStderrLine: (@Sendable (String) -> Void)?,
+        timeout: TimeInterval?,
+        datalessFiles: DatalessFileReads?
+    ) async throws -> ProcessResult {
         guard !argv.isEmpty else {
             throw ProcessRunnerError.invalidArgv
         }
@@ -244,7 +318,12 @@ public struct DefaultProcessRunner: ProcessRunning {
         }
         let process: OwnedProcess
         do {
-            process = try Self.spawnWithRetry(argv: argv, env: env, terminationSignal: terminationSignal)
+            process = try Self.spawnWithRetry(
+                argv: argv,
+                env: env,
+                datalessFiles: datalessFiles,
+                terminationSignal: terminationSignal
+            )
         } catch let error as ProcessRunnerError {
             throw error
         } catch {

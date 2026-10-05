@@ -395,7 +395,7 @@ public final class BackupEngine: Sendable {
             } else {
                 let note = "warning: cloud-synced source, but restic \(version ?? "(version unknown)") "
                     + "cannot skip online-only files (needs \(ResticRunner.excludeCloudFilesMinimumVersion)); "
-                    + "reading them will download them"
+                    + "they are not downloaded, so restic reports each as unreadable"
                 logWarning("BackupEngine: set \"\(set.name)\": \(note)")
                 cloudSourceNote = note
             }
@@ -419,7 +419,13 @@ public final class BackupEngine: Sendable {
                 excludes: set.effectiveBackupExcludes,
                 excludeCloudFiles: excludeCloudFiles
             ),
-            invocation: ResticInvocation(destination: primary, expectedExecutableIdentity: versionBoundIdentity),
+            invocation: ResticInvocation(
+                destination: primary,
+                expectedExecutableIdentity: versionBoundIdentity,
+                // The only restic process allowed to download online-only
+                // files (#156); every other one is refused them by the kernel.
+                downloadsOnlineOnlyFiles: set.onlineOnlyFiles == .download
+            ),
             streamProgress: true,
             preflightPhase: "probing",
             preflight: { [self] logWriter in
