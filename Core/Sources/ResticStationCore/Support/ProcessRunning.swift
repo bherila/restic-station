@@ -13,11 +13,20 @@ public struct ProcessResult: Sendable {
     public let exitCode: Int32
     public let stdout: Data
     public let stderr: Data
+    /// Whether everything written to either pipe before the reader stopped
+    /// was read (#150). True at end-of-file, and true when the bounded drain
+    /// after the child's exit stopped with the pipe empty: a descendant holding
+    /// the write end idly (`ssh` ControlPersist) cut nothing. False when data
+    /// was still arriving after a bounded final read (a descendant writing),
+    /// or a read failed. `stdout`/`stderr` are then a prefix, and nothing in
+    /// them shows where it was cut.
+    public let outputComplete: Bool
 
-    public init(exitCode: Int32, stdout: Data, stderr: Data) {
+    public init(exitCode: Int32, stdout: Data, stderr: Data, outputComplete: Bool = true) {
         self.exitCode = exitCode
         self.stdout = stdout
         self.stderr = stderr
+        self.outputComplete = outputComplete
     }
 }
 
@@ -69,8 +78,9 @@ public protocol ProcessRunning: Sendable {
     /// lifetime, and where the deadline never fired the call would come back
     /// a descendant's lifetime late reporting *success*. A run is still
     /// waited on for as long as its own child runs; only the drain after
-    /// that is bounded, and a transcript cut short by it fails a downstream
-    /// parse closed rather than reading as an empty success.
+    /// that is bounded. A stopped reader first takes whatever is already in
+    /// the pipe, and ``ProcessResult/outputComplete`` says whether anything
+    /// written before the stop was left unread (#150).
     ///
     /// Both readers run to completion before `run` returns, so no
     /// `onStdoutLine` or `onStderrLine` callback can fire after it — callers
@@ -469,7 +479,12 @@ public struct DefaultProcessRunner: ProcessRunning {
             throw ProcessRunnerError.timeout
         }
 
-        return ProcessResult(exitCode: process.terminationStatus, stdout: outData, stderr: errData)
+        return ProcessResult(
+            exitCode: process.terminationStatus,
+            stdout: outData.data,
+            stderr: errData.data,
+            outputComplete: outData.complete && errData.complete
+        )
     }
 
     /// Writes all of `data`, giving up quietly on any error other than
@@ -542,17 +557,24 @@ public struct DefaultProcessRunner: ProcessRunning {
     /// descriptors, and would let `onLine` keep firing after `run` had
     /// already thrown — into, for the engine's callers, a `LogWriter` the
     /// same return path has just closed.
-    private static func readPipeToCompletion(
+    /// How much a stopped reader takes from a pipe that is still filling
+    /// before it gives up and reports the transcript incomplete. Several pipe
+    /// buffers' worth: the child's own unread output is at most one.
+    private static let finalDrainLimit = 1024 * 1024
+
+    static func readPipeToCompletion(
         _ fd: Int32,
         onLine: (@Sendable (String) -> Void)?,
-        stop: AtomicFlag
-    ) async -> Data {
-        await withCheckedContinuation { (continuation: CheckedContinuation<Data, Never>) in
+        stop: AtomicFlag,
+        finalDrainLimit: Int = finalDrainLimit
+    ) async -> (data: Data, complete: Bool) {
+        await withCheckedContinuation { (continuation: CheckedContinuation<(data: Data, complete: Bool), Never>) in
             DispatchQueue.global(qos: .utility).async {
                 var accumulated = Data()
                 var lineBuffer = Data()
                 let newline = UInt8(ascii: "\n")
                 var buffer = [UInt8](repeating: 0, count: 64 * 1024)
+                var reachedEOF = false
 
                 reading: while !stop.isSet {
                     var poller = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
@@ -572,7 +594,10 @@ public struct DefaultProcessRunner: ProcessRunning {
                         if errno == EINTR { continue }
                         break reading
                     }
-                    if count == 0 { break reading } // EOF
+                    if count == 0 { // EOF
+                        reachedEOF = true
+                        break reading
+                    }
 
                     let chunk = Data(buffer[0..<count])
                     accumulated.append(chunk)
@@ -585,11 +610,63 @@ public struct DefaultProcessRunner: ProcessRunning {
                     }
                 }
 
+                // Told to stop before EOF: a descendant still holds the write
+                // end. Whatever is already in the pipe is taken now, without
+                // waiting. Everything the child wrote before it exited is
+                // there or already read. A pipe that is then empty means
+                // nothing was cut: an idle holder (`ssh` ControlPersist) is
+                // not a truncation. Data still arriving after a bounded extra
+                // read means a descendant is writing, and the transcript
+                // cannot be told complete (#150).
+                var complete = reachedEOF
+                if !reachedEOF && stop.isSet {
+                    var extra = 0
+                    final: while true {
+                        var poller = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+                        let ready = poll(&poller, 1, 0)
+                        if ready < 0 {
+                            if errno == EINTR { continue }
+                            break final
+                        }
+                        if ready == 0 {
+                            complete = true
+                            break final
+                        }
+                        // Read before judging the budget: a pipe that hits
+                        // end-of-file just as the budget runs out was read
+                        // completely, and only a read that returns data
+                        // after the budget is spent proves a writer is
+                        // still going (Codex on #175).
+                        let count = buffer.withUnsafeMutableBytes { raw -> Int in
+                            read(fd, raw.baseAddress, raw.count)
+                        }
+                        if count < 0 {
+                            if errno == EINTR { continue }
+                            break final
+                        }
+                        if count == 0 {
+                            complete = true
+                            break final
+                        }
+                        let overBudget = extra >= finalDrainLimit
+                        extra += count
+                        let chunk = Data(buffer[0..<count])
+                        accumulated.append(chunk)
+                        lineBuffer.append(chunk)
+                        while let newlineIndex = lineBuffer.firstIndex(of: newline) {
+                            let lineData = lineBuffer[lineBuffer.startIndex..<newlineIndex]
+                            onLine?(String(decoding: lineData, as: UTF8.self))
+                            lineBuffer.removeSubrange(lineBuffer.startIndex...newlineIndex)
+                        }
+                        if overBudget { break final }
+                    }
+                }
+
                 if !lineBuffer.isEmpty {
                     onLine?(String(decoding: lineBuffer, as: UTF8.self))
                 }
 
-                continuation.resume(returning: accumulated)
+                continuation.resume(returning: (accumulated, complete))
             }
         }
     }
@@ -601,7 +678,7 @@ public struct DefaultProcessRunner: ProcessRunning {
 /// A one-way boolean, safe to set from one concurrency domain and read from
 /// another. Used both for "the caller cancelled" and for "stop reading the
 /// pipes now".
-private final class AtomicFlag: @unchecked Sendable {
+final class AtomicFlag: @unchecked Sendable {
     private let lock = NSLock()
     private var value = false
 

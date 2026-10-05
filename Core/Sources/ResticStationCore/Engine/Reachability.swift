@@ -162,7 +162,9 @@ public struct Reachability: Sendable {
                 ),
                 timeout: Self.probeTimeout
             )
-            if outcome.status == .success {
+            // Exit 0 is the whole answer here, so a cut transcript (#150)
+            // still means the repository answered.
+            if outcome.status == .success || outcome.status == .successUnverified {
                 return ClassifiedProbe(result: .reachable, secretError: nil)
             }
             // restic ran and reported a problem with the repository itself

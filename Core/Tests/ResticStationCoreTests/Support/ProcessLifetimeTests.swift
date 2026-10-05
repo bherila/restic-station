@@ -359,6 +359,80 @@ struct ProcessLifetimeTests {
             elapsed < 10,
             "returned after \(elapsed)s; the descendant was waited out, and because the deadline never fired this came back as a late success"
         )
+        // An idle holder cut nothing: the pipe was empty when the drain
+        // stopped (#150). This is the `ssh` ControlPersist shape, and
+        // flagging it would mark every such sftp run unverified.
+        #expect(result.outputComplete)
+    }
+
+    /// #150, the property that protects restic's own output: everything
+    /// already in the pipe when the drain stops is collected, even by a
+    /// reader that never got to run before the stop (a starved reader), and
+    /// with the write end still held open by a descendant.
+    @Test("a stopped reader still collects what is already in the pipe, and calls that complete")
+    func stoppedReaderCollectsBufferedOutput() async throws {
+        var ends: [Int32] = [0, 0]
+        try #require(pipe(&ends) == 0)
+        defer { close(ends[1]) }
+        let payload = String(repeating: "restic line\n", count: 3000) // ~36 KiB
+        _ = payload.utf8CString.withUnsafeBufferPointer { write(ends[1], $0.baseAddress, payload.utf8.count) }
+        let stop = AtomicFlag()
+        stop.set()
+
+        let result = await DefaultProcessRunner.readPipeToCompletion(ends[0], onLine: nil, stop: stop)
+        close(ends[0])
+
+        #expect(String(decoding: result.data, as: UTF8.self) == payload)
+        #expect(result.complete, "the pipe was empty when reading stopped; nothing was cut")
+    }
+
+    /// Codex on #175: end-of-file reached just as the budget is spent is a
+    /// complete read, not a cut one.
+    @Test("end-of-file right after the final read's budget is spent is complete")
+    func endOfFileAfterBudgetIsComplete() async throws {
+        var ends: [Int32] = [0, 0]
+        try #require(pipe(&ends) == 0)
+        let payload = String(repeating: "x", count: 100)
+        _ = payload.utf8CString.withUnsafeBufferPointer { write(ends[1], $0.baseAddress, payload.utf8.count) }
+        close(ends[1])
+        let stop = AtomicFlag()
+        stop.set()
+
+        let result = await DefaultProcessRunner.readPipeToCompletion(ends[0], onLine: nil, stop: stop, finalDrainLimit: 10)
+        close(ends[0])
+
+        #expect(String(decoding: result.data, as: UTF8.self) == payload)
+        #expect(result.complete)
+    }
+
+    @Test("data still pending when the final read's budget runs out is incomplete")
+    func pendingDataBeyondBudgetIsIncomplete() async throws {
+        var ends: [Int32] = [0, 0]
+        try #require(pipe(&ends) == 0)
+        defer { close(ends[1]) }
+        let payload = "more\n"
+        _ = payload.utf8CString.withUnsafeBufferPointer { write(ends[1], $0.baseAddress, payload.utf8.count) }
+        let stop = AtomicFlag()
+        stop.set()
+
+        let result = await DefaultProcessRunner.readPipeToCompletion(ends[0], onLine: nil, stop: stop, finalDrainLimit: 0)
+        close(ends[0])
+
+        #expect(!result.complete)
+    }
+
+    @Test("output read to end-of-file is complete")
+    func outputToEOFIsComplete() async throws {
+        let result = try await Self.runner().run(
+            ["/bin/sh", "-c", "echo one; echo two >&2"],
+            env: nil,
+            stdin: nil,
+            currentDirectory: nil,
+            onStdoutLine: nil,
+            onStderrLine: nil,
+            timeout: 20
+        )
+        #expect(result.outputComplete)
     }
 
     /// The mirror image: the deadline fires and the direct child is stopped,

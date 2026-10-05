@@ -26,6 +26,9 @@ final class FakeProcessRunner: ProcessRunning, @unchecked Sendable {
         /// Runs when this expectation is consumed, before it answers — how a
         /// test changes the world *during* a child process.
         let onRun: (@Sendable () -> Void)?
+        /// `ProcessResult.outputComplete` (#150): false stands for a drain
+        /// that expired with a descendant still holding a pipe.
+        let outputComplete: Bool
 
         init(
             argvPrefix: [String],
@@ -34,7 +37,8 @@ final class FakeProcessRunner: ProcessRunning, @unchecked Sendable {
             exitCode: Int32 = 0,
             delay: TimeInterval? = nil,
             failure: ProcessRunnerError? = nil,
-            onRun: (@Sendable () -> Void)? = nil
+            onRun: (@Sendable () -> Void)? = nil,
+            outputComplete: Bool = true
         ) {
             self.argvPrefix = argvPrefix
             self.stdoutLines = stdoutLines
@@ -43,6 +47,7 @@ final class FakeProcessRunner: ProcessRunning, @unchecked Sendable {
             self.delay = delay
             self.failure = failure
             self.onRun = onRun
+            self.outputComplete = outputComplete
         }
     }
 
@@ -142,7 +147,12 @@ final class FakeProcessRunner: ProcessRunning, @unchecked Sendable {
         }
         let stderrData = Data(expectation.stderr.utf8)
 
-        return ProcessResult(exitCode: expectation.exitCode, stdout: stdoutData, stderr: stderrData)
+        return ProcessResult(
+            exitCode: expectation.exitCode,
+            stdout: stdoutData,
+            stderr: stderrData,
+            outputComplete: expectation.outputComplete
+        )
     }
 
     private func withLock<T>(_ body: () -> T) -> T {

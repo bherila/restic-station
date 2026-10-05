@@ -1381,6 +1381,11 @@ public final class BackupEngine: Sendable {
                     return .completed(.success)
                 case .warningIncompleteRead:
                     return .completed(.warning)
+                case .successUnverified:
+                    // A preview is its transcript, and the helper mints the
+                    // destructive confirmation from any completed dry run.
+                    // A cut one must not authorize anything (#150).
+                    return .failed(.restic(outcome.status))
                 case .fatal, .repoDoesNotExist, .repoLocked, .wrongPassword, .other:
                     // Every failing exit class keeps its own identity in the
                     // typed result; enumerated (no `default`) so a new
@@ -3313,6 +3318,19 @@ public final class BackupEngine: Sendable {
                     status = .success
                 }
             case .warningIncompleteRead:
+                status = .warning
+                errorSummary = outcome.status.userFacingMessage
+            case .successUnverified where kind == .purge:
+                // A destructive rewrite whose transcript was cut (#150): the
+                // rewrite mapping that proves which snapshots now exist is
+                // not there, so the outcome is indeterminate. This is the
+                // same audit failure as an unparseable rewrite summary.
+                status = .failed
+                auditFailureReason = .repositoryOutcomeUnknown
+                errorSummary = "operation_completed_audit_failed — purge transcript is incomplete"
+            case .successUnverified:
+                // Exit 0 is real, so this is not a failure; but the
+                // transcript cannot vouch for the run (#150).
                 status = .warning
                 errorSummary = outcome.status.userFacingMessage
             case .fatal, .repoDoesNotExist, .repoLocked, .wrongPassword, .other:

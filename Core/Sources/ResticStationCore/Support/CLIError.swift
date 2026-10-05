@@ -947,6 +947,12 @@ extension CLIFailure {
         case .fatal:
             code = .resticFailed
             resticExitCode = 1
+        case .successUnverified:
+            // restic exited 0, but the output a caller needed was cut by the
+            // bounded drain (#150). A local process-plumbing failure, not
+            // restic's; the real exit code is kept.
+            code = .internalError
+            resticExitCode = 0
         case .success, .warningIncompleteRead:
             // Not failures. Reaching here means a caller asked for a
             // classification of something that succeeded; say so plainly
