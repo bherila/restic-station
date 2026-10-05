@@ -34,6 +34,31 @@ import Testing
         (.backendFailed("locked"), false),
     ]
 
+    @Test("every read after the pre-flight gives the pre-flight's answer and record")
+    func everyReadMatchesThePreflight() async throws {
+        for operation in try Self.operations() {
+            let total = try await Self.readCount(operation)
+            #expect(total >= 2, "\(operation.name): only \(total) read(s) — nothing after the pre-flight to sweep")
+            for (error, refuses) in Self.errors {
+                let reference = try await Self.run(operation, failingAfter: 0, with: error).label
+                for reads in 1..<max(total, 1) {
+                    let (label, env) = try await Self.run(operation, failingAfter: reads, with: error)
+                    #expect(
+                        label == reference,
+                        "\(operation.name), \(error), failing from read \(reads + 1) of \(total)"
+                    )
+                    if refuses {
+                        #expect(
+                            env.stateStore.readSecretAttention(destId: T.primaryId)?.attention == .secretStoreUnusable,
+                            "\(operation.name): no attention recorded for a refusal at read \(reads + 1) of \(total)"
+                        )
+                    }
+                    env.cleanUp()
+                }
+            }
+        }
+    }
+
     @Test("a run-history failure outranks a secret failure inside the same run")
     func runHistoryFailureOutranksSecret() async throws {
         var covered = 0
