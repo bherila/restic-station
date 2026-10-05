@@ -85,6 +85,21 @@ public final class ProcessLeases: @unchecked Sendable {
     }
 }
 
+/// For a launch this process makes outside ``DefaultProcessRunner``, such
+/// as the app's `Foundation.Process` children (#156).
+///
+/// A ``DefaultProcessRunner`` spawn briefly changes this *process's*
+/// dataless-file policy, and any child launched in that window inherits it
+/// for life. A launch made inside ``run(_:)`` holds the same lock as those
+/// spawns, so it never lands in that window. `body` must only launch: it
+/// must not itself spawn through ``DefaultProcessRunner``, because the lock
+/// is not reentrant.
+public enum SpawnSerialization {
+    public static func run<T>(_ body: () throws -> T) rethrows -> T {
+        try OwnedProcess.withSpawnLock(body)
+    }
+}
+
 /// A child process this process spawned and reaps itself (#114), in its own
 /// process group.
 ///
@@ -337,6 +352,12 @@ final class OwnedProcess: @unchecked Sendable {
     // MARK: - posix_spawn
 
     private static let spawnLock = NSLock()
+
+    static func withSpawnLock<T>(_ body: () throws -> T) rethrows -> T {
+        spawnLock.lock()
+        defer { spawnLock.unlock() }
+        return try body()
+    }
 
     /// Runs `spawn` with this process's dataless-file policy set as `reads`
     /// asks, then puts back the policy it found (#156).

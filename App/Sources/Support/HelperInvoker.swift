@@ -214,7 +214,8 @@ public struct HelperInvoker: Sendable {
         process.standardInput = stdinPipe
 
         do {
-            try process.run()
+            // Outside any DefaultProcessRunner policy window (#156).
+            try SpawnSerialization.run { try process.run() }
         } catch {
             return HelperInvocation(
                 result: .failed(output: "Could not start the helper: \(error.localizedDescription)"),

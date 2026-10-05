@@ -176,7 +176,8 @@ public final class LaunchdManager: ObservableObject {
             // blocks the main actor, and we deliberately do NOT
             // `waitUntilExit()`: `kickstart` returns as soon as launchd has
             // accepted the request, but we don't need even that.
-            try process.run()
+            // Outside any DefaultProcessRunner policy window (#156).
+            try SpawnSerialization.run { try process.run() }
             lastKickstartError = nil
         } catch {
             lastKickstartError = "launchctl kickstart failed: \(error.localizedDescription)"
