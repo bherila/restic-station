@@ -386,6 +386,25 @@ struct ProcessLifetimeTests {
         #expect(result.complete, "the pipe was empty when reading stopped; nothing was cut")
     }
 
+    /// Codex on #175: end-of-file reached just as the budget is spent is a
+    /// complete read, not a cut one.
+    @Test("end-of-file right after the final read's budget is spent is complete")
+    func endOfFileAfterBudgetIsComplete() async throws {
+        var ends: [Int32] = [0, 0]
+        try #require(pipe(&ends) == 0)
+        let payload = String(repeating: "x", count: 100)
+        _ = payload.utf8CString.withUnsafeBufferPointer { write(ends[1], $0.baseAddress, payload.utf8.count) }
+        close(ends[1])
+        let stop = AtomicFlag()
+        stop.set()
+
+        let result = await DefaultProcessRunner.readPipeToCompletion(ends[0], onLine: nil, stop: stop, finalDrainLimit: 10)
+        close(ends[0])
+
+        #expect(String(decoding: result.data, as: UTF8.self) == payload)
+        #expect(result.complete)
+    }
+
     @Test("data still pending when the final read's budget runs out is incomplete")
     func pendingDataBeyondBudgetIsIncomplete() async throws {
         var ends: [Int32] = [0, 0]

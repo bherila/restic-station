@@ -632,7 +632,11 @@ public struct DefaultProcessRunner: ProcessRunning {
                             complete = true
                             break final
                         }
-                        guard extra < finalDrainLimit else { break final }
+                        // Read before judging the budget: a pipe that hits
+                        // end-of-file just as the budget runs out was read
+                        // completely, and only a read that returns data
+                        // after the budget is spent proves a writer is
+                        // still going (Codex on #175).
                         let count = buffer.withUnsafeMutableBytes { raw -> Int in
                             read(fd, raw.baseAddress, raw.count)
                         }
@@ -644,6 +648,7 @@ public struct DefaultProcessRunner: ProcessRunning {
                             complete = true
                             break final
                         }
+                        let overBudget = extra >= finalDrainLimit
                         extra += count
                         let chunk = Data(buffer[0..<count])
                         accumulated.append(chunk)
@@ -653,6 +658,7 @@ public struct DefaultProcessRunner: ProcessRunning {
                             onLine?(String(decoding: lineData, as: UTF8.self))
                             lineBuffer.removeSubrange(lineBuffer.startIndex...newlineIndex)
                         }
+                        if overBudget { break final }
                     }
                 }
 
