@@ -110,4 +110,25 @@ import Testing
 
         #expect(result == .failed(.restic(.successUnverified)), "got \(result)")
     }
+
+    /// Codex on #175: the helper's restore warning now defers to the run
+    /// log for the reason, so the run record must carry the real one, not
+    /// the per-file-error wording.
+    @Test("a cut restore is a warning whose run record says it could not be verified")
+    func restoreRecordsTheRealReason() async throws {
+        let env = T.makeEnv(script: [], reachableSecondaries: [])
+        defer { env.cleanUp() }
+        env.fake.script = [
+            .init(argvPrefix: [env.resticPath, "-r", env.primary.repoURL, "restore"], outputComplete: false),
+        ]
+
+        let outcome = await env.engine.runRestore(request: RestoreRequest(
+            destId: T.primaryId, snapshotID: "abc123", targetPath: "/tmp/target"
+        ))
+
+        #expect(outcome == .completed(.warning))
+        let restore = try #require(env.entries(kind: .restore).first)
+        #expect(restore.errorSummary?.contains("could not be verified") == true, "\(restore.errorSummary ?? "nil")")
+        #expect(restore.errorSummary?.contains("could not be restored") != true)
+    }
 }
