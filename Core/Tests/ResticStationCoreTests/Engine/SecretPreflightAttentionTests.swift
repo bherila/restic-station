@@ -344,4 +344,21 @@ import Testing
         // refusal must leave one behind for health and status.
         #expect(env.stateStore.readSecretAttention(destId: T.primaryId)?.attention == .secretStoreUnusable)
     }
+
+    // MARK: - #169 review: the remaining post-pre-flight sites
+
+    @Test("purge preview: a transient failure after the pre-flight is secret_unavailable, not failed")
+    func purgePreviewTransientAfterPreflight() async throws {
+        let env = T.makeEnv(script: [], purgeExcludes: ["secret.key"])
+        defer { env.cleanUp() }
+        env.fake.script = Self.anything
+        env.secrets.failSecretEnv(for: T.primaryId, afterReads: 1, with: .backendFailed("locked"))
+
+        let result = await env.engine.previewPurge(
+            set: env.set, destination: env.primary, executable: try env.requireResticExecutable()
+        )
+
+        #expect(result.status == .secretUnavailable, "got \(result.status)")
+    }
+
 }

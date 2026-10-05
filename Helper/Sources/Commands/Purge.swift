@@ -201,7 +201,13 @@ struct PurgePreview: AsyncParsableCommand, JSONRenderable {
         case .secretStoreUnusable:
             throw Self.attentionFailure(.secretStoreUnusable, result: result, setId: setId, destination: destination)
         case .cloudRepositoryNotHydrated:
-            throw Self.attentionFailure(.cloudRepositoryNotHydrated, result: result, setId: setId, destination: destination)
+            throw Self.attentionFailure(.cloudRepositoryNotHydrated, result: result, setId: setId, destination: destination)        case .secretUnavailable:
+            // Restic never ran and a retry may succeed (#152).
+            throw CLIFailure(
+                code: .secretUnavailable,
+                message: CLIFailure.bounded(result.message ?? "Could not read the repository secret. Try again."),
+                details: CLIErrorDetails(setId: setId, destinationId: destination.id)
+            )
         }
     }
 
@@ -257,7 +263,7 @@ struct PurgePreview: AsyncParsableCommand, JSONRenderable {
             }
             print("  space is not reclaimed until a prune runs")
         case .busy, .offline, .infrastructureFailure, .failed,
-             .secretNotConfigured, .secretStoreUnusable, .cloudRepositoryNotHydrated:
+             .secretNotConfigured, .secretStoreUnusable, .cloudRepositoryNotHydrated, .secretUnavailable:
             // These states are rejected before a report is printed.
             break
         }

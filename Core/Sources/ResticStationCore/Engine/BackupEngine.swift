@@ -1685,7 +1685,7 @@ public final class BackupEngine: Sendable {
             case .empty, .ready:
                 continue
             case .busy, .offline, .infrastructureFailure, .failed,
-                 .secretNotConfigured, .secretStoreUnusable, .cloudRepositoryNotHydrated:
+                 .secretNotConfigured, .secretStoreUnusable, .cloudRepositoryNotHydrated, .secretUnavailable:
                 return PurgePreviewSession(previews: previews, token: nil)
             }
         }
@@ -3889,8 +3889,10 @@ public final class BackupEngine: Sendable {
             return PurgePlanResult(plan: plan, status: .secretStoreUnusable, message: message)
         case .attention(.cloudRepositoryNotHydrated, _):
             return PurgePlanResult(plan: plan, status: .cloudRepositoryNotHydrated, message: message)
-        case .secretUnavailable, nil:
-            return PurgePlanResult(plan: plan, status: .failed, message: "secret store unavailable")
+        case .secretUnavailable:
+            return PurgePlanResult(plan: plan, status: .secretUnavailable, message: message)
+        case nil:
+            return PurgePlanResult(plan: plan, status: .failed, message: message)
         }
     }
 
