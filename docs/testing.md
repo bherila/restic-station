@@ -70,8 +70,13 @@ out". `DefaultProcessRunner` therefore takes its two graces as an internal
 initializer parameter; these tests pass 1 s and finish in ~3 s with bounds
 that are tight enough to mean something. `stopSequenceGracesAreTenSecondsInProduction`
 guards the seam, so shrinking graces for tests cannot quietly become the
-shipped values. The children sleep 60 s, far longer than any bound, so
-"waited the child out" can never pass.
+shipped values. The children sleep 60 s (`childLifetime`), so "waited the
+child out" can never pass. Every deadline test asserts the same 30 s bound
+(`stoppedBound`), halfway between the ~4 s worst nominal and the 60 s
+lifetime rather than near the nominal: bounds of 10–12 s flaked on the 3-core
+macOS runner, which starved a 1 s-deadline run to 10.7 s (#173).
+`stoppedBoundSeparatesTheOutcomes` keeps the bound at most half the lifetime
+and the lifetime within the tests' one-minute time limit.
 
 **An elapsed bound is not optional on a timeout test.** `#expect(throws:)`
 alone passes identically whether the deadline stopped the child or was merely
