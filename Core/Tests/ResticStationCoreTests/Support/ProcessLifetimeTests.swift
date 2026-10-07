@@ -32,6 +32,29 @@ struct ProcessLifetimeTests {
         DefaultProcessRunner(terminationGrace: 1, drainGrace: 1)
     }
 
+    /// How long the children that must be stopped would live if nobody
+    /// stopped them. "Waited out" therefore means returning at about this.
+    private static let childLifetime: TimeInterval = 60
+
+    /// The one elapsed bound every deadline test here asserts. It only has to
+    /// separate "stopped at the deadline" (~1 s deadline plus up to three 1 s
+    /// graces, ~4 s) from "waited out" (`childLifetime`), so it sits halfway
+    /// between rather than close to the nominal: the 3-core macOS runner has
+    /// starved a 1 s-deadline run past 10 s (#173), and a tight bound measures
+    /// the runner, not the contract.
+    private static let stoppedBound: TimeInterval = 30
+
+    /// Keeps the two constants above meaning something. A bound that creeps
+    /// toward the lifetime stops distinguishing the outcomes, and a lifetime
+    /// past the one-minute time limit turns "waited out" from a failed
+    /// assertion into a cancelled test that names nothing.
+    @Test("the elapsed bound still separates a stopped child from a waited-out one")
+    func stoppedBoundSeparatesTheOutcomes() {
+        #expect(Self.stoppedBound * 2 <= Self.childLifetime)
+        #expect(Self.stoppedBound >= 20, "leave the starved macOS runner its margin (#173)")
+        #expect(Self.childLifetime <= 60)
+    }
+
     /// The production graces are the documented ones. Guards the seam above:
     /// shrinking graces for tests must not quietly become the shipped values.
     @Test("the stop sequence's graces are 10s in production")
@@ -146,7 +169,7 @@ struct ProcessLifetimeTests {
 
         await #expect(throws: ProcessRunnerError.timeout) {
             _ = try await Self.runner().run(
-                ["/bin/sh", "-c", "exec 1>&- 2>&-; sleep 60"],
+                ["/bin/sh", "-c", "exec 1>&- 2>&-; sleep \(Int(Self.childLifetime))"],
                 env: nil,
                 stdin: nil,
                 currentDirectory: nil,
@@ -157,7 +180,7 @@ struct ProcessLifetimeTests {
         }
 
         let elapsed = Date().timeIntervalSince(started)
-        #expect(elapsed < 10, "returned after \(elapsed)s; the child was waited out rather than stopped at the deadline")
+        #expect(elapsed < Self.stoppedBound, "returned after \(elapsed)s; the child was waited out rather than stopped at the deadline")
     }
 
     /// The stop sequence must actually **end the child**, not merely stop
@@ -305,7 +328,7 @@ struct ProcessLifetimeTests {
 
         await #expect(throws: ProcessRunnerError.timeout) {
             _ = try await Self.runner().run(
-                ["/bin/sh", "-c", "trap '' INT; sleep 60"],
+                ["/bin/sh", "-c", "trap '' INT; sleep \(Int(Self.childLifetime))"],
                 env: nil,
                 stdin: nil,
                 currentDirectory: nil,
@@ -316,7 +339,7 @@ struct ProcessLifetimeTests {
         }
 
         let elapsed = Date().timeIntervalSince(started)
-        #expect(elapsed < 12, "returned after \(elapsed)s; nothing bounded the wait for a child that survives SIGINT")
+        #expect(elapsed < Self.stoppedBound, "returned after \(elapsed)s; nothing bounded the wait for a child that survives SIGINT")
     }
 
     /// The case the elapsed bounds elsewhere structurally cannot reach: the
@@ -344,7 +367,7 @@ struct ProcessLifetimeTests {
         let started = Date()
 
         let result = try await Self.runner().run(
-            ["/bin/sh", "-c", "sleep 30 & exit 0"],
+            ["/bin/sh", "-c", "sleep \(Int(Self.childLifetime)) & exit 0"],
             env: nil,
             stdin: nil,
             currentDirectory: nil,
@@ -356,7 +379,7 @@ struct ProcessLifetimeTests {
         let elapsed = Date().timeIntervalSince(started)
         #expect(result.exitCode == 0)
         #expect(
-            elapsed < 10,
+            elapsed < Self.stoppedBound,
             "returned after \(elapsed)s; the descendant was waited out, and because the deadline never fired this came back as a late success"
         )
         // An idle holder cut nothing: the pipe was empty when the drain
@@ -445,7 +468,7 @@ struct ProcessLifetimeTests {
 
         await #expect(throws: ProcessRunnerError.timeout) {
             _ = try await Self.runner().run(
-                ["/bin/sh", "-c", "sleep 60 & sleep 60"],
+                ["/bin/sh", "-c", "sleep \(Int(Self.childLifetime)) & sleep \(Int(Self.childLifetime))"],
                 env: nil,
                 stdin: nil,
                 currentDirectory: nil,
@@ -456,7 +479,7 @@ struct ProcessLifetimeTests {
         }
 
         let elapsed = Date().timeIntervalSince(started)
-        #expect(elapsed < 12, "returned after \(elapsed)s; the descendant holding the pipes was waited out")
+        #expect(elapsed < Self.stoppedBound, "returned after \(elapsed)s; the descendant holding the pipes was waited out")
     }
 }
 
