@@ -399,12 +399,24 @@ final class ExclusionsSettingsModel: ObservableObject {
         // operator's extra patterns and disabled groups in it.
         hasPendingEdit = false
         do {
-            // A compare-and-swap, like every other write from this pane.
-            // The lock keeps two writers from interleaving but does not stop
-            // a lost update: an `excludes disable …` run after this pane
-            // loaded would otherwise be deleted outright, silently
-            // re-enabling the group it had turned off.
-            try store.removeSettings(ifUnchangedFrom: fingerprint)
+            if loadFailure == nil {
+                // A compare-and-swap, like every other write from this
+                // pane. The lock keeps two writers from interleaving but
+                // does not stop a lost update: an `excludes disable …` run
+                // after this pane loaded would otherwise be deleted
+                // outright, silently re-enabling the group it had turned
+                // off.
+                try store.removeSettings(ifUnchangedFrom: fingerprint)
+            } else {
+                // The pane never read the file it is showing a failure for
+                // (malformed, oversized, not a regular file), so it has no
+                // snapshot to compare against, and the comparison would
+                // refuse or rethrow the read error. This button is then the
+                // only in-app way out of a state where every backup
+                // refuses, so it removes the file unconditionally, as
+                // `excludes reset` does.
+                try store.removeSettings()
+            }
             settings = .default
             persistedExcludeLargerThan = nil
             fingerprint = nil
