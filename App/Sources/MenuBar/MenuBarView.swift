@@ -140,6 +140,7 @@ enum MenuBarCopy {
             case .secretStoreUnusable:
                 return "\(health.name) — skipped: secrets unreadable ⚠"
             case .cloudRepositoryNotHydrated:
+                // Not recorded as attention yet, so not reached (#180).
                 return "\(health.name) — skipped: repository not downloaded ⚠"
             }
         }
