@@ -1042,8 +1042,17 @@ public struct GlobalExcludeSettings: Codable, Equatable, Sendable {
         for id in groups.keys.sorted() where !known.contains(id) {
             throw GlobalExcludeError.unknownGroup(id, known: GlobalExcludeCatalog.groupIDs)
         }
-        for (index, pattern) in extraPatterns.enumerated() where pattern.isEmpty {
-            throw GlobalExcludeError.emptyExtraPattern(index: index)
+        for (index, pattern) in extraPatterns.enumerated() {
+            if pattern.isEmpty {
+                throw GlobalExcludeError.emptyExtraPattern(index: index)
+            }
+            // These follow a set's purge rules in one `--exclude` list, and
+            // restic lets a later negation re-include what an earlier pattern
+            // excluded: a purged file would return in every new snapshot
+            // while the watermark says the purge is done.
+            if pattern.hasPrefix("!") {
+                throw GlobalExcludeError.negatedExtraPattern(index: index, pattern: pattern)
+            }
         }
         if let excludeLargerThan, !Self.isValidSize(excludeLargerThan) {
             throw GlobalExcludeError.invalidSize(excludeLargerThan)
@@ -1087,6 +1096,11 @@ public enum GlobalExcludeError: Error, Equatable, Sendable, CustomStringConverti
     case unknownGroup(String, known: [String])
     /// An empty string in `extraPatterns`.
     case emptyExtraPattern(index: Int)
+    /// An `extraPatterns` entry starts with `!`. Host patterns follow a set's
+    /// purge rules in the same `--exclude` list, where restic lets a later
+    /// negation re-include what an earlier pattern excluded, so one could
+    /// bring a purged file back into new snapshots.
+    case negatedExtraPattern(index: Int, pattern: String)
     /// `excludeLargerThan` is not restic's `<digits>[kKmMgGtT]` size form.
     case invalidSize(String)
     /// The file changed underneath an editor that had already loaded it.
@@ -1137,6 +1151,10 @@ public enum GlobalExcludeError: Error, Equatable, Sendable, CustomStringConverti
         case .emptyExtraPattern(let index):
             return "global-excludes.json has an empty extraPatterns entry at position \(index) — "
                 + "remove it or give it a real path or glob"
+        case .negatedExtraPattern(let index, let pattern):
+            return "global-excludes.json has a negated extraPatterns entry \"\(pattern)\" at position \(index) — "
+                + "a leading ! would re-include files a set's purge rules removed; remove it, or turn the "
+                + "list off for the set that needs those files (usesGlobalExcludes: false)"
         case .invalidSize(let size):
             return "global-excludes.json has an invalid excludeLargerThan \"\(size)\" — it must be "
                 + "a number optionally followed by k, m, g or t (for example \"500m\" or \"10G\")"

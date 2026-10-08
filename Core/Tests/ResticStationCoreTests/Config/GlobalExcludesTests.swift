@@ -662,6 +662,39 @@ import Musl
         settings.extraPatterns = ["*.iso", ""]
         #expect(throws: GlobalExcludeError.self) { try settings.validate() }
     }
+
+    /// The nearest constraint on host patterns is the purge watermark
+    /// (`docs/data-model.md` §purgeExcludes): an applied purge rule must not
+    /// reappear in a snapshot this host writes later. Host patterns ride the
+    /// same `--exclude` flag list as a set's purge rules, after them, and
+    /// restic lets a later `!` pattern re-include what an earlier one in that
+    /// list excluded. So a negation is refused when saved and when read.
+    @Test(arguments: ["!*.key", "!important.key", "!/Users/me/secret"])
+    func aNegatedExtraPatternIsRefused(pattern: String) throws {
+        var settings = GlobalExcludeSettings()
+        settings.extraPatterns = ["*.iso", pattern]
+        #expect(throws: GlobalExcludeError.negatedExtraPattern(index: 1, pattern: pattern)) {
+            try settings.validate()
+        }
+
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-excludes-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = AppPaths(root: root)
+        try FileManager.default.createDirectory(
+            at: paths.globalExcludesFile.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        let json = #"{"version":1,"extraPatterns":["*.iso","\#(pattern)"]}"#
+        try Data(json.utf8).write(to: paths.globalExcludesFile)
+        #expect(throws: GlobalExcludeError.self) { try GlobalExcludeStore(paths: paths).load() }
+    }
+
+    /// Only a leading `!` negates. A `!` elsewhere is an ordinary character.
+    @Test func aBangInsideAnExtraPatternIsAllowed() throws {
+        var settings = GlobalExcludeSettings()
+        settings.extraPatterns = ["build!old", "*.bak!"]
+        try settings.validate()
+    }
 }
 
 // MARK: - Store
