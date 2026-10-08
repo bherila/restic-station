@@ -2751,9 +2751,9 @@ public final class BackupEngine: Sendable {
         case .tagged(let directory)?:
             cacheTagNote = " (--exclude-caches held back: \(directory)/CACHEDIR.TAG marks a source or a "
                 + "directory above one, and restic would leave that source out of the snapshot)"
-        case .unverifiable(let directory, let code)?:
+        case .unverifiable(let directory, let reason)?:
             cacheTagNote = " (--exclude-caches held back: could not read \(directory)/CACHEDIR.TAG "
-                + "(errno \(code)), so a tag that would leave a source out cannot be ruled out)"
+                + "(\(reason)), so a tag that would leave a source out cannot be ruled out)"
         }
         return "global excludes: \(applied) pattern(s)\(suffix) "
             + "from this machine's global exclusion list\(heldBack)\(ancestorNote)\(cacheTagNote)"

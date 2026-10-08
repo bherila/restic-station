@@ -71,12 +71,40 @@ import Musl
         #expect(CacheDirTag.finding(atOrAbove: link.path) == .tagged(directory: cache.path))
     }
 
-    /// A FIFO named `CACHEDIR.TAG` must not hang the backup about to start.
-    @Test(.timeLimit(.minutes(1))) func aFIFONamedLikeATagDoesNotBlock() throws {
+    /// A FIFO named `CACHEDIR.TAG` must not hang this check, and must hold
+    /// the flag back: restic 0.18.1 opens a tag blocking and would wait for
+    /// a writer forever. Same for a symlink to one. Codex on #158.
+    @Test(.timeLimit(.minutes(1))) func aFIFONamedLikeATagHoldsTheFlagBackWithoutBlocking() throws {
         let root = try makeTree()
         defer { try? FileManager.default.removeItem(at: root) }
         let source = root.appendingPathComponent("plain/project")
         #expect(mkfifo(source.appendingPathComponent("CACHEDIR.TAG").path, 0o600) == 0)
-        #expect(CacheDirTag.finding(atOrAbove: source.path) == nil)
+        #expect(CacheDirTag.finding(atOrAbove: source.path)
+            == .unverifiable(directory: source.path, reason: "not a regular file"))
+
+        let fifo = root.appendingPathComponent("fifo")
+        #expect(mkfifo(fifo.path, 0o600) == 0)
+        let linked = root.appendingPathComponent("cache/project")
+        try FileManager.default.createSymbolicLink(
+            at: linked.appendingPathComponent("CACHEDIR.TAG"), withDestinationURL: fifo
+        )
+        #expect(CacheDirTag.finding(atOrAbove: linked.path)
+            == .unverifiable(directory: linked.path, reason: "not a regular file"))
+    }
+
+    /// The nearest independent constraint for that change: a *directory*
+    /// named `CACHEDIR.TAG` is not a regular file either, and restic cannot
+    /// read it as a tag, but it is treated the same way (held back), which
+    /// is the safe direction. A plain file without the signature is still
+    /// ignored, as `aTagBelowTheSourceOrWithoutTheSignatureIsIgnored` pins.
+    @Test func aDirectoryNamedLikeATagIsNotRuledOut() throws {
+        let root = try makeTree()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appendingPathComponent("plain/project")
+        try FileManager.default.createDirectory(
+            at: source.appendingPathComponent("CACHEDIR.TAG"), withIntermediateDirectories: false
+        )
+        #expect(CacheDirTag.finding(atOrAbove: source.path)
+            == .unverifiable(directory: source.path, reason: "not a regular file"))
     }
 }
