@@ -972,7 +972,7 @@ This host's global exclusion list (§global-excludes.json). Host-local — `--ma
   "excludeLargerThan": null,
   "platform": "macOS",
   "catalogVersion": 12,
-  "savedCatalogVersion": 11,
+  "savedCatalogVersion": 12,
   "groups": [
     {
       "id": "browser-caches",
