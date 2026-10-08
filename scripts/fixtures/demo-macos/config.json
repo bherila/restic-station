@@ -28,7 +28,8 @@
       "retention" : { "keepDaily" : 7, "keepLast" : 5, "keepMonthly" : 12, "keepWeekly" : 5, "keepYearly" : 3 },
       "schedule" : { "hour" : 2, "kind" : "daily", "minute" : 30 },
       "sources" : ["/Users/demo/Documents", "/Users/demo/Projects"],
-      "stalenessWarningDays" : 14
+      "stalenessWarningDays" : 14,
+      "usesGlobalExcludes" : true
     },
     {
       "checkPolicy" : null,
@@ -49,7 +50,8 @@
       "retention" : null,
       "schedule" : { "hour" : 3, "kind" : "weekly", "minute" : 0, "weekday" : 1 },
       "sources" : ["/Users/demo/Pictures/Photos Library.photoslibrary"],
-      "stalenessWarningDays" : 3
+      "stalenessWarningDays" : 3,
+      "usesGlobalExcludes" : true
     },
     {
       "checkPolicy" : null,
@@ -70,9 +72,10 @@
       "retention" : { "keepDaily" : 14, "keepLast" : 10, "keepMonthly" : 12, "keepWeekly" : 8, "keepYearly" : 5 },
       "schedule" : { "kind" : "hourly", "minute" : 15 },
       "sources" : ["/Users/demo/Desktop", "/Users/demo/Library/Mail", "/Users/demo/Library/Messages"],
-      "stalenessWarningDays" : 14
+      "stalenessWarningDays" : 14,
+      "usesGlobalExcludes" : true
     }
   ],
   "showMenuBarIcon" : true,
-  "version" : 4
+  "version" : 5
 }

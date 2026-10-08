@@ -8,8 +8,8 @@ import Glibc
 import Musl
 #endif
 
-/// Crash-durable writes for `config.json`, `machine.json` and the migration
-/// backups (#159).
+/// Crash-durable writes for `config.json`, `machine.json`, the migration
+/// backups (#159) and `global-excludes.json`.
 ///
 /// `rename(2)` is atomic for *readers* — nobody sees a half-written file —
 /// and that is all it promises. After a power cut the target can come back
@@ -114,15 +114,27 @@ enum DurableFile {
         }
     }
 
-    /// Syncs the directory holding an already-installed file, reporting a
-    /// failure on stderr instead of throwing (see the type's note).
-    static func syncDirectoryAfterInstall(of url: URL) {
+    /// Removes `url` and syncs its directory, so a reboot cannot resurrect
+    /// a file a caller reported removed. An absent file is not an error.
+    /// The unlink is the commit point, as the rename is for a write: a
+    /// directory sync that fails after it is reported, not thrown.
+    static func remove(_ url: URL) throws {
+        if unlink(url.path) != 0, errno != ENOENT {
+            throw LockFailure(path: url.path, operation: "unlink", errnoValue: errno)
+        }
+        syncDirectoryAfterInstall(of: url, removed: true)
+    }
+
+    /// Syncs the directory holding an already-installed (or just-removed)
+    /// file, reporting a failure on stderr instead of throwing (see the
+    /// type's note).
+    static func syncDirectoryAfterInstall(of url: URL, removed: Bool = false) {
         do {
             try syncDirectory(of: url)
         } catch {
             StandardStream.write(
-                Data(("restic-station: \(url.path) is saved, but syncing its directory to disk failed "
-                    + "(\(error)); it may not survive a power loss\n").utf8),
+                Data(("restic-station: \(url.path) is \(removed ? "removed" : "saved"), but syncing its "
+                    + "directory to disk failed (\(error)); it may not survive a power loss\n").utf8),
                 to: .standardError
             )
         }

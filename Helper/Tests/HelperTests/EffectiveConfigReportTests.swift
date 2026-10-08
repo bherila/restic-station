@@ -182,3 +182,207 @@ struct EffectiveConfigReportTests {
         #expect(text.contains("\"purgeExcludes\" : [\n        \"node_modules\"\n      ]"))
     }
 }
+
+// MARK: - Global exclusions
+
+/// `config show`/`config validate` report the **fleet-wide** half of the
+/// global exclusion list — whether a set applies it — and deliberately not
+/// the host-local list itself (`docs/data-model.md` §global-excludes.json).
+/// `excludes show` is the command for the list, and `GlobalExcludeReport`
+/// below is its payload.
+@Suite("Global exclusions in the effective plan")
+struct EffectiveConfigReportGlobalExcludesTests {
+
+    private let setId = UUID(uuidString: "6F9619FF-8B86-D011-B42D-000000000001")!
+    private let primaryId = UUID(uuidString: "0A1B2C3D-4E5F-4A1B-8C1D-000000000011")!
+
+    private func config(usesGlobalExcludes: Bool) -> AppConfig {
+        AppConfig(sets: [BackupSet(
+            id: setId,
+            name: "Build archive",
+            sources: ["/srv/artifacts"],
+            usesGlobalExcludes: usesGlobalExcludes,
+            schedule: .daily(hour: 2, minute: 30),
+            destinations: [
+                Destination(id: primaryId, label: "NAS", repoURL: "/mnt/nas/archive.restic", isPrimary: true),
+            ]
+        )])
+    }
+
+    private func report(usesGlobalExcludes: Bool) -> EffectiveConfigReport {
+        let config = config(usesGlobalExcludes: usesGlobalExcludes)
+        return EffectiveConfigReport.build(
+            addressable: config.addressable(for: "linux-nas"),
+            scheduled: config.resolved(for: "linux-nas")
+        )
+    }
+
+    @Test("usesGlobalExcludes is always in the --json payload, both ways round")
+    func theFlagIsAlwaysEncoded() throws {
+        for expected in [true, false] {
+            let data = try ConfigStore.makeEncoder().encode(report(usesGlobalExcludes: expected))
+            let object = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+            let sets = object?["sets"] as? [[String: Any]] ?? []
+            #expect(sets.count == 1)
+            #expect(sets.first?["usesGlobalExcludes"] as? Bool == expected)
+        }
+    }
+
+    /// The list applies everywhere by default, so saying so on every set
+    /// would be noise — but saying nothing when a set has opted out would
+    /// hide the one case where someone is surprised by what was backed up.
+    @Test("human output names the opt-out, and stays silent when the list applies")
+    func humanOutputOnlyMentionsTheOptOut() {
+        let optedIn = report(usesGlobalExcludes: true).humanLines().joined(separator: "\n")
+        #expect(!optedIn.contains("global excludes"))
+
+        let optedOut = report(usesGlobalExcludes: false).humanLines().joined(separator: "\n")
+        #expect(optedOut.contains("global excludes: opted out (usesGlobalExcludes: false)"))
+    }
+}
+
+// MARK: - excludes show
+
+@Suite("GlobalExcludeReport")
+struct GlobalExcludeReportTests {
+
+    private let path = URL(fileURLWithPath: "/data/global-excludes.json")
+
+    @Test("with no settings file, the report is the built-in defaults and says so")
+    func defaultsAreReportedAsSuch() {
+        let report = GlobalExcludeReport.build(settings: .default, path: path, exists: false, platform: .macOS)
+
+        #expect(!report.exists)
+        #expect(report.enabled)
+        #expect(report.excludeCaches)
+        // A size cap is opt-in; the default must never carry one.
+        #expect(report.excludeLargerThan == nil)
+        #expect(report.groups.count == GlobalExcludeCatalog.groups.count)
+        // `allPatterns` rather than `patterns`: the report's top-level list
+        // is what an applying set receives, which includes the
+        // cloud-placeholder patterns (the default carries no host patterns
+        // of its own, so the two differ by exactly those).
+        #expect(report.patterns == GlobalExcludeSettings.default.plan(on: .macOS).allPatterns)
+        #expect(report.cloudPlaceholderPatterns == ["*.icloud"])
+        #expect(report.platform == "macOS")
+        // Not "written against catalogue 0" — there is no file to have been
+        // written against an older one.
+        #expect(report.savedCatalogVersion == GlobalExcludeCatalog.version)
+
+        let lines = report.humanLines(includePatterns: false).joined(separator: "\n")
+        #expect(lines.contains("(not present — built-in defaults)"))
+        #expect(!lines.contains("note: this build carries catalogue version"))
+    }
+
+    @Test("a group changed on this machine is marked, and its state is the one that applies")
+    func aChangedGroupIsMarked() {
+        var settings = GlobalExcludeSettings()
+        settings.groups = ["browser-caches": false]
+        let report = GlobalExcludeReport.build(settings: settings, path: path, exists: true, platform: .macOS)
+
+        let browser = try? #require(report.groups.first { $0.id == "browser-caches" })
+        #expect(browser?.enabled == false)
+        #expect(browser?.enabledByDefault == true)
+        #expect(!report.patterns.contains("Library/Caches/Google/Chrome"))
+
+        let lines = report.humanLines(includePatterns: false).joined(separator: "\n")
+        #expect(lines.contains("[ ] browser-caches"))
+        #expect(lines.contains("(changed on this machine)"))
+    }
+
+    /// The placeholder patterns are reported in both places for a reason:
+    /// `patterns` is what nearly every set gets, and
+    /// `cloudPlaceholderPatterns` is the subset that a set with
+    /// `onlineOnlyFiles: "download"` does not — see `docs/data-model.md`
+    /// §Cloud placeholders. A script reading only `patterns` still sees the
+    /// common case correctly.
+    @Test("cloud placeholders appear in patterns and in their own list, and the human output says why")
+    func cloudPlaceholdersAreReportedTwice() throws {
+        let report = GlobalExcludeReport.build(settings: .default, path: path, exists: false, platform: .macOS)
+        #expect(report.cloudPlaceholderPatterns == ["*.icloud"])
+        #expect(report.patterns.contains("*.icloud"))
+
+        let data = try ConfigStore.makeEncoder().encode(report)
+        let object = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        #expect(object?["cloudPlaceholderPatterns"] as? [String] == ["*.icloud"])
+
+        let lines = report.humanLines(includePatterns: false).joined(separator: "\n")
+        #expect(lines.contains("match cloud placeholder stubs (*.icloud)"))
+        #expect(lines.contains("onlineOnlyFiles is \"download\""))
+    }
+
+    /// A build that added groups since the file was written must say so:
+    /// those groups are already applying, and a surprise exclusion with no
+    /// explanation is the failure this line exists to prevent.
+    @Test("an older saved catalogue version is called out")
+    func anOlderCatalogueVersionIsCalledOut() {
+        var settings = GlobalExcludeSettings()
+        settings.catalogVersion = 0
+        let report = GlobalExcludeReport.build(settings: settings, path: path, exists: true, platform: .macOS)
+
+        let lines = report.humanLines(includePatterns: false).joined(separator: "\n")
+        #expect(lines.contains("note: this build carries catalogue version"))
+    }
+
+    @Test("--patterns prints every individual pattern")
+    func patternsFlagPrintsThem() {
+        let report = GlobalExcludeReport.build(settings: .default, path: path, exists: false, platform: .macOS)
+        let terse = report.humanLines(includePatterns: false).joined(separator: "\n")
+        let verbose = report.humanLines(includePatterns: true).joined(separator: "\n")
+
+        #expect(!terse.contains("node_modules"))
+        #expect(verbose.contains("node_modules"))
+    }
+
+    /// `null` rather than an omitted key, and the human line says "(no
+    /// cap)" — a `--json` consumer must be able to tell "no cap" from "this
+    /// build has no such field".
+    @Test("the size cap is reported in both modes, capped or not")
+    func theSizeCapIsAlwaysReportedBothWays() throws {
+        var settings = GlobalExcludeSettings()
+        settings.excludeLargerThan = "10G"
+        let capped = GlobalExcludeReport.build(settings: settings, path: path, exists: true, platform: .macOS)
+        #expect(capped.humanLines(includePatterns: false).contains("--exclude-larger-than: 10G"))
+
+        let uncapped = GlobalExcludeReport.build(settings: .default, path: path, exists: false, platform: .macOS)
+        #expect(uncapped.humanLines(includePatterns: false).contains("--exclude-larger-than: (no cap)"))
+
+        let object = try JSONSerialization.jsonObject(
+            with: try ConfigStore.makeEncoder().encode(uncapped)
+        ) as? [String: Any]
+        #expect(object?.keys.contains("excludeLargerThan") == true)
+        #expect(object?["excludeLargerThan"] is NSNull)
+    }
+
+    /// The catalogue is platform-scoped, so the same build reports a
+    /// different list on each host — and the report says which one it is,
+    /// because a `--json` consumer cannot tell otherwise.
+    @Test("the report names its platform and resolves that platform's patterns")
+    func theReportIsPlatformScoped() {
+        let mac = GlobalExcludeReport.build(settings: .default, path: path, exists: false, platform: .macOS)
+        let linux = GlobalExcludeReport.build(settings: .default, path: path, exists: false, platform: .linux)
+
+        #expect(mac.platform == "macOS")
+        #expect(linux.platform == "linux")
+        #expect(mac.patterns != linux.patterns)
+        #expect(mac.patterns.contains("Library/Caches"))
+        #expect(!linux.patterns.contains("Library/Caches"))
+
+        // The count of what this host will never apply is reported, not
+        // hidden — otherwise "why is this group smaller here?" has no answer.
+        let linuxSystem = linux.groups.first { $0.id == "system-caches" }
+        #expect((linuxSystem?.otherPlatformPatternCount ?? 0) > 0)
+
+        #expect(linux.humanLines(includePatterns: false).contains("platform: linux"))
+    }
+
+    @Test("the master switch off reports no patterns at all")
+    func masterSwitchOffReportsNothing() {
+        var settings = GlobalExcludeSettings()
+        settings.enabled = false
+        let report = GlobalExcludeReport.build(settings: settings, path: path, exists: true, platform: .macOS)
+
+        #expect(report.patterns.isEmpty)
+        #expect(report.humanLines(includePatterns: false).first == "global exclusion list: off")
+    }
+}

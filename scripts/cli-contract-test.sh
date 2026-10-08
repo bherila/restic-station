@@ -133,6 +133,7 @@ runs list|json|live
 runs show|json|live
 config show|json|live
 config validate|json|live
+excludes show|json|live
 config upgrade|json|live
 config acknowledge-migration|json|live
 probe-repo|json|live
@@ -154,6 +155,12 @@ config import|nojson|live
 secret set|nojson|live
 secret set-env|nojson|live
 secret rm|nojson|live
+excludes enable|nojson|live
+excludes disable|nojson|live
+excludes add|nojson|live
+excludes remove|nojson|live
+excludes set|nojson|live
+excludes reset|nojson|live
 cli install|nojson|live
 cli uninstall|nojson|live
 timer install|nojson|env
@@ -399,7 +406,7 @@ write_config() { # write_config <dir> <resticPath-or-null-json>
     local dir="$1" restic_json="$2"
     cat > "$dir/config.json" <<EOF
 {
-  "version": 4,
+  "version": 5,
   "resticPath": $restic_json,
   "showMenuBarIcon": true,
   "sets": [
@@ -1045,6 +1052,49 @@ RESTIC_STATION_DATA_DIR="$IMPORT_DATA" run_helper_split config import "$WORK/exp
 expect_rc 0
 [[ -f "$IMPORT_DATA/config.json" ]] || fail "the exported document did not round-trip into config import"
 mark_cmd "config export"
+
+# `excludes …` — the host-local global exclusion list. Its own data
+# directory so the "no settings file yet" path is real, and so nothing here
+# changes what the fixture host above backs up.
+EXCLUDES_DATA="$WORK/excludes-data"
+mkdir -p "$EXCLUDES_DATA"
+RESTIC_STATION_DATA_DIR="$EXCLUDES_DATA" run_helper_split excludes show --json
+expect_rc 0
+assert_success_envelope "excludes show --json"
+jq -e '.data | (.exists == false) and (.enabled == true) and (.groups | length > 0) and (.patterns | length > 0)' \
+    "$OUT_FILE" >/dev/null \
+    || fail "excludes show --json data is not the global exclusion report"
+mark_cmd "excludes show"
+
+RESTIC_STATION_DATA_DIR="$EXCLUDES_DATA" run_helper_split excludes disable browser-caches
+expect_rc 0
+mark_cmd "excludes disable"
+RESTIC_STATION_DATA_DIR="$EXCLUDES_DATA" run_helper_split excludes enable browser-caches
+expect_rc 0
+mark_cmd "excludes enable"
+RESTIC_STATION_DATA_DIR="$EXCLUDES_DATA" run_helper_split excludes add "/srv/scratch"
+expect_rc 0
+mark_cmd "excludes add"
+RESTIC_STATION_DATA_DIR="$EXCLUDES_DATA" run_helper_split excludes remove "/srv/scratch"
+expect_rc 0
+mark_cmd "excludes remove"
+RESTIC_STATION_DATA_DIR="$EXCLUDES_DATA" run_helper_split excludes set --exclude-caches false
+expect_rc 0
+mark_cmd "excludes set"
+
+# Fail closed, in the documented envelope: an unusable settings file is
+# `config_invalid`, never a silent fall back to the built-in defaults
+# (docs/data-model.md §global-excludes.json).
+printf '{ not json' > "$EXCLUDES_DATA/global-excludes.json"
+RESTIC_STATION_DATA_DIR="$EXCLUDES_DATA" run_helper_split excludes show --json
+assert_error_envelope config_invalid
+mark_code config_invalid
+
+RESTIC_STATION_DATA_DIR="$EXCLUDES_DATA" run_helper_split excludes reset
+expect_rc 0
+[[ ! -f "$EXCLUDES_DATA/global-excludes.json" ]] \
+    || fail "excludes reset left global-excludes.json in place"
+mark_cmd "excludes reset"
 ok "config export: unwrapped document, round-trips into config import"
 
 # Every human-only row: `--json` must be a usage error — exit 64 — and,
