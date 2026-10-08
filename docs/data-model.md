@@ -222,7 +222,7 @@ The list has three parts, and each lives where its scope actually is:
 ```json
 {
   "version": 1,
-  "catalogVersion": 12,
+  "catalogVersion": 13,
   "enabled": true,
   "excludeCaches": true,
   "excludeLargerThan": null,
@@ -971,8 +971,8 @@ This host's global exclusion list (§global-excludes.json). Host-local — `--ma
   "excludeCaches": true,
   "excludeLargerThan": null,
   "platform": "macOS",
-  "catalogVersion": 12,
-  "savedCatalogVersion": 12,
+  "catalogVersion": 13,
+  "savedCatalogVersion": 13,
   "groups": [
     {
       "id": "browser-caches",

@@ -217,7 +217,7 @@ public enum GlobalExcludeCatalog {
     /// never heard of is an error (see ``GlobalExcludeError/unknownGroup``),
     /// and a group added after the file was written takes its built-in
     /// default.
-    public static let version = 12
+    public static let version = 13
 
     /// The catalogue, in the order its patterns reach argv.
     public static let groups: [GlobalExcludeGroup] = [
@@ -473,7 +473,9 @@ public enum GlobalExcludeCatalog {
                 ".terraform/modules",
                 ".ccls-cache",
                 "*.class",
-                ".sonarlint",
+                // **Not** `.sonarlint`. In a project it holds
+                // `connectedMode.json`, the connected-mode binding people
+                // write and commit, not analyzer output.
                 // The editor's downloaded extensions, not its settings:
                 // `.vscode` itself holds a workspace's committed config.
                 ".vscode/extensions",

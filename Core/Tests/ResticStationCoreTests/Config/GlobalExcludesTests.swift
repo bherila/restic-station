@@ -303,7 +303,7 @@ import Testing
             .filter(\.enabledByDefault)
             .flatMap(\.patterns)
             .map(\.pattern)
-        for name in ["lost+found", "xcuserdata", ".git", "Documents", "Desktop"] {
+        for name in ["lost+found", "xcuserdata", ".git", "Documents", "Desktop", ".sonarlint"] {
             #expect(!defaultOn.contains(name), "\(name) can hold content nobody can regenerate")
         }
         // The narrowed replacement is still there and still generated.
