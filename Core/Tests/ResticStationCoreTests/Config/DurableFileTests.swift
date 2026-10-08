@@ -278,4 +278,84 @@ import Musl
         let record = try #require(StateStore(paths: paths).readConfigMigration())
         #expect(record.fromVersion == from)
     }
+
+    // MARK: global-excludes.json
+
+    /// Losing an exclusion-settings write to a power cut restores the
+    /// built-in defaults, re-enabling a group the operator disabled, so the
+    /// save, its compare-and-swap form and the removal all take the durable
+    /// path — and, since #165, follow the same "nothing throws after the
+    /// rename" rule as `config.json`.
+    @Test func exclusionSettingsSavesSyncTheFileThenItsDirectory() throws {
+        let (paths, root) = try makePaths()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = GlobalExcludeStore(paths: paths)
+        var settings = GlobalExcludeSettings()
+        settings.extraPatterns = ["/one"]
+
+        let probe = SyncProbe()
+        try DurableFile.$sync.withValue(probe.hook) { try store.save(settings) }
+        #expect(probe.calls == 2)
+
+        let fingerprint = try #require(try store.loadFingerprinted().fingerprint)
+        settings.extraPatterns = ["/two"]
+        let casProbe = SyncProbe()
+        try DurableFile.$sync.withValue(casProbe.hook) {
+            _ = try store.save(settings, ifUnchangedFrom: fingerprint)
+        }
+        #expect(casProbe.calls == 2)
+        #expect(try store.load().extraPatterns == ["/two"])
+
+        let attributes = try FileManager.default.attributesOfItem(atPath: paths.globalExcludesFile.path)
+        #expect((attributes[.posixPermissions] as? NSNumber)?.intValue == 0o600)
+    }
+
+    @Test func exclusionSettingsRemovalSyncsTheDirectory() throws {
+        let (paths, root) = try makePaths()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = GlobalExcludeStore(paths: paths)
+        try store.save(GlobalExcludeSettings())
+
+        let probe = SyncProbe()
+        let removed = try DurableFile.$sync.withValue(probe.hook) { try store.removeSettings() }
+        #expect(removed)
+        #expect(probe.calls == 1)
+        #expect(!FileManager.default.fileExists(atPath: paths.globalExcludesFile.path))
+    }
+
+    @Test func anExclusionSettingsFileSyncFailureInstallsNothing() throws {
+        let (paths, root) = try makePaths()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = GlobalExcludeStore(paths: paths)
+        var settings = GlobalExcludeSettings()
+        settings.extraPatterns = ["/kept"]
+        try store.save(settings)
+        let before = try Data(contentsOf: paths.globalExcludesFile)
+
+        settings.extraPatterns = ["/lost"]
+        #expect(throws: LockFailure.self) {
+            try DurableFile.$sync.withValue(SyncProbe(failing: [1]).hook) { try store.save(settings) }
+        }
+        #expect(try Data(contentsOf: paths.globalExcludesFile) == before)
+        #expect(!FileManager.default.fileExists(atPath: store.tempFile.path))
+    }
+
+    /// After the rename (or the unlink) the change is live, so a failed
+    /// directory sync must not report the save or removal as failed — an
+    /// editor that believed it would reload stale state over a file that
+    /// actually changed.
+    @Test func exclusionSettingsDirectorySyncFailureAfterCommitStillCounts() throws {
+        let (paths, root) = try makePaths()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = GlobalExcludeStore(paths: paths)
+        var settings = GlobalExcludeSettings()
+        settings.extraPatterns = ["/after-rename"]
+
+        try DurableFile.$sync.withValue(SyncProbe(failing: [2]).hook) { try store.save(settings) }
+        #expect(try store.load().extraPatterns == ["/after-rename"])
+
+        let removed = try DurableFile.$sync.withValue(SyncProbe(failing: [1]).hook) { try store.removeSettings() }
+        #expect(removed)
+        #expect(!FileManager.default.fileExists(atPath: paths.globalExcludesFile.path))
+    }
 }
