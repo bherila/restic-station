@@ -339,7 +339,7 @@ Every backup log records one line saying how many patterns applied to *that set*
 
 `usesGlobalExcludes: false` in `config.json` (schema v5) turns the whole list off for one set — patterns and `--exclude-caches` alike. It lives in the shared file rather than the host-local one because it is a fleet-wide fact: a set whose whole job is to archive build output should not have build output skipped, and that is true on every machine.
 
-Opting out is all-or-nothing on purpose. restic exclude patterns have no re-include form, so "everything except one group" cannot be expressed by cancelling a pattern. A set that needs a narrower arrangement opts out and lists what it does want in `excludes`.
+Opting out is all-or-nothing on purpose. restic's `!` re-include works only within one flag's list, and the catalogue rides `--iexclude` while a set's own patterns ride `--exclude`, so "everything except one group" cannot be expressed by cancelling a pattern (and host patterns may not start with `!` at all, above). A set that needs a narrower arrangement opts out and lists what it does want in `excludes`.
 
 ## Per-machine scoping
 

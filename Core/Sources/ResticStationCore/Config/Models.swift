@@ -122,9 +122,11 @@ public struct BackupSet: Codable, Equatable, Identifiable, Sendable {
     /// skipped" is true on every machine, so it belongs in the shared file
     /// rather than being restated on each of them.
     ///
-    /// Opting out is all-or-nothing on purpose. restic exclude patterns
-    /// have no re-include form, so "everything except one group" cannot be
-    /// expressed by cancelling a pattern; a set that needs a narrower
+    /// Opting out is all-or-nothing on purpose. restic's `!` re-include
+    /// works only within one flag's list, and the catalogue rides
+    /// `--iexclude` while a set's patterns ride `--exclude`, so "everything
+    /// except one group" cannot be expressed by cancelling a pattern; a set
+    /// that needs a narrower
     /// arrangement opts out and lists what it does want in ``excludes``.
     public var usesGlobalExcludes: Bool
     public var schedule: Schedule
