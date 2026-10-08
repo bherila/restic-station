@@ -64,9 +64,11 @@ public struct SetRunChild: Equatable, Sendable {
 ///   the worst child run status (success | warning | failed).
 /// - ``skipped`` — the set lock was busy; exactly one `.skipped` index
 ///   record was written and nothing else happened (**retryable**).
-/// - ``retryable(reason:)`` — an environmental failure *before* anything was
-///   recorded (secret store unreadable): NO run record, NO `lastBackupStart` update,
-///   NO lock taken, so the next tick simply tries again.
+/// - ``retryable(reason:)`` — the secret store could not be read, so restic
+///   never ran. At the pre-flight: NO run record, NO `lastBackupStart`
+///   update, NO lock taken. At a later read (#152): the failed run record
+///   stays, but `lastBackupStart` is put back (#170). Either way the next
+///   tick simply tries again.
 /// - ``misconfigured(reason:)`` — defensive only: the set has no primary
 ///   destination, which `AppConfig.validate()` rejects on load and save.
 ///   Nothing is written (there is no destination to attribute a record to).
@@ -346,8 +348,12 @@ public final class BackupEngine: Sendable {
         defer { try? stateStore.clearCurrentRun(setId: set.id) }
 
         // ── Step 3: attempt-based lastBackupStart ───────────────────────
+        var priorBackupStart: Date?
         do {
-            try updateScheduleState(setId: set.id) { $0.lastBackupStart = self.now() }
+            try updateScheduleState(setId: set.id) {
+                priorBackupStart = $0.lastBackupStart
+                $0.lastBackupStart = self.now()
+            }
         } catch {
             let reason = "schedule state unusable — \(error)"
             recordInfrastructureFailure(
@@ -474,6 +480,7 @@ public final class BackupEngine: Sendable {
             // given. The run record stays — an attempt was made — and its
             // summary names the secret problem.
             if let outcome = Self.scheduledSecretOutcome(backup.verdict) {
+                withdrawAttempt(setId: set.id, \.lastBackupStart, restoring: priorBackupStart)
                 return outcome
             }
             return .completed(status: .failed, groupId: groupId, children: children)
@@ -827,8 +834,10 @@ public final class BackupEngine: Sendable {
 
         // Attempt semantics, exactly like `lastBackupStart`.
         let updatedScheduleState: ScheduleState
+        var priorCheckStart: Date?
         do {
             updatedScheduleState = try updateScheduleState(setId: set.id) {
+                priorCheckStart = $0.lastCheckStart
                 $0.lastCheckStart = self.now()
             }
         } catch {
@@ -874,6 +883,7 @@ public final class BackupEngine: Sendable {
         // Seen after the pre-flight (#152): the outcome it would give —
         // unless the run record itself failed, which `verdict` puts first.
         if case .secret(let equivalent, let message) = primaryCheck.verdict {
+            withdrawAttempt(setId: set.id, \.lastCheckStart, restoring: priorCheckStart)
             switch equivalent {
             case .attention:
                 return .misconfigured(reason: message)
@@ -3706,6 +3716,32 @@ public final class BackupEngine: Sendable {
         mutate: (inout SetScheduleState) -> Void
     ) throws -> ScheduleState {
         try stateStore.updateScheduleState(setId: setId, mutate: mutate)
+    }
+
+    /// Takes back an attempt stamp when a secret problem seen after the
+    /// pre-flight (#152) stopped the run before restic launched (#170). The
+    /// pre-flight would have refused without stamping, and the next tick
+    /// retries; a stamp left behind would hold that retry off for the whole
+    /// interval (seven days for a check) although nothing was attempted.
+    /// A run where restic did launch keeps its stamp, whatever it exited.
+    ///
+    /// Called under the set lock, which every writer of the two attempt
+    /// stamps holds, so the stamp being replaced is this run's own.
+    /// Best effort: if the state cannot be written the stamp stays, which
+    /// is the old behaviour, and the warning says what it costs.
+    private func withdrawAttempt(
+        setId: UUID,
+        _ stamp: WritableKeyPath<SetScheduleState, Date?>,
+        restoring prior: Date?
+    ) {
+        do {
+            _ = try updateScheduleState(setId: setId) { $0[keyPath: stamp] = prior }
+        } catch {
+            logWarning(
+                "BackupEngine: could not withdraw the attempt stamp after a secret failure "
+                    + "before launch; the retry waits for the next scheduled attempt — \(error)"
+            )
+        }
     }
 
     /// Advances the purge-exclusion watermark only after the matching

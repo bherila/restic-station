@@ -14,6 +14,10 @@ import Testing
 /// must match. A new read site needs no new test: it is a new read in the
 /// count, and it is swept.
 ///
+/// "The same" includes the schedule: the pre-flight refuses before the
+/// attempt stamps are written, so a later refusal must take its stamp back,
+/// or a transient failure holds the retry off for a whole interval (#170).
+///
 /// The second sweep pins the precedence (#169 review): when the failing
 /// read lands inside a recorded run and the run record then cannot be
 /// written, the run-history failure is the answer, not the secret one.
@@ -40,12 +44,22 @@ import Testing
             let total = try await Self.readCount(operation)
             #expect(total >= 2, "\(operation.name): only \(total) read(s) — nothing after the pre-flight to sweep")
             for (error, refuses) in Self.errors {
-                let reference = try await Self.run(operation, failingAfter: 0, with: error).label
+                let (reference, referenceEnv) = try await Self.run(operation, failingAfter: 0, with: error)
+                let referenceStamps = Self.attemptStamps(referenceEnv)
+                referenceEnv.cleanUp()
+                #expect(
+                    referenceStamps == Self.priorStamps,
+                    "\(operation.name), \(error): the pre-flight itself moved an attempt stamp"
+                )
                 for reads in 1..<max(total, 1) {
                     let (label, env) = try await Self.run(operation, failingAfter: reads, with: error)
                     #expect(
                         label == reference,
                         "\(operation.name), \(error), failing from read \(reads + 1) of \(total)"
+                    )
+                    #expect(
+                        Self.attemptStamps(env) == referenceStamps,
+                        "\(operation.name), \(error): an attempt stamp moved for a refusal at read \(reads + 1) of \(total)"
                     )
                     if refuses {
                         #expect(
@@ -107,8 +121,22 @@ import Testing
         with error: SecretStoreError
     ) async throws -> (label: String, env: T.Env) {
         let (env, run) = try operation.make()
+        // An earlier attempt on record, so a stamp that is taken back must
+        // be restored to it, not merely cleared.
+        try env.stateStore.updateScheduleState(setId: T.setId) {
+            $0.lastBackupStart = priorStamps[0]
+            $0.lastCheckStart = priorStamps[1]
+        }
         env.secrets.failReads(for: T.primaryId, afterReads: reads, with: error)
         return (await run(), env)
+    }
+
+    /// Eight days back: both a backup and the weekly check are due again.
+    private static let priorStamps: [Date?] = Array(repeating: T.t0.addingTimeInterval(-8 * 24 * 60 * 60), count: 2)
+
+    private static func attemptStamps(_ env: T.Env) -> [Date?] {
+        let state = env.stateStore.readScheduleState()?.sets[T.setId]
+        return [state?.lastBackupStart, state?.lastCheckStart]
     }
 
     /// An outcome's description with every quoted string removed: the
