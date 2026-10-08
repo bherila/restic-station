@@ -955,6 +955,43 @@ import Testing
         }
     }
 
+    /// The writer's limit is the reader's: settings that encode to exactly
+    /// the size the reader accepts save and load back, and one byte more is
+    /// refused before anything is written. Codex on #158: a save the reader
+    /// would refuse turned a successful `excludes add` into a refusal for
+    /// every later backup.
+    @Test func theWriterNeverInstallsAFileTheReaderRefuses() throws {
+        try withPaths { paths in
+            let store = GlobalExcludeStore(paths: paths)
+            var kept = GlobalExcludeSettings()
+            kept.extraPatterns = ["/kept"]
+            try store.save(kept)
+            let before = try Data(contentsOf: paths.globalExcludesFile)
+
+            // Encoded exactly as the store encodes: an ASCII pattern adds
+            // one byte per character, so the overhead is fixed.
+            func settings(patternLength: Int) -> GlobalExcludeSettings {
+                var settings = GlobalExcludeSettings()
+                settings.version = GlobalExcludeSettings.currentVersion
+                settings.catalogVersion = GlobalExcludeCatalog.version
+                settings.extraPatterns = [String(repeating: "x", count: patternLength)]
+                return settings
+            }
+            let overhead = try ConfigStore.makeEncoder().encode(settings(patternLength: 1)).count - 1
+            let limit = Int(GlobalExcludeStore.maximumSettingsFileSize)
+            let atLimit = settings(patternLength: limit - overhead)
+            #expect(try ConfigStore.makeEncoder().encode(atLimit).count == limit)
+
+            #expect(throws: GlobalExcludeError.tooLarge(bytes: limit + 1, limit: limit)) {
+                try store.save(settings(patternLength: limit - overhead + 1))
+            }
+            #expect(try Data(contentsOf: paths.globalExcludesFile) == before)
+
+            try store.save(atLimit)
+            #expect(try store.load().extraPatterns == atLimit.extraPatterns)
+        }
+    }
+
     @Test func savingAnInvalidSettingsValueWritesNothing() throws {
         try withPaths { paths in
             let store = GlobalExcludeStore(paths: paths)

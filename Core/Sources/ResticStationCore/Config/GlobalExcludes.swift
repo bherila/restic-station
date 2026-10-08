@@ -1128,6 +1128,12 @@ public enum GlobalExcludeError: Error, Equatable, Sendable, CustomStringConverti
     /// else. Never treated as "no contention, go ahead": without the lock
     /// the compare-and-swap below is not atomic with the rename it guards.
     case writeLockUnusable(String)
+    /// The encoded settings would be larger than the reader accepts
+    /// (``GlobalExcludeStore/maximumSettingsFileSize``). Refused before
+    /// writing, so the store never installs a file every later load
+    /// refuses, which would make every backup that applies the list
+    /// refuse too.
+    case tooLarge(bytes: Int, limit: Int)
 
     public var description: String {
         switch self {
@@ -1160,6 +1166,9 @@ public enum GlobalExcludeError: Error, Equatable, Sendable, CustomStringConverti
         case .writeLockUnusable(let failure):
             return "refusing to write global-excludes.json: its write lock is unusable, so a "
                 + "concurrent edit could not be detected — \(failure)"
+        case .tooLarge(let bytes, let limit):
+            return "refusing to write global-excludes.json: it would be \(bytes) bytes, over the "
+                + "\(limit)-byte limit this build reads — remove some extra patterns"
         }
     }
 }
@@ -1481,6 +1490,12 @@ public struct GlobalExcludeStore: Sendable {
             throw GlobalExcludeError.staleWrite(path: paths.globalExcludesFile.path)
         }
         let data = try ConfigStore.makeEncoder().encode(updated)
+        // The reader refuses anything over this size, so writing it would
+        // turn a successful `excludes add` into a refusal for every later
+        // load and every backup that applies the list.
+        guard data.count <= Self.maximumSettingsFileSize else {
+            throw GlobalExcludeError.tooLarge(bytes: data.count, limit: Int(Self.maximumSettingsFileSize))
+        }
         // Durable, not merely atomic. `rename(2)` is atomic for *readers*
         // and says nothing about a power cut: without the two `fsync`s the
         // file can come back empty, come back as its previous bytes, or
