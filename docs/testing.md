@@ -121,7 +121,12 @@ spawns with `POSIX_SPAWN_SETSIGDEF` and an empty mask on every platform and
 reaps with its own `waitid`/`waitpid` (#114), which removes both causes;
 `ProcessGroupOwnershipTests` pins group signalling, the post-exit straggler
 SIGTERM, opt-in inheritance, the lease, and that nothing is signalled after
-the reap. Only the Linux CI jobs can confirm the Linux half.
+the reap. Only the Linux CI jobs can confirm the Linux half. Its two
+group-signalling tests tell "SIGINT reached the group" (~1 s) from "the
+SIGKILL grace was waited out" with a 60 s grace and a 40 s bound, about 20 s
+from each: the hosted macOS runner has stalled every spawn in a run by
+20.7 s (#177), past the 20 s bound these tests used to have.
+`stoppedBoundSeparatesTheOutcomes` there pins that spacing.
 
 **An elapsed bound is necessary and not sufficient.** Two independent reviews
 of #147 built the same counterexample: delete the runner's entire kill path,
