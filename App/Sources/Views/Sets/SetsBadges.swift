@@ -86,7 +86,9 @@ enum DestinationStatus: Equatable, Sendable {
         case .error: return "Error"
         case .unknown: return "Not probed yet"
         case .secretProblem(.secretNotConfigured): return "Password not stored"
-        case .secretProblem: return "Secrets unreadable"
+        case .secretProblem(.secretStoreUnusable): return "Secrets unreadable"
+        // Refused through the same path, but the repair is a download (#171).
+        case .secretProblem(.cloudRepositoryNotHydrated): return "Not downloaded"
         }
     }
 

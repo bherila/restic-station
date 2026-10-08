@@ -126,6 +126,29 @@ struct AppPresentationContractTests {
         #expect(!DestinationStatus.notInitialized.isAlarm, "not-initialized keeps its existing styling")
     }
 
+    @Test("a repository with online-only files is worded as a download, never as secrets (#171)")
+    func hydrationIsNotWordedAsSecrets() {
+        let primary = UUID()
+        let mirror = UUID()
+        let set = UUID()
+        func health(problemOn destination: UUID) -> SetHealth {
+            SetHealth(
+                setId: set, name: "Docs", lastBackup: nil, lastRun: nil, currentRun: nil,
+                staleDestinationIds: [], nextDue: .distantPast,
+                secretAttention: [SecretAttentionRecord(
+                    destId: destination, setId: set, attention: .cloudRepositoryNotHydrated,
+                    detail: "data/ab/abcd is online-only", detectedAt: .now
+                )],
+                primaryDestinationId: primary
+            )
+        }
+        #expect(MenuBarCopy.statusLine(for: health(problemOn: primary)) == "Docs — skipped: repository not downloaded ⚠")
+        #expect(MenuBarCopy.statusLine(for: health(problemOn: mirror)) == "Docs — never backed up · mirror not downloaded ⚠")
+        let status = DestinationStatus.secretProblem(.cloudRepositoryNotHydrated)
+        #expect(status.label == "Not downloaded")
+        #expect(status.isAlarm)
+    }
+
     @Test("the menu bar line says a set is skipped only when its primary is affected (#95)")
     func menuLineNamesSecretProblem() {
         let primary = UUID()

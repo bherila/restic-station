@@ -281,7 +281,11 @@ struct BackupEngineTests {
         /// Overridable so a test can point the engine at a binary it is
         /// allowed to modify, and assert what happens when restic is
         /// replaced mid-operation.
-        resticPath: String = BackupEngineTests.resticPath
+        resticPath: String = BackupEngineTests.resticPath,
+        /// The online-only check of a local repository, separately for the
+        /// reachability probe and for the runner's own check at launch.
+        probeDatalessEntry: (@Sendable (String) -> String?)? = nil,
+        runnerDatalessEntry: (@Sendable (String) -> String?)? = nil
     ) -> Env {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("restic-station-engine-\(UUID().uuidString)", isDirectory: true)
@@ -341,7 +345,12 @@ struct BackupEngineTests {
         for id in secretsUnavailableFor {
             secrets.failPassword(for: id, with: secretFailure)
         }
-        let restic = ResticRunner(
+        let restic = runnerDatalessEntry.map { entry in
+            ResticRunner(
+                resticPath: resticPath, paths: paths, secrets: secrets, runner: processRunner,
+                datalessRepositoryEntry: { entry($0.repoURL) }
+            )
+        } ?? ResticRunner(
             resticPath: resticPath,
             paths: paths,
             secrets: secrets,
@@ -359,7 +368,9 @@ struct BackupEngineTests {
             secrets: secrets,
             runStore: runStore,
             stateStore: stateStore,
-            reachability: Reachability(restic: restic),
+            reachability: probeDatalessEntry.map {
+                Reachability(restic: restic, datalessRepositoryEntry: $0)
+            } ?? Reachability(restic: restic),
             now: clock.now,
             purgeSourcePaths: purgeSourcePaths,
             purgeHostnames: purgeHostnames,

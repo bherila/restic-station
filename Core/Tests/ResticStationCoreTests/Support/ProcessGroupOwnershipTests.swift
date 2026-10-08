@@ -14,11 +14,34 @@ import Musl
 /// can lease a lock descriptor to the child.
 @Suite struct ProcessGroupOwnershipTests {
     private let runner = DefaultProcessRunner(terminationGrace: 10, drainGrace: 2)
-    /// For the two tests that prove SIGINT reached the group: with a 30 s
-    /// SIGKILL grace, the old direct-child behaviour takes at least 31 s and
-    /// the group behaviour about 1 s, so a bound of 20 s tells them apart
-    /// even on a heavily loaded CI runner.
-    private let patientRunner = DefaultProcessRunner(terminationGrace: 30, drainGrace: 2)
+    /// For the two tests that prove SIGINT reached the group: with a long
+    /// SIGKILL grace, the old direct-child behaviour takes at least
+    /// `1 + patientGrace` s and the group behaviour about 1 s, and
+    /// `stoppedBound` sits between them.
+    private let patientRunner = DefaultProcessRunner(terminationGrace: Self.patientGrace, drainGrace: 2)
+
+    /// The SIGKILL grace that a missed SIGINT would wait out.
+    private static let patientGrace: TimeInterval = 60
+
+    /// The elapsed bound both group-signalling tests assert. It sits about
+    /// 20 s from each outcome rather than near the nominal ~1 s: the hosted
+    /// macOS runner has stalled every spawn in a run by 20.7 s (#177), which
+    /// a 20 s bound against a 30 s grace could not absorb.
+    private static let stoppedBound: TimeInterval = 40
+
+    /// How long the children sleep. Well past the grace, so a child that
+    /// never got the signal cannot end on its own inside the bound.
+    private static let childLifetime: TimeInterval = 120
+
+    /// Keeps the constants above meaning something. A bound that creeps
+    /// toward the grace stops distinguishing the outcomes; one that creeps
+    /// toward the nominal measures the runner, not the contract.
+    @Test("the stopped bound separates the group outcome from the waited-out grace")
+    func stoppedBoundSeparatesTheOutcomes() {
+        #expect(Self.stoppedBound + 15 <= Self.patientGrace)
+        #expect(Self.stoppedBound >= 30, "leave the stalled macOS runner its margin (#177)")
+        #expect(Self.childLifetime >= Self.patientGrace * 2)
+    }
 
     /// Polls until `pid` is gone or dead (or `seconds` pass).
     ///
@@ -69,12 +92,12 @@ import Musl
         let started = ContinuousClock.now
         await #expect(throws: ProcessRunnerError.timeout) {
             _ = try await patientRunner.run(
-                ["/bin/sh", "-c", "sleep 60 & echo $!; wait"],
+                ["/bin/sh", "-c", "sleep \(Int(Self.childLifetime)) & echo $!; wait"],
                 env: nil, currentDirectory: nil,
                 onStdoutLine: { lines.append($0) }, onStderrLine: nil, timeout: 1
             )
         }
-        #expect(ContinuousClock.now - started < .seconds(20))
+        #expect(ContinuousClock.now - started < .seconds(Self.stoppedBound))
         let grandchild = try #require(lines.all.first.flatMap { pid_t($0) })
         #expect(await waitForExit(grandchild), "the backgrounded sleep survived the stop sequence")
     }
@@ -88,11 +111,11 @@ import Musl
         let started = ContinuousClock.now
         await #expect(throws: ProcessRunnerError.timeout) {
             _ = try await patientRunner.run(
-                ["/bin/sh", "-c", "sleep 60; true"],
+                ["/bin/sh", "-c", "sleep \(Int(Self.childLifetime)); true"],
                 env: nil, currentDirectory: nil, onStdoutLine: nil, onStderrLine: nil, timeout: 1
             )
         }
-        #expect(ContinuousClock.now - started < .seconds(20), "SIGINT did not reach the group; SIGKILL grace was waited out")
+        #expect(ContinuousClock.now - started < .seconds(Self.stoppedBound), "SIGINT did not reach the group; SIGKILL grace was waited out")
     }
 
     @Test("a descendant left behind by a child that exited normally is stopped")
