@@ -68,7 +68,8 @@ public struct SetRunChild: Equatable, Sendable {
 ///   never ran. At the pre-flight: NO run record, NO `lastBackupStart`
 ///   update, NO lock taken. At a later read (#152): the failed run record
 ///   stays, but `lastBackupStart` is put back (#170). Either way the next
-///   tick simply tries again.
+///   tick simply tries again. If it cannot be put back, the run is an
+///   ``infrastructureFailure(reason:)`` instead.
 /// - ``misconfigured(reason:)`` — defensive only: the set has no primary
 ///   destination, which `AppConfig.validate()` rejects on load and save.
 ///   Nothing is written (there is no destination to attribute a record to).
@@ -480,8 +481,9 @@ public final class BackupEngine: Sendable {
             // given. The run record stays — an attempt was made — and its
             // summary names the secret problem.
             if let outcome = Self.scheduledSecretOutcome(backup.verdict) {
-                if case .secret(let equivalent, _) = backup.verdict, Self.preflightWouldRefuse(equivalent) {
-                    withdrawAttempt(setId: set.id, \.lastBackupStart, restoring: priorBackupStart)
+                if case .secret(let equivalent, let message) = backup.verdict, Self.preflightWouldRefuse(equivalent),
+                   let failure = withdrawAttempt(setId: set.id, \.lastBackupStart, restoring: priorBackupStart) {
+                    return .infrastructureFailure(reason: "\(message); \(failure)")
                 }
                 return outcome
             }
@@ -901,8 +903,9 @@ public final class BackupEngine: Sendable {
         // Seen after the pre-flight (#152): the outcome it would give —
         // unless the run record itself failed, which `verdict` puts first.
         if case .secret(let equivalent, let message) = primaryCheck.verdict {
-            if Self.preflightWouldRefuse(equivalent) {
-                withdrawAttempt(setId: set.id, \.lastCheckStart, restoring: priorCheckStart)
+            if Self.preflightWouldRefuse(equivalent),
+               let failure = withdrawAttempt(setId: set.id, \.lastCheckStart, restoring: priorCheckStart) {
+                return .infrastructureFailure(reason: "\(message); \(failure)")
             }
             switch equivalent {
             case .attention:
@@ -3752,20 +3755,22 @@ public final class BackupEngine: Sendable {
     ///
     /// Called under the set lock, which every writer of the two attempt
     /// stamps holds, so the stamp being replaced is this run's own.
-    /// Best effort: if the state cannot be written the stamp stays, which
-    /// is the old behaviour, and the warning says what it costs.
+    /// Returns why, when the state cannot be written: the stamp then stays
+    /// and holds the retry off, so the caller reports an infrastructure
+    /// failure rather than a refusal that the next tick retries.
     private func withdrawAttempt(
         setId: UUID,
         _ stamp: WritableKeyPath<SetScheduleState, Date?>,
         restoring prior: Date?
-    ) {
+    ) -> String? {
         do {
             _ = try updateScheduleState(setId: setId) { $0[keyPath: stamp] = prior }
+            return nil
         } catch {
-            logWarning(
-                "BackupEngine: could not withdraw the attempt stamp after a secret failure "
-                    + "before launch; the retry waits for the next scheduled attempt — \(error)"
-            )
+            let reason = "the attempt stamp could not be taken back, so the retry waits for "
+                + "the next scheduled attempt — schedule state unusable — \(error)"
+            logWarning("BackupEngine: \(reason)")
+            return reason
         }
     }
 

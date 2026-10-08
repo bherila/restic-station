@@ -175,6 +175,34 @@ import Testing
         }
     }
 
+    /// Taking the stamp back is a second schedule-state write (#170). When
+    /// it fails, the stamp still holds the retry off for an interval, so the
+    /// run must not report the refusal as cleanly deferred.
+    @Test("a stamp that cannot be taken back is an infrastructure failure")
+    func failedWithdrawalIsInfrastructure() async throws {
+        let names: Set = ["scheduled backup", "scheduled check"]
+        let operations = try Self.operations().filter { names.contains($0.name) }
+        #expect(operations.count == names.count)
+        for operation in operations {
+            // The last read is restic's launch, after the stamp is written.
+            let total = try await Self.readCount(operation)
+            for (error, _) in Self.errors {
+                let (env, run) = try operation.make()
+                defer { env.cleanUp() }
+                let lock = env.paths.scheduleStateLockFile
+                env.secrets.failReads(for: T.primaryId, afterReads: total - 1, with: error) {
+                    try? FileManager.default.removeItem(at: lock)
+                    try? FileManager.default.createDirectory(at: lock, withIntermediateDirectories: true)
+                }
+                let label = await run()
+                #expect(
+                    label.contains("infrastructureFailure"),
+                    "\(operation.name), \(error): \(label)"
+                )
+            }
+        }
+    }
+
     /// The nearest constraint on taking the stamp back (#170): it is right
     /// only where the pre-flight would refuse on the next tick. Online-only
     /// files in a local cloud repository are not a pre-flight question. A
