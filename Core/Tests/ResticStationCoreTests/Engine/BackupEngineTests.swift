@@ -447,7 +447,8 @@ struct BackupEngineTests {
         excludes: [String] = [],
         globalExcludes: [String] = [],
         excludeCaches: Bool = false,
-        excludeLargerThan: String? = nil
+        excludeLargerThan: String? = nil,
+        source: String = source
     ) -> [String] {
         var argv = ["-r", repo, "backup", "--json"]
         if excludeCaches {
@@ -1594,6 +1595,55 @@ struct BackupEngineTests {
         // The run log has to answer "why is this file missing?" on its own.
         #expect(env.log(runId: groupId).contains("global excludes: 2 pattern(s)"))
         #expect(env.log(runId: groupId).contains("--exclude-larger-than 10G"))
+    }
+
+    /// A source under a directory carrying `CACHEDIR.TAG` would be left out
+    /// entirely by `--exclude-caches` (restic 0.18.1: zero files), so the
+    /// engine holds the flag back for that run and the log names the tag.
+    /// The patterns and the size cap still apply. Codex on #158.
+    @Test("global excludes: a tagged directory above a source holds back --exclude-caches")
+    func engineHoldsBackExcludeCachesForATaggedSourceAncestor() async throws {
+        let tree = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-engine-cachedir-\(UUID().uuidString)", isDirectory: true)
+            .resolvingSymlinksInPath()
+        defer { try? FileManager.default.removeItem(at: tree) }
+        let source = tree.appendingPathComponent("cache/project")
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        try Data("Signature: 8a477f597d28d172789f06886806bc55\n".utf8)
+            .write(to: tree.appendingPathComponent("cache/CACHEDIR.TAG"))
+
+        let plan = GlobalExcludePlan(patterns: ["node_modules"], excludeCaches: true, excludeLargerThan: "10G")
+        let env = Self.makeEnv(
+            script: [],
+            sources: [source.path],
+            retention: nil,
+            globalExcludes: .success(plan),
+            reachableSecondaries: []
+        )
+        defer { env.cleanUp() }
+
+        let expected = Self.backupArgv(
+            env.primary.repoURL,
+            globalExcludes: ["node_modules"],
+            excludeCaches: false,
+            excludeLargerThan: "10G",
+            source: source.path
+        )
+        env.fake.script = Self.resticCall(expected, dest: Self.primaryId, stdoutLines: Self.backupStream())
+
+        let outcome = await env.engine.runSet(env.set, trigger: .scheduled)
+
+        guard case .completed(let status, let groupId, _) = outcome else {
+            Issue.record("expected .completed, got \(outcome)")
+            return
+        }
+        #expect(status == .success)
+        let backupArgv = try #require(env.resticArgvs.first { $0.contains("backup") })
+        #expect(backupArgv == [Self.resticPath] + expected)
+        #expect(!backupArgv.contains("--exclude-caches"))
+        let log = env.log(runId: groupId)
+        #expect(log.contains("--exclude-caches held back: \(tree.appendingPathComponent("cache").path)/CACHEDIR.TAG"))
+        #expect(!log.contains("plus --exclude-caches"))
     }
 
     /// `usesGlobalExcludes: false` removes the patterns **and**

@@ -467,6 +467,13 @@ public final class BackupEngine: Sendable {
             }
         }
 
+        // A `CACHEDIR.TAG` in a source or above one would make
+        // `--exclude-caches` leave that source out (``CacheDirTag``), so the
+        // flag is held back for this run and the log says why.
+        let cacheTagFinding = set.excludesCaches(applying: globalExcludes)
+            ? set.sources.lazy.compactMap { CacheDirTag.finding(atOrAbove: $0) }.first
+            : nil
+
         // ── Steps 4 + 5: probe primary, then back it up ─────────────────
         let backupResult = await performChild(
             kind: .backup,
@@ -492,7 +499,7 @@ public final class BackupEngine: Sendable {
                 excludes: set.effectiveBackupExcludes + set.hostBackupExcludes(applying: globalExcludes),
                 globalExcludes: set.globalBackupExcludes(applying: globalExcludes),
                 excludeCloudFiles: excludeCloudFiles,
-                excludeCaches: set.excludesCaches(applying: globalExcludes),
+                excludeCaches: set.excludesCaches(applying: globalExcludes) && cacheTagFinding == nil,
                 excludeLargerThan: set.excludeLargerThan(applying: globalExcludes)
             ),
             invocation: ResticInvocation(
@@ -508,7 +515,7 @@ public final class BackupEngine: Sendable {
                 if let cloudSourceNote {
                     logWriter?.appendLine(cloudSourceNote)
                 }
-                logWriter?.appendLine(globalExcludeNote(for: set))
+                logWriter?.appendLine(globalExcludeNote(for: set, cacheTagFinding: cacheTagFinding))
                 let (probe, secretError) = await probeDestination(primary)
                 logWriter?.appendLine("probe primary \"\(primary.label)\": \(describe(probe))")
                 record(probe: probe, for: primary)
@@ -2711,7 +2718,7 @@ public final class BackupEngine: Sendable {
     /// list, so "why is this file missing from my snapshot?" is answerable
     /// from the run log alone rather than by reconstructing which build
     /// shipped which catalogue.
-    func globalExcludeNote(for set: BackupSet) -> String {
+    func globalExcludeNote(for set: BackupSet, cacheTagFinding: CacheDirTag.Finding? = nil) -> String {
         guard set.usesGlobalExcludes else {
             return "global excludes: set opted out (usesGlobalExcludes: false)"
         }
@@ -2719,7 +2726,7 @@ public final class BackupEngine: Sendable {
             return "global excludes: none configured on this machine"
         }
         var extras: [String] = []
-        if globalExcludes.excludeCaches { extras.append("--exclude-caches") }
+        if globalExcludes.excludeCaches && cacheTagFinding == nil { extras.append("--exclude-caches") }
         if let size = globalExcludes.excludeLargerThan { extras.append("--exclude-larger-than \(size)") }
         let suffix = extras.isEmpty ? "" : " plus \(extras.joined(separator: ", "))"
         // The count this set actually sends, not the plan's: patterns the
@@ -2737,8 +2744,19 @@ public final class BackupEngine: Sendable {
             : " (held back as unsafe for this set's sources, where they would match the source "
                 + "itself or a directory above it and empty the snapshot: "
                 + "\(swallowed.joined(separator: ", ")))"
+        let cacheTagNote: String
+        switch cacheTagFinding {
+        case nil:
+            cacheTagNote = ""
+        case .tagged(let directory)?:
+            cacheTagNote = " (--exclude-caches held back: \(directory)/CACHEDIR.TAG marks a source or a "
+                + "directory above one, and restic would leave that source out of the snapshot)"
+        case .unverifiable(let directory, let code)?:
+            cacheTagNote = " (--exclude-caches held back: could not read \(directory)/CACHEDIR.TAG "
+                + "(errno \(code)), so a tag that would leave a source out cannot be ruled out)"
+        }
         return "global excludes: \(applied) pattern(s)\(suffix) "
-            + "from this machine's global exclusion list\(heldBack)\(ancestorNote)"
+            + "from this machine's global exclusion list\(heldBack)\(ancestorNote)\(cacheTagNote)"
     }
 
     /// The patterns in `set.purgeExcludes` that this destination's durable
