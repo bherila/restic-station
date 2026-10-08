@@ -61,7 +61,10 @@ public struct SetRunChild: Equatable, Sendable {
 /// taxonomy in `docs/architecture.md`:
 ///
 /// - ``completed(status:groupId:children:)`` — the sequence ran; `status` is
-///   the worst child run status (success | warning | failed).
+///   the worst child run status (success | warning | failed), leaving out a
+///   mirror's child that its own secret read stopped before restic ran.
+///   That child stays in `children` as `.failed`, but it skips the mirror as
+///   its probe would, so it does not decide the group (#172).
 /// - ``skipped`` — the set lock was busy; exactly one `.skipped` index
 ///   record was written and nothing else happened (**retryable**).
 /// - ``retryable(reason:)`` — the secret store could not be read, so restic
@@ -299,7 +302,8 @@ public final class BackupEngine: Sendable {
     ///    then retention only if that copy succeeded;
     /// 8. retention on the primary if the policy is non-nil and non-empty;
     /// 9. clear `current-run`, release the lock (also on every failure path),
-    ///    group outcome = worst child status.
+    ///    group outcome = worst child status, leaving out a mirror's child
+    ///    that its own secret read refused (#172).
     public func runSet(_ set: BackupSet, trigger: RunTrigger) async -> SetRunOutcome {
         guard let primary = set.destinations.first(where: { $0.isPrimary }) else {
             let reason = "backup set \"\(set.name)\" has no primary destination"
