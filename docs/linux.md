@@ -422,7 +422,7 @@ platform: linux
       20 pattern(s) here  (+8 for the other platform)
 [x] system-caches — System and application caches
       …
-      22 pattern(s) here  (+6 for the other platform)
+      23 pattern(s) here  (+6 for the other platform)
 [x] temporary-files — Temporary and partial files
       …
       12 pattern(s) here
@@ -453,7 +453,7 @@ platform: linux
 
 this machine adds no patterns of its own
 
-152 pattern(s) reach every backup set that has not set usesGlobalExcludes: false
+153 pattern(s) reach every backup set that has not set usesGlobalExcludes: false
 of those, 1 match cloud placeholder stubs (*.icloud) and are held back for a set whose onlineOnlyFiles is "download"
 ```
 
