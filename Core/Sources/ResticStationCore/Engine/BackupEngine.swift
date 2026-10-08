@@ -699,7 +699,9 @@ public final class BackupEngine: Sendable {
             if let reason = copy.infrastructureFailureReason {
                 infrastructureFailures.append("secondary \"\(secondary.label)\": \(reason)")
             }
-            if case .secret = copy.verdict {
+            // The copy reads the primary's secrets too, as its source; a
+            // refusal of those is the primary's and still fails the group.
+            if Self.refusesOnlyMirror(copy.verdict, mirror: secondary) {
                 mirrorSecretRefusals.insert(copy.child.runId)
             }
 
@@ -741,7 +743,7 @@ public final class BackupEngine: Sendable {
                 if let reason = prune.infrastructureFailureReason {
                     infrastructureFailures.append("secondary \"\(secondary.label)\": \(reason)")
                 }
-                if case .secret = prune.verdict {
+                if Self.refusesOnlyMirror(prune.verdict, mirror: secondary) {
                     mirrorSecretRefusals.insert(prune.child.runId)
                 }
             case .infrastructureFailure(let reason):
@@ -949,7 +951,7 @@ public final class BackupEngine: Sendable {
                     case .completed(let secondaryCheck):
                         // A secret refusal before restic ran is the probe's
                         // answer, a skipped mirror, not a failed check (#172).
-                        if case .secret = secondaryCheck.verdict {} else {
+                        if !Self.refusesOnlyMirror(secondaryCheck.verdict, mirror: secondary) {
                             statuses.append(secondaryCheck.child.status)
                         }
                         if let reason = secondaryCheck.infrastructureFailureReason {
@@ -4158,6 +4160,18 @@ public final class BackupEngine: Sendable {
 
     /// The scheduled-backup outcome for a primary whose restic never ran
     /// because of a secret problem seen after the pre-flight (#152).
+    /// Whether a mirror's child was refused for the mirror's own secrets,
+    /// which skips that mirror as its probe would, rather than failing the
+    /// group (#172). A refusal naming any other destination, such as a
+    /// copy's source, is not the mirror's to absorb.
+    private static func refusesOnlyMirror(_ verdict: ChildVerdict, mirror: Destination) -> Bool {
+        guard case .secret(let equivalent, _) = verdict else { return false }
+        switch equivalent {
+        case .attention(_, let destinationId), .secretUnavailable(let destinationId):
+            return destinationId == mirror.id
+        }
+    }
+
     /// Whether the engine's own pre-flight checks for this failure, so that
     /// the next tick would refuse it there, before stamping or recording
     /// anything. Online-only files in a local cloud repository are not a

@@ -140,6 +140,41 @@ import Testing
         }
     }
 
+    /// The nearest constraint on letting a mirror's refusal pass (#172):
+    /// the copy reads the primary's secrets too, as its source. A refusal
+    /// of those is the primary's, the mirror was not updated, and the group
+    /// must not read as a success. Each of the primary's reads after the
+    /// pre-flight fails alone.
+    @Test("the primary's secret failure during mirroring still fails the group")
+    func primaryFailureDuringMirroringFailsTheGroup() async throws {
+        for operation in try Self.mirrorOperations() {
+            let (cleanEnv, cleanRun) = try operation.make()
+            let clean = await cleanRun()
+            let total = cleanEnv.secrets.reads(for: T.primaryId)
+            cleanEnv.cleanUp()
+            guard clean == "completed success" else { continue }
+            #expect(total >= 2, "\(operation.name): only \(total) read(s) of the primary's secrets")
+            for (error, _) in Self.errors {
+                for reads in 1..<max(total, 1) {
+                    let (env, run) = try operation.make()
+                    defer { env.cleanUp() }
+                    // This one read only: a later read that also fails,
+                    // such as the primary's own retention, would fail the
+                    // group whatever the copy's refusal did.
+                    let secrets = env.secrets
+                    env.secrets.failReads(for: T.primaryId, afterReads: reads, with: error) {
+                        secrets.failReads(for: T.primaryId, afterReads: .max, with: error)
+                    }
+                    let label = await run()
+                    #expect(
+                        label != clean,
+                        "\(operation.name), \(error), failing the primary from read \(reads + 1) of \(total): \(label)"
+                    )
+                }
+            }
+        }
+    }
+
     /// The nearest constraint on taking the stamp back (#170): it is right
     /// only where the pre-flight would refuse on the next tick. Online-only
     /// files in a local cloud repository are not a pre-flight question. A
