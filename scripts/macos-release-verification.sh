@@ -70,7 +70,11 @@ assert_equal() {
 pass "release bundle layout is complete"
 
 plutil -lint "$INFO_PLIST" "$AGENT_PLIST" | tee "$EVIDENCE_DIR/plist-lint.txt"
-assert_equal "bundle version" "0.1.0" "$(plutil -extract CFBundleShortVersionString raw -o - "$INFO_PLIST")"
+# The version this checkout declares; the helper test keeps
+# Helper/Sources/Commands/Version.swift equal to it.
+EXPECTED_VERSION=$(sed -n 's/^[[:space:]]*MARKETING_VERSION:[[:space:]]*"\{0,1\}\([^"]*\)"\{0,1\}[[:space:]]*$/\1/p' "$(dirname "$0")/../project.yml" | head -1)
+[[ -n "$EXPECTED_VERSION" ]] || fail "project.yml declares MARKETING_VERSION"
+assert_equal "bundle version" "$EXPECTED_VERSION" "$(plutil -extract CFBundleShortVersionString raw -o - "$INFO_PLIST")"
 assert_equal "agent label" "net.herila.ResticStation.helper" "$(plutil -extract Label raw -o - "$AGENT_PLIST")"
 assert_equal "agent BundleProgram" "Contents/MacOS/restic-station-helper" "$(plutil -extract BundleProgram raw -o - "$AGENT_PLIST")"
 assert_equal "agent command" "tick" "$(plutil -extract ProgramArguments.1 raw -o - "$AGENT_PLIST")"
@@ -82,9 +86,9 @@ codesign -d --verbose=4 "$HELPER" > "$EVIDENCE_DIR/helper-codesign-direct.txt" 2
 pass "app and nested helper pass strict code-signature verification"
 
 "$HELPER" version | tee "$EVIDENCE_DIR/helper-version.txt"
-grep -q '^restic-station-helper 0\.1\.0$' "$EVIDENCE_DIR/helper-version.txt" \
-    || fail "embedded helper reports version 0.1.0"
-pass "embedded helper reports version 0.1.0"
+[[ "$(cat "$EVIDENCE_DIR/helper-version.txt")" == "restic-station-helper $EXPECTED_VERSION" ]] \
+    || fail "embedded helper reports version $EXPECTED_VERSION"
+pass "embedded helper reports version $EXPECTED_VERSION"
 
 # Launch the shipped executable against isolated data and require it to stay
 # alive long enough to prove the SwiftUI app did not crash during startup.

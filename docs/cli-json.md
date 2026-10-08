@@ -44,7 +44,7 @@ itself, unwrapped, because its output is meant to be fed straight back into
 
 | Command | `--json` | Payload (`data`) |
 |---|---|---|
-| `version` | ✅ | `{ name, version, platform }` |
+| `version` | ✅ | `{ name, version, platform, configSchemaVersion }` — the last is the newest `config.json` schema this binary reads and writes |
 | `status` | ✅ | `StatusReport` — see `data-model.md` §`status --json` |
 | `sets list` | ✅ | array of set entries — `data-model.md` §`sets list --json` |
 | `runs list` | ✅ | array of `RunIndexEntry` |
@@ -52,6 +52,8 @@ itself, unwrapped, because its output is meant to be fed straight back into
 | `config show` | ✅ | effective-config report |
 | `config validate` | ✅ | `{ machineId, errors, warnings, effective, nothingRunsHere }` |
 | `excludes show` | ✅ | this host's global exclusion list — `data-model.md` §`excludes show --json` |
+| `config upgrade` | ✅ | `{ fromVersion, toVersion, migrated, backupFile, message }` — migrates `config.json` to this binary's schema now; `migrated: false` (with `backupFile`/`message` `null`) when it was already current. A migration that could not be written is `internal_error` |
+| `config acknowledge-migration` | ✅ | `{ hadMigration, fromVersion, toVersion, acknowledgedAt }` — clears the warning `status` raises for this machine's last schema migration (`configMigration`); `hadMigration: false` and nulls when none was recorded |
 | `probe-repo` | ✅ | `{ setId, destinationId, label, outcome, reachable, reason }` |
 | `secret list` | ✅ | array of `{ destId, label, setName, hasPassword, secretEnvCount }` — only destinations that have something stored, the same set human mode prints |
 | `cli status` | ✅ | `CLIInstaller.Status` |
@@ -129,7 +131,7 @@ never match on it. `details` is omitted entirely when empty.
 | `preview_expired` | no | 1 | A destructive preview token has expired. Run a fresh preview; the old token can never be applied. |
 | `operation_not_allowed` | no | 1 | Refused by a safety invariant — `forget` with an empty retention policy, `prune` on a mirror behind its primary (`architecture.md` §Invariants). |
 | `operation_completed_audit_failed` | no | 1 | A destructive launch crossed its audit boundary, but complete terminal metadata plus its index projection could not be proven. Inspect repository state and reconcile run history; never retry the destructive request automatically. |
-| `internal_error` | no | 1 | An unexpected or structurally unrecoverable local failure, including an unusable process-control lock. Bounded; never a serialized object description. |
+| `internal_error` | no | 1 | An unexpected or structurally unrecoverable local failure, including an unusable process-control lock. Also restic exiting 0 when its output, which the command needed, was cut because a descendant kept writing past the drain bound (`resticExitCode: 0`, `architecture.md` §Process model, #150). Bounded; never a serialized object description. |
 
 ### `retryable`
 

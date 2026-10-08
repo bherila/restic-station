@@ -70,8 +70,13 @@ out". `DefaultProcessRunner` therefore takes its two graces as an internal
 initializer parameter; these tests pass 1 s and finish in ~3 s with bounds
 that are tight enough to mean something. `stopSequenceGracesAreTenSecondsInProduction`
 guards the seam, so shrinking graces for tests cannot quietly become the
-shipped values. The children sleep 60 s, far longer than any bound, so
-"waited the child out" can never pass.
+shipped values. The children sleep 60 s (`childLifetime`), so "waited the
+child out" can never pass. Every deadline test asserts the same 30 s bound
+(`stoppedBound`), halfway between the ~4 s worst nominal and the 60 s
+lifetime rather than near the nominal: bounds of 10–12 s flaked on the 3-core
+macOS runner, which starved a 1 s-deadline run to 10.7 s (#173).
+`stoppedBoundSeparatesTheOutcomes` keeps the bound at most half the lifetime
+and the lifetime within the tests' one-minute time limit.
 
 **An elapsed bound is not optional on a timeout test.** `#expect(throws:)`
 alone passes identically whether the deadline stopped the child or was merely
@@ -107,14 +112,16 @@ exists when `posix_spawn` reports an error, so it cannot double-spawn a
 destructive command; `onlyTransientSpawnFailuresAreRetried` pins the boundary
 so a real `ENOENT` or `EACCES` still fails on the first attempt.
 
-**Signal delivery to children is not portable, and CI is the only place that
-shows it.** On the `linux` job, a child does not stop on SIGINT and is ended
-by the SIGKILL escalation behind it — an ignored disposition is inherited
-across `exec` there, while macOS's Foundation resets child dispositions (cf.
-the same divergence behind `SIGPIPEGuard`'s no-op handler). One further
-Linux-only observation came out of #114 and is recorded in #149 alongside it: a
-`/bin/sh -c` child's termination is not observed after SIGKILL the way a
-direct `/bin/sleep` child's is. None of it is visible from a green macOS run.
+**Signal delivery to children used to differ by platform.** Under
+`Foundation.Process`, a child on the `linux` job did not stop on SIGINT —
+an ignored disposition was inherited across `exec` there, while macOS's
+Foundation reset it — and a `/bin/sh -c` child's termination was not
+observed after SIGKILL the way a direct child's was (#149). The runner now
+spawns with `POSIX_SPAWN_SETSIGDEF` and an empty mask on every platform and
+reaps with its own `waitid`/`waitpid` (#114), which removes both causes;
+`ProcessGroupOwnershipTests` pins group signalling, the post-exit straggler
+SIGTERM, opt-in inheritance, the lease, and that nothing is signalled after
+the reap. Only the Linux CI jobs can confirm the Linux half.
 
 **An elapsed bound is necessary and not sufficient.** Two independent reviews
 of #147 built the same counterexample: delete the runner's entire kill path,
@@ -123,22 +130,15 @@ satisfies the bounds on its own — leaving eight children running. A timeout
 test must therefore assert *liveness* too. `deadlineEndsTheChild` does it
 portably, by having the child append to a file on a loop and requiring that
 file to stop growing; a pid probe would not work, since `kill(pid, 0)`
-succeeds against a zombie and a child ended on Linux may not be reaped
-promptly (#149). `descendantCannotExtendARunWhoseChildExited` covers the
+succeeds against a zombie, which an orphan in a CI container (whose PID 1
+does not reap) can stay. `descendantCannotExtendARunWhoseChildExited` covers the
 interleaving every other test structurally cannot reach — the child exits
 *before* the deadline, so no stop sequence runs, and an unbounded drain then
-returns **success** a descendant's lifetime late. It is macOS-gated because
-its *precondition* is unreachable on Linux, not merely its mechanism: there
-a `/bin/sh -c` child's termination is not observed while a descendant lives
-(#149), so the deadline fires and the run ends as a bounded `.timeout`
-instead. A bound loose enough to pass on Linux would also pass with the fix
-reverted, which is worse than not running the test there.
-
-One thing the Linux runs did settle: `deadlineEndsTheChild` passes there. So
-SIGKILL genuinely reaches and ends the child on Linux — it is only the
-*observation* of that death that does not arrive, which narrows #149 from
-"the signal may not be landing" to "the signal lands and corelibs does not
-report it".
+returns **success** a descendant's lifetime late. It runs on every
+platform since the runner owns its reap (#114); under `Foundation.Process`
+it was macOS-only, because on Linux a `/bin/sh -c` child's termination was
+not observed while a descendant lived (#149) and the scenario could not be
+set up.
 
 ### Fixture conventions
 `Core/Tests/ResticStationCoreTests/Fixtures/` — restic output fixtures are copied verbatim from `docs/fixtures/` (captured from restic 0.18.1; see restic-cli.md). Load via `Bundle.module` (declare `resources: [.copy("Fixtures")]` in Package.swift). Every parser has a test decoding its fixture; NDJSON parsers additionally get a partial-line-buffering test (feed the fixture in random-sized chunks, expect identical parse) and an unknown-`message_type` tolerance test.

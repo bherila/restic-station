@@ -238,9 +238,24 @@ public struct AppPaths: Equatable, Sendable {
         stateDir.appendingPathComponent("repo-status-\(destId.uuidString).json", isDirectory: false)
     }
 
+    /// `state/secret-attention-<destId>.json` — the engine's secret pre-flight
+    /// found a permanent reason this destination's secrets cannot be
+    /// produced (#95). Present only while that is true.
+    public func secretAttentionFile(destId: UUID) -> URL {
+        stateDir.appendingPathComponent("secret-attention-\(destId.uuidString).json", isDirectory: false)
+    }
+
     /// `state/fda-check.json` — result of the helper's Full Disk Access probe.
     public var fdaCheckFile: URL {
         stateDir.appendingPathComponent("fda-check.json", isDirectory: false)
+    }
+
+    /// `state/config-migration.json` — the last schema migration this host
+    /// wrote to `config.json`, kept until someone acknowledges it
+    /// (`docs/data-model.md` §Versioning & migration). Host-local state: the
+    /// host that migrated a shared config is the one that must say so.
+    public var configMigrationFile: URL {
+        stateDir.appendingPathComponent("config-migration.json", isDirectory: false)
     }
 
     /// `state/preview-tokens.json` — the local, owner-only index behind

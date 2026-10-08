@@ -43,7 +43,13 @@ public final class StateWatcher: ObservableObject {
     /// Sourced from `state/repo-status-<destId>.json` files, discovered the
     /// same way as `currentRuns`.
     @Published public private(set) var repoStatuses: [UUID: RepoStatus] = [:]
+    /// `state/secret-attention-<destId>.json`, keyed by `Destination.id`
+    /// (#95): destinations whose secrets the engine cannot produce.
+    @Published public private(set) var secretAttention: [UUID: SecretAttentionRecord] = [:]
     @Published public private(set) var fdaCheck: FdaCheckResult?
+    /// `state/config-migration.json`: the last schema migration this host
+    /// wrote to the shared config (#161).
+    @Published public private(set) var configMigration: ConfigMigrationRecord?
     /// `RunStore.recentRuns(limit: 200)`, newest first.
     @Published public private(set) var recentRuns: [RunIndexEntry] = []
     /// Destructive runs whose launch marker has no complete terminal
@@ -375,10 +381,12 @@ public final class StateWatcher: ObservableObject {
                 : nil
         }
         fdaCheck = stateStore.readFdaCheck()
+        configMigration = stateStore.readConfigMigration()
 
         let discovered = enumerateStateDirectory()
         currentRuns = discovered.currentRuns
         repoStatuses = discovered.repoStatuses
+        secretAttention = discovered.secretAttention
 
         recentRuns = (try? runStore.recentRuns(limit: 200)) ?? []
     }
@@ -454,16 +462,21 @@ public final class StateWatcher: ObservableObject {
     /// method never decodes JSON itself. A directory listing failure (e.g.
     /// `state/` momentarily absent mid delete-recreate) yields empty
     /// dictionaries rather than throwing; the next event repopulates them.
-    private func enumerateStateDirectory() -> (currentRuns: [UUID: CurrentRunState], repoStatuses: [UUID: RepoStatus]) {
+    private func enumerateStateDirectory() -> (
+        currentRuns: [UUID: CurrentRunState],
+        repoStatuses: [UUID: RepoStatus],
+        secretAttention: [UUID: SecretAttentionRecord]
+    ) {
         guard let entries = try? FileManager.default.contentsOfDirectory(
             at: paths.stateDir,
             includingPropertiesForKeys: nil
         ) else {
-            return ([:], [:])
+            return ([:], [:], [:])
         }
 
         var currentRuns: [UUID: CurrentRunState] = [:]
         var repoStatuses: [UUID: RepoStatus] = [:]
+        var secretAttention: [UUID: SecretAttentionRecord] = [:]
 
         for entry in entries {
             let filename = entry.lastPathComponent
@@ -475,10 +488,14 @@ public final class StateWatcher: ObservableObject {
                 if let status = stateStore.readRepoStatus(destId: destId) {
                     repoStatuses[destId] = status
                 }
+            } else if let destId = Self.extractUUID(from: filename, prefix: "secret-attention-", suffix: ".json") {
+                if let record = stateStore.readSecretAttention(destId: destId) {
+                    secretAttention[destId] = record
+                }
             }
         }
 
-        return (currentRuns, repoStatuses)
+        return (currentRuns, repoStatuses, secretAttention)
     }
 
     private static func extractUUID(from filename: String, prefix: String, suffix: String) -> UUID? {

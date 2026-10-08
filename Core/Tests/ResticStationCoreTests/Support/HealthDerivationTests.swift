@@ -858,4 +858,55 @@ private func currentRun(percentDone: Double, phase: String = "backing-up-primary
         #expect(!healths[1].isRunning)
         #expect(healths[1].nextDue == .distantPast)
     }
+
+    // #161: the host that migrated a shared config warns until acknowledged,
+    // for both the menu bar glyph and `status`'s exit code.
+    @Test func anUnacknowledgedConfigMigrationIsAWarning() {
+        #expect(HealthDerivation.hasWarningConditions(
+            setHealths: [], runsInFlight: [], fullDiskAccessDenied: false, backgroundAgentEnabled: true,
+            configMigrationUnacknowledged: true
+        ))
+        #expect(!HealthDerivation.hasWarningConditions(
+            setHealths: [], runsInFlight: [], fullDiskAccessDenied: false, backgroundAgentEnabled: true
+        ))
+        #expect(HealthDerivation.appHealth(
+            setHealths: [], runsInFlight: [], fullDiskAccessDenied: false, backgroundAgentEnabled: true,
+            configMigrationUnacknowledged: true
+        ) == .warning)
+        #expect(HealthDerivation.appHealth(
+            setHealths: [], runsInFlight: [], fullDiskAccessDenied: false, backgroundAgentEnabled: true,
+            destructiveAuditFailure: true, configMigrationUnacknowledged: true
+        ) == .critical)
+    }
+
+    // #95: a recorded secret problem makes its set need attention at once —
+    // no grace period — and only the set it was recorded for.
+    @Test func aSecretProblemNeedsAttentionImmediatelyAndOnlyForItsSet() {
+        let destination = Destination(id: UUID(), label: "Primary", repoURL: "/repo", isPrimary: true)
+        let set = BackupSet(
+            id: UUID(), name: "Docs", sources: ["/src"], schedule: .daily(hour: 3, minute: 0),
+            destinations: [destination]
+        )
+        let now = Date(timeIntervalSince1970: 1_000_000)
+        let record = SecretAttentionRecord(
+            destId: destination.id, setId: set.id, attention: .secretNotConfigured,
+            detail: "no item", detectedAt: now
+        )
+        func health(_ attention: [UUID: SecretAttentionRecord]) -> SetHealth {
+            HealthDerivation.setHealth(
+                set: set, recentRuns: [], currentRun: nil, repoStatuses: [:], setScheduleState: nil,
+                now: now, calendar: Calendar(identifier: .gregorian), visibleSince: now,
+                secretAttention: attention
+            )
+        }
+
+        #expect(!health([:]).needsAttention, "a brand-new set is inside its first-backup grace")
+        #expect(health([destination.id: record]).needsAttention)
+        #expect(health([destination.id: record]).secretAttention == [record])
+
+        var foreign = record
+        foreign.setId = UUID()
+        #expect(!health([destination.id: foreign]).needsAttention)
+        #expect(!health([UUID(): record]).needsAttention)
+    }
 }

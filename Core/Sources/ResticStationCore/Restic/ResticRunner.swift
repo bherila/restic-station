@@ -19,19 +19,31 @@ public struct ResticInvocation: Sendable {
     /// Opaque digest binding for a helper-confirmed maintenance executable.
     /// The runner rechecks it immediately before the child is spawned.
     public let expectedExecutableIdentity: String?
+    /// Whether restic may download online-only files by reading them (#156).
+    /// Only a backup of a set whose `onlineOnlyFiles` is `.download`, and
+    /// whose primary repository is not itself in cloud storage, asks for it
+    /// (`BackupEngine.backupDownloadsOnlineOnlyFiles`), because the policy
+    /// covers the repository reads too. Every other restic process reads only repositories and the
+    /// restore target, and a repository's online-only files are never
+    /// downloaded implicitly. So by default the kernel refuses such a read
+    /// for the child's whole life, including a file evicted after the
+    /// pre-flight's scan.
+    public let downloadsOnlineOnlyFiles: Bool
 
     public init(
         destination: Destination,
         fromDestination: Destination? = nil,
         destinationSecretEnv: [String: String]? = nil,
         resticPathOverride: String? = nil,
-        expectedExecutableIdentity: String? = nil
+        expectedExecutableIdentity: String? = nil,
+        downloadsOnlineOnlyFiles: Bool = false
     ) {
         self.destination = destination
         self.fromDestination = fromDestination
         self.destinationSecretEnv = destinationSecretEnv
         self.resticPathOverride = resticPathOverride
         self.expectedExecutableIdentity = expectedExecutableIdentity
+        self.downloadsOnlineOnlyFiles = downloadsOnlineOnlyFiles
     }
 }
 
@@ -190,6 +202,7 @@ public final class ResticRunner: Sendable {
             beforeLaunch: beforeLaunch,
             auditBeforeLaunch: auditBeforeLaunch,
             afterLaunchFailure: afterLaunchFailure,
+            datalessFiles: inv.downloadsOnlineOnlyFiles ? .download : .refuse,
             onLine: onLine,
             onRawLine: onRawLine,
             timeout: timeout
@@ -314,7 +327,7 @@ public final class ResticRunner: Sendable {
         }
         let stdout = String(decoding: result.stdout, as: UTF8.self)
         let stderr = String(decoding: result.stderr, as: UTF8.self)
-        return ResticOutcome(exitCode: result.exitCode, status: Self.status(exitCode: result.exitCode, messages: collector.messages, stderr: stderr), messages: collector.messages, rawOutput: stdout + stderr)
+        return ResticOutcome(exitCode: result.exitCode, status: Self.status(exitCode: result.exitCode, messages: collector.messages, stderr: stderr, outputComplete: result.outputComplete), messages: collector.messages, rawOutput: stdout + stderr)
     }
 
     public func verifyRemoteMaintenance(_ command: RemoteResticCommand) async throws -> VersionInfo {
@@ -489,6 +502,7 @@ public final class ResticRunner: Sendable {
         beforeLaunch: (@Sendable () throws -> Void)? = nil,
         auditBeforeLaunch: (@Sendable () throws -> Void)? = nil,
         afterLaunchFailure: (@Sendable () -> Void)? = nil,
+        datalessFiles: DatalessFileReads = .refuse,
         onLine: (@Sendable (ResticMessage) -> Void)?,
         onRawLine: (@Sendable (String) -> Void)?,
         timeout: TimeInterval?
@@ -546,7 +560,8 @@ public final class ResticRunner: Sendable {
                 onStderrLine: { line in
                     onRawLine?(line)
                 },
-                timeout: timeout
+                timeout: timeout,
+                datalessFiles: datalessFiles
             )
         } catch let error as ProcessRunnerError {
             // `DefaultProcessRunner` emits `.launchFailed` only from
@@ -570,7 +585,12 @@ public final class ResticRunner: Sendable {
         let stderrText = String(decoding: result.stderr, as: UTF8.self)
         return ResticOutcome(
             exitCode: result.exitCode,
-            status: Self.status(exitCode: result.exitCode, messages: messages, stderr: stderrText),
+            status: Self.status(
+                exitCode: result.exitCode,
+                messages: messages,
+                stderr: stderrText,
+                outputComplete: result.outputComplete
+            ),
             messages: messages,
             rawOutput: stdoutText + stderrText
         )
@@ -606,9 +626,18 @@ public final class ResticRunner: Sendable {
     /// precise one — the process exit status is sometimes the generic 1 — so
     /// when the run failed and an `exit_error` was streamed, the message's
     /// code and text drive the classification.
-    static func status(exitCode: Int32, messages: [ResticMessage], stderr: String) -> ResticExitClass {
+    ///
+    /// An exit 0 whose output was not read to the end is
+    /// ``ResticExitClass/successUnverified``, never `.success` (#150): the
+    /// exit code is real, but what restic said about the run was cut.
+    static func status(
+        exitCode: Int32,
+        messages: [ResticMessage],
+        stderr: String,
+        outputComplete: Bool = true
+    ) -> ResticExitClass {
         guard exitCode != 0 else {
-            return .success
+            return outputComplete ? .success : .successUnverified
         }
         let exitErrors = messages.compactMap { message -> (code: Int, message: String)? in
             guard case .exitError(let code, let text) = message else { return nil }

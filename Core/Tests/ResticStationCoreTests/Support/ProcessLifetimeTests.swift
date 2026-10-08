@@ -32,6 +32,29 @@ struct ProcessLifetimeTests {
         DefaultProcessRunner(terminationGrace: 1, drainGrace: 1)
     }
 
+    /// How long the children that must be stopped would live if nobody
+    /// stopped them. "Waited out" therefore means returning at about this.
+    private static let childLifetime: TimeInterval = 60
+
+    /// The one elapsed bound every deadline test here asserts. It only has to
+    /// separate "stopped at the deadline" (~1 s deadline plus up to three 1 s
+    /// graces, ~4 s) from "waited out" (`childLifetime`), so it sits halfway
+    /// between rather than close to the nominal: the 3-core macOS runner has
+    /// starved a 1 s-deadline run past 10 s (#173), and a tight bound measures
+    /// the runner, not the contract.
+    private static let stoppedBound: TimeInterval = 30
+
+    /// Keeps the two constants above meaning something. A bound that creeps
+    /// toward the lifetime stops distinguishing the outcomes, and a lifetime
+    /// past the one-minute time limit turns "waited out" from a failed
+    /// assertion into a cancelled test that names nothing.
+    @Test("the elapsed bound still separates a stopped child from a waited-out one")
+    func stoppedBoundSeparatesTheOutcomes() {
+        #expect(Self.stoppedBound * 2 <= Self.childLifetime)
+        #expect(Self.stoppedBound >= 20, "leave the starved macOS runner its margin (#173)")
+        #expect(Self.childLifetime <= 60)
+    }
+
     /// The production graces are the documented ones. Guards the seam above:
     /// shrinking graces for tests must not quietly become the shipped values.
     @Test("the stop sequence's graces are 10s in production")
@@ -146,7 +169,7 @@ struct ProcessLifetimeTests {
 
         await #expect(throws: ProcessRunnerError.timeout) {
             _ = try await Self.runner().run(
-                ["/bin/sh", "-c", "exec 1>&- 2>&-; sleep 60"],
+                ["/bin/sh", "-c", "exec 1>&- 2>&-; sleep \(Int(Self.childLifetime))"],
                 env: nil,
                 stdin: nil,
                 currentDirectory: nil,
@@ -157,7 +180,7 @@ struct ProcessLifetimeTests {
         }
 
         let elapsed = Date().timeIntervalSince(started)
-        #expect(elapsed < 10, "returned after \(elapsed)s; the child was waited out rather than stopped at the deadline")
+        #expect(elapsed < Self.stoppedBound, "returned after \(elapsed)s; the child was waited out rather than stopped at the deadline")
     }
 
     /// The stop sequence must actually **end the child**, not merely stop
@@ -305,7 +328,7 @@ struct ProcessLifetimeTests {
 
         await #expect(throws: ProcessRunnerError.timeout) {
             _ = try await Self.runner().run(
-                ["/bin/sh", "-c", "trap '' INT; sleep 60"],
+                ["/bin/sh", "-c", "trap '' INT; sleep \(Int(Self.childLifetime))"],
                 env: nil,
                 stdin: nil,
                 currentDirectory: nil,
@@ -316,7 +339,7 @@ struct ProcessLifetimeTests {
         }
 
         let elapsed = Date().timeIntervalSince(started)
-        #expect(elapsed < 12, "returned after \(elapsed)s; nothing bounded the wait for a child that survives SIGINT")
+        #expect(elapsed < Self.stoppedBound, "returned after \(elapsed)s; nothing bounded the wait for a child that survives SIGINT")
     }
 
     /// The case the elapsed bounds elsewhere structurally cannot reach: the
@@ -335,22 +358,16 @@ struct ProcessLifetimeTests {
     /// Every other test here uses a child that survives to the deadline, so
     /// this interleaving was untested until a review constructed it.
     ///
-    /// macOS only, and for a sharper reason than the other gate in this file:
-    /// the *precondition* is unreachable on Linux. This needs the child's
-    /// exit to be observed before the deadline, and there a `/bin/sh -c`
-    /// child's termination is not observed at all while a descendant lives
-    /// (#149) — so the deadline fires and the run ends as a bounded
-    /// `.timeout` instead, at 26.97 s against a 20 s deadline. That is the
-    /// runner behaving correctly; it simply is not this scenario. A bound
-    /// loose enough to pass there would be satisfied with the fix reverted,
-    /// which is worse than not running the test.
-    #if canImport(Darwin)
+    /// Runs on every platform since the runner owns its reap (#114). Under
+    /// `Foundation.Process` it was macOS-only: on Linux a `/bin/sh -c`
+    /// child's termination was not observed while a descendant lived (#149),
+    /// so the scenario could not even be set up there.
     @Test("a descendant cannot extend a run whose child already exited", .timeLimit(.minutes(1)))
     func descendantCannotExtendARunWhoseChildExited() async throws {
         let started = Date()
 
         let result = try await Self.runner().run(
-            ["/bin/sh", "-c", "sleep 30 & exit 0"],
+            ["/bin/sh", "-c", "sleep \(Int(Self.childLifetime)) & exit 0"],
             env: nil,
             stdin: nil,
             currentDirectory: nil,
@@ -362,11 +379,84 @@ struct ProcessLifetimeTests {
         let elapsed = Date().timeIntervalSince(started)
         #expect(result.exitCode == 0)
         #expect(
-            elapsed < 10,
+            elapsed < Self.stoppedBound,
             "returned after \(elapsed)s; the descendant was waited out, and because the deadline never fired this came back as a late success"
         )
+        // An idle holder cut nothing: the pipe was empty when the drain
+        // stopped (#150). This is the `ssh` ControlPersist shape, and
+        // flagging it would mark every such sftp run unverified.
+        #expect(result.outputComplete)
     }
-    #endif
+
+    /// #150, the property that protects restic's own output: everything
+    /// already in the pipe when the drain stops is collected, even by a
+    /// reader that never got to run before the stop (a starved reader), and
+    /// with the write end still held open by a descendant.
+    @Test("a stopped reader still collects what is already in the pipe, and calls that complete")
+    func stoppedReaderCollectsBufferedOutput() async throws {
+        var ends: [Int32] = [0, 0]
+        try #require(pipe(&ends) == 0)
+        defer { close(ends[1]) }
+        let payload = String(repeating: "restic line\n", count: 3000) // ~36 KiB
+        _ = payload.utf8CString.withUnsafeBufferPointer { write(ends[1], $0.baseAddress, payload.utf8.count) }
+        let stop = AtomicFlag()
+        stop.set()
+
+        let result = await DefaultProcessRunner.readPipeToCompletion(ends[0], onLine: nil, stop: stop)
+        close(ends[0])
+
+        #expect(String(decoding: result.data, as: UTF8.self) == payload)
+        #expect(result.complete, "the pipe was empty when reading stopped; nothing was cut")
+    }
+
+    /// Codex on #175: end-of-file reached just as the budget is spent is a
+    /// complete read, not a cut one.
+    @Test("end-of-file right after the final read's budget is spent is complete")
+    func endOfFileAfterBudgetIsComplete() async throws {
+        var ends: [Int32] = [0, 0]
+        try #require(pipe(&ends) == 0)
+        let payload = String(repeating: "x", count: 100)
+        _ = payload.utf8CString.withUnsafeBufferPointer { write(ends[1], $0.baseAddress, payload.utf8.count) }
+        close(ends[1])
+        let stop = AtomicFlag()
+        stop.set()
+
+        let result = await DefaultProcessRunner.readPipeToCompletion(ends[0], onLine: nil, stop: stop, finalDrainLimit: 10)
+        close(ends[0])
+
+        #expect(String(decoding: result.data, as: UTF8.self) == payload)
+        #expect(result.complete)
+    }
+
+    @Test("data still pending when the final read's budget runs out is incomplete")
+    func pendingDataBeyondBudgetIsIncomplete() async throws {
+        var ends: [Int32] = [0, 0]
+        try #require(pipe(&ends) == 0)
+        defer { close(ends[1]) }
+        let payload = "more\n"
+        _ = payload.utf8CString.withUnsafeBufferPointer { write(ends[1], $0.baseAddress, payload.utf8.count) }
+        let stop = AtomicFlag()
+        stop.set()
+
+        let result = await DefaultProcessRunner.readPipeToCompletion(ends[0], onLine: nil, stop: stop, finalDrainLimit: 0)
+        close(ends[0])
+
+        #expect(!result.complete)
+    }
+
+    @Test("output read to end-of-file is complete")
+    func outputToEOFIsComplete() async throws {
+        let result = try await Self.runner().run(
+            ["/bin/sh", "-c", "echo one; echo two >&2"],
+            env: nil,
+            stdin: nil,
+            currentDirectory: nil,
+            onStdoutLine: nil,
+            onStderrLine: nil,
+            timeout: 20
+        )
+        #expect(result.outputComplete)
+    }
 
     /// The mirror image: the deadline fires and the direct child is stopped,
     /// but a descendant still holds the inherited stdout/stderr write ends.
@@ -378,7 +468,7 @@ struct ProcessLifetimeTests {
 
         await #expect(throws: ProcessRunnerError.timeout) {
             _ = try await Self.runner().run(
-                ["/bin/sh", "-c", "sleep 60 & sleep 60"],
+                ["/bin/sh", "-c", "sleep \(Int(Self.childLifetime)) & sleep \(Int(Self.childLifetime))"],
                 env: nil,
                 stdin: nil,
                 currentDirectory: nil,
@@ -389,7 +479,7 @@ struct ProcessLifetimeTests {
         }
 
         let elapsed = Date().timeIntervalSince(started)
-        #expect(elapsed < 12, "returned after \(elapsed)s; the descendant holding the pipes was waited out")
+        #expect(elapsed < Self.stoppedBound, "returned after \(elapsed)s; the descendant holding the pipes was waited out")
     }
 }
 

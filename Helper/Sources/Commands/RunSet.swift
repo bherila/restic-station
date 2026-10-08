@@ -222,6 +222,8 @@ struct RunSet: AsyncParsableCommand {
                 ? "\(kind.rawValue) may have run, but its result could not be recorded or trusted: "
                     + "\(reason). Inspect the repositories before retrying."
                 : "this machine cannot run \(kind.rawValue): \(reason)")
+        case .secretRefused(let attention, let destinationId, let detail):
+            HelperExit.secretRefused(kind.rawValue, attention: attention, destinationId: destinationId, detail: detail)
         case .operationNotAllowed(let reason):
             // Unreachable via the CLI — `run()` refuses before building a
             // context. Kept exhaustive so a future caller that reaches the

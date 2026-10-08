@@ -124,9 +124,13 @@ struct Status: AsyncParsableCommand, JSONRenderable {
         )
 
         var repoStatuses: [UUID: RepoStatus] = [:]
+        var secretAttention: [UUID: SecretAttentionRecord] = [:]
         for (_, destination) in scheduled.destinations {
             if let status = stateStore.readRepoStatus(destId: destination.id) {
                 repoStatuses[destination.id] = status
+            }
+            if let attention = stateStore.readSecretAttention(destId: destination.id) {
+                secretAttention[destination.id] = attention
             }
         }
         let scheduleState: ScheduleState?
@@ -150,6 +154,7 @@ struct Status: AsyncParsableCommand, JSONRenderable {
             now: now,
             calendar: calendar,
             visibleSince: configurationVisibleSince,
+            secretAttention: secretAttention,
             runLiveness: runLiveness
         )
 
@@ -181,6 +186,10 @@ struct Status: AsyncParsableCommand, JSONRenderable {
         ) ?? auditGateFailure.map {
             LockingHealthFailure(scope: .machine, failure: $0)
         }
+        // Only an unacknowledged record is a warning; an acknowledged one is
+        // still reported, so the last migration stays discoverable.
+        let configMigration = stateStore.readConfigMigration()
+        let migrationUnacknowledged = configMigration?.needsAcknowledgement == true
         let health = HealthDerivation.appHealth(
             setHealths: setHealths,
             // Every current-run file, including one for a set no longer in
@@ -191,6 +200,7 @@ struct Status: AsyncParsableCommand, JSONRenderable {
             backgroundAgentEnabled: scheduler.flatMap(\.healthy),
             lockingBroken: lockingFailure != nil,
             destructiveAuditFailure: !auditFailures.isEmpty,
+            configMigrationUnacknowledged: migrationUnacknowledged,
             runLiveness: runLiveness
         )
 
@@ -205,7 +215,10 @@ struct Status: AsyncParsableCommand, JSONRenderable {
                     reachable: status?.reachable,
                     stale: setHealth.staleDestinationIds.contains(destination.id),
                     lastSyncedAt: status?.lastSyncedAt,
-                    lastError: status?.lastError
+                    lastError: status?.lastError,
+                    secretProblem: setHealth.secretAttention
+                        .first { $0.destId == destination.id }
+                        .map(StatusReport.SecretProblem.init)
                 )
             }
             return StatusReport.SetStatus(
@@ -270,6 +283,7 @@ struct Status: AsyncParsableCommand, JSONRenderable {
             excludedHere: excludedHere
         )
         report.auditFailures = auditFailures.map(StatusReport.AuditFailure.init)
+        report.configMigration = configMigration.map(StatusReport.ConfigMigration.init)
 
         if json {
             CLIJSON.print(report)
@@ -291,6 +305,7 @@ struct Status: AsyncParsableCommand, JSONRenderable {
             fullDiskAccessDenied: fdaDenied,
             backgroundAgentEnabled: scheduler.flatMap(\.healthy),
             lockingBroken: lockingFailure != nil,
+            configMigrationUnacknowledged: migrationUnacknowledged,
             runLiveness: runLiveness
         )
         HelperExit.code(needsAttention ? 1 : 0)
@@ -524,9 +539,12 @@ struct StatusReport: Encodable {
         let stale: Bool
         let lastSyncedAt: Date?
         let lastError: String?
+        /// Why the engine cannot produce this destination's secrets, when it
+        /// will not clear on its own (#95); `null` otherwise.
+        var secretProblem: SecretProblem? = nil
 
         private enum CodingKeys: String, CodingKey {
-            case id, label, isPrimary, reachable, stale, lastSyncedAt, lastError
+            case id, label, isPrimary, reachable, stale, lastSyncedAt, lastError, secretProblem
         }
 
         // Explicit `null` for the three "unknown until probed" fields — see
@@ -540,6 +558,24 @@ struct StatusReport: Encodable {
             try container.encode(stale, forKey: .stale)
             try container.encode(lastSyncedAt, forKey: .lastSyncedAt)
             try container.encode(lastError, forKey: .lastError)
+            try container.encode(secretProblem, forKey: .secretProblem)
+        }
+    }
+
+    /// `state/secret-attention-<destId>.json`, as reported: the published
+    /// error code (`secret_not_configured` or `secret_store_unusable`), the
+    /// store's own text naming the repair, and when it was first seen.
+    struct SecretProblem: Encodable {
+        let code: String
+        let detail: String
+        let detectedAt: Date
+
+        init(_ record: SecretAttentionRecord) {
+            code = record.attention.code.rawValue
+            detail = record.attention == .secretNotConfigured
+                ? "no password is stored; run `\(DestinationAttention.secretSetCommand(destId: record.destId))`"
+                : record.detail
+            detectedAt = record.detectedAt
         }
     }
 
@@ -735,12 +771,53 @@ struct StatusReport: Encodable {
     let scheduler: SchedulerStatus?
     let sets: [SetStatus]
     var auditFailures: [AuditFailure] = []
+    /// The last schema migration this host wrote to the shared config
+    /// (`state/config-migration.json`), or `null` if there has been none.
+    var configMigration: ConfigMigration?
     let unattributedRuns: [UnattributedRun]
     let excludedHere: [Exclusion]
 
+    struct ConfigMigration: Encodable {
+        let fromVersion: Int
+        let toVersion: Int
+        let migratedAt: Date
+        let process: String
+        let machineId: String?
+        let acknowledged: Bool
+        let acknowledgedAt: Date?
+        let message: String
+
+        init(_ record: ConfigMigrationRecord) {
+            fromVersion = record.fromVersion
+            toVersion = record.toVersion
+            migratedAt = record.migratedAt
+            process = record.process
+            machineId = record.machineId
+            acknowledged = !record.needsAcknowledgement
+            acknowledgedAt = record.acknowledgedAt
+            message = ConfigMigrationRecord.fleetWarning(from: record.fromVersion, to: record.toVersion)
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case fromVersion, toVersion, migratedAt, process, machineId, acknowledged, acknowledgedAt, message
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(fromVersion, forKey: .fromVersion)
+            try container.encode(toVersion, forKey: .toVersion)
+            try container.encode(migratedAt, forKey: .migratedAt)
+            try container.encode(process, forKey: .process)
+            try container.encode(machineId, forKey: .machineId)
+            try container.encode(acknowledged, forKey: .acknowledged)
+            try container.encode(acknowledgedAt, forKey: .acknowledgedAt)
+            try container.encode(message, forKey: .message)
+        }
+    }
+
     private enum CodingKeys: String, CodingKey {
         case machineId, generatedAt, health, fullDiskAccessDenied, locking, scheduler, sets, auditFailures
-        case unattributedRuns, excludedHere
+        case configMigration, unattributedRuns, excludedHere
     }
 
     // Explicit `null` for `scheduler` — see
@@ -757,6 +834,7 @@ struct StatusReport: Encodable {
         try container.encode(scheduler, forKey: .scheduler)
         try container.encode(sets, forKey: .sets)
         try container.encode(auditFailures, forKey: .auditFailures)
+        try container.encode(configMigration, forKey: .configMigration)
         try container.encode(unattributedRuns, forKey: .unattributedRuns)
         try container.encode(excludedHere, forKey: .excludedHere)
     }
@@ -774,6 +852,11 @@ struct StatusReport: Encodable {
             lines.append(
                 "  - \(failure.reason); inspect repository state and reconcile run history before retrying"
             )
+        }
+        if let migration = configMigration, !migration.acknowledged {
+            lines.append("config: SCHEMA UPGRADED v\(migration.fromVersion) → v\(migration.toVersion) — upgrade every machine sharing it")
+            lines.append("  - \(migration.message)")
+            lines.append("  detail: run `restic-station-helper config acknowledge-migration` once they are")
         }
         // Ahead of the scheduler line: if this is broken, the scheduler
         // firing perfectly on time changes nothing.
@@ -877,6 +960,12 @@ struct StatusReport: Encodable {
                 let error = destination.lastError.map { " (\($0))" } ?? ""
                 let staleFlag = destination.stale ? ", STALE" : ""
                 lines.append("      - \(role) \"\(destination.label)\": \(reach)\(error)\(staleFlag)")
+                if let problem = destination.secretProblem {
+                    let consequence = destination.isPrimary
+                        ? "scheduled runs skip this set until fixed"
+                        : "the primary still backs up; copies to this mirror fail until fixed"
+                    lines.append("        SECRETS: \(problem.code) — \(problem.detail); \(consequence)")
+                }
             }
         }
 

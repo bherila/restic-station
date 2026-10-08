@@ -52,14 +52,28 @@ enum DestinationStatus: Equatable, Sendable {
     case error
     /// Never probed — no `state/repo-status-<destId>.json` yet.
     case unknown
+    /// The engine cannot produce this destination's secrets and will not
+    /// until someone fixes it (#95): no password stored, or the store
+    /// refuses to be read. Outranks everything — scheduled runs of the set
+    /// are skipped until it clears.
+    case secretProblem(DestinationAttention)
 
     var color: Color {
         switch self {
         case .reachable: return .green
         case .stale: return .yellow
         case .offline: return .secondary
-        case .notInitialized, .error: return .red
+        case .notInitialized, .error, .secretProblem: return .red
         case .unknown: return .secondary
+        }
+    }
+
+    /// Whether the status line itself is drawn in red: a recorded restic
+    /// error, or secrets the engine cannot produce.
+    var isAlarm: Bool {
+        switch self {
+        case .error, .secretProblem: return true
+        case .reachable, .stale, .offline, .notInitialized, .unknown: return false
         }
     }
 
@@ -71,12 +85,21 @@ enum DestinationStatus: Equatable, Sendable {
         case .notInitialized: return "Not initialized"
         case .error: return "Error"
         case .unknown: return "Not probed yet"
+        case .secretProblem(.secretNotConfigured): return "Password not stored"
+        case .secretProblem: return "Secrets unreadable"
         }
     }
 
     /// Derives the status from the on-disk probe record plus the staleness
     /// decision already made by `HealthDerivation` (which owns the rule).
-    static func derive(status: RepoStatus?, isStale: Bool) -> DestinationStatus {
+    static func derive(
+        status: RepoStatus?,
+        isStale: Bool,
+        secretAttention: SecretAttentionRecord? = nil
+    ) -> DestinationStatus {
+        if let secretAttention {
+            return .secretProblem(secretAttention.attention)
+        }
         guard let status else {
             return isStale ? .stale : .unknown
         }

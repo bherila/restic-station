@@ -81,8 +81,15 @@ struct AppAlertBanners: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            if model.configChangedOnDisk {
+            if let problem = model.configFileProblem {
+                ConfigProblemBanner(problem: problem)
+            } else if let offer = model.pendingSchemaUpgrade {
+                SchemaUpgradeBanner(offer: offer)
+            } else if model.configChangedOnDisk {
                 ConfigChangeBanner()
+            }
+            if let migration = model.unacknowledgedConfigMigration {
+                ConfigMigrationNoticeBanner(migration: migration)
             }
             if let error = model.pendingSecretRollbackError {
                 SecretRollbackBanner(message: error)
@@ -155,6 +162,100 @@ struct ConfigChangeBanner: View {
             Button("Reload Settings") {
                 Task { await model.reloadConfigFromDisk() }
             }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 9)
+        .background(.bar)
+        .overlay(alignment: .bottom) { Divider() }
+    }
+}
+
+/// `config.json` failed its last load or reload (#162). Replaces the
+/// generic "changed on disk" banner, which a failed reload also raises,
+/// because it says what is wrong: an unreadable file, or one written by a
+/// newer Restic Station.
+struct ConfigProblemBanner: View {
+    @EnvironmentObject private var model: AppModel
+    let problem: ConfigFileProblem
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.yellow)
+            // With no earlier config to show, the set list carries the full
+            // explanation; the banner only has to name the problem.
+            Text(model.config.sets.isEmpty ? problem.menuBarLine : problem.staleListBanner)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 12)
+            if problem.offersUpdateCheck {
+                CheckForUpdatesButton()
+            }
+            Button("Reload Settings") {
+                Task { await model.reloadConfigFromDisk() }
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 9)
+        .background(.bar)
+        .overlay(alignment: .bottom) { Divider() }
+    }
+}
+
+/// `config.json` is at an older schema and this app will not rewrite it
+/// without asking (#161). Settings are read-only meanwhile.
+struct SchemaUpgradeBanner: View {
+    @EnvironmentObject private var model: AppModel
+    let offer: SchemaUpgradeOffer
+    @State private var confirming = false
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "arrow.up.doc.fill")
+                .foregroundStyle(.blue)
+            Text(offer.bannerText)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 12)
+            Button("Upgrade…") { confirming = true }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 9)
+        .background(.bar)
+        .overlay(alignment: .bottom) { Divider() }
+        .alert(offer.confirmationTitle, isPresented: $confirming) {
+            Button("Upgrade") {
+                Task { await model.upgradeConfigSchema() }
+            }
+            Button("Not Now", role: .cancel) {}
+        } message: {
+            Text(offer.confirmationMessage)
+        }
+    }
+}
+
+/// This host rewrote the shared `config.json` at a newer schema (#161) —
+/// by the app, the helper, or the CLI. Stays until acknowledged, because
+/// the machines left behind cannot report that they stopped.
+struct ConfigMigrationNoticeBanner: View {
+    @EnvironmentObject private var model: AppModel
+    let migration: ConfigMigrationRecord
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.yellow)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(ConfigMigrationRecord.fleetWarning(from: migration.fromVersion, to: migration.toVersion))
+                    .fixedSize(horizontal: false, vertical: true)
+                Text("Upgraded \(migration.migratedAt.formatted(date: .abbreviated, time: .shortened)) "
+                    + "by \(migration.process).")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 12)
+            Button("They're Upgraded") {
+                model.acknowledgeConfigMigration()
+            }
+            .help("Clear this warning once every machine sharing config.json runs a version that reads it")
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 9)

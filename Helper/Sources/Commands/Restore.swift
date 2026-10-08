@@ -65,7 +65,11 @@ struct Restore: AsyncParsableCommand {
             case .success:
                 print("restore completed")
             case .warning:
-                print("restore completed with warnings — some items could not be restored, see the run log")
+                // Two causes share `.warning`: per-file restore errors, and a
+                // restore whose transcript was cut so it cannot be verified
+                // (#150). The run log's summary says which.
+                print("restore completed with warnings — some items may not have been restored, "
+                    + "or the result could not be verified; see the run log")
             case .failed:
                 HelperExit.fail("restore failed — see the run log")
             case .skipped:
@@ -80,6 +84,8 @@ struct Restore: AsyncParsableCommand {
                 ? "restore may have run, but its result could not be recorded or trusted: \(reason). "
                     + "Inspect the target before retrying."
                 : "this machine cannot run the restore: \(reason)")
+        case .secretRefused(let attention, let destinationId, let detail):
+            HelperExit.secretRefused("restore", attention: attention, destinationId: destinationId, detail: detail)
         case .operationNotAllowed(let reason):
             // Not reachable today: only manual retention apply is
             // contained. Exhaustive so that containing another

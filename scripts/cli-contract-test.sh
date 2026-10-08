@@ -134,6 +134,8 @@ runs show|json|live
 config show|json|live
 config validate|json|live
 excludes show|json|live
+config upgrade|json|live
+config acknowledge-migration|json|live
 probe-repo|json|live
 secret list|json|live
 cli status|json|live
@@ -493,8 +495,8 @@ log "PART 2a: success envelopes and documented payloads"
 RESTIC_STATION_DATA_DIR="$FIXTURE" run_helper_split version --json
 expect_rc 0
 assert_success_envelope "version --json"
-jq -e '.data | has("name") and has("version") and has("platform")' "$OUT_FILE" >/dev/null \
-    || fail "version --json payload is not { name, version, platform }"
+jq -e '.data | has("name") and has("version") and has("platform") and (.configSchemaVersion | type == "number")' "$OUT_FILE" >/dev/null \
+    || fail "version --json payload is not { name, version, platform, configSchemaVersion }"
 mark_cmd "version"
 
 RESTIC_STATION_DATA_DIR="$FIXTURE" run_helper_split status --json
@@ -539,6 +541,56 @@ jq -e '.data | has("machineId") and has("errors") and has("warnings") and has("e
     "$OUT_FILE" >/dev/null \
     || fail "config validate --json data is not { machineId, errors, warnings, effective, nothingRunsHere }"
 mark_cmd "config validate"
+
+# #161: an explicit upgrade of an older-schema copy of the fixture records a
+# migration that keeps status at warning until it is acknowledged. A copy,
+# so the fixture's own status/rc expectations are untouched.
+RESTIC_STATION_DATA_DIR="$FIXTURE" run_helper_split config upgrade --json
+expect_rc 0
+assert_success_envelope "config upgrade --json (current)"
+jq -e '.data | .migrated == false and .fromVersion == .toVersion and .backupFile == null and .message == null' \
+    "$OUT_FILE" >/dev/null || fail "config upgrade --json on a current config did not report a no-op"
+UPGRADE_DIR="$WORK/upgrade-fixture"
+cp -R "$FIXTURE" "$UPGRADE_DIR"
+rm -f "$UPGRADE_DIR/state/config-migration.json"
+CURRENT_SCHEMA=$(jq -r '.version' "$FIXTURE/config.json")
+OLDER_SCHEMA=$((CURRENT_SCHEMA - 1))
+jq --argjson v "$OLDER_SCHEMA" '.version = $v' "$FIXTURE/config.json" > "$UPGRADE_DIR/config.json"
+RESTIC_STATION_DATA_DIR="$UPGRADE_DIR" run_helper_split config upgrade --json
+expect_rc 0
+assert_success_envelope "config upgrade --json (older)"
+jq -e --argjson from "$OLDER_SCHEMA" --argjson to "$CURRENT_SCHEMA" \
+    '.data | .migrated == true and .fromVersion == $from and .toVersion == $to
+        and (.backupFile | endswith("config.v\($from).backup.json")) and (.message | length > 0)' \
+    "$OUT_FILE" >/dev/null || fail "config upgrade --json did not report the migration"
+[[ "$(jq -r '.version' "$UPGRADE_DIR/config.json")" == "$CURRENT_SCHEMA" ]] \
+    || fail "config upgrade did not rewrite config.json"
+grep -q "must run a Restic Station that reads" "$ERR_FILE" || fail "config upgrade printed no fleet warning on stderr"
+mark_cmd "config upgrade"
+
+RESTIC_STATION_DATA_DIR="$UPGRADE_DIR" run_helper_split status --json
+expect_rc 1
+jq -e --argjson from "$OLDER_SCHEMA" \
+    '.data.health == "warning" and .data.configMigration.acknowledged == false
+        and .data.configMigration.fromVersion == $from' "$OUT_FILE" >/dev/null \
+    || fail "status --json does not warn about an unacknowledged migration"
+RESTIC_STATION_DATA_DIR="$FIXTURE" run_helper_split status --json
+jq -e '.data | has("configMigration") and .configMigration == null' "$OUT_FILE" >/dev/null \
+    || fail "status --json must carry configMigration: null when nothing was migrated"
+
+RESTIC_STATION_DATA_DIR="$UPGRADE_DIR" run_helper_split config acknowledge-migration --json
+expect_rc 0
+assert_success_envelope "config acknowledge-migration --json"
+jq -e '.data | .hadMigration == true and (.acknowledgedAt | length > 0)' "$OUT_FILE" >/dev/null \
+    || fail "config acknowledge-migration --json did not acknowledge"
+RESTIC_STATION_DATA_DIR="$UPGRADE_DIR" run_helper_split status --json
+jq -e '.data.configMigration.acknowledged == true' "$OUT_FILE" >/dev/null \
+    || fail "status --json still reports the migration as unacknowledged"
+RESTIC_STATION_DATA_DIR="$FIXTURE" run_helper_split config acknowledge-migration --json
+expect_rc 0
+jq -e '.data | .hadMigration == false and .fromVersion == null' "$OUT_FILE" >/dev/null \
+    || fail "config acknowledge-migration --json with nothing recorded is not a no-op"
+mark_cmd "config acknowledge-migration"
 
 RESTIC_STATION_DATA_DIR="$FIXTURE" run_helper_split secret list --json
 expect_rc 0
@@ -1122,8 +1174,9 @@ if grep -qF -- "$SECRET_PASSWORD" "$COMBINED_LOG"; then
 fi
 ok "the stored password never appeared in any command's output"
 
-printf '\ncoverage: %s commands asserted (%s/37 rows); codes: %s live + %s env asserted, %s delegated to unit tests (of %s documented)\n' \
+printf '\ncoverage: %s commands asserted (%s/%s rows); codes: %s live + %s env asserted, %s delegated to unit tests (of %s documented)\n' \
     "$(wc -l < "$WORK/marked-cmds.sorted" | tr -d ' ')" "$CMDS_TOTAL" \
+    "$(printf '%s\n' "$CMD_TABLE" | wc -l | tr -d ' ')" \
     "$CODES_LIVE" "$CODES_ENV" "$CODES_UNIT" \
     "$(wc -l < "$DOC_CODES_FILE" | tr -d ' ')"
 

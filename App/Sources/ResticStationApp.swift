@@ -12,11 +12,14 @@ struct ResticStationApp: App {
     /// alive for as long as the process is (the menu bar extra keeps working
     /// after the last window closes).
     @StateObject private var model = AppModel()
+    /// Sparkle, started once per launch (`docs/release.md` §Updates).
+    @StateObject private var updates = UpdateController()
 
     var body: some Scene {
         WindowGroup("Restic Station", id: AppWindowID.main) {
             MainWindow()
                 .environmentObject(model)
+                .environmentObject(updates)
                 // `StateWatcher` and `LaunchdManager` are separate
                 // `ObservableObject`s; views that render raw live state
                 // (runs list, progress bars, agent status) observe them
@@ -34,12 +37,17 @@ struct ResticStationApp: App {
             // A single-window utility: "New Window" would open a second,
             // equally authoritative view of the same config.
             CommandGroup(replacing: .newItem) {}
+            CommandGroup(after: .appInfo) {
+                CheckForUpdatesButton()
+                    .environmentObject(updates)
+            }
         }
 
         Settings {
             SettingsRootView()
                 .environmentObject(model)
                 .environmentObject(model.launchd)
+                .environmentObject(updates)
         }
 
         // `docs/ui-spec.md` §Menu bar. `isInserted` is bound straight through
@@ -52,6 +60,7 @@ struct ResticStationApp: App {
         ) {
             MenuBarView()
                 .environmentObject(model)
+                .environmentObject(updates)
         }
         .menuBarExtraStyle(.menu)
     }

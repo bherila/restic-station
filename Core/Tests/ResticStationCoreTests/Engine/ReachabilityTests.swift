@@ -128,6 +128,22 @@ struct ReachabilityTests {
         #expect(resticCall?.argv == ["/usr/local/bin/restic", "-r", dest.repoURL, "cat", "config"])
     }
 
+    /// #150: the probe needs only the exit code, so a `cat config` whose
+    /// output was cut by the drain still means the repository answered.
+    @Test("remote exit 0 with a cut transcript is still reachable")
+    func remoteExitZeroWithCutTranscriptIsReachable() async throws {
+        let dest = Destination(id: Self.destId, label: "R2", repoURL: "s3:https://x/bucket", isPrimary: false)
+        let fake = FakeProcessRunner(script: [
+            .init(
+                argvPrefix: ["/usr/local/bin/restic", "-r", dest.repoURL, "cat", "config"],
+                exitCode: 0,
+                outputComplete: false
+            ),
+        ])
+        let result = await Self.makeReachability(fake).probe(dest)
+        #expect(result == .reachable)
+    }
+
     @Test("remote destination: an explicit secret snapshot is used for the probe")
     func remoteProbeUsesProvidedSecretSnapshot() async throws {
         let dest = Destination(id: Self.destId, label: "R2", repoURL: "s3:https://x/bucket", isPrimary: false)

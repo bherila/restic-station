@@ -1478,7 +1478,7 @@ public struct GlobalExcludeStore: Sendable {
         // come back as if the write never happened — and each of those
         // restores the built-in defaults, re-enabling a group the operator
         // had disabled.
-        try DurableFile.write(data, to: paths.globalExcludesFile, via: tempFile)
+        try DurableFile.write(data, to: paths.globalExcludesFile, via: tempFile, mode: 0o600)
         return Self.fingerprint(of: data)
     }
 

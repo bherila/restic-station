@@ -78,7 +78,7 @@ extension SecretStoreError: LocalizedError {
 /// cannot quietly pick one of them as a fallback for the other — which is
 /// how a "no password stored" refusal came to be reported as an unusable
 /// store during a pre-flight race (#96 review).
-public enum DestinationAttention: String, Sendable, Equatable, CaseIterable {
+public enum DestinationAttention: String, Codable, Sendable, Equatable, CaseIterable {
     /// Nothing is stored for this destination. Remedy: `secret set`.
     case secretNotConfigured = "secret_not_configured"
     /// The store refused to be read at all. Remedy: whatever its own
@@ -88,6 +88,14 @@ public enum DestinationAttention: String, Sendable, Equatable, CaseIterable {
     /// online-only (dataless) files, and reading them would download them.
     /// Remedy: keep the repository folder available offline in the provider.
     case cloudRepositoryNotHydrated = "cloud_repository_not_hydrated"
+
+    /// The command that stores a destination's password — the repair for
+    /// ``secretNotConfigured``. One definition, because every surface that
+    /// prints it (engine reasons, helper refusals, `status`) must print a
+    /// command the CLI actually accepts (`secret set` takes `--dest`).
+    public static func secretSetCommand(destId: UUID) -> String {
+        "restic-station-helper secret set --dest \(destId.uuidString)"
+    }
 
     /// `nil` for the transient cases, which are not attention at all: they
     /// clear without anyone doing anything.

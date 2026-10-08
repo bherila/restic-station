@@ -73,7 +73,25 @@ public protocol ProcessRunning: Sendable {
 }
 ```
 
-The production implementation (`DefaultProcessRunner`) wraps `Process` + pipes. Its deadline races the child's termination, not the end of its output: a child that closes stdout and stderr while continuing to run would otherwise cancel its own deadline and be waited out indefinitely with the set lock held. Once the child is gone — or has been told to go and did not — the readers get a bounded grace and are then told to stop, so a descendant that inherited the pipe write ends (`ssh` for the sftp backend, a password command) cannot extend the call by holding them open. **That bound is unconditional, including on the success path.** An `ssh` master with `ControlPersist` outlives its client by design, and a run whose child exited before its deadline would otherwise return a descendant's whole lifetime later — reporting *success*, since the deadline never fired. Only the drain after the child's own exit is bounded; the run still waits as long as its child runs. A transcript cut short by that bound is **not** flagged as incomplete (#150). In practice the cut cannot reach the child's own output — restic writes before it exits, leaving at most one pipe buffer to drain in microseconds against a ten-second grace — so only a descendant's later traffic is lost. Where a cut does reach a destructive transcript it fails closed, since an unparseable `rewrite` summary forces `operation_completed_audit_failed`; a cut *backup* transcript is weaker, reading as success with absent stats rather than as unverified. The readers are interruptible rather than abandoned, and both are awaited to completion, so no `onStdoutLine`/`onStderrLine` callback outlives the call — callers close the run's `LogWriter` on that same return path. Signalling reaches only the direct child today; the process-group half of #114 is still open. Tests inject `FakeProcessRunner` (see `testing.md`). `KeychainSecretStore`, `ResticRunner`, and `Reachability` all take a `ProcessRunning` in their initializers. Secret storage itself is behind the `SecretStore` protocol (`KeychainSecretStore` on macOS, `FileSecretStore` elsewhere — see `keychain-and-fda.md`); `ResticRunner` and `BackupEngine` take `any SecretStore`, not a concrete backend.
+The production implementation (`DefaultProcessRunner`) spawns with `posix_spawn` and reaps the child itself (`OwnedProcess`, #114) rather than using `Foundation.Process`, which offers no process-group control and reaps on its own monitor:
+
+- **Own process group.** The child leads a new group (`POSIX_SPAWN_SETPGROUP`), and the stop sequence — SIGINT, 10 s grace, SIGKILL — goes to the whole group with `killpg`. So `ssh` for the sftp backend or a password command is stopped with restic, and SIGINT reaches a worker even behind a shell that would defer it. When the child exits on its own, anything left in its group gets SIGTERM before the reap.
+- **Owned reap.** A waiter thread observes exit with `waitid(…, WNOWAIT)`, which leaves the leader a zombie whose pid (= pgid) cannot be reused, then signals the stragglers, and only then reaps. Every signal is sent under a lock and only while the child is unreaped: **a signal is never delivered to a pid this process has not proven it still owns.**
+- **Opt-in inheritance.** Signal dispositions are reset and the mask cleared in the child on every platform (`POSIX_SPAWN_SETSIGDEF`). Only stdin/stdout/stderr and declared leases are inherited: `POSIX_SPAWN_CLOEXEC_DEFAULT` on Darwin, and on Linux a close action for every non-close-on-exec descriptor, found in `/proc/self/fd`. A `currentDirectory` is refused (no caller sets one).
+- **Lease (helper death).** A set lock is taken with `FileLock(…, leaseToChildren: true)`, which registers its descriptor in `ProcessLeases` while held; every child receives the registered descriptors as fds 3, 4, … Because a `flock` belongs to the open file description, the set lock stays held while restic — or any descendant that kept the descriptor — is alive, even if the helper is `SIGKILL`ed, so the next tick reads the set as busy instead of overlapping the orphan. A normal `release()` still frees it at once (`LOCK_UN` unlocks the shared description). After a helper crash, a descendant that left the group and kept fd 3 (an `ssh` `ControlPersist` master, say) keeps the set busy until it exits. That is the fail-safe direction, but it is a liveness cost.
+
+Its deadline races the child's termination, not the end of its output: a child that closes stdout and stderr while continuing to run would otherwise cancel its own deadline and be waited out indefinitely with the set lock held. Once the child is gone — or has been told to go and did not — the readers get a bounded grace and are then told to stop, so a descendant that inherited the pipe write ends (`ssh` for the sftp backend, a password command) cannot extend the call by holding them open. **That bound is unconditional, including on the success path.** An `ssh` master with `ControlPersist` outlives its client by design, and a run whose child exited before its deadline would otherwise return a descendant's whole lifetime later — reporting *success*, since the deadline never fired. Only the drain after the child's own exit is bounded; the run still waits as long as its child runs. When that bound stops a reader, it first takes whatever is already in the pipe, without waiting. Everything the child wrote before it exited is in the pipe or already read, so the child's own output is collected even by a reader that was starved until the stop. The reader then reports whether the pipe was empty at that point (`ProcessResult.outputComplete`, #150):
+- An idle holder, such as a ControlPersist `ssh` master, cut nothing, and the run reads as complete.
+- Data still arriving after a bounded final read means a descendant was writing, and the transcript is marked incomplete.
+
+An exit 0 with an incomplete transcript is `ResticExitClass.successUnverified`, never `.success`:
+- Every `== .success` gate treats it as not succeeded. Previews and purge queries fail closed.
+- A run record shows it as a warning.
+- A purge records it as an `operation_completed_audit_failed` with an unknown repository outcome, because its rewrite mapping is the evidence.
+- The reachability probe, which needs only the exit code, still reads it as reachable.
+- The CLI publishes it as `internal_error` with `resticExitCode: 0`.
+
+Bytes a descendant writes after the reader stops are not covered. They were never restic's. The readers are interruptible rather than abandoned, and both are awaited to completion, so no `onStdoutLine`/`onStderrLine` callback outlives the call — callers close the run's `LogWriter` on that same return path. Signals go to the child's whole process group (see the list above). Tests inject `FakeProcessRunner` (see `testing.md`). `KeychainSecretStore`, `ResticRunner`, and `Reachability` all take a `ProcessRunning` in their initializers. Secret storage itself is behind the `SecretStore` protocol (`KeychainSecretStore` on macOS, `FileSecretStore` elsewhere — see `keychain-and-fda.md`); `ResticRunner` and `BackupEngine` take `any SecretStore`, not a concrete backend.
 
 ## restic discovery
 
@@ -131,25 +149,31 @@ the trust boundary, or does not decode is permanent. The keychain backend's
 in `keychain-and-fda.md` §2 depends on it, and marking a transient failure
 permanent is the more damaging error. See `cli-json.md` §`retryable`.
 
-**The engine has not yet followed.** `BackupEngine.runSet`'s own pre-flight
-and `secretsAvailable` still collapse both into the retryable row: a
-destination with no password stored is skipped silently, forever, with
-nothing recorded. That is a behaviour change with health and badge
-consequences — whether it should become a `.failed` run every tick, a
-`.misconfigured` result, or a health warning that is not a run at all — so
-it is issue #95 rather than a side effect of the CLI contract. Until then,
-the classification is honest and the scheduling behaviour is unchanged.
+**The engine follows the same split (#95).** Its own pre-flight — before
+the set lock and before any state is written — reads the password and, on
+every path that passes it to local restic, the secret environment (remote
+maintenance reads only the password, since it spawns with no environment).
+A transient failure is still traceless and retried next tick. A permanent
+one — `itemNotFound` or `storeUnusable`, which includes an unparseable
+`<uuid>-env` blob — is:
 
-**Two known gaps in that classification, both tracked rather than hidden.**
-The engine's pre-flight reads a destination's *password* only, so a stored
-secret-environment blob that does not parse is not refused there and
-surfaces later as a restic failure; closing it means reading the
-environment on exactly the paths that pass it to local restic, since remote
-maintenance spawns with no environment at all (#95). And the pre-flight is
-not atomic with the reads that follow it, so a `secret rm` or `chmod` in
-the window between it and the restic spawn is still published as retryable
-by the later generic catches — the evidence-binding rule in `AGENTS.md`,
-applied to secrets.
+- for a **scheduled** backup or check, `.misconfigured`: no run record (a
+  2-minute schedule must not write a failed run every tick), the tick still
+  exits 0, and `state/secret-attention-<destId>.json` makes the set need
+  attention at once, with the reason, in the app, the menu bar and
+  `status --json` (`destinations[].secretProblem`). The next pre-flight
+  that succeeds removes it;
+- for a **manual** restore, prune or init-secondary,
+  `ManualRunOutcome.secretRefused`, which the helper reports with the
+  repair instead of "try again".
+
+**After the pre-flight, too (#152).** The pre-flight is not atomic with the reads that follow it — the maintenance environment, the runner's own pre-flight and environment assembly, a remote repository's reachability probe, and purge's repository queries, including the ones repeated at launch — so a `secret rm` or a `chmod` can land in between. The rule is that each of those reads, for the destination the operation acts on, publishes and records exactly what the pre-flight would have. It is enforced in three places rather than at each consumer:
+
+- `ResticRunnerError.preflightEquivalent` (exhaustive, no `default:`) classifies a runner error. `BackupEngine.postPreflightSecretError` is the one place that applies it and updates the secret-attention state. Every runner catch goes through it, and so does every probe, via `probeDestination`. `Reachability.classifiedProbe` keeps the secret error beside the `RepoProbeResult` because `.offline`'s reason is persisted and matched by the app's badges.
+- A child run exposes a secret failure only through `ChildRun.verdict`. Its fixed precedence is a run-history failure first, then the secret failure, then the child's own status. A caller cannot report a secret problem over an unwritable run record.
+- `PostPreflightSecretSweepTests` fails every read an operation makes, one at a time. Each answer must match the pre-flight's, including its attention record. The sweep also checks that a run-history failure inside the same run wins. A new read site is covered by the sweep without a new test. The sweep fails the primary's reads only. A secondary's later reads are recorded as attention, but a copy or secondary check refused that way still fails its child and the group, while a refusal at the secondary's probe skips the mirror; whether those should match is tracked separately.
+
+Manual restore and init-secondary return `secretRefused`. Prune publishes its pre-flight's skip reason. Purge apply throws `secretRefused`, or `unavailable` for a transient failure, as its pre-flight does. Purge preview reports the secret status rather than `restic_failed`; a transient failure is `secret_unavailable`, from its pre-flight too.
 
 restic exit code mapping (verified against restic 0.18.1 — see `restic-cli.md`): `0` success, `1` fatal, `2` Go runtime error, `3` backup incomplete-read warning, `10` repository does not exist, `11` repository locked, `12` wrong password. Exit 11 on a *scheduled* run: attempt `restic unlock` once (removes only stale locks of dead processes), retry the operation once, then fail terminal if still locked.
 
@@ -206,4 +230,4 @@ restic's cache is redirected via `RESTIC_CACHE_DIR` to the location in the table
 
 ## Build system
 
-XcodeGen (`project.yml`) generates `ResticStation.xcodeproj` (git-ignored). The `Restic Station` app and `restic-station-helper` tool both depend on the local package `ResticStationCore`; the `Restic StationTests` unit-test target hosts against the app. The helper is embedded via a Copy Files phase (destination: executables); the LaunchAgent plist is copied to `Contents/Library/LaunchAgents/` via a Copy Files phase (destination: wrapper). CI builds with `CODE_SIGNING_ALLOWED=NO`; the app is **not sandboxed** (required for spawning restic/security, PATH-external binaries, and flock in Application Support) and is therefore not App Store eligible — accepted.
+XcodeGen (`project.yml`) generates `ResticStation.xcodeproj` (git-ignored). The `Restic Station` app and `restic-station-helper` tool both depend on the local package `ResticStationCore`; the `Restic StationTests` unit-test target hosts against the app. The helper is embedded via a Copy Files phase (destination: executables); the LaunchAgent plist is copied to `Contents/Library/LaunchAgents/` via a Copy Files phase (destination: wrapper). The app alone links Sparkle (SwiftPM, exact version) for self-update; `App/Resources/Info.plist` holds its keys and is merged into the generated plist. `Core/` and `Helper/` never depend on it. CI builds with `CODE_SIGNING_ALLOWED=NO`; the app is **not sandboxed** (required for spawning restic/security, PATH-external binaries, and flock in Application Support) and is therefore not App Store eligible — accepted.

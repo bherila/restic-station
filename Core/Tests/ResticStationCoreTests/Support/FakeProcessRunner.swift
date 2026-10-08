@@ -26,6 +26,9 @@ final class FakeProcessRunner: ProcessRunning, @unchecked Sendable {
         /// Runs when this expectation is consumed, before it answers — how a
         /// test changes the world *during* a child process.
         let onRun: (@Sendable () -> Void)?
+        /// `ProcessResult.outputComplete` (#150): false stands for a drain
+        /// that expired with a descendant still holding a pipe.
+        let outputComplete: Bool
 
         init(
             argvPrefix: [String],
@@ -34,7 +37,8 @@ final class FakeProcessRunner: ProcessRunning, @unchecked Sendable {
             exitCode: Int32 = 0,
             delay: TimeInterval? = nil,
             failure: ProcessRunnerError? = nil,
-            onRun: (@Sendable () -> Void)? = nil
+            onRun: (@Sendable () -> Void)? = nil,
+            outputComplete: Bool = true
         ) {
             self.argvPrefix = argvPrefix
             self.stdoutLines = stdoutLines
@@ -43,12 +47,14 @@ final class FakeProcessRunner: ProcessRunning, @unchecked Sendable {
             self.delay = delay
             self.failure = failure
             self.onRun = onRun
+            self.outputComplete = outputComplete
         }
     }
 
     private let lock = NSLock()
     private var _script: [Expectation]
     private var _invocations: [(argv: [String], env: [String: String]?, stdin: Data?)] = []
+    private var _datalessPolicies: [(argv: [String], policy: DatalessFileReads?)] = []
 
     init(script: [Expectation] = []) {
         self._script = script
@@ -64,6 +70,12 @@ final class FakeProcessRunner: ProcessRunning, @unchecked Sendable {
         set { withLock { _invocations = newValue } }
     }
 
+    /// The ``DatalessFileReads`` each call asked for, nil for a call that
+    /// left the child to inherit this process's policy (#156).
+    var datalessPolicies: [(argv: [String], policy: DatalessFileReads?)] {
+        withLock { _datalessPolicies }
+    }
+
     func run(
         _ argv: [String],
         env: [String: String]?,
@@ -73,7 +85,32 @@ final class FakeProcessRunner: ProcessRunning, @unchecked Sendable {
         onStderrLine: (@Sendable (String) -> Void)?,
         timeout: TimeInterval?
     ) async throws -> ProcessResult {
-        withLock { _invocations.append((argv, env, stdin)) }
+        try await run(
+            argv,
+            env: env,
+            stdin: stdin,
+            currentDirectory: currentDirectory,
+            onStdoutLine: onStdoutLine,
+            onStderrLine: onStderrLine,
+            timeout: timeout,
+            datalessFiles: nil
+        )
+    }
+
+    func run(
+        _ argv: [String],
+        env: [String: String]?,
+        stdin: Data?,
+        currentDirectory: String?,
+        onStdoutLine: (@Sendable (String) -> Void)?,
+        onStderrLine: (@Sendable (String) -> Void)?,
+        timeout: TimeInterval?,
+        datalessFiles: DatalessFileReads?
+    ) async throws -> ProcessResult {
+        withLock {
+            _invocations.append((argv, env, stdin))
+            _datalessPolicies.append((argv, datalessFiles))
+        }
 
         guard let expectation = withLock({ () -> Expectation? in
             guard !_script.isEmpty else { return nil }
@@ -110,7 +147,12 @@ final class FakeProcessRunner: ProcessRunning, @unchecked Sendable {
         }
         let stderrData = Data(expectation.stderr.utf8)
 
-        return ProcessResult(exitCode: expectation.exitCode, stdout: stdoutData, stderr: stderrData)
+        return ProcessResult(
+            exitCode: expectation.exitCode,
+            stdout: stdoutData,
+            stderr: stderrData,
+            outputComplete: expectation.outputComplete
+        )
     }
 
     private func withLock<T>(_ body: () -> T) -> T {

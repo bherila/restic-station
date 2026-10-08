@@ -78,6 +78,22 @@ final class AppModel: ObservableObject {
     /// overwriting a config we failed to understand would destroy the user's
     /// backup definitions.
     @Published private(set) var configLoadError: String?
+    /// Why `config.json` itself failed its last load or reload (`nil` once
+    /// it loads). Unlike `configLoadError`, never set by a `machine.json`
+    /// failure — this is what tells the set list and the menu bar that the
+    /// sets they show are missing or stale, not absent.
+    @Published private(set) var configFileProblem: ConfigFileProblem?
+    /// `config.json` is at an older schema and this app has not been told
+    /// it may rewrite it (#161). Settings stay read-only until the user
+    /// confirms `upgradeConfigSchema()`; the helper may still migrate the
+    /// file on its own, which `stateWatcher.configMigration` then reports.
+    @Published private(set) var pendingSchemaUpgrade: SchemaUpgradeOffer?
+    /// The last migration this host wrote, while it still needs
+    /// acknowledging. Mirrored from `stateWatcher` so views observing only
+    /// this model redraw when it appears or clears.
+    @Published private(set) var unacknowledgedConfigMigration: ConfigMigrationRecord?
+    /// Set by `upgradeConfigSchema()`: from then on a reload may migrate.
+    private var schemaUpgradeConfirmed = false
     /// True only when config.json itself failed to load or reload. Kept
     /// separate from the combined operator-facing error, which can also
     /// contain a machine.json failure that Reload Settings cannot repair.
@@ -240,6 +256,7 @@ final class AppModel: ObservableObject {
         // branch below needs to append to whatever the config branch found.
         var loadFailures: [String] = []
         var configReloadRequired = false
+        var configFileProblem: ConfigFileProblem?
 
         let loadedConfig: AppConfig
         let loadedConfigFingerprint: String
@@ -258,6 +275,7 @@ final class AppModel: ObservableObject {
             loadedConfig = AppConfig()
             loadedConfigFingerprint = configStore.fileFingerprint()
             configReloadRequired = true
+            configFileProblem = ConfigFileProblem(error)
             loadFailures.append(Self.describe(configLoadFailure: error, path: paths.configFile.path))
         }
 
@@ -282,6 +300,10 @@ final class AppModel: ObservableObject {
 
         self.configLoadError = loadFailures.isEmpty ? nil : loadFailures.joined(separator: "\n\n")
         self.configReloadRequired = configReloadRequired
+        self.configFileProblem = configFileProblem
+        self.pendingSchemaUpgrade = configFileProblem == nil
+            ? SchemaUpgradeOffer(fileVersion: loadedConfig.version)
+            : nil
 
         self.machine = loadedMachine
         self.config = loadedConfig
@@ -343,6 +365,30 @@ final class AppModel: ObservableObject {
         recomputeDerivedState()
     }
 
+    // MARK: - Config schema (#161)
+
+    /// The user confirmed rewriting `config.json` at this build's schema.
+    /// The migration itself is `ConfigStore`'s, reached through the normal
+    /// migrating reload, so it keeps its backup-before-overwrite ordering
+    /// and records `state/config-migration.json` like any other.
+    func upgradeConfigSchema() async {
+        schemaUpgradeConfirmed = true
+        await reloadConfigFromDisk()
+    }
+
+    /// Clears the post-migration warning once every machine sharing the
+    /// config runs a build that reads it.
+    func acknowledgeConfigMigration() {
+        do {
+            try stateStore.acknowledgeConfigMigration()
+        } catch {
+            lastConfigError = "Could not record the acknowledgement in "
+                + "\(paths.configMigrationFile.path): \(error)"
+        }
+        stateWatcher.reloadNow()
+        recomputeDerivedState()
+    }
+
     // MARK: - Config
 
     /// Validates, persists, and — when the change can affect what the next
@@ -355,6 +401,9 @@ final class AppModel: ObservableObject {
     ) throws -> String {
         if let configLoadError {
             throw AppModelError.configUnreadable(configLoadError)
+        }
+        if let pendingSchemaUpgrade {
+            throw AppModelError.configUnreadable(pendingSchemaUpgrade.readOnlyReason)
         }
         if configReloadRequired {
             throw AppModelError.configUnreadable(
@@ -445,7 +494,18 @@ final class AppModel: ObservableObject {
         let requestGeneration = configReloadGeneration
         let watcherRevisionAtStart = stateWatcher.configFileRevision
         do {
-            let snapshot = try await configSnapshotLoader()
+            // Until the user confirms the upgrade, read an older-schema file
+            // as it is (no lock, no migration) instead of through the
+            // migrating loader — the app never rewrites the shared config
+            // without asking (#161).
+            let snapshot: ConfigSnapshot
+            if !schemaUpgradeConfirmed,
+               let unmigrated = try? configStore.reconciliationSnapshot(),
+               unmigrated.config.version < AppConfig.currentVersion {
+                snapshot = unmigrated
+            } else {
+                snapshot = try await configSnapshotLoader()
+            }
             guard requestGeneration == configReloadGeneration else { return }
             let liveFingerprint = try await configRevisionLoader()
             guard requestGeneration == configReloadGeneration else { return }
@@ -482,12 +542,18 @@ final class AppModel: ObservableObject {
             // blocked until a later reload can actually install the current
             // schema; repairing the lock alone need not change the file hash.
             configReloadRequired = snapshot.config.version < AppConfig.currentVersion
-            configChangedOnDisk = configReloadRequired
+            pendingSchemaUpgrade = schemaUpgradeConfirmed
+                ? nil
+                : SchemaUpgradeOffer(fileVersion: snapshot.config.version)
+            // A pending upgrade has its own banner; "changed on disk" is for
+            // the lock-unavailable case below, where Reload is the remedy.
+            configChangedOnDisk = configReloadRequired && pendingSchemaUpgrade == nil
             configLoadError = machineLoadError
+            configFileProblem = nil
             resolvedConfig = snapshot.config.resolved(for: refreshedMachine).config
             addressableConfig = snapshot.config.addressable(for: refreshedMachine)
             stateWatcher.updateConfiguredSetIds(Set(resolvedConfig.sets.map(\.id)))
-            lastConfigError = configReloadRequired
+            lastConfigError = configReloadRequired && pendingSchemaUpgrade == nil
                 ? "Settings still use an older schema because config.lock could not be used. Repair the lock, then reload settings."
                 : nil
             recomputeDerivedState()
@@ -502,6 +568,8 @@ final class AppModel: ObservableObject {
             guard requestGeneration == configReloadGeneration else { return }
             let detail = Self.describe(configLoadFailure: error, path: paths.configFile.path)
             configLoadError = [detail, machineLoadError].compactMap { $0 }.joined(separator: "\n\n")
+            configFileProblem = ConfigFileProblem(error)
+            recomputeDerivedState()
             configReloadRequired = true
             configChangedOnDisk = true
             lastConfigError = "Reload failed: \(error)"
@@ -626,6 +694,10 @@ final class AppModel: ObservableObject {
     }
 
     private func recomputeDerivedState() {
+        let migration = stateWatcher.configMigration.flatMap { $0.needsAcknowledgement ? $0 : nil }
+        if unacknowledgedConfigMigration != migration {
+            unacknowledgedConfigMigration = migration
+        }
         let currentDate = now()
         // Resolved, not raw: a set this machine does not run has no health
         // to report here, and a destination disabled on this machine must
@@ -646,6 +718,7 @@ final class AppModel: ObservableObject {
             now: currentDate,
             calendar: calendar,
             visibleSince: paths.configurationVisibleSince(),
+            secretAttention: stateWatcher.secretAttention,
             runLiveness: runLiveness
         )
         let derivedHealth = HealthDerivation.appHealth(
@@ -669,6 +742,7 @@ final class AppModel: ObservableObject {
             destructiveAuditFailure: !stateWatcher.auditFailures.isEmpty
                 || stateWatcher.auditVerificationFailed
                 || stateWatcher.scheduleStateFailure != nil,
+            configMigrationUnacknowledged: migration != nil,
             runLiveness: runLiveness
         )
         // A failed abandoned-edit rollback can leave scheduled backups using
@@ -677,15 +751,21 @@ final class AppModel: ObservableObject {
         // visible even when no app window survives.
         appHealth = Self.health(
             derivedHealth,
-            pendingSecretRollbackError: pendingSecretRollbackError
+            pendingSecretRollbackError: pendingSecretRollbackError,
+            configFileProblem: configFileProblem
         )
     }
 
+    /// A config this app cannot read means scheduled backups on this
+    /// machine have stopped (the helper refuses it too), so it is a warning
+    /// even though every set-level signal looks quiet.
     static func health(
         _ derivedHealth: AppHealth,
-        pendingSecretRollbackError: String?
+        pendingSecretRollbackError: String?,
+        configFileProblem: ConfigFileProblem? = nil
     ) -> AppHealth {
-        pendingSecretRollbackError == nil || derivedHealth == .critical
+        guard derivedHealth != .critical else { return derivedHealth }
+        return pendingSecretRollbackError == nil && configFileProblem == nil
             ? derivedHealth
             : .warning
     }
@@ -718,6 +798,16 @@ final class AppModel: ObservableObject {
             .sink { [weak self] observedFingerprint in
                 MainActor.assumeIsolated {
                     guard let self else { return }
+                    // Settings are read-only while an upgrade is pending, so
+                    // no draft can be overwritten by following the file.
+                    // Following it matters: the background helper may have
+                    // just migrated it, and the offer must not outlive that.
+                    if self.pendingSchemaUpgrade != nil {
+                        if observedFingerprint != self.configFingerprint {
+                            Task { await self.reloadConfigFromDisk() }
+                        }
+                        return
+                    }
                     // A failed reload must retain the only production reload
                     // affordance even if fleet sync restores the exact bytes
                     // already represented by `configFingerprint`.
@@ -886,5 +976,42 @@ enum AppModelError: LocalizedError {
             return "A newer credential edit is still open or awaiting restoration. Finish or close the "
                 + "newer edit, or close this editor so Restic Station can restore credentials in order."
         }
+    }
+}
+
+
+// MARK: - SchemaUpgradeOffer
+
+/// `config.json` is at `fromVersion`, older than this build's schema.
+struct SchemaUpgradeOffer: Equatable {
+    let fromVersion: Int
+    let toVersion: Int
+
+    /// `nil` unless `fileVersion` is older than this build's schema.
+    init?(fileVersion: Int, current: Int = AppConfig.currentVersion) {
+        guard fileVersion < current else { return nil }
+        fromVersion = fileVersion
+        toVersion = current
+    }
+
+    var bannerText: String {
+        "config.json uses schema v\(fromVersion); this version of Restic Station writes v\(toVersion). "
+            + "Settings are read-only until you upgrade the file."
+    }
+
+    var readOnlyReason: String {
+        "config.json is still at schema v\(fromVersion). Upgrade it (the banner at the top of the window) "
+            + "before changing settings."
+    }
+
+    var confirmationTitle: String {
+        "Upgrade config.json to schema v\(toVersion)?"
+    }
+
+    var confirmationMessage: String {
+        "Restic Station rewrites config.json at schema v\(toVersion) and keeps the current file as "
+            + "config.v\(fromVersion).backup.json. Every machine that shares this config, including Linux "
+            + "hosts, must run a Restic Station that reads v\(toVersion), or backups stop there. "
+            + "The background helper on this Mac may upgrade it on its next run even if you don't."
     }
 }
