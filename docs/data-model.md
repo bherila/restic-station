@@ -222,7 +222,7 @@ The list has three parts, and each lives where its scope actually is:
 ```json
 {
   "version": 1,
-  "catalogVersion": 11,
+  "catalogVersion": 12,
   "enabled": true,
   "excludeCaches": true,
   "excludeLargerThan": null,
@@ -263,7 +263,7 @@ Every catalogue pattern is **relative and unanchored**: no leading `/`, no `~`, 
 
 `GlobalExcludeCatalogTests` still holds a catalogue-level rule as an **allowlist**: a bare single-component pattern must either be self-evidently machine-generated (a leading dot, or a glob) or be listed by name with its reason. The denylist it replaced could only encode mistakes already made, and it did not contain `Pods` — an ordinary English word that a folder of podcast assets above a source would match, emptying that source's snapshot.
 
-A related rule: **a default-enabled group never names a directory whose contents someone authored**, however generated the name sounds. `xcuserdata` is a developer's unshared schemes and breakpoints, which no build reproduces — only the `UserInterfaceState.xcuserstate` blob inside it is generated, and that is what the catalogue names. `GlobalExcludeCatalogTests` pins both this and the rule below.
+A related rule: **a default-enabled group never names a directory whose contents someone authored**, however generated the name sounds. The one deliberate exception is `.DocumentRevisions-V100` (`system-caches` below), which holds earlier revisions of files the set already backs up, a history restic's snapshots keep for them. `xcuserdata` is a developer's unshared schemes and breakpoints, which no build reproduces — only the `UserInterfaceState.xcuserstate` blob inside it is generated, and that is what the catalogue names. `GlobalExcludeCatalogTests` pins both this and the rule below.
 
 That is also why a pattern is never a bare name that is *both* a project's scratch directory and a user home full of authored configuration. `.gradle` was exactly that — a project build directory, and the Gradle user home whose `gradle.properties` and `init.d/` hold repository credentials, signing settings and init scripts someone wrote by hand. The catalogue names the regenerable subdirectories on both sides instead (`.gradle/configuration-cache`, `.gradle/daemon`, …), the way it already did for `.cargo`, `.m2` and `.docker`. `GlobalExcludeCatalogTests` pins that too.
 
@@ -288,7 +288,7 @@ There is no `windows` scope, because Restic Station has no Windows build and a s
 | id | Default | What it skips |
 |---|---|---|
 | `browser-caches` | on | Cached pages, images, compiled scripts and GPU shaders for the Chromium and Gecko families, plus the same cache directory names inside Electron apps. Bookmarks, history, passwords and profile settings are not in it. |
-| `system-caches` | on | Per-user cache, log and trash directories, the index/metadata sidecars either OS leaves on removable media, iCloud placeholder stubs (but see §Cloud placeholders), and a Time Machine destination or local snapshot store (backing up a backup). **Not** `lost+found`: after an `fsck` that directory holds files recovered from a damaged filesystem, frequently the only surviving copy, so excluding it would skip exactly the data most in need of the backup. |
+| `system-caches` | on | Per-user cache, log and trash directories, the index/metadata sidecars either OS leaves on removable media, iCloud placeholder stubs (but see §Cloud placeholders), a Time Machine destination or local snapshot store (backing up a backup), and a Mac volume's `.DocumentRevisions-V100` Versions store. That store holds earlier revisions of documents, so it is the one entry here that is not rebuilt. It is excluded because the set backs up the documents themselves and restic's snapshots are their history. A revision saved and superseded between two snapshots is not kept. **Not** `lost+found`: after an `fsck` that directory holds files recovered from a damaged filesystem, frequently the only surviving copy, so excluding it would skip exactly the data most in need of the backup. |
 | `temporary-files` | on | Editor swap files, partial downloads, crash dumps, anything already named as scratch. |
 | `developer-build-artifacts` | on | Swift, Xcode, Rust, .NET, Node, Python, JVM and CMake output trees, including the hidden framework directories (`.next`, `.nuxt`, `.vercel`, `.turbo`, …) and the architecture-qualified layouts (`bin/x64/Debug`, `target/<triple>/release`). |
 | `package-manager-caches` | on | npm/yarn/pnpm/bun, cargo, Go module, Gradle, Maven, NuGet, pip, Homebrew, CocoaPods, Playwright and Hugging Face caches. |
@@ -971,7 +971,7 @@ This host's global exclusion list (§global-excludes.json). Host-local — `--ma
   "excludeCaches": true,
   "excludeLargerThan": null,
   "platform": "macOS",
-  "catalogVersion": 11,
+  "catalogVersion": 12,
   "savedCatalogVersion": 11,
   "groups": [
     {

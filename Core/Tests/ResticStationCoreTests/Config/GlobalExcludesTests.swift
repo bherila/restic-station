@@ -246,6 +246,16 @@ import Testing
         #expect(defaultOn.contains("UserInterfaceState.xcuserstate"))
     }
 
+    /// The one deliberate exception to the rule above, kept on purpose so a
+    /// later review does not quietly undo it. The Versions store holds
+    /// earlier revisions of documents the set already backs up, and restic's
+    /// snapshots are their history (maintainer's call on #158).
+    @Test func theVersionsStoreIsExcludedByDefaultOnPurpose() {
+        let systemCaches = GlobalExcludeCatalog.groups.first { $0.id == "system-caches" }
+        #expect(systemCaches?.enabledByDefault == true)
+        #expect(systemCaches?.patterns.map(\.pattern).contains(".DocumentRevisions-V100") == true)
+    }
+
     /// Exactly one pattern is a *cloud placeholder*, and it is the one a
     /// sync client leaves behind for a file it has evicted.
     ///

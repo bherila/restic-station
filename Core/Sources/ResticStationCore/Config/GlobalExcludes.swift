@@ -217,7 +217,7 @@ public enum GlobalExcludeCatalog {
     /// never heard of is an error (see ``GlobalExcludeError/unknownGroup``),
     /// and a group added after the file was written takes its built-in
     /// default.
-    public static let version = 11
+    public static let version = 12
 
     /// The catalogue, in the order its patterns reach argv.
     public static let groups: [GlobalExcludeGroup] = [
@@ -268,7 +268,8 @@ public enum GlobalExcludeCatalog {
             id: "system-caches",
             title: "System and application caches",
             summary: "Per-user cache, log and trash directories, plus the index and metadata "
-                + "sidecars the OS maintains. All of it is rebuilt automatically.",
+                + "sidecars the OS maintains, all rebuilt automatically, and a Mac volume's "
+                + "document-versions store, whose history the backup's own snapshots keep.",
             patterns: [
                 .mac("Library/Caches"),
                 .mac("Library/Logs"),
@@ -285,6 +286,14 @@ public enum GlobalExcludeCatalog {
                 ".Trash",
                 ".Trashes",
                 ".Spotlight-V100",
+                // The macOS Versions store. Not rebuilt like the sidecars
+                // around it: it holds earlier revisions of documents. It is
+                // excluded because the set already backs up those documents
+                // and its snapshots are their history. What that gives up is
+                // a revision saved and superseded between two snapshots.
+                // Maintainer's call on #158, overriding the round-10
+                // removal.
+                ".DocumentRevisions-V100",
                 ".fseventsd",
                 ".TemporaryItems",
                 ".apdisk",
