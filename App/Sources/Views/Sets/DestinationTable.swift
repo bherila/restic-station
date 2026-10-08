@@ -205,8 +205,11 @@ struct DestinationTable: View {
         case .secretNotConfigured:
             return "No password is stored for this destination, \(consequence). "
                 + "Edit the destination and enter the repository password."
-        case .secretStoreUnusable, .cloudRepositoryNotHydrated:
+        case .secretStoreUnusable:
             return "Restic Station cannot read this destination's secrets, \(consequence): \(record.detail)"
+        case .cloudRepositoryNotHydrated:
+            return "This destination's repository has files that are not downloaded, \(consequence): "
+                + "\(record.detail). To use it, \(DestinationAttention.hydrationRepair)."
         }
     }
 

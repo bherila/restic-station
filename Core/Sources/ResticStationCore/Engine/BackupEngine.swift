@@ -3964,8 +3964,11 @@ public final class BackupEngine: Sendable {
         case .secretNotConfigured:
             return "no password is stored for destination \"\(destination.label)\" — "
                 + "store it with `\(DestinationAttention.secretSetCommand(destId: destination.id))` or in the app"
-        case .secretStoreUnusable, .cloudRepositoryNotHydrated:
+        case .secretStoreUnusable:
             return "the secrets for destination \"\(destination.label)\" cannot be read: \(error.description)"
+        case .cloudRepositoryNotHydrated:
+            return "the repository for destination \"\(destination.label)\" has files that are not downloaded: "
+                + "\(error.description) — \(DestinationAttention.hydrationRepair)"
         }
     }
 

@@ -97,6 +97,12 @@ public enum DestinationAttention: String, Codable, Sendable, Equatable, CaseIter
         "restic-station-helper secret set --dest \(destId.uuidString)"
     }
 
+    /// The repair for ``cloudRepositoryNotHydrated``. The refusal reaches
+    /// the same surfaces as the two secret cases, but it is not a secret
+    /// problem, and every surface words it as the download it needs (#171).
+    public static let hydrationRepair =
+        "keep the repository folder available offline in the cloud provider"
+
     /// `nil` for the transient cases, which are not attention at all: they
     /// clear without anyone doing anything.
     public init?(_ error: SecretStoreError) {
