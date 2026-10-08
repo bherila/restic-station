@@ -81,8 +81,11 @@ public enum SetRunOutcome: Equatable, Sendable {
     case skipped
     case retryable(reason: String)
     case misconfigured(reason: String)
-    /// The operation could not start because the *machine* is broken — the
-    /// set lock is unopenable, wrong-owner, or its directory uncreatable.
+    /// The *machine* is broken rather than the backup — the set lock is
+    /// unopenable, wrong-owner, or its directory uncreatable; schedule state
+    /// or run history cannot be written (including taking an attempt stamp
+    /// back, #170); or this host's global exclusion list cannot be read for
+    /// a set that uses it (#158).
     ///
     /// Deliberately not `.misconfigured`, which describes a configuration the
     /// operator can fix by editing it, and emphatically not `.retryable`,
@@ -325,6 +328,9 @@ public final class BackupEngine: Sendable {
     /// 3. `lastBackupStart = now()` (attempt semantics, scheduled *and*
     ///    manual, written before the backup so a crash still counts as an
     ///    attempt);
+    ///    3b. a set that uses this host's global exclusion list refuses, as
+    ///    an infrastructure failure that keeps the stamp, when the list
+    ///    cannot be read; it never falls back to the built-in defaults;
     /// 4. probe the primary — not reachable ⇒ `.failed` backup record, stop;
     /// 5. `backup` (exit 3 ⇒ `.warning` and continue; exit 11 ⇒ `unlock` +
     ///    exactly one retry; 1/2/10/12 ⇒ `.failed`, stop — no copies, no
