@@ -140,6 +140,44 @@ import Testing
         }
     }
 
+    /// The nearest constraint on taking the stamp back (#170): it is right
+    /// only where the pre-flight would refuse on the next tick. Online-only
+    /// files in a local cloud repository are not a pre-flight question. A
+    /// backup's probe finds them and fails the run with its stamp, and a
+    /// check, which does not probe the primary, finds them only at the
+    /// runner's own check. Taking that stamp back would repeat the failed
+    /// check on every tick instead of once a week.
+    @Test("a repository with online-only files keeps the attempt stamp")
+    func hydrationKeepsTheAttemptStamp() async throws {
+        let online: @Sendable (String) -> String? = { _ in "data/ab/abcdef" }
+        // Seen by the probe and the runner; or evicted after the probe, so
+        // only the runner's check at launch sees it.
+        let cases: [(name: String, probe: (@Sendable (String) -> String?)?, check: Bool)] = [
+            ("backup, seen by the probe", online, false),
+            ("backup, evicted after the probe", nil, false),
+            ("check", online, true),
+        ]
+        for (name, probe, check) in cases {
+            let env = T.makeEnv(
+                script: [], retention: nil, checkPolicy: CheckPolicy(enabled: true), reachableSecondaries: [],
+                probeDatalessEntry: probe, runnerDatalessEntry: online
+            )
+            defer { env.cleanUp() }
+            env.fake.script = Self.anything
+            try env.stateStore.updateScheduleState(setId: T.setId) {
+                $0.lastBackupStart = Self.priorStamps[0]
+                $0.lastCheckStart = Self.priorStamps[1]
+            }
+            let outcome = check
+                ? Self.label(await env.engine.runCheck(env.set, trigger: .scheduled))
+                : Self.label(await env.engine.runSet(env.set, trigger: .scheduled))
+            #expect(env.fake.invocations.isEmpty, "\(name): restic ran — \(outcome)")
+            let state = env.stateStore.readScheduleState()?.sets[T.setId]
+            let stamp = check ? state?.lastCheckStart : state?.lastBackupStart
+            #expect(stamp == T.t0, "\(name): the attempt stamp is \(String(describing: stamp)), not this run's — \(outcome)")
+        }
+    }
+
     // MARK: - Harness
 
     private static func readCount(_ operation: Operation) async throws -> Int {

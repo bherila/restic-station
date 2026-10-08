@@ -480,7 +480,9 @@ public final class BackupEngine: Sendable {
             // given. The run record stays — an attempt was made — and its
             // summary names the secret problem.
             if let outcome = Self.scheduledSecretOutcome(backup.verdict) {
-                withdrawAttempt(setId: set.id, \.lastBackupStart, restoring: priorBackupStart)
+                if case .secret(let equivalent, _) = backup.verdict, Self.preflightWouldRefuse(equivalent) {
+                    withdrawAttempt(setId: set.id, \.lastBackupStart, restoring: priorBackupStart)
+                }
                 return outcome
             }
             return .completed(status: .failed, groupId: groupId, children: children)
@@ -897,7 +899,9 @@ public final class BackupEngine: Sendable {
         // Seen after the pre-flight (#152): the outcome it would give —
         // unless the run record itself failed, which `verdict` puts first.
         if case .secret(let equivalent, let message) = primaryCheck.verdict {
-            withdrawAttempt(setId: set.id, \.lastCheckStart, restoring: priorCheckStart)
+            if Self.preflightWouldRefuse(equivalent) {
+                withdrawAttempt(setId: set.id, \.lastCheckStart, restoring: priorCheckStart)
+            }
             switch equivalent {
             case .attention:
                 return .misconfigured(reason: message)
@@ -3742,6 +3746,7 @@ public final class BackupEngine: Sendable {
     /// retries; a stamp left behind would hold that retry off for the whole
     /// interval (seven days for a check) although nothing was attempted.
     /// A run where restic did launch keeps its stamp, whatever it exited.
+    /// Only for what ``preflightWouldRefuse(_:)`` covers.
     ///
     /// Called under the set lock, which every writer of the two attempt
     /// stamps holds, so the stamp being replaced is this run's own.
@@ -4153,6 +4158,21 @@ public final class BackupEngine: Sendable {
 
     /// The scheduled-backup outcome for a primary whose restic never ran
     /// because of a secret problem seen after the pre-flight (#152).
+    /// Whether the engine's own pre-flight checks for this failure, so that
+    /// the next tick would refuse it there, before stamping or recording
+    /// anything. Online-only files in a local cloud repository are not a
+    /// secret-store question: the pre-flight never sees them, and a run that
+    /// finds them keeps its attempt stamp, as a failed probe does. Taking it
+    /// back would repeat that failed run on every tick (#170).
+    private static func preflightWouldRefuse(_ equivalent: ResticRunnerError.PreflightEquivalent) -> Bool {
+        switch equivalent {
+        case .secretUnavailable, .attention(.secretNotConfigured, _), .attention(.secretStoreUnusable, _):
+            return true
+        case .attention(.cloudRepositoryNotHydrated, _):
+            return false
+        }
+    }
+
     private static func scheduledSecretOutcome(_ verdict: ChildVerdict) -> SetRunOutcome? {
         guard case .secret(let equivalent, let message) = verdict else { return nil }
         switch equivalent {
