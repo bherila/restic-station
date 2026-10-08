@@ -728,59 +728,48 @@ enum GlobalExcludeAncestorSafety {
         guard !patternParts.isEmpty else { return false }
         let sourceParts = sourcePath.split(separator: "/").map(String.init)
         guard !sourceParts.isEmpty else { return false }
+        // A pattern of nothing but `**` matches any non-empty run.
+        guard patternParts.contains(where: { $0 != "**" }) else { return true }
 
-        // Every ancestor of the source, and the source itself — `/srv`,
-        // `/srv/project.tmp`, `/srv/project.tmp/work` — against every
-        // trailing run of components, because a relative pattern is matched
-        // against the trailing components of a path.
-        for end in 1...sourceParts.count {
-            for start in 0..<end {
-                if consumes(
-                    patternParts, Array(sourceParts[start..<end]),
-                    caseInsensitive: caseInsensitive
-                ) {
-                    return true
-                }
-            }
-        }
-        return false
-    }
-
-    /// Whether `patternParts` matches `pathParts` exactly, with `**`
-    /// spanning **zero or more** components.
-    ///
-    /// The first version of this guard split the pattern into a fixed
-    /// number of parts and matched each against exactly one component,
-    /// which quietly treated `**` as `*`. The catalogue really does use
-    /// `**` — `*.imovielibrary/**/Render Files` — so a source below
-    /// `…/Movie.imovielibrary/Event/Sub/Render Files/work` was not detected
-    /// and the pattern still reached restic, which would have emptied that
-    /// snapshot: precisely the hazard this guard exists to remove.
-    private static func consumes(
-        _ patternParts: [String],
-        _ pathParts: [String],
-        caseInsensitive: Bool
-    ) -> Bool {
-        guard let head = patternParts.first else { return pathParts.isEmpty }
-        let restPattern = Array(patternParts.dropFirst())
-        if head == "**" {
-            // Zero components, then one, then two…
-            for consumed in 0...pathParts.count {
-                if consumes(
-                    restPattern, Array(pathParts.dropFirst(consumed)),
-                    caseInsensitive: caseInsensitive
-                ) {
-                    return true
-                }
-            }
-            return false
-        }
-        guard let first = pathParts.first,
-              glob(head, matches: first, caseInsensitive: caseInsensitive)
-        else { return false }
-        return consumes(
-            restPattern, Array(pathParts.dropFirst()), caseInsensitive: caseInsensitive
+        // The question is whether the pattern matches *some* run of
+        // components `sourceParts[start..<end]` — every ancestor of the
+        // source, and the source itself (`/srv`, `/srv/project.tmp`,
+        // `/srv/project.tmp/work`), against every trailing run, because a
+        // relative pattern is matched against the trailing components of a
+        // path. `matches(i, j)` answers "does `patternParts[i...]` match
+        // `sourceParts[j..<end]` for some `end`", with `**` spanning **zero
+        // or more** components.
+        //
+        // The first version split the pattern into a fixed number of parts
+        // and matched each against exactly one component, quietly treating
+        // `**` as `*` (`*.imovielibrary/**/Render Files` really is in the
+        // catalogue). The second recursed over every way to split the path
+        // at each `**`, which was exponential in the number of `**`: a host
+        // pattern with several of them and a deep source could keep a
+        // backup from ever launching. Memoised on `(i, j)`, the work is at
+        // most patterns × components² `fnmatch` calls.
+        var memo = [[Bool?]](
+            repeating: [Bool?](repeating: nil, count: sourceParts.count + 1),
+            count: patternParts.count + 1
         )
+        func matches(_ i: Int, _ j: Int) -> Bool {
+            if let known = memo[i][j] { return known }
+            let result: Bool
+            if i == patternParts.count {
+                result = true
+            } else if patternParts[i] == "**" {
+                result = (j...sourceParts.count).contains { matches(i + 1, $0) }
+            } else {
+                result = j < sourceParts.count
+                    && glob(patternParts[i], matches: sourceParts[j], caseInsensitive: caseInsensitive)
+                    && matches(i + 1, j + 1)
+            }
+            memo[i][j] = result
+            return result
+        }
+        // Not every start needs its own pass: a pattern with a real
+        // component consumes at least one, so no match is empty.
+        return (0..<sourceParts.count).contains { matches(0, $0) }
     }
 
     /// One path component against one pattern component. `*` and `?` do not

@@ -182,6 +182,70 @@ import Testing
         #expect(!matches("PROJECT", "/srv/project/work", caseInsensitive: false))
     }
 
+    /// The memoised matcher answers exactly what the plain recursive one
+    /// did, over every small pattern and path built from a few components,
+    /// `*` and `**`. The reference below is the previous implementation:
+    /// slow, but obviously right.
+    @Test func theMemoisedAncestorCheckAgreesWithTheRecursiveDefinition() {
+        func reference(_ pattern: [String], _ path: [String]) -> Bool {
+            guard let head = pattern.first else { return path.isEmpty }
+            let rest = Array(pattern.dropFirst())
+            if head == "**" {
+                return (0...path.count).contains { reference(rest, Array(path.dropFirst($0))) }
+            }
+            guard let first = path.first, head == "*" || head == first else { return false }
+            return reference(rest, Array(path.dropFirst()))
+        }
+        func referenceAncestor(_ pattern: [String], _ path: [String]) -> Bool {
+            guard !pattern.isEmpty, !path.isEmpty else { return false }
+            for end in 1...path.count {
+                for start in 0..<end where reference(pattern, Array(path[start..<end])) {
+                    return true
+                }
+            }
+            return false
+        }
+
+        let tokens = ["a", "b", "*", "**"]
+        var patterns: [[String]] = []
+        var frontier: [[String]] = [[]]
+        for _ in 1...4 {
+            frontier = frontier.flatMap { prefix in tokens.map { prefix + [$0] } }
+            patterns += frontier
+        }
+        let paths = ["/a", "/b", "/a/b", "/b/a", "/a/a/b", "/a/b/a/b", "/b/b/b/a", "/a/b/c/a/b"]
+        var compared = 0
+        for pattern in patterns {
+            for path in paths {
+                let parts = path.split(separator: "/").map(String.init)
+                let expected = referenceAncestor(pattern, parts)
+                let actual = GlobalExcludeAncestorSafety.matchesSourceOrAncestor(
+                    pattern: pattern.joined(separator: "/"), sourcePath: path, caseInsensitive: false
+                )
+                #expect(actual == expected, "\(pattern.joined(separator: "/")) against \(path)")
+                compared += 1
+            }
+        }
+        #expect(compared > 2_000)
+    }
+
+    /// Codex on #158: the recursive matcher tried every way to split the
+    /// path at each `**`, so a host pattern with several of them that fails
+    /// on its last component against a deep source took time exponential in
+    /// the `**` count, and this check runs before every backup. The
+    /// memoised one answers in polynomial time.
+    @Test func manyRecursiveGlobsAgainstADeepSourceAnswerPromptly() {
+        let pattern = Array(repeating: "**", count: 12).joined(separator: "/") + "/never-there"
+        let source = "/" + (1...40).map { "d\($0)" }.joined(separator: "/")
+        let clock = ContinuousClock()
+        let elapsed = clock.measure {
+            #expect(!GlobalExcludeAncestorSafety.matchesSourceOrAncestor(
+                pattern: pattern, sourcePath: source, caseInsensitive: true
+            ))
+        }
+        #expect(elapsed < .seconds(2), "took \(elapsed)")
+    }
+
     @Test func noPatternIsListedTwiceAcrossTheCatalogue() {
         var seen: [String: String] = [:]
         for group in GlobalExcludeCatalog.groups {
