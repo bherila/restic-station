@@ -137,8 +137,11 @@ enum MenuBarCopy {
             switch problem.attention {
             case .secretNotConfigured:
                 return "\(health.name) — skipped: password not stored ⚠"
-            case .secretStoreUnusable, .cloudRepositoryNotHydrated:
+            case .secretStoreUnusable:
                 return "\(health.name) — skipped: secrets unreadable ⚠"
+            case .cloudRepositoryNotHydrated:
+                // Not recorded as attention yet, so not reached (#180).
+                return "\(health.name) — skipped: repository not downloaded ⚠"
             }
         }
         let line = backupLine(for: health, now: now)
@@ -146,8 +149,10 @@ enum MenuBarCopy {
         switch mirror.attention {
         case .secretNotConfigured:
             return "\(line) · mirror password not stored ⚠"
-        case .secretStoreUnusable, .cloudRepositoryNotHydrated:
+        case .secretStoreUnusable:
             return "\(line) · mirror secrets unreadable ⚠"
+        case .cloudRepositoryNotHydrated:
+            return "\(line) · mirror not downloaded ⚠"
         }
     }
 

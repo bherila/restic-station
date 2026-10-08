@@ -27,13 +27,27 @@ enum HelperExit {
         destinationId: UUID,
         detail: String
     ) -> Never {
+        fail(secretRefusalMessage(operation, attention: attention, destinationId: destinationId, detail: detail))
+    }
+
+    /// The text ``secretRefused(_:attention:destinationId:detail:)`` prints.
+    static func secretRefusalMessage(
+        _ operation: String,
+        attention: DestinationAttention,
+        destinationId: UUID,
+        detail: String
+    ) -> String {
         let id = destinationId.uuidString
         switch attention {
         case .secretNotConfigured:
-            fail("\(operation) refused: no password is stored for destination \(id). "
-                + "Store it with `\(DestinationAttention.secretSetCommand(destId: destinationId))` or in the app.")
-        case .secretStoreUnusable, .cloudRepositoryNotHydrated:
-            fail("\(operation) refused: the secrets for destination \(id) cannot be read — \(detail)")
+            return "\(operation) refused: no password is stored for destination \(id). "
+                + "Store it with `\(DestinationAttention.secretSetCommand(destId: destinationId))` or in the app."
+        case .secretStoreUnusable:
+            return "\(operation) refused: the secrets for destination \(id) cannot be read — \(detail)"
+        case .cloudRepositoryNotHydrated:
+            // Not a secret problem: the repair is a download (#171).
+            return "\(operation) refused: the repository for destination \(id) has files that are not downloaded — "
+                + "\(detail). To use it, \(DestinationAttention.hydrationRepair)."
         }
     }
 

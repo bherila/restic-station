@@ -61,12 +61,18 @@ public struct SetRunChild: Equatable, Sendable {
 /// taxonomy in `docs/architecture.md`:
 ///
 /// - ``completed(status:groupId:children:)`` — the sequence ran; `status` is
-///   the worst child run status (success | warning | failed).
+///   the worst child run status (success | warning | failed), leaving out a
+///   mirror's child that its own secret read stopped before restic ran.
+///   That child stays in `children` as `.failed`, but it skips the mirror as
+///   its probe would, so it does not decide the group (#172).
 /// - ``skipped`` — the set lock was busy; exactly one `.skipped` index
 ///   record was written and nothing else happened (**retryable**).
-/// - ``retryable(reason:)`` — an environmental failure *before* anything was
-///   recorded (secret store unreadable): NO run record, NO `lastBackupStart` update,
-///   NO lock taken, so the next tick simply tries again.
+/// - ``retryable(reason:)`` — the secret store could not be read, so restic
+///   never ran. At the pre-flight: NO run record, NO `lastBackupStart`
+///   update, NO lock taken. At a later read (#152): the failed run record
+///   stays, but `lastBackupStart` is put back (#170). Either way the next
+///   tick simply tries again. If it cannot be put back, the run is an
+///   ``infrastructureFailure(reason:)`` instead.
 /// - ``misconfigured(reason:)`` — defensive only: the set has no primary
 ///   destination, which `AppConfig.validate()` rejects on load and save.
 ///   Nothing is written (there is no destination to attribute a record to).
@@ -296,7 +302,8 @@ public final class BackupEngine: Sendable {
     ///    then retention only if that copy succeeded;
     /// 8. retention on the primary if the policy is non-nil and non-empty;
     /// 9. clear `current-run`, release the lock (also on every failure path),
-    ///    group outcome = worst child status.
+    ///    group outcome = worst child status, leaving out a mirror's child
+    ///    that its own secret read refused (#172).
     public func runSet(_ set: BackupSet, trigger: RunTrigger) async -> SetRunOutcome {
         guard let primary = set.destinations.first(where: { $0.isPrimary }) else {
             let reason = "backup set \"\(set.name)\" has no primary destination"
@@ -346,8 +353,12 @@ public final class BackupEngine: Sendable {
         defer { try? stateStore.clearCurrentRun(setId: set.id) }
 
         // ── Step 3: attempt-based lastBackupStart ───────────────────────
+        var priorBackupStart: Date?
         do {
-            try updateScheduleState(setId: set.id) { $0.lastBackupStart = self.now() }
+            try updateScheduleState(setId: set.id) {
+                priorBackupStart = $0.lastBackupStart
+                $0.lastBackupStart = self.now()
+            }
         } catch {
             let reason = "schedule state unusable — \(error)"
             recordInfrastructureFailure(
@@ -474,6 +485,10 @@ public final class BackupEngine: Sendable {
             // given. The run record stays — an attempt was made — and its
             // summary names the secret problem.
             if let outcome = Self.scheduledSecretOutcome(backup.verdict) {
+                if case .secret(let equivalent, let message) = backup.verdict, Self.preflightWouldRefuse(equivalent),
+                   let failure = withdrawAttempt(setId: set.id, \.lastBackupStart, restoring: priorBackupStart) {
+                    return .infrastructureFailure(reason: "\(message); \(failure)")
+                }
                 return outcome
             }
             return .completed(status: .failed, groupId: groupId, children: children)
@@ -547,6 +562,12 @@ public final class BackupEngine: Sendable {
 
         var primaryPurgeFullSnapshotIDs: [String]?
         var boundedCopyExecutable: ResticRunner.MaintenanceExecutable?
+        /// Mirror children that a secret read stopped before restic ran
+        /// (#172). They stay in the history, but they do not decide the
+        /// group's status: the probe skips a mirror whose secrets fail
+        /// without failing the group, and a later read gives its answer.
+        /// The attention record and staleness are what surface it.
+        var mirrorSecretRefusals: Set<String> = []
 
         // ── Step 7: secondaries, in config order ────────────────────────
         for secondary in set.destinations where !secondary.isPrimary {
@@ -684,6 +705,11 @@ public final class BackupEngine: Sendable {
             if let reason = copy.infrastructureFailureReason {
                 infrastructureFailures.append("secondary \"\(secondary.label)\": \(reason)")
             }
+            // The copy reads the primary's secrets too, as its source; a
+            // refusal of those is the primary's and still fails the group.
+            if Self.refusesOnlyMirror(copy.verdict, mirror: secondary) {
+                mirrorSecretRefusals.insert(copy.child.runId)
+            }
 
             // SAFETY: retention on a mirror runs *only* when this run's copy
             // succeeded. A stale mirror plus an aggressive policy is a data
@@ -722,6 +748,9 @@ public final class BackupEngine: Sendable {
                 children.append(prune.child)
                 if let reason = prune.infrastructureFailureReason {
                     infrastructureFailures.append("secondary \"\(secondary.label)\": \(reason)")
+                }
+                if Self.refusesOnlyMirror(prune.verdict, mirror: secondary) {
+                    mirrorSecretRefusals.insert(prune.child.runId)
                 }
             case .infrastructureFailure(let reason):
                 infrastructureFailures.append("secondary \"\(secondary.label)\": \(reason)")
@@ -768,7 +797,9 @@ public final class BackupEngine: Sendable {
             return .infrastructureFailure(reason: infrastructureFailures.joined(separator: "; "))
         }
         return .completed(
-            status: Self.worstStatus(children.map(\.status)),
+            status: Self.worstStatus(
+                children.filter { !mirrorSecretRefusals.contains($0.runId) }.map(\.status)
+            ),
             groupId: groupId,
             children: children
         )
@@ -827,8 +858,10 @@ public final class BackupEngine: Sendable {
 
         // Attempt semantics, exactly like `lastBackupStart`.
         let updatedScheduleState: ScheduleState
+        var priorCheckStart: Date?
         do {
             updatedScheduleState = try updateScheduleState(setId: set.id) {
+                priorCheckStart = $0.lastCheckStart
                 $0.lastCheckStart = self.now()
             }
         } catch {
@@ -874,6 +907,10 @@ public final class BackupEngine: Sendable {
         // Seen after the pre-flight (#152): the outcome it would give —
         // unless the run record itself failed, which `verdict` puts first.
         if case .secret(let equivalent, let message) = primaryCheck.verdict {
+            if Self.preflightWouldRefuse(equivalent),
+               let failure = withdrawAttempt(setId: set.id, \.lastCheckStart, restoring: priorCheckStart) {
+                return .infrastructureFailure(reason: "\(message); \(failure)")
+            }
             switch equivalent {
             case .attention:
                 return .misconfigured(reason: message)
@@ -919,7 +956,11 @@ public final class BackupEngine: Sendable {
                     )
                     switch secondaryCheckResult {
                     case .completed(let secondaryCheck):
-                        statuses.append(secondaryCheck.child.status)
+                        // A secret refusal before restic ran is the probe's
+                        // answer, a skipped mirror, not a failed check (#172).
+                        if !Self.refusesOnlyMirror(secondaryCheck.verdict, mirror: secondary) {
+                            statuses.append(secondaryCheck.child.status)
+                        }
                         if let reason = secondaryCheck.infrastructureFailureReason {
                             infrastructureFailures.append(
                                 "secondary \"\(secondary.label)\": \(reason)"
@@ -3708,6 +3749,35 @@ public final class BackupEngine: Sendable {
         try stateStore.updateScheduleState(setId: setId, mutate: mutate)
     }
 
+    /// Takes back an attempt stamp when a secret problem seen after the
+    /// pre-flight (#152) stopped the run before restic launched (#170). The
+    /// pre-flight would have refused without stamping, and the next tick
+    /// retries; a stamp left behind would hold that retry off for the whole
+    /// interval (seven days for a check) although nothing was attempted.
+    /// A run where restic did launch keeps its stamp, whatever it exited.
+    /// Only for what ``preflightWouldRefuse(_:)`` covers.
+    ///
+    /// Called under the set lock, which every writer of the two attempt
+    /// stamps holds, so the stamp being replaced is this run's own.
+    /// Returns why, when the state cannot be written: the stamp then stays
+    /// and holds the retry off, so the caller reports an infrastructure
+    /// failure rather than a refusal that the next tick retries.
+    private func withdrawAttempt(
+        setId: UUID,
+        _ stamp: WritableKeyPath<SetScheduleState, Date?>,
+        restoring prior: Date?
+    ) -> String? {
+        do {
+            _ = try updateScheduleState(setId: setId) { $0[keyPath: stamp] = prior }
+            return nil
+        } catch {
+            let reason = "the attempt stamp could not be taken back, so the retry waits for "
+                + "the next scheduled attempt — schedule state unusable — \(error)"
+            logWarning("BackupEngine: \(reason)")
+            return reason
+        }
+    }
+
     /// Advances the purge-exclusion watermark only after the matching
     /// repository rewrite succeeded. Existing snapshots are never inferred
     /// from this state; it merely prevents a newly added exclusion from
@@ -3928,8 +3998,11 @@ public final class BackupEngine: Sendable {
         case .secretNotConfigured:
             return "no password is stored for destination \"\(destination.label)\" — "
                 + "store it with `\(DestinationAttention.secretSetCommand(destId: destination.id))` or in the app"
-        case .secretStoreUnusable, .cloudRepositoryNotHydrated:
+        case .secretStoreUnusable:
             return "the secrets for destination \"\(destination.label)\" cannot be read: \(error.description)"
+        case .cloudRepositoryNotHydrated:
+            return "the repository for destination \"\(destination.label)\" has files that are not downloaded: "
+                + "\(error.description) — \(DestinationAttention.hydrationRepair)"
         }
     }
 
@@ -4096,6 +4169,33 @@ public final class BackupEngine: Sendable {
 
     /// The scheduled-backup outcome for a primary whose restic never ran
     /// because of a secret problem seen after the pre-flight (#152).
+    /// Whether a mirror's child was refused for the mirror's own secrets,
+    /// which skips that mirror as its probe would, rather than failing the
+    /// group (#172). A refusal naming any other destination, such as a
+    /// copy's source, is not the mirror's to absorb.
+    private static func refusesOnlyMirror(_ verdict: ChildVerdict, mirror: Destination) -> Bool {
+        guard case .secret(let equivalent, _) = verdict else { return false }
+        switch equivalent {
+        case .attention(_, let destinationId), .secretUnavailable(let destinationId):
+            return destinationId == mirror.id
+        }
+    }
+
+    /// Whether the engine's own pre-flight checks for this failure, so that
+    /// the next tick would refuse it there, before stamping or recording
+    /// anything. Online-only files in a local cloud repository are not a
+    /// secret-store question: the pre-flight never sees them, and a run that
+    /// finds them keeps its attempt stamp, as a failed probe does. Taking it
+    /// back would repeat that failed run on every tick (#170).
+    private static func preflightWouldRefuse(_ equivalent: ResticRunnerError.PreflightEquivalent) -> Bool {
+        switch equivalent {
+        case .secretUnavailable, .attention(.secretNotConfigured, _), .attention(.secretStoreUnusable, _):
+            return true
+        case .attention(.cloudRepositoryNotHydrated, _):
+            return false
+        }
+    }
+
     private static func scheduledSecretOutcome(_ verdict: ChildVerdict) -> SetRunOutcome? {
         guard case .secret(let equivalent, let message) = verdict else { return nil }
         switch equivalent {
