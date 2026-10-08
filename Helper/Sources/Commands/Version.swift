@@ -22,7 +22,7 @@ struct Version: AsyncParsableCommand, JSONRenderable {
     /// which the app bundle carries; `VersionReportTests` enforces that,
     /// because the Linux helper has no bundle to read it from.
     static let name = "restic-station-helper"
-    static let version = "0.1.2"
+    static let version = "0.1.3"
 
     /// `version --json`'s shape — see `docs/cli-json.md`.
     struct Report: Encodable {
