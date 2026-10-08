@@ -18,6 +18,11 @@ import Testing
 /// attempt stamps are written, so a later refusal must take its stamp back,
 /// or a transient failure holds the retry off for a whole interval (#170).
 ///
+/// A mirror has no pre-flight of its own that stops the run: its probe
+/// skips it without failing the group, and the primary's backup stands.
+/// So the third sweep fails each of a mirror's reads in turn and requires
+/// the group's status to be the one a run with no failure gives (#172).
+///
 /// The second sweep pins the precedence (#169 review): when the failing
 /// read lands inside a recorded run and the run record then cannot be
 /// written, the run-history failure is the answer, not the secret one.
@@ -106,6 +111,35 @@ import Testing
         #expect(covered >= 4, "the precedence sweep reached only \(covered) recorded run(s)")
     }
 
+    @Test("a mirror's secret failure at any read leaves the group's status alone")
+    func mirrorSecretFailureNeverDecidesTheGroup() async throws {
+        for operation in try Self.mirrorOperations() {
+            let (cleanEnv, cleanRun) = try operation.make()
+            let clean = await cleanRun()
+            let total = cleanEnv.secrets.reads(for: T.secondaryAId)
+            cleanEnv.cleanUp()
+            #expect(total >= 2, "\(operation.name): only \(total) read(s) of the mirror's secrets to sweep")
+            for (error, refuses) in Self.errors {
+                for reads in 0..<total {
+                    let (env, run) = try operation.make()
+                    env.secrets.failReads(for: T.secondaryAId, afterReads: reads, with: error)
+                    let label = await run()
+                    #expect(
+                        label == clean,
+                        "\(operation.name), \(error), failing the mirror from read \(reads + 1) of \(total)"
+                    )
+                    if refuses {
+                        #expect(
+                            env.stateStore.readSecretAttention(destId: T.secondaryAId)?.attention == .secretStoreUnusable,
+                            "\(operation.name): no attention recorded for the mirror at read \(reads + 1) of \(total)"
+                        )
+                    }
+                    env.cleanUp()
+                }
+            }
+        }
+    }
+
     // MARK: - Harness
 
     private static func readCount(_ operation: Operation) async throws -> Int {
@@ -149,6 +183,35 @@ import Testing
     }
 
     // MARK: - Operations
+
+    /// Runs with one reachable local mirror, labelled by the group's
+    /// status alone: the mirror's children stay in the history either way.
+    private static func mirrorOperations() throws -> [Operation] {
+        [
+            Operation(name: "scheduled backup, copy and mirror retention") {
+                let env = T.makeEnv(script: [], reachableSecondaries: [true])
+                env.fake.script = anything
+                return (env, {
+                    switch await env.engine.runSet(env.set, trigger: .scheduled) {
+                    case .completed(let status, _, _): return "completed \(status)"
+                    case let other: return label(other)
+                    }
+                })
+            },
+            Operation(name: "scheduled check, on the mirror's turn") {
+                let env = T.makeEnv(
+                    script: [], retention: nil, checkPolicy: CheckPolicy(enabled: true), reachableSecondaries: [true]
+                )
+                env.fake.script = anything
+                // The next successful check is a multiple of the rotation,
+                // so the mirror gets its structure-only check.
+                try env.stateStore.updateScheduleState(setId: T.setId) {
+                    $0.checkCount = BackupEngine.secondaryCheckEveryNChecks - 1
+                }
+                return (env, { label(await env.engine.runCheck(env.set, trigger: .scheduled)) })
+            },
+        ]
+    }
 
     private static func operations() throws -> [Operation] {
         let remoteURL = "sftp:backup@example:/srv/repo"

@@ -554,6 +554,12 @@ public final class BackupEngine: Sendable {
 
         var primaryPurgeFullSnapshotIDs: [String]?
         var boundedCopyExecutable: ResticRunner.MaintenanceExecutable?
+        /// Mirror children that a secret read stopped before restic ran
+        /// (#172). They stay in the history, but they do not decide the
+        /// group's status: the probe skips a mirror whose secrets fail
+        /// without failing the group, and a later read gives its answer.
+        /// The attention record and staleness are what surface it.
+        var mirrorSecretRefusals: Set<String> = []
 
         // ── Step 7: secondaries, in config order ────────────────────────
         for secondary in set.destinations where !secondary.isPrimary {
@@ -691,6 +697,9 @@ public final class BackupEngine: Sendable {
             if let reason = copy.infrastructureFailureReason {
                 infrastructureFailures.append("secondary \"\(secondary.label)\": \(reason)")
             }
+            if case .secret = copy.verdict {
+                mirrorSecretRefusals.insert(copy.child.runId)
+            }
 
             // SAFETY: retention on a mirror runs *only* when this run's copy
             // succeeded. A stale mirror plus an aggressive policy is a data
@@ -729,6 +738,9 @@ public final class BackupEngine: Sendable {
                 children.append(prune.child)
                 if let reason = prune.infrastructureFailureReason {
                     infrastructureFailures.append("secondary \"\(secondary.label)\": \(reason)")
+                }
+                if case .secret = prune.verdict {
+                    mirrorSecretRefusals.insert(prune.child.runId)
                 }
             case .infrastructureFailure(let reason):
                 infrastructureFailures.append("secondary \"\(secondary.label)\": \(reason)")
@@ -775,7 +787,9 @@ public final class BackupEngine: Sendable {
             return .infrastructureFailure(reason: infrastructureFailures.joined(separator: "; "))
         }
         return .completed(
-            status: Self.worstStatus(children.map(\.status)),
+            status: Self.worstStatus(
+                children.filter { !mirrorSecretRefusals.contains($0.runId) }.map(\.status)
+            ),
             groupId: groupId,
             children: children
         )
@@ -929,7 +943,11 @@ public final class BackupEngine: Sendable {
                     )
                     switch secondaryCheckResult {
                     case .completed(let secondaryCheck):
-                        statuses.append(secondaryCheck.child.status)
+                        // A secret refusal before restic ran is the probe's
+                        // answer, a skipped mirror, not a failed check (#172).
+                        if case .secret = secondaryCheck.verdict {} else {
+                            statuses.append(secondaryCheck.child.status)
+                        }
                         if let reason = secondaryCheck.infrastructureFailureReason {
                             infrastructureFailures.append(
                                 "secondary \"\(secondary.label)\": \(reason)"
