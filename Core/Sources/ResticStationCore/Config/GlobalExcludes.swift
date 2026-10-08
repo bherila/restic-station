@@ -1287,6 +1287,29 @@ public struct GlobalExcludeStore: Sendable {
         guard info.st_mode & S_IFMT == S_IFREG else {
             throw LockFailure(path: url.path, operation: "regular-file check", errnoValue: 0)
         }
+        // This file decides what every opted-in backup leaves out, so it is
+        // trusted only when this user owns it and nobody else can write it,
+        // the rule the secret and lock files already follow. A data
+        // directory may legitimately be a sticky shared one
+        // (`FileLock.verifyDirectory` accepts that), where another local
+        // user could otherwise create the normally absent file and quietly
+        // add a size cap or patterns that skip data. Refused, not ignored:
+        // falling back to the defaults could exclude more than this host
+        // configured.
+        guard info.st_uid == geteuid() else {
+            throw LockFailure(
+                path: url.path, operation: "ownership", errnoValue: 0,
+                underlying: "owned by uid \(info.st_uid), not this user (uid \(geteuid())); "
+                    + "remove it with `excludes reset` or recreate it as this user"
+            )
+        }
+        guard info.st_mode & 0o022 == 0 else {
+            throw LockFailure(
+                path: url.path, operation: "permissions", errnoValue: 0,
+                underlying: "mode \(String(info.st_mode & 0o777, radix: 8)) lets other users change "
+                    + "which paths are backed up; run `chmod 600` on it"
+            )
+        }
         // `O_NONBLOCK` does nothing for a regular file, so a settings path
         // accidentally replaced by a multi-gigabyte file would be read into
         // memory in full — by every command, before any of them dispatches.

@@ -2,6 +2,14 @@ import Foundation
 import Testing
 @testable import ResticStationCore
 
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#endif
+
 /// The built-in catalogue's shape rules (`docs/data-model.md`
 /// §global-excludes.json — Pattern shape).
 ///
@@ -1053,6 +1061,47 @@ import Testing
 
             try store.save(atLimit)
             #expect(try store.load().extraPatterns == atLimit.extraPatterns)
+        }
+    }
+
+    /// Codex on #158: in a shared sticky data directory, another user could
+    /// create the normally absent settings file and add patterns or a size
+    /// cap. The file is trusted only when this user owns it and nobody else
+    /// can write it. Refusal is the fail-closed direction, and `excludes
+    /// reset` (which does not read the file) is the way out.
+    @Test func settingsOthersCanWriteAreRefusedButAPlainHandEditedFileLoads() throws {
+        try withPaths { paths in
+            try paths.ensureDirectories()
+            let file = paths.globalExcludesFile
+            let store = GlobalExcludeStore(paths: paths)
+            var settings = GlobalExcludeSettings()
+            settings.extraPatterns = ["/hand-edited"]
+            try ConfigStore.makeEncoder().encode(settings).write(to: file)
+
+            // The nearest independent constraint: a file someone wrote by
+            // hand with an ordinary umask is 0644 and must still load.
+            #expect(chmod(file.path, 0o644) == 0)
+            #expect(try store.load().extraPatterns == ["/hand-edited"])
+
+            for mode: mode_t in [0o664, 0o646, 0o666] {
+                #expect(chmod(file.path, mode) == 0)
+                #expect(throws: GlobalExcludeError.self, "mode \(String(mode, radix: 8))") { try store.load() }
+                #expect(throws: GlobalExcludeError.self) { try store.save(settings, ifUnchangedFrom: nil) }
+            }
+            #expect(try store.removeSettings())
+        }
+    }
+
+    /// Only root can hand a file to another owner, so this runs on the
+    /// Linux CI jobs (which run as root) and is skipped elsewhere.
+    @Test(.enabled(if: geteuid() == 0)) func settingsOwnedByAnotherUserAreRefused() throws {
+        try withPaths { paths in
+            try paths.ensureDirectories()
+            let file = paths.globalExcludesFile
+            try ConfigStore.makeEncoder().encode(GlobalExcludeSettings()).write(to: file)
+            #expect(chmod(file.path, 0o600) == 0)
+            #expect(chown(file.path, 65534, 65534) == 0)
+            #expect(throws: GlobalExcludeError.self) { try GlobalExcludeStore(paths: paths).load() }
         }
     }
 

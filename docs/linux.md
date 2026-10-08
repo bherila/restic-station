@@ -492,7 +492,8 @@ lifts it again. It is off by default: every other rule names a folder of regener
 while a size cap can skip one irreplaceable file with nothing to point at afterwards.
 
 A `global-excludes.json` this build cannot honour — bad JSON, a group id it does not know, a
-blank pattern, a newer `version`, or a settings path that is not a plain readable file —
+blank pattern, a newer `version`, a settings path that is not a plain readable file, or one owned
+by another user or writable by group or others —
 **fails the backup** rather than falling back to the built-in defaults, because the defaults may
 skip more than you had configured. Only backups: `restore`, `unlock`, `probe-repo`, `purge`,
 `check` and `init-secondary` keep working, and the refusal is written into the run history so
