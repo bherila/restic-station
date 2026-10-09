@@ -107,4 +107,72 @@ import Musl
         #expect(CacheDirTag.finding(atOrAbove: source.path)
             == .unverifiable(directory: source.path, reason: "not a regular file"))
     }
+
+    /// An online-only tag is held back without its contents being read:
+    /// reading it in the helper would download it, and the #156 policy only
+    /// covers restic's children (#181). `SF_DATALESS` cannot be set from user
+    /// space, so the test decides which inode is online-only. The tag carries
+    /// a valid signature, so reading it would have answered `.tagged`.
+    @Test func anOnlineOnlyTagIsNotRead() throws {
+        let root = try makeTree()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appendingPathComponent("plain/project")
+        try tag(source)
+        let online = try inode(of: source.appendingPathComponent("CACHEDIR.TAG"))
+        #expect(CacheDirTag.finding(atOrAbove: source.path, isDataless: { $0.st_ino == online })
+            == .unverifiable(directory: source.path, reason: CacheDirTag.onlineOnlyReason))
+    }
+
+    /// The nearest independent constraint: a symlinked tag is judged by its
+    /// target, which `lstat` would not reach, and the file actually opened
+    /// is the one that counts.
+    @Test func aSymlinkToAnOnlineOnlyTagIsNotRead() throws {
+        let root = try makeTree()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let elsewhere = root.appendingPathComponent("cache")
+        try tag(elsewhere)
+        let source = root.appendingPathComponent("plain/project")
+        try FileManager.default.createSymbolicLink(
+            at: source.appendingPathComponent("CACHEDIR.TAG"),
+            withDestinationURL: elsewhere.appendingPathComponent("CACHEDIR.TAG")
+        )
+        let online = try inode(of: elsewhere.appendingPathComponent("CACHEDIR.TAG"))
+        #expect(CacheDirTag.check(source.path, isDataless: { $0.st_ino == online })
+            == .unverifiable(directory: source.path, reason: CacheDirTag.onlineOnlyReason))
+    }
+
+    /// Not even opened: an unreadable online-only tag reports as online-only,
+    /// not as the `open` failure. Root can open a mode-000 file, so this
+    /// cannot tell the two apart there.
+    @Test(.enabled(if: geteuid() != 0)) func anOnlineOnlyTagIsNotOpened() throws {
+        let root = try makeTree()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appendingPathComponent("plain/project")
+        try tag(source)
+        let file = source.appendingPathComponent("CACHEDIR.TAG")
+        try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: file.path)
+        #expect(CacheDirTag.check(source.path, isDataless: { _ in false })
+            == .unverifiable(directory: source.path, reason: "errno \(EACCES)"))
+        #expect(CacheDirTag.check(source.path, isDataless: { _ in true })
+            == .unverifiable(directory: source.path, reason: CacheDirTag.onlineOnlyReason))
+    }
+
+    /// A tag evicted between the `stat` and the `open` is caught on the
+    /// descriptor, before the read.
+    @Test func aTagEvictedAfterTheFirstLookIsNotRead() throws {
+        let root = try makeTree()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appendingPathComponent("plain/project")
+        try tag(source)
+        var looks = 0
+        #expect(CacheDirTag.check(source.path, isDataless: { _ in looks += 1; return looks > 1 })
+            == .unverifiable(directory: source.path, reason: CacheDirTag.onlineOnlyReason))
+        #expect(looks == 2)
+    }
+
+    private func inode(of file: URL) throws -> ino_t {
+        var info = stat()
+        guard lstat(file.path, &info) == 0 else { throw CocoaError(.fileReadUnknown) }
+        return info.st_ino
+    }
 }

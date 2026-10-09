@@ -31,14 +31,20 @@ enum CacheDirTag {
         /// `directory/CACHEDIR.TAG` exists but could not be read as a plain
         /// file. Counted as tagged: holding the flag back only backs up
         /// more. A FIFO lands here too, because restic opens a tag without
-        /// `O_NONBLOCK` and would wait forever for a writer.
+        /// `O_NONBLOCK` and would wait forever for a writer. So does an
+        /// online-only tag, which is never read: reading it here would
+        /// download it in the helper, which the set's `onlineOnlyFiles`
+        /// policy does not cover (#181).
         case unverifiable(directory: String, reason: String)
     }
 
     /// The first directory, from the source itself upward, whose tag would
     /// make restic leave the source out. Checks the path as configured and,
     /// when they differ, with symlinks resolved.
-    static func finding(atOrAbove sourcePath: String) -> Finding? {
+    static func finding(
+        atOrAbove sourcePath: String,
+        isDataless: (stat) -> Bool = CacheDirTag.isDataless
+    ) -> Finding? {
         let url = URL(fileURLWithPath: sourcePath)
         var paths = [url.standardizedFileURL.path]
         let resolved = url.resolvingSymlinksInPath().path
@@ -46,7 +52,7 @@ enum CacheDirTag {
         for path in paths {
             var directory = path
             while true {
-                if let finding = check(directory) { return finding }
+                if let finding = check(directory, isDataless: isDataless) { return finding }
                 let parent = (directory as NSString).deletingLastPathComponent
                 if parent.isEmpty || parent == directory { break }
                 directory = parent
@@ -60,8 +66,16 @@ enum CacheDirTag {
     /// unverifiable rather than "no tag": restic 0.18.1 opens the tag
     /// *blocking* and `io.ReadFull`s it, so passing `--exclude-caches` with a
     /// FIFO there would leave the backup waiting forever, set lock held.
-    static func check(_ directory: String) -> Finding? {
+    ///
+    /// An online-only (dataless) tag is unverifiable without being opened:
+    /// `stat` follows a symlinked tag to its target, and `fstat` repeats the
+    /// test on what was actually opened, before any read.
+    static func check(_ directory: String, isDataless: (stat) -> Bool = CacheDirTag.isDataless) -> Finding? {
         let tag = (directory as NSString).appendingPathComponent("CACHEDIR.TAG")
+        var target = stat()
+        if stat(tag, &target) == 0, isDataless(target) {
+            return .unverifiable(directory: directory, reason: onlineOnlyReason)
+        }
         let descriptor = tag.withCString { open($0, O_RDONLY | O_NONBLOCK | O_CLOEXEC) }
         if descriptor < 0 {
             let code = errno
@@ -77,6 +91,9 @@ enum CacheDirTag {
         guard info.st_mode & S_IFMT == S_IFREG else {
             return .unverifiable(directory: directory, reason: "not a regular file")
         }
+        if isDataless(info) {
+            return .unverifiable(directory: directory, reason: onlineOnlyReason)
+        }
         var buffer = [UInt8](repeating: 0, count: signature.count)
         var filled = 0
         while filled < buffer.count {
@@ -91,5 +108,17 @@ enum CacheDirTag {
             filled += count
         }
         return filled == buffer.count && buffer == signature ? .tagged(directory: directory) : nil
+    }
+
+    static let onlineOnlyReason = "online-only, not downloaded"
+
+    /// Whether a file's contents are not on this machine. Only macOS File
+    /// Provider placeholders are; elsewhere nothing is.
+    static func isDataless(_ info: stat) -> Bool {
+        #if canImport(Darwin)
+        return (info.st_flags & UInt32(SF_DATALESS)) != 0
+        #else
+        return false
+        #endif
     }
 }
