@@ -67,9 +67,10 @@ enum CacheDirTag {
     /// *blocking* and `io.ReadFull`s it, so passing `--exclude-caches` with a
     /// FIFO there would leave the backup waiting forever, set lock held.
     ///
-    /// An online-only (dataless) tag is unverifiable without being opened:
-    /// `stat` follows a symlinked tag to its target, and `fstat` repeats the
-    /// test on what was actually opened, before any read.
+    /// An online-only (dataless) tag is unverifiable without being read:
+    /// `stat` follows a symlinked tag to its target so it is not even
+    /// opened, and `fstat` repeats the test on what was actually opened, for
+    /// a tag evicted in between.
     static func check(_ directory: String, isDataless: (stat) -> Bool = CacheDirTag.isDataless) -> Finding? {
         let tag = (directory as NSString).appendingPathComponent("CACHEDIR.TAG")
         var target = stat()
