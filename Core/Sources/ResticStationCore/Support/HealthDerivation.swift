@@ -76,11 +76,15 @@ public struct SetHealth: Identifiable, Equatable, Sendable {
     /// Destinations of this set that are stale per `docs/scheduling.md`
     /// §Staleness, in the set's configured destination order.
     public let staleDestinationIds: [UUID]
-    /// Secret problems the engine recorded for this set's destinations
-    /// (`state/secret-attention-<destId>.json`, #95), in configured
-    /// destination order: a password was never stored, or the store refuses
-    /// to be read. Scheduled runs skip the set without a run record, so this
-    /// is the only place the reason appears — immediately, with no grace.
+    /// Problems that need a human at this set's destinations, in configured
+    /// destination order, at most one per destination. Mostly secret
+    /// problems the engine recorded (`state/secret-attention-<destId>.json`,
+    /// #95): a password was never stored, or the store refuses to be read.
+    /// Scheduled runs skip the set without a run record, so this is the only
+    /// place the reason appears — immediately, with no grace. A destination
+    /// without one can instead carry `cloudRepositoryNotHydrated`, projected
+    /// from its repo status (#180): a local repository in cloud storage with
+    /// online-only files, as the latest probe or run found it.
     public let secretAttention: [SecretAttentionRecord]
     /// The set's primary destination, so a surface can tell a refused set
     /// (primary secrets missing: nothing backs up) from a failing mirror
@@ -119,8 +123,9 @@ public struct SetHealth: Identifiable, Equatable, Sendable {
         self.primaryDestinationId = primaryDestinationId
     }
 
-    /// The primary's secret problem, which is what makes scheduled runs of
-    /// the whole set skip. `nil` when only secondaries have one.
+    /// The primary's problem: a secret one makes scheduled runs of the
+    /// whole set skip, and online-only repository files make them fail.
+    /// `nil` when only secondaries have one.
     public var primarySecretProblem: SecretAttentionRecord? {
         guard let primaryDestinationId else { return nil }
         return secretAttention.first { $0.destId == primaryDestinationId }
@@ -304,10 +309,29 @@ public enum HealthDerivation {
             firstBackupOverdue: firstBackupOverdue,
             // Keyed by destination; a record for a destination that has
             // left this set (or was recorded under another set) is ignored.
+            // A secret record wins over hydration: its pre-flight refuses
+            // before anything looks at the repository.
             secretAttention: set.destinations.compactMap { destination in
                 secretAttention[destination.id].flatMap { $0.setId == set.id ? $0 : nil }
+                    ?? hydrationAttention(status: repoStatuses[destination.id], setId: set.id)
             },
             primaryDestinationId: set.destinations.first(where: \.isPrimary)?.id
+        )
+    }
+
+    /// `cloudRepositoryNotHydrated` from a destination's repo status, in the
+    /// shape of a secret-attention record so every surface words it the way
+    /// it already words that case (#180). Only that case: the secret ones a
+    /// probe also reports are owned by `state/secret-attention`, which the
+    /// secret pre-flight clears, and a stale probe must not outlive it.
+    static func hydrationAttention(status: RepoStatus?, setId: UUID) -> SecretAttentionRecord? {
+        guard let status, status.attention == .cloudRepositoryNotHydrated else { return nil }
+        return SecretAttentionRecord(
+            destId: status.destId,
+            setId: setId,
+            attention: .cloudRepositoryNotHydrated,
+            detail: status.lastError ?? "repository is not fully downloaded",
+            detectedAt: status.attentionSince ?? status.probedAt
         )
     }
 

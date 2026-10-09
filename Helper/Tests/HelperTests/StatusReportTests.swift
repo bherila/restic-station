@@ -104,7 +104,8 @@ struct StatusReportTests {
         isRunning: Bool,
         firstBackupOverdue: Bool = false,
         stalledRun: StatusReport.CurrentRunSummary? = nil,
-        stalledRunLog: String? = nil
+        stalledRunLog: String? = nil,
+        secretProblem: StatusReport.SecretProblem? = nil
     ) -> StatusReport.SetStatus {
         StatusReport.SetStatus(
             id: setId, name: "Projects", needsAttention: needsAttention, isRunning: isRunning,
@@ -116,7 +117,7 @@ struct StatusReportTests {
             destinations: [
                 StatusReport.DestinationStatus(
                     id: destId, label: "Primary", isPrimary: true, reachable: false, stale: true,
-                    lastSyncedAt: nil, lastError: "volume not mounted"
+                    lastSyncedAt: nil, lastError: "volume not mounted", secretProblem: secretProblem
                 ),
             ]
         )
@@ -458,5 +459,40 @@ struct StatusReportTests {
         ))
         #expect(unusable.code == "secret_store_unusable")
         #expect(unusable.detail == "chmod 600 secrets.json")
+    }
+
+    /// #180: a primary whose cloud repository has online-only files is not
+    /// a secret problem and is not skipped. Its backups fail until the files
+    /// are downloaded, and the report names the download. The nearest
+    /// independent constraint: a secret problem on the same primary still
+    /// reads as a skip.
+    @Test("a repository that is not downloaded reads as failing backups, with the download it needs")
+    func notDownloadedIsNotASecretSkip() {
+        func lines(_ attention: DestinationAttention) -> String {
+            let set = makeSetStatus(
+                needsAttention: true, isRunning: false,
+                secretProblem: StatusReport.SecretProblem(SecretAttentionRecord(
+                    destId: destId, setId: setId, attention: attention,
+                    detail: "repository is not fully downloaded (data/ab/abcdef is online-only)",
+                    detectedAt: Date(timeIntervalSince1970: 1_000)
+                ))
+            )
+            let report = StatusReport(
+                machineId: "studio-mac", generatedAt: Date(), health: "warning",
+                fullDiskAccessDenied: false, locking: Self.healthyLocking, scheduler: nil,
+                sets: [set], unattributedRuns: [], excludedHere: []
+            )
+            return report.humanLines().joined(separator: "\n")
+        }
+        let notDownloaded = lines(.cloudRepositoryNotHydrated)
+        #expect(notDownloaded.contains("NOT DOWNLOADED: cloud_repository_not_hydrated"))
+        #expect(notDownloaded.contains(DestinationAttention.hydrationRepair))
+        #expect(notDownloaded.contains("this set's backups fail until fixed"))
+        #expect(!notDownloaded.contains("SECRETS"))
+        #expect(!notDownloaded.contains("skip"))
+
+        let secret = lines(.secretStoreUnusable)
+        #expect(secret.contains("SECRETS: secret_store_unusable"))
+        #expect(secret.contains("scheduled runs skip this set until fixed"))
     }
 }

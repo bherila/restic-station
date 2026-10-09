@@ -3057,9 +3057,7 @@ public final class BackupEngine: Sendable {
         }
         if initRun.child.status == .success {
             updateRepoStatus(destId: dest.id) { status in
-                status.reachable = true
-                status.probedAt = self.now()
-                status.lastError = nil
+                status.record(probe: .reachable, at: self.now())
             }
         }
         if let reason = initRun.infrastructureFailureReason {
@@ -4000,15 +3998,7 @@ public final class BackupEngine: Sendable {
     /// most recent evidence rather than only the 30-minute tick re-probe.
     private func record(probe: RepoProbeResult, for destination: Destination) {
         updateRepoStatus(destId: destination.id) { status in
-            status.probedAt = self.now()
-            switch probe {
-            case .reachable:
-                status.reachable = true
-                status.lastError = nil
-            case .offline, .error, .needsAttention:
-                status.reachable = false
-                status.lastError = self.describe(probe)
-            }
+            status.record(probe: probe, at: self.now())
         }
     }
 
@@ -4016,10 +4006,10 @@ public final class BackupEngine: Sendable {
     /// `copy` (secondary), per `docs/data-model.md` §repo-status.
     private func markSynced(_ destination: Destination) {
         updateRepoStatus(destId: destination.id) { status in
-            status.reachable = true
-            status.probedAt = self.now()
+            // restic just ran against this repository, past the runner's own
+            // online-only check, so it answered as a reachable probe would.
+            status.record(probe: .reachable, at: self.now())
             status.lastSyncedAt = self.now()
-            status.lastError = nil
         }
     }
 
@@ -4313,10 +4303,21 @@ public final class BackupEngine: Sendable {
     /// A secret problem seen after the pre-flight is the same fact about
     /// the destination, so it updates `state/secret-attention` the same way
     /// (#152). Transient failures, like the pre-flight's, record nothing.
+    /// Online-only repository files are not a secret problem, and nothing
+    /// clears a secret-attention record for them, so the runner's refusal is
+    /// recorded where a probe records it: on the destination's repo status,
+    /// which the next probe or successful sync re-derives (#180).
     private func recordPostPreflight(_ equivalent: ResticRunnerError.PreflightEquivalent, message: String) {
-        guard case .attention(let attention, let destinationId) = equivalent,
-              attention != .cloudRepositoryNotHydrated,
-              let (set, _) = locate(destId: destinationId) else { return }
+        guard case .attention(let attention, let destinationId) = equivalent else { return }
+        if attention == .cloudRepositoryNotHydrated {
+            updateRepoStatus(destId: destinationId) { status in
+                status.reachable = false
+                status.lastError = message
+                status.note(attention: attention, at: self.now())
+            }
+            return
+        }
+        guard let (set, _) = locate(destId: destinationId) else { return }
         do {
             try stateStore.recordSecretAttention(SecretAttentionRecord(
                 destId: destinationId, setId: set.id, attention: attention, detail: message, detectedAt: now()

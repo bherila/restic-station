@@ -142,7 +142,7 @@ struct AppPresentationContractTests {
                 primaryDestinationId: primary
             )
         }
-        #expect(MenuBarCopy.statusLine(for: health(problemOn: primary)) == "Docs — skipped: repository not downloaded ⚠")
+        #expect(MenuBarCopy.statusLine(for: health(problemOn: primary)) == "Docs — failing: repository not downloaded ⚠")
         #expect(MenuBarCopy.statusLine(for: health(problemOn: mirror)) == "Docs — never backed up · mirror not downloaded ⚠")
         let status = DestinationStatus.secretProblem(.cloudRepositoryNotHydrated)
         #expect(status.label == "Not downloaded")

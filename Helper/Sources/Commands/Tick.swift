@@ -178,21 +178,7 @@ struct Tick: AsyncParsableCommand {
                 let probe = await context.reachability.probe(destination)
                 do {
                     try context.stateStore.updateRepoStatus(destId: destination.id) { status in
-                        status.probedAt = now
-                        switch probe {
-                        case .reachable:
-                            status.reachable = true
-                            status.lastError = nil
-                        case .offline(let reason):
-                            status.reachable = false
-                            status.lastError = reason
-                        case .error(let exitClass):
-                            status.reachable = false
-                            status.lastError = exitClass.userFacingMessage
-                        case .needsAttention(_, let reason):
-                            status.reachable = false
-                            status.lastError = reason
-                        }
+                        status.record(probe: probe, at: now)
                     }
                 } catch {
                     StandardStream.writeToStandardError(

@@ -724,7 +724,9 @@ struct StateStoreTests {
           "reachable": false,
           "probedAt": "2026-07-26T20:57:10Z",
           "lastSyncedAt": "2026-07-12T02:31:00Z",
-          "lastError": null
+          "lastError": null,
+          "attention": null,
+          "attentionSince": null
         }
         """
         let decoded = try StateStore.makeDecoder().decode(RepoStatus.self, from: Data(json.utf8))
@@ -733,10 +735,78 @@ struct StateStoreTests {
         #expect(decoded.probedAt == Self.date("2026-07-26T20:57:10Z"))
         #expect(decoded.lastSyncedAt == Self.date("2026-07-12T02:31:00Z"))
         #expect(decoded.lastError == nil)
+        #expect(decoded.attention == nil)
+        #expect(decoded.attentionSince == nil)
 
         let reEncoded = try StateStore.makeEncoder().encode(decoded)
         let reDecoded = try StateStore.makeDecoder().decode(RepoStatus.self, from: reEncoded)
         #expect(reDecoded == decoded)
+    }
+
+    /// Written before #180, by this host or an older build: no attention
+    /// fields, which read as none.
+    @Test("decodes a repo-status file without the attention fields")
+    func decodesLegacyRepoStatus() throws {
+        let json = """
+        {
+          "destId": "\(Self.exampleDestId.uuidString)",
+          "reachable": false,
+          "probedAt": "2026-07-26T20:57:10Z",
+          "lastSyncedAt": null,
+          "lastError": "repository is not fully downloaded (data/ab/abcdef is online-only)"
+        }
+        """
+        let decoded = try StateStore.makeDecoder().decode(RepoStatus.self, from: Data(json.utf8))
+        #expect(decoded.attention == nil)
+        #expect(decoded.attentionSince == nil)
+
+        let hydration = """
+        {
+          "destId": "\(Self.exampleDestId.uuidString)",
+          "reachable": false,
+          "probedAt": "2026-07-26T20:57:10Z",
+          "lastSyncedAt": null,
+          "lastError": "repository is not fully downloaded (data/ab/abcdef is online-only)",
+          "attention": "cloud_repository_not_hydrated",
+          "attentionSince": "2026-07-26T20:00:00Z"
+        }
+        """
+        let withAttention = try StateStore.makeDecoder().decode(RepoStatus.self, from: Data(hydration.utf8))
+        #expect(withAttention.attention == .cloudRepositoryNotHydrated)
+        #expect(withAttention.attentionSince == Self.date("2026-07-26T20:00:00Z"))
+    }
+
+    /// Written by a newer build with an attention value this one does not
+    /// know: the record survives, `lastSyncedAt` included, so the
+    /// destination does not turn stale; only the attention reads as none.
+    /// The nearest independent constraint: a malformed required field still
+    /// fails the decode.
+    @Test("an unknown attention value reads as none, keeping the rest of the record")
+    func unknownAttentionKeepsTheRecord() throws {
+        func json(destId: String) -> String {
+            """
+            {
+              "destId": "\(destId)",
+              "reachable": false,
+              "probedAt": "2026-07-26T20:57:10Z",
+              "lastSyncedAt": "2026-07-12T02:31:00Z",
+              "lastError": "something new",
+              "attention": "a_case_from_the_future",
+              "attentionSince": "2026-07-26T20:00:00Z"
+            }
+            """
+        }
+        let decoded = try StateStore.makeDecoder().decode(
+            RepoStatus.self, from: Data(json(destId: Self.exampleDestId.uuidString).utf8)
+        )
+        #expect(decoded.lastSyncedAt == Self.date("2026-07-12T02:31:00Z"))
+        #expect(decoded.lastError == "something new")
+        #expect(decoded.attention == nil)
+        #expect(decoded.attentionSince == nil)
+
+        #expect(throws: DecodingError.self) {
+            try StateStore.makeDecoder().decode(RepoStatus.self, from: Data(json(destId: "not-a-uuid").utf8))
+        }
     }
 
     @Test("decodes the documented state/current-run-<setId>.json literal")
