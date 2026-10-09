@@ -357,6 +357,24 @@ public struct RepoStatus: Codable, Equatable, Sendable {
         case destId, reachable, probedAt, lastSyncedAt, lastError, attention, attentionSince
     }
 
+    /// ``attention`` and ``attentionSince`` are read leniently. A value
+    /// written by a newer build that this one does not know reads as none,
+    /// rather than failing the whole record: `updateRepoStatus` would then
+    /// start over and drop `lastSyncedAt`, and the destination would read as
+    /// stale until its next sync. The next probe re-derives the attention.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        destId = try container.decode(UUID.self, forKey: .destId)
+        reachable = try container.decode(Bool.self, forKey: .reachable)
+        probedAt = try container.decode(Date.self, forKey: .probedAt)
+        lastSyncedAt = try container.decodeIfPresent(Date.self, forKey: .lastSyncedAt)
+        lastError = try container.decodeIfPresent(String.self, forKey: .lastError)
+        attention = (try? container.decodeIfPresent(DestinationAttention.self, forKey: .attention)) ?? nil
+        attentionSince = attention == nil
+            ? nil
+            : (try? container.decodeIfPresent(Date.self, forKey: .attentionSince)) ?? nil
+    }
+
     // Explicit `null` for nil optionals — see AppConfig.encode(to:).
     public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
