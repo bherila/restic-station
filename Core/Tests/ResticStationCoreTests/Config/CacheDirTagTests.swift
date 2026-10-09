@@ -124,9 +124,10 @@ import Musl
     }
 
     /// The nearest independent constraint: a symlinked tag is judged by its
-    /// target, which `lstat` would not reach, and the file actually opened
-    /// is the one that counts.
-    @Test func aSymlinkToAnOnlineOnlyTagIsNotRead() throws {
+    /// target before anything is opened, which `lstat` would not do. The
+    /// target is unreadable, so a pre-check that stopped at the link would
+    /// report the `open` failure instead. Root can open it regardless.
+    @Test(.enabled(if: geteuid() != 0)) func aSymlinkToAnOnlineOnlyTagIsNotOpened() throws {
         let root = try makeTree()
         defer { try? FileManager.default.removeItem(at: root) }
         let elsewhere = root.appendingPathComponent("cache")
@@ -136,7 +137,9 @@ import Musl
             at: source.appendingPathComponent("CACHEDIR.TAG"),
             withDestinationURL: elsewhere.appendingPathComponent("CACHEDIR.TAG")
         )
-        let online = try inode(of: elsewhere.appendingPathComponent("CACHEDIR.TAG"))
+        let target = elsewhere.appendingPathComponent("CACHEDIR.TAG")
+        try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: target.path)
+        let online = try inode(of: target)
         #expect(CacheDirTag.check(source.path, isDataless: { $0.st_ino == online })
             == .unverifiable(directory: source.path, reason: CacheDirTag.onlineOnlyReason))
     }
