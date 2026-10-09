@@ -290,23 +290,71 @@ public struct RepoStatus: Codable, Equatable, Sendable {
     /// success.
     public var lastSyncedAt: Date?
     public var lastError: String?
+    /// Why the latest look at this destination needs a human, typed:
+    /// `RepoProbeResult.needsAttention`'s case, or a runner refusal of the
+    /// same kind. `nil` when the latest probe found nothing to act on, or
+    /// could not look (offline). Set health projects only
+    /// `cloudRepositoryNotHydrated` from here (#180): the secret cases have
+    /// their own record, `state/secret-attention-<destId>.json`, which the
+    /// secret pre-flight keeps true. Hydration has no such pre-flight, so
+    /// every probe re-derives it, and it clears once the files are local.
+    public var attention: DestinationAttention?
+    /// When ``attention`` was first seen, kept while it stays the same.
+    public var attentionSince: Date?
 
     public init(
         destId: UUID,
         reachable: Bool,
         probedAt: Date,
         lastSyncedAt: Date? = nil,
-        lastError: String? = nil
+        lastError: String? = nil,
+        attention: DestinationAttention? = nil,
+        attentionSince: Date? = nil
     ) {
         self.destId = destId
         self.reachable = reachable
         self.probedAt = probedAt
         self.lastSyncedAt = lastSyncedAt
         self.lastError = lastError
+        self.attention = attention
+        self.attentionSince = attentionSince
+    }
+
+    /// Records a probe. The one mapping every probe writer uses — the
+    /// engine, the tick's reprobe and `probe-repo` — so none of them can
+    /// leave a stale ``attention`` behind.
+    public mutating func record(probe: RepoProbeResult, at date: Date) {
+        probedAt = date
+        switch probe {
+        case .reachable:
+            reachable = true
+            lastError = nil
+            note(attention: nil, at: date)
+        case .offline(let reason):
+            reachable = false
+            lastError = reason
+            note(attention: nil, at: date)
+        case .error(let exitClass):
+            reachable = false
+            lastError = exitClass.userFacingMessage
+            note(attention: nil, at: date)
+        case .needsAttention(let attention, let reason):
+            reachable = false
+            lastError = reason
+            note(attention: attention, at: date)
+        }
+    }
+
+    /// Sets ``attention``, keeping ``attentionSince`` while it is unchanged.
+    public mutating func note(attention newAttention: DestinationAttention?, at date: Date) {
+        if newAttention != attention || attentionSince == nil {
+            attentionSince = newAttention == nil ? nil : date
+        }
+        attention = newAttention
     }
 
     private enum CodingKeys: String, CodingKey {
-        case destId, reachable, probedAt, lastSyncedAt, lastError
+        case destId, reachable, probedAt, lastSyncedAt, lastError, attention, attentionSince
     }
 
     // Explicit `null` for nil optionals — see AppConfig.encode(to:).
@@ -317,6 +365,8 @@ public struct RepoStatus: Codable, Equatable, Sendable {
         try container.encode(probedAt, forKey: .probedAt)
         try container.encode(lastSyncedAt, forKey: .lastSyncedAt)
         try container.encode(lastError, forKey: .lastError)
+        try container.encode(attention, forKey: .attention)
+        try container.encode(attentionSince, forKey: .attentionSince)
     }
 }
 
