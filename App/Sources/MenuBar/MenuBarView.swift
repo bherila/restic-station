@@ -140,7 +140,8 @@ enum MenuBarCopy {
             case .secretStoreUnusable:
                 return "\(health.name) — skipped: secrets unreadable ⚠"
             case .cloudRepositoryNotHydrated:
-                return "\(health.name) — skipped: repository not downloaded ⚠"
+                // Not skipped: each attempt fails until the files are local.
+                return "\(health.name) — failing: repository not downloaded ⚠"
             }
         }
         let line = backupLine(for: health, now: now)

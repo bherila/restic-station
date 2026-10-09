@@ -123,8 +123,9 @@ public struct SetHealth: Identifiable, Equatable, Sendable {
         self.primaryDestinationId = primaryDestinationId
     }
 
-    /// The primary's secret problem, which is what makes scheduled runs of
-    /// the whole set skip. `nil` when only secondaries have one.
+    /// The primary's problem: a secret one makes scheduled runs of the
+    /// whole set skip, and online-only repository files make them fail.
+    /// `nil` when only secondaries have one.
     public var primarySecretProblem: SecretAttentionRecord? {
         guard let primaryDestinationId else { return nil }
         return secretAttention.first { $0.destId == primaryDestinationId }

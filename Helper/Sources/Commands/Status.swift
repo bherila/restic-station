@@ -564,7 +564,9 @@ struct StatusReport: Encodable {
 
     /// `state/secret-attention-<destId>.json`, as reported: the published
     /// error code (`secret_not_configured` or `secret_store_unusable`), the
-    /// store's own text naming the repair, and when it was first seen.
+    /// store's own text naming the repair, and when it was first seen. Or
+    /// `cloud_repository_not_hydrated`, projected from the destination's
+    /// repo status (#180), with the download it needs.
     struct SecretProblem: Encodable {
         let code: String
         let detail: String
@@ -572,9 +574,14 @@ struct StatusReport: Encodable {
 
         init(_ record: SecretAttentionRecord) {
             code = record.attention.code.rawValue
-            detail = record.attention == .secretNotConfigured
-                ? "no password is stored; run `\(DestinationAttention.secretSetCommand(destId: record.destId))`"
-                : record.detail
+            switch record.attention {
+            case .secretNotConfigured:
+                detail = "no password is stored; run `\(DestinationAttention.secretSetCommand(destId: record.destId))`"
+            case .secretStoreUnusable:
+                detail = record.detail
+            case .cloudRepositoryNotHydrated:
+                detail = "\(record.detail); \(DestinationAttention.hydrationRepair)"
+            }
             detectedAt = record.detectedAt
         }
     }
@@ -961,10 +968,15 @@ struct StatusReport: Encodable {
                 let staleFlag = destination.stale ? ", STALE" : ""
                 lines.append("      - \(role) \"\(destination.label)\": \(reach)\(error)\(staleFlag)")
                 if let problem = destination.secretProblem {
+                    // Online-only repository files are not a secret problem,
+                    // and the run is not skipped: it fails, once per
+                    // interval, keeping its attempt stamp (#170, #180).
+                    let notDownloaded = problem.code == CLIErrorCode.cloudRepositoryNotHydrated.rawValue
                     let consequence = destination.isPrimary
-                        ? "scheduled runs skip this set until fixed"
+                        ? (notDownloaded ? "this set's backups fail until fixed" : "scheduled runs skip this set until fixed")
                         : "the primary still backs up; copies to this mirror fail until fixed"
-                    lines.append("        SECRETS: \(problem.code) — \(problem.detail); \(consequence)")
+                    let label = notDownloaded ? "NOT DOWNLOADED" : "SECRETS"
+                    lines.append("        \(label): \(problem.code) — \(problem.detail); \(consequence)")
                 }
             }
         }

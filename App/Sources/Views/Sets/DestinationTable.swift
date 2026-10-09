@@ -198,8 +198,11 @@ struct DestinationTable: View {
     private func secretProblemHelp(_ destination: Destination) -> String? {
         guard let record = model.setHealth(for: set.id)?.secretAttention.first(where: { $0.destId == destination.id })
         else { return nil }
+        // A secret refusal skips the set; online-only repository files make
+        // its backups fail instead (#180).
         let consequence = destination.isPrimary
-            ? "so this set's backups are skipped"
+            ? (record.attention == .cloudRepositoryNotHydrated
+                ? "so this set's backups fail" : "so this set's backups are skipped")
             : "so copies to this mirror fail; the primary still backs up"
         switch record.attention {
         case .secretNotConfigured:
