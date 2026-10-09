@@ -126,6 +126,77 @@ import Testing
         #expect(Self.health(env).primarySecretProblem?.attention == .cloudRepositoryNotHydrated)
     }
 
+    // MARK: - Copies and init
+
+    /// The nearest independent constraint on where a refusal lands: a copy
+    /// reads two repositories, and the refusal names the one with online-only
+    /// files. The mirror's own files are the mirror's problem.
+    @Test("a copy refused for the mirror's own files lands on the mirror")
+    func copyRefusedForTheMirror() async throws {
+        let online = OnlineOnly()
+        let env = T.makeEnv(
+            script: [], retention: nil, reachableSecondaries: [true],
+            probeDatalessEntry: { _ in nil }, runnerDatalessEntry: online.entry
+        )
+        defer { env.cleanUp() }
+        online.set([env.secondaries[0].repoURL])
+        env.fake.script = Self.anything
+
+        _ = await env.engine.runSet(env.set, trigger: .scheduled)
+
+        #expect(env.fake.invocations.contains { $0.argv.contains("backup") }, "the primary still backs up")
+        #expect(env.stateStore.readRepoStatus(destId: T.secondaryAId)?.attention == .cloudRepositoryNotHydrated)
+        #expect(env.stateStore.readRepoStatus(destId: T.primaryId)?.attention == nil)
+        #expect(Self.health(env).secretAttention.map(\.destId) == [T.secondaryAId])
+    }
+
+    /// The primary evicted after its own backup: the copy is refused for its
+    /// source, which is the primary's problem, not the mirror's.
+    @Test("a copy refused for its source lands on the primary, not the mirror")
+    func copyRefusedForTheSource() async throws {
+        let online = OnlineOnly()
+        let env = T.makeEnv(
+            script: [], retention: nil, reachableSecondaries: [true],
+            onSpawn: { argv in
+                guard argv.contains("backup"), let repo = argv.firstIndex(of: "-r") else { return }
+                online.set([argv[repo + 1]])
+            },
+            probeDatalessEntry: { _ in nil }, runnerDatalessEntry: online.entry
+        )
+        defer { env.cleanUp() }
+        env.fake.script = Self.anything
+
+        _ = await env.engine.runSet(env.set, trigger: .scheduled)
+
+        #expect(!env.fake.invocations.contains { $0.argv.contains("copy") }, "the copy must not have run")
+        #expect(env.stateStore.readRepoStatus(destId: T.primaryId)?.attention == .cloudRepositoryNotHydrated)
+        #expect(env.stateStore.readRepoStatus(destId: T.secondaryAId)?.attention == nil)
+        #expect(Self.health(env).secretAttention.map(\.destId) == [T.primaryId])
+    }
+
+    /// `initSecondary` does not probe first, so its own success is what
+    /// clears a mirror's earlier hydration problem: restic just read both
+    /// repositories past the runner's online-only check.
+    @Test("a successful init clears the mirror's earlier problem")
+    func initClearsTheMirror() async throws {
+        let env = T.makeEnv(script: [], reachableSecondaries: [true])
+        defer { env.cleanUp() }
+        let secondary = env.secondaries[0]
+        try env.stateStore.updateRepoStatus(destId: secondary.id) {
+            $0.record(probe: .needsAttention(.cloudRepositoryNotHydrated, reason: "not downloaded"), at: T.t0)
+        }
+        env.fake.script = T.resticCall(
+            ["-r", secondary.repoURL, "init", "--json", "--from-repo", env.primary.repoURL, "--copy-chunker-params"],
+            dest: T.secondaryAId,
+            from: T.primaryId,
+            stdoutLines: [(try? FixtureLoader.string("init-secondary.json").trimmingCharacters(in: .newlines)) ?? ""]
+        )
+
+        #expect(await env.engine.initSecondary(env.set, dest: secondary) == .completed(.success))
+        #expect(env.stateStore.readRepoStatus(destId: secondary.id)?.attention == nil)
+        #expect(Self.health(env).secretAttention.isEmpty)
+    }
+
     // MARK: - Projection
 
     static let destId = UUID(uuidString: "11111111-2222-3333-4444-555555555555")!
