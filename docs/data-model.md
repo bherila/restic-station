@@ -356,7 +356,7 @@ One `config.json` describes the whole fleet. Each machine reads it through `AppC
 | Overrides applied | yes | yes |
 | `enabled: false` drops things | **yes** | **no** |
 | `omissions` | populated | always empty |
-| Used by | `tick`, `run-set` (backup/check/prune), health/staleness derivation | `restore`, `probe-repo`, `unlock`, `init-secondary`, the restore browser, maintenance sizes and `forget --dry-run`, "Initialize repository" |
+| Used by | `tick`, `run-set` (backup/check/prune), `backup dry-run`, health/staleness derivation | `restore`, `probe-repo`, `unlock`, `init-secondary`, `snapshots list`, `retention preview`, the restore browser, maintenance sizes and `forget --dry-run`, "Initialize repository" |
 
 `enabled: false` means "do not back this up here". It does not mean "pretend this repository does not exist": a host set up as a restore/mirror target by disabling every set must still be able to restore from, probe, and unlock every repository in the shared config — that is the whole point of the arrangement. Both views apply *identical* overrides, so they can never disagree about what a repository **is**, only about which ones this machine backs up.
 

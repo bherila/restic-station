@@ -1180,6 +1180,256 @@ public final class BackupEngine: Sendable {
         }
     }
 
+    // MARK: - snapshots list / retention preview (#80)
+
+    /// `snapshots list`'s default and largest `limit`.
+    public static let snapshotListDefaultLimit = 50
+    public static let snapshotListMaximumLimit = 1000
+
+    /// `snapshots list` (#80): one destination's snapshots, newest first,
+    /// at most `limit` of them.
+    ///
+    /// Read-only and lock-free: `restic snapshots` takes no exclusive lock,
+    /// and holding the set lock would make the answer wait out an hours-long
+    /// backup. Runs the secret pre-flight and the reachability probe first,
+    /// and records neither the probe nor a run.
+    ///
+    /// - Throws: ``RepositoryQueryError``, and nothing else.
+    public func listSnapshots(
+        _ set: BackupSet,
+        destination: Destination,
+        limit: Int
+    ) async throws -> SnapshotListing {
+        try await readOnlyPreflight(destination)
+        let outcome = try await readOnlyQuery(
+            .snapshots(repo: destination.repoURL),
+            invocation: ResticInvocation(destination: destination)
+        )
+        let snapshots: [Snapshot]
+        do {
+            snapshots = try parseSnapshots(Self.jsonDocument(in: outcome.rawOutput))
+        } catch {
+            throw RepositoryQueryError.unreadableOutput(
+                destinationId: destination.id,
+                reason: "could not read restic's snapshot list: \(error)"
+            )
+        }
+        return SnapshotListing(
+            setId: set.id,
+            destination: destination,
+            totalCount: snapshots.count,
+            limit: limit,
+            snapshots: Array(Self.newestFirst(snapshots).prefix(max(0, limit)))
+        )
+    }
+
+    /// `retention preview` (#80): what `set`'s configured policy would keep
+    /// and remove on `destination`, from `restic forget --json --dry-run`
+    /// with exactly the flags scheduled retention passes, minus `--prune`.
+    ///
+    /// Under the set lock, after the same pre-flights as every repository
+    /// operation. **Never destructive:** the only `forget` it can build has
+    /// `--dry-run` and no `--prune`, and that is checked again before launch.
+    /// No run record, no `lastSyncedAt`, no repo-status write for the probe.
+    ///
+    /// A mirror's preview carries its recorded sync state, and the CLI says
+    /// in so many words that a preview is not evidence a mirror is safe to
+    /// prune: scheduled retention prunes a mirror only after that run's copy
+    /// to it succeeded, and manual retention apply stays contained (#82,
+    /// #111).
+    ///
+    /// - Throws: ``RepositoryQueryError``, and nothing else.
+    public func previewRetention(
+        _ set: BackupSet,
+        destination: Destination
+    ) async throws -> RetentionPreview {
+        guard let policy = set.retention, !policy.isEmpty else {
+            throw RepositoryQueryError.noRetentionPolicy
+        }
+
+        let (lock, acquisition) = acquireSetLock(setId: set.id)
+        switch acquisition {
+        case .acquired:
+            break
+        case .busy:
+            throw RepositoryQueryError.busy
+        case .failed(let failure):
+            logWarning("BackupEngine: cannot acquire the set lock: \(failure)")
+            throw RepositoryQueryError.lockUnusable("\(failure)")
+        }
+        defer { lock.release() }
+
+        try await readOnlyPreflight(destination)
+
+        let command = ResticCommand.forget(repo: destination.repoURL, policy: policy, dryRun: true)
+        guard Self.isRetentionPreview(command) else {
+            throw RepositoryQueryError.notAPreview
+        }
+
+        let previewedAt = now()
+        let outcome = try await readOnlyQuery(command, invocation: ResticInvocation(destination: destination))
+        let results: [ForgetResult]
+        do {
+            results = try parseForget(Self.jsonDocument(in: outcome.rawOutput))
+        } catch {
+            throw RepositoryQueryError.unreadableOutput(
+                destinationId: destination.id,
+                reason: "could not read restic's retention plan: \(error)"
+            )
+        }
+
+        let groups = results.map { result -> RetentionPreview.Group in
+            var reasons: [String: [String]] = [:]
+            for reason in result.reasons ?? [] {
+                reasons[reason.snapshot.id] = reason.matches ?? []
+            }
+            return RetentionPreview.Group(
+                host: result.host,
+                tags: result.tags ?? [],
+                paths: result.paths ?? [],
+                keep: Self.newestFirst(result.keep ?? []).map {
+                    RetentionPreview.Kept(snapshot: $0, reasons: reasons[$0.id] ?? [])
+                },
+                remove: Self.newestFirst(result.remove ?? [])
+            )
+        }
+
+        let mirrorSync: RetentionPreview.MirrorSync?
+        if destination.isPrimary {
+            mirrorSync = nil
+        } else {
+            let primary = set.destinations.first(where: { $0.isPrimary })
+            mirrorSync = RetentionPreview.MirrorSync(
+                lastSyncedAt: stateStore.readRepoStatus(destId: destination.id)?.lastSyncedAt,
+                primaryLastSyncedAt: primary.flatMap { stateStore.readRepoStatus(destId: $0.id)?.lastSyncedAt }
+            )
+        }
+
+        return RetentionPreview(
+            setId: set.id,
+            destination: destination,
+            policy: policy,
+            previewedAt: previewedAt,
+            groups: groups,
+            mirrorSync: mirrorSync,
+            fingerprint: RetentionPreview.computeFingerprint(
+                setId: set.id,
+                destination: destination,
+                policy: policy,
+                keepIDs: groups.flatMap { $0.keep.map(\.snapshot.id) },
+                removeIDs: groups.flatMap { $0.remove.map(\.id) }
+            )
+        )
+    }
+
+    /// `forget` with `--dry-run` and without `--prune`. Every argument after
+    /// `forget` is a flag or a number, so a plain membership test is exact.
+    static func isRetentionPreview(_ command: ResticCommand) -> Bool {
+        command.argv.contains("forget")
+            && command.argv.contains("--dry-run")
+            && !command.argv.contains("--prune")
+    }
+
+    /// Newest first; equal times ordered by id, so the order never depends
+    /// on what restic happened to print first.
+    static func newestFirst(_ snapshots: [Snapshot]) -> [Snapshot] {
+        snapshots.sorted { $0.time != $1.time ? $0.time > $1.time : $0.id < $1.id }
+    }
+
+    /// The single-line JSON document restic printed. `rawOutput` is stdout
+    /// followed by stderr, and a warning on stderr must not be mistaken for
+    /// it, so this takes the first line that opens an array or object.
+    static func jsonDocument(in rawOutput: String) throws -> Data {
+        struct NoJSONDocument: Error, CustomStringConvertible {
+            var description: String { "restic printed no JSON document" }
+        }
+        for line in rawOutput.split(whereSeparator: \.isNewline) {
+            let trimmed = line.drop { $0 == " " || $0 == "\t" }
+            if trimmed.first == "[" || trimmed.first == "{" {
+                return Data(trimmed.utf8)
+            }
+        }
+        throw NoJSONDocument()
+    }
+
+    /// The secret pre-flight and the reachability probe, as every
+    /// repository operation runs them, with nothing recorded for the probe.
+    private func readOnlyPreflight(_ destination: Destination) async throws {
+        if let refusal = await secretStoreRefusal(for: [destination]) {
+            if let attention = DestinationAttention(refusal.error) {
+                throw RepositoryQueryError.attention(
+                    attention,
+                    destinationId: destination.id,
+                    message: Self.secretRefusalReason(
+                        attention: attention, destination: destination, error: refusal.error
+                    )
+                )
+            }
+            throw RepositoryQueryError.secretUnavailable(
+                destinationId: destination.id, message: refusal.error.description
+            )
+        }
+        let (probe, secretError) = await probeDestination(destination)
+        if let secretError {
+            throw Self.queryError(secretError)
+        }
+        switch probe {
+        case .reachable:
+            return
+        case .offline(let reason):
+            throw RepositoryQueryError.offline(destinationId: destination.id, reason: reason)
+        case .error(let exitClass):
+            throw RepositoryQueryError.probeFailed(destinationId: destination.id, exitClass)
+        case .needsAttention(let attention, let reason):
+            throw RepositoryQueryError.attention(attention, destinationId: destination.id, message: reason)
+        }
+    }
+
+    /// One read-only restic command. No `unlock` and no retry on exit 11:
+    /// a locked repository is reported.
+    private func readOnlyQuery(_ command: ResticCommand, invocation: ResticInvocation) async throws -> ResticOutcome {
+        let destination = invocation.destination
+        let outcome: ResticOutcome
+        do {
+            outcome = try await restic.run(command, for: invocation)
+        } catch {
+            throw readOnlyQueryError(error, destination: destination)
+        }
+        switch outcome.status {
+        case .success:
+            return outcome
+        case .successUnverified:
+            throw RepositoryQueryError.unreadableOutput(
+                destinationId: destination.id,
+                reason: "restic's output was cut short, so it cannot be read in full"
+            )
+        case .warningIncompleteRead, .fatal, .repoDoesNotExist, .repoLocked, .wrongPassword, .other:
+            throw RepositoryQueryError.resticFailed(destinationId: destination.id, outcome.status)
+        }
+    }
+
+    /// A failure of a read-only query, or of reading what it needs, as a
+    /// ``RepositoryQueryError``: a secret problem keeps the pre-flight's
+    /// classification (#152), anything else is "restic did not run".
+    private func readOnlyQueryError(_ error: any Error, destination: Destination) -> RepositoryQueryError {
+        if let secretError = postPreflightSecretError(error) {
+            return Self.queryError(secretError)
+        }
+        if let runnerError = error as? ResticRunnerError {
+            return .resticDidNotRun(destinationId: destination.id, runnerError)
+        }
+        return .resticDidNotRun(destinationId: destination.id, .launchFailed("\(error)"))
+    }
+
+    private static func queryError(_ failure: PostPreflightSecretError) -> RepositoryQueryError {
+        switch failure.equivalent {
+        case .attention(let attention, let destinationId):
+            return .attention(attention, destinationId: destinationId, message: failure.message)
+        case .secretUnavailable(let destinationId):
+            return .secretUnavailable(destinationId: destinationId, message: failure.message)
+        }
+    }
+
     // MARK: - runCheck
 
     /// One scheduled integrity check: `--read-data-subset=n/t` against the

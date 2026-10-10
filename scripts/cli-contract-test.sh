@@ -104,9 +104,9 @@ ok()   { printf 'ok: %s\n' "$*"; }
 CODE_TABLE='invalid_arguments|no|64/1|live
 config_invalid|no|1|live
 set_not_found|no|1|live
-set_disabled_here|no|1|unit:no command emits it — only tests construct it (see the report note in this PR)
+set_disabled_here|no|1|unit:emitted by backup dry-run for a set switched off on this machine; this fixture has no machine override, so RepositoryQueryCommandTests pins it
 destination_not_found|no|1|live
-destination_disabled_here|no|1|unit:no command emits it — only tests construct it
+destination_disabled_here|no|1|unit:no command emits it — read-only repository commands use the addressable view, which drops nothing; only tests construct it
 run_not_found|no|1|live
 set_busy|yes|2|live
 repository_offline|yes|3|live
@@ -138,6 +138,8 @@ config upgrade|json|live
 config acknowledge-migration|json|live
 probe-repo|json|live
 backup dry-run|json|live
+snapshots list|json|live
+retention preview|json|live
 secret list|json|live
 cli status|json|live
 fda-check|json|live
@@ -717,7 +719,68 @@ assert_error_envelope internal_error
 [[ "$(run_count)" == "$RUNS_BEFORE_DRY" ]] || fail "an unconfirmed backup dry-run wrote a run record"
 fake_mode 0
 mark_cmd "backup dry-run"
-ok "all 14 asserted --json commands emit {schemaVersion, ok, data} with their documented payloads"
+
+# snapshots list (#80): one `snapshots --json`, newest first, paths left
+# out unless asked for, no repository URL, nothing recorded.
+A64="$(printf '%064d' 0 | tr 0 a)"
+B64="$(printf '%064d' 0 | tr 0 b)"
+SNAP_A="{\"id\":\"$A64\",\"short_id\":\"aaaaaaaa\",\"time\":\"2026-07-01T10:00:00Z\",\"paths\":[\"/tmp/src\"],\"hostname\":\"ci-host\",\"username\":\"ci\",\"tags\":null}"
+SNAP_B="{\"id\":\"$B64\",\"short_id\":\"bbbbbbbb\",\"time\":\"2026-07-02T10:00:00Z\",\"paths\":[\"/tmp/src\"],\"hostname\":\"ci-host\",\"username\":\"ci\",\"tags\":[\"nightly\"]}"
+RUNS_BEFORE_QUERY="$(run_count)"
+: > "$FAKE_DIR/calls"
+fake_mode 0 "[$SNAP_A,$SNAP_B]"
+RESTIC_STATION_DATA_DIR="$FIXTURE" run_helper_split snapshots list --set "$SET_ID" --json
+expect_rc 0
+assert_success_envelope "snapshots list --json"
+[[ "$(jq -r '.data | keys | join(",")' "$OUT_FILE")" == "destination,limit,pathsIncluded,setId,snapshots,totalCount" ]] \
+    || fail "snapshots list --json payload keys drifted: $(jq -r '.data | keys | join(",")' "$OUT_FILE")"
+jq -e --arg b "$B64" '.data | .totalCount == 2 and .limit == 50 and .pathsIncluded == false
+    and .destination.role == "primary" and (.destination | has("repoURL") | not)
+    and .snapshots[0].id == $b and .snapshots[0].tags == ["nightly"]
+    and .snapshots[0].paths == null and .snapshots[0].pathCount == 1' "$OUT_FILE" >/dev/null \
+    || fail "snapshots list --json payload is wrong: $(jq -c '.data' "$OUT_FILE")"
+! grep -q '/tmp/src' "$OUT_FILE" || fail "snapshots list published a source path without --include-paths"
+[[ "$(cat "$FAKE_DIR/calls")" == "-r $REPO_DIR snapshots --json" ]] \
+    || fail "snapshots list must launch exactly one restic, snapshots --json: $(cat "$FAKE_DIR/calls")"
+RESTIC_STATION_DATA_DIR="$FIXTURE" run_helper_split snapshots list --set "$SET_ID" --limit 1 --include-paths --json
+expect_rc 0
+jq -e '.data | .pathsIncluded == true and (.snapshots | length) == 1 and .snapshots[0].paths == ["/tmp/src"]' \
+    "$OUT_FILE" >/dev/null || fail "snapshots list --limit 1 --include-paths is wrong: $(jq -c '.data' "$OUT_FILE")"
+RESTIC_STATION_DATA_DIR="$FIXTURE" run_helper_split snapshots list --set "$SET_ID" --limit 0 --json
+assert_error_envelope invalid_arguments
+[[ "$(run_count)" == "$RUNS_BEFORE_QUERY" ]] || fail "snapshots list wrote a run record"
+mark_cmd "snapshots list"
+
+# retention preview (#80): refused without a policy before restic runs;
+# with one, `forget --json <policy> --dry-run` and never `--prune`. The
+# policy lives in a copy of the fixture so no other assertion sees it.
+: > "$FAKE_DIR/calls"
+RESTIC_STATION_DATA_DIR="$FIXTURE" run_helper_split retention preview --set "$SET_ID" --json
+assert_error_envelope operation_not_allowed
+[[ ! -s "$FAKE_DIR/calls" ]] || fail "retention preview with no policy launched restic: $(cat "$FAKE_DIR/calls")"
+RETENTION_FIXTURE="$WORK/retention-data"
+cp -Rp "$FIXTURE" "$RETENTION_FIXTURE"
+jq '.sets[0].retention = {"keepLast": 2}' "$RETENTION_FIXTURE/config.json" > "$WORK/retention-config.json"
+mv "$WORK/retention-config.json" "$RETENTION_FIXTURE/config.json"
+RETENTION_INDEX_BEFORE="$(cat "$RETENTION_FIXTURE/runs/index.jsonl")"
+fake_mode 0 "[{\"tags\":null,\"host\":\"ci-host\",\"paths\":[\"/tmp/src\"],\"keep\":[$SNAP_B],\"remove\":[$SNAP_A],\"reasons\":[{\"snapshot\":$SNAP_B,\"matches\":[\"last snapshot\"]}]}]"
+RESTIC_STATION_DATA_DIR="$RETENTION_FIXTURE" run_helper_split retention preview --set "$SET_ID" --json
+expect_rc 0
+assert_success_envelope "retention preview --json"
+[[ "$(jq -r '.data | keys | join(",")' "$OUT_FILE")" == "destination,fingerprint,groups,keepCount,mirror,pathsIncluded,policy,previewedAt,removeCount,setId,warnings" ]] \
+    || fail "retention preview --json payload keys drifted: $(jq -r '.data | keys | join(",")' "$OUT_FILE")"
+jq -e --arg a "$A64" --arg b "$B64" '.data | .keepCount == 1 and .removeCount == 1 and .mirror == null
+    and .policy.keepLast == 2 and .policy.keepDaily == null and (.fingerprint | startswith("sha256:"))
+    and .groups[0].keep[0].id == $b and .groups[0].keep[0].reasons == ["last snapshot"]
+    and .groups[0].remove[0].id == $a and .groups[0].paths == null and .warnings == []' "$OUT_FILE" >/dev/null \
+    || fail "retention preview --json payload is wrong: $(jq -c '.data' "$OUT_FILE")"
+[[ "$(cat "$FAKE_DIR/calls")" == "-r $REPO_DIR forget --json --keep-last 2 --dry-run" ]] \
+    || fail "retention preview must launch exactly forget --json --keep-last 2 --dry-run: $(cat "$FAKE_DIR/calls")"
+[[ "$(cat "$RETENTION_FIXTURE/runs/index.jsonl")" == "$RETENTION_INDEX_BEFORE" ]] \
+    || fail "retention preview wrote a run record"
+fake_mode 0
+mark_cmd "retention preview"
+ok "all 16 asserted --json commands emit {schemaVersion, ok, data} with their documented payloads"
 
 # The consumed-binding flow: the dry run's binding, fed through the
 # documented stdin selector, authorizes exactly one real prune.

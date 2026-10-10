@@ -93,7 +93,7 @@ struct HelperMain: AsyncParsableCommand {
         CommandConfiguration(
             commandName: resolvedCommandName(),
             abstract: "Restic Station background helper. "
-                + "Exit codes (per-subcommand, see each --help): 0 ok, 1 error, 2 busy, 3 offline (probe-repo, purge preview, backup dry-run).",
+                + "Exit codes (per-subcommand, see each --help): 0 ok, 1 error, 2 busy, 3 offline (probe-repo, purge preview, backup dry-run, snapshots list, retention preview).",
             subcommands: subcommandList
         )
     }
@@ -143,6 +143,10 @@ struct HelperMain: AsyncParsableCommand {
             RunSet.self,
             // #78: read-only — what a backup would add, without one.
             Backup.self,
+            // #80: read-only — a destination's snapshots, and what the
+            // retention policy would keep and remove.
+            Snapshots.self,
+            Retention.self,
             Purge.self,
             Maintenance.self,
             InitSecondary.self,

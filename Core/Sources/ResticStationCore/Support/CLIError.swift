@@ -679,6 +679,67 @@ extension CLIFailure {
         }
     }
 
+    /// Error mapping for `snapshots list` and `retention preview` (#80).
+    /// Enumerated with no `default:`, like ``classifyBackupDryRun(_:setId:)``,
+    /// whose wording it shares: neither command keeps a run log.
+    public static func classifyRepositoryQuery(_ error: any Error, setId: UUID) -> CLIFailure {
+        guard let queryError = error as? RepositoryQueryError else {
+            return classify(error)
+        }
+        switch queryError {
+        case .busy:
+            return setBusy(setId: setId)
+        case .lockUnusable(let detail):
+            return classifyBackupDryRun(BackupDryRunError.lockUnusable(detail), setId: setId)
+        case .noRetentionPolicy:
+            // The invariant that `forget` never runs without a keep rule,
+            // previewed or not (`architecture.md` §Invariants).
+            return CLIFailure(
+                code: .operationNotAllowed,
+                message: "This backup set has no retention policy with a keep rule, so there is nothing to preview.",
+                details: CLIErrorDetails(setId: setId)
+            )
+        case .attention(let attention, let destinationId, let message):
+            return classifyBackupDryRun(
+                BackupDryRunError.attention(attention, destinationId: destinationId, message: message), setId: setId
+            )
+        case .secretUnavailable(let destinationId, let message):
+            return classifyBackupDryRun(
+                BackupDryRunError.secretUnavailable(destinationId: destinationId, message: message), setId: setId
+            )
+        case .offline(let destinationId, let reason):
+            return CLIFailure(
+                code: .repositoryOffline,
+                message: bounded("The destination is offline: \(reason)"),
+                details: CLIErrorDetails(setId: setId, destinationId: destinationId)
+            )
+        case .probeFailed(let destinationId, let exitClass):
+            return classifyBackupDryRun(
+                BackupDryRunError.probeFailed(destinationId: destinationId, exitClass), setId: setId
+            )
+        case .resticFailed(let destinationId, let exitClass):
+            return classifyBackupDryRun(
+                BackupDryRunError.resticFailed(destinationId: destinationId, exitClass), setId: setId
+            )
+        case .resticDidNotRun(let destinationId, let runnerError):
+            return classifyBackupDryRun(
+                BackupDryRunError.resticDidNotRun(destinationId: destinationId, runnerError), setId: setId
+            )
+        case .unreadableOutput(let destinationId, let reason):
+            return CLIFailure(
+                code: .internalError,
+                message: bounded("restic's answer could not be read: \(reason)"),
+                details: CLIErrorDetails(setId: setId, destinationId: destinationId)
+            )
+        case .notAPreview:
+            return CLIFailure(
+                code: .internalError,
+                message: "Refused: the retention command was about to run without --dry-run or with --prune.",
+                details: CLIErrorDetails(setId: setId)
+            )
+        }
+    }
+
     public static func invalidArguments(_ message: String) -> CLIFailure {
         CLIFailure(code: .invalidArguments, message: bounded(message))
     }
