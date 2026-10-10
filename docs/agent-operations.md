@@ -77,6 +77,12 @@ running a backup.
    applies the retention policy, which can remove old snapshots. Say so
    before running it.
 
+The dry run is information, not a binding: `run-set` uses the configuration
+as it is when it runs and checks nothing against the preview. If the
+configuration may have changed since the dry run (another host, the app, a
+config sync), run `config validate --json` and the dry run again, and ask
+again, rather than relying on the earlier go-ahead.
+
 Backups, copies, restores, `init-secondary` and `unlock` are different
 actions; authorize each one on its own.
 

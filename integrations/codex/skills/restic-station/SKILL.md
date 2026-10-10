@@ -45,7 +45,8 @@ nothing else. No backup.
 **Back up.** `restic-station backup dry-run --set <uuid> --json`, then
 summarize the figures and warnings and ask. Only then
 `restic-station run-set --set <uuid> --kind backup`. Say beforehand that it
-also copies to mirrors and applies retention.
+also copies to mirrors and applies retention. The dry run does not bind
+`run-set`: if the configuration may have changed since, dry-run and ask again.
 
 **Clean up old backups.** `restic-station retention preview --set <uuid> --json`
 for each destination. Summarize keep and remove counts. For a mirror, include
