@@ -309,9 +309,18 @@ public struct CapabilityDocument: Sendable, Encodable {
                 : .no(CLIFailure.bounded(ManualRetentionApplyAvailability.reason))
         )
 
+        // The default is the *document's* platform's, not the host's:
+        // `SecretBackend.resolve` falls back to the compiled-in default, which
+        // would describe a Linux helper as using the keychain whenever this
+        // is built for a platform other than the one running it (a test).
         let secretBackend: SecretBackendInfo
+        let override = environment[SecretBackend.environmentKey]?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         do {
-            secretBackend = SecretBackendInfo(kind: try SecretBackend.resolve(environment: environment).rawValue, reason: nil)
+            let backend: SecretBackend = override.isEmpty
+                ? (isMacOS ? .keychain : .file)
+                : try SecretBackend.resolve(environment: environment)
+            secretBackend = SecretBackendInfo(kind: backend.rawValue, reason: nil)
         } catch {
             secretBackend = SecretBackendInfo(
                 kind: nil,
