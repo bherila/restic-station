@@ -126,13 +126,13 @@ Two payload notes that are easy to get wrong:
   restic's policy groups (`host`, `tags`, `pathCount`, `paths`); each
   `keep` entry carries restic's `reasons` (`"last snapshot"`,
   `"daily snapshot"`, …) and each `remove` entry `reasons: []`.
-  `fingerprint` is `sha256:` over the set, destination, the effective
-  invocation (repository URL, non-secret and secret environment, restic
-  executable identity — secrets only inside the hash), policy and the exact
-  keep and remove ids — not the time — so two previews of an unchanged
-  repository match, and a credential change that could point the same URL
-  at a different store does not. The query runs with exactly the captured
-  environment and executable. For a mirror, `mirror` is
+  `fingerprint` is `sha256:` over the set, destination, configured
+  repository URL, policy and the exact keep and remove ids — not the time,
+  and never a secret — so two previews of an unchanged plan match. It
+  identifies a plan for comparison; **it is not authorization**. A future
+  retention apply (#82) binds to the executable, the resolved repository,
+  the addressing environment and a secret snapshot through an opaque,
+  single-use token kept helper-side, the way `purge preview` does. For a mirror, `mirror` is
   `{ lastSyncedAt, primaryLastSyncedAt, behindPrimary }` from repo-status
   and `warnings` says that a preview is not evidence the mirror is safe to
   prune (scheduled retention prunes a mirror only after that run's copy to

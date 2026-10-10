@@ -1266,28 +1266,8 @@ public final class BackupEngine: Sendable {
             throw RepositoryQueryError.notAPreview
         }
 
-        // The plan is bound to everything that decides which repository
-        // restic reads, not only its URL: a changed rclone config or
-        // credential can point the same URL at a different store holding
-        // the same snapshot ids. So the secret environment and the restic
-        // executable are captured once, the query runs with exactly those,
-        // and both are folded into the fingerprint through the destination
-        // binding `maintenance prune` already uses (Codex on #188).
-        let executableIdentity = restic.maintenanceExecutable()?.identity
-        let secretEnv: [String: String]
-        do {
-            secretEnv = try await restic.maintenanceSecretEnvironment(for: destination)
-        } catch {
-            throw readOnlyQueryError(error, destination: destination)
-        }
-        let invocation = ResticInvocation(
-            destination: destination,
-            destinationSecretEnv: secretEnv,
-            expectedExecutableIdentity: executableIdentity
-        )
-
         let previewedAt = now()
-        let outcome = try await readOnlyQuery(command, invocation: invocation)
+        let outcome = try await readOnlyQuery(command, invocation: ResticInvocation(destination: destination))
         let results: [ForgetResult]
         do {
             results = try parseForget(Self.jsonDocument(in: outcome.rawOutput))
@@ -1335,10 +1315,6 @@ public final class BackupEngine: Sendable {
             fingerprint: RetentionPreview.computeFingerprint(
                 setId: set.id,
                 destination: destination,
-                invocationBinding: destination.pruneConfirmationFingerprint(
-                    secretEnv: secretEnv,
-                    executableIdentity: executableIdentity
-                ),
                 policy: policy,
                 keepIDs: groups.flatMap { $0.keep.map(\.snapshot.id) },
                 removeIDs: groups.flatMap { $0.remove.map(\.id) }

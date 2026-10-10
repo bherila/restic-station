@@ -70,13 +70,19 @@ public struct RetentionPreview: Sendable, Equatable {
     public let groups: [Group]
     /// `nil` for the primary.
     public let mirrorSync: MirrorSync?
-    /// `sha256:<hex>` over the plan's inputs and result — set, destination,
-    /// the effective invocation (repository URL, non-secret and secret
-    /// environment, restic executable identity, through
-    /// `Destination.pruneConfirmationFingerprint`), policy and the exact
-    /// keep and remove ids — and nothing time-dependent, so two previews of
-    /// an unchanged repository agree. The binding the token-gated apply
-    /// (#82) would check. Secrets reach it only inside the hash.
+    /// `sha256:<hex>` identifying the plan: set, destination, configured
+    /// repository URL, policy and the exact keep and remove ids, and nothing
+    /// time-dependent, so two previews of an unchanged plan match.
+    ///
+    /// **An identity for comparing previews, not authorization.** It is
+    /// published, so it is built only from values the preview already shows
+    /// and never from a secret: hashing the secret environment into it (as
+    /// one revision of #188 did) would hand anyone holding a preview an
+    /// offline check for guessed credentials. Binding a destructive apply to
+    /// what was previewed (#82) needs the executable, the resolved
+    /// repository, the addressing environment and a secret snapshot, and
+    /// belongs in an opaque single-use token kept helper-side, the way
+    /// `purge preview` mints one, never in a published digest.
     public let fingerprint: String
 
     public var keepCount: Int { groups.reduce(0) { $0 + $1.keep.count } }
@@ -88,7 +94,6 @@ public struct RetentionPreview: Sendable, Equatable {
     static func computeFingerprint(
         setId: UUID,
         destination: Destination,
-        invocationBinding: String,
         policy: RetentionPolicy,
         keepIDs: [String],
         removeIDs: [String]
@@ -99,7 +104,6 @@ public struct RetentionPreview: Sendable, Equatable {
             "set=\(setId.uuidString)",
             "destination=\(destination.id.uuidString)",
             "repository=\(destination.repoURL)",
-            "invocation=\(invocationBinding)",
             "policy=last:\(value(policy.keepLast)),hourly:\(value(policy.keepHourly)),"
                 + "daily:\(value(policy.keepDaily)),weekly:\(value(policy.keepWeekly)),"
                 + "monthly:\(value(policy.keepMonthly)),yearly:\(value(policy.keepYearly))",
