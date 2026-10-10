@@ -598,6 +598,11 @@ private func installMachine(at paths: AppPaths, resticPath: String? = nil) throw
         #expect(inspection.config.resticPath == "/opt/homebrew/bin/restic")
         let warning = try #require(inspection.pendingMigrationWarning)
         #expect(warning.contains("schema v1") && warning.contains("v\(AppConfig.currentVersion)"))
+        // Every kind of trigger, including the repository commands that are
+        // not backups (Codex on #193).
+        for trigger in ["backups", "restore", "unlock", "purge apply", "configuration", "scheduled run"] {
+            #expect(warning.contains(trigger), "the warning does not name \(trigger) as a trigger")
+        }
         #expect(try store.load(.inspecting) == inspection.config)
         #expect(try dataDirectoryContents(paths) == before)
 

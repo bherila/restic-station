@@ -957,14 +957,18 @@ public struct ConfigInspection: Sendable {
     }
 
     /// What `config validate` and `status` say about a pending migration, or
-    /// `nil` when there is none.
+    /// `nil` when there is none. It names every kind of trigger, not just
+    /// backups and configuration changes: `restore` and `unlock` migrate too,
+    /// and an operator who believed otherwise could upgrade a shared config
+    /// by accident.
     public var pendingMigrationWarning: String? {
         guard migrationPending, let from = onDiskVersion else { return nil }
         let to = AppConfig.currentVersion
         return "config.json is schema v\(from). It was read as v\(to) and not rewritten. "
-            + "The next backup or configuration change on this machine upgrades the file to v\(to), "
-            + "and every machine that shares it must then run a Restic Station that reads v\(to), "
-            + "or backups stop there."
+            + "Any command above localStateWrite in `capabilities` (backups, restore, unlock, "
+            + "purge apply, configuration and secret changes), and the next scheduled run, upgrades "
+            + "the file to v\(to). Every machine that shares it must then run a Restic Station that "
+            + "reads v\(to), or backups stop there."
     }
 }
 
