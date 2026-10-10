@@ -1147,7 +1147,8 @@ public final class BackupEngine: Sendable {
     }
 
     /// Whether restic's `summary` line carries `"dry_run": true`, which
-    /// restic 0.18 and later write only for `backup --dry-run`.
+    /// restic writes only for `backup --dry-run` — every release from 0.17.0,
+    /// the supported minimum.
     ///
     /// Read from the raw transcript because ``BackupSummary`` is persisted
     /// into run records and has no business growing a field only this
