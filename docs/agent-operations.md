@@ -57,7 +57,9 @@ newer commands.
    `effective` object is the whole resolved configuration, with source paths,
    exclusions and repository URLs. For a health or schedule question, keep
    only what you need, for example
-   `restic-station config validate --json | jq '.data | {errors, warnings, nothingRunsHere}'`,
+   `restic-station config validate --json | jq 'if .ok then {ok, data: (.data | {errors, warnings, nothingRunsHere})} else . end'`
+   (an `ok: false` envelope passes through whole, so its `error.code` is
+   still there to branch on),
    and show `effective` only when the user asks about the configuration
    itself.
 3. `restic-station status --json`: health, last runs, destinations, scheduler.
