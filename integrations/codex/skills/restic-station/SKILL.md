@@ -24,7 +24,12 @@ this skill: use only `status --json` and `config validate --json`. Add `--json` 
   lists each command's class. Get the user's explicit go-ahead before anything
   at `configurationWrite`, `repositoryWrite` or `destructive`.
 - Read `capabilities.features` before relying on a feature. If it says
-  `available: false`, tell the user its `reason` and stop.
+  `available: false`, tell the user its `reason` and stop. The one exception
+  is restic itself: `capabilities` never reads configuration, so it searches
+  only the standard locations and `PATH` and cannot see a `resticPath`
+  configured on this host. When it reports restic (or `backupDryRun`,
+  `excludeCloudFiles`) unavailable, let the real command decide. Report a
+  `restic_not_found` or `restic_unsupported` error if one comes back.
 
 ## Never
 

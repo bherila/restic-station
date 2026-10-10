@@ -160,6 +160,12 @@ plan the user saw.
 ## When something is unsupported
 
 Read `capabilities --json` instead of guessing. A feature that is
-`available: false` has a `reason`; tell the user and stop. Never invent a
+`available: false` has a `reason`; tell the user and stop. Restic is the
+exception: `capabilities` reads no configuration, so its restic search
+covers only the standard locations and `PATH` and cannot see a `resticPath`
+configured on the host. Commands that load configuration use that path.
+When `capabilities` says restic (or a feature that needs it) is
+unavailable, let the command itself answer, and report `restic_not_found` or
+`restic_unsupported` if that is what comes back. Never invent a
 flag, call a command the document lists as unavailable on this platform
 (`timer …` on macOS), or fall back to raw restic.
