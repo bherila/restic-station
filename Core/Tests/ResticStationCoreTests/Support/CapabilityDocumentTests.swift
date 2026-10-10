@@ -124,6 +124,12 @@ import Testing
         #expect(document.secretBackend.reason != nil)
         let file = Self.document(.macOS, environment: [SecretBackend.environmentKey: "file"])
         #expect(file.secretBackend.kind == "file")
+        // A real backend name the Linux helper refuses (Codex on #189).
+        let keychainOnLinux = Self.document(.linux, environment: [SecretBackend.environmentKey: "keychain"])
+        #expect(keychainOnLinux.secretBackend.kind == nil)
+        #expect(keychainOnLinux.secretBackend.reason != nil)
+        let keychainOnMac = Self.document(.macOS, environment: [SecretBackend.environmentKey: "keychain"])
+        #expect(keychainOnMac.secretBackend.kind == "keychain")
     }
 
     @Test("no path, version text or override value leaks into the document")

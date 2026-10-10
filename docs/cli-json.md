@@ -192,7 +192,8 @@ not read, because reading it would mean loading configuration).
   too old, or found but unusable.
 - **`secretBackend.kind`** is `keychain` or `file` as
   `RESTIC_STATION_SECRET_BACKEND` selects it, or `null` with a `reason` when
-  the variable names neither; nothing is read from the store.
+  the variable names neither or selects the keychain on Linux, which the
+  helper refuses there; nothing is read from the store.
 - **`commands`** is every command in the binary except the hidden
   `print-password`, from `CommandRegistry`. A command built only for the
   other platform (`timer …` on macOS) is listed with `available: false`.

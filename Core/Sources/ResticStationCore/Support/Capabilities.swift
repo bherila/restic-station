@@ -320,7 +320,17 @@ public struct CapabilityDocument: Sendable, Encodable {
             let backend: SecretBackend = override.isEmpty
                 ? (isMacOS ? .keychain : .file)
                 : try SecretBackend.resolve(environment: environment)
-            secretBackend = SecretBackendInfo(kind: backend.rawValue, reason: nil)
+            if backend == .keychain && !isMacOS {
+                // A valid name, but `SecretStoreFactory` refuses it off macOS:
+                // there is no `/usr/bin/security` (`keychain-and-fda.md`
+                // §Troubleshooting).
+                secretBackend = SecretBackendInfo(
+                    kind: nil,
+                    reason: "\(SecretBackend.environmentKey) selects the keychain, which exists only on macOS"
+                )
+            } else {
+                secretBackend = SecretBackendInfo(kind: backend.rawValue, reason: nil)
+            }
         } catch {
             secretBackend = SecretBackendInfo(
                 kind: nil,
