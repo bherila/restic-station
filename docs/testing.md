@@ -204,6 +204,19 @@ Real restic (from PATH; CI: `brew install restic` on macOS, and the **official 0
 
 `docs/cli-json.md` is normative for automated callers, so it is executable: the contract script extracts the doc's §Command matrix and §Codes tables and reconciles them — both directions — against its own contract tables and the built helper's `--help` output *before* running a single assertion, so editing the doc without the script (or the reverse, or adding a subcommand without a matrix row) fails CI as **drift**, not as a later review finding (the motivating failure: #122 shipped an integration test still asserting the old documented behavior of a changed command). Every `live` row is then asserted against the real binary — envelope shape, `error.code`, `retryable`, exit code, refusal behavior — using a mode-file-driven fake restic so every restic exit class is reachable deterministically on hosts with no restic at all; a final reconciliation pass fails if any table row went unasserted or any assertion has no row. Codes with no shell-reachable producer are classed `unit:<why>` and pinned by the Layer-1 envelope tests instead. Runs on both platforms (file secret backend, like the other Layer-2 scripts) and ends with a secret-leak sweep over every byte the helper produced. Takes the helper path as its optional argument, like `headless-cli-test.sh`.
 
+### Agent skill lint (`scripts/agent-skill-lint.sh`)
+
+The Codex skill (`integrations/codex/`), the agent guide (`docs/agent-operations.md`) and the prompt fixtures in `integrations/codex/evals/fixtures.json` are checked against the built helper's own `capabilities --json` (#84):
+- the skill's frontmatter and sections are present;
+- every `restic-station …` command they name exists;
+- each fixture's steps resolve, and nothing above `localStateWrite` runs before an `ask-user` step;
+- each fixture respects its `maxSafetyClass` and contains none of its forbidden strings;
+- a restore always names `--target` and passes `--overwrite never`;
+- links resolve;
+- only declared synthetic UUIDs and `/Users/example` / `/home/example` paths appear.
+
+It runs in the `linux` job after the CLI contract script. There is no LLM in the loop: the fixtures pin what a correct sequence *is*, not what a model produced.
+
 ### Negative assertions
 
 A "nothing happened" claim is proved with a filter-free check — a run count that must not change at all, a directory listing that must gain no entry of any kind, an index grep for records of **any** status — never with a success-only filter. A `status == "success"`-shaped filter passes even when a differently-shaped record was written, which is exactly the forbidden outcome (#122, #124 review findings). Layer-2 scripts state the convention in their headers; new assertions follow it.
