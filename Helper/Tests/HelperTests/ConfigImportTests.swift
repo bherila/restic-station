@@ -225,3 +225,34 @@ struct ConfigImportTests {
         #expect(!FileManager.default.fileExists(atPath: paths.root.path))
     }
 }
+
+/// `config export` reads an older file without migrating it (#191), so the
+/// export itself must not carry what a migration would have moved.
+@Suite("config export of an older schema")
+struct ConfigExportTests {
+
+    private func config(version: Int, resticPath: String?) -> AppConfig {
+        var config = AppConfig()
+        config.version = version
+        config.resticPath = resticPath
+        return config
+    }
+
+    @Test func anOlderFileIsExportedWithoutItsHostLocalResticPath() {
+        let older = ConfigStore.previewMigration(config(version: 1, resticPath: "/opt/homebrew/bin/restic"))
+        let exported = ConfigExport.exportable(ConfigInspection(config: older, onDiskVersion: 1))
+
+        #expect(exported.version == AppConfig.currentVersion)
+        #expect(exported.resticPath == nil)
+    }
+
+    /// A current file exports exactly as it reads, as before #191.
+    @Test func aCurrentFileIsExportedUnchanged() {
+        let current = config(version: AppConfig.currentVersion, resticPath: "/usr/local/bin/restic")
+        let exported = ConfigExport.exportable(
+            ConfigInspection(config: current, onDiskVersion: AppConfig.currentVersion)
+        )
+
+        #expect(exported == current)
+    }
+}

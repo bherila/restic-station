@@ -46,9 +46,8 @@ struct ConfigCLIContext {
     /// error). Still exit 1; `docs/cli-json.md` covers the envelope a
     /// `--json` caller sees instead of the bare sentence.
     ///
-    /// Inspecting (#191): every caller (`config show`, `config export`) is
-    /// `readOnly` or `localStateWrite`, so an older schema is converted in
-    /// memory and the file is left as it is.
+    /// Inspecting (#191): its caller, `config show`, is `readOnly`, so an
+    /// older schema is converted in memory and the file is left as it is.
     func loadConfig() throws -> AppConfig {
         do {
             return try configStore.load(.inspecting)
@@ -110,9 +109,30 @@ struct ConfigExport: AsyncParsableCommand {
     @Option(name: .long, help: "Write to this path instead of stdout.")
     var out: String?
 
+    /// What an export of `inspection` writes. An older file is exported at
+    /// the current schema, so the importing host will not migrate it, and
+    /// the one value a real migration moves has to be dealt with here:
+    /// the deprecated top-level `resticPath` is host-local and is cleared,
+    /// as the migrating export did before #191. Left in, it would become a
+    /// shared fallback naming this host's binary on every importer (Codex
+    /// on #193).
+    static func exportable(_ inspection: ConfigInspection) -> AppConfig {
+        var config = inspection.config
+        if inspection.migrationPending {
+            config.resticPath = nil
+        }
+        return config
+    }
+
     func run() async throws {
         let context = ConfigCLIContext.make()
-        let config = try context.loadConfig()
+        let inspection: ConfigInspection
+        do {
+            inspection = try context.configStore.inspect()
+        } catch {
+            throw CLIFailure.configInvalid(underlying: error)
+        }
+        let config = Self.exportable(inspection)
 
         let data: Data
         do {
