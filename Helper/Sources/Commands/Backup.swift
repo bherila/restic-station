@@ -162,7 +162,7 @@ struct BackupDryRunCommand: AsyncParsableCommand, JSONRenderable {
         func count(_ value: Int?) -> String { value.map(String.init) ?? "?" }
         func bytes(_ value: Int?) -> String { value.map(Self.byteCount) ?? "?" }
         var lines = [
-            "dry run of \"\(report.setName)\" to \"\(report.primary.label)\" — nothing was written",
+            "dry run of \"\(report.setName)\" to \"\(report.primary.label)\" — no snapshot was saved",
             "  files: \(count(summary.filesNew)) new, \(count(summary.filesChanged)) changed, "
                 + "\(count(summary.filesUnmodified)) unmodified",
             "  processed: \(count(summary.totalFilesProcessed)) files, \(bytes(summary.totalBytesProcessed))",

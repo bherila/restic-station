@@ -50,11 +50,11 @@ struct BackupDryRunOutputTests {
         #expect(!text.contains("global excludes"), "log notes are for humans only")
     }
 
-    @Test("human: says nothing was written, prints the figures, the notes and each warning")
+    @Test("human: says no snapshot was saved, prints the figures, the notes and each warning")
     func humanLines() throws {
         let lines = BackupDryRunCommand.humanLines(try Self.report(warnings: ["some files were unreadable"]))
 
-        #expect(lines.first == "dry run of \"Projects\" to \"Primary\" — nothing was written")
+        #expect(lines.first == "dry run of \"Projects\" to \"Primary\" — no snapshot was saved")
         #expect(lines.contains("  files: 2 new, 1 changed, 5 unmodified"))
         #expect(lines.contains("  processed: 8 files, 3.0 MiB"))
         #expect(lines.contains("  would add: 1.5 KiB (? packed)"))
