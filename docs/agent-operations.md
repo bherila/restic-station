@@ -120,6 +120,13 @@ reading the files yourself.
 
 ## Purge (removing files from existing snapshots)
 
+A purge removes the patterns already configured as the set's
+`purgeExcludes`; it takes no pattern of its own. Check them first with
+`config show --json`. If the pattern the user asked for is not there, adding
+it is a configuration change (the app, or an edited `config.json` through
+`config import`) that needs its own authorization, and a list holding other
+patterns would remove those too: show all of them.
+
 `purge preview --set <uuid> --json` lists what a purge would rewrite and
 returns a short-lived, single-use `previewToken`. Applying it is
 destructive: show the user the plan, get explicit authorization, then pass

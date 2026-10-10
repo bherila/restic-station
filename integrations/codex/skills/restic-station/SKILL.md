@@ -54,7 +54,11 @@ the "not evidence it is safe to prune" warning. Manual retention apply is
 unavailable (`capabilities.features.manualRetentionApply`): scheduled backups
 apply the policy. Do not prune by any other route.
 
-**Remove files from old snapshots.** `restic-station purge preview --set <uuid> --json`,
+**Remove files from old snapshots.** Purge applies only the set's configured
+`purgeExcludes`. Check them with `restic-station config show --json`. If the
+requested pattern is missing, say that adding it is a configuration change
+needing its own authorization, and show every configured pattern the purge
+would apply. Then `restic-station purge preview --set <uuid> --json`,
 show the plan, get explicit authorization, then pipe that exact `previewToken`
 to `restic-station purge apply --set <uuid> --preview-token-stdin --json`.
 Never put the token in argv. On `preview_expired` or `operation_not_allowed`,
