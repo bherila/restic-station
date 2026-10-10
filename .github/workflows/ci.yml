@@ -71,6 +71,10 @@ jobs:
       # it can become a review finding. Fake restic, so no restic needed.
       - name: CLI JSON contract (docs/cli-json.md is executable)
         run: scripts/cli-contract-test.sh
+      # #84: the Codex skill, the agent guide and their prompt fixtures,
+      # checked against this build's own `capabilities --json`.
+      - name: Agent skill lint
+        run: scripts/agent-skill-lint.sh
 
       # T25 acceptance criteria that only a real Linux run can show.
       - name: fda-check is a no-op on Linux

@@ -78,6 +78,8 @@ restic-station retention preview --set <uuid>  # what the retention policy would
 restic-station capabilities --json    # every command, its safety class, and what works here
 ```
 
+**Agents.** Codex, Claude Code and other shell agents can drive the same CLI: [`docs/agent-operations.md`](docs/agent-operations.md) says what to call, in what order, and what never to do (no raw restic, no secrets, preview before anything destructive), and `capabilities --json` lists every command with its safety class. An optional Codex skill that follows that guide is in [`integrations/codex/`](integrations/codex/README.md); it is installed by hand with one symlink, and no MCP server is involved.
+
 Run `restic-station --help` for the full subcommand list (`config`, `excludes`, `status`, `sets`, `runs`, `secret`, `cli`, and the mutating commands `tick`/`run-set`/`restore`/… that the app and the background agent use themselves). Out of scope for now: a Homebrew formula, man pages, and shell completions (ArgumentParser can generate the last one cheaply — see the open follow-up issue if you want to pick it up).
 
 ## Building from source
