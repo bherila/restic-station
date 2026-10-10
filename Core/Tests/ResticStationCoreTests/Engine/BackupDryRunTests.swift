@@ -78,16 +78,39 @@ import Testing
     /// tested as the observable fact rather than as the refactor: two engines
     /// over the same set, every kind of exclusion, and the dry run's argv is
     /// the real one with `--dry-run` and nothing else changed.
-    @Test("the dry run's argv is the real backup's argv plus --dry-run, for every exclusion source")
-    func sharesTheRealBackupsConstruction() async throws {
+    ///
+    /// Run twice: once plain, and once with a `CACHEDIR.TAG` above the
+    /// source, where both must hold `--exclude-caches` back. Without the
+    /// second case a dry run that skipped the tag check passed (review
+    /// finding on #185).
+    @Test(
+        "the dry run's argv is the real backup's argv plus --dry-run, for every exclusion source",
+        arguments: [false, true]
+    )
+    func sharesTheRealBackupsConstruction(taggedAboveSource: Bool) async throws {
         let plan = GlobalExcludePlan(
             patterns: ["node_modules", "Library/Caches"],
             excludeCaches: true,
             excludeLargerThan: "10G"
         )
+        let tree = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restic-station-dry-run-cachedir-\(UUID().uuidString)", isDirectory: true)
+            .resolvingSymlinksInPath()
+        defer { try? FileManager.default.removeItem(at: tree) }
+        let source: String
+        if taggedAboveSource {
+            let project = tree.appendingPathComponent("cache/project")
+            try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+            try Data("Signature: 8a477f597d28d172789f06886806bc55\n".utf8)
+                .write(to: tree.appendingPathComponent("cache/CACHEDIR.TAG"))
+            source = project.path
+        } else {
+            source = T.source
+        }
         func env() -> T.Env {
             T.makeEnv(
                 script: [],
+                sources: [source],
                 retention: nil,
                 excludes: ["*.log"],
                 purgeExcludes: ["secrets/"],
@@ -114,7 +137,8 @@ import Testing
 
         #expect(dry.resticArgvs == [expected])
         #expect(realBackup.contains("--iexclude") && realBackup.contains("secrets/"), "fixture exercises every list")
-        #expect(report.excludeCaches)
+        #expect(realBackup.contains("--exclude-caches") == !taggedAboveSource)
+        #expect(report.excludeCaches == !taggedAboveSource)
         #expect(report.excludePatternCount == 4)
     }
 
