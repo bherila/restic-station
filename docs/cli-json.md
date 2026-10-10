@@ -45,6 +45,7 @@ itself, unwrapped, because its output is meant to be fed straight back into
 | Command | `--json` | Payload (`data`) |
 |---|---|---|
 | `version` | ✅ | `{ name, version, platform, configSchemaVersion }` — the last is the newest `config.json` schema this binary reads and writes |
+| `capabilities` | ✅ | `{ capabilitiesVersion, application, platform, configSchema, restic, features, scheduler, secretBackend, safetyClasses, commands }` — see §`capabilities` below |
 | `status` | ✅ | `StatusReport` — see `data-model.md` §`status --json` |
 | `sets list` | ✅ | array of set entries — `data-model.md` §`sets list --json` |
 | `runs list` | ✅ | array of `RunIndexEntry` |
@@ -143,6 +144,90 @@ Two payload notes that are easy to get wrong:
   `false` and `granted` is `null`. A caller must check `applicable` before
   reading `granted`, exactly as an absent `state/fda-check.json` means
   *unknown* rather than *denied*.
+
+## `capabilities`
+
+`capabilities --json` (#83) is what an agent calls first. Like `version`, it
+never loads configuration and creates nothing: it works with no data
+directory, with an unreadable `config.json`, from any working directory, and
+it reads no secret, probes no repository and touches no scheduler. The one
+process it starts is restic discovery's `restic version` over the
+well-known locations and `PATH` (a `resticPath` configured on the host is
+not read, because reading it would mean loading configuration).
+
+```json
+{
+  "capabilitiesVersion": 1,
+  "application": { "name": "restic-station-helper", "version": "0.1.3" },
+  "platform": "macOS",
+  "configSchema": { "current": 5 },
+  "restic": { "available": true, "version": "0.19.1", "minimumVersion": "0.17.0", "reason": null },
+  "features": {
+    "backupDryRun": { "available": true, "reason": null },
+    "excludeCloudFiles": { "available": true, "reason": null },
+    "onlineOnlyFilesRefusedAtKernel": { "available": true, "reason": null },
+    "cloudRepositoryDatalessPreflight": { "available": true, "reason": null },
+    "purgeRequiresPreviewToken": { "available": true, "reason": null },
+    "manualRetentionApply": { "available": false, "reason": "…" }
+  },
+  "scheduler": { "kind": "launchd", "managedBy": "app" },
+  "secretBackend": { "kind": "keychain", "reason": null },
+  "safetyClasses": ["readOnly", "localStateWrite", "configurationWrite", "repositoryWrite", "destructive"],
+  "commands": [
+    { "name": "snapshots list", "json": true, "safetyClass": "localStateWrite", "available": true, "reason": null }
+  ]
+}
+```
+
+- **`capabilitiesVersion`** is bumped only for a breaking change to this
+  shape. A new feature key, command or safety class is additive; callers
+  ignore what they do not know.
+- **Features describe behaviour, not versions.** Each is `{ available,
+  reason }`, from a table in code (`CapabilityDocument.build`):
+  `excludeCloudFiles` needs macOS and restic 0.19+ (restic on Linux rejects
+  the flag, #186); the two online-only protections exist only on macOS;
+  `manualRetentionApply` is `false` while #82/#111 keep it contained.
+- **`restic.version`** is reduced to a dotted triple, like `versionFound`
+  (§Redaction). `restic.available: false` comes with a `reason`: none found,
+  too old, or found but unusable.
+- **`secretBackend.kind`** is `keychain` or `file` as
+  `RESTIC_STATION_SECRET_BACKEND` selects it, or `null` with a `reason` when
+  the variable names neither or selects the keychain on Linux, which the
+  helper refuses there; nothing is read from the store.
+- **`commands`** is every command in the binary except the hidden
+  `print-password`, from `CommandRegistry`. A command built only for the
+  other platform (`timer …` on macOS) is listed with `available: false`.
+  The helper's tests fail if a command is registered without an entry, so
+  this list cannot fall behind `--help`.
+
+**Safety classes are description, not authorization.** Locks, preview
+tokens, config validation and secret boundaries stay authoritative. A
+command's class is its own effect; the start-up every configuration-reading
+command shares (creating `machine.json`, migrating `config.json`) is not
+counted.
+
+| Class | Means | Commands |
+|---|---|---|
+| `readOnly` | Changes nothing. | `version`, `capabilities`, `status`, `sets list`, `runs list`/`show`, `config show`/`validate`, `excludes show`, `secret list`, `cli status`, `timer status` |
+| `localStateWrite` | Writes local files only: observations or bookkeeping, or an output file the caller named. Never configuration, secrets or a repository. | `probe-repo` (repo-status), `fda-check`, `purge preview` (mints a token), `config acknowledge-migration`, `config export` (`--out` writes the named file), and the repository previews `backup dry-run`, `snapshots list`, `retention preview`: no repository changes, but their secret pre-flight creates, updates or clears `secret-attention-<destId>.json` |
+| `configurationWrite` | Changes configuration, stored secrets, the exclusion list, or host integration. | `config import`/`upgrade`, `secret set`/`set-env`/`rm`, `excludes enable`/`disable`/`add`/`remove`/`set`/`reset`, `cli install`/`uninstall`, `timer install`/`uninstall` |
+| `repositoryWrite` | Writes to a repository or restores from one. | `init-secondary`, `restore`, `unlock` |
+| `destructive` | Can remove repository data. | `tick`, `run-set` (scheduled retention runs inside a backup), `purge apply`, `maintenance prune` |
+
+#83 proposed four classes; `configurationWrite` is the fifth, split from
+`localStateWrite` because `secret rm` or `config import` changes every later
+backup and must not read as "updates a cache".
+
+### Agent bootstrap
+
+1. `capabilities --json` — what this helper can do here.
+2. `config validate --json` — whether the configuration loads, and what runs
+   on this machine.
+3. `status --json` — health, schedule and destinations.
+4. Then the read or guarded write the task needs, lowest class first: the
+   repository previews (`backup dry-run`, `snapshots list`,
+   `retention preview`) change no repository and only keep attention
+   bookkeeping true, so prefer them before anything above `localStateWrite`.
 
 ## The error branch
 
@@ -316,7 +401,7 @@ code alone.
 
 ## Coverage today
 
-Seventeen commands, listed in the matrix above. The mutating commands remain
+Eighteen commands, listed in the matrix above. The mutating commands remain
 human-only and still write prose to stderr — the boundary is stated in the
 matrix rather than papered over. `purge apply` and `maintenance prune` are the
 exception: they mutate, and they carry `--json` because the app drives them.

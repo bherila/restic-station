@@ -48,6 +48,7 @@ import Testing
             "cli",
             "print-password",
             "timer",
+            "capabilities",
             "version",
         ]
     )
@@ -74,6 +75,7 @@ import Testing
             "runs",
             "cli",
             "print-password",
+            "capabilities",
             "version",
         ]
     )

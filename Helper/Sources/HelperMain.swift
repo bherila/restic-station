@@ -93,7 +93,7 @@ struct HelperMain: AsyncParsableCommand {
         CommandConfiguration(
             commandName: resolvedCommandName(),
             abstract: "Restic Station background helper. "
-                + "Exit codes (per-subcommand, see each --help): 0 ok, 1 error, 2 busy, 3 offline (probe-repo, purge preview, backup dry-run, snapshots list, retention preview).",
+                + "Exit codes (per-subcommand, see each --help): 0 ok, 1 error, 2 busy, 3 offline (probe-repo, purge preview, backup dry-run, snapshots list, retention preview). `capabilities --json` lists every command.",
             subcommands: subcommandList
         )
     }
@@ -182,6 +182,8 @@ struct HelperMain: AsyncParsableCommand {
         #if os(Linux)
         subcommands.append(TimerCommand.self)
         #endif
+        // #83: what this helper can do, with no configuration needed.
+        subcommands.append(Capabilities.self)
         subcommands.append(Version.self)
         return subcommands
     }
