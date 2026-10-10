@@ -75,9 +75,13 @@ snapshot, confirm what to restore, then restore into a new, empty directory
 with `--overwrite never` unless the user explicitly asks to overwrite.
 Report a partial restore separately from a complete one.
 
-**Online-only files.** Files missing from a snapshot of an iCloud or File
-Provider folder were online-only and were deliberately not downloaded (macOS,
-`features.excludeCloudFiles`). `cloud_repository_not_hydrated` means the
+**Online-only files.** If files are missing from a snapshot of an iCloud or
+File Provider folder, one *possible* reason is that they were online-only and
+were deliberately not downloaded (macOS, `features.excludeCloudFiles`).
+Present it as a possibility, alongside the others: the set's exclusions, the
+global exclusion list, a `CACHEDIR.TAG`, an unreadable-file warning, or a
+change since that snapshot. The dry run reports totals, not which file
+matched what. `cloud_repository_not_hydrated` means the
 repository folder itself must be made available offline in the cloud
 provider; the user does that, not you.
 

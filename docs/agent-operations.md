@@ -94,8 +94,11 @@ On macOS, sources under iCloud Drive or a File Provider folder can hold
 online-only files. Unless a set's `onlineOnlyFiles` is `"download"`, those
 files are skipped with `--exclude-cloud-files` (restic 0.19+), or reported as
 unreadable on an older restic. Either way they are **not** in the snapshot.
-That is deliberate: reading them would download them. Explain this when a
-user asks why such files are missing. Check
+That is deliberate: reading them would download them. When a user asks why
+files are missing, offer this as one *possible* reason, not a finding.
+Exclusion patterns, the global exclusion list, a `CACHEDIR.TAG`, unreadable
+files, or a change since the snapshot can look the same, and the dry run
+reports totals, not which file matched what. Check
 `capabilities.features.excludeCloudFiles` for this host; Linux has no
 online-only files and never uses the flag.
 
