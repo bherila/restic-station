@@ -19,6 +19,11 @@ this skill: use only `status --json` and `config validate --json`. Add `--json` 
 
 - Start with `restic-station capabilities --json`, then
   `restic-station config validate --json`, then `restic-station status --json`.
+- Every command except `version` and `capabilities` loads `config.json`, and
+  loading an older schema migrates the file in place. If the config is shared
+  with other machines, they then need an upgraded helper or they stop backing
+  up. Straight after a helper upgrade on such a host, ask before the first
+  config-loading command, even `config validate`.
 - Use only the set and destination UUIDs these return.
 - Pick the lowest safety class that answers the question. `capabilities`
   lists each command's class. Get the user's explicit go-ahead before anything

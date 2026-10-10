@@ -56,6 +56,16 @@ newer commands.
    its errors and warnings, and which sets run on this machine.
 3. `restic-station status --json`: health, last runs, destinations, scheduler.
 
+**Loading the configuration can rewrite it.** Every command except `version`
+and `capabilities` loads `config.json`. If the file was written by an older
+schema than `capabilities.configSchema.current`, loading it migrates it in
+place (keeping `config.v<N>.backup.json`). When `config.json` is shared,
+every other host must then run a helper that reads the new schema or it
+stops backing up (`data-model.md` §Versioning). So straight after a helper
+upgrade on a host that shares its configuration, tell the user and get
+their go-ahead before the first command that loads it, `config validate`
+included. Inspection is not exempt.
+
 Before any write, resolve what these report: configuration errors, a missing
 or unusable secret (`secret_not_configured`, `secret_store_unusable`), Full
 Disk Access on macOS (`fda-check --json`), an unhealthy scheduler, an offline
