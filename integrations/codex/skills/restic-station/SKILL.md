@@ -19,6 +19,9 @@ this skill: use only `status --json` and `config validate --json`. Add `--json` 
 
 - Start with `restic-station capabilities --json`, then
   `restic-station config validate --json`, then `restic-station status --json`.
+  For a health or schedule question, run the validation through the
+  redaction filter, so the full configuration never reaches the transcript:
+  `restic-station config validate --json | jq 'if .ok then {ok, data: (.data | {errors, warnings, nothingRunsHere})} else . end'`.
 - Every command except `version` and `capabilities` loads `config.json`, and
   loading an older schema migrates the file in place. If the config is shared
   with other machines, they then need an upgraded helper or they stop backing
