@@ -954,7 +954,8 @@ public final class BackupEngine: Sendable {
     /// probe's result is not written to repo-status. What it shares with
     /// every other operation is the attention bookkeeping for problems that
     /// describe the destination rather than this run: the secret
-    /// pre-flight's `state/secret-attention-<destId>.json`, and — when a
+    /// pre-flight creates, updates or clears
+    /// `state/secret-attention-<destId>.json`, and — when a
     /// secret or online-only-repository refusal arrives only at restic's
     /// launch, after the probe passed — what ``postPreflightSecretError(_:)``
     /// records for it (#152, #180), which for an online-only repository is
