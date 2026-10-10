@@ -4,9 +4,9 @@ import Testing
 
 @testable import restic_station_helper
 
-/// #80: the set/destination selection `backup dry-run`, `snapshots list`
-/// and `retention preview` share, and the snapshot shape both new commands
-/// publish. The engine half is pinned by `RepositoryQueryTests`.
+/// #80: the set/destination selection behind `backup dry-run`,
+/// `snapshots list` and `retention preview`, and the snapshot shape the two
+/// new commands publish. The engine half is pinned by `RepositoryQueryTests`.
 @Suite("repository query commands")
 struct RepositoryQueryCommandTests {
     static let setId = UUID(uuidString: "6F9619FF-8B86-D011-B42D-00C04FC964FF")!
@@ -43,40 +43,37 @@ struct RepositoryQueryCommandTests {
         }
     }
 
-    @Test("a set switched off here is set_disabled_here; an unknown one set_not_found")
+    /// `backup dry-run` reads the scheduling view and refuses a set switched
+    /// off here; `snapshots list` and `retention preview` read the
+    /// addressable view and still reach it (`docs/data-model.md` §Two views,
+    /// Codex on #188).
+    @Test("scheduling view refuses a set switched off here; the addressable view still reaches it")
     func setSelection() throws {
         let config = Self.config()
         let disabled = Self.code { try RepositorySelection.set(Self.setId, scheduled: config.resolved(for: "laptop")) }
         #expect(disabled == .setDisabledHere)
         let unknown = Self.code { try RepositorySelection.set(Self.unknownId, scheduled: config.resolved(for: "studio")) }
         #expect(unknown == .setNotFound)
-        let set = try RepositorySelection.set(Self.setId, scheduled: config.resolved(for: "studio"))
-        #expect(set.id == Self.setId)
+
+        let addressed = try RepositorySelection.set(Self.setId, addressable: config.addressable(for: "laptop"))
+        #expect(addressed.id == Self.setId)
+        let unknownAddressed = Self.code {
+            try RepositorySelection.set(Self.unknownId, addressable: config.addressable(for: "laptop"))
+        }
+        #expect(unknownAddressed == .setNotFound)
     }
 
-    @Test("no --dest is the primary; a destination switched off here is destination_disabled_here")
+    @Test("no --dest is the primary; a destination switched off here is still addressable")
     func destinationSelection() throws {
         let config = Self.config()
-        let here = config.resolved(for: "mirror-box")
-        let set = try RepositorySelection.set(Self.setId, scheduled: here)
-        let addressable = config.addressable(for: "mirror-box")
+        let set = try RepositorySelection.set(Self.setId, addressable: config.addressable(for: "mirror-box"))
 
-        let primary = try RepositorySelection.destination(nil, of: set, addressable: addressable, machineId: "mirror-box")
+        let primary = try RepositorySelection.destination(nil, of: set)
         #expect(primary.id == Self.primaryId)
-        let disabled = Self.code {
-            try RepositorySelection.destination(Self.mirrorId, of: set, addressable: addressable, machineId: "mirror-box")
-        }
-        #expect(disabled == .destinationDisabledHere)
-        let unknown = Self.code {
-            try RepositorySelection.destination(Self.unknownId, of: set, addressable: addressable, machineId: "mirror-box")
-        }
-        #expect(unknown == .destinationNotFound)
-
-        let elsewhere = try RepositorySelection.set(Self.setId, scheduled: config.resolved(for: "studio"))
-        let mirror = try RepositorySelection.destination(
-            Self.mirrorId, of: elsewhere, addressable: config.addressable(for: "studio"), machineId: "studio"
-        )
+        let mirror = try RepositorySelection.destination(Self.mirrorId, of: set)
         #expect(mirror.id == Self.mirrorId)
+        let unknown = Self.code { try RepositorySelection.destination(Self.unknownId, of: set) }
+        #expect(unknown == .destinationNotFound)
     }
 
     static func snapshot() throws -> Snapshot {

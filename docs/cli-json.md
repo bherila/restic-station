@@ -106,9 +106,11 @@ Two payload notes that are easy to get wrong:
   by default.** Each snapshot carries `pathCount`, and `paths` is `null`
   unless the caller passed `--include-paths`: source paths can reveal
   private structure. Neither publishes a repository URL — `destination` is
-  `{ id, label, role }`, `role` being `primary` or `secondary`. `--dest`
-  defaults to the set's primary on this machine; a set or destination
-  switched off here is `set_disabled_here` / `destination_disabled_here`.
+  `{ id, label, role }`, `role` being `primary` or `secondary`. Both read
+  the **addressable** view (`data-model.md` §Two views), like `restore` and
+  `probe-repo`: overrides applied, nothing dropped, so a host that switched
+  a set or destination off can still inspect its repository. `--dest`
+  defaults to the set's primary.
 
   A snapshot is `{ id, shortId, time, hostname, username, tags, parent,
   pathCount, paths }`; `tags` is `[]` when there are none, `parent` is
@@ -166,9 +168,9 @@ never match on it. `details` is omitted entirely when empty.
 | `invalid_arguments` | no | 64 / 1 | Arguments missing, malformed, or out of range. See §Argument-parser failures for the two exit codes. |
 | `config_invalid` | no | 1 | A configuration file on this host will not load — `config.json` undecodable, failing `validate()`, or written by a newer build; `machine.json` unreadable; or `RESTIC_STATION_SECRET_BACKEND` naming a backend that does not exist. `message` names which. |
 | `set_not_found` | no | 1 | No backup set with that id. |
-| `set_disabled_here` | no | 1 | The set exists in the shared config but is switched off for this machine. Emitted by `backup dry-run`, `snapshots list` and `retention preview`. |
+| `set_disabled_here` | no | 1 | The set exists in the shared config but is switched off for this machine. Emitted by `backup dry-run`. |
 | `destination_not_found` | no | 1 | No such destination in that set. |
-| `destination_disabled_here` | no | 1 | The destination is switched off for this machine. Emitted by `snapshots list` and `retention preview` for a `--dest` switched off here. |
+| `destination_disabled_here` | no | 1 | The destination is switched off for this machine. |
 | `run_not_found` | no | 1 | No run record with that id. |
 | `set_busy` | **yes** | **2** | Another operation holds this set's lock. |
 | `repository_offline` | **yes** | **3** | The destination did not answer — an unplugged drive, a sleeping NAS. Expected, not a fault. |

@@ -104,9 +104,9 @@ ok()   { printf 'ok: %s\n' "$*"; }
 CODE_TABLE='invalid_arguments|no|64/1|live
 config_invalid|no|1|live
 set_not_found|no|1|live
-set_disabled_here|no|1|unit:emitted by backup dry-run, snapshots list and retention preview for a set switched off on this machine; this fixture has no machine override, so RepositoryQueryCommandTests pins it
+set_disabled_here|no|1|unit:emitted by backup dry-run for a set switched off on this machine; this fixture has no machine override, so RepositoryQueryCommandTests pins it
 destination_not_found|no|1|live
-destination_disabled_here|no|1|unit:emitted by snapshots list and retention preview for a destination switched off on this machine; this fixture has no machine override, so RepositoryQueryCommandTests pins it
+destination_disabled_here|no|1|unit:no command emits it — read-only repository commands use the addressable view, which drops nothing; only tests construct it
 run_not_found|no|1|live
 set_busy|yes|2|live
 repository_offline|yes|3|live

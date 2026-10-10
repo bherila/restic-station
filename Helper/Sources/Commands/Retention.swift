@@ -29,7 +29,7 @@ struct RetentionPreviewCommand: AsyncParsableCommand, JSONRenderable {
     @Option(name: .long, help: "The backup set's UUID.")
     var set: UUID
 
-    @Option(name: .long, help: "Destination UUID. Defaults to the set's primary on this machine.")
+    @Option(name: .long, help: "Destination UUID. Defaults to the set's primary.")
     var dest: UUID?
 
     @Flag(name: .long, help: "Include source paths. Left out by default: they can reveal private structure.")
@@ -186,10 +186,8 @@ struct RetentionPreviewCommand: AsyncParsableCommand, JSONRenderable {
 
     func run() async throws {
         let context = try await HelperContext.make()
-        let backupSet = try RepositorySelection.set(set, scheduled: context.scheduled)
-        let destination = try RepositorySelection.destination(
-            dest, of: backupSet, addressable: context.addressable, machineId: context.scheduled.machineId
-        )
+        let backupSet = try RepositorySelection.set(set, addressable: context.addressable)
+        let destination = try RepositorySelection.destination(dest, of: backupSet)
 
         let preview: RetentionPreview
         do {

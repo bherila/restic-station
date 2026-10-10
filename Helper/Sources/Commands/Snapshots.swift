@@ -4,14 +4,19 @@ import ResticStationCore
 
 // MARK: - Selection
 
-/// Which set and destination a read-only repository command acts on, as
-/// this machine resolves them (#80). Shared by `backup dry-run`,
-/// `snapshots list` and `retention preview`, so all three refuse a set or a
-/// destination switched off here with the same code rather than reporting
-/// it as missing.
+/// Which set and destination a read-only command acts on (#78, #80).
+///
+/// Two views, per `docs/data-model.md` §Two views. `backup dry-run` asks
+/// "what would this machine's backup do", so it reads the **scheduling**
+/// view and refuses a set switched off here. `snapshots list` and
+/// `retention preview` read repositories, so they use the **addressable**
+/// view, like `restore` and `probe-repo`: a host that disabled a set (a
+/// restore or mirror target) can still inspect every repository the shared
+/// config names. Both views apply the same overrides, so they agree on what
+/// a repository is.
 enum RepositorySelection {
-    /// The set from this machine's `scheduled` view: machine overrides
-    /// applied, a set switched off here refused.
+    /// The set from the scheduling view: machine overrides applied, a set
+    /// switched off here refused with `set_disabled_here`.
     static func set(_ id: UUID, scheduled: ResolvedConfig) throws -> BackupSet {
         if let backupSet = scheduled.set(id: id) {
             return backupSet
@@ -29,15 +34,16 @@ enum RepositorySelection {
         throw CLIFailure.setNotFound(setId: id)
     }
 
-    /// `id`, or the set's primary on this machine when `id` is nil. A
-    /// destination the shared config has but this machine switched off is
-    /// `destination_disabled_here`, not `destination_not_found`.
-    static func destination(
-        _ id: UUID?,
-        of backupSet: BackupSet,
-        addressable: ResolvedConfig,
-        machineId: String
-    ) throws -> Destination {
+    /// The set from the addressable view: overrides applied, nothing dropped.
+    static func set(_ id: UUID, addressable: ResolvedConfig) throws -> BackupSet {
+        guard let backupSet = addressable.set(id: id) else {
+            throw CLIFailure.setNotFound(setId: id)
+        }
+        return backupSet
+    }
+
+    /// `id`, or the set's primary when `id` is nil.
+    static func destination(_ id: UUID?, of backupSet: BackupSet) throws -> Destination {
         guard let id else {
             guard let primary = backupSet.destinations.first(where: { $0.isPrimary }) else {
                 throw CLIFailure(
@@ -48,13 +54,10 @@ enum RepositorySelection {
             }
             return primary
         }
-        if let destination = backupSet.destinations.first(where: { $0.id == id }) {
-            return destination
+        guard let destination = backupSet.destinations.first(where: { $0.id == id }) else {
+            throw CLIFailure.destinationNotFound(setId: backupSet.id, destinationId: id)
         }
-        if addressable.set(id: backupSet.id)?.destinations.contains(where: { $0.id == id }) == true {
-            throw CLIFailure.destinationDisabledHere(setId: backupSet.id, destinationId: id, machineId: machineId)
-        }
-        throw CLIFailure.destinationNotFound(setId: backupSet.id, destinationId: id)
+        return destination
     }
 }
 
@@ -156,7 +159,7 @@ struct SnapshotsList: AsyncParsableCommand, JSONRenderable {
     @Option(name: .long, help: "The backup set's UUID.")
     var set: UUID
 
-    @Option(name: .long, help: "Destination UUID. Defaults to the set's primary on this machine.")
+    @Option(name: .long, help: "Destination UUID. Defaults to the set's primary.")
     var dest: UUID?
 
     @Option(
@@ -197,10 +200,8 @@ struct SnapshotsList: AsyncParsableCommand, JSONRenderable {
             )
         }
         let context = try await HelperContext.make()
-        let backupSet = try RepositorySelection.set(set, scheduled: context.scheduled)
-        let destination = try RepositorySelection.destination(
-            dest, of: backupSet, addressable: context.addressable, machineId: context.scheduled.machineId
-        )
+        let backupSet = try RepositorySelection.set(set, addressable: context.addressable)
+        let destination = try RepositorySelection.destination(dest, of: backupSet)
 
         let listing: SnapshotListing
         do {
