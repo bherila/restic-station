@@ -127,6 +127,7 @@ operation_completed_audit_failed|no|1|unit:needs a destructive launch whose audi
 internal_error|no|1|live'
 
 CMD_TABLE='version|json|live
+capabilities|json|live
 status|json|live
 sets list|json|live
 runs list|json|live
@@ -780,7 +781,34 @@ jq -e --arg a "$A64" --arg b "$B64" '.data | .keepCount == 1 and .removeCount ==
     || fail "retention preview wrote a run record"
 fake_mode 0
 mark_cmd "retention preview"
-ok "all 16 asserted --json commands emit {schemaVersion, ok, data} with their documented payloads"
+
+# capabilities (#83): works with no data directory at all and with an
+# unreadable config, creates nothing (filter-free listing), and its command
+# inventory agrees with this script's own table, which the drift check has
+# already tied to docs/cli-json.md.
+EMPTY_DATA="$WORK/capabilities-empty"
+RESTIC_STATION_DATA_DIR="$EMPTY_DATA" run_helper_split capabilities --json
+expect_rc 0
+assert_success_envelope "capabilities --json (no data directory)"
+[[ ! -e "$EMPTY_DATA" ]] || fail "capabilities created $EMPTY_DATA: $(find "$EMPTY_DATA" | head)"
+[[ "$(jq -r '.data | keys | join(",")' "$OUT_FILE")" == "application,capabilitiesVersion,commands,configSchema,features,platform,restic,safetyClasses,scheduler,secretBackend" ]] \
+    || fail "capabilities --json payload keys drifted: $(jq -r '.data | keys | join(",")' "$OUT_FILE")"
+jq -e '.data.capabilitiesVersion == 1' "$OUT_FILE" >/dev/null || fail "capabilitiesVersion is not 1"
+while IFS='|' read -r cmd mode _; do
+    [[ -n "$cmd" && "$cmd" != "print-password" ]] || continue
+    got="$(jq -r --arg c "$cmd" '.data.commands[] | select(.name == $c) | .json' "$OUT_FILE")"
+    want=false; [[ "$mode" == "json" ]] && want=true
+    [[ "$got" == "$want" ]] || fail "capabilities says $cmd json=$got, the contract table says $mode"
+done <<< "$CMD_TABLE"
+[[ "$(jq -r '.data.commands | length' "$OUT_FILE")" == "$(printf '%s\n' "$CMD_TABLE" | grep -cv '^print-password|')" ]] \
+    || fail "capabilities lists a different number of commands than the contract table (less print-password)"
+BROKEN_BEFORE="$(find "$BROKEN" | sort)"
+RESTIC_STATION_DATA_DIR="$BROKEN" run_helper_split capabilities --json
+expect_rc 0
+assert_success_envelope "capabilities --json (unreadable config.json)"
+[[ "$(find "$BROKEN" | sort)" == "$BROKEN_BEFORE" ]] || fail "capabilities wrote into a data directory"
+mark_cmd "capabilities"
+ok "all 17 asserted --json commands emit {schemaVersion, ok, data} with their documented payloads"
 
 # The consumed-binding flow: the dry run's binding, fed through the
 # documented stdin selector, authorizes exactly one real prune.
