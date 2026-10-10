@@ -579,6 +579,106 @@ extension CLIFailure {
         classifyPurgeOperation(error, setId: setId)
     }
 
+    /// Error mapping for `backup dry-run` (#78). Enumerated with no
+    /// `default:`, so a new ``BackupDryRunError`` case has to be given a code
+    /// here rather than inheriting one.
+    ///
+    /// The exit codes follow from the codes: `set_busy` is 2 and
+    /// `repository_offline` is 3, the same as `run-set` and `purge preview`.
+    public static func classifyBackupDryRun(_ error: any Error, setId: UUID) -> CLIFailure {
+        guard let dryRunError = error as? BackupDryRunError else {
+            return classify(error)
+        }
+        switch dryRunError {
+        case .noPrimary:
+            return CLIFailure(
+                code: .configInvalid,
+                message: "This backup set has no primary destination.",
+                details: CLIErrorDetails(setId: setId)
+            )
+        case .busy:
+            return setBusy(setId: setId)
+        case .lockUnusable(let detail):
+            // Not `set_busy`, for the reason `classifyPurgeOperation` gives:
+            // waiting does not fix an unopenable lock directory (#110).
+            return CLIFailure(
+                code: .internalError,
+                message: bounded(
+                    "The backup-set lock could not be used: \(detail). "
+                        + "Check the permissions on the Restic Station data directory."
+                ),
+                details: CLIErrorDetails(setId: setId)
+            )
+        case .globalExcludesUnusable(let reason):
+            // The same refusal a real backup records, and the same repair:
+            // `excludes show` explains it, `excludes reset` replaces the file.
+            return CLIFailure(
+                code: .configInvalid,
+                message: bounded("A backup of this set would be refused: \(reason)"),
+                details: CLIErrorDetails(setId: setId)
+            )
+        case .attention(let attention, let destinationId, let message):
+            return CLIFailure(
+                code: attention.code,
+                message: bounded(message),
+                details: CLIErrorDetails(setId: setId, destinationId: destinationId)
+            )
+        case .secretUnavailable(let destinationId, let message):
+            return CLIFailure(
+                code: .secretUnavailable,
+                message: bounded(message),
+                details: CLIErrorDetails(setId: setId, destinationId: destinationId)
+            )
+        case .offline(let destinationId, let reason):
+            return CLIFailure(
+                code: .repositoryOffline,
+                message: bounded("The primary destination is offline: \(reason)"),
+                details: CLIErrorDetails(setId: setId, destinationId: destinationId)
+            )
+        case .probeFailed(let destinationId, let exitClass),
+             .resticFailed(let destinationId, let exitClass):
+            let failure = classify(exitClass: exitClass, setId: setId, destinationId: destinationId)
+            // The generic wording sends the caller to "the run log", which
+            // a dry run deliberately never writes. Keep the code, details
+            // and restic's own error text; say where the output went.
+            let message: String
+            switch exitClass {
+            case .fatal(let stderrSummary):
+                let trimmed = stderrSummary.trimmingCharacters(in: CharacterSet(charactersIn: ". \n"))
+                message = (trimmed.isEmpty ? "restic reported a fatal error" : trimmed)
+                    + ". A dry run keeps no run log, so this is all of restic's output that was kept."
+            case .other(let code):
+                message = "restic exited unexpectedly (code \(code)). "
+                    + "A dry run keeps no run log, so there is no further output to open."
+            case .success, .successUnverified, .warningIncompleteRead,
+                 .repoDoesNotExist, .repoLocked, .wrongPassword:
+                return failure
+            }
+            return CLIFailure(code: failure.code, message: bounded(message), details: failure.details)
+        case .resticDidNotRun(let destinationId, let runnerError):
+            let failure = classify(runnerError)
+            var details = failure.details
+            details.setId = setId
+            details.destinationId = destinationId
+            return CLIFailure(code: failure.code, message: failure.message, details: details)
+        case .notADryRun:
+            return CLIFailure(
+                code: .internalError,
+                message: "Refused: the command was about to run without --dry-run, which would be a real backup.",
+                details: CLIErrorDetails(setId: setId)
+            )
+        case .unconfirmed(let destinationId, let reason):
+            return CLIFailure(
+                code: .internalError,
+                message: bounded(
+                    "The dry run could not be confirmed: \(reason). "
+                        + "Check the repository's snapshots before relying on this result."
+                ),
+                details: CLIErrorDetails(setId: setId, destinationId: destinationId)
+            )
+        }
+    }
+
     public static func invalidArguments(_ message: String) -> CLIFailure {
         CLIFailure(code: .invalidArguments, message: bounded(message))
     }

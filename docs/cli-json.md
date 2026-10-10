@@ -55,6 +55,7 @@ itself, unwrapped, because its output is meant to be fed straight back into
 | `config upgrade` | ✅ | `{ fromVersion, toVersion, migrated, backupFile, message }` — migrates `config.json` to this binary's schema now; `migrated: false` (with `backupFile`/`message` `null`) when it was already current. A migration that could not be written is `internal_error` |
 | `config acknowledge-migration` | ✅ | `{ hadMigration, fromVersion, toVersion, acknowledgedAt }` — clears the warning `status` raises for this machine's last schema migration (`configMigration`); `hadMigration: false` and nulls when none was recorded |
 | `probe-repo` | ✅ | `{ setId, destinationId, label, outcome, reachable, reason }` |
+| `backup dry-run` | ✅ | `{ operation, setId, setName, primary, outcome, resticExitCode, cloudFilesExcluded, excludeCaches, excludePatternCount, summary, warnings }` — see §`backup dry-run` below |
 | `secret list` | ✅ | array of `{ destId, label, setName, hasPassword, secretEnvCount }` — only destinations that have something stored, the same set human mode prints |
 | `cli status` | ✅ | `CLIInstaller.Status` |
 | `fda-check` | ✅ | `{ applicable, granted, probedPath, checkedAt, context }` |
@@ -78,6 +79,27 @@ Two payload notes that are easy to get wrong:
   (`secret_not_configured` / `secret_store_unusable`, exit 1), because
   `ok: true` at exit 3 means "try later" and neither will ever succeed
   unattended.
+- **`backup dry-run` publishes no paths.** No source, file name or
+  repository URL, and no snapshot id: restic prints a `snapshot_id` for a
+  dry run too, for a snapshot it never saved. `outcome` is `success` or
+  `warning` (restic exit 3: some files could not be read, and the figures
+  leave them out). Every `summary` figure is restic's own, `null` when restic
+  left it out. A busy set is `set_busy` (exit 2), an offline primary
+  `repository_offline` (exit 3), and a dry run that restic did not confirm
+  (`"dry_run": true` on its summary) is `internal_error` — see
+  `restic-cli.md` §backup dry-run.
+
+  ```json
+  { "operation": "backup-dry-run", "setId": "…", "setName": "Projects",
+    "primary": { "id": "…", "label": "Primary" },
+    "outcome": "success", "resticExitCode": 0,
+    "cloudFilesExcluded": false, "excludeCaches": true, "excludePatternCount": 165,
+    "summary": { "filesNew": 2, "filesChanged": 0, "filesUnmodified": 0,
+                 "dirsNew": 8, "dirsChanged": 0, "dirsUnmodified": 0,
+                 "totalFilesProcessed": 2, "totalBytesProcessed": 8,
+                 "dataAdded": 4472, "dataAddedPacked": 3435 },
+    "warnings": [] }
+  ```
 - **`fda-check` has three states, not two.** Off macOS, `applicable` is
   `false` and `granted` is `null`. A caller must check `applicable` before
   reading `granted`, exactly as an absent `state/fda-check.json` means
@@ -119,7 +141,7 @@ never match on it. `details` is omitted entirely when empty.
 | `repository_offline` | **yes** | **3** | The destination did not answer — an unplugged drive, a sleeping NAS. Expected, not a fault. |
 | `repository_locked` | **yes** | 1 | restic exit 11: another restic process holds the repository lock. |
 | `repository_not_initialized` | no | 1 | restic exit 10: nothing is initialized at that location. |
-| `cloud_repository_not_hydrated` | no | 1 | A local repository inside a cloud-synced folder (`~/Library/Mobile Documents`, `~/Library/CloudStorage`) has an online-only entry, so restic was not started — reading it would download repository data implicitly. Detected from file metadata, never from restic's stderr: the local reachability probe reports it, so `probe-repo`, `maintenance prune` and `purge preview`/`purge apply` publish it before anything runs restic. `message` names the online-only entry. Make the repository folder available offline in the cloud provider, then retry. |
+| `cloud_repository_not_hydrated` | no | 1 | A local repository inside a cloud-synced folder (`~/Library/Mobile Documents`, `~/Library/CloudStorage`) has an online-only entry, so restic was not started — reading it would download repository data implicitly. Detected from file metadata, never from restic's stderr: the local reachability probe reports it, so `probe-repo`, `maintenance prune`, `backup dry-run` and `purge preview`/`purge apply` publish it before anything runs restic. `message` names the online-only entry. Make the repository folder available offline in the cloud provider, then retry. |
 | `secret_unavailable` | **yes** | 1 | The secret backend answered badly and may answer well later — a locked login keychain at a pre-login tick, a transient I/O error, a lock held by a stuck peer. Every remaining `errno` wrapper in the file backend is here, because no `errno` set is uniformly permanent. A structurally unusable `secrets.lock` is instead non-retryable `internal_error`. |
 | `secret_not_configured` | no | 1 | The backend answered "no such item": no password is stored for this destination. Run `secret set`. Also what `ResticRunner`'s pre-flight reports, so the distinction survives to the commands that actually run restic. |
 | `secret_store_unusable` | no | 1 | The store could not be consulted at all, and repeating the request cannot change that: a symlinked `secrets.json`, one that is group- or world-accessible, one owned outside the helper's trust boundary, contents that do not decode (the outer document or a stored secret-env blob, on either backend), a document written by a newer format version, a directory another user could replace entries in, or a filesystem that does not honour `chmod`. `message` carries the backend's own refusal, which names the exact `chmod`, `chown`, or move to perform. Reported by every command that reads a secret, `maintenance prune`, `purge preview`/`purge apply` and `probe-repo` included — none of them may report it as retryable or as a restic failure, because restic never ran. One gap is known and tracked: the engine's pre-flight reads only the password, so a destination with a good password beside an unparseable `<uuid>-env` blob is not refused at the pre-flight and surfaces later as a restic failure instead. Closing it means reading the environment on exactly the paths that pass it to local restic (remote maintenance does not), which is engine-pre-flight work — see #95. |
@@ -255,13 +277,13 @@ code alone.
 
 ## Coverage today
 
-Fourteen commands, listed in the matrix above. The mutating commands remain
+Fifteen commands, listed in the matrix above. The mutating commands remain
 human-only and still write prose to stderr — the boundary is stated in the
 matrix rather than papered over. `purge apply` and `maintenance prune` are the
 exception: they mutate, and they carry `--json` because the app drives them.
 
 Every defined code now has a producer. `repository_offline` was wired by #79
-and is also emitted by `purge preview` (exit 3); `operation_not_allowed` is
+and is also emitted by `purge preview` and `backup dry-run` (exit 3); `operation_not_allowed` is
 emitted by `purge apply` and `maintenance prune` when a confirmation does not
 match the current plan; it is also the classification behind
 `run-set --kind prune`'s unconditional refusal — but `run-set` is

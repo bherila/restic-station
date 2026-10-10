@@ -443,53 +443,9 @@ public final class BackupEngine: Sendable {
         var children: [SetRunChild] = []
         var infrastructureFailures: [String] = []
 
-        // Online-only files under a cloud-synced source are skipped rather
-        // than downloaded when the set asks for it, but only by a restic that
-        // accepts the flag on this platform; an older one would fail the
-        // whole backup on it.
-        //
-        // The version answer decides the argv, so it is bound to the bytes
-        // that gave it: the backup launch revalidates that identity and
-        // refuses a restic replaced in between (an upgrade mid-tick) rather
-        // than running an argv decided for a different binary.
-        let excludeCloudFiles: Bool
-        let cloudSourceNote: String?
-        let versionBoundIdentity: String?
-        if !CloudStorageSafety.containsCloudBackedSource(set.sources) {
-            excludeCloudFiles = false
-            cloudSourceNote = nil
-            versionBoundIdentity = nil
-        } else if set.onlineOnlyFiles == .download {
-            excludeCloudFiles = false
-            cloudSourceNote = Self.backupDownloadsOnlineOnlyFiles(set: set, primary: primary)
-                ? "cloud-synced source: online-only files are downloaded (set policy)"
-                : "cloud-synced source: online-only files are not downloaded, despite the set policy — "
-                    + "the repository is in cloud storage too, and its files are never downloaded implicitly"
-            versionBoundIdentity = nil
-        } else {
-            let bound = await restic.boundResticVersion()
-            let version = bound?.version
-            versionBoundIdentity = bound?.executableIdentity
-            excludeCloudFiles = version.map {
-                VersionInfo.compareVersions($0, ResticRunner.excludeCloudFilesMinimumVersion) >= 0
-            } ?? false
-            if excludeCloudFiles {
-                cloudSourceNote = "cloud-synced source: online-only files are skipped, not downloaded"
-            } else {
-                let note = "warning: cloud-synced source, but restic \(version ?? "(version unknown)") "
-                    + "cannot skip online-only files (needs \(ResticRunner.excludeCloudFilesMinimumVersion)); "
-                    + "they are not downloaded, so restic reports each as unreadable"
-                logWarning("BackupEngine: set \"\(set.name)\": \(note)")
-                cloudSourceNote = note
-            }
-        }
-
-        // A `CACHEDIR.TAG` in a source or above one would make
-        // `--exclude-caches` leave that source out (``CacheDirTag``), so the
-        // flag is held back for this run and the log says why.
-        let cacheTagFinding = set.excludesCaches(applying: globalExcludes)
-            ? set.sources.lazy.compactMap { CacheDirTag.finding(atOrAbove: $0) }.first
-            : nil
+        let launch = await backupLaunch(for: set, primary: primary, dryRun: false)
+        let cloudSourceNote = launch.cloudSourceNote
+        let cacheTagFinding = launch.cacheTagFinding
 
         // ── Steps 4 + 5: probe primary, then back it up ─────────────────
         let backupResult = await performChild(
@@ -499,33 +455,8 @@ public final class BackupEngine: Sendable {
             trigger: trigger,
             groupId: nil, // this run *is* the group
             phase: "backing-up-primary",
-            // `effectiveBackupExcludes`, not `excludes`: purge patterns are
-            // ordinary excludes as far as `backup` is concerned. Passing
-            // only `excludes` here would have every run re-capture exactly
-            // what the purge phase had just rewritten out of history. This
-            // host's global catalogue rides alongside as `--iexclude`.
-            //
-            // The flow is one-way. Nothing downstream turns a global
-            // pattern into a `purgeExcludes` entry, so a pattern that
-            // arrives because a newer build shipped a better default can
-            // keep files out of the *next* snapshot and can never delete
-            // anything already in a repository.
-            command: .backup(
-                repo: primary.repoURL,
-                sources: set.sources,
-                excludes: set.effectiveBackupExcludes + set.hostBackupExcludes(applying: globalExcludes),
-                globalExcludes: set.globalBackupExcludes(applying: globalExcludes),
-                excludeCloudFiles: excludeCloudFiles,
-                excludeCaches: set.excludesCaches(applying: globalExcludes) && cacheTagFinding == nil,
-                excludeLargerThan: set.excludeLargerThan(applying: globalExcludes)
-            ),
-            invocation: ResticInvocation(
-                destination: primary,
-                expectedExecutableIdentity: versionBoundIdentity,
-                // The only restic process allowed to download online-only
-                // files (#156); every other one is refused them by the kernel.
-                downloadsOnlineOnlyFiles: Self.backupDownloadsOnlineOnlyFiles(set: set, primary: primary)
-            ),
+            command: launch.command,
+            invocation: launch.invocation,
             streamProgress: true,
             preflightPhase: "probing",
             preflight: { [self] logWriter in
@@ -890,6 +821,363 @@ public final class BackupEngine: Sendable {
             groupId: groupId,
             children: children
         )
+    }
+
+    // MARK: - backup launch
+
+    /// Everything a backup of one set launches, decided once and shared by
+    /// ``runSet(_:trigger:)`` and ``backupDryRun(_:)`` (#78). A dry run that
+    /// built its own argv could preview a different source or exclusion list
+    /// than the backup it claims to describe.
+    private struct BackupLaunch {
+        let command: ResticCommand
+        let invocation: ResticInvocation
+        let excludeCloudFiles: Bool
+        let excludeCaches: Bool
+        let excludePatternCount: Int
+        let cloudSourceNote: String?
+        let cacheTagFinding: CacheDirTag.Finding?
+    }
+
+    /// Builds ``BackupLaunch``. May run `restic version` (a cloud-backed
+    /// source); writes nothing.
+    ///
+    /// `dryRun` changes two things and nothing else: the argv gains
+    /// `--dry-run`, and the process is never allowed to download online-only
+    /// files, even for a set whose policy is `"download"`. A preview that
+    /// pulled gigabytes out of iCloud would be the opposite of side-effect
+    /// free; ``backupDryRun(_:)`` says so in its warnings instead.
+    private func backupLaunch(for set: BackupSet, primary: Destination, dryRun: Bool) async -> BackupLaunch {
+        // Online-only files under a cloud-synced source are skipped rather
+        // than downloaded when the set asks for it, but only by a restic that
+        // accepts the flag on this platform; an older one would fail the
+        // whole backup on it.
+        //
+        // The version answer decides the argv, so it is bound to the bytes
+        // that gave it: the backup launch revalidates that identity and
+        // refuses a restic replaced in between (an upgrade mid-tick) rather
+        // than running an argv decided for a different binary.
+        let excludeCloudFiles: Bool
+        let cloudSourceNote: String?
+        let versionBoundIdentity: String?
+        if !CloudStorageSafety.containsCloudBackedSource(set.sources) {
+            excludeCloudFiles = false
+            cloudSourceNote = nil
+            versionBoundIdentity = nil
+        } else if set.onlineOnlyFiles == .download {
+            excludeCloudFiles = false
+            cloudSourceNote = Self.backupDownloadsOnlineOnlyFiles(set: set, primary: primary)
+                ? "cloud-synced source: online-only files are downloaded (set policy)"
+                : "cloud-synced source: online-only files are not downloaded, despite the set policy — "
+                    + "the repository is in cloud storage too, and its files are never downloaded implicitly"
+            versionBoundIdentity = nil
+        } else {
+            let bound = await restic.boundResticVersion()
+            let version = bound?.version
+            versionBoundIdentity = bound?.executableIdentity
+            excludeCloudFiles = version.map {
+                VersionInfo.compareVersions($0, ResticRunner.excludeCloudFilesMinimumVersion) >= 0
+            } ?? false
+            if excludeCloudFiles {
+                cloudSourceNote = "cloud-synced source: online-only files are skipped, not downloaded"
+            } else {
+                let note = "warning: cloud-synced source, but restic \(version ?? "(version unknown)") "
+                    + "cannot skip online-only files (needs \(ResticRunner.excludeCloudFilesMinimumVersion)); "
+                    + "they are not downloaded, so restic reports each as unreadable"
+                logWarning("BackupEngine: set \"\(set.name)\": \(note)")
+                cloudSourceNote = note
+            }
+        }
+
+        // A `CACHEDIR.TAG` in a source or above one would make
+        // `--exclude-caches` leave that source out (``CacheDirTag``), so the
+        // flag is held back for this run and the log says why.
+        let cacheTagFinding = set.excludesCaches(applying: globalExcludes)
+            ? set.sources.lazy.compactMap { CacheDirTag.finding(atOrAbove: $0) }.first
+            : nil
+        let excludeCaches = set.excludesCaches(applying: globalExcludes) && cacheTagFinding == nil
+
+        // `effectiveBackupExcludes`, not `excludes`: purge patterns are
+        // ordinary excludes as far as `backup` is concerned. Passing
+        // only `excludes` here would have every run re-capture exactly
+        // what the purge phase had just rewritten out of history. This
+        // host's global catalogue rides alongside as `--iexclude`.
+        //
+        // The flow is one-way. Nothing downstream turns a global
+        // pattern into a `purgeExcludes` entry, so a pattern that
+        // arrives because a newer build shipped a better default can
+        // keep files out of the *next* snapshot and can never delete
+        // anything already in a repository.
+        let excludes = set.effectiveBackupExcludes + set.hostBackupExcludes(applying: globalExcludes)
+        let globalBackupExcludes = set.globalBackupExcludes(applying: globalExcludes)
+        return BackupLaunch(
+            command: .backup(
+                repo: primary.repoURL,
+                sources: set.sources,
+                excludes: excludes,
+                globalExcludes: globalBackupExcludes,
+                excludeCloudFiles: excludeCloudFiles,
+                excludeCaches: excludeCaches,
+                excludeLargerThan: set.excludeLargerThan(applying: globalExcludes),
+                dryRun: dryRun
+            ),
+            invocation: ResticInvocation(
+                destination: primary,
+                expectedExecutableIdentity: versionBoundIdentity,
+                // The only restic process allowed to download online-only
+                // files (#156); every other one is refused them by the
+                // kernel. A dry run never is.
+                downloadsOnlineOnlyFiles: !dryRun && Self.backupDownloadsOnlineOnlyFiles(set: set, primary: primary)
+            ),
+            excludeCloudFiles: excludeCloudFiles,
+            excludeCaches: excludeCaches,
+            excludePatternCount: excludes.count + globalBackupExcludes.count,
+            cloudSourceNote: cloudSourceNote,
+            cacheTagFinding: cacheTagFinding
+        )
+    }
+
+    // MARK: - backupDryRun
+
+    /// `backup dry-run` (#78): what a backup of `set` would do right now,
+    /// measured by `restic backup --dry-run --json` against the primary.
+    ///
+    /// The sequence mirrors ``runSet(_:trigger:)`` up to the backup and stops
+    /// there: set lock → secret pre-flight → global exclusion list → probe
+    /// → the same command ``backupLaunch(for:primary:dryRun:)`` builds for a
+    /// real run, with `--dry-run`.
+    ///
+    /// **What it never does.** No snapshot, copy, forget, prune, check,
+    /// init, purge or `unlock` — a locked repository is reported, not
+    /// unlocked. No run record or run log, no `current-run`, no
+    /// `lastBackupStart`, no check cursor or purge watermark, and the
+    /// probe's result is not written to repo-status. What it shares with
+    /// every other operation is the attention bookkeeping for problems that
+    /// describe the destination rather than this run: the secret
+    /// pre-flight creates, updates or clears
+    /// `state/secret-attention-<destId>.json`, and — when a
+    /// secret or online-only-repository refusal arrives only at restic's
+    /// launch, after the probe passed — what ``postPreflightSecretError(_:)``
+    /// records for it (#152, #180), which for an online-only repository is
+    /// repo-status's `reachable: false` and attention.
+    ///
+    /// **Fails closed on its own evidence.** The argv must carry
+    /// `--dry-run`, checked again just before launch; and restic's
+    /// `summary` must say `"dry_run": true`. Without that line nothing is
+    /// reported as a projection: the error tells the caller to look at the
+    /// repository instead.
+    ///
+    /// - Throws: ``BackupDryRunError``, and nothing else.
+    public func backupDryRun(_ set: BackupSet) async throws -> BackupDryRunReport {
+        guard let primary = set.destinations.first(where: { $0.isPrimary }) else {
+            throw BackupDryRunError.noPrimary
+        }
+
+        let (lock, acquisition) = acquireSetLock(setId: set.id)
+        switch acquisition {
+        case .acquired:
+            break
+        case .busy:
+            throw BackupDryRunError.busy
+        case .failed(let failure):
+            logWarning("BackupEngine: cannot acquire the set lock: \(failure)")
+            throw BackupDryRunError.lockUnusable("\(failure)")
+        }
+        defer { lock.release() }
+
+        if let refusal = await secretStoreRefusal(for: [primary]) {
+            if let attention = DestinationAttention(refusal.error) {
+                throw BackupDryRunError.attention(
+                    attention,
+                    destinationId: primary.id,
+                    message: Self.secretRefusalReason(
+                        attention: attention, destination: primary, error: refusal.error
+                    )
+                )
+            }
+            throw BackupDryRunError.secretUnavailable(destinationId: primary.id, message: refusal.error.description)
+        }
+
+        if let reason = globalExcludesRefusal(for: set) {
+            throw BackupDryRunError.globalExcludesUnusable(reason)
+        }
+
+        let launch = await backupLaunch(for: set, primary: primary, dryRun: true)
+
+        let (probe, secretError) = await probeDestination(primary)
+        if let secretError {
+            throw Self.dryRunError(secretError)
+        }
+        switch probe {
+        case .reachable:
+            break
+        case .offline(let reason):
+            throw BackupDryRunError.offline(destinationId: primary.id, reason: reason)
+        case .error(let exitClass):
+            throw BackupDryRunError.probeFailed(destinationId: primary.id, exitClass)
+        case .needsAttention(let attention, let reason):
+            throw BackupDryRunError.attention(attention, destinationId: primary.id, message: reason)
+        }
+
+        // The builder put `--dry-run` there; this is the check that a later
+        // edit cannot quietly take it away. Without it this would be a real
+        // backup.
+        guard Self.isDryRunBackup(launch.command) else {
+            throw BackupDryRunError.notADryRun
+        }
+        let outcome: ResticOutcome
+        do {
+            outcome = try await restic.run(launch.command, for: launch.invocation)
+        } catch {
+            if let secretError = postPreflightSecretError(error) {
+                throw Self.dryRunError(secretError)
+            }
+            if let runnerError = error as? ResticRunnerError {
+                throw BackupDryRunError.resticDidNotRun(destinationId: primary.id, runnerError)
+            }
+            throw BackupDryRunError.resticDidNotRun(destinationId: primary.id, .launchFailed("\(error)"))
+        }
+
+        let reportOutcome: BackupDryRunReport.Outcome
+        switch outcome.status {
+        case .success:
+            reportOutcome = .success
+        case .warningIncompleteRead:
+            reportOutcome = .warning
+        case .successUnverified:
+            throw BackupDryRunError.unconfirmed(
+                destinationId: primary.id,
+                reason: "restic's output was cut before its summary, so the dry run cannot be confirmed"
+            )
+        case .fatal, .repoDoesNotExist, .repoLocked, .wrongPassword, .other:
+            throw BackupDryRunError.resticFailed(destinationId: primary.id, outcome.status)
+        }
+
+        guard let summary = Self.summary(in: outcome.messages) else {
+            throw BackupDryRunError.unconfirmed(destinationId: primary.id, reason: "restic reported no summary")
+        }
+        guard Self.summaryConfirmsDryRun(outcome.rawOutput) else {
+            throw BackupDryRunError.unconfirmed(
+                destinationId: primary.id,
+                reason: "restic's summary does not say this was a dry run"
+            )
+        }
+
+        var warnings: [String] = []
+        if reportOutcome == .warning {
+            warnings.append("some source files could not be read; the figures leave them out")
+        }
+        let onlineOnly = Self.dryRunOnlineOnlyNotes(
+            set: set,
+            primary: primary,
+            hasCloudSource: CloudStorageSafety.containsCloudBackedSource(set.sources),
+            excludeCloudFiles: launch.excludeCloudFiles,
+            cloudSourceNote: launch.cloudSourceNote
+        )
+        if let warning = onlineOnly.warning {
+            warnings.append(warning)
+        }
+        if set.excludesCaches(applying: globalExcludes) && !launch.excludeCaches {
+            warnings.append(
+                "--exclude-caches is held back: a CACHEDIR.TAG at or above a source could not be ruled out"
+            )
+        }
+
+        var logNotes: [String] = []
+        if let note = onlineOnly.note {
+            logNotes.append(note)
+        }
+        logNotes.append(globalExcludeNote(for: set, cacheTagFinding: launch.cacheTagFinding))
+
+        return BackupDryRunReport(
+            setId: set.id,
+            setName: set.name,
+            primary: primary,
+            outcome: reportOutcome,
+            summary: summary,
+            cloudFilesExcluded: launch.excludeCloudFiles,
+            excludeCaches: launch.excludeCaches,
+            excludePatternCount: launch.excludePatternCount,
+            resticExitCode: outcome.exitCode,
+            warnings: warnings,
+            logNotes: logNotes
+        )
+    }
+
+    /// What a dry run says about online-only files: a path-free warning,
+    /// and the run-log note to print beside it.
+    ///
+    /// The real backup's note is kept except in the one case where a dry
+    /// run behaves differently: a set that downloads online-only files,
+    /// into a primary that is not itself in cloud storage. There the note
+    /// ("online-only files are downloaded") would contradict what the dry
+    /// run did, so it is replaced by the warning that the real backup can
+    /// add more. A download set whose primary *is* in cloud storage gets no
+    /// such warning: its real backup does not download them either, and its
+    /// note already says why.
+    static func dryRunOnlineOnlyNotes(
+        set: BackupSet,
+        primary: Destination,
+        hasCloudSource: Bool,
+        excludeCloudFiles: Bool,
+        cloudSourceNote: String?,
+        homeDirectory: String = NSHomeDirectory()
+    ) -> (warning: String?, note: String?) {
+        guard hasCloudSource else { return (nil, cloudSourceNote) }
+        if set.onlineOnlyFiles == .download {
+            guard backupDownloadsOnlineOnlyFiles(set: set, primary: primary, homeDirectory: homeDirectory) else {
+                return (nil, cloudSourceNote)
+            }
+            return (
+                "online-only files were not downloaded for the dry run; "
+                    + "a real backup downloads them, so it can add more than this",
+                nil
+            )
+        }
+        guard !excludeCloudFiles else { return (nil, cloudSourceNote) }
+        return ("this restic cannot skip online-only files, so each is reported as unreadable", cloudSourceNote)
+    }
+
+    /// `backup --json --dry-run`, exactly where ``ResticCommand/backup(repo:sources:excludes:globalExcludes:excludeCloudFiles:excludeCaches:excludeLargerThan:dryRun:)``
+    /// puts the flag. Positional on purpose: `--dry-run` as the value of an
+    /// `--exclude` is a pattern, not the flag, and must not count.
+    static func isDryRunBackup(_ command: ResticCommand) -> Bool {
+        guard let backup = command.argv.firstIndex(of: "backup") else { return false }
+        return command.argv[(backup + 1)...].prefix(2) == ["--json", "--dry-run"]
+    }
+
+    /// Whether restic's `summary` line carries `"dry_run": true`, which
+    /// restic 0.18 and later write only for `backup --dry-run`.
+    ///
+    /// Read from the raw transcript because ``BackupSummary`` is persisted
+    /// into run records and has no business growing a field only this
+    /// command reads.
+    static func summaryConfirmsDryRun(_ rawOutput: String) -> Bool {
+        struct Marker: Decodable {
+            let messageType: String?
+            let dryRun: Bool?
+            enum CodingKeys: String, CodingKey {
+                case messageType = "message_type"
+                case dryRun = "dry_run"
+            }
+        }
+        let decoder = JSONDecoder()
+        for line in rawOutput.split(whereSeparator: \.isNewline).reversed() {
+            guard line.first == "{",
+                  let marker = try? decoder.decode(Marker.self, from: Data(line.utf8)),
+                  marker.messageType == "summary" else { continue }
+            return marker.dryRun == true
+        }
+        return false
+    }
+
+    private static func dryRunError(_ failure: PostPreflightSecretError) -> BackupDryRunError {
+        switch failure.equivalent {
+        case .attention(let attention, let destinationId):
+            return .attention(attention, destinationId: destinationId, message: failure.message)
+        case .secretUnavailable(let destinationId):
+            return .secretUnavailable(destinationId: destinationId, message: failure.message)
+        }
     }
 
     // MARK: - runCheck

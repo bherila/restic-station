@@ -82,7 +82,7 @@ public struct ResticCommand: Equatable, Sendable {
 
     // MARK: - backup / copy
 
-    /// `restic -r <primaryRepo> backup --json [--exclude-cloud-files]
+    /// `restic -r <primaryRepo> backup --json [--dry-run] [--exclude-cloud-files]
     /// [--exclude-caches] [--exclude-larger-than <size>] [--exclude <pat>]...
     /// [--iexclude <pat>]... <source>...`
     ///
@@ -101,6 +101,12 @@ public struct ResticCommand: Equatable, Sendable {
     /// unlike `--exclude-cloud-files` it needs no version probe.
     /// `excludeLargerThan` is restic's size cap (`500m`, `10G`, …), off
     /// unless the host asked for it.
+    ///
+    /// `dryRun` is `backup dry-run`'s (#78): restic reads every source and
+    /// reports what it would add, and writes no snapshot. It is a parameter
+    /// of this one builder rather than a separate one so a dry run can never
+    /// be built from a different source, exclusion or cloud-file list than
+    /// the real backup it previews.
     public static func backup(
         repo: String,
         sources: [String],
@@ -108,10 +114,14 @@ public struct ResticCommand: Equatable, Sendable {
         globalExcludes: [String] = [],
         excludeCloudFiles: Bool = false,
         excludeCaches: Bool = false,
-        excludeLargerThan: String? = nil
+        excludeLargerThan: String? = nil,
+        dryRun: Bool = false
     ) -> ResticCommand {
         precondition(!sources.isEmpty, "ResticCommand.backup requires at least one source path")
         var argv = ["-r", repo, "backup", "--json"]
+        if dryRun {
+            argv.append("--dry-run")
+        }
         if excludeCloudFiles {
             argv.append("--exclude-cloud-files")
         }
