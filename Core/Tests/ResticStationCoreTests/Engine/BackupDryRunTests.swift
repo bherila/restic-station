@@ -341,6 +341,7 @@ import Testing
 
     // MARK: - Online-only files
 
+    #if os(macOS)
     /// A set whose policy downloads online-only files still does not for a
     /// dry run: a preview that pulled them out of iCloud would not be side-
     /// effect free. The real backup of the same set does download.
@@ -366,6 +367,7 @@ import Testing
         #expect(!report.logNotes.contains { $0.contains("downloaded (set policy)") })
         #expect(!report.cloudFilesExcluded)
     }
+    #endif
 
     /// A download set whose primary is itself in cloud storage does not
     /// download in its real backup either, so the dry run must not claim
@@ -395,6 +397,7 @@ import Testing
         #expect(localPrimary.note == nil)
     }
 
+    #if os(macOS)
     @Test("a cloud-backed source on restic 0.19 gets --exclude-cloud-files in the dry run too")
     func cloudSourceSkipsOnlineOnlyFiles() async throws {
         let env = T.makeEnv(script: [], sources: [T.cloudSource], reachableSecondaries: [])
@@ -409,6 +412,7 @@ import Testing
         #expect(report.cloudFilesExcluded)
         #expect(report.warnings.isEmpty)
     }
+    #endif
 
     // MARK: - CLI mapping
 

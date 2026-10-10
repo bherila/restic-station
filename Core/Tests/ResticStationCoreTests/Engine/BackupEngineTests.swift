@@ -595,6 +595,9 @@ struct BackupEngineTests {
         (NSHomeDirectory() as NSString).appendingPathComponent("Library/CloudStorage/Provider-Example/Documents")
     }
 
+    // The online-only decision is macOS's alone (#186): these pin what a
+    // Mac does, and the `#else` arm pins that Linux never does any of it.
+    #if os(macOS)
     @Test("cloud-backed source on restic 0.19.0 skips online-only files")
     func cloudSourceUsesExcludeCloudFiles() async throws {
         let env = Self.makeEnv(
@@ -751,6 +754,41 @@ struct BackupEngineTests {
         #expect(env.resticArgvs == [[Self.resticPath] + backup])
         #expect(env.log(runId: groupId).contains("online-only files are downloaded"))
     }
+    #else
+    /// #186: on Linux `$HOME` is an ancestor of the synthetic
+    /// `$HOME/Library/CloudStorage`, but restic there has no
+    /// `--exclude-cloud-files` and rejects it. No flag, no version probe, no
+    /// note — even with restic 0.19+ installed and for a download set.
+    @Test("Linux: a home-directory or cloud-shaped source never gets the flag, a version probe, or a note")
+    func linuxNeverDecidesOnlineOnlyFiles() async throws {
+        for (source, policy) in [
+            (NSHomeDirectory(), OnlineOnlyFiles.skip),
+            (Self.cloudSource, .skip),
+            (Self.cloudSource, .download),
+        ] {
+            let env = Self.makeEnv(
+                script: [],
+                sources: [source],
+                onlineOnlyFiles: policy,
+                retention: nil,
+                reachableSecondaries: []
+            )
+            defer { env.cleanUp() }
+            let backup = ["-r", env.primary.repoURL, "backup", "--json", source]
+            env.fake.script = Self.resticCall(backup, dest: Self.primaryId, stdoutLines: Self.backupStream())
+
+            let outcome = await env.engine.runSet(env.set, trigger: .manual)
+
+            guard case .completed(let status, let groupId, _) = outcome else {
+                Issue.record("\(source) \(policy): expected completed backup, got \(outcome)")
+                continue
+            }
+            #expect(status == .success, "\(source) \(policy)")
+            #expect(env.resticArgvs == [[Self.resticPath] + backup], "\(source) \(policy)")
+            #expect(!env.log(runId: groupId).contains("online-only"), "\(source) \(policy)")
+        }
+    }
+    #endif
 
     @Test("a set with no cloud-backed source never asks restic for its version")
     func localSourceSkipsVersionProbe() async throws {

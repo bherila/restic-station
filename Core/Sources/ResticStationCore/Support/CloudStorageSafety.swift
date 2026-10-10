@@ -53,6 +53,35 @@ public enum CloudStorageSafety {
 
     /// Whether any source reaches cloud storage (``reachesCloudStorage(_:homeDirectory:)``)
     /// — the condition for the set's online-only files policy to apply.
+    /// Whether this platform has online-only (dataless) files at all.
+    /// Only macOS does: iCloud Drive and File Provider are macOS services,
+    /// and restic registers `--exclude-cloud-files` only on macOS and
+    /// Windows (`cmd/restic/cmd_backup.go`, v0.19.0 and v0.19.1).
+    public static var platformHasOnlineOnlyFiles: Bool {
+        #if os(macOS)
+        return true
+        #else
+        return false
+        #endif
+    }
+
+    /// Whether a backup of `sources` has to decide about online-only files
+    /// — the flag, the version probe that gates it, and the run-log note.
+    ///
+    /// ``containsCloudBackedSource(_:homeDirectory:)`` answers a path
+    /// question and answers it the same everywhere: on Linux a source of
+    /// `$HOME`, `/home` or `/` is an ancestor of `$HOME/Library/CloudStorage`
+    /// too. But a Linux host has no online-only files to skip, and restic
+    /// there rejects `--exclude-cloud-files` as an unknown flag, which
+    /// failed every backup of such a set with restic 0.19+ (#186).
+    public static func backupDecidesOnlineOnlyFiles(
+        _ sources: [String],
+        homeDirectory: String = NSHomeDirectory(),
+        platformHasOnlineOnlyFiles: Bool = platformHasOnlineOnlyFiles
+    ) -> Bool {
+        platformHasOnlineOnlyFiles && containsCloudBackedSource(sources, homeDirectory: homeDirectory)
+    }
+
     public static func containsCloudBackedSource(
         _ sources: [String],
         homeDirectory: String = NSHomeDirectory()
