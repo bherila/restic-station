@@ -71,10 +71,14 @@ public enum CommandRegistry {
         CommandCapability("secret list", json: true, .readOnly),
         CommandCapability("cli status", json: true, .readOnly),
         CommandCapability("timer status", json: false, .readOnly, linuxOnly: true),
-        CommandCapability("backup dry-run", json: true, .readOnly),
-        CommandCapability("snapshots list", json: true, .readOnly),
-        CommandCapability("retention preview", json: true, .readOnly),
-        // Bookkeeping.
+        // Bookkeeping. The three repository previews read secrets, and the
+        // secret pre-flight creates, updates or clears
+        // `state/secret-attention-<destId>.json` (a refusal seen only at
+        // restic's launch can also mark repo-status), so they are not
+        // `readOnly` even though no repository changes.
+        CommandCapability("backup dry-run", json: true, .localStateWrite),
+        CommandCapability("snapshots list", json: true, .localStateWrite),
+        CommandCapability("retention preview", json: true, .localStateWrite),
         CommandCapability("probe-repo", json: true, .localStateWrite),
         CommandCapability("fda-check", json: true, .localStateWrite),
         CommandCapability("purge preview", json: true, .localStateWrite),

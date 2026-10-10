@@ -148,8 +148,11 @@ import Testing
         let table = Dictionary(uniqueKeysWithValues: CommandRegistry.commands.map { command in
             (command.name, command)
         })
-        #expect(table["backup dry-run"]?.safetyClass == .readOnly)
-        #expect(table["retention preview"]?.safetyClass == .readOnly)
+        // Secret-attention bookkeeping is a local write (Codex on #189).
+        #expect(table["backup dry-run"]?.safetyClass == .localStateWrite)
+        #expect(table["snapshots list"]?.safetyClass == .localStateWrite)
+        #expect(table["retention preview"]?.safetyClass == .localStateWrite)
+        #expect(table["status"]?.safetyClass == .readOnly)
         #expect(table["probe-repo"]?.safetyClass == .localStateWrite)
         #expect(table["secret rm"]?.safetyClass == .configurationWrite)
         #expect(table["restore"]?.safetyClass == .repositoryWrite)
