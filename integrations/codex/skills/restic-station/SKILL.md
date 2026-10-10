@@ -22,11 +22,11 @@ this skill: use only `status --json` and `config validate --json`. Add `--json` 
   For a health or schedule question, run the validation through the
   redaction filter, so the full configuration never reaches the transcript:
   `restic-station config validate --json | jq 'if .ok then {ok, data: (.data | {errors, warnings, nothingRunsHere})} else . end'`.
-- Every command except `version` and `capabilities` loads `config.json`, and
-  loading an older schema migrates the file in place. If the config is shared
-  with other machines, they then need an upgraded helper or they stop backing
-  up. Straight after a helper upgrade on such a host, ask before the first
-  config-loading command, even `config validate`.
+- Read-only and `localStateWrite` commands never rewrite `config.json`. If
+  `status` shows a non-null `pendingConfigMigration`, the file is an older
+  schema, and any command above `localStateWrite` will upgrade it in place.
+  If the config is shared with other machines, they then need an upgraded
+  helper or they stop backing up. Tell the user and ask before such a command.
 - Use only the set and destination UUIDs these return. Do not echo
   `config validate`'s `effective` object (source paths, exclusions,
   repository URLs) unless the user asks about the configuration; its `errors`,

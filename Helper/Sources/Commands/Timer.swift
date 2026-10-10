@@ -218,7 +218,7 @@ extension TimerCommand {
             var problems: [TimerProblem] = []
             var config = AppConfig()
             do {
-                config = try ConfigStore(paths: paths).load()
+                config = try ConfigStore(paths: paths).load(.inspecting)
             } catch {
                 problems.append(.configUnreadable)
             }

@@ -547,6 +547,87 @@ jq -e '.data | has("machineId") and has("errors") and has("warnings") and has("e
     || fail "config validate --json data is not { machineId, errors, warnings, effective, nothingRunsHere }"
 mark_cmd "config validate"
 
+# #191: no readOnly or localStateWrite command rewrites an older-schema
+# config. The commands come from `capabilities --json` itself, so a new
+# inspecting command is covered without editing this list. Each gets the
+# arguments its own usage line asks for, and must get past argument parsing:
+# exit 64 would mean it never reached the config load being asserted on.
+# Filter-free per file: config.json and machine.json byte-for-byte, and no
+# migration backup or record of any version.
+INSPECT_DIR="$WORK/inspect-fixture"
+cp -R "$FIXTURE" "$INSPECT_DIR"
+rm -f "$INSPECT_DIR/state/config-migration.json"
+INSPECT_CURRENT=$(jq -r '.version' "$FIXTURE/config.json")
+INSPECT_OLDER=$((INSPECT_CURRENT - 1))
+jq --argjson v "$INSPECT_OLDER" '.version = $v' "$FIXTURE/config.json" > "$INSPECT_DIR/config.json"
+cp "$INSPECT_DIR/config.json" "$WORK/inspect-config.before"
+[[ -f "$INSPECT_DIR/machine.json" ]] || fail "the fixture has no machine.json to compare"
+cp "$INSPECT_DIR/machine.json" "$WORK/inspect-machine.before"
+# The fixture's config carries a top-level resticPath, which a real migration
+# moves into machine.json, so that comparison can fail too.
+[[ "$(jq -r '.resticPath' "$INSPECT_DIR/config.json")" != null ]] || fail "the fixture config has no resticPath"
+"$HELPER" capabilities --json \
+    | jq -r '.data.commands[]
+        | select(.available and (.safetyClass == "readOnly" or .safetyClass == "localStateWrite")) | .name' \
+    > "$WORK/inspecting-commands"
+for expected in "status" "config validate" "snapshots list" "purge preview"; do
+    grep -qx "$expected" "$WORK/inspecting-commands" \
+        || fail "capabilities --json no longer lists $expected as an inspecting command"
+done
+INSPECTING=()
+while IFS= read -r name; do INSPECTING+=("$name"); done < "$WORK/inspecting-commands"
+fake_mode 0
+for name in "${INSPECTING[@]}"; do
+    read -r -a words <<<"$name"
+    usage=$("$HELPER" "${words[@]}" --help 2>&1 | grep '^USAGE:' || true)
+    args=("${words[@]}")
+    [[ "$usage" == *"<run-id>"* ]] && args+=("r-1")
+    [[ "$usage" == *"--set <set>"* ]] && args+=(--set "$SET_ID")
+    [[ "$usage" == *"--dest <dest>"* ]] && args+=(--dest "$PRIMARY_ID")
+    [[ "$usage" == *"--json"* ]] && args+=(--json)
+    RESTIC_STATION_DATA_DIR="$INSPECT_DIR" run_helper_split "${args[@]}"
+    [[ "$RC" -ne 64 ]] || {
+        cat "$ERR_FILE" >&2
+        fail "$name: the arguments built from its usage line were rejected, so it never loaded the config"
+    }
+    cmp -s "$INSPECT_DIR/config.json" "$WORK/inspect-config.before" \
+        || fail "$name rewrote an older-schema config.json (#191)"
+    cmp -s "$INSPECT_DIR/machine.json" "$WORK/inspect-machine.before" \
+        || fail "$name changed machine.json while reading an older-schema config (#191)"
+    for leftover in "$INSPECT_DIR"/config.v*.backup.json "$INSPECT_DIR/state/config-migration.json"; do
+        [[ ! -e "$leftover" ]] || fail "$name wrote $(basename "$leftover") (#191)"
+    done
+done
+printf 'ok: %d inspecting commands left an older-schema config alone\n' "${#INSPECTING[@]}"
+
+RESTIC_STATION_DATA_DIR="$INSPECT_DIR" run_helper_split status --json
+jq -e --argjson from "$INSPECT_OLDER" --argjson to "$INSPECT_CURRENT" \
+    '.data.pendingConfigMigration | .fromVersion == $from and .toVersion == $to and (.message | length > 0)' \
+    "$OUT_FILE" >/dev/null || fail "status --json does not report the pending migration (#191)"
+RESTIC_STATION_DATA_DIR="$INSPECT_DIR" run_helper_split config validate --json
+expect_rc 0
+jq -e --arg v "schema v$INSPECT_OLDER" '.data.warnings | any(contains($v))' "$OUT_FILE" >/dev/null \
+    || fail "config validate --json does not warn about an older schema (#191)"
+# Exporting the older file is refused, with the upgrade to run: without the
+# migration's resticPath move, no portable export exists (Codex on #193).
+# Nothing reaches stdout or the --out file.
+RESTIC_STATION_DATA_DIR="$INSPECT_DIR" run_helper_split config export --out "$WORK/inspect-export.json"
+expect_rc 1
+grep -q "config upgrade" "$ERR_FILE" || fail "config export of an older-schema config did not name config upgrade (#191)"
+[[ ! -s "$OUT_FILE" && ! -e "$WORK/inspect-export.json" ]] \
+    || fail "config export of an older-schema config wrote output (#191)"
+# The control: a migrating command changes the same files, so the
+# comparisons above can see a migration.
+RESTIC_STATION_DATA_DIR="$INSPECT_DIR" run_helper_split config upgrade --json
+expect_rc 0
+! cmp -s "$INSPECT_DIR/config.json" "$WORK/inspect-config.before" \
+    || fail "config upgrade did not rewrite the older-schema config, so the #191 sweep proves nothing"
+! cmp -s "$INSPECT_DIR/machine.json" "$WORK/inspect-machine.before" \
+    || fail "config upgrade did not move resticPath into machine.json, so the #191 sweep proves nothing"
+RESTIC_STATION_DATA_DIR="$INSPECT_DIR" run_helper_split status --json
+jq -e '.data | has("pendingConfigMigration") and .pendingConfigMigration == null' "$OUT_FILE" >/dev/null \
+    || fail "status --json still reports a pending migration after config upgrade"
+
 # #161: an explicit upgrade of an older-schema copy of the fixture records a
 # migration that keeps status at warning until it is acknowledged. A copy,
 # so the fixture's own status/rc expectations are untouched.
@@ -582,6 +663,8 @@ jq -e --argjson from "$OLDER_SCHEMA" \
 RESTIC_STATION_DATA_DIR="$FIXTURE" run_helper_split status --json
 jq -e '.data | has("configMigration") and .configMigration == null' "$OUT_FILE" >/dev/null \
     || fail "status --json must carry configMigration: null when nothing was migrated"
+jq -e '.data | has("pendingConfigMigration") and .pendingConfigMigration == null' "$OUT_FILE" >/dev/null \
+    || fail "status --json must carry pendingConfigMigration: null for a current config"
 
 RESTIC_STATION_DATA_DIR="$UPGRADE_DIR" run_helper_split config acknowledge-migration --json
 expect_rc 0

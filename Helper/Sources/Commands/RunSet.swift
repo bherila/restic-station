@@ -54,7 +54,7 @@ struct RunSet: AsyncParsableCommand {
             )
         }
 
-        let context = try await HelperContext.make()
+        let context = try await HelperContext.make(.migrating)
         // `scheduled`: backup, check and prune are all things this machine
         // *does to* a set, so a set disabled here must not run — unlike the
         // repository utilities, which use `addressable`.

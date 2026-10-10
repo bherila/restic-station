@@ -179,12 +179,24 @@ cat > "$MAC_DATA/config.json" <<EOF
 }
 EOF
 
+# Export only inspects configuration (#191), so it refuses the v1 file
+# rather than export one that loses or leaks its host-local resticPath, and
+# names the upgrade to run. Nothing is written.
+RESTIC_STATION_DATA_DIR="$MAC_DATA" run_helper config export --out "$WORK/exported-config.json"
+expect_rc 1
+grep -q 'config upgrade' "$OUT_FILE" || fail "export of a v1 config did not name config upgrade"
+[[ ! -e "$WORK/exported-config.json" ]] || fail "a refused export still wrote --out"
+grep -q '"version": 1' "$MAC_DATA/config.json" || fail "a refused export changed config.json"
+ok "export refuses a v1 config and names config upgrade"
+
+RESTIC_STATION_DATA_DIR="$MAC_DATA" run_helper config upgrade
+expect_rc 0
 RESTIC_STATION_DATA_DIR="$MAC_DATA" run_helper config export --out "$WORK/exported-config.json"
 expect_rc 0
-grep -q '"version" : 5' "$WORK/exported-config.json" \
-    || fail "exported config was not migrated to v5 in memory before export"
-grep -q 'machine.json' "$OUT_FILE" || true # note-only; not asserted further
-ok "export migrates v1 → v5 and writes to --out"
+grep -q '"version" : 5' "$WORK/exported-config.json" || fail "exported config is not v5 after config upgrade"
+jq -e '.resticPath == null' "$WORK/exported-config.json" >/dev/null \
+    || fail "the export after config upgrade still carries this host's resticPath"
+ok "after config upgrade, export writes a v5 config without the host-local resticPath to --out"
 
 RESTIC_STATION_DATA_DIR="$LINUX_DATA" run_helper config import "$WORK/exported-config.json" --dry-run
 expect_rc 0

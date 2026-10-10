@@ -121,7 +121,7 @@ struct BackupDryRunCommand: AsyncParsableCommand, JSONRenderable {
     }
 
     func run() async throws {
-        let context = try await HelperContext.make()
+        let context = try await HelperContext.make(.inspecting)
         // `scheduled`, as `run-set` does: a dry run answers "what would this
         // machine's backup do", so it resolves the set exactly as this
         // machine's backup would — machine overrides applied, and a set

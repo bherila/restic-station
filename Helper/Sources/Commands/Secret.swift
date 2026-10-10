@@ -53,7 +53,7 @@ struct SecretSet: AsyncParsableCommand {
     var dest: UUID
 
     func run() async throws {
-        let context = try SecretContext.make()
+        let context = try SecretContext.make(.migrating)
         let destination = context.destination(dest)
 
         let password = SecretInput.read(prompt: "Password for \"\(destination.label)\": ")
@@ -85,7 +85,7 @@ struct SecretSetEnv: AsyncParsableCommand {
     var dest: UUID
 
     func run() async throws {
-        let context = try SecretContext.make()
+        let context = try SecretContext.make(.migrating)
         let destination = context.destination(dest)
 
         let raw = SecretInput.readAllStdin()
@@ -128,7 +128,7 @@ struct SecretRemove: AsyncParsableCommand {
     var env = false
 
     func run() async throws {
-        let context = try SecretContext.make()
+        let context = try SecretContext.make(.migrating)
         let destination = context.destination(dest)
 
         do {
@@ -174,7 +174,7 @@ struct SecretList: AsyncParsableCommand, JSONRenderable {
     }
 
     func run() async throws {
-        let context = try SecretContext.make()
+        let context = try SecretContext.make(.inspecting)
 
         var rows: [SecretListing.Row] = []
         for entry in context.destinations {

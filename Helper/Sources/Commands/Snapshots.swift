@@ -199,7 +199,7 @@ struct SnapshotsList: AsyncParsableCommand, JSONRenderable {
                 "--limit must be between 1 and \(BackupEngine.snapshotListMaximumLimit)."
             )
         }
-        let context = try await HelperContext.make()
+        let context = try await HelperContext.make(.inspecting)
         let backupSet = try RepositorySelection.set(set, addressable: context.addressable)
         let destination = try RepositorySelection.destination(dest, of: backupSet)
 

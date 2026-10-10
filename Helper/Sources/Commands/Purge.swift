@@ -100,7 +100,7 @@ struct PurgePreview: AsyncParsableCommand, JSONRenderable {
     }
 
     func run() async throws {
-        let context = try await HelperContext.make()
+        let context = try await HelperContext.make(.inspecting)
         guard let backupSet = context.addressable.set(id: set) else {
             throw CLIFailure.setNotFound(setId: set)
         }
@@ -311,7 +311,7 @@ struct PurgeApply: AsyncParsableCommand, JSONRenderable {
         }
         let previewToken = try CapabilityInput.read(prompt: "Preview token: ")
 
-        let context = try await HelperContext.make()
+        let context = try await HelperContext.make(.migrating)
         guard let backupSet = context.addressable.set(id: set) else {
             throw CLIFailure.setNotFound(setId: set)
         }

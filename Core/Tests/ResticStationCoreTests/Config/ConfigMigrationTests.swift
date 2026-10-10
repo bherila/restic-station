@@ -561,6 +561,108 @@ private func installMachine(at paths: AppPaths, resticPath: String? = nil) throw
         // simulate the relocation.
         #expect(preview.resticPath == decoded.resticPath)
     }
+
+    // MARK: - #191: an inspecting load never writes the migration
+
+    /// Every file under the data directory and its bytes, except `locks/`:
+    /// the config read lock creates `locks/config.lock`, the same lock
+    /// every reader takes. Anything else that appears, disappears or
+    /// changes is a write.
+    private func dataDirectoryContents(_ paths: AppPaths) throws -> [String: Data] {
+        var contents: [String: Data] = [:]
+        let root = paths.root.resolvingSymlinksInPath().path
+        guard let walker = FileManager.default.enumerator(atPath: root) else { return contents }
+        for case let relative as String in walker where !relative.hasPrefix("locks") {
+            var isDirectory: ObjCBool = false
+            let full = root + "/" + relative
+            FileManager.default.fileExists(atPath: full, isDirectory: &isDirectory)
+            contents[relative] = isDirectory.boolValue ? Data() : try Data(contentsOf: URL(fileURLWithPath: full))
+        }
+        return contents
+    }
+
+    @Test func inspectingAnOlderConfigWritesNothingAndReadsItAsTheCurrentSchema() throws {
+        let (store, paths, cleanup) = try makeStore()
+        defer { cleanup() }
+        try installV1Fixture(at: paths)
+        try installMachine(at: paths)
+        let before = try dataDirectoryContents(paths)
+
+        let inspection = try store.inspect()
+
+        #expect(try dataDirectoryContents(paths) == before)
+        #expect(inspection.config.version == AppConfig.currentVersion)
+        #expect(inspection.onDiskVersion == 1)
+        #expect(inspection.migrationPending)
+        // Not relocated: it stays the fallback `machine.json` does not override.
+        #expect(inspection.config.resticPath == "/opt/homebrew/bin/restic")
+        let warning = try #require(inspection.pendingMigrationWarning)
+        #expect(warning.contains("schema v1") && warning.contains("v\(AppConfig.currentVersion)"))
+        // Every kind of trigger, including the repository commands that are
+        // not backups (Codex on #193).
+        for trigger in ["backups", "restore", "unlock", "purge apply", "configuration", "scheduled run"] {
+            #expect(warning.contains(trigger), "the warning does not name \(trigger) as a trigger")
+        }
+        #expect(try store.load(.inspecting) == inspection.config)
+        #expect(try dataDirectoryContents(paths) == before)
+
+        // The control: a migrating load of the same directory does change
+        // it, so the comparison above can see a migration.
+        _ = try store.load(.migrating)
+        #expect(try dataDirectoryContents(paths) != before)
+    }
+
+    /// Each migration step so far is a pure version bump, so for a config
+    /// with no deprecated `resticPath` an inspecting load returns exactly
+    /// what migrating returns.
+    @Test func inspectingAV4ConfigReturnsWhatMigratingWould() throws {
+        let (store, paths, cleanup) = try makeStore()
+        defer { cleanup() }
+        guard var object = try JSONSerialization.jsonObject(with: FixtureLoader.data("config-v2.json")) as? [String: Any],
+              var sets = object["sets"] as? [[String: Any]] else {
+            Issue.record("could not parse config-v2.json fixture as a JSON object with a sets array")
+            return
+        }
+        for index in sets.indices {
+            sets[index]["purgeExcludes"] = [String]()
+            sets[index]["onlineOnlyFiles"] = "skip"
+        }
+        object["sets"] = sets
+        object["version"] = 4
+        object["resticPath"] = NSNull()
+        try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]).write(to: paths.configFile)
+        try installMachine(at: paths)
+
+        let inspected = try store.inspect()
+        let migrated = try store.load(.migrating)
+
+        #expect(inspected.onDiskVersion == 4)
+        #expect(!inspected.config.sets.isEmpty)
+        #expect(inspected.config == migrated)
+        // Now current on disk: nothing is pending.
+        let after = try store.inspect()
+        #expect(after.onDiskVersion == AppConfig.currentVersion)
+        #expect(!after.migrationPending)
+        #expect(after.pendingMigrationWarning == nil)
+    }
+
+    @Test func inspectingANewerConfigRefusesAndAbsentIsEmpty() throws {
+        let (store, paths, cleanup) = try makeStore()
+        defer { cleanup() }
+
+        let absent = try store.inspect()
+        #expect(absent.onDiskVersion == nil)
+        #expect(!absent.migrationPending)
+        #expect(absent.config == AppConfig())
+
+        try Data(#"{"version":999,"resticPath":null,"showMenuBarIcon":true,"sets":[]}"#.utf8)
+            .write(to: paths.configFile)
+        let before = try dataDirectoryContents(paths)
+        #expect(throws: ConfigError.newerVersion(found: 999, supported: AppConfig.currentVersion)) {
+            _ = try store.inspect()
+        }
+        #expect(try dataDirectoryContents(paths) == before)
+    }
 }
 
 // MARK: - The environment override must never be persisted

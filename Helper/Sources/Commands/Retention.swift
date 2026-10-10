@@ -185,7 +185,7 @@ struct RetentionPreviewCommand: AsyncParsableCommand, JSONRenderable {
     }
 
     func run() async throws {
-        let context = try await HelperContext.make()
+        let context = try await HelperContext.make(.inspecting)
         let backupSet = try RepositorySelection.set(set, addressable: context.addressable)
         let destination = try RepositorySelection.destination(dest, of: backupSet)
 
