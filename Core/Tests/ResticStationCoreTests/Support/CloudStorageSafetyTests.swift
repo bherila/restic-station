@@ -31,6 +31,29 @@ struct CloudStorageSafetyTests {
         #expect(!CloudStorageSafety.isCloudSyncedPath("", homeDirectory: home))
     }
 
+    /// #186: the path answer is the same everywhere; whether a backup acts
+    /// on it is not. Both platform values are exercised on every host.
+    @Test("a backup decides about online-only files only where the platform has them")
+    func backupDecisionIsMacOSOnly() {
+        let home = "/Users/example"
+        let sources = [home]
+        #expect(CloudStorageSafety.containsCloudBackedSource(sources, homeDirectory: home))
+        #expect(CloudStorageSafety.backupDecidesOnlineOnlyFiles(
+            sources, homeDirectory: home, platformHasOnlineOnlyFiles: true
+        ))
+        #expect(!CloudStorageSafety.backupDecidesOnlineOnlyFiles(
+            sources, homeDirectory: home, platformHasOnlineOnlyFiles: false
+        ))
+        #expect(!CloudStorageSafety.backupDecidesOnlineOnlyFiles(
+            ["/srv/data"], homeDirectory: home, platformHasOnlineOnlyFiles: true
+        ))
+        #if os(macOS)
+        #expect(CloudStorageSafety.platformHasOnlineOnlyFiles)
+        #else
+        #expect(!CloudStorageSafety.platformHasOnlineOnlyFiles)
+        #endif
+    }
+
     @Test("a mixed source list enables cloud placeholder exclusion")
     func mixedSources() {
         #expect(CloudStorageSafety.containsCloudBackedSource([

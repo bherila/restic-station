@@ -860,7 +860,7 @@ public final class BackupEngine: Sendable {
         let excludeCloudFiles: Bool
         let cloudSourceNote: String?
         let versionBoundIdentity: String?
-        if !CloudStorageSafety.containsCloudBackedSource(set.sources) {
+        if !CloudStorageSafety.backupDecidesOnlineOnlyFiles(set.sources) {
             excludeCloudFiles = false
             cloudSourceNote = nil
             versionBoundIdentity = nil
@@ -1070,7 +1070,7 @@ public final class BackupEngine: Sendable {
         let onlineOnly = Self.dryRunOnlineOnlyNotes(
             set: set,
             primary: primary,
-            hasCloudSource: CloudStorageSafety.containsCloudBackedSource(set.sources),
+            hasCloudSource: CloudStorageSafety.backupDecidesOnlineOnlyFiles(set.sources),
             excludeCloudFiles: launch.excludeCloudFiles,
             cloudSourceNote: launch.cloudSourceNote
         )
