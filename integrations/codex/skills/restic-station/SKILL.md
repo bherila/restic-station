@@ -24,7 +24,10 @@ this skill: use only `status --json` and `config validate --json`. Add `--json` 
   with other machines, they then need an upgraded helper or they stop backing
   up. Straight after a helper upgrade on such a host, ask before the first
   config-loading command, even `config validate`.
-- Use only the set and destination UUIDs these return.
+- Use only the set and destination UUIDs these return. Do not echo
+  `config validate`'s `effective` object (source paths, exclusions,
+  repository URLs) unless the user asks about the configuration; its `errors`,
+  `warnings` and `nothingRunsHere` answer health questions.
 - Pick the lowest safety class that answers the question. `capabilities`
   lists each command's class. Get the user's explicit go-ahead before anything
   at `configurationWrite`, `repositoryWrite` or `destructive`.

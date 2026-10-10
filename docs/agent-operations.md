@@ -53,7 +53,13 @@ newer commands.
 1. `restic-station capabilities --json`: platform, restic, features, and every
    command with its safety class. Nothing else is read or written.
 2. `restic-station config validate --json`: whether the configuration loads,
-   its errors and warnings, and which sets run on this machine.
+   its errors and warnings, and which sets run on this machine. Its
+   `effective` object is the whole resolved configuration, with source paths,
+   exclusions and repository URLs. For a health or schedule question, keep
+   only what you need, for example
+   `restic-station config validate --json | jq '.data | {errors, warnings, nothingRunsHere}'`,
+   and show `effective` only when the user asks about the configuration
+   itself.
 3. `restic-station status --json`: health, last runs, destinations, scheduler.
 
 **Loading the configuration can rewrite it.** Every command except `version`
