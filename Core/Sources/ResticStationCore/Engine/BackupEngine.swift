@@ -950,11 +950,15 @@ public final class BackupEngine: Sendable {
     /// **What it never does.** No snapshot, copy, forget, prune, check,
     /// init, purge or `unlock` — a locked repository is reported, not
     /// unlocked. No run record or run log, no `current-run`, no
-    /// `lastBackupStart`, no repo-status write (not even the probe's), no
-    /// check cursor or purge watermark. The one thing it shares with every
-    /// other operation is the secret pre-flight's attention bookkeeping
-    /// (`state/secret-attention-<destId>.json`), which describes the store
-    /// rather than this run.
+    /// `lastBackupStart`, no check cursor or purge watermark, and the
+    /// probe's result is not written to repo-status. What it shares with
+    /// every other operation is the attention bookkeeping for problems that
+    /// describe the destination rather than this run: the secret
+    /// pre-flight's `state/secret-attention-<destId>.json`, and — when a
+    /// secret or online-only-repository refusal arrives only at restic's
+    /// launch, after the probe passed — what ``postPreflightSecretError(_:)``
+    /// records for it (#152, #180), which for an online-only repository is
+    /// repo-status's `reachable: false` and attention.
     ///
     /// **Fails closed on its own evidence.** The argv must carry
     /// `--dry-run`, checked again just before launch; and restic's
