@@ -41,6 +41,30 @@ struct ResticCommandTests {
         #expect(cmd.argv == ["-r", Self.repo, "backup", "--json", "/Users/user/Documents"])
     }
 
+    /// `docs/restic-cli.md` §backup dry-run: `--dry-run` sits right after
+    /// `--json`, ahead of every other flag, which is where
+    /// `BackupEngine.isDryRunBackup` looks for it (#78).
+    @Test("backup dry run: --dry-run right after --json, everything else unchanged")
+    func backupDryRun() {
+        // restic -r <primaryRepo> backup --json --dry-run [--exclude-cloud-files] [--exclude-caches] [--exclude-larger-than <size>] [--exclude <pat>]... [--iexclude <pat>]... <source>...
+        let cmd = ResticCommand.backup(
+            repo: Self.repo,
+            sources: ["/Users/user/proj"],
+            excludes: ["*.log"],
+            globalExcludes: ["node_modules"],
+            excludeCloudFiles: true,
+            excludeCaches: true,
+            excludeLargerThan: "10G",
+            dryRun: true
+        )
+        #expect(cmd.argv == [
+            "-r", Self.repo, "backup", "--json", "--dry-run",
+            "--exclude-cloud-files", "--exclude-caches", "--exclude-larger-than", "10G",
+            "--exclude", "*.log", "--iexclude", "node_modules",
+            "/Users/user/proj",
+        ])
+    }
+
     @Test("backup with excludes preserves flag order: excludes before sources")
     func backupWithExcludes() {
         // restic -r <primaryRepo> backup --json [--exclude <pat>]... <source>...

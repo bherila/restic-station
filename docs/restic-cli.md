@@ -91,8 +91,9 @@ Output (`init-secondary.json`): same `initialized` message. Without `--copy-chun
 
 ### backup
 ```
-restic -r <primaryRepo> backup --json [--exclude-cloud-files] [--exclude-caches] [--exclude-larger-than <size>] [--exclude <pat>]... [--iexclude <pat>]... <source>...
+restic -r <primaryRepo> backup --json [--dry-run] [--exclude-cloud-files] [--exclude-caches] [--exclude-larger-than <size>] [--exclude <pat>]... [--iexclude <pat>]... <source>...
 ```
+`--dry-run` is passed only by `backup dry-run` (§backup dry-run below); a real backup never carries it.
 `--exclude-cloud-files` is included when the set's `onlineOnlyFiles` is `"skip"` (the default; `docs/data-model.md` §v3 → v4), any effective source is under macOS's iCloud Drive (`~/Library/Mobile Documents`) or File Provider (`~/Library/CloudStorage`) roots — after resolving symlinks, and ignoring case on macOS — **and** the launched restic reports version 0.19.0 or newer (`restic version --json`, run immediately before the backup). It prevents restic from opening online-only placeholders and triggering large implicit downloads. The resulting snapshot intentionally contains only files resident on the Mac; the set editor warns about that completeness boundary. restic 0.17 does not know the flag and 0.18 accepts it only on Windows, so with an older or unreadable version the backup runs without it. The run log records a warning, and since #156 those files are still not downloaded: the backup's process is refused them (§Online-only files are refused at the kernel), so restic reports each as an unreadable file and the backup ends as a warning (exit 3). On Linux 0.19+ accepts the flag and skips nothing. With `onlineOnlyFiles: "download"` the flag is never passed and no version is asked for. The run log notes that online-only files are downloaded, unless the primary repository is itself in cloud storage. In that case the backup runs under the refusal policy below, online-only files are reported unreadable instead of downloaded, and the run log says so.
 
 Sources passed as **absolute paths**. NDJSON stream on stdout (`backup.ndjson`, `backup2.ndjson`):
@@ -111,6 +112,22 @@ Each backup passes `BackupSet.effectiveBackupExcludes` as `--exclude`: `excludes
 Note that an unanchored pattern matches any component of the **absolute** path, including directories above the source — `--exclude tmp` against a source under `/tmp/…` excludes the source itself. `docs/data-model.md` §Pattern shape covers what that rules out of the catalogue.
 
 The global list reaches **`backup` only**; `rewrite --forget` (§rewrite) sees `purgeExcludes` and nothing else, so a pattern that arrives because a newer build shipped a better catalogue can keep files out of the next snapshot and can never delete anything already in a repository.
+
+### backup dry-run
+```
+restic -r <primaryRepo> backup --json --dry-run [--exclude-cloud-files] [--exclude-caches] [--exclude-larger-than <size>] [--exclude <pat>]... [--iexclude <pat>]... <source>...
+```
+`restic-station-helper backup dry-run --set <uuid> [--json]` (#78) asks restic what a backup of the set would add right now, and writes nothing. restic reads every source as it would for a real backup, reports the totals, and saves no snapshot. The argv comes from the same builder as §backup, for the set as this machine resolves it (machine overrides applied, a set switched off here refused), so the two cannot disagree about sources, exclusions or `--exclude-cloud-files`; the only argv difference is `--dry-run`, right after `--json`.
+
+The helper takes the set lock, runs the secret pre-flight, refuses as a real backup would when the set uses an unusable global exclusion list, probes the primary (an online-only repository in a cloud-synced folder is refused before restic starts), and then runs that one command. Mirrors and retention are not involved.
+
+**What it never does.** No snapshot, `copy`, `forget`, `prune`, `check`, `init`, purge, or `unlock`: exit 11 is reported as `repository_locked`, never unlocked and retried. No run record or run log, no `current-run`, no `lastBackupStart`, and no repo-status write, not even for the probe. The secret pre-flight still keeps `state/secret-attention-<destId>.json` true, as every command that reads a secret does; that file describes the store, not this run.
+
+**Online-only files are never downloaded by a dry run**, even for a set whose `onlineOnlyFiles` is `"download"`. Its process gets the refusal policy (§Online-only files are refused at the kernel), so those files read as unreadable, the result is a warning, and the report says the real backup can add more.
+
+**Two checks that it really was a dry run.** The helper refuses to launch a command whose argv lacks `--dry-run` in that position. And restic 0.18 and later end a dry run with a `summary` line carrying `"dry_run": true`. The `snapshot_id` on that line names a snapshot that was never saved, and is never published. If the line is missing or does not say `dry_run`, no figures are reported: the command fails with `internal_error` and asks the caller to look at the repository's snapshots. restic has had `backup --dry-run` since 0.12, well below the 0.18 minimum, so no version probe gates it.
+
+Exit codes: 0 when restic finished (exit 3, some files unreadable, is still 0 with `"outcome": "warning"`), 2 when the set is busy, 3 when the primary is offline, 1 for everything else. `docs/cli-json.md` has the `--json` shape.
 
 ### copy (mirror primary → secondary)
 ```

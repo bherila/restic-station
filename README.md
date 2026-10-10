@@ -72,6 +72,7 @@ restic-station sets list              # configured backup sets on this machine
 restic-station runs list --limit 20   # recent run history
 restic-station config show --json     # effective, per-machine-resolved configuration
 restic-station excludes show          # this machine's global exclusion list
+restic-station backup dry-run --set <uuid>  # what a backup would add, without writing a snapshot
 ```
 
 Run `restic-station --help` for the full subcommand list (`config`, `excludes`, `status`, `sets`, `runs`, `secret`, `cli`, and the mutating commands `tick`/`run-set`/`restore`/… that the app and the background agent use themselves). Out of scope for now: a Homebrew formula, man pages, and shell completions (ArgumentParser can generate the last one cheaply — see the open follow-up issue if you want to pick it up).

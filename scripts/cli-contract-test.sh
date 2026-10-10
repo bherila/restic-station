@@ -137,6 +137,7 @@ excludes show|json|live
 config upgrade|json|live
 config acknowledge-migration|json|live
 probe-repo|json|live
+backup dry-run|json|live
 secret list|json|live
 cli status|json|live
 fda-check|json|live
@@ -390,6 +391,7 @@ if [ "\$1" = "version" ]; then
   echo '{"version":"0.18.1","go_version":"go1.22.0","go_os":"any","go_arch":"any"}'
   exit 0
 fi
+printf '%s\n' "\$*" >> "$FAKE_DIR/calls"
 CODE=\$(sed -n 1p "$MODE_FILE")
 OUT=\$(sed -n 2p "$MODE_FILE")
 FIFO=\$(sed -n 3p "$MODE_FILE")
@@ -685,7 +687,37 @@ jq -e '.data | .dryRun == false and .status == "success" and (has("confirmationB
     "$OUT_FILE" >/dev/null \
     || fail "an unbound real prune must complete without a confirmationBinding: $(jq -c '.data' "$OUT_FILE")"
 mark_cmd "maintenance prune"
-ok "all 13 asserted --json commands emit {schemaVersion, ok, data} with their documented payloads"
+
+# backup dry-run (#78): one restic call, `backup --json --dry-run`, and
+# nothing recorded — the run count is checked filter-free. restic's
+# `snapshot_id` for the unsaved snapshot must not reach the payload, and a
+# summary without `"dry_run": true` is not reported as a projection.
+DRY_SUMMARY='{"message_type":"summary","files_new":2,"files_changed":0,"files_unmodified":5,"dirs_new":1,"dirs_changed":0,"dirs_unmodified":3,"data_blobs":2,"tree_blobs":2,"data_added":4096,"data_added_packed":2048,"total_files_processed":7,"total_bytes_processed":9000,"total_duration":0.1,"backup_start":"2026-10-09T10:00:00Z","backup_end":"2026-10-09T10:00:01Z","snapshot_id":"e9ffc5cb64395ad443fd14f432751a9823181224978d6b25bf2af1a99ad367fd"'
+RUNS_BEFORE_DRY="$(run_count)"
+: > "$FAKE_DIR/calls"
+fake_mode 0 "$DRY_SUMMARY,\"dry_run\":true}"
+RESTIC_STATION_DATA_DIR="$FIXTURE" run_helper_split backup dry-run --set "$SET_ID" --json
+expect_rc 0
+assert_success_envelope "backup dry-run --json"
+[[ "$(jq -r '.data | keys | join(",")' "$OUT_FILE")" == "cloudFilesExcluded,excludeCaches,excludePatternCount,operation,outcome,primary,resticExitCode,setId,setName,summary,warnings" ]] \
+    || fail "backup dry-run --json payload keys drifted: $(jq -r '.data | keys | join(",")' "$OUT_FILE")"
+jq -e '.data | .operation == "backup-dry-run" and .outcome == "success" and .summary.filesNew == 2
+    and .summary.dataAdded == 4096 and (.primary | keys == ["id","label"])' "$OUT_FILE" >/dev/null \
+    || fail "backup dry-run --json payload is wrong: $(jq -c '.data' "$OUT_FILE")"
+! grep -q e9ffc5cb "$OUT_FILE" || fail "backup dry-run published restic's unsaved snapshot id"
+[[ "$(cat "$FAKE_DIR/calls")" == "-r $REPO_DIR backup --json --dry-run "* ]] \
+    || fail "backup dry-run must launch exactly one restic, backup --json --dry-run: $(cat "$FAKE_DIR/calls")"
+[[ "$(wc -l < "$FAKE_DIR/calls" | tr -d ' ')" == "1" ]] \
+    || fail "backup dry-run launched more than one restic: $(cat "$FAKE_DIR/calls")"
+[[ "$(run_count)" == "$RUNS_BEFORE_DRY" ]] || fail "backup dry-run wrote a run record"
+
+fake_mode 0 "$DRY_SUMMARY}"
+RESTIC_STATION_DATA_DIR="$FIXTURE" run_helper_split backup dry-run --set "$SET_ID" --json
+assert_error_envelope internal_error
+[[ "$(run_count)" == "$RUNS_BEFORE_DRY" ]] || fail "an unconfirmed backup dry-run wrote a run record"
+fake_mode 0
+mark_cmd "backup dry-run"
+ok "all 14 asserted --json commands emit {schemaVersion, ok, data} with their documented payloads"
 
 # The consumed-binding flow: the dry run's binding, fed through the
 # documented stdin selector, authorizes exactly one real prune.

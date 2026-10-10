@@ -29,6 +29,7 @@ import Testing
         names == [
             "tick",
             "run-set",
+            "backup",
             "purge",
             "maintenance",
             "init-secondary",
@@ -53,6 +54,7 @@ import Testing
         names == [
             "tick",
             "run-set",
+            "backup",
             "purge",
             "maintenance",
             "init-secondary",

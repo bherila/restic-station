@@ -141,6 +141,8 @@ struct HelperMain: AsyncParsableCommand {
         var subcommands: [any ParsableCommand.Type] = [
             Tick.self,
             RunSet.self,
+            // #78: read-only — what a backup would add, without one.
+            Backup.self,
             Purge.self,
             Maintenance.self,
             InitSecondary.self,

@@ -589,6 +589,76 @@ assert_run4() {
     log "$step OK (groupId=$group_id)"
 }
 
+# #78: `backup dry-run` against the real primary. The point is what it does
+# NOT do, so every assertion after the first is about state that must be
+# byte-for-byte what it was: snapshot counts on both repositories, the run
+# index, schedule state and both repo-status files. A held set lock must
+# make it exit 2 without leaving the `skipped` record `run-set` writes.
+assert_backup_dry_run() {
+    local step="backup dry-run (no snapshot, no run record, no state change)"
+    log "$step"
+
+    echo "dry-run only $RANDOM" > "$SOURCE_DIR/dry-run-new.txt"
+
+    local pcount_before scount_before index_before state_before
+    pcount_before="$(primary_snapshot_count)"
+    scount_before="$(secondary_snapshot_count_at "$SECONDARY_REPO")"
+    index_before="$(cat "$INDEX_FILE")"
+    state_before="$(cat "$DATA_DIR/state/schedule-state.json" \
+        "$DATA_DIR/state/repo-status-${PRIMARY_DEST_ID}.json" \
+        "$DATA_DIR/state/repo-status-${SECONDARY_DEST_ID}.json")"
+
+    local out err rc
+    set +e
+    out="$("$HELPER" backup dry-run --set "$SET_ID" --json 2>"$WORK/dry-run.err")"
+    rc=$?
+    set -e
+    err="$(cat "$WORK/dry-run.err")"
+    [[ $rc -eq 0 ]] || fail "$step" "backup dry-run exited $rc: $out $err"
+    echo "$out" | jq -e '.ok == true and .data.operation == "backup-dry-run"' >/dev/null \
+        || fail "$step" "not one success envelope on stdout: $out"
+    echo "$out" | jq -e '.data.outcome == "success" and .data.summary.filesNew >= 1' >/dev/null \
+        || fail "$step" "expected a success projecting the new file: $out"
+    # Path-free: neither the source tree nor the unsaved snapshot id that
+    # restic prints for a dry run may reach the published document.
+    [[ "$out" != *"$SOURCE_DIR"* ]] || fail "$step" "JSON output names the source path: $out"
+    echo "$out" | jq -e '[.. | objects | has("snapshotId")] | any | not' >/dev/null \
+        || fail "$step" "JSON output carries a snapshotId: $out"
+
+    [[ "$(primary_snapshot_count)" -eq "$pcount_before" ]] \
+        || fail "$step" "primary snapshot count changed ($pcount_before -> $(primary_snapshot_count))"
+    [[ "$(secondary_snapshot_count_at "$SECONDARY_REPO")" -eq "$scount_before" ]] \
+        || fail "$step" "secondary snapshot count changed"
+    [[ "$(cat "$INDEX_FILE")" == "$index_before" ]] || fail "$step" "runs/index.jsonl changed"
+    [[ "$(cat "$DATA_DIR/state/schedule-state.json" \
+        "$DATA_DIR/state/repo-status-${PRIMARY_DEST_ID}.json" \
+        "$DATA_DIR/state/repo-status-${SECONDARY_DEST_ID}.json")" == "$state_before" ]] \
+        || fail "$step" "schedule state or repo-status changed"
+
+    mkdir -p "$DATA_DIR/locks"
+    python3 - "$DATA_DIR/locks/set-${SET_ID}.lock" <<'PY' &
+import fcntl, sys, time
+f = open(sys.argv[1], "a+")
+fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+time.sleep(20)
+PY
+    LOCK_HOLDER_PID=$!
+    sleep 1
+    set +e
+    out="$("$HELPER" backup dry-run --set "$SET_ID" --json 2>/dev/null)"
+    rc=$?
+    set -e
+    kill "$LOCK_HOLDER_PID" >/dev/null 2>&1 || true
+    wait "$LOCK_HOLDER_PID" 2>/dev/null || true
+    LOCK_HOLDER_PID=""
+    [[ $rc -eq 2 ]] || fail "$step" "expected exit 2 while the set lock is held, got $rc: $out"
+    echo "$out" | jq -e '.ok == false and .error.code == "set_busy"' >/dev/null \
+        || fail "$step" "expected a set_busy envelope: $out"
+    [[ "$(cat "$INDEX_FILE")" == "$index_before" ]] || fail "$step" "a busy dry run wrote a run record"
+
+    log "$step OK"
+}
+
 # T24: end-to-end proof that a real v1 config, loaded by the real helper,
 # migrates non-destructively and keeps backing up exactly what it did before.
 # Runs after the first backup, so migration has definitely happened.
@@ -1539,6 +1609,7 @@ main() {
     assert_run2
     assert_run3
     assert_run4
+    assert_backup_dry_run
     assert_retention
     assert_purge_noop_self_heals
     assert_global_excludes
