@@ -93,7 +93,7 @@ struct HelperMain: AsyncParsableCommand {
         CommandConfiguration(
             commandName: resolvedCommandName(),
             abstract: "Restic Station background helper. "
-                + "Exit codes (per-subcommand, see each --help): 0 ok, 1 error, 2 busy, 3 offline (probe-repo, purge preview).",
+                + "Exit codes (per-subcommand, see each --help): 0 ok, 1 error, 2 busy, 3 offline (probe-repo, purge preview, backup dry-run).",
             subcommands: subcommandList
         )
     }
