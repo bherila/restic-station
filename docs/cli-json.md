@@ -208,8 +208,8 @@ counted.
 
 | Class | Means | Commands |
 |---|---|---|
-| `readOnly` | Changes nothing. | `version`, `capabilities`, `status`, `sets list`, `runs list`/`show`, `config show`/`validate`/`export`, `excludes show`, `secret list`, `cli status`, `timer status`, `backup dry-run`, `snapshots list`, `retention preview` |
-| `localStateWrite` | Records observations or bookkeeping. | `probe-repo` (repo-status), `fda-check`, `purge preview` (mints a token), `config acknowledge-migration` |
+| `readOnly` | Changes nothing. | `version`, `capabilities`, `status`, `sets list`, `runs list`/`show`, `config show`/`validate`, `excludes show`, `secret list`, `cli status`, `timer status`, `backup dry-run`, `snapshots list`, `retention preview` |
+| `localStateWrite` | Writes local files only: observations or bookkeeping, or an output file the caller named. Never configuration, secrets or a repository. | `probe-repo` (repo-status), `fda-check`, `purge preview` (mints a token), `config acknowledge-migration`, `config export` (`--out` writes the named file) |
 | `configurationWrite` | Changes configuration, stored secrets, the exclusion list, or host integration. | `config import`/`upgrade`, `secret set`/`set-env`/`rm`, `excludes enable`/`disable`/`add`/`remove`/`set`/`reset`, `cli install`/`uninstall`, `timer install`/`uninstall` |
 | `repositoryWrite` | Writes to a repository or restores from one. | `init-secondary`, `restore`, `unlock` |
 | `destructive` | Can remove repository data. | `tick`, `run-set` (scheduled retention runs inside a backup), `purge apply`, `maintenance prune` |

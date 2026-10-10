@@ -156,6 +156,8 @@ import Testing
         #expect(table["run-set"]?.safetyClass == .destructive)
         #expect(table["purge apply"]?.safetyClass == .destructive)
         #expect(table["config export"]?.json == false)
+        // `--out` writes a file (Codex on #189).
+        #expect(table["config export"]?.safetyClass == .localStateWrite)
         #expect(table["capabilities"]?.json == true)
         #expect(CommandRegistry.excludedCommands["print-password"] != nil)
         #expect(table["print-password"] == nil)

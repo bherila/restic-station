@@ -17,8 +17,10 @@ import Foundation
 public enum CommandSafetyClass: String, CaseIterable, Sendable, Encodable {
     /// Changes nothing, locally or in a repository.
     case readOnly
-    /// Records observations or bookkeeping only: repo-status, the FDA
-    /// probe result, a preview token, a cleared migration notice.
+    /// Writes local files only: observations or bookkeeping (repo-status,
+    /// the FDA probe result, a preview token, a cleared migration notice),
+    /// or an output file the caller named (`config export --out`). Never
+    /// configuration, secrets or a repository.
     case localStateWrite
     /// Changes configuration, stored secrets, the exclusion list, or host
     /// integration (the CLI symlink, the systemd timer).
@@ -65,7 +67,6 @@ public enum CommandRegistry {
         CommandCapability("runs show", json: true, .readOnly),
         CommandCapability("config show", json: true, .readOnly),
         CommandCapability("config validate", json: true, .readOnly),
-        CommandCapability("config export", json: false, .readOnly),
         CommandCapability("excludes show", json: true, .readOnly),
         CommandCapability("secret list", json: true, .readOnly),
         CommandCapability("cli status", json: true, .readOnly),
@@ -78,6 +79,8 @@ public enum CommandRegistry {
         CommandCapability("fda-check", json: true, .localStateWrite),
         CommandCapability("purge preview", json: true, .localStateWrite),
         CommandCapability("config acknowledge-migration", json: true, .localStateWrite),
+        // `--out` creates or replaces the file the caller names.
+        CommandCapability("config export", json: false, .localStateWrite),
         // Configuration and host integration.
         CommandCapability("config import", json: false, .configurationWrite),
         CommandCapability("config upgrade", json: true, .configurationWrite),
