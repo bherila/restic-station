@@ -337,7 +337,38 @@ import Testing
         #expect(report.warnings.contains {
             $0.hasPrefix("online-only files were not downloaded for the dry run")
         })
+        // The real backup's "are downloaded (set policy)" note would
+        // contradict what this run did.
+        #expect(!report.logNotes.contains { $0.contains("downloaded (set policy)") })
         #expect(!report.cloudFilesExcluded)
+    }
+
+    /// A download set whose primary is itself in cloud storage does not
+    /// download in its real backup either, so the dry run must not claim
+    /// the real one would add more. Review finding on #185.
+    @Test("a download set into a cloud-stored primary gets no 'a real backup downloads them' warning")
+    func downloadSetIntoCloudPrimary() {
+        let home = "/Users/example"
+        let cloudSource = home + "/Library/Mobile Documents/com~apple~CloudDocs/Notes"
+        func notes(primaryRepo: String) -> (warning: String?, note: String?) {
+            let primary = Destination(id: T.primaryId, label: "Primary", repoURL: primaryRepo, isPrimary: true)
+            let set = BackupSet(
+                id: T.setId, name: "Notes", sources: [cloudSource], onlineOnlyFiles: .download,
+                schedule: .daily(hour: 2, minute: 30), destinations: [primary]
+            )
+            return BackupEngine.dryRunOnlineOnlyNotes(
+                set: set, primary: primary, hasCloudSource: true, excludeCloudFiles: false,
+                cloudSourceNote: "the real backup's note", homeDirectory: home
+            )
+        }
+
+        let cloudPrimary = notes(primaryRepo: home + "/Library/Mobile Documents/com~apple~CloudDocs/repo")
+        #expect(cloudPrimary.warning == nil)
+        #expect(cloudPrimary.note == "the real backup's note")
+
+        let localPrimary = notes(primaryRepo: "/Volumes/Backup/repo")
+        #expect(localPrimary.warning?.contains("a real backup downloads them") == true)
+        #expect(localPrimary.note == nil)
     }
 
     @Test("a cloud-backed source on restic 0.19 gets --exclude-cloud-files in the dry run too")

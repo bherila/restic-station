@@ -1066,17 +1066,15 @@ public final class BackupEngine: Sendable {
         if reportOutcome == .warning {
             warnings.append("some source files could not be read; the figures leave them out")
         }
-        if CloudStorageSafety.containsCloudBackedSource(set.sources) {
-            if set.onlineOnlyFiles == .download {
-                warnings.append(
-                    "online-only files were not downloaded for the dry run; "
-                        + "a real backup downloads them, so it can add more than this"
-                )
-            } else if !launch.excludeCloudFiles {
-                warnings.append(
-                    "this restic cannot skip online-only files, so each is reported as unreadable"
-                )
-            }
+        let onlineOnly = Self.dryRunOnlineOnlyNotes(
+            set: set,
+            primary: primary,
+            hasCloudSource: CloudStorageSafety.containsCloudBackedSource(set.sources),
+            excludeCloudFiles: launch.excludeCloudFiles,
+            cloudSourceNote: launch.cloudSourceNote
+        )
+        if let warning = onlineOnly.warning {
+            warnings.append(warning)
         }
         if set.excludesCaches(applying: globalExcludes) && !launch.excludeCaches {
             warnings.append(
@@ -1085,7 +1083,7 @@ public final class BackupEngine: Sendable {
         }
 
         var logNotes: [String] = []
-        if let note = launch.cloudSourceNote {
+        if let note = onlineOnly.note {
             logNotes.append(note)
         }
         logNotes.append(globalExcludeNote(for: set, cacheTagFinding: launch.cacheTagFinding))
@@ -1103,6 +1101,40 @@ public final class BackupEngine: Sendable {
             warnings: warnings,
             logNotes: logNotes
         )
+    }
+
+    /// What a dry run says about online-only files: a path-free warning,
+    /// and the run-log note to print beside it.
+    ///
+    /// The real backup's note is kept except in the one case where a dry
+    /// run behaves differently: a set that downloads online-only files,
+    /// into a primary that is not itself in cloud storage. There the note
+    /// ("online-only files are downloaded") would contradict what the dry
+    /// run did, so it is replaced by the warning that the real backup can
+    /// add more. A download set whose primary *is* in cloud storage gets no
+    /// such warning: its real backup does not download them either, and its
+    /// note already says why.
+    static func dryRunOnlineOnlyNotes(
+        set: BackupSet,
+        primary: Destination,
+        hasCloudSource: Bool,
+        excludeCloudFiles: Bool,
+        cloudSourceNote: String?,
+        homeDirectory: String = NSHomeDirectory()
+    ) -> (warning: String?, note: String?) {
+        guard hasCloudSource else { return (nil, cloudSourceNote) }
+        if set.onlineOnlyFiles == .download {
+            guard backupDownloadsOnlineOnlyFiles(set: set, primary: primary, homeDirectory: homeDirectory) else {
+                return (nil, cloudSourceNote)
+            }
+            return (
+                "online-only files were not downloaded for the dry run; "
+                    + "a real backup downloads them, so it can add more than this",
+                nil
+            )
+        }
+        guard !excludeCloudFiles else { return (nil, cloudSourceNote) }
+        return ("this restic cannot skip online-only files, so each is reported as unreadable", cloudSourceNote)
     }
 
     /// `backup --json --dry-run`, exactly where ``ResticCommand/backup(repo:sources:excludes:globalExcludes:excludeCloudFiles:excludeCaches:excludeLargerThan:dryRun:)``
