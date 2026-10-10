@@ -795,6 +795,46 @@ assert_retention() {
     [[ "$(secondary_snapshot_count_at "$SECONDARY_REPO")" -eq "$scount_before" ]] \
         || fail "$step" "the refusal removed secondary snapshots"
 
+    # ── half 1b: the read-only views of the same state (#80) ─────────────
+    # `snapshots list` sees every primary snapshot; `retention preview`
+    # plans keep-last 2 against them and removes nothing; a mirror's preview
+    # says it is not evidence of a safe prune. Filter-free: snapshot counts
+    # and the whole run index are unchanged afterwards.
+    local index_before_preview
+    index_before_preview="$(cat "$INDEX_FILE")"
+    set +e
+    out="$("$HELPER" snapshots list --set "$SET_ID" --json 2>/dev/null)"
+    rc=$?
+    set -e
+    [[ $rc -eq 0 ]] || fail "$step" "snapshots list exited $rc: $out"
+    echo "$out" | jq -e --argjson n "$pcount_before" \
+        '.ok == true and .data.totalCount == $n and (.data.snapshots | length) == $n and .data.snapshots[0].paths == null' \
+        >/dev/null || fail "$step" "snapshots list did not report the $pcount_before primary snapshots: $out"
+    [[ "$out" != *"$SOURCE_DIR"* ]] || fail "$step" "snapshots list published the source path: $out"
+
+    set +e
+    out="$("$HELPER" retention preview --set "$SET_ID" --json 2>/dev/null)"
+    rc=$?
+    set -e
+    [[ $rc -eq 0 ]] || fail "$step" "retention preview exited $rc: $out"
+    echo "$out" | jq -e --argjson n "$pcount_before" \
+        '.ok == true and .data.keepCount == 2 and .data.removeCount == ($n - 2) and .data.mirror == null' \
+        >/dev/null || fail "$step" "retention preview did not plan keep-last 2 over $pcount_before snapshots: $out"
+
+    set +e
+    out="$("$HELPER" retention preview --set "$SET_ID" --dest "$SECONDARY_DEST_ID" --json 2>/dev/null)"
+    rc=$?
+    set -e
+    [[ $rc -eq 0 ]] || fail "$step" "retention preview of the mirror exited $rc: $out"
+    echo "$out" | jq -e '.ok == true and .data.destination.role == "secondary" and .data.mirror != null
+        and (.data.warnings | map(test("not evidence")) | any)' \
+        >/dev/null || fail "$step" "the mirror's preview did not carry its sync state and warning: $out"
+
+    [[ "$(primary_snapshot_count)" -eq "$pcount_before" ]] || fail "$step" "a preview removed primary snapshots"
+    [[ "$(secondary_snapshot_count_at "$SECONDARY_REPO")" -eq "$scount_before" ]] \
+        || fail "$step" "a preview removed secondary snapshots"
+    [[ "$(cat "$INDEX_FILE")" == "$index_before_preview" ]] || fail "$step" "a preview wrote a run record"
+
     # ── half 2: the scheduled path still applies the same policy ─────────
     # Through `tick`, not `run-set --kind backup`: only `tick` runs the due
     # check and dispatches with trigger `.scheduled`. Driving `run-set` here

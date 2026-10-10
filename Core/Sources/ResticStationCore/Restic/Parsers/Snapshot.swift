@@ -16,6 +16,8 @@ public struct Snapshot: Decodable, Equatable, Sendable {
     public let paths: [String]
     public let hostname: String
     public let username: String
+    /// `null` (or absent) when the snapshot has none.
+    public let tags: [String]?
     public let programVersion: String?
     public let summary: Summary?
 
@@ -28,6 +30,7 @@ public struct Snapshot: Decodable, Equatable, Sendable {
         case paths
         case hostname
         case username
+        case tags
         case programVersion = "program_version"
         case summary
     }

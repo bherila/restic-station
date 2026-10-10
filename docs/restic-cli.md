@@ -249,7 +249,7 @@ JSON output (`forget.json`, captured with `--dry-run`): array of group objects `
 - Refuse to run with an empty policy (no --keep flags would delete NOTHING in restic ≥0.17 by default, but guard anyway).
 - Always run with the exact per-set `RetentionPolicy`, mapped flag-per-field, skipping nil fields.
 - Apply the same policy to secondaries after a successful copy (copy never propagates deletions; without this, mirrors grow forever).
-- UI "preview" uses `--dry-run` and renders keep/remove lists.
+- UI "preview" uses `--dry-run` and renders keep/remove lists. So does the helper's `retention preview` (#80): `restic -r <repo> forget --json <policy> --dry-run`, the configured policy only, never `--prune` (checked again before launch), under the set lock and after the secret pre-flight and reachability probe, recording nothing. A set with no keep rule is refused before restic runs. `snapshots list` (#80) is `restic -r <repo> snapshots --json` after the same pre-flights, without the set lock. Neither runs `unlock` on exit 11. `docs/cli-json.md` has both shapes.
 
 ### check (integrity)
 ```

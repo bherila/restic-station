@@ -55,6 +55,8 @@ itself, unwrapped, because its output is meant to be fed straight back into
 | `config upgrade` | ✅ | `{ fromVersion, toVersion, migrated, backupFile, message }` — migrates `config.json` to this binary's schema now; `migrated: false` (with `backupFile`/`message` `null`) when it was already current. A migration that could not be written is `internal_error` |
 | `config acknowledge-migration` | ✅ | `{ hadMigration, fromVersion, toVersion, acknowledgedAt }` — clears the warning `status` raises for this machine's last schema migration (`configMigration`); `hadMigration: false` and nulls when none was recorded |
 | `probe-repo` | ✅ | `{ setId, destinationId, label, outcome, reachable, reason }` |
+| `snapshots list` | ✅ | `{ setId, destination, totalCount, limit, pathsIncluded, snapshots }` — see §`snapshots list` below |
+| `retention preview` | ✅ | `{ setId, destination, previewedAt, policy, keepCount, removeCount, pathsIncluded, groups, mirror, fingerprint, warnings }` — see §`retention preview` below |
 | `backup dry-run` | ✅ | `{ operation, setId, setName, primary, outcome, resticExitCode, cloudFilesExcluded, excludeCaches, excludePatternCount, summary, warnings }` — see §`backup dry-run` below |
 | `secret list` | ✅ | array of `{ destId, label, setName, hasPassword, secretEnvCount }` — only destinations that have something stored, the same set human mode prints |
 | `cli status` | ✅ | `CLIInstaller.Status` |
@@ -100,6 +102,37 @@ Two payload notes that are easy to get wrong:
                  "dataAdded": 4472, "dataAddedPacked": 3435 },
     "warnings": [] }
   ```
+- **`snapshots list` and `retention preview` (#80) leave source paths out
+  by default.** Each snapshot carries `pathCount`, and `paths` is `null`
+  unless the caller passed `--include-paths`: source paths can reveal
+  private structure. Neither publishes a repository URL — `destination` is
+  `{ id, label, role }`, `role` being `primary` or `secondary`. `--dest`
+  defaults to the set's primary on this machine; a set or destination
+  switched off here is `set_disabled_here` / `destination_disabled_here`.
+
+  A snapshot is `{ id, shortId, time, hostname, username, tags, parent,
+  pathCount, paths }`; `tags` is `[]` when there are none, `parent` is
+  `null` when restic has none. `snapshots list` orders them newest first
+  (ties by `id`) and returns at most `--limit` (default 50, 1–1000);
+  `totalCount` is how many the repository holds. It takes no set lock, so
+  it answers during a backup.
+
+  `retention preview` runs `restic forget --json <policy> --dry-run` — the
+  configured policy, never `--prune`, never arbitrary keep values — under
+  the set lock (`set_busy`, exit 2). A set with no policy, or one with no
+  keep rule, is `operation_not_allowed` before restic runs. `groups` are
+  restic's policy groups (`host`, `tags`, `pathCount`, `paths`); each
+  `keep` entry carries restic's `reasons` (`"last snapshot"`,
+  `"daily snapshot"`, …) and each `remove` entry `reasons: []`.
+  `fingerprint` is `sha256:` over the set, destination, repository,
+  policy and the exact keep and remove ids — not the time — so two
+  previews of an unchanged repository match. For a mirror, `mirror` is
+  `{ lastSyncedAt, primaryLastSyncedAt, behindPrimary }` from repo-status
+  and `warnings` says that a preview is not evidence the mirror is safe to
+  prune (scheduled retention prunes a mirror only after that run's copy to
+  it succeeds, and manual apply stays contained — #82, #111); it is `null`
+  for the primary. Both commands are read-only: no run record, no
+  repo-status write for their probe.
 - **`fda-check` has three states, not two.** Off macOS, `applicable` is
   `false` and `granted` is `null`. A caller must check `applicable` before
   reading `granted`, exactly as an absent `state/fda-check.json` means
@@ -133,9 +166,9 @@ never match on it. `details` is omitted entirely when empty.
 | `invalid_arguments` | no | 64 / 1 | Arguments missing, malformed, or out of range. See §Argument-parser failures for the two exit codes. |
 | `config_invalid` | no | 1 | A configuration file on this host will not load — `config.json` undecodable, failing `validate()`, or written by a newer build; `machine.json` unreadable; or `RESTIC_STATION_SECRET_BACKEND` naming a backend that does not exist. `message` names which. |
 | `set_not_found` | no | 1 | No backup set with that id. |
-| `set_disabled_here` | no | 1 | The set exists in the shared config but is switched off for this machine. |
+| `set_disabled_here` | no | 1 | The set exists in the shared config but is switched off for this machine. Emitted by `backup dry-run`, `snapshots list` and `retention preview`. |
 | `destination_not_found` | no | 1 | No such destination in that set. |
-| `destination_disabled_here` | no | 1 | The destination is switched off for this machine. |
+| `destination_disabled_here` | no | 1 | The destination is switched off for this machine. Emitted by `snapshots list` and `retention preview` for a `--dest` switched off here. |
 | `run_not_found` | no | 1 | No run record with that id. |
 | `set_busy` | **yes** | **2** | Another operation holds this set's lock. |
 | `repository_offline` | **yes** | **3** | The destination did not answer — an unplugged drive, a sleeping NAS. Expected, not a fault. |
@@ -277,15 +310,16 @@ code alone.
 
 ## Coverage today
 
-Fifteen commands, listed in the matrix above. The mutating commands remain
+Seventeen commands, listed in the matrix above. The mutating commands remain
 human-only and still write prose to stderr — the boundary is stated in the
 matrix rather than papered over. `purge apply` and `maintenance prune` are the
 exception: they mutate, and they carry `--json` because the app drives them.
 
 Every defined code now has a producer. `repository_offline` was wired by #79
-and is also emitted by `purge preview` and `backup dry-run` (exit 3); `operation_not_allowed` is
+and is also emitted by `purge preview`, `backup dry-run`, `snapshots list` and `retention preview` (exit 3); `operation_not_allowed` is
 emitted by `purge apply` and `maintenance prune` when a confirmation does not
-match the current plan; it is also the classification behind
+match the current plan, and by `retention preview` for a set with no keep
+rule; it is also the classification behind
 `run-set --kind prune`'s unconditional refusal — but `run-set` is
 **human-only** (it has no `--json` mode), so that refusal reaches callers as
 prose on stderr with exit 1, never as a JSON envelope. Automation should

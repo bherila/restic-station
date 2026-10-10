@@ -126,19 +126,7 @@ struct BackupDryRunCommand: AsyncParsableCommand, JSONRenderable {
         // machine's backup do", so it resolves the set exactly as this
         // machine's backup would — machine overrides applied, and a set
         // switched off here refused rather than previewed.
-        guard let backupSet = context.scheduled.set(id: set) else {
-            if let omission = context.scheduled.omissions.first(where: { $0.id == set }) {
-                if case .disabledForMachine = omission.reason {
-                    throw CLIFailure.setDisabledHere(setId: set, machineId: context.scheduled.machineId)
-                }
-                throw CLIFailure(
-                    code: .configInvalid,
-                    message: CLIFailure.bounded("\(omission) (\"\(context.scheduled.machineId)\")"),
-                    details: CLIErrorDetails(setId: set, machineId: context.scheduled.machineId)
-                )
-            }
-            throw CLIFailure.setNotFound(setId: set)
-        }
+        let backupSet = try RepositorySelection.set(set, scheduled: context.scheduled)
 
         let report: BackupDryRunReport
         do {
