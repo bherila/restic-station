@@ -22,7 +22,7 @@ installing anything.
   `scripts/agent-skill-lint.sh` checks them, the skill and the guide against
   the helper's own `capabilities --json` on every CI run.
 
-The skill needs a helper newer than v0.1.3, which has `capabilities`,
+The skill needs a helper that has `capabilities` (ask it: `capabilities --json`), along with
 `backup dry-run`, `snapshots list` and `retention preview`.
 
 ## Install

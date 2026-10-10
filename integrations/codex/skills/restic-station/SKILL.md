@@ -11,7 +11,8 @@ repository (https://github.com/bherila/restic-station/blob/main/docs/agent-opera
 This skill is the sequence; the guide wins on any disagreement.
 
 Call `restic-station` (or `restic-station-helper` where the link is not
-installed). Add `--json` wherever it is offered, and branch on `ok`,
+installed). If `capabilities` is an unknown command, the helper is too old for
+this skill: use only `status --json` and `config validate --json`. Add `--json` wherever it is offered, and branch on `ok`,
 `error.code` and `error.retryable`, never on message text.
 
 ## Always

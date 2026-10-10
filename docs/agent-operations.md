@@ -18,10 +18,12 @@ Call `restic-station`, the link that `restic-station-helper cli install` puts
 on `PATH`. On a host without the link, call `restic-station-helper` by its
 installed path; the two are the same program.
 
-These commands need a helper newer than v0.1.3: `capabilities`,
-`backup dry-run`, `snapshots list`, `retention preview`. If `capabilities`
-is an unknown command, the helper is older: use `status --json` and
-`config validate --json`, and do not try the newer commands.
+Whether this helper has the commands this guide relies on is decided by
+asking it, not by its version number: run `capabilities --json`. If that
+is an unknown command (exit 64, `invalid_arguments`), the helper predates
+`capabilities`, `backup dry-run`, `snapshots list` and `retention preview`:
+use `status --json` and `config validate --json` only, and do not try the
+newer commands.
 
 ## Rules that always apply
 
