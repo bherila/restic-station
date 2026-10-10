@@ -637,7 +637,24 @@ extension CLIFailure {
             )
         case .probeFailed(let destinationId, let exitClass),
              .resticFailed(let destinationId, let exitClass):
-            return classify(exitClass: exitClass, setId: setId, destinationId: destinationId)
+            let failure = classify(exitClass: exitClass, setId: setId, destinationId: destinationId)
+            // The generic wording sends the caller to "the run log", which
+            // a dry run deliberately never writes. Keep the code, details
+            // and restic's own error text; say where the output went.
+            let message: String
+            switch exitClass {
+            case .fatal(let stderrSummary):
+                let trimmed = stderrSummary.trimmingCharacters(in: CharacterSet(charactersIn: ". \n"))
+                message = (trimmed.isEmpty ? "restic reported a fatal error" : trimmed)
+                    + ". A dry run keeps no run log, so this is all of restic's output that was kept."
+            case .other(let code):
+                message = "restic exited unexpectedly (code \(code)). "
+                    + "A dry run keeps no run log, so there is no further output to open."
+            case .success, .successUnverified, .warningIncompleteRead,
+                 .repoDoesNotExist, .repoLocked, .wrongPassword:
+                return failure
+            }
+            return CLIFailure(code: failure.code, message: bounded(message), details: failure.details)
         case .resticDidNotRun(let destinationId, let runnerError):
             let failure = classify(runnerError)
             var details = failure.details

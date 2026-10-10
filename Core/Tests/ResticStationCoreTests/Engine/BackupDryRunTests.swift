@@ -412,6 +412,30 @@ import Testing
 
     // MARK: - CLI mapping
 
+    /// A dry run writes no run log, so no refusal may send the caller to
+    /// one. Codex on #185.
+    @Test("restic failures keep restic's text and never point at a run log")
+    func failureMessagesNameNoRunLog() {
+        let cases: [ResticExitClass] = [.fatal(stderrSummary: "Fatal: unable to open config file"), .other(42)]
+        for exitClass in cases {
+            for error in [
+                BackupDryRunError.resticFailed(destinationId: T.primaryId, exitClass),
+                .probeFailed(destinationId: T.primaryId, exitClass),
+            ] {
+                let failure = CLIFailure.classifyBackupDryRun(error, setId: T.setId)
+                #expect(!failure.message.contains("run log for"), "\(error): \(failure.message)")
+                #expect(failure.message.contains("keeps no run log"), "\(error)")
+                #expect(failure.code == .resticFailed)
+                #expect(failure.details.resticExitCode != nil)
+            }
+        }
+        let fatal = CLIFailure.classifyBackupDryRun(
+            BackupDryRunError.resticFailed(destinationId: T.primaryId, .fatal(stderrSummary: "Fatal: unable to open config file")),
+            setId: T.setId
+        )
+        #expect(fatal.message.hasPrefix("Fatal: unable to open config file"))
+    }
+
     @Test("each refusal maps to its documented code and exit")
     func cliMapping() {
         let setId = T.setId
