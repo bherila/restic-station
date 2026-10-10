@@ -230,8 +230,10 @@ public final class ResticRunner: Sendable {
     /// The first restic whose `backup --exclude-cloud-files` works on macOS.
     ///
     /// Older releases fail the whole backup when the flag is passed: 0.17
-    /// does not know it, and 0.18 accepts it only on Windows. Linux releases
-    /// from 0.19 accept it and find nothing to skip.
+    /// does not know it, and 0.18 accepts it only on Windows. No Linux
+    /// release accepts it: restic registers the flag only on macOS and
+    /// Windows, so the engine never passes it off macOS
+    /// (``CloudStorageSafety/backupDecidesOnlineOnlyFiles(_:homeDirectory:platformHasOnlineOnlyFiles:)``, #186).
     public static let excludeCloudFilesMinimumVersion = "0.19.0"
 
     /// The version the restic this runner launches reports, or nil when it
