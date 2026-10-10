@@ -11,7 +11,9 @@
 #   3. integrations/codex/evals/fixtures.json: every fixture's steps resolve;
 #      nothing above localStateWrite runs before an `ask-user` step; a
 #      fixture's maxSafetyClass holds; its forbidden strings appear in no
-#      step; a restore never runs without --target and --overwrite never;
+#      step; it starts with `capabilities --json` and runs `config validate`
+#      before any `ask-user`; a restore never runs without --target and
+#      --overwrite never;
 #      and the required kinds of request are all covered.
 #   4. Relative links (and links to this repository on GitHub) resolve.
 #   5. Privacy: every UUID is a declared synthetic one, and every home path
@@ -116,6 +118,12 @@ while IFS= read -r id; do
     max="$(jq -r --arg id "$id" '.fixtures[] | select(.id == $id) | .maxSafetyClass // "destructive"' "$FIXTURES")"
     max_rank="$(class_rank "$max")"
     [[ "$max_rank" != 9 ]] || fail "$id: unknown maxSafetyClass '$max'"
+    [[ "$(head -n1 "$WORK/steps")" == "restic-station capabilities --json" ]] \
+        || fail "$id: does not start with restic-station capabilities --json"
+    if grep -qx 'ask-user' "$WORK/steps"; then
+        sed '/^ask-user$/,$d' "$WORK/steps" | grep -q '^restic-station config validate' \
+            || fail "$id: asks for authorization before running config validate"
+    fi
     authorized=false
     while IFS= read -r step; do
         case "$step" in
