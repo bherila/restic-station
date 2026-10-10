@@ -36,12 +36,16 @@ struct Status: AsyncParsableCommand, JSONRenderable {
         let stateStore = StateStore(paths: paths)
         let runStore = RunStore(paths: paths)
 
-        let config: AppConfig
+        // Inspecting (#191): `status` is a monitoring check, and running one
+        // must not be what upgrades a shared config. An older schema is
+        // reported in `pendingConfigMigration` instead.
+        let inspection: ConfigInspection
         do {
-            config = try configStore.load()
+            inspection = try configStore.inspect()
         } catch {
             throw CLIFailure.configInvalid(underlying: error)
         }
+        let config = inspection.config
         let machineId: String
         do {
             machineId = try MachineStore(paths: paths).load().machineId
@@ -284,6 +288,7 @@ struct Status: AsyncParsableCommand, JSONRenderable {
         )
         report.auditFailures = auditFailures.map(StatusReport.AuditFailure.init)
         report.configMigration = configMigration.map(StatusReport.ConfigMigration.init)
+        report.pendingConfigMigration = StatusReport.PendingConfigMigration(inspection)
 
         if json {
             CLIJSON.print(report)
@@ -781,6 +786,9 @@ struct StatusReport: Encodable {
     /// The last schema migration this host wrote to the shared config
     /// (`state/config-migration.json`), or `null` if there has been none.
     var configMigration: ConfigMigration?
+    /// `config.json` is an older schema that this command read without
+    /// rewriting (#191), or `null` when it is current or absent.
+    var pendingConfigMigration: PendingConfigMigration?
     let unattributedRuns: [UnattributedRun]
     let excludedHere: [Exclusion]
 
@@ -822,9 +830,24 @@ struct StatusReport: Encodable {
         }
     }
 
+    struct PendingConfigMigration: Encodable {
+        let fromVersion: Int
+        let toVersion: Int
+        let message: String
+
+        init?(_ inspection: ConfigInspection) {
+            guard let from = inspection.onDiskVersion, let message = inspection.pendingMigrationWarning else {
+                return nil
+            }
+            fromVersion = from
+            toVersion = AppConfig.currentVersion
+            self.message = message
+        }
+    }
+
     private enum CodingKeys: String, CodingKey {
         case machineId, generatedAt, health, fullDiskAccessDenied, locking, scheduler, sets, auditFailures
-        case configMigration, unattributedRuns, excludedHere
+        case configMigration, pendingConfigMigration, unattributedRuns, excludedHere
     }
 
     // Explicit `null` for `scheduler` — see
@@ -842,6 +865,7 @@ struct StatusReport: Encodable {
         try container.encode(sets, forKey: .sets)
         try container.encode(auditFailures, forKey: .auditFailures)
         try container.encode(configMigration, forKey: .configMigration)
+        try container.encode(pendingConfigMigration, forKey: .pendingConfigMigration)
         try container.encode(unattributedRuns, forKey: .unattributedRuns)
         try container.encode(excludedHere, forKey: .excludedHere)
     }
@@ -864,6 +888,10 @@ struct StatusReport: Encodable {
             lines.append("config: SCHEMA UPGRADED v\(migration.fromVersion) → v\(migration.toVersion) — upgrade every machine sharing it")
             lines.append("  - \(migration.message)")
             lines.append("  detail: run `restic-station-helper config acknowledge-migration` once they are")
+        }
+        if let pending = pendingConfigMigration {
+            lines.append("config: schema v\(pending.fromVersion) on disk, not yet upgraded to v\(pending.toVersion)")
+            lines.append("  - \(pending.message)")
         }
         // Ahead of the scheduler line: if this is broken, the scheduler
         // firing perfectly on time changes nothing.

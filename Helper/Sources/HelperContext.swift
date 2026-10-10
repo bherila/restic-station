@@ -105,13 +105,20 @@ struct HelperContext {
 
     /// Loads `config.json` + `machine.json` and resolves both views.
     ///
-    /// Order matters: `configStore.load()` may run a schema migration,
+    /// `access` is the caller's safety class speaking (#191): a command
+    /// classed `readOnly` or `localStateWrite` in `CommandRegistry` passes
+    /// `.inspecting`, so an older schema is read without being rewritten;
+    /// everything else passes `.migrating`. `scripts/cli-contract-test.sh`
+    /// runs every inspecting command against an older config and fails if
+    /// the file changes.
+    ///
+    /// Order matters: `configStore.load(.migrating)` may run a schema migration,
     /// which writes `resticPath` into `machine.json` and clears it from the
     /// config it returns. Reading the machine identity *after* the load is
     /// what makes the migrated path visible on the very first run rather
     /// than one invocation later.
-    static func loadViews(paths: AppPaths, configStore: ConfigStore) throws -> Views {
-        let config = try configStore.load()
+    static func loadViews(paths: AppPaths, configStore: ConfigStore, access: ConfigStore.Access) throws -> Views {
+        let config = try configStore.load(access)
         let machine = try MachineStore(paths: paths).load()
         return Views(
             shared: config,
@@ -130,12 +137,12 @@ struct HelperContext {
     /// (`docs/cli-json.md`). The exit codes and the human wording are
     /// unchanged — `resticNotFoundMessage` still builds the prose, and the
     /// classification is derived from the same discovery result it reads.
-    static func make() async throws -> HelperContext {
+    static func make(_ access: ConfigStore.Access) async throws -> HelperContext {
         let paths = AppPaths.default()
         let configStore = ConfigStore(paths: paths)
         let views: Views
         do {
-            views = try loadViews(paths: paths, configStore: configStore)
+            views = try loadViews(paths: paths, configStore: configStore, access: access)
         } catch {
             throw CLIFailure.configInvalid(underlying: error)
         }
@@ -319,11 +326,13 @@ struct SecretContext {
     ///   commands promise to report as an envelope, and exiting from inside
     ///   the setup path is how `secret list --json` used to answer an
     ///   unloadable `config.json` with an empty stdout.
-    static func make() throws -> SecretContext {
+    /// - Parameter access: `.inspecting` for `secret list`, `.migrating`
+    ///   for the commands that store or remove a secret (#191).
+    static func make(_ access: ConfigStore.Access) throws -> SecretContext {
         let paths = AppPaths.default()
         let config: AppConfig
         do {
-            config = try ConfigStore(paths: paths).load()
+            config = try ConfigStore(paths: paths).load(access)
         } catch {
             throw CLIFailure.configInvalid(underlying: error)
         }

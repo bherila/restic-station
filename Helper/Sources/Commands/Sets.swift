@@ -27,7 +27,7 @@ struct SetsList: AsyncParsableCommand, JSONRenderable {
         let paths = AppPaths.default()
         let config: AppConfig
         do {
-            config = try ConfigStore(paths: paths).load()
+            config = try ConfigStore(paths: paths).load(.inspecting)
         } catch {
             throw CLIFailure.configInvalid(underlying: error)
         }

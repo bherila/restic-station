@@ -81,7 +81,7 @@ import ResticStationCore
         defer { cleanup() }
         try writeFleetConfig(at: paths, machineId: "mirror-box")
 
-        let views = try HelperContext.loadViews(paths: paths, configStore: ConfigStore(paths: paths))
+        let views = try HelperContext.loadViews(paths: paths, configStore: ConfigStore(paths: paths), access: .migrating)
 
         // Scheduler: nothing runs here, and it says why.
         #expect(views.scheduled.config.sets.isEmpty)
@@ -104,7 +104,7 @@ import ResticStationCore
         defer { cleanup() }
         try writeFleetConfig(at: paths, machineId: "mirror-box")
 
-        let views = try HelperContext.loadViews(paths: paths, configStore: ConfigStore(paths: paths))
+        let views = try HelperContext.loadViews(paths: paths, configStore: ConfigStore(paths: paths), access: .migrating)
 
         let primary = views.addressable.destination(id: primaryId)?.destination
         #expect(primary?.repoURL == "/mnt/big/docs.restic")
@@ -126,7 +126,7 @@ import ResticStationCore
         defer { cleanup() }
         try writeFleetConfig(at: paths, machineId: "studio-mac")
 
-        let views = try HelperContext.loadViews(paths: paths, configStore: ConfigStore(paths: paths))
+        let views = try HelperContext.loadViews(paths: paths, configStore: ConfigStore(paths: paths), access: .migrating)
 
         #expect(views.scheduled.config == views.addressable.config)
         #expect(views.scheduled.config.sets.count == 1)
@@ -141,7 +141,7 @@ import ResticStationCore
         defer { cleanup() }
         try writeFleetConfig(at: paths, machineId: "mirror-box")
 
-        let views = try HelperContext.loadViews(paths: paths, configStore: ConfigStore(paths: paths))
+        let views = try HelperContext.loadViews(paths: paths, configStore: ConfigStore(paths: paths), access: .migrating)
         #expect(views.scheduled.scope == .scheduling)
         #expect(views.addressable.scope == .addressable)
         #expect(views.scheduled.machineId == "mirror-box")
@@ -155,7 +155,7 @@ import ResticStationCore
         defer { cleanup() }
         try writeFleetConfig(at: paths, machineId: "mirror-box")
 
-        let views = try HelperContext.loadViews(paths: paths, configStore: ConfigStore(paths: paths))
+        let views = try HelperContext.loadViews(paths: paths, configStore: ConfigStore(paths: paths), access: .migrating)
         #expect(views.scheduled.config.resticPath == "/usr/bin/restic")
         #expect(views.addressable.config.resticPath == "/usr/bin/restic")
     }
@@ -180,7 +180,7 @@ import ResticStationCore
         try Data(v1.utf8).write(to: paths.configFile)
         #expect(!FileManager.default.fileExists(atPath: paths.machineFile.path))
 
-        let views = try HelperContext.loadViews(paths: paths, configStore: ConfigStore(paths: paths))
+        let views = try HelperContext.loadViews(paths: paths, configStore: ConfigStore(paths: paths), access: .migrating)
 
         #expect(views.scheduled.config.version == 5)
         #expect(views.scheduled.config.resticPath == "/opt/homebrew/bin/restic")

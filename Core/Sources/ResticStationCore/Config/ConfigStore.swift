@@ -162,6 +162,60 @@ public struct ConfigStore: Sendable {
         }
     }
 
+    /// How a load treats a `config.json` written by an older schema (#191).
+    public enum Access: Sendable {
+        /// Migrate the file and rewrite it, after backing it up. What every
+        /// load did before #191; still right for anything that runs backups
+        /// or changes configuration.
+        case migrating
+        /// Convert an older file in memory only, with nothing written: not
+        /// `config.json`, its migration backup, `machine.json` or the
+        /// migration record. For commands that only inspect. In a shared
+        /// config, the rewrite is a fleet event (`docs/data-model.md`
+        /// §Versioning), and looking must not cause it.
+        case inspecting
+    }
+
+    /// ``load()`` for `.migrating`; ``inspect()``'s configuration for
+    /// `.inspecting`.
+    public func load(_ access: Access) throws -> AppConfig {
+        switch access {
+        case .migrating: return try load()
+        case .inspecting: return try inspect().config
+        }
+    }
+
+    /// The configuration as an inspecting command sees it, and the schema
+    /// version the file on disk was written with.
+    ///
+    /// The same checks as ``load()``: a newer schema is
+    /// `ConfigError.newerVersion`, and the file is validated at its own
+    /// version. An older schema is then converted with
+    /// ``previewMigration(_:)``. That is the whole in-memory effect of every
+    /// migration step so far, since each is a pure version bump. The one
+    /// value a real migration moves, a deprecated top-level `resticPath`, is
+    /// left in place, where it is still read as the fallback when
+    /// `machine.json` has none.
+    ///
+    /// Taken under the config read lock, like ``load()``, so it never sees
+    /// a Darwin exchange candidate between swap and rollback.
+    public func inspect() throws -> ConfigInspection {
+        try withConfigReadLock { _ in
+            guard let bytes = try readConfigBytes() else {
+                return ConfigInspection(config: AppConfig(), onDiskVersion: nil)
+            }
+            let decoded = try Self.makeDecoder().decode(AppConfig.self, from: bytes)
+            if decoded.version > AppConfig.currentVersion {
+                throw ConfigError.newerVersion(found: decoded.version, supported: AppConfig.currentVersion)
+            }
+            try decoded.validate()
+            guard decoded.version < AppConfig.currentVersion else {
+                return ConfigInspection(config: decoded, onDiskVersion: decoded.version)
+            }
+            return ConfigInspection(config: Self.previewMigration(decoded), onDiskVersion: decoded.version)
+        }
+    }
+
     /// The read/validate/migrate body. A usable `config.lock` lets the caller
     /// pass `migrationAllowed: true`; otherwise this remains a read-only load
     /// of the original schema. Keeping migrations and ordinary readers on the
@@ -885,6 +939,35 @@ public enum ConfigStoreError: Error, Equatable, Sendable, CustomStringConvertibl
 /// `config.json`'s bytes, their fingerprint, and the configuration decoded
 /// from exactly those bytes — so a caller cannot bind a hash of one revision
 /// while acting on another.
+/// What ``ConfigStore/inspect()`` read: the configuration at the current
+/// schema, and the version of the file it came from.
+public struct ConfigInspection: Sendable {
+    public let config: AppConfig
+    /// The `version` written in `config.json`; `nil` when there is no file.
+    public let onDiskVersion: Int?
+
+    public init(config: AppConfig, onDiskVersion: Int?) {
+        self.config = config
+        self.onDiskVersion = onDiskVersion
+    }
+
+    /// The file is an older schema that this helper read without rewriting.
+    public var migrationPending: Bool {
+        onDiskVersion.map { $0 < AppConfig.currentVersion } ?? false
+    }
+
+    /// What `config validate` and `status` say about a pending migration, or
+    /// `nil` when there is none.
+    public var pendingMigrationWarning: String? {
+        guard migrationPending, let from = onDiskVersion else { return nil }
+        let to = AppConfig.currentVersion
+        return "config.json is schema v\(from). It was read as v\(to) and not rewritten. "
+            + "The next backup or configuration change on this machine upgrades the file to v\(to), "
+            + "and every machine that shares it must then run a Restic Station that reads v\(to), "
+            + "or backups stop there."
+    }
+}
+
 public struct ConfigSnapshot: Sendable {
     public let bytes: Data
     public let fingerprint: String

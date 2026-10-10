@@ -64,15 +64,17 @@ newer commands.
    itself.
 3. `restic-station status --json`: health, last runs, destinations, scheduler.
 
-**Loading the configuration can rewrite it.** Every command except `version`
-and `capabilities` loads `config.json`. If the file was written by an older
-schema than `capabilities.configSchema.current`, loading it migrates it in
-place (keeping `config.v<N>.backup.json`). When `config.json` is shared,
-every other host must then run a helper that reads the new schema or it
-stops backing up (`data-model.md` §Versioning). So straight after a helper
-upgrade on a host that shares its configuration, tell the user and get
-their go-ahead before the first command that loads it, `config validate`
-included. Inspection is not exempt.
+**Inspection never upgrades the configuration; writing does.** If
+`config.json` was written by an older schema than
+`capabilities.configSchema.current`, the `readOnly` and `localStateWrite`
+commands read it as the current schema in memory and leave the file alone
+(#191). `config validate` lists it in `warnings`, and `status` reports it in
+`pendingConfigMigration`. Any command above `localStateWrite` migrates the
+file in place (keeping `config.v<N>.backup.json`), and so does the next
+scheduled tick. When `config.json` is shared, every other host must then run
+a helper that reads the new schema or it stops backing up (`data-model.md`
+§Versioning). So when `pendingConfigMigration` is not `null`, tell the user
+and get their go-ahead before any command above `localStateWrite`.
 
 Before any write, resolve what these report: configuration errors, a missing
 or unusable secret (`secret_not_configured`, `secret_store_unusable`), Full

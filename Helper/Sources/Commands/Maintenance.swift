@@ -67,7 +67,7 @@ struct MaintenancePrune: AsyncParsableCommand, JSONRenderable {
             ? CapabilityInput.read(prompt: "Reclaim preview token: ")
             : nil
 
-        let context = try await HelperContext.make()
+        let context = try await HelperContext.make(.migrating)
         guard let backupSet = context.addressable.set(id: set) else {
             throw CLIFailure.setNotFound(setId: set)
         }

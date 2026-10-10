@@ -45,9 +45,13 @@ struct ConfigCLIContext {
     /// T10/T27 exit-code contract: a config that will not load is a hard
     /// error). Still exit 1; `docs/cli-json.md` covers the envelope a
     /// `--json` caller sees instead of the bare sentence.
+    ///
+    /// Inspecting (#191): every caller (`config show`, `config export`) is
+    /// `readOnly` or `localStateWrite`, so an older schema is converted in
+    /// memory and the file is left as it is.
     func loadConfig() throws -> AppConfig {
         do {
-            return try configStore.load()
+            return try configStore.load(.inspecting)
         } catch {
             throw CLIFailure.configInvalid(underlying: error)
         }
@@ -420,9 +424,11 @@ struct ConfigValidate: AsyncParsableCommand, JSONRenderable {
 
         // Hard errors first, per the report order above: an unloadable
         // config has no resolvable plan, so there is nothing else to say.
-        let config: AppConfig
+        // Inspecting (#191): validating a config must not be what upgrades
+        // it. An older schema is reported as a warning below instead.
+        let inspection: ConfigInspection
         do {
-            config = try context.configStore.load()
+            inspection = try context.configStore.inspect()
         } catch {
             // Human mode keeps printing its own `Errors:` block and exiting
             // 1; JSON mode reports the same condition as the shared
@@ -438,6 +444,7 @@ struct ConfigValidate: AsyncParsableCommand, JSONRenderable {
             print("  (none)")
             print("")
         }
+        let config = inspection.config
 
         // The error is kept, not discarded: `localMachineId` is optional on
         // purpose — with `--machine` given, this host's own identity is only
@@ -473,6 +480,10 @@ struct ConfigValidate: AsyncParsableCommand, JSONRenderable {
         let report = EffectiveConfigReport.build(addressable: addressable, scheduled: scheduled)
 
         var warnings: [String] = []
+
+        if let pending = inspection.pendingMigrationWarning {
+            warnings.append(pending)
+        }
 
         // Every `machines` key this config mentions that neither this
         // invocation's target nor this host's own identity can vouch for.
@@ -691,7 +702,7 @@ struct ConfigUpgrade: AsyncParsableCommand, JSONRenderable {
 
         let after: Int
         do {
-            _ = try context.configStore.load()
+            _ = try context.configStore.load(.migrating)
             after = try context.configStore.reconciliationSnapshot().config.version
         } catch {
             throw CLIFailure.configInvalid(underlying: error)

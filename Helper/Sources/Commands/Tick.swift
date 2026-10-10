@@ -86,7 +86,7 @@ struct Tick: AsyncParsableCommand {
         let configStore = ConfigStore(paths: paths)
         let views: HelperContext.Views
         do {
-            views = try HelperContext.loadViews(paths: paths, configStore: configStore)
+            views = try HelperContext.loadViews(paths: paths, configStore: configStore, access: .migrating)
         } catch {
             HelperExit.fail("tick: could not load configuration: \(error)")
         }

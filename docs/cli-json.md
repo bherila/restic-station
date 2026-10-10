@@ -203,8 +203,13 @@ not read, because reading it would mean loading configuration).
 **Safety classes are description, not authorization.** Locks, preview
 tokens, config validation and secret boundaries stay authoritative. A
 command's class is its own effect; the start-up every configuration-reading
-command shares (creating `machine.json`, migrating `config.json`) is not
-counted.
+command shares (creating `machine.json`) is not counted. Migrating an older
+`config.json` is decided by class (#191): `readOnly` and `localStateWrite`
+commands read it as the current schema in memory and never rewrite it
+(`config validate` warns, and `status` reports `pendingConfigMigration`).
+Every class above them migrates the file on load. `scripts/cli-contract-test.sh`
+runs each inspecting command against an older config and fails if the file,
+`machine.json`, or the migration backup or record changes.
 
 | Class | Means | Commands |
 |---|---|---|
