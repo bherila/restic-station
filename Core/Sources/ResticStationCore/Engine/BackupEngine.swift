@@ -1201,7 +1201,10 @@ public final class BackupEngine: Sendable {
         limit: Int
     ) async throws -> SnapshotListing {
         try await readOnlyPreflight(destination)
-        let outcome = try await readOnlyQuery(.snapshots(repo: destination.repoURL), destination: destination)
+        let outcome = try await readOnlyQuery(
+            .snapshots(repo: destination.repoURL),
+            invocation: ResticInvocation(destination: destination)
+        )
         let snapshots: [Snapshot]
         do {
             snapshots = try parseSnapshots(Self.jsonDocument(in: outcome.rawOutput))
@@ -1262,8 +1265,29 @@ public final class BackupEngine: Sendable {
         guard Self.isRetentionPreview(command) else {
             throw RepositoryQueryError.notAPreview
         }
+
+        // The plan is bound to everything that decides which repository
+        // restic reads, not only its URL: a changed rclone config or
+        // credential can point the same URL at a different store holding
+        // the same snapshot ids. So the secret environment and the restic
+        // executable are captured once, the query runs with exactly those,
+        // and both are folded into the fingerprint through the destination
+        // binding `maintenance prune` already uses (Codex on #188).
+        let executableIdentity = restic.maintenanceExecutable()?.identity
+        let secretEnv: [String: String]
+        do {
+            secretEnv = try await restic.maintenanceSecretEnvironment(for: destination)
+        } catch {
+            throw readOnlyQueryError(error, destination: destination)
+        }
+        let invocation = ResticInvocation(
+            destination: destination,
+            destinationSecretEnv: secretEnv,
+            expectedExecutableIdentity: executableIdentity
+        )
+
         let previewedAt = now()
-        let outcome = try await readOnlyQuery(command, destination: destination)
+        let outcome = try await readOnlyQuery(command, invocation: invocation)
         let results: [ForgetResult]
         do {
             results = try parseForget(Self.jsonDocument(in: outcome.rawOutput))
@@ -1311,6 +1335,10 @@ public final class BackupEngine: Sendable {
             fingerprint: RetentionPreview.computeFingerprint(
                 setId: set.id,
                 destination: destination,
+                invocationBinding: destination.pruneConfirmationFingerprint(
+                    secretEnv: secretEnv,
+                    executableIdentity: executableIdentity
+                ),
                 policy: policy,
                 keepIDs: groups.flatMap { $0.keep.map(\.snapshot.id) },
                 removeIDs: groups.flatMap { $0.remove.map(\.id) }
@@ -1383,18 +1411,13 @@ public final class BackupEngine: Sendable {
 
     /// One read-only restic command. No `unlock` and no retry on exit 11:
     /// a locked repository is reported.
-    private func readOnlyQuery(_ command: ResticCommand, destination: Destination) async throws -> ResticOutcome {
+    private func readOnlyQuery(_ command: ResticCommand, invocation: ResticInvocation) async throws -> ResticOutcome {
+        let destination = invocation.destination
         let outcome: ResticOutcome
         do {
-            outcome = try await restic.run(command, for: ResticInvocation(destination: destination))
+            outcome = try await restic.run(command, for: invocation)
         } catch {
-            if let secretError = postPreflightSecretError(error) {
-                throw Self.queryError(secretError)
-            }
-            if let runnerError = error as? ResticRunnerError {
-                throw RepositoryQueryError.resticDidNotRun(destinationId: destination.id, runnerError)
-            }
-            throw RepositoryQueryError.resticDidNotRun(destinationId: destination.id, .launchFailed("\(error)"))
+            throw readOnlyQueryError(error, destination: destination)
         }
         switch outcome.status {
         case .success:
@@ -1407,6 +1430,19 @@ public final class BackupEngine: Sendable {
         case .warningIncompleteRead, .fatal, .repoDoesNotExist, .repoLocked, .wrongPassword, .other:
             throw RepositoryQueryError.resticFailed(destinationId: destination.id, outcome.status)
         }
+    }
+
+    /// A failure of a read-only query, or of reading what it needs, as a
+    /// ``RepositoryQueryError``: a secret problem keeps the pre-flight's
+    /// classification (#152), anything else is "restic did not run".
+    private func readOnlyQueryError(_ error: any Error, destination: Destination) -> RepositoryQueryError {
+        if let secretError = postPreflightSecretError(error) {
+            return Self.queryError(secretError)
+        }
+        if let runnerError = error as? ResticRunnerError {
+            return .resticDidNotRun(destinationId: destination.id, runnerError)
+        }
+        return .resticDidNotRun(destinationId: destination.id, .launchFailed("\(error)"))
     }
 
     private static func queryError(_ failure: PostPreflightSecretError) -> RepositoryQueryError {

@@ -208,17 +208,49 @@ import Testing
         #expect(!Sync(lastSyncedAt: T.t0, primaryLastSyncedAt: T.t0).behindPrimary)
     }
 
-    @Test("the fingerprint ignores id order and changes with the plan")
+    @Test("the fingerprint ignores id order and changes with the plan or the invocation")
     func fingerprintIsDeterministic() {
         let destination = Destination(id: T.primaryId, label: "Primary", repoURL: "/repo", isPrimary: true)
-        func fp(keep: [String], remove: [String], policy: RetentionPolicy = RetentionPolicy(keepLast: 3)) -> String {
+        func fp(
+            keep: [String],
+            remove: [String],
+            policy: RetentionPolicy = RetentionPolicy(keepLast: 3),
+            invocation: String = "binding-1"
+        ) -> String {
             RetentionPreview.computeFingerprint(
-                setId: T.setId, destination: destination, policy: policy, keepIDs: keep, removeIDs: remove
+                setId: T.setId, destination: destination, invocationBinding: invocation,
+                policy: policy, keepIDs: keep, removeIDs: remove
             )
         }
         #expect(fp(keep: ["c"], remove: ["a", "b"]) == fp(keep: ["c"], remove: ["b", "a"]))
         #expect(fp(keep: ["c"], remove: ["a", "b"]) != fp(keep: ["c", "a"], remove: ["b"]))
         #expect(fp(keep: ["c"], remove: ["a"]) != fp(keep: ["c"], remove: ["a"], policy: RetentionPolicy(keepLast: 4)))
+        #expect(fp(keep: ["c"], remove: ["a"]) != fp(keep: ["c"], remove: ["a"], invocation: "binding-2"))
+    }
+
+    /// The same URL with different credentials can be a different store
+    /// holding the same snapshot ids, so the fingerprint must move when the
+    /// secret environment does, and stay put when nothing changed (Codex on
+    /// #188).
+    @Test("the preview fingerprint is stable, and moves when the destination's secret environment changes")
+    func fingerprintBindsTheInvocation() async throws {
+        let env = T.makeEnv(script: [])
+        defer { env.cleanUp() }
+        let call = T.resticCall(Self.previewArgv(env.primary.repoURL), dest: T.primaryId, stdoutLines: [Self.forgetJSON])
+        env.fake.script = call + call + call
+
+        let first = try await env.engine.previewRetention(env.set, destination: env.primary)
+        env.clock.advance(60)
+        let second = try await env.engine.previewRetention(env.set, destination: env.primary)
+        env.secrets.store(secretEnv: ["AWS_ACCESS_KEY_ID": "example-key-2"], for: T.primaryId)
+        let third = try await env.engine.previewRetention(env.set, destination: env.primary)
+
+        #expect(first.fingerprint == second.fingerprint)
+        #expect(first.previewedAt != second.previewedAt)
+        #expect(third.fingerprint != first.fingerprint)
+        // The query itself ran with the captured environment.
+        let lastEnv = env.fake.invocations.last?.env ?? [:]
+        #expect(lastEnv["AWS_ACCESS_KEY_ID"] == "example-key-2")
     }
 
     @Test("isRetentionPreview accepts only forget with --dry-run and without --prune")
