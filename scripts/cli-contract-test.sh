@@ -608,13 +608,14 @@ RESTIC_STATION_DATA_DIR="$INSPECT_DIR" run_helper_split config validate --json
 expect_rc 0
 jq -e --arg v "schema v$INSPECT_OLDER" '.data.warnings | any(contains($v))' "$OUT_FILE" >/dev/null \
     || fail "config validate --json does not warn about an older schema (#191)"
-# An export of the older file is at the current schema, so an importer will
-# not migrate it, and it must not carry this host's deprecated resticPath
-# (Codex on #193).
-RESTIC_STATION_DATA_DIR="$INSPECT_DIR" run_helper_split config export
-expect_rc 0
-jq -e --argjson to "$INSPECT_CURRENT" '.version == $to and .resticPath == null' "$OUT_FILE" >/dev/null \
-    || fail "config export of an older-schema config kept resticPath or the old version (#191)"
+# Exporting the older file is refused, with the upgrade to run: without the
+# migration's resticPath move, no portable export exists (Codex on #193).
+# Nothing reaches stdout or the --out file.
+RESTIC_STATION_DATA_DIR="$INSPECT_DIR" run_helper_split config export --out "$WORK/inspect-export.json"
+expect_rc 1
+grep -q "config upgrade" "$ERR_FILE" || fail "config export of an older-schema config did not name config upgrade (#191)"
+[[ ! -s "$OUT_FILE" && ! -e "$WORK/inspect-export.json" ]] \
+    || fail "config export of an older-schema config wrote output (#191)"
 # The control: a migrating command changes the same files, so the
 # comparisons above can see a migration.
 RESTIC_STATION_DATA_DIR="$INSPECT_DIR" run_helper_split config upgrade --json

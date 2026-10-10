@@ -226,8 +226,9 @@ struct ConfigImportTests {
     }
 }
 
-/// `config export` reads an older file without migrating it (#191), so the
-/// export itself must not carry what a migration would have moved.
+/// `config export` reads without migrating (#191), so it refuses an older
+/// file rather than export one that loses or leaks the deprecated
+/// `resticPath` (Codex on #193).
 @Suite("config export of an older schema")
 struct ConfigExportTests {
 
@@ -238,21 +239,19 @@ struct ConfigExportTests {
         return config
     }
 
-    @Test func anOlderFileIsExportedWithoutItsHostLocalResticPath() {
+    @Test func anOlderFileIsRefusedWithTheUpgradeToRun() throws {
         let older = ConfigStore.previewMigration(config(version: 1, resticPath: "/opt/homebrew/bin/restic"))
-        let exported = ConfigExport.exportable(ConfigInspection(config: older, onDiskVersion: 1))
+        let refusal = try #require(ConfigExport.refusal(for: ConfigInspection(config: older, onDiskVersion: 1)))
 
-        #expect(exported.version == AppConfig.currentVersion)
-        #expect(exported.resticPath == nil)
+        #expect(refusal.contains("schema v1"))
+        #expect(refusal.contains("config upgrade"))
     }
 
-    /// A current file exports exactly as it reads, as before #191.
-    @Test func aCurrentFileIsExportedUnchanged() {
+    @Test func aCurrentOrAbsentFileIsExported() {
         let current = config(version: AppConfig.currentVersion, resticPath: "/usr/local/bin/restic")
-        let exported = ConfigExport.exportable(
-            ConfigInspection(config: current, onDiskVersion: AppConfig.currentVersion)
-        )
-
-        #expect(exported == current)
+        #expect(ConfigExport.refusal(
+            for: ConfigInspection(config: current, onDiskVersion: AppConfig.currentVersion)
+        ) == nil)
+        #expect(ConfigExport.refusal(for: ConfigInspection(config: AppConfig(), onDiskVersion: nil)) == nil)
     }
 }

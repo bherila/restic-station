@@ -109,19 +109,23 @@ struct ConfigExport: AsyncParsableCommand {
     @Option(name: .long, help: "Write to this path instead of stdout.")
     var out: String?
 
-    /// What an export of `inspection` writes. An older file is exported at
-    /// the current schema, so the importing host will not migrate it, and
-    /// the one value a real migration moves has to be dealt with here:
-    /// the deprecated top-level `resticPath` is host-local and is cleared,
-    /// as the migrating export did before #191. Left in, it would become a
-    /// shared fallback naming this host's binary on every importer (Codex
-    /// on #193).
-    static func exportable(_ inspection: ConfigInspection) -> AppConfig {
-        var config = inspection.config
-        if inspection.migrationPending {
-            config.resticPath = nil
-        }
-        return config
+    /// Why an export of `inspection` is refused, or `nil` to export it.
+    ///
+    /// An older file is refused (#191). Exporting it portably needs the
+    /// migration's one side effect, moving a deprecated top-level
+    /// `resticPath` into this host's `machine.json`, and an inspecting
+    /// command writes nothing. Without that move, either answer is wrong:
+    /// keeping the path makes it a shared fallback on every importer, and
+    /// dropping it loses the only path on a host that re-imports its own
+    /// export (Codex on #193, both passes). `config upgrade` does the move,
+    /// and the export after it is portable.
+    static func refusal(for inspection: ConfigInspection) -> String? {
+        guard inspection.migrationPending, let from = inspection.onDiskVersion else { return nil }
+        let to = AppConfig.currentVersion
+        return "config.json is schema v\(from), older than this helper's v\(to), and `config export` "
+            + "does not upgrade it. Run `restic-station-helper config upgrade` first, then export again. "
+            + "The upgrade rewrites the shared config.json, so every machine that shares it must then "
+            + "run a Restic Station that reads v\(to), or backups stop there."
     }
 
     func run() async throws {
@@ -132,7 +136,10 @@ struct ConfigExport: AsyncParsableCommand {
         } catch {
             throw CLIFailure.configInvalid(underlying: error)
         }
-        let config = Self.exportable(inspection)
+        if let refusal = Self.refusal(for: inspection) {
+            HelperExit.fail(refusal)
+        }
+        let config = inspection.config
 
         let data: Data
         do {

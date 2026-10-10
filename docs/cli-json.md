@@ -65,7 +65,7 @@ itself, unwrapped, because its output is meant to be fed straight back into
 | `purge preview` | ✅ | array of per-destination purge plans: matched/changed/unattributed snapshots and patterns |
 | `purge apply` | ✅ | `{ setId, status, children }` for the token-gated destructive purge |
 | `maintenance prune` | ✅ | `{ setId, destinationId, label, dryRun, status, confirmationBinding, destinationFingerprint }` for standalone pack reclamation; `confirmationBinding` is an opaque, short-lived token present only for a dry run that completed (`success` or `warning`), and `destinationFingerprint` binds that preview to the displayed destination |
-| `config export` | — | **Unwrapped by design.** The exported config document itself, so it round-trips into `config import`. |
+| `config export` | — | **Unwrapped by design.** The exported config document itself, so it round-trips into `config import`. An older-schema `config.json` is refused (exit 1, nothing written) with a pointer to `config upgrade` (#191). |
 | `timer status` (Linux) | — | **Human-only.** Its report is narrative assembled while probing; the machine-readable equivalent is `status --json`'s `.scheduler`, in the same problem vocabulary. |
 | `print-password` | — | Hidden; exists for `RESTIC_PASSWORD_COMMAND` and writes a secret to stdout. |
 | `tick`, `run-set`, `restore`, `init-secondary`, `unlock`, `config import`, `secret set`/`set-env`/`rm`, `excludes enable`/`disable`/`add`/`remove`/`set`/`reset`, `cli install`/`uninstall`, `timer install`/`uninstall` | — | Mutating, not inspection. Progress is a human/log concern; the machine-readable record of what happened is the run record (`runs show --json`). |
