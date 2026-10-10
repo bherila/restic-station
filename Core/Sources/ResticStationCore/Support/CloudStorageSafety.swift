@@ -51,8 +51,6 @@ public enum CloudStorageSafety {
         }
     }
 
-    /// Whether any source reaches cloud storage (``reachesCloudStorage(_:homeDirectory:)``)
-    /// — the condition for the set's online-only files policy to apply.
     /// Whether this platform has online-only (dataless) files at all.
     /// Only macOS does: iCloud Drive and File Provider are macOS services,
     /// and restic registers `--exclude-cloud-files` only on macOS and
@@ -82,6 +80,9 @@ public enum CloudStorageSafety {
         platformHasOnlineOnlyFiles && containsCloudBackedSource(sources, homeDirectory: homeDirectory)
     }
 
+    /// Whether any source reaches cloud storage (``reachesCloudStorage(_:homeDirectory:)``)
+    /// — a path question, answered the same on every platform. A backup
+    /// acts on it only through ``backupDecidesOnlineOnlyFiles(_:homeDirectory:platformHasOnlineOnlyFiles:)``.
     public static func containsCloudBackedSource(
         _ sources: [String],
         homeDirectory: String = NSHomeDirectory()
