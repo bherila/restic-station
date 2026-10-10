@@ -174,7 +174,7 @@ not read, because reading it would mean loading configuration).
   "secretBackend": { "kind": "keychain", "reason": null },
   "safetyClasses": ["readOnly", "localStateWrite", "configurationWrite", "repositoryWrite", "destructive"],
   "commands": [
-    { "name": "snapshots list", "json": true, "safetyClass": "readOnly", "available": true, "reason": null }
+    { "name": "snapshots list", "json": true, "safetyClass": "localStateWrite", "available": true, "reason": null }
   ]
 }
 ```
