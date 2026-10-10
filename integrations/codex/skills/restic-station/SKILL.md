@@ -58,7 +58,7 @@ apply the policy. Do not prune by any other route.
 show the plan, get explicit authorization, then pipe that exact `previewToken`
 to `restic-station purge apply --set <uuid> --preview-token-stdin --json`.
 Never put the token in argv. On `preview_expired` or `operation_not_allowed`,
-preview again.
+preview again, show the new plan, and ask again before applying it.
 
 **Restore.** `restic-station snapshots list --set <uuid> --json` to find the
 snapshot, confirm what to restore, then restore into a new, empty directory

@@ -126,7 +126,9 @@ destructive: show the user the plan, get explicit authorization, then pass
 **that** token on standard input to
 `purge apply --set <uuid> --preview-token-stdin --json`. Never put the token
 in argv. Stop on `preview_expired`, or on `operation_not_allowed` (the plan
-changed), and preview again rather than retrying.
+changed). Preview again, show the **new** plan, and get explicit
+authorization for it before applying its token: an approval covers only the
+plan the user saw.
 
 ## Restore
 
