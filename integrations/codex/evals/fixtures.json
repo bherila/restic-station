@@ -174,7 +174,7 @@
       "steps": [
         "restic-station capabilities --json",
         "restic-station config validate --json",
-        "restic-station snapshots list --set 00000000-0000-4000-8000-000000000001 --json",
+        "restic-station snapshots list --set 00000000-0000-4000-8000-000000000001 --dest 00000000-0000-4000-8000-000000000002 --include-paths --json",
         "ask-user",
         "restic-station restore --set 00000000-0000-4000-8000-000000000001 --dest 00000000-0000-4000-8000-000000000002 --snapshot 1a2b3c4d --sub /Users/example/Documents --target /Users/example/Restored --overwrite never"
       ],

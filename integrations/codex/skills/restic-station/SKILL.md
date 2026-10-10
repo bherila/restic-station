@@ -81,8 +81,10 @@ to `restic-station purge apply --set <uuid> --preview-token-stdin --json`.
 Never put the token in argv. On `preview_expired` or `operation_not_allowed`,
 preview again, show the new plan, and ask again before applying it.
 
-**Restore.** `restic-station snapshots list --set <uuid> --json` to find the
-snapshot, confirm what to restore, then restore into a new, empty directory
+**Restore.** `restic-station snapshots list --set <uuid> --dest <uuid> --json`
+to find the snapshot. For one folder, add `--include-paths` and take the
+`--sub` in-snapshot path from what it lists, never from a guess. Confirm what
+to restore, then restore into a new, empty directory
 with `--overwrite never` unless the user explicitly asks to overwrite.
 Report a partial restore separately from a complete one.
 

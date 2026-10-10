@@ -162,7 +162,12 @@ plan the user saw.
 
 ## Restore
 
-1. Find the snapshot: `restic-station snapshots list --set <uuid> [--dest <uuid>] --json`.
+1. Find the snapshot: `restic-station snapshots list --set <uuid> --dest <uuid> --json`.
+   When the user wants one folder, add `--include-paths` to see each
+   snapshot's source paths. `--sub` takes an **in-snapshot** path, which
+   for an absolute source mirrors that source's path
+   (`restic-cli.md` §ls). Choose it from what the listing shows; never
+   construct it from where the user thinks the files were.
 2. Confirm the set, destination, snapshot id, and which paths (`--sub`,
    `--include`) the user wants.
 3. Restore into a **new, empty** directory with `--overwrite never`, unless
