@@ -71,6 +71,22 @@ struct SourceSyncEndpointTests {
         #expect(repeated.inventory.endpointGeneration == completed.inventory.endpointGeneration)
     }
 
+    @Test("a lost install receipt can resume after transport replenishes the same payload")
+    func replenishedPayloadAfterLostReceipt() throws {
+        let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
+        let prepared = try f.prepare()
+        _ = try SyncEndpointService.handle(f.protectedRequest())
+        let incoming = URL(fileURLWithPath: try #require(prepared.stagingPath))
+        let journalURL = incoming.deletingLastPathComponent().appendingPathComponent("journal.json")
+        var journal = try JSONDecoder().decode(SyncEndpointJournal.self, from: Data(contentsOf: journalURL))
+        journal.steps["note"] = .captured // crash after move, before durable receipt
+        try JSONEncoder().encode(journal).write(to: journalURL)
+        try Data("new".utf8).write(to: incoming.appendingPathComponent("note"))
+        #expect(try SyncEndpointService.handle(f.protectedRequest()).inventory.items["note"] == f.after)
+        #expect(try String(contentsOf: URL(fileURLWithPath: #require(prepared.recoveryPath)).appendingPathComponent(SyncEndpointService.recoveryName(for: "note")), encoding: .utf8) == "old")
+        #expect(try SyncEndpointService.handle(f.request(.finish)).inventory.items["note"] == f.after)
+    }
+
     @Test("missing protection refuses before any displacement")
     func noProtection() throws {
         let f = try Fixture()

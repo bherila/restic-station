@@ -319,16 +319,15 @@ public enum SyncEndpointService {
             }
             let (payloadParent, payloadName) = try SourceSyncFilesystem.parent(of: change.path, in: staging, create: true)
             let staged = try SourceSyncFilesystem.item(named: payloadName, in: payloadParent, relative: change.path)
-            if staged == after {
-                try SyncDurability.moveExclusive(payloadName, from: payloadParent, to: targetParent, as: targetName)
+            let installed = try SourceSyncFilesystem.item(named: targetName, in: targetParent, relative: change.path)
+            if installed == after {
+                // The original was durably captured before installation.
+                // Recovery may replenish staging after a lost receipt; an
+                // exact live value already satisfies this operation.
+                guard staged == nil || staged == after else { throw SourceSyncError.stalePlan }
             } else {
-                // A crash may have installed the payload before the receipt.
-                // Accept it only if the exact intended value is present and
-                // no staged entry remains; ambiguous states stop recovery.
-                guard staged == nil,
-                      try SourceSyncFilesystem.item(named: targetName, in: targetParent, relative: change.path) == after else {
-                    throw SourceSyncError.stalePlan
-                }
+                guard staged == after else { throw SourceSyncError.stalePlan }
+                try SyncDurability.moveExclusive(payloadName, from: payloadParent, to: targetParent, as: targetName)
             }
         } else {
             guard try SourceSyncFilesystem.item(named: targetName, in: targetParent, relative: change.path) == nil else {
