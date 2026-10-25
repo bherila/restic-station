@@ -258,16 +258,16 @@ public enum SyncEndpointService {
         journal: inout SyncEndpointJournal, root: DirectoryHandle,
         staging: DirectoryHandle, recovery: DirectoryHandle, operation: DirectoryHandle
     ) throws {
-        let (targetParent, targetName) = try SourceSyncFilesystem.parent(of: change.path, in: root)
-        let recoveryParent = recovery
-        let recoveryName = self.recoveryName(for: change.path)
         let stage = journal.steps[change.path] ?? .pending
         if stage == .installed {
-            guard try SourceSyncFilesystem.item(named: targetName, in: targetParent, relative: change.path) == change.after else {
+            guard try SourceSyncFilesystem.item(at: change.path, in: root) == change.after else {
                 throw SourceSyncError.stateInvalid("An installed entry changed before recovery completed. Both versions are retained.")
             }
             return
         }
+        let (targetParent, targetName) = try SourceSyncFilesystem.parent(of: change.path, in: root)
+        let recoveryParent = recovery
+        let recoveryName = self.recoveryName(for: change.path)
         if stage == .pending {
             // Publish intent before displacing an inode. Recovery can tell
             // whether a crash happened before or after the exclusive move.

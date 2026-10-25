@@ -87,6 +87,30 @@ struct SourceSyncEndpointTests {
         #expect(try SyncEndpointService.handle(f.request(.finish)).inventory.items["note"] == f.after)
     }
 
+    @Test("subtree deletion receipts replay after their parent was removed")
+    func removedParentReplay() throws {
+        let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
+        let nested = f.root.appendingPathComponent("nested")
+        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+        try Data("child".utf8).write(to: nested.appendingPathComponent("child"))
+        let inventory = try SyncEndpointService.handle(.init(action: .inventory, group: f.group, root: f.root.path)).inventory
+        var request = SyncEndpointRequest(action: .prepare, group: f.group, root: f.root.path, operationId: f.operation, expected: inventory)
+        request.operations = ["nested/child", "nested"].map { .init(path: $0, before: inventory.items[$0], after: nil) }
+        _ = try SyncEndpointService.handle(request)
+        request.action = .commit
+        request.protectedItems = inventory.items
+        request.protectedSnapshotId = String(repeating: "a", count: 64)
+        request.protectedRepositoryId = String(repeating: "b", count: 64)
+        _ = try SyncEndpointService.handle(request)
+        #expect(try SyncEndpointService.handle(request).inventory.items == ["note": f.before])
+        // A missing ancestor is absence; a link substituting for it is not.
+        try FileManager.default.createSymbolicLink(at: nested, withDestinationURL: f.base)
+        #expect(throws: SourceSyncError.self) { try SyncEndpointService.handle(request) }
+        try FileManager.default.removeItem(at: nested)
+        request.action = .finish
+        #expect(try SyncEndpointService.handle(request).inventory.items == ["note": f.before])
+    }
+
     @Test("missing protection refuses before any displacement")
     func noProtection() throws {
         let f = try Fixture()

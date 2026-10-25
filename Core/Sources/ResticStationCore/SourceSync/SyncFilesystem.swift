@@ -112,6 +112,25 @@ public enum SourceSyncFilesystem {
         return (directory, leaf)
     }
 
+    /// Receipt verification may encounter an ancestor removed by a later
+    /// operation. Only ENOENT means absence; links and inspection errors
+    /// still refuse. The root itself was opened and identity-checked first.
+    static func item(at path: String, in root: DirectoryHandle) throws -> SyncItem? {
+        guard SourceSyncPlanner.isRelativePath(path) else { throw changed() }
+        var parts = path.split(separator: "/").map(String.init)
+        let leaf = parts.removeLast()
+        var directory = root
+        for part in parts {
+            var info = stat()
+            if part.withCString({ fstatat(directory.descriptor, $0, &info, AT_SYMLINK_NOFOLLOW) }) != 0 {
+                if errno == ENOENT { return nil }
+                throw changed()
+            }
+            directory = try openDirectory(part, in: directory)
+        }
+        return try item(named: leaf, in: directory, relative: path)
+    }
+
     static func item(named name: String, in parent: DirectoryHandle, relative: String, synchronize: Bool = false) throws -> SyncItem? {
         var info = stat()
         let result = name.withCString { fstatat(parent.descriptor, $0, &info, AT_SYMLINK_NOFOLLOW) }
