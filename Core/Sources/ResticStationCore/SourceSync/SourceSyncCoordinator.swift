@@ -296,12 +296,20 @@ public struct SourceSyncCoordinator: Sendable {
                 try persist()
             }
             if journal.phase == .installed {
+                let goal = expectedResult(plan)
+                // A divergent finish is attention evidence, not a receipt.
+                // Do not cache it: once the operator resolves the conflict,
+                // recovery must inspect that endpoint again.
                 if journal.localFinished == nil {
-                    journal.localFinished = try await transport.request(endpointRequest(.finish, local: true), at: .init(path: group.localPath))
+                    let reply = try await transport.request(endpointRequest(.finish, local: true), at: .init(path: group.localPath))
+                    guard reply.inventory.items == goal else { throw SourceSyncError.stateInvalid("The local copy changed before agreement. Resolve the change, then resume this operation.") }
+                    journal.localFinished = reply
                     try persist()
                 }
                 if journal.peerFinished == nil {
-                    journal.peerFinished = try await transport.request(endpointRequest(.finish, local: false), at: group.peer)
+                    let reply = try await transport.request(endpointRequest(.finish, local: false), at: group.peer)
+                    guard reply.inventory.items == goal else { throw SourceSyncError.stateInvalid("The other copy changed before agreement. Resolve the change, then resume this operation.") }
+                    journal.peerFinished = reply
                     try persist()
                 }
                 guard let local = journal.localFinished?.inventory, let peer = journal.peerFinished?.inventory,

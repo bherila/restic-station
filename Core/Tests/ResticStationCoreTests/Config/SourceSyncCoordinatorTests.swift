@@ -193,6 +193,26 @@ struct SourceSyncCoordinatorTests {
         #expect(!FileManager.default.fileExists(atPath: f.peer.appendingPathComponent("nested").path))
     }
 
+    @Test("a changed finish inventory is retained for attention without poisoning recovery receipts")
+    func changedFinishCanRecover() async throws {
+        let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
+        try f.write("planned", "note")
+        let preview = try await f.preview()
+        await #expect(throws: SourceSyncError.self) {
+            try await SourceSyncCoordinator.$afterDurablePhase.withValue({ phase in
+                if phase == "installed" { try f.write("external", "note") }
+            }) { try await f.apply(preview) }
+        }
+        #expect(try String(contentsOf: f.local.appendingPathComponent("note"), encoding: .utf8) == "external")
+        #expect(try SourceSyncCoordinator.status(paths: f.paths, setId: f.set.id, groupId: f.group.id).status == "needsRecovery")
+        // The operator resolves the editor conflict. Retrying the same
+        // operation must inspect this copy again, not reuse a bad receipt.
+        try f.write("planned", "note")
+        let result = try await f.coordinator.recover(set: f.set, group: f.group, machineId: "laptop", binding: "fixture")
+        #expect(result.status == "synchronized" && result.operationId == nil)
+        #expect(await f.backups.counts().0 == 1)
+    }
+
     @Test("a failed final backup resumes without replaying synchronization")
     func finalBackupRecovery() async throws {
         let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
