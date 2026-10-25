@@ -25,6 +25,13 @@ Each root's parent must be owned and writable by the endpoint user so the
 helper can keep private sibling recovery storage on the same filesystem.
 Choose a folder inside the user's home or another user-managed directory;
 volume roots and folders directly under system-owned parents are refused.
+Read-only directory trees can be exported and copied into a writable
+replica: new directories stay owner-writable during construction and get
+their exact planned modes after descendants are installed. Existing live
+directories are never silently made writable. A change beneath an existing
+read-only target directory refuses before capture; make that target writable
+before retrying. Private staging is made writable only for construction and
+cleanup, independently of the live source permissions.
 
 The first version requires `retention: null` and no purge exclusions on a
 sync-enabled set. It must exclusively own its backup repositories: no

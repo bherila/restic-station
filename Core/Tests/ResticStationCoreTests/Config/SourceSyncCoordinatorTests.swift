@@ -23,10 +23,7 @@ struct SourceSyncCoordinatorTests {
             let sourceRoot = try SourceSyncFilesystem.openRoot(source.path)
             let targetRoot = try SourceSyncFilesystem.openRoot(destination.path)
             let inventory = try SourceSyncFilesystem.inventory(at: source.path)
-            for path in paths.sorted() {
-                guard let item = inventory.items[path] else { throw SourceSyncError.stalePlan }
-                try SourceSyncFilesystem.exportItem(path, expected: item, from: sourceRoot, to: targetRoot)
-            }
+            try SourceSyncFilesystem.exportItems(paths, expected: inventory, from: sourceRoot, to: targetRoot)
         }
     }
     actor Backups: SourceSyncBackingUp {
@@ -114,6 +111,31 @@ struct SourceSyncCoordinatorTests {
         #expect(await f.backups.protectedSources() == [[f.workspace.path]])
         #expect(await f.backups.counts().1 == 1)
         #expect(await f.backups.agreementWasBackedUp())
+    }
+
+    @Test("read-only source directories export and install with their final modes")
+    func readOnlyTreeConstruction() async throws {
+        let f = try Fixture()
+        let nested = f.local.appendingPathComponent("readonly/nested")
+        let peerNested = f.peer.appendingPathComponent("readonly/nested")
+        defer {
+            for root in [f.local, f.peer] {
+                try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: root.appendingPathComponent("readonly").path)
+                try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: root.appendingPathComponent("readonly/nested").path)
+            }
+            try? FileManager.default.removeItem(at: f.base)
+        }
+        try f.write("content", "readonly/nested/note")
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: nested.path)
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: nested.deletingLastPathComponent().path)
+        #expect(try await f.apply(f.preview()).status == "synchronized")
+        #expect(try String(contentsOf: peerNested.appendingPathComponent("note"), encoding: .utf8) == "content")
+        let local = try SourceSyncFilesystem.inventory(at: f.local.path)
+        let peer = try SourceSyncFilesystem.inventory(at: f.peer.path)
+        #expect(local.items == peer.items)
+        #expect(local.items["readonly"]?.mode == 0o500 && local.items["readonly/nested"]?.mode == 0o500)
+        // A new run can export an already-sealed private tree again.
+        #expect(try await f.apply(f.preview()).status == "synchronized")
     }
 
     @Test("a protection failure cannot displace either live version")

@@ -108,6 +108,7 @@ public enum SourceSyncFilesystem {
                 if result == 0, fsync(directory.descriptor) != 0 { throw changed() }
             }
             directory = try openDirectory(part, in: directory)
+            if create { try setMode(try directoryMode(directory) | 0o700, on: directory) }
         }
         return (directory, leaf)
     }
@@ -184,19 +185,47 @@ public enum SourceSyncFilesystem {
         return target
     }
 
+    static func directoryMode(_ directory: DirectoryHandle) throws -> UInt16 {
+        var info = stat()
+        guard fstat(directory.descriptor, &info) == 0 else { throw changed() }
+        return UInt16(info.st_mode & 0o777)
+    }
+
+    static func setMode(_ mode: UInt16, on directory: DirectoryHandle) throws {
+        guard fchmod(directory.descriptor, mode_t(mode)) == 0,
+              fsync(directory.descriptor) == 0 else { throw changed() }
+    }
+
+    /// Construct private trees while owner-writable, then seal descendants
+    /// before their parents. Retry can reopen an already-sealed export.
+    static func exportItems(_ paths: [String], expected: SyncInventory, from source: DirectoryHandle, to staging: DirectoryHandle) throws {
+        for path in paths.sorted() {
+            guard let item = expected.items[path] else { throw SourceSyncError.stalePlan }
+            try exportItem(path, expected: item, from: source, to: staging)
+        }
+        for path in paths.sorted().reversed() where expected.items[path]?.kind == .directory {
+            let (parent, name) = try parent(of: path, in: staging)
+            let directory = try openDirectory(name, in: parent)
+            try setMode(expected.items[path]!.mode, on: directory)
+        }
+    }
+
     /// Seals a planned value into private staging through pinned handles.
     /// rsync subsequently reads this copy, never a mutable live pathname.
     static func exportItem(_ path: String, expected: SyncItem, from source: DirectoryHandle, to staging: DirectoryHandle) throws {
         let (from, name) = try parent(of: path, in: source)
         let (to, target) = try parent(of: path, in: staging, create: true)
+        guard try item(named: name, in: from, relative: path) == expected else { throw SourceSyncError.stalePlan }
+        var construction = expected
+        if expected.kind == .directory { construction.mode |= 0o700 }
         if let existing = try item(named: target, in: to, relative: path) {
-            guard existing == expected else { throw SourceSyncError.stalePlan }
+            guard existing == expected || existing == construction else { throw SourceSyncError.stalePlan }
+            if expected.kind == .directory { try setMode(construction.mode, on: openDirectory(target, in: to)) }
             return
         }
-        guard try item(named: name, in: from, relative: path) == expected else { throw SourceSyncError.stalePlan }
         switch expected.kind {
         case .directory:
-            _ = try createDirectory(target, in: to, mode: expected.mode)
+            _ = try createDirectory(target, in: to, mode: construction.mode)
         case .symbolicLink:
             let destination = try linkTarget(named: name, in: from)
             guard destination.withCString({ link in target.withCString { symlinkat(link, to.descriptor, $0) } }) == 0 else { throw changed() }
@@ -213,7 +242,7 @@ public enum SourceSyncFilesystem {
             guard fchmod(outputFD, mode_t(expected.mode)) == 0, fsync(outputFD) == 0 else { throw changed() }
             try output.close()
         }
-        guard fsync(to.descriptor) == 0, try item(named: target, in: to, relative: path) == expected else {
+        guard fsync(to.descriptor) == 0, try item(named: target, in: to, relative: path) == construction else {
             throw SourceSyncError.stalePlan
         }
     }
@@ -336,19 +365,10 @@ public enum SourceSyncFilesystem {
         }
         if info.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR) {
             let child = try openDirectory(name, in: directory)
-            let fd = openat(child.descriptor, ".", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
-            guard fd >= 0 else { throw changed() }
-            guard let stream = fdopendir(fd) else { close(fd); throw changed() }
-            defer { closedir(stream) }
-            while true {
-                errno = 0
-                guard let entry = readdir(stream) else { if errno != 0 { throw changed() }; break }
-                let leaf: String? = withUnsafePointer(to: &entry.pointee.d_name) {
-                    $0.withMemoryRebound(to: CChar.self, capacity: Int(NAME_MAX) + 1) { String(validatingCString: $0) }
-                }
-                guard let leaf else { throw changed() }
-                if leaf != "." && leaf != ".." { try removeTree(leaf, in: child) }
-            }
+            // Only private operation storage reaches this function. Sealed
+            // exports/restores may be read-only; live modes stay untouched.
+            try setMode(try directoryMode(child) | 0o700, on: child)
+            for leaf in try entryNames(in: child) { try removeTree(leaf, in: child) }
             guard name.withCString({ unlinkat(directory.descriptor, $0, AT_REMOVEDIR) }) == 0 else { throw changed() }
         } else {
             guard info.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG) || info.st_mode & mode_t(S_IFMT) == mode_t(S_IFLNK),

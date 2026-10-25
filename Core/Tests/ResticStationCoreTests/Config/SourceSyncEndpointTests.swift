@@ -111,6 +111,51 @@ struct SourceSyncEndpointTests {
         #expect(try SyncEndpointService.handle(request).inventory.items == ["note": f.before])
     }
 
+    @Test("read-only exports can be prepared twice and cancelled without changing source modes")
+    func readOnlyExportReplay() throws {
+        let f = try Fixture()
+        let folder = f.root.appendingPathComponent("readonly")
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: folder.path)
+            try? FileManager.default.removeItem(at: f.base)
+        }
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try Data("child".utf8).write(to: folder.appendingPathComponent("child"))
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: folder.path)
+        let inventory = try SyncEndpointService.handle(.init(action: .inventory, group: f.group, root: f.root.path)).inventory
+        var request = SyncEndpointRequest(action: .prepare, group: f.group, root: f.root.path, operationId: f.operation, expected: inventory)
+        request.exportPaths = ["readonly", "readonly/child"]
+        _ = try SyncEndpointService.handle(request)
+        let prepared = try SyncEndpointService.handle(request)
+        let exported = try SourceSyncFilesystem.inventory(at: #require(prepared.exportPath))
+        #expect(exported.items == inventory.items.filter { $0.key.hasPrefix("readonly") })
+        request.action = .cancel
+        _ = try SyncEndpointService.handle(request)
+        let exportPath = try #require(prepared.exportPath)
+        #expect(!FileManager.default.fileExists(atPath: exportPath))
+        #expect(try SourceSyncFilesystem.inventory(at: f.root.path).items == inventory.items)
+    }
+
+    @Test("an existing read-only target parent refuses before any capture or permission change")
+    func existingReadOnlyParent() throws {
+        let f = try Fixture()
+        let folder = f.root.appendingPathComponent("readonly")
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: folder.path)
+            try? FileManager.default.removeItem(at: f.base)
+        }
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try Data("original".utf8).write(to: folder.appendingPathComponent("child"))
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: folder.path)
+        let inventory = try SyncEndpointService.handle(.init(action: .inventory, group: f.group, root: f.root.path)).inventory
+        var request = SyncEndpointRequest(action: .prepare, group: f.group, root: f.root.path, operationId: f.operation, expected: inventory)
+        request.operations = [.init(path: "readonly/child", before: inventory.items["readonly/child"], after: f.after)]
+        #expect(throws: SourceSyncError.self) { try SyncEndpointService.handle(request) }
+        #expect(try SourceSyncFilesystem.inventory(at: f.root.path).items == inventory.items)
+        // Refusal left the root available, without a partial reservation.
+        #expect(try SyncEndpointService.handle(.init(action: .inventory, group: f.group, root: f.root.path)).operationId == nil)
+    }
+
     @Test("missing protection refuses before any displacement")
     func noProtection() throws {
         let f = try Fixture()

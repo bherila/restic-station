@@ -105,6 +105,7 @@ public enum SyncEndpointService {
         case .prepare:
             guard let expected = request.expected else { throw SourceSyncError.stalePlan }
             if journal == nil {
+                try validateWritableParents(request.operations, expected: expected, root: root)
                 guard record.activeOperation == nil, expected.endpointGeneration == record.generation,
                       try inventory() == expected else { throw SourceSyncError.stalePlan }
                 journal = SyncEndpointJournal(operationId: operationId, expected: expected, phase: .prepared, operations: request.operations, steps: [:])
@@ -127,10 +128,7 @@ public enum SyncEndpointService {
                 }
                 guard record.activeOperation == operationId else { throw SourceSyncError.stalePlan }
             }
-            for path in request.exportPaths.sorted() {
-                guard SourceSyncPlanner.isRelativePath(path), let item = expected.items[path] else { throw SourceSyncError.stalePlan }
-                try SourceSyncFilesystem.exportItem(path, expected: item, from: root, to: exported)
-            }
+            try SourceSyncFilesystem.exportItems(request.exportPaths, expected: expected, from: root, to: exported)
         case .commit:
             guard var current = journal, record.activeOperation == operationId,
                   current.phase == .prepared || current.phase == .applying else { throw SourceSyncError.stalePlan }
@@ -158,6 +156,13 @@ public enum SyncEndpointService {
             for change in current.operations {
                 try apply(change, request: request, journal: &current, root: root,
                           staging: staging, recovery: recovery, operation: operation)
+            }
+            // New directories stay writable until every descendant is in
+            // place. Replay accepts either construction or finalized modes.
+            for change in current.operations.reversed() where change.after?.kind == .directory {
+                let (parent, name) = try SourceSyncFilesystem.parent(of: change.path, in: root)
+                guard matchesInstalled(try SourceSyncFilesystem.item(named: name, in: parent, relative: change.path), change: change) else { throw SourceSyncError.stalePlan }
+                try SourceSyncFilesystem.setMode(change.after!.mode, on: SourceSyncFilesystem.openDirectory(name, in: parent))
             }
             journal = current
         case .finish:
@@ -235,6 +240,33 @@ public enum SyncEndpointService {
         return child
     }
 
+    private static func validateWritableParents(_ operations: [SyncEndpointOperation], expected: SyncInventory, root: DirectoryHandle) throws {
+        if operations.isEmpty { return }
+        guard try SourceSyncFilesystem.directoryMode(root) & 0o300 == 0o300 else {
+            throw SourceSyncError.unsafeRoot("The destination folder is read-only. Make it writable before syncing changes into it.")
+        }
+        let constructed = Set(operations.filter { $0.before == nil && $0.after?.kind == .directory }.map(\.path))
+        for change in operations {
+            guard SourceSyncPlanner.isRelativePath(change.path) else { throw SourceSyncError.stalePlan }
+            var parts = change.path.split(separator: "/").map(String.init)
+            parts.removeLast()
+            while !parts.isEmpty {
+                let parent = parts.joined(separator: "/")
+                if !constructed.contains(parent), let item = expected.items[parent], item.mode & 0o300 != 0o300 {
+                    throw SourceSyncError.unsafeRoot("An existing destination subfolder is read-only. Make it writable before syncing changes into it.")
+                }
+                parts.removeLast()
+            }
+        }
+    }
+
+    private static func matchesInstalled(_ actual: SyncItem?, change: SyncEndpointOperation) -> Bool {
+        if actual == change.after { return true }
+        guard var construction = change.after, construction.kind == .directory else { return false }
+        construction.mode |= 0o700
+        return actual == construction
+    }
+
     private static func validateProtection(_ request: SyncEndpointRequest, expected: SyncInventory) throws {
         var paths: Set<String> = []
         for change in request.operations {
@@ -260,7 +292,7 @@ public enum SyncEndpointService {
     ) throws {
         let stage = journal.steps[change.path] ?? .pending
         if stage == .installed {
-            guard try SourceSyncFilesystem.item(at: change.path, in: root) == change.after else {
+            guard matchesInstalled(try SourceSyncFilesystem.item(at: change.path, in: root), change: change) else {
                 throw SourceSyncError.stateInvalid("An installed entry changed before recovery completed. Both versions are retained.")
             }
             return
@@ -305,12 +337,12 @@ public enum SyncEndpointService {
                 // directory wholesale would install its descendants before
                 // their own verification and durable intents.
                 let candidate = "directory-" + SHA256Digest.hex(Data(change.path.utf8))
-                let candidateDirectory = try SourceSyncFilesystem.createDirectory(candidate, in: operation, mode: after.mode)
+                let candidateDirectory = try SourceSyncFilesystem.createDirectory(candidate, in: operation, mode: after.mode | 0o700)
                 guard try SourceSyncFilesystem.inventory(at: candidateDirectory.path.path).items.isEmpty else { throw SourceSyncError.stalePlan }
                 let existing = try SourceSyncFilesystem.item(named: targetName, in: targetParent, relative: change.path)
                 if existing == nil {
                     try SyncDurability.moveExclusive(candidate, from: operation, to: targetParent, as: targetName)
-                } else if existing != after {
+                } else if !matchesInstalled(existing, change: change) {
                     throw SourceSyncError.stalePlan
                 }
                 journal.steps[change.path] = .installed
