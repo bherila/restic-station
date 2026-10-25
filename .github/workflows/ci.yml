@@ -173,7 +173,7 @@ jobs:
           # jump, so the backup is named for the version the file started at
           # (v1 here), not for current - 1.
           .build/debug/restic-station-helper config upgrade
-          grep -qE '"version"[[:space:]]*:[[:space:]]*5' "$RESTIC_STATION_DATA_DIR/config.json"
+          grep -qE '"version"[[:space:]]*:[[:space:]]*6' "$RESTIC_STATION_DATA_DIR/config.json"
           grep -qE '"version"[[:space:]]*:[[:space:]]*1' "$RESTIC_STATION_DATA_DIR/config.v1.backup.json"
 
           # 2. A restic on PATH is discovered and used, with no configuration
