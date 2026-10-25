@@ -5,6 +5,7 @@ set -euo pipefail
 umask 077
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 HELPER="${RESTIC_STATION_HELPER_OVERRIDE:-$ROOT/.build/debug/restic-station-helper}"
+HELPER="$(cd "$(dirname "$HELPER")" && pwd -P)/$(basename "$HELPER")"
 RESTIC="$(command -v restic)"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/restic-source-sync.XXXXXX")"
 WORK="$(cd "$WORK" && pwd -P)"
@@ -40,7 +41,10 @@ config = {"version": 6, "showMenuBarIcon": True, "sets": [{"id": sid, "name": "W
 PY
 printf '%s' 'synthetic-sync-password' | "$HELPER" secret set --dest "$DEST" >/dev/null
 printf '%s' 'synthetic-sync-password' | "$HELPER" secret set --dest "$MIRROR" >/dev/null
-printf -v PASSWORD_COMMAND '%q print-password --dest %s' "$HELPER" "$DEST"
+# Match FileSecretStore's quoting: restic splits this string itself and
+# does not interpret Bash's %q escaping (notably app bundle spaces).
+QUOTED_HELPER="\"$HELPER\""
+PASSWORD_COMMAND="$QUOTED_HELPER print-password --dest $DEST"
 RESTIC_PASSWORD_COMMAND="$PASSWORD_COMMAND" "$RESTIC" -r "$WORK/repo" init >/dev/null
 "$HELPER" init-secondary --set "$SET" --dest "$MIRROR" >/dev/null
 plan() { "$HELPER" sync plan --set "$SET" --json > "$WORK/plan.json"; }
@@ -92,7 +96,7 @@ SNAPSHOT="$(cat "$WORK/snapshot")"
 VAULT="$(cat "$WORK/vault")"
 RESTIC_PASSWORD_COMMAND="$PASSWORD_COMMAND" "$RESTIC" -r "$WORK/repo" restore "$SNAPSHOT:$VAULT" --target "$WORK/recovered" >/dev/null
 test "$(cat "$WORK/recovered/local/nested/from local")" = 'local version'
-printf -v MIRROR_PASSWORD_COMMAND '%q print-password --dest %s' "$HELPER" "$MIRROR"
+MIRROR_PASSWORD_COMMAND="$QUOTED_HELPER print-password --dest $MIRROR"
 MIRROR_SNAPSHOT="$(RESTIC_PASSWORD_COMMAND="$MIRROR_PASSWORD_COMMAND" "$RESTIC" -r "$WORK/mirror" snapshots --json | jq -r --arg snapshot "$SNAPSHOT" 'first(.[] | select(.id == $snapshot or .original == $snapshot) | .id)')"
 test -n "$MIRROR_SNAPSHOT"
 RESTIC_PASSWORD_COMMAND="$MIRROR_PASSWORD_COMMAND" "$RESTIC" -r "$WORK/mirror" restore "$MIRROR_SNAPSHOT:$VAULT" --target "$WORK/mirror-recovered" >/dev/null
