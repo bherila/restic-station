@@ -2,7 +2,11 @@
 # A loopback-only daemon, disposable keys/config, and no user SSH changes.
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-WORK=$(mktemp -d "${TMPDIR:-${HOME}}/restic-ssh-test.XXXXXX")
+# OpenSSH checks every ancestor of AuthorizedKeysFile with StrictModes.
+# Container HOME may be a shared, writable Actions mount. Use the account's
+# real home from the user database, without changing HOME or its modes.
+SSH_FIXTURE_PARENT=$(python3 -c 'import os, pwd; print(pwd.getpwuid(os.getuid()).pw_dir)')
+WORK=$(mktemp -d "$SSH_FIXTURE_PARENT/restic-ssh-test.XXXXXX")
 SSHD_PID=
 cleanup() { if [[ -n "$SSHD_PID" ]]; then kill "$SSHD_PID" 2>/dev/null || true; wait "$SSHD_PID" 2>/dev/null || true; fi; rm -rf "$WORK"; }
 trap cleanup EXIT
