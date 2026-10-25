@@ -57,3 +57,24 @@ func syncRecoveryHistoryCannotBePrunedByAnotherSet() throws {
     #expect(throws: ConfigError.self) { try AppConfig(sets: [set, other]).validate() }
     try AppConfig(sets: [set]).validate()
 }
+
+@Test("sync recovery repositories remain exclusive through machine overrides", arguments: [0, 1, 2, 3])
+func syncRepositoryOverrideExclusivity(_ scenario: Int) throws {
+    let group = SourceSyncGroup(name: "Notes", localPath: "/workspace/notes", peer: .init(path: "/other"), coordinatorMachineId: "laptop")
+    var sync = BackupSet(id: UUID(), name: "Workspace", sources: ["/workspace"], schedule: .daily(hour: 2, minute: 0), destinations: [.init(id: UUID(), label: "Archive", repoURL: "/archive", isPrimary: true)], syncFolders: [group])
+    var other = BackupSet(id: UUID(), name: "Other", sources: ["/other"], schedule: .daily(hour: 2, minute: 0), retention: .init(keepLast: 7), destinations: [.init(id: UUID(), label: "Other archive", repoURL: "/other-archive", isPrimary: true)])
+    switch scenario {
+    case 0: sync.destinations[0].machines = ["laptop": .init(repoURL: "/other-archive")]
+    case 1: other.destinations[0].machines = ["server": .init(repoURL: "/archive")]
+    case 2:
+        sync.destinations[0].machines = ["laptop": .init(repoURL: "/shared-archive")]
+        other.destinations[0].machines = ["server": .init(repoURL: "/shared-archive")]
+    default:
+        other.machines = ["server": .init(enabled: false)]
+        other.destinations[0].machines = ["server": .init(enabled: false, repoURL: "/archive")]
+    }
+    #expect(throws: ConfigError.self) { try AppConfig(sets: [sync, other]).validate() }
+    // Repository sharing remains legal for ordinary backup-only sets.
+    sync.syncFolders = []
+    try AppConfig(sets: [sync, other]).validate()
+}

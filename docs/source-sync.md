@@ -30,7 +30,8 @@ The first version requires `retention: null` and no purge exclusions on a
 sync-enabled set. It must exclusively own its backup repositories: no
 other set, independently configured computer, external retention tool, or
 alternate URL may delete or rewrite its recovery snapshots. Config
-validation rejects literal repository sharing; it cannot discover aliases
+validation rejects literal repository sharing across shared URLs and every
+machine override, including disabled profiles; it cannot discover aliases
 managed outside this configuration. This conservative limit keeps verified
 recovery snapshots available across the source commit. Retention-aware
 snapshot pins are a later extension, not an implied guarantee today.

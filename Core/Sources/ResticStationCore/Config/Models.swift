@@ -908,9 +908,17 @@ extension AppConfig {
                 throw ConfigError.invalidSyncFolder(setId: set.id, reason: "Folder sync currently requires keeping all backup history, without automatic purge patterns.")
             }
             if !set.syncFolders.isEmpty {
-                let ownRepositories = Set(set.destinations.map(\.repoURL))
+                // Shared configuration can run on another host later.
+                // Include every override, even currently disabled profiles,
+                // rather than checking only this machine's resolved URLs.
+                func repositories(_ candidate: BackupSet) -> Set<String> {
+                    Set(candidate.destinations.flatMap { destination in
+                        [destination.repoURL] + (destination.machines ?? [:]).values.compactMap(\.repoURL)
+                    })
+                }
+                let ownRepositories = repositories(set)
                 if sets.contains(where: { other in
-                    other.id != set.id && other.destinations.contains { ownRepositories.contains($0.repoURL) }
+                    other.id != set.id && !ownRepositories.isDisjoint(with: repositories(other))
                 }) {
                     throw ConfigError.invalidSyncFolder(setId: set.id, reason: "A folder-sync backup repository must not also be managed by another backup set.")
                 }
