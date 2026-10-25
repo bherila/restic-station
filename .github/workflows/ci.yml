@@ -60,7 +60,7 @@ jobs:
           jq --version
       - name: Source sync over isolated loopback SSH
         run: |
-          apt-get update -qq && apt-get install -y -qq --no-install-recommends rsync openssh-server
+          apt-get update -qq && apt-get install -y -qq --no-install-recommends rsync openssh-server python3
           mkdir -p /run/sshd
           scripts/source-sync-ssh-test.sh
       # T27 — headless CLI ergonomics (config export/import/validate/show,
