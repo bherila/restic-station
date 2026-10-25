@@ -1,4 +1,5 @@
 import Foundation
+import ResticStationPOSIX
 
 #if canImport(Darwin)
 import Darwin
@@ -11,6 +12,22 @@ import Musl
 /// Descriptor-relative inspection. Inventories never follow a link, turn
 /// an I/O error into an empty tree, or load a large file into memory.
 public enum SourceSyncFilesystem {
+    @TaskLocal static var rootCreation: @Sendable (Int32) throws -> String = { descriptor in
+        var seconds: Int64 = 0
+        var nanoseconds: Int32 = 0
+        guard rs_sync_creation_time(descriptor, &seconds, &nanoseconds) == 0 else {
+            throw SourceSyncError.unsafeRoot("This drive does not support safe folder identity checks. Choose another local filesystem for synchronization.")
+        }
+        return "\(seconds):\(nanoseconds)"
+    }
+
+    static func rootIdentity(_ root: DirectoryHandle) throws -> String {
+        guard let identity = root.identity else { throw changed() }
+        // Inode numbers may be reused after a directory is removed. Its
+        // immutable creation generation distinguishes recreation from an
+        // intentional edit/delete inside the original folder.
+        return "\(identity.deviceID):\(identity.inode):\(try rootCreation(root.descriptor))"
+    }
     public static func physicalDirectory(_ path: String) throws -> String {
         guard SourceSyncGroup.isAbsoluteCanonical(path), let resolved = realpath(path, nil) else { throw changed() }
         defer { free(resolved) }
@@ -27,11 +44,11 @@ public enum SourceSyncFilesystem {
             throw SourceSyncError.unsafeRoot("Choose an absolute local folder outside a cloud-sync provider.")
         }
         let root = try openRoot(path)
-        guard let identity = root.identity else { throw changed() }
+        let identity = try rootIdentity(root)
         var items: [String: SyncItem] = [:]
         var names: Set<String> = []
         try scan(root, relative: "", items: &items, names: &names)
-        return SyncInventory(rootIdentity: "\(identity.deviceID):\(identity.inode)", items: items)
+        return SyncInventory(rootIdentity: identity, items: items)
     }
 
     static func openRoot(_ path: String) throws -> DirectoryHandle {

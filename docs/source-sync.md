@@ -42,6 +42,10 @@ to the actual root inode and records content hashes, types, link targets
 and permissions. Timestamps are scan optimizations, never winner selection.
 Changing root identity, configuration, or losing/corrupting a baseline
 requires reconciliation; an unreadable directory is never an empty tree.
+Root identity includes filesystem creation metadata as well as device and
+inode, so inode reuse cannot disguise a recreated folder as deletion of its
+contents. Filesystems/kernels without creation metadata refuse sync; ordinary
+backup remains available. Linux uses the birth-time field of `statx`.
 
 On the first run, identical paths already agree and unique new paths can
 be offered for copying. Different contents at the same path conflict.

@@ -180,6 +180,17 @@ struct SourceSyncEndpointTests {
         #expect(try String(contentsOf: f.root.appendingPathComponent("note"), encoding: .utf8) == "old")
     }
 
+    @Test("a recreated folder is refused even if the filesystem reuses its inode number")
+    func reusedRootInode() throws {
+        let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
+        #expect(throws: SourceSyncError.self) {
+            try SourceSyncFilesystem.$rootCreation.withValue({ _ in "different-creation-generation" }) {
+                try SyncEndpointService.handle(.init(action: .inventory, group: f.group, root: f.root.path))
+            }
+        }
+        #expect(try String(contentsOf: f.root.appendingPathComponent("note"), encoding: .utf8) == "old")
+    }
+
     @Test("finish requires durable installation even for an empty change list")
     func cannotFinishPreparedNoop() throws {
         let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }

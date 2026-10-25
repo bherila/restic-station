@@ -35,6 +35,18 @@ struct SourceSyncFilesystemTests {
             #expect(try SourceSyncFilesystem.linkTarget(named: name, in: directory) == target)
         }
     }
+
+    @Test("ordinary child changes preserve the root's creation identity")
+    func rootGenerationSurvivesChildEdits() throws {
+        let root = try syncTemporaryRoot()
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let initial = try SourceSyncFilesystem.inventory(at: root.path).rootIdentity
+        try Data("new child".utf8).write(to: root.appendingPathComponent("note"))
+        #expect(try SourceSyncFilesystem.inventory(at: root.path).rootIdentity == initial)
+        try FileManager.default.removeItem(at: root.appendingPathComponent("note"))
+        #expect(try SourceSyncFilesystem.inventory(at: root.path).rootIdentity == initial)
+    }
     @Test("repositories, their children and parents are never live replicas")
     func repositoryBoundary() throws {
         let root = try syncTemporaryRoot()

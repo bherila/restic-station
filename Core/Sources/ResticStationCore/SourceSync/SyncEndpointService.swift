@@ -30,8 +30,7 @@ public enum SyncEndpointService {
             throw SourceSyncError.unsafeRoot("Restic Station's control state cannot be a live sync folder.")
         }
         let root = try SourceSyncFilesystem.openRoot(physicalRoot)
-        guard let identity = root.identity else { throw SourceSyncFilesystem.changed() }
-        let rootIdentity = "\(identity.deviceID):\(identity.inode)"
+        let rootIdentity = try SourceSyncFilesystem.rootIdentity(root)
         let parent = try SourceSyncFilesystem.openRoot(root.path.deletingLastPathComponent().path)
         let controlURL = AppPaths.sourceSyncControlDirectory(for: root.path)
         let controlName = controlURL.lastPathComponent
