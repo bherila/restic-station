@@ -135,10 +135,16 @@ public enum SourceSyncFilesystem {
     }
 
     static func linkTarget(named name: String, in parent: DirectoryHandle) throws -> String {
-        var bytes = [UInt8](repeating: 0, count: 4097)
-        let count = name.withCString { readlinkat(parent.descriptor, $0, &bytes, bytes.count) }
+        var bytes = [CChar](repeating: 0, count: 4097)
+        // readlinkat's imported raw-pointer signature must receive the
+        // array's element storage, not the address of its Swift value.
+        // Older Swift toolchains do not bridge &Array at this boundary.
+        let count = bytes.withUnsafeMutableBufferPointer { storage -> Int in
+            guard let address = storage.baseAddress else { return -1 }
+            return name.withCString { readlinkat(parent.descriptor, $0, address, storage.count) }
+        }
         guard count >= 0, count < bytes.count,
-              let target = String(bytes: bytes.prefix(count), encoding: .utf8) else { throw changed() }
+              let target = String(bytes: bytes.prefix(count).map { UInt8(bitPattern: $0) }, encoding: .utf8) else { throw changed() }
         return target
     }
 

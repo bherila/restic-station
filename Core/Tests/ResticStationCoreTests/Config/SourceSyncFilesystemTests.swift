@@ -23,6 +23,18 @@ func syncTemporaryRoot() throws -> URL {
 
 @Suite("Selected-folder inventory")
 struct SourceSyncFilesystemTests {
+    @Test("symlink reads preserve exact short, Unicode and long target bytes")
+    func linkTargetBytes() throws {
+        let root = try syncTemporaryRoot()
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let directory = try SourceSyncFilesystem.openRoot(root.path)
+        for (index, target) in ["note", "資料/記録", String(repeating: "segment/", count: 100) + "資料"].enumerated() {
+            let name = "link-\(index)"
+            try FileManager.default.createSymbolicLink(atPath: root.appendingPathComponent(name).path, withDestinationPath: target)
+            #expect(try SourceSyncFilesystem.linkTarget(named: name, in: directory) == target)
+        }
+    }
     @Test("repositories, their children and parents are never live replicas")
     func repositoryBoundary() throws {
         let root = try syncTemporaryRoot()
