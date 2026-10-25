@@ -304,6 +304,26 @@ public enum SourceSyncFilesystem {
         throw SourceSyncError.unsafeRoot("Backup repositories cannot be live sync folders. Choose the original files rather than the backup storage.")
     }
 
+    /// Enumerate a pinned directory, independently of pathname aliases and
+    /// other readers' directory offsets. Errors never become an empty list.
+    static func entryNames(in directory: DirectoryHandle) throws -> [String] {
+        let fd = openat(directory.descriptor, ".", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        guard fd >= 0 else { throw changed() }
+        guard let stream = fdopendir(fd) else { close(fd); throw changed() }
+        defer { closedir(stream) }
+        var names: [String] = []
+        while true {
+            errno = 0
+            guard let entry = readdir(stream) else { if errno != 0 { throw changed() }; break }
+            let leaf: String? = withUnsafePointer(to: &entry.pointee.d_name) {
+                $0.withMemoryRebound(to: CChar.self, capacity: Int(NAME_MAX) + 1) { String(validatingCString: $0) }
+            }
+            guard let leaf else { throw changed() }
+            if leaf != "." && leaf != ".." { names.append(leaf) }
+        }
+        return names
+    }
+
     /// Used only for private, already-protected operation storage, never a
     /// live source. Descend through retained descriptors without following
     /// symbolic links; an unexpected type or I/O error refuses cleanup.

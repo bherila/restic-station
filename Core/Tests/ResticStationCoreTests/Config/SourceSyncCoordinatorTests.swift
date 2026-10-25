@@ -48,7 +48,7 @@ struct SourceSyncCoordinatorTests {
             protectedSets.append(set)
             manifests.append(inventory)
             if protectionFails { throw SourceSyncError.protectionFailed }
-            let restored = vault.deletingLastPathComponent().appendingPathComponent("restored-\(UUID())")
+            let restored = vault.deletingLastPathComponent().appendingPathComponent("restore-\(UUID())")
             try FileManager.default.copyItem(at: vault, to: restored)
             return try SyncProtectionReceipt.verify(repositoryId: String(repeating: "b", count: 64), snapshotId: String(repeating: "a", count: 64), expected: inventory, restoredAt: restored)
         }
@@ -131,6 +131,32 @@ struct SourceSyncCoordinatorTests {
         #expect(try SourceSyncCoordinator.status(paths: f.paths, setId: f.set.id, groupId: f.group.id).canCancel)
         _ = try await f.coordinator.cancelUnstarted(set: f.set, group: f.group, machineId: "laptop")
         #expect(try await f.preview().copies == 1)
+    }
+
+    @Test("cancelling before installation removes private verification restores only")
+    func cancelledVerificationCleanup() async throws {
+        let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
+        try f.write("local", "note")
+        let preview = try await f.preview()
+        await #expect(throws: SourceSyncError.self) {
+            try await SourceSyncCoordinator.$afterDurablePhase.withValue({ phase in
+                if phase == "protected" { throw SourceSyncError.transferFailed }
+            }) { try await f.apply(preview) }
+        }
+        let store = try SourceSyncStore(paths: f.paths, setId: f.set.id, groupId: f.group.id)
+        let operation = try store.operation(#require(store.record().activeOperation))
+        let before = try FileManager.default.contentsOfDirectory(atPath: operation.path.path)
+        #expect(before.contains { $0.hasPrefix("restore-") })
+        let unrelated = operation.path.appendingPathComponent("restore-not-a-verification")
+        try FileManager.default.createDirectory(at: unrelated, withIntermediateDirectories: false)
+        _ = try await f.coordinator.cancelUnstarted(set: f.set, group: f.group, machineId: "laptop")
+        let remaining = try FileManager.default.contentsOfDirectory(atPath: operation.path.path)
+        #expect(!remaining.contains { $0.hasPrefix("restore-") && UUID(uuidString: String($0.dropFirst(8))) != nil })
+        #expect(!remaining.contains("vault"))
+        #expect(remaining.contains("restore-not-a-verification"))
+        #expect(try String(contentsOf: f.local.appendingPathComponent("note"), encoding: .utf8) == "local")
+        #expect(try SourceSyncFilesystem.inventory(at: f.peer.path).items.isEmpty)
+        #expect(try store.record().activeOperation == nil)
     }
 
     @Test("deleting a subtree removes children before their parent")

@@ -126,7 +126,9 @@ separate outcomes under one user-facing set.
 The final backup must include successful copies to every configured mirror
 before cleanup. Protected plaintext payloads and restored verification
 copies are then removed through descriptor-relative private-storage
-operations. Captured versions are checked again first: an unexpected editor
+operations. Cancelling an operation before installation also removes its
+private verification restores, without changing either source. Captured
+versions are checked again first: an unexpected editor
 save retains recovery storage and requires attention. Small journals remain
 for audit and recovery mapping; live source folders are never cleanup roots.
 An interrupted cleanup resumes without replaying synchronization or backup.

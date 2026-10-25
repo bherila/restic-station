@@ -162,6 +162,7 @@ public struct SourceSyncCoordinator: Sendable {
             var r = request(.cancel, group: group, local: local); r.operationId = id
             _ = try await transport.request(r, at: local ? .init(path: group.localPath) : group.peer)
         }
+        try cleanupVerificationCopies(in: operation)
         for name in ["vault", "local", "peer"] { try SourceSyncFilesystem.removeTree(name, in: operation) }
         journal.phase = .cancelled
         try SyncDurability.write(journal, named: "journal.json", in: operation)
@@ -171,6 +172,15 @@ public struct SourceSyncCoordinator: Sendable {
         record.status = record.hasHistory ? .synchronized : .ready
         try store.save(record)
         return report(record)
+    }
+
+    private func cleanupVerificationCopies(in operation: DirectoryHandle) throws {
+        // Only the backup adapter's random, operation-private restore
+        // copies qualify. Keep unrelated names and all live source roots.
+        for name in try SourceSyncFilesystem.entryNames(in: operation)
+        where name.hasPrefix("restore-") && UUID(uuidString: String(name.dropFirst(8))) != nil {
+            try SourceSyncFilesystem.removeTree(name, in: operation)
+        }
     }
 
     public static func status(paths: AppPaths, setId: UUID, groupId: UUID, includePaths: Bool = false) throws -> SourceSyncStatus {
@@ -324,11 +334,7 @@ public struct SourceSyncCoordinator: Sendable {
                 _ = try await transport.request(endpointRequest(.cleanup, local: true), at: .init(path: group.localPath))
                 _ = try await transport.request(endpointRequest(.cleanup, local: false), at: group.peer)
                 try SourceSyncFilesystem.removeTree("vault", in: operation)
-                // Restores have random private names and are never live
-                // roots. Remove only the copies this backup adapter made.
-                for url in try FileManager.default.contentsOfDirectory(at: operation.path, includingPropertiesForKeys: nil) where url.lastPathComponent.hasPrefix("restore-") {
-                    try SourceSyncFilesystem.removeTree(url.lastPathComponent, in: operation)
-                }
+                try cleanupVerificationCopies(in: operation)
                 journal.phase = .complete
                 try persist()
             }
