@@ -8,7 +8,7 @@ HELPER="${RESTIC_STATION_HELPER_OVERRIDE:-$ROOT/.build/debug/restic-station-help
 RESTIC="$(command -v restic)"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/restic-source-sync.XXXXXX")"
 WORK="$(cd "$WORK" && pwd -P)"
-trap 'rm -rf "$WORK"' EXIT
+trap 'chmod -R u+rwX "$WORK" 2>/dev/null || true; rm -rf "$WORK"' EXIT
 export RESTIC_STATION_DATA_DIR="$WORK/state"
 export RESTIC_STATION_SECRET_BACKEND=file
 export RESTIC_STATION_MACHINE_ID=laptop
@@ -32,6 +32,9 @@ config = {"version": 6, "showMenuBarIcon": True, "sets": [{"id": sid, "name": "W
 (p/"state/machine.json").write_text(json.dumps({"version":1,"machineId":"laptop","resticPath":restic}))
 (p/"workspace/notes/nested/from local").write_text("local version")
 (p/"workspace/notes/nested").chmod(0o750)
+(p/"workspace/notes/read-only").mkdir()
+(p/"workspace/notes/read-only/note").write_text("read-only tree")
+(p/"workspace/notes/read-only").chmod(0o500)
 (p/"other copy/from peer").write_text("peer version")
 (p/"workspace/sibling").write_text("backup only")
 PY
@@ -47,11 +50,22 @@ apply() {
     return 1
 }
 plan
-jq -e '.ok and .data.copies == 3 and .data.conflicts == 0 and (.data | has("changes") | not)' "$WORK/plan.json" >/dev/null
+jq -e '.ok and .data.copies == 5 and .data.conflicts == 0 and (.data | has("changes") | not)' "$WORK/plan.json" >/dev/null
 apply
 cmp "$WORK/workspace/notes/nested/from local" "$WORK/other copy/nested/from local"
 cmp "$WORK/workspace/notes/from peer" "$WORK/other copy/from peer"
 test ! -e "$WORK/other copy/sibling"
+cmp "$WORK/workspace/notes/read-only/note" "$WORK/other copy/read-only/note"
+python3 - "$WORK" <<'PYMODES'
+import pathlib, stat, sys
+p = pathlib.Path(sys.argv[1])
+for root in [p/"workspace/notes", p/"other copy"]:
+    assert stat.S_IMODE((root/"read-only").stat().st_mode) == 0o500
+    assert stat.S_IMODE((root/"nested").stat().st_mode) == 0o750
+# Both copies were finalized; make them writable for subsequent manual edits.
+for root in [p/"workspace/notes", p/"other copy"]:
+    (root/"read-only").chmod(0o700)
+PYMODES
 # The same token cannot authorize a second operation.
 if apply; then echo 'FAIL: replayed token accepted' >&2; exit 1; fi
 printf '%s' 'replacement' > "$WORK/other copy/nested/from local"
