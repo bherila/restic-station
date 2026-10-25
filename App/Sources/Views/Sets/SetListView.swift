@@ -159,6 +159,17 @@ struct SetListView: View {
             }
             .width(min: 90, ideal: 110)
 
+            TableColumn("Folder sync") { set in
+                if let summary = model.sourceSyncSummaries[set.id] {
+                    Button(model.pendingActionSetIds.contains(set.id) ? "Running" : summary.title) { model.backUpNow(setId: set.id) }
+                        .buttonStyle(.link)
+                        .foregroundStyle(summary.needsAttention ? Color.orange : Color.primary)
+                        .disabled(model.backUpNowUnavailableReason(setId: set.id) != nil)
+                        .help(summary.detail)
+                } else { Text("—").foregroundStyle(.secondary) }
+            }
+            .width(min: 90, ideal: 120)
+
             TableColumn("Next due") { set in
                 Text(nextDueText(for: set))
                     .foregroundStyle(.secondary)
@@ -230,7 +241,7 @@ struct SetListView: View {
             if let health = model.setHealth(for: id), !health.isRunning, let run = health.lastBackup {
                 Button("Open Run Details") { onOpenRun(run.runId) }
             }
-            Button("Back Up Now") { model.backUpNow(setId: id) }
+            Button(set.syncFolders.isEmpty ? "Back Up Now" : "Sync & Back Up…") { model.backUpNow(setId: id) }
                 .disabled(backupUnavailableReason != nil)
                 .help(backupUnavailableReason ?? "Back up \(set.name) now.")
             Divider()

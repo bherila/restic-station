@@ -40,6 +40,9 @@ struct MainWindow: View {
                 .frame(minWidth: 640, minHeight: 480)
         }
         .navigationTitle("Restic Station")
+        .sheet(item: $model.pendingSourceSync) { set in
+            SourceSyncRunSheet(set: set)
+        }
         .safeAreaInset(edge: .top, spacing: 0) {
             AppAlertBanners()
         }

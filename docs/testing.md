@@ -2,6 +2,20 @@
 
 Three layers: unit tests (portable Core plus macOS app wiring), an integration script (real restic, macOS **and** Linux CI — see §Layer 2), and manual hardware/OS checklists (see §Layer 3; they cannot be automated).
 
+Source sync adds `scripts/source-sync-test.sh`: real rsync and disposable
+Restic repositories prove that only a selected child is synchronized, the
+parent remains the backup source, a replaced version can actually be
+restored from its protection snapshot, replay is refused, and excluding the
+recovery payload blocks replacement. `RESTIC_STATION_HELPER_OVERRIDE`
+selects an already-built helper, including the app-bundled/static binary.
+The fixture uses only synthetic data and a temporary FileSecretStore.
+
+`scripts/source-sync-ssh-test.sh` starts a loopback-only sshd with disposable
+keys and pinned host configuration, then runs the optional Core SSH fixture.
+It never edits user SSH configuration or known_hosts. It needs the existing
+OpenSSH server and rsync tools; CI installs them in its disposable Linux
+container. The fixture covers real helper RPC, transfer and quoted paths.
+
 ## Layer 1 — unit tests (`swift test --package-path Core`; app tests through `xcodebuild test`)
 
 App tests include focused projection contracts for non-UI state machines:

@@ -123,11 +123,11 @@ public final class FileLock: @unchecked Sendable {
     /// that directory under the lock: sharing one descriptor is what makes
     /// "the lock protects the tree I am writing into" a structural property
     /// rather than an assumption. See ``DirectoryHandle``.
-    public init(name: String, in directory: DirectoryHandle) {
+    public init(name: String, in directory: DirectoryHandle, leaseToChildren: Bool = false) {
         self.path = directory.path.appendingPathComponent(name)
         self.trustedRoot = nil
         self.directory = directory
-        self.leaseToChildren = false
+        self.leaseToChildren = leaseToChildren
     }
 
     /// While held, the lock's descriptor is a `ProcessLeases` entry, so every

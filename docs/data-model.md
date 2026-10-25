@@ -16,11 +16,11 @@ Every Restic Station writer serializes `config.json` through `locks/config.lock`
 
 ## config.json — `AppConfig`
 
-The example below is a schema-v5 config with **no** `machines` keys — the shape most installs have, and the one the compatibility guarantee is about: absent `machines` means inherit and run everywhere. `resticPath` is shown for completeness; it is deprecated (see §machine.json) and migration clears it.
+The example below is a schema-v6 config with **no** `machines` keys — the shape most installs have, and the one the compatibility guarantee is about: absent `machines` means inherit and run everywhere. `resticPath` is shown for completeness; it is deprecated (see §machine.json) and migration clears it.
 
 ```json
 {
-  "version": 5,
+  "version": 6,
   "resticPath": "/opt/homebrew/bin/restic",
   "showMenuBarIcon": true,
   "sets": [
@@ -71,7 +71,7 @@ The example below is a schema-v5 config with **no** `machines` keys — the shap
 
 ```swift
 public struct AppConfig: Codable, Equatable {
-    public var version: Int            // = 5; bump on breaking schema change
+    public var version: Int            // = 6; bump on breaking schema change
     public var resticPath: String?     // DEPRECATED — see machine.json; nil = not set
     public var showMenuBarIcon: Bool   // default true
     public var sets: [BackupSet]
@@ -84,6 +84,7 @@ public struct BackupSet: Codable, Equatable, Identifiable {
     public var excludes: [String]          // restic --exclude patterns
     public var purgeExcludes: [String]     // history-affecting restic --exclude patterns (v3)
     public var onlineOnlyFiles: OnlineOnlyFiles // v4; .skip | .download — cloud placeholders under cloud-synced sources
+    public var syncFolders: [SourceSyncGroup] // v6; optional live copies, independent of sources
     public var usesGlobalExcludes: Bool    // v5; false opts the set out of §global-excludes.json
     public var schedule: Schedule
     public var retention: RetentionPolicy? // nil = never forget
@@ -164,13 +165,15 @@ public struct CheckPolicy: Codable, Equatable {
 ### Invariants (enforced by `AppConfig.validate() throws`, called on every save and after load)
 
 1. Each set has **exactly one** destination with `isPrimary == true`.
-2. Set and destination UUIDs are unique across the whole config.
+2. Set, destination and sync-folder UUIDs are unique across the whole config.
 3. `sources` non-empty for every set; every source is an absolute path, and carries no `.` or `..` component. restic records the lexically cleaned path in a snapshot while `PurgePlan` deliberately does not resolve those components — it has no filesystem access, and resolving `..` lexically is wrong across a symlink — so a source written that way makes its own snapshots unattributable, and purge fails closed at run time. Repeated and trailing separators stay legal: both sides are normalized for those.
 4. `Schedule` fields in range (minute 0–59, hour 0–23, weekday 1–7, everyMinutes ≥ 5).
 5. Every `purgeExcludes` pattern is non-empty. A blank plain `excludes` entry is harmless noise, but a blank pattern must never become a history-changing purge rule.
 6. `stalenessWarningDays ≥ 1`; `readDataSubsetSlices` in 2...100.
 7. Every `machines` key is a valid `machineId` (see §machine.json for the charset), and every value an override supplies gets the same check as the field it replaces: override `sources` entries get the whole of invariant 3's path rule (absolute, no `.`/`..`), an override `schedule` must be in range. **Exception:** an override `sources` of `[]` is legal where a top-level `[]` is not — it is how a machine says "nothing to back up here", and resolution drops the set with a recorded reason rather than running a source-less backup.
 8. **Per machine:** if a set runs on a machine, exactly one of its destinations must be a primary that is enabled there. Disabling the primary is never a valid way to say "do not run here" — disable the whole set for that machine instead. Checked for every `machineId` the config mentions; machines with no overrides see the shared values, which invariant 1 already covers.
+
+9. Sync folders require schema v6, absolute non-overlapping roots, a valid coordinating machine, and a local root covered by that machine’s backup sources. Initial sync-enabled sets retain all history (`retention: null`, no purge exclusions); their repositories cannot also belong to another set. See [source-sync.md](source-sync.md) for runtime identity, restore-proof and ownership requirements.
 
 A `machines` key that no `machine.json` in the fleet claims is **not** an error — machines come and go, and the config is shared. It is a warning surfaced by `config validate` (T27).
 
@@ -867,6 +870,16 @@ This is the first step that does **not** preserve the older behavior: a v3 build
 
 Like v3 → v4 and unlike the steps before it, that does **not** preserve the older behavior: a v4 build had no global exclusion list at all, so every set gains one at migration. It is deliberate — the list exists precisely so a cache directory does not have to be named in every set on every machine — and a set that must keep archiving build output sets `"usesGlobalExcludes": false`. What actually changes on a given host is visible before it runs: `excludes show` prints the resolved pattern list, and every backup log records how many patterns applied. As with v3 and v4, a v4 build refuses a v5 config (§Loader behavior), so hosts sharing a config upgrade together.
 
+### v5 → v6
+
+Adds optional `syncFolders` to a backup set. An absent or empty list means
+backup only; migration never selects a source for synchronization. `sources`
+remains the full backup scope. Empty sync lists are omitted when encoding.
+The pre-upgrade bytes are preserved in `config.v5.backup.json` as for other
+schema upgrades. Older helpers refuse v6, so upgrade all computers sharing
+configuration before saving it with a v6 app. Inspection commands do not
+rewrite an older config. See [source-sync.md](source-sync.md).
+
 ### How `config.json` and `machine.json` are written
 
 Every write is atomic for readers **and** crash-durable (#159, `DurableFile`): the bytes go to a temp file beside the target (`O_NOFOLLOW`, so a symlink planted there is refused rather than written through), the temp file is `fsync`ed, `rename(2)` installs it (on Darwin, the compare-and-swap save's `RENAME_SWAP`), and then the containing directory is `fsync`ed. A failure before the rename is an error and leaves the old file in place. **After the rename nothing throws**: the new file is live, so a directory sync that fails there is reported on stderr and the write counts as done — every caller's "the write failed" means "the old file is still there", and a third, possibly-committed outcome was a source of wrong rollbacks (#165 review). The migration backup is the exception, because it licenses overwriting the source: one whose directory cannot be synced is removed and counts as not written, and an existing backup's directory is synced before the backup is relied on.
@@ -921,7 +934,7 @@ Both commands build the identical report (`EffectiveConfigReport`, `Helper/Sourc
 ```json
 {
   "machineId": "studio-mac",
-  "version": 5,
+  "version": 6,
   "resticPath": null,
   "sets": [
     {

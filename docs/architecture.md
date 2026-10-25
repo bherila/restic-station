@@ -233,3 +233,21 @@ restic's cache is redirected via `RESTIC_CACHE_DIR` to the location in the table
 ## Build system
 
 XcodeGen (`project.yml`) generates `ResticStation.xcodeproj` (git-ignored). The `Restic Station` app and `restic-station-helper` tool both depend on the local package `ResticStationCore`; the `Restic StationTests` unit-test target hosts against the app. The helper is embedded via a Copy Files phase (destination: executables); the LaunchAgent plist is copied to `Contents/Library/LaunchAgents/` via a Copy Files phase (destination: wrapper). The app alone links Sparkle (SwiftPM, exact version) for self-update; `App/Resources/Info.plist` holds its keys and is merged into the generated plist. `Core/` and `Helper/` never depend on it. CI builds with `CODE_SIGNING_ALLOWED=NO`; the app is **not sandboxed** (required for spawning restic/security, PATH-external binaries, and flock in Application Support) and is therefore not App Store eligible — accepted.
+
+## Selected live-folder synchronization
+
+`SourceSyncCoordinator` in Core reconciles two inventories against a durable
+last agreement. `sync plan/apply/status/recover` expose that engine to the
+macOS app and Linux CLI. `SourceSyncClient` uses typed helper RPC over pinned
+SSH for control and rsync only for sealed private payloads. Endpoint
+reservations and journals outlive any single helper process. Workers use
+retained directory descriptors, capture actual displaced entries, and
+install without clobbering a concurrently created pathname.
+
+`EngineSourceSyncBackups` runs the ordinary `BackupEngine` with every
+configured source plus an operation-scoped recovery vault, then restores
+that exact vault snapshot to prove protection before commit. It runs the
+full backup/mirror pipeline again after agreement. The backup selection and
+the sync selection remain independent fields on the same set. See
+[source-sync.md](source-sync.md) for the trust boundary, recovery state
+machine, retention limitation and tests.

@@ -23,7 +23,8 @@ public struct AppConfig: Codable, Equatable, Sendable {
     ///   global exclusion list (`docs/data-model.md`
     ///   §global-excludes.json) is applied to the set, or the set is opted
     ///   out of it.
-    public static let currentVersion = 5
+    /// - 6: explicitly selected source-sync folders, independent of sources.
+    public static let currentVersion = 6
 
     public var version: Int
     /// **Deprecated** — superseded by `MachineConfig.resticPath`, because
@@ -91,6 +92,9 @@ public struct BackupSet: Codable, Equatable, Identifiable, Sendable {
     public var name: String
     /// Absolute paths.
     public var sources: [String]
+    /// Optional live-copy selections. Never inferred from backup sources.
+    /// Omitted when empty so backup-only sets retain their original shape.
+    public var syncFolders: [SourceSyncGroup]
     /// restic `--exclude` patterns. Forward-only: they keep matching paths
     /// out of *new* snapshots and do nothing to snapshots already written.
     public var excludes: [String]
@@ -159,11 +163,13 @@ public struct BackupSet: Codable, Equatable, Identifiable, Sendable {
         checkPolicy: CheckPolicy? = nil,
         stalenessWarningDays: Int = 14,
         destinations: [Destination],
-        machines: [String: BackupSetMachineOverride]? = nil
+        machines: [String: BackupSetMachineOverride]? = nil,
+        syncFolders: [SourceSyncGroup] = []
     ) {
         self.id = id
         self.name = name
         self.sources = sources
+        self.syncFolders = syncFolders
         self.excludes = excludes
         self.purgeExcludes = purgeExcludes
         self.onlineOnlyFiles = onlineOnlyFiles
@@ -180,7 +186,7 @@ public struct BackupSet: Codable, Equatable, Identifiable, Sendable {
         case id, name, sources, excludes, purgeExcludes, onlineOnlyFiles, usesGlobalExcludes
         case schedule, retention, checkPolicy
         case stalenessWarningDays, destinations
-        case machines
+        case machines, syncFolders
     }
 
     // Hand-written decode, where every other type here relies on the
@@ -198,6 +204,7 @@ public struct BackupSet: Codable, Equatable, Identifiable, Sendable {
         id = try container.decode(UUID.self, forKey: .id)
         name = try container.decode(String.self, forKey: .name)
         sources = try container.decode([String].self, forKey: .sources)
+        syncFolders = try container.decodeIfPresent([SourceSyncGroup].self, forKey: .syncFolders) ?? []
         excludes = try container.decode([String].self, forKey: .excludes)
         purgeExcludes = try container.decodeIfPresent([String].self, forKey: .purgeExcludes) ?? []
         onlineOnlyFiles = try container.decodeIfPresent(OnlineOnlyFiles.self, forKey: .onlineOnlyFiles) ?? .skip
@@ -222,6 +229,7 @@ public struct BackupSet: Codable, Equatable, Identifiable, Sendable {
         try container.encode(id, forKey: .id)
         try container.encode(name, forKey: .name)
         try container.encode(sources, forKey: .sources)
+        if !syncFolders.isEmpty { try container.encode(syncFolders, forKey: .syncFolders) }
         try container.encode(excludes, forKey: .excludes)
         try container.encode(purgeExcludes, forKey: .purgeExcludes)
         try container.encode(onlineOnlyFiles, forKey: .onlineOnlyFiles)
@@ -768,6 +776,7 @@ public struct CheckPolicy: Codable, Equatable, Sendable {
 
 /// Errors thrown by `AppConfig.validate()` and `ConfigStore`.
 public enum ConfigError: Error, Equatable, Sendable, CustomStringConvertible {
+    case invalidSyncFolder(setId: UUID, reason: String)
     case remoteMaintenanceRequiresSFTP(destinationId: UUID)
     /// `config.version` is greater than `AppConfig.currentVersion` — refuse
     /// to load a config written by a newer build.
@@ -805,6 +814,8 @@ public enum ConfigError: Error, Equatable, Sendable, CustomStringConvertible {
 
     public var description: String {
         switch self {
+        case .invalidSyncFolder(let setId, let reason):
+            return "backup set \(setId): \(reason)"
         case .remoteMaintenanceRequiresSFTP(let destinationId):
             return "destination \(destinationId) enables remote maintenance but is not an sftp repository"
         case .newerVersion(let found, let supported):
@@ -891,6 +902,36 @@ extension AppConfig {
             }
             for source in set.sources where Self.hasNonCanonicalComponent(source) {
                 throw ConfigError.nonCanonicalSourcePath(setId: set.id, path: source)
+            }
+
+            if !set.syncFolders.isEmpty, set.retention != nil || !set.purgeExcludes.isEmpty {
+                throw ConfigError.invalidSyncFolder(setId: set.id, reason: "Folder sync currently requires keeping all backup history, without automatic purge patterns.")
+            }
+            if !set.syncFolders.isEmpty {
+                let ownRepositories = Set(set.destinations.map(\.repoURL))
+                if sets.contains(where: { other in
+                    other.id != set.id && other.destinations.contains { ownRepositories.contains($0.repoURL) }
+                }) {
+                    throw ConfigError.invalidSyncFolder(setId: set.id, reason: "A folder-sync backup repository must not also be managed by another backup set.")
+                }
+            }
+            for group in set.syncFolders {
+                if version < 6 {
+                    throw ConfigError.invalidSyncFolder(setId: set.id, reason: "Sync folders require config schema version 6 or newer.")
+                }
+                guard seenIDs.insert(group.id).inserted else { throw ConfigError.duplicateIdentifier(group.id) }
+                do {
+                    let protectedSources = set.machines?[group.coordinatorMachineId]?.sources ?? set.sources
+                    try group.validate(backupSources: protectedSources)
+                } catch {
+                    throw ConfigError.invalidSyncFolder(setId: set.id, reason: String(describing: error))
+                }
+                for other in set.syncFolders where other.id != group.id {
+                    if SourceSyncGroup.contains(group.localPath, other.localPath)
+                        || SourceSyncGroup.contains(other.localPath, group.localPath) {
+                        throw ConfigError.invalidSyncFolder(setId: set.id, reason: "Sync selections must not overlap.")
+                    }
+                }
             }
 
             // Invariant 3: no blank purge pattern. `excludes` is deliberately

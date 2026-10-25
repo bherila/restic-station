@@ -121,6 +121,7 @@ if [[ "$FAST" == "1" ]]; then
 else
     if command -v restic >/dev/null 2>&1; then
         step "integration test" scripts/integration-test.sh
+        step "source sync integration" scripts/source-sync-test.sh
     else
         skip "integration test" "restic not on PATH"
     fi

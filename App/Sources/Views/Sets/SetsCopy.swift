@@ -231,6 +231,8 @@ enum SetsCopy {
     /// surface inline (map `ConfigError` cases to field-level messages)").
     static func fieldMessage(for error: ConfigError) -> (field: SetEditorField, message: String) {
         switch error {
+        case .invalidSyncFolder(_, let reason):
+            return (.syncFolders, reason)
         case .remoteMaintenanceRequiresSFTP:
             return (.destinations, "Remote maintenance is available only for SFTP destinations.")
         case .newerVersion:
@@ -371,6 +373,7 @@ enum SetsCopy {
 /// The set editor's inline-error slots. One per section that can fail
 /// validation, plus `.general` for anything that is not field-specific.
 enum SetEditorField: Hashable, Sendable {
+    case syncFolders
     case name
     case sources
     /// The purging-exclusion list (schema v3). There is no `excludes` case:

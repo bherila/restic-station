@@ -340,6 +340,8 @@ struct ConfigErrorTableTests {
     /// case-exhaustive too, so both break together.
     private static func expected(_ error: ConfigError) -> (code: CLIErrorCode, carriesVersions: Bool) {
         switch error {
+        case .invalidSyncFolder:
+            return (.configInvalid, false)
         case .newerVersion:
             return (.configInvalid, true)
         case .remoteMaintenanceRequiresSFTP, .notExactlyOnePrimaryDestination,
@@ -354,6 +356,7 @@ struct ConfigErrorTableTests {
     }
 
     private static let cases: [ConfigError] = [
+        .invalidSyncFolder(setId: setId, reason: "outside backup coverage"),
         .remoteMaintenanceRequiresSFTP(destinationId: destId),
         .newerVersion(found: 4, supported: 3),
         .notExactlyOnePrimaryDestination(setId: setId, count: 2),

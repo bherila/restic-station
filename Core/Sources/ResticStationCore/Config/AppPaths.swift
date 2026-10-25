@@ -215,6 +215,17 @@ public struct AppPaths: Equatable, Sendable {
         root.appendingPathComponent("state", isDirectory: true)
     }
 
+    public var sourceSyncDir: URL { root.appendingPathComponent("source-sync", isDirectory: true) }
+
+    /// Endpoint recovery must share a filesystem with the selected root so
+    /// an exclusive rename can preserve the exact displaced inode. This is
+    /// control/recovery storage, outside the live folder and never another
+    /// synchronization root. Its name contains no user folder basename.
+    public static func sourceSyncControlDirectory(for root: URL) -> URL {
+        let key = SHA256Digest.hex(Data(root.path.utf8)).prefix(24)
+        return root.deletingLastPathComponent().appendingPathComponent(".restic-station-sync-\(key)", isDirectory: true)
+    }
+
     /// `state/schedule-state.json` — last-start times + check-slice cursors per set.
     public var scheduleStateFile: URL {
         stateDir.appendingPathComponent("schedule-state.json", isDirectory: false)

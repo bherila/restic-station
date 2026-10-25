@@ -50,6 +50,35 @@ public struct HelperInvoker: Sendable {
         await run(.backUpNow(setId: setId))
     }
 
+    func syncPlan(setId: UUID, groupId: UUID) async throws -> SourceSyncPreview {
+        try await syncReport(.syncPlan(setId: setId, groupId: groupId), as: SourceSyncPreview.self)
+    }
+
+    func syncStatus(setId: UUID, groupId: UUID) async throws -> SourceSyncStatus {
+        try await syncReport(.syncStatus(setId: setId, groupId: groupId), as: SourceSyncStatus.self)
+    }
+
+    func syncApply(setId: UUID, groupId: UUID, token: String) async throws -> SourceSyncStatus {
+        try await syncReport(.syncApply(setId: setId, groupId: groupId, previewToken: token), as: SourceSyncStatus.self)
+    }
+
+    func syncRecover(setId: UUID, groupId: UUID, cancelUnstarted: Bool = false) async throws -> SourceSyncStatus {
+        try await syncReport(.syncRecover(setId: setId, groupId: groupId, cancelUnstarted: cancelUnstarted), as: SourceSyncStatus.self)
+    }
+
+    private func syncReport<T: Decodable & Sendable>(_ command: HelperCommand, as type: T.Type) async throws -> T {
+        let invocation = await runDetailed(command)
+        guard case .ok = invocation.result else {
+            throw SourceSyncError.stateInvalid(Self.humanResult(invocation.result, jsonOutput: invocation.stdout).message)
+        }
+        do {
+            let envelope = try ConfigStore.makeDecoder().decode(SyncReportEnvelope<T>.self, from: Data(invocation.stdout.utf8))
+            guard envelope.ok else { throw SourceSyncError.stalePlan }
+            return envelope.data
+        }
+        catch { throw SourceSyncError.stateInvalid("The helper returned an incomplete synchronization report. Inspect its status before continuing.") }
+    }
+
     /// `expectedConfig` binds the run to the `config.json` the caller
     /// reviewed; the helper refuses if the file changed underneath it.
     public func prune(setId: UUID, expectedConfig: String? = nil) async -> HelperResult {
@@ -271,6 +300,8 @@ public struct HelperInvoker: Sendable {
         }
     }
 }
+
+private struct SyncReportEnvelope<T: Decodable>: Decodable { let ok: Bool; let data: T }
 
 /// Keeps JSON-mode stdout distinct from incidental helper diagnostics. The
 /// UI still renders combined output for human-mode failures, but structured

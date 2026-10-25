@@ -287,8 +287,8 @@ import Musl
         #expect(flock(contender, LOCK_EX | LOCK_NB) == 0, "the lock stayed held after the child exited")
     }
 
-    @Test("a lease-holding FileLock registers while held and unregisters on release")
-    func fileLockRegistersLease() throws {
+    @Test("a lease-holding FileLock registers while held and unregisters on release", arguments: [false, true])
+    func fileLockRegistersLease(descriptorRelative: Bool) throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("lease-lock-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -296,7 +296,10 @@ import Musl
         // Asserted on this lock's own registration, never by diffing the
         // process-wide registry: parallel engine tests take set locks, which
         // register and release leases at any moment.
-        let lock = FileLock(path: root.appendingPathComponent("set.lock"), leaseToChildren: true)
+        let directory = try SourceSyncFilesystem.openRoot(SourceSyncFilesystem.physicalDirectory(root.path))
+        let lock = descriptorRelative
+            ? FileLock(name: "set.lock", in: directory, leaseToChildren: true)
+            : FileLock(path: root.appendingPathComponent("set.lock"), leaseToChildren: true)
         #expect(lock.acquire() == .acquired)
         let token = try #require(lock.leaseToken)
         #expect(ProcessLeases.shared.contains(token))

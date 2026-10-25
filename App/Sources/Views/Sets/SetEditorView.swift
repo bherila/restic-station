@@ -66,6 +66,12 @@ struct SetEditorView: View {
                 errorMessage: fieldErrors[.sources]
             )
 
+            SourceSyncSection(
+                folders: $draft.syncFolders,
+                machineId: model.machine.machineId,
+                errorMessage: fieldErrors[.syncFolders]
+            )
+
             OnlineOnlyFilesSection(policy: $draft.onlineOnlyFiles, sources: draft.sourcesOnAnyMachine)
 
             ExcludesSection(

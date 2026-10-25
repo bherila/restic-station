@@ -13,8 +13,10 @@ let package = Package(
         )
     ],
     targets: [
+        .target(name: "ResticStationPOSIX"),
         .target(
-            name: "ResticStationCore"
+            name: "ResticStationCore",
+            dependencies: ["ResticStationPOSIX"]
         ),
         .testTarget(
             name: "ResticStationCoreTests",

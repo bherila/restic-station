@@ -172,6 +172,14 @@ final class AppModel: ObservableObject {
     /// spawning the helper and the run's state file appearing, and a second
     /// click in that window would just collide on the per-set lock.
     @Published private(set) var pendingActionSetIds: Set<UUID> = []
+    @Published var pendingSourceSync: BackupSet?
+    @Published private(set) var sourceSyncSummaries: [UUID: SourceSyncSummary] = [:]
+
+    struct SourceSyncSummary: Equatable {
+        var title: String
+        var detail: String
+        var needsAttention: Bool = false
+    }
 
     // MARK: - Collaborators
 
@@ -694,6 +702,29 @@ final class AppModel: ObservableObject {
     }
 
     private func recomputeDerivedState() {
+        var syncSummaries: [UUID: SourceSyncSummary] = [:]
+        for set in resolvedConfig.sets where !set.syncFolders.isEmpty {
+            let local = set.syncFolders.filter { $0.coordinatorMachineId == machine.machineId }
+            if local.isEmpty {
+                syncSummaries[set.id] = .init(title: "Another computer", detail: "Run synchronization on the configured coordinating computer. Backups here are independent.")
+                continue
+            }
+            do {
+                let states = try local.map { try SourceSyncCoordinator.status(paths: paths, setId: set.id, groupId: $0.id) }
+                if states.contains(where: { $0.operationId != nil }) {
+                    syncSummaries[set.id] = .init(title: "Resume needed", detail: "Open Sync & Back Up to inspect and resume the interrupted operation.", needsAttention: true)
+                } else if states.contains(where: { $0.lastSynchronizedAt == nil }) {
+                    syncSummaries[set.id] = .init(title: "Not run yet", detail: "Preview the selected folders with Sync & Back Up.")
+                } else {
+                    syncSummaries[set.id] = .init(title: "Synchronized", detail: "The last manual synchronization completed. Open a new preview to check current changes.")
+                }
+            } catch SourceSyncError.busy {
+                syncSummaries[set.id] = .init(title: "Running", detail: "A helper is synchronizing these folders.")
+            } catch {
+                syncSummaries[set.id] = .init(title: "Needs attention", detail: "Synchronization state could not be read. Open Sync & Back Up for the recovery reason.", needsAttention: true)
+            }
+        }
+        if sourceSyncSummaries != syncSummaries { sourceSyncSummaries = syncSummaries }
         let migration = stateWatcher.configMigration.flatMap { $0.needsAcknowledgement ? $0 : nil }
         if unacknowledgedConfigMigration != migration {
             unacknowledgedConfigMigration = migration
@@ -824,11 +855,15 @@ final class AppModel: ObservableObject {
     /// `restic-station-helper run-set`, it never runs restic itself).
     /// Fire-and-forget: progress arrives through `StateWatcher`, and only the
     /// final outcome line is recorded here.
-    func backUpNow(setId: UUID) {
+    func backUpNow(setId: UUID, backupOnly: Bool = false) {
         // This is the process-wide guard, not merely presentation state: any
         // current or future UI entry point must fail closed while destructive
         // schedule bookkeeping needs recovery.
         guard backUpNowUnavailableReason(setId: setId) == nil else { return }
+        if !backupOnly, let set = resolvedConfig.sets.first(where: { $0.id == setId }), !set.syncFolders.isEmpty {
+            pendingSourceSync = set
+            return
+        }
         let setName = config.sets.first { $0.id == setId }?.name ?? "backup set"
         pendingActionSetIds.insert(setId)
         Task { [helper] in
@@ -843,6 +878,11 @@ final class AppModel: ObservableObject {
 
     func clearLastHelperMessage() {
         lastHelperMessage = nil
+    }
+
+    func setSourceSyncBusy(_ busy: Bool, setId: UUID) {
+        if busy { pendingActionSetIds.insert(setId) }
+        else { pendingActionSetIds.remove(setId) }
     }
 
     // MARK: - restic

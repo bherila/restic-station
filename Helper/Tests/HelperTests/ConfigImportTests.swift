@@ -111,7 +111,7 @@ struct ConfigImportTests {
         let migration = store.migrateToCurrentVersion(decoded, originalBytes: v1JSON)
 
         #expect(migration.backupWritten)
-        #expect(migration.config.version == 5)
+        #expect(migration.config.version == AppConfig.currentVersion)
         #expect(migration.config.resticPath == nil)
         #expect(try MachineStore.persistentIdentity(paths: paths).load().resticPath == "/opt/homebrew/bin/restic")
         #expect(FileManager.default.fileExists(atPath: paths.configV1BackupFile.path))
@@ -221,7 +221,7 @@ struct ConfigImportTests {
 
         let preview = ConfigStore.previewMigration(decoded)
 
-        #expect(preview.version == 5)
+        #expect(preview.version == AppConfig.currentVersion)
         #expect(!FileManager.default.fileExists(atPath: paths.root.path))
     }
 }
