@@ -342,7 +342,9 @@ public final class BackupEngine: Sendable {
     /// 9. clear `current-run`, release the lock (also on every failure path),
     ///    group outcome = worst child status, leaving out a mirror's child
     ///    that its own secret read refused (#172).
-    public func runSet(_ set: BackupSet, trigger: RunTrigger) async -> SetRunOutcome {
+    /// `parent` is for source sync only (``ResticCommand/backup(repo:sources:excludes:globalExcludes:excludeCloudFiles:excludeCaches:excludeLargerThan:parent:dryRun:)``);
+    /// scheduled and manual backups leave restic to choose.
+    public func runSet(_ set: BackupSet, trigger: RunTrigger, parent: String? = nil) async -> SetRunOutcome {
         guard let primary = set.destinations.first(where: { $0.isPrimary }) else {
             let reason = "backup set \"\(set.name)\" has no primary destination"
             logWarning("BackupEngine: \(reason) — refusing to run")
@@ -443,7 +445,7 @@ public final class BackupEngine: Sendable {
         var children: [SetRunChild] = []
         var infrastructureFailures: [String] = []
 
-        let launch = await backupLaunch(for: set, primary: primary, dryRun: false)
+        let launch = await backupLaunch(for: set, primary: primary, dryRun: false, parent: parent)
         let cloudSourceNote = launch.cloudSourceNote
         let cacheTagFinding = launch.cacheTagFinding
 
@@ -847,7 +849,7 @@ public final class BackupEngine: Sendable {
     /// files, even for a set whose policy is `"download"`. A preview that
     /// pulled gigabytes out of iCloud would be the opposite of side-effect
     /// free; ``backupDryRun(_:)`` says so in its warnings instead.
-    private func backupLaunch(for set: BackupSet, primary: Destination, dryRun: Bool) async -> BackupLaunch {
+    private func backupLaunch(for set: BackupSet, primary: Destination, dryRun: Bool, parent: String? = nil) async -> BackupLaunch {
         // Online-only files under a cloud-synced source are skipped rather
         // than downloaded when the set asks for it, but only by a restic that
         // accepts the flag on this platform; an older one would fail the
@@ -919,6 +921,7 @@ public final class BackupEngine: Sendable {
                 excludeCloudFiles: excludeCloudFiles,
                 excludeCaches: excludeCaches,
                 excludeLargerThan: set.excludeLargerThan(applying: globalExcludes),
+                parent: parent,
                 dryRun: dryRun
             ),
             invocation: ResticInvocation(

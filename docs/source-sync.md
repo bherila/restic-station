@@ -109,6 +109,12 @@ the existing guarded Restic interfaces before authorizing replacement;
 retain enough origin and restore mapping to recover remote-only versions.
 Existing verified coverage may be reused when it still proves those exact
 versions. Repository retention/purge invariants remain unchanged.
+Each protection and final backup names the newest snapshot of this host
+that covers every configured source as restic's `--parent`. The vault path
+is unique per operation, so restic's own host-and-paths match would never
+find one and every sync would re-read the whole backup scope. The vault is
+never in a parent, so it is always read in full; without a usable parent
+the backup still runs, only slower.
 The protection receipt records the actual repository ID as well as the
 exact snapshot ID and manifest fingerprint. Repository identity must match
 before backup and after the verification restore, and both IDs remain bound

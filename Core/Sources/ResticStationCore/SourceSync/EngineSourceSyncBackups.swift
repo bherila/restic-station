@@ -13,7 +13,8 @@ public struct EngineSourceSyncBackups: SourceSyncBackingUp {
     public func protect(set: BackupSet, vault: URL, inventory: SyncInventory) async throws -> SyncProtectionReceipt {
         guard let primary = set.destinations.first(where: \.isPrimary) else { throw SourceSyncError.protectionFailed }
         let repositoryId = try await identity(primary)
-        let result = await engine.runSet(adding(vault, to: set), trigger: .manual)
+        let parent = await parentSnapshot(for: set, primary: primary)
+        let result = await engine.runSet(adding(vault, to: set), trigger: .manual, parent: parent)
         guard case .completed(let status, _, let children) = result,
               status == .success,
               let backup = children.first(where: { $0.kind == .backup && $0.destId == primary.id }),
@@ -55,6 +56,27 @@ public struct EngineSourceSyncBackups: SourceSyncBackingUp {
         var scoped = set
         scoped.sources.append(vault.path)
         return scoped
+    }
+
+    /// The vault path is unique per operation, so restic's own match on
+    /// host and exact paths never finds a parent, and every sync would re-read
+    /// the whole backup scope twice. Any snapshot of this host covering every
+    /// configured source is a valid parent; the newest one skips the most
+    /// reading. A parent only decides which unchanged files are not re-read,
+    /// so any doubt falls back to none: slower, never less complete.
+    func parentSnapshot(for set: BackupSet, primary: Destination) async -> String? {
+        guard let host = MachineIdentity.kernelHostName(),
+              let result = try? await restic.run(.snapshots(repo: primary.repoURL), for: ResticInvocation(destination: primary)),
+              result.status == .success,
+              let snapshots = try? parseSnapshots(Data(result.rawOutput.utf8)) else { return nil }
+        return Self.parent(among: snapshots, host: host, sources: set.sources)
+    }
+
+    static func parent(among snapshots: [Snapshot], host: String, sources: [String]) -> String? {
+        let required = Set(sources)
+        return snapshots
+            .filter { $0.hostname == host && required.isSubset(of: $0.paths) && $0.id.count == 64 && $0.id.allSatisfy(\.isHexDigit) }
+            .max { $0.time < $1.time }?.id
     }
 
     private func mirrorsComplete(_ set: BackupSet, children: [SetRunChild]) -> Bool {

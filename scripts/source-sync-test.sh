@@ -125,4 +125,11 @@ PY
 plan
 if apply; then echo 'FAIL: excluded recovery vault authorized replacement' >&2; exit 1; fi
 test "$(cat "$WORK/workspace/notes/from peer")" = 'peer version'
-echo 'PASS: source sync, real restore proof, modification times, independent backup scope, deletion, replay and exclusion refusal'
+# Each sync backup adds a per-operation vault path, so restic's own
+# host-and-paths match never finds a parent; without an explicit one every
+# sync re-reads the whole backup scope. Only the repository's first snapshot
+# may lack a parent.
+RESTIC_PASSWORD_COMMAND="$PASSWORD_COMMAND" "$RESTIC" -r "$WORK/repo" snapshots --json > "$WORK/snapshots.json"
+jq -e 'length >= 6 and ([.[] | select(.parent == null)] | length) == 1' "$WORK/snapshots.json" >/dev/null \
+    || { echo 'FAIL: sync backups ran without a parent snapshot' >&2; jq -c '[.[] | {id: .short_id, parent}]' "$WORK/snapshots.json" >&2; exit 1; }
+echo 'PASS: source sync, real restore proof, modification times, independent backup scope, deletion, replay, exclusion refusal and parent snapshots'
