@@ -103,6 +103,13 @@ defined internal recovery source in that run's snapshot in addition to
 the complete configured source list; it must not turn a small protection
 snapshot into an apparent successful backup of the whole set.
 
+Only versions an operation would replace or delete are at risk. A plan
+that only creates entries absent from both copies displaces nothing, so it
+runs no protection backup or verification restore; each endpoint still
+refuses to install any operation that has a prior value without a receipt.
+The final backup records and restore-verifies that operation's vault either
+way.
+
 Coverage is an exact repository/snapshot/version proof, not last-backup
 time. An excluded payload is not covered. Verify protected content through
 the existing guarded Restic interfaces before authorizing replacement;

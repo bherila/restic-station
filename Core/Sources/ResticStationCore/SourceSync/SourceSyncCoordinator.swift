@@ -302,12 +302,21 @@ public struct SourceSyncCoordinator: Sendable {
                 // The encrypted snapshot must remain understandable even
                 // if the coordinator's local state is later lost.
                 try SyncDurability.write(journal.preview, named: "recovery.json", in: vault)
-                let inventory = try SourceSyncFilesystem.inventory(at: vault.path.path)
-                try revalidate()
-                let proof = try await backups.protect(set: set, vault: vault.path, inventory: inventory)
-                guard proof.payloadFingerprint == (try inventory.fingerprint) else { throw SourceSyncError.protectionFailed }
-                journal.protectedSnapshot = proof.snapshotId
-                journal.protectedRepository = proof.repositoryId
+                // Protection preserves versions an operation would replace
+                // or delete. A plan that only creates entries absent from
+                // both copies displaces nothing, so it skips this backup and
+                // restore. Each endpoint still demands a receipt for any
+                // operation with a prior value (validateProtection), and the
+                // final backup still records and restore-verifies the vault.
+                let displaces = (operations(plan, local: true) + operations(plan, local: false)).contains { $0.before != nil }
+                if displaces {
+                    let inventory = try SourceSyncFilesystem.inventory(at: vault.path.path)
+                    try revalidate()
+                    let proof = try await backups.protect(set: set, vault: vault.path, inventory: inventory)
+                    guard proof.payloadFingerprint == (try inventory.fingerprint) else { throw SourceSyncError.protectionFailed }
+                    journal.protectedSnapshot = proof.snapshotId
+                    journal.protectedRepository = proof.repositoryId
+                }
                 journal.phase = .protected
                 try persist()
             }

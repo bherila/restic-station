@@ -95,8 +95,8 @@ struct SourceSyncCoordinatorTests {
         func modified(_ path: String, peer other: Bool = false) throws -> Date? {
             try FileManager.default.attributesOfItem(atPath: (other ? peer : local).appendingPathComponent(path).path)[.modificationDate] as? Date
         }
-        func preview() async throws -> SourceSyncPreview {
-            try await coordinator.preview(set: set, group: group, machineId: "laptop", config: config, binding: "fixture")
+        func preview(includePaths: Bool = false) async throws -> SourceSyncPreview {
+            try await coordinator.preview(set: set, group: group, machineId: "laptop", config: config, binding: "fixture", includePaths: includePaths)
         }
         func apply(_ preview: SourceSyncPreview) async throws -> SourceSyncStatus {
             try await coordinator.apply(token: #require(preview.previewToken), set: set, group: group, machineId: "laptop", config: config, binding: "fixture")
@@ -116,9 +116,16 @@ struct SourceSyncCoordinatorTests {
         #expect(try String(contentsOf: f.peer.appendingPathComponent("nested/from-local"), encoding: .utf8) == "local")
         #expect(try String(contentsOf: f.local.appendingPathComponent("from-peer"), encoding: .utf8) == "remote")
         #expect(!FileManager.default.fileExists(atPath: f.peer.appendingPathComponent("sibling").path))
-        #expect(await f.backups.protectedSources() == [[f.workspace.path]])
+        // Only new entries: nothing was at risk, so no protection backup.
+        #expect(await f.backups.protectedSources() == [])
         #expect(await f.backups.counts().1 == 1)
         #expect(await f.backups.agreementWasBackedUp())
+        // Replacing a version puts it at risk: protection covers the whole
+        // configured backup scope, not only the sync folder.
+        try f.write("remote edit", "from-peer", peer: true)
+        #expect(try await f.apply(f.preview()).status == "synchronized")
+        #expect(await f.backups.protectedSources() == [[f.workspace.path]])
+        #expect(try String(contentsOf: f.local.appendingPathComponent("from-peer"), encoding: .utf8) == "remote edit")
     }
 
     @Test("synced files keep their source modification time in both directions")
@@ -186,6 +193,9 @@ struct SourceSyncCoordinatorTests {
     func cancelledVerificationCleanup() async throws {
         let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
         try f.write("local", "note")
+        _ = try await f.apply(f.preview())
+        // A replacement puts the peer's version at risk, so it is protected.
+        try f.write("local edit", "note")
         let preview = try await f.preview()
         await #expect(throws: SourceSyncError.self) {
             try await SourceSyncCoordinator.$afterDurablePhase.withValue({ phase in
@@ -203,8 +213,8 @@ struct SourceSyncCoordinatorTests {
         #expect(!remaining.contains { $0.hasPrefix("restore-") && UUID(uuidString: String($0.dropFirst(8))) != nil })
         #expect(!remaining.contains("vault"))
         #expect(remaining.contains("restore-not-a-verification"))
-        #expect(try String(contentsOf: f.local.appendingPathComponent("note"), encoding: .utf8) == "local")
-        #expect(try SourceSyncFilesystem.inventory(at: f.peer.path).items.isEmpty)
+        #expect(try String(contentsOf: f.local.appendingPathComponent("note"), encoding: .utf8) == "local edit")
+        #expect(try String(contentsOf: f.peer.appendingPathComponent("note"), encoding: .utf8) == "local")
         #expect(try store.record().activeOperation == nil)
     }
 
@@ -223,6 +233,8 @@ struct SourceSyncCoordinatorTests {
     @Test("a changed finish inventory is retained for attention without poisoning recovery receipts")
     func changedFinishCanRecover() async throws {
         let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
+        try f.write("first", "note")
+        _ = try await f.apply(f.preview())
         try f.write("planned", "note")
         let preview = try await f.preview()
         await #expect(throws: SourceSyncError.self) {
@@ -243,6 +255,8 @@ struct SourceSyncCoordinatorTests {
     @Test("a failed final backup resumes without replaying synchronization")
     func finalBackupRecovery() async throws {
         let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
+        try f.write("first", "a")
+        _ = try await f.apply(f.preview())
         try f.write("a", "a")
         let preview = try await f.preview()
         await f.backups.failFinal(true)
@@ -341,6 +355,24 @@ struct SourceSyncCoordinatorTests {
             (FileManager.default.enumerator(atPath: root.deletingLastPathComponent().path)?.allObjects as? [String] ?? []).map { ($0 as NSString).lastPathComponent }
         }
         #expect(!(names + endpointNames).contains { $0.hasPrefix("directory-") })
+    }
+
+    @Test("only plans that replace or delete an existing version run a protection backup",
+          arguments: ["create", "replace", "delete", "mixed"])
+    func protectionOnlyWhenDisplacing(_ kind: String) async throws {
+        let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
+        try f.write("kept", "kept")
+        _ = try await f.apply(f.preview())
+        #expect(await f.backups.counts().0 == 0)
+        switch kind {
+        case "create": try f.write("new", "fresh", peer: true)
+        case "replace": try f.write("edited", "kept")
+        case "delete": try FileManager.default.removeItem(at: f.local.appendingPathComponent("kept"))
+        default: try f.write("new", "fresh", peer: true); try f.write("edited", "kept")
+        }
+        #expect(try await f.apply(f.preview()).status == "synchronized")
+        #expect(await f.backups.counts().0 == (kind == "create" ? 0 : 1))
+        #expect(await f.backups.counts().1 == 2)
     }
 
     @Test("consumed and day-old previews are removed; a fresh unconsumed one is kept")
