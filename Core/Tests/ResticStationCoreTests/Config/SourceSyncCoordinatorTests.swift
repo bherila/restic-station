@@ -20,6 +20,8 @@ struct SourceSyncCoordinatorTests {
             try SyncEndpointService.handle(request)
         }
         func copy(paths: [String], from source: SyncEndpoint, to destination: SyncEndpoint, listFile: URL) async throws {
+            // Like SourceSyncClient, leave a list file for the coordinator to clean.
+            try Data(paths.joined(separator: "\0").utf8).write(to: listFile, options: .withoutOverwriting)
             let sourceRoot = try SourceSyncFilesystem.openRoot(source.path)
             let targetRoot = try SourceSyncFilesystem.openRoot(destination.path)
             let inventory = try SourceSyncFilesystem.inventory(at: source.path)
@@ -305,6 +307,27 @@ struct SourceSyncCoordinatorTests {
             #expect(try await f.apply(preview).status == "synchronized")
         }
         #expect(try String(contentsOf: f.peer.appendingPathComponent("from-local"), encoding: .utf8) == "local")
+    }
+
+    @Test("transfer lists and unused directory candidates do not outlive their use")
+    func privateLeftoversRemoved() async throws {
+        let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
+        try f.write("local", "made/here/note")
+        try f.write("peer", "from-peer", peer: true)
+        let preview = try await f.preview()
+        // Someone creates the same new directory first, as a retry would
+        // find it: the installed value matches and the candidate is unused.
+        let status = try await SyncEndpointService.$beforeInstall.withValue({ path in
+            if path == "made" { try FileManager.default.createDirectory(at: f.peer.appendingPathComponent("made"), withIntermediateDirectories: false) }
+        }) { try await f.apply(preview) }
+        #expect(status.status == "synchronized")
+        let state = f.paths.root.appendingPathComponent("source-sync")
+        let names = (FileManager.default.enumerator(atPath: state.path)?.allObjects as? [String] ?? []).map { ($0 as NSString).lastPathComponent }
+        #expect(!names.contains { $0.hasPrefix("files-") })
+        let endpointNames = [f.local, f.peer].flatMap { root in
+            (FileManager.default.enumerator(atPath: root.deletingLastPathComponent().path)?.allObjects as? [String] ?? []).map { ($0 as NSString).lastPathComponent }
+        }
+        #expect(!(names + endpointNames).contains { $0.hasPrefix("directory-") })
     }
 
     @Test("consumed and day-old previews are removed; a fresh unconsumed one is kept")

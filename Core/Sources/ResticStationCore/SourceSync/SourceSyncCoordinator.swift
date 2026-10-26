@@ -415,8 +415,12 @@ public struct SourceSyncCoordinator: Sendable {
         }
     }
 
+    /// The list holds relative paths in plain text and is useless once
+    /// rsync has exited, whatever the outcome.
     private func transfer(_ paths: [String], from source: SyncEndpoint, to destination: SyncEndpoint, operation: DirectoryHandle) async throws {
-        try await transport.copy(paths: paths, from: source, to: destination, listFile: operation.path.appendingPathComponent("files-\(UUID().uuidString)"))
+        let name = "files-\(UUID().uuidString)"
+        defer { _ = name.withCString { unlinkat(operation.descriptor, $0, 0) } }
+        try await transport.copy(paths: paths, from: source, to: destination, listFile: operation.path.appendingPathComponent(name))
     }
 
     private func verifyExport(_ directory: DirectoryHandle, paths: [String], inventory: SyncInventory) throws {
