@@ -157,6 +157,11 @@ continue backing up the configured sources; synchronization is manual.
 - Refuse missing mounts, root replacement, overlapping copies, unsafe
   relative paths, symlink traversal, unsupported file types and ambiguous
   case/Unicode names before mutation.
+- A sync tree stays on one filesystem. Any directory or file whose device
+  differs from its parent's (a mounted volume, bind mount or network mount
+  inside the folder) refuses inventory. Otherwise a baseline would include
+  the mount's contents, and once it was unmounted the empty mount point
+  would plan as deletion on the other copy.
 - Keep credentials and host identity local; SSH uses pinned host keys and
   bounded connection/keepalive behavior. No shell hooks or arbitrary flags.
 - rsync transfers staged payloads; the typed inventory/plan is authoritative.

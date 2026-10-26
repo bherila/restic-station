@@ -21,6 +21,22 @@ public enum SourceSyncFilesystem {
         return "\(seconds):\(nanoseconds)"
     }
 
+    /// The filesystem an inspected entry lives on. Tests substitute it:
+    /// Linux CI cannot mount a volume without privileges.
+    @TaskLocal static var device: @Sendable (stat) -> Int64 = { Int64(truncatingIfNeeded: $0.st_dev) }
+
+    /// A sync tree never crosses into another filesystem. A mount inside
+    /// it would enter the agreed inventory, and once unmounted would leave
+    /// an empty directory that plans as deletion on the other copy; while
+    /// mounted, a recovery rename across it would fail with EXDEV.
+    private static func requireSameFilesystem(_ info: stat, as parent: DirectoryHandle) throws {
+        var parentInfo = stat()
+        guard fstat(parent.descriptor, &parentInfo) == 0 else { throw changed() }
+        guard device(info) == device(parentInfo) else {
+            throw SourceSyncError.unsafeRoot("Part of this folder is a separate drive or mount. Synchronization stays within one filesystem; choose a folder with no mounts inside it.")
+        }
+    }
+
     static func rootIdentity(_ root: DirectoryHandle) throws -> String {
         guard let identity = root.identity else { throw changed() }
         // Inode numbers may be reused after a directory is removed. Its
@@ -80,6 +96,8 @@ public enum SourceSyncFilesystem {
             close(fd)
             throw SourceSyncError.unsafeRoot("A sync subfolder is writable by another user or cannot be inspected safely.")
         }
+        do { try requireSameFilesystem(info, as: parent) }
+        catch { close(fd); throw error }
         return DirectoryHandle.adopting(descriptor: fd, path: parent.path.appendingPathComponent(name))
     }
 
@@ -139,6 +157,7 @@ public enum SourceSyncFilesystem {
             if errno == ENOENT { return nil }
             throw changed()
         }
+        try requireSameFilesystem(info, as: parent)
         let mode = UInt16(info.st_mode & 0o777)
         switch info.st_mode & mode_t(S_IFMT) {
         case mode_t(S_IFDIR):

@@ -292,6 +292,69 @@ struct SourceSyncCoordinatorTests {
         if phase == "backedUp" || phase == "complete" { #expect(await f.backups.counts().1 == before.1) }
     }
 
+    @Test("a folder on another filesystem inside either copy refuses planning", arguments: [false, true])
+    func nestedFilesystemRefusesPlanning(_ onPeer: Bool) async throws {
+        let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
+        try f.write("archived", "archive/note", peer: onPeer)
+        try f.write("ordinary", "kept", peer: !onPeer)
+        let mounted = try #require(FileManager.default.attributesOfItem(atPath: (onPeer ? f.peer : f.local).appendingPathComponent("archive").path)[.systemFileNumber] as? UInt64)
+        // A baseline that included a mount's contents would plan its
+        // later absence (an empty mount point) as deletion elsewhere.
+        await #expect(throws: SourceSyncError.self) {
+            try await SourceSyncFilesystem.$device.withValue({ UInt64($0.st_ino) == mounted ? -1 : Int64(truncatingIfNeeded: $0.st_dev) }) {
+                _ = try await f.preview()
+            }
+        }
+        let preview = try await f.preview()
+        #expect(preview.copies == 3 && preview.previewToken != nil)
+    }
+
+    @Test("a mount that appears after preview refuses before any reservation")
+    func nestedFilesystemAfterPreview() async throws {
+        let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
+        try f.write("archived", "archive/note")
+        let preview = try await f.preview()
+        let mounted = try #require(FileManager.default.attributesOfItem(atPath: f.local.appendingPathComponent("archive").path)[.systemFileNumber] as? UInt64)
+        await #expect(throws: SourceSyncError.self) {
+            try await SourceSyncFilesystem.$device.withValue({ UInt64($0.st_ino) == mounted ? -1 : Int64(truncatingIfNeeded: $0.st_dev) }) {
+                _ = try await f.apply(preview)
+            }
+        }
+        #expect(!FileManager.default.fileExists(atPath: f.peer.appendingPathComponent("archive").path))
+        #expect(try SourceSyncCoordinator.status(paths: f.paths, setId: f.set.id, groupId: f.group.id).operationId == nil)
+        // The refusal consumed nothing: the reviewed plan is still usable.
+        #expect(try await f.apply(preview).status == "synchronized")
+    }
+
+    #if os(macOS)
+    @Test("a real volume mounted inside the sync folder refuses planning", .enabled(if: FileManager.default.isExecutableFile(atPath: "/usr/bin/hdiutil")))
+    func realNestedMountRefusesPlanning() async throws {
+        let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
+        let image = f.base.appendingPathComponent("volume.dmg"), mountPoint = f.local.appendingPathComponent("archive")
+        try FileManager.default.createDirectory(at: mountPoint, withIntermediateDirectories: true)
+        func hdiutil(_ arguments: [String]) throws -> Int32 {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/hdiutil")
+            process.arguments = arguments
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+            try process.run()
+            process.waitUntilExit()
+            return process.terminationStatus
+        }
+        #expect(try hdiutil(["create", "-quiet", "-size", "4m", "-fs", "HFS+", "-volname", "RSMount", image.path]) == 0)
+        #expect(try hdiutil(["attach", "-quiet", "-nobrowse", "-noautoopen", "-mountpoint", mountPoint.path, image.path]) == 0)
+        defer { _ = try? hdiutil(["detach", "-quiet", "-force", mountPoint.path]) }
+        try Data("archived".utf8).write(to: mountPoint.appendingPathComponent("note"))
+        do {
+            _ = try await f.preview()
+            Issue.record("a mounted volume inside the sync folder was planned")
+        } catch let error as SourceSyncError {
+            #expect(error.description.contains("separate drive or mount"))
+        }
+    }
+    #endif
+
     @Test("a partly installed operation resumes after unrelated settings changes", arguments: ["installing", "installed", "agreed", "backedUp"])
     func resumeAfterSettingsChange(_ phase: String) async throws {
         let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
