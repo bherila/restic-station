@@ -36,8 +36,9 @@ public struct SourceSyncRecovery: Codable, Sendable {
     public var entries: [Entry]
 }
 
-/// Manual, two-copy reconciliation. The caller holds the shared config and
-/// revision lock while applying and supplies a binding covering the exact
+/// Manual, two-copy reconciliation. The caller holds the config revision
+/// (`ConfigStore.withRevisionHold`, never `config.lock`, which would starve
+/// every reader for the whole run) and supplies a binding covering the exact
 /// effective configuration and executable. Journals survive helper exits;
 /// endpoint reservations never expire on a timer.
 public struct SourceSyncCoordinator: Sendable {

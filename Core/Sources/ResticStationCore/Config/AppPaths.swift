@@ -79,11 +79,18 @@ public struct AppPaths: Equatable, Sendable {
         root.appendingPathComponent("config.json", isDirectory: false)
     }
 
-    /// Serializes Restic Station writers of ``configFile``. Readers do not
-    /// take this lock; app saves additionally compare the exact fingerprint
-    /// they began editing against while the lock is held.
+    /// Serializes Restic Station writers of ``configFile``. Readers wait
+    /// for it only briefly; app saves additionally compare the exact
+    /// fingerprint they began editing against while the lock is held.
     public var configLockFile: URL {
         locksDir.appendingPathComponent("config.lock", isDirectory: false)
+    }
+
+    /// Held by a long operation that binds the current config revision
+    /// (source-sync apply/recover). Every writer refuses while it is held;
+    /// readers never take it, so backups and status keep loading config.
+    public var configHoldLockFile: URL {
+        locksDir.appendingPathComponent("config-hold.lock", isDirectory: false)
     }
 
     /// `config.v<N>.backup.json` — the untouched copy of a `config.json` at

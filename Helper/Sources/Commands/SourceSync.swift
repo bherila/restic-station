@@ -78,7 +78,7 @@ struct SourceSyncApplyCommand: AsyncParsableCommand, JSONRenderable {
         guard previewTokenStdin else { throw CLIFailure.invalidArguments("--preview-token-stdin is required") }
         let token = try CapabilityInput.read(prompt: "Preview token: ")
         let s = try await SyncSession.make(set: set, group: group)
-        let result = try await s.context.configStore.withUnchangedRevision(from: s.fingerprint) {
+        let result = try await s.context.configStore.withRevisionHold(from: s.fingerprint) {
             try await s.coordinator.apply(token: token, set: s.set, group: s.group, machineId: s.context.scheduled.machineId, config: s.config, binding: s.binding)
         }
         if json { CLIJSON.print(result) } else { print("Folders synchronized and the full backup set backed up.") }
@@ -94,7 +94,7 @@ struct SourceSyncRecoverCommand: AsyncParsableCommand, JSONRenderable {
 
     func run() async throws {
         let s = try await SyncSession.make(set: set, group: group)
-        let result = try await s.context.configStore.withUnchangedRevision(from: s.fingerprint) {
+        let result = try await s.context.configStore.withRevisionHold(from: s.fingerprint) {
             if cancelUnstarted {
                 return try await s.coordinator.cancelUnstarted(set: s.set, group: s.group, machineId: s.context.scheduled.machineId)
             }

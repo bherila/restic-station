@@ -572,8 +572,12 @@ The app requests paths to show a reviewable preview.
 the same bounded capability input as purge apply. Never put a token in argv
 or an environment variable. The token binds inventories, endpoint epochs,
 last agreement, effective set, machine settings, configuration revision and
-restic executable. The helper holds `config.lock` through apply and checks
-machine/executable evidence at destructive handoffs.
+restic executable. The helper holds `config-hold.lock` through apply and
+recover, so every config writer refuses meanwhile, and checks
+machine/executable evidence at destructive handoffs. It does not hold
+`config.lock`: readers wait on that lock for at most 60 seconds, and an
+apply runs full backups, so holding it would fail every scheduled tick
+and status read until the sync finished.
 
 `sync status` reads local operation state without contacting the peer or
 requiring restic; first enrollment can create private local bookkeeping.

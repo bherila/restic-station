@@ -276,6 +276,78 @@ import Testing
         #expect(try store.snapshot().config == installed)
     }
 
+    @Test("a revision hold leaves every reader unblocked")
+    func revisionHoldDoesNotBlockReaders() async throws {
+        let (store, root) = makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let installed = sampleConfig()
+        try store.save(installed)
+
+        // Source-sync apply holds the revision through full backups. A
+        // reader waiting on config.lock gives up after 60 seconds, which
+        // would fail every scheduled tick and status read meanwhile.
+        let clock = ContinuousClock()
+        let started = clock.now
+        try await store.withRevisionHold(from: store.currentFileFingerprint()) { () async throws in
+            #expect(try store.load() == installed)
+            #expect(try store.load(.inspecting) == installed)
+            #expect(try store.inspect().config == installed)
+            #expect(try store.snapshot().config == installed)
+        }
+        #expect(clock.now - started < .seconds(10))
+    }
+
+    @Test("every config writer refuses while a revision hold is active")
+    func revisionHoldRefusesEveryWriter() async throws {
+        let (store, root) = makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let installed = sampleConfig()
+        try store.save(installed)
+        let fingerprint = try store.currentFileFingerprint()
+        var competing = installed
+        competing.sets[0].retention = nil
+        let busy = ConfigStoreError.writeLockBusy(path: store.paths.configHoldLockFile.path)
+
+        try await store.withRevisionHold(from: fingerprint) { () async throws in
+            #expect(throws: busy) { try store.save(competing) }
+            #expect(throws: busy) { try store.save(competing, ifUnchangedFrom: fingerprint) }
+            #expect(throws: busy) { try store.assertUnchanged(from: fingerprint) }
+            do {
+                _ = try await store.withUnchangedRevision(from: fingerprint) { true }
+                Issue.record("a revision-guarded mutation ran inside a revision hold")
+            } catch let error as ConfigStoreError {
+                #expect(error == busy)
+            }
+            do {
+                _ = try await store.withRevisionHold(from: fingerprint) { true }
+                Issue.record("two revision holds were active at once")
+            } catch let error as ConfigStoreError {
+                #expect(error == busy)
+            }
+        }
+        #expect(try store.currentFileFingerprint() == fingerprint)
+        try store.save(competing)
+        #expect(try store.load() == competing)
+    }
+
+    @Test("a revision hold defers migration side effects")
+    func revisionHoldDefersMigration() async throws {
+        let (store, root) = makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try store.paths.ensureDirectories()
+        let legacy = AppConfig(version: 1, resticPath: "/usr/local/bin/restic")
+        let original = try ConfigStore.makeEncoder().encode(legacy)
+        try original.write(to: store.paths.configFile)
+
+        try await store.withRevisionHold(from: store.currentFileFingerprint()) { () async throws in
+            #expect(try store.load() == legacy)
+            #expect(try store.snapshot().bytes == original)
+        }
+        #expect(try Data(contentsOf: store.paths.configFile) == original)
+        #expect(!FileManager.default.fileExists(atPath: store.paths.machineFile.path))
+        #expect(!FileManager.default.fileExists(atPath: store.paths.configV1BackupFile.path))
+    }
+
     @Test("an unusable config lock permits no migration side effects")
     func brokenReadLockDisablesMigration() throws {
         let (store, root) = makeStore()
