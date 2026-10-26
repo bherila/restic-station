@@ -143,6 +143,7 @@ public enum ConfigDiff {
             var fields: [String] = []
             if oldSet.name != newSet.name { fields.append("name") }
             if oldSet.sources != newSet.sources { fields.append("sources") }
+            if oldSet.syncFolders != newSet.syncFolders { fields.append("syncFolders") }
             if oldSet.excludes != newSet.excludes { fields.append("excludes") }
             if oldSet.purgeExcludes != newSet.purgeExcludes { fields.append("purgeExcludes") }
             if oldSet.onlineOnlyFiles != newSet.onlineOnlyFiles { fields.append("onlineOnlyFiles") }
