@@ -196,6 +196,35 @@ private func baseConfig() -> AppConfig {
         #expect(Set(summary.changed[0].changedFields) == ["schedule", "sources"])
     }
 
+    /// A field the summary omits makes `config import` print "no changes"
+    /// for an edit it is about to install (a new sync folder once did).
+    /// Every stored field but `id` is changed here, and the expected list is
+    /// the struct's own, so a new field fails this until it is reported.
+    @Test func everyEditableSetFieldIsReported() {
+        var new = baseConfig()
+        let set = new.sets[0]
+        new.sets[0].name = "Renamed"
+        new.sets[0].sources.append("/Users/someone/Documents")
+        new.sets[0].syncFolders = [SourceSyncGroup(
+            name: "Notes", localPath: "/Users/someone/Projects/notes",
+            peer: .init(path: "/home/someone/notes", sshTarget: "sync.example.test"), coordinatorMachineId: "laptop")]
+        new.sets[0].excludes = []
+        new.sets[0].purgeExcludes = ["*.log"]
+        new.sets[0].onlineOnlyFiles = set.onlineOnlyFiles == .skip ? .download : .skip
+        new.sets[0].usesGlobalExcludes.toggle()
+        new.sets[0].schedule = .hourly(minute: 5)
+        new.sets[0].retention = nil
+        new.sets[0].checkPolicy = nil
+        new.sets[0].stalenessWarningDays += 1
+        new.sets[0].destinations[0].label = "Renamed primary"
+        new.sets[0].machines = ["laptop": BackupSetMachineOverride(enabled: false)]
+
+        let stored = Set(Mirror(reflecting: set).children.compactMap(\.label)).subtracting(["id"])
+        let summary = ConfigDiff.summarize(from: baseConfig(), to: new)
+        #expect(summary.changed.count == 1)
+        #expect(Set(summary.changed.first?.changedFields ?? []) == stored)
+    }
+
     /// Unlike `isScheduleRelevantChange`, a bare rename IS reported here —
     /// this summary is for a human deciding whether an import looks right,
     /// not for the scheduler.

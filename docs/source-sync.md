@@ -157,6 +157,12 @@ continue backing up the configured sources; synchronization is manual.
 - Refuse missing mounts, root replacement, overlapping copies, unsafe
   relative paths, symlink traversal, unsupported file types and ambiguous
   case/Unicode names before mutation.
+- A sync folder is never a Restic repository, inside one, or a parent of
+  one, on either computer. Both endpoints recognize the on-disk layout
+  (`config` plus `data/`, `index/`, `keys/` and `snapshots/`; `locks/` is
+  optional because copies often exclude it) without reading repository
+  contents, so the other computer needs no password to refuse it.
+  Repositories replicate through `restic copy`, never through folder sync.
 - A sync tree stays on one filesystem. Any directory or file whose device
   differs from its parent's (a mounted volume, bind mount or network mount
   inside the folder) refuses inventory. Otherwise a baseline would include
@@ -176,7 +182,9 @@ continue backing up the configured sources; synchronization is manual.
   always copy rather than trusting rsync's size-and-time check. Extended
   attributes and ACLs are not synchronized.
 - Keep journal/control state outside managed roots and Restic repositories.
-  Never stage plaintext live data into a cloud-sync directory.
+  Never stage plaintext live data into a cloud-sync directory. Both sync
+  folders refuse cloud storage; a set's encrypted local repository may live
+  there (for example in iCloud Drive) and is only checked for overlap.
 - Use synthetic local/SSH fixtures. Test both directions, ancestor
   conflicts, backup-exclusion refusal, corrupt/lost state, concurrent
   operations, changes at every handoff, cancellation and crashes before

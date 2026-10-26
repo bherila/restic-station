@@ -44,19 +44,30 @@ public enum SourceSyncFilesystem {
         // intentional edit/delete inside the original folder.
         return "\(identity.deviceID):\(identity.inode):\(try rootCreation(root.descriptor))"
     }
+    /// Whether a path reaches cloud storage. Tests substitute it: detection
+    /// keys off the real home directory, where a test must not write.
+    @TaskLocal static var reachesCloudStorage: @Sendable (String) -> Bool = { CloudStorageSafety.reachesCloudStorage($0) }
+
+    /// A directory that holds plaintext sync data: never in cloud storage.
     public static func physicalDirectory(_ path: String) throws -> String {
-        guard SourceSyncGroup.isAbsoluteCanonical(path), let resolved = realpath(path, nil) else { throw changed() }
-        defer { free(resolved) }
-        let physical = String(cString: resolved)
-        guard !CloudStorageSafety.reachesCloudStorage(physical) else {
+        let physical = try resolvedDirectory(path)
+        guard !reachesCloudStorage(physical) else {
             throw SourceSyncError.unsafeRoot("Choose a folder outside a cloud-sync provider.")
         }
         return physical
     }
 
+    /// Resolves a path only to compare it with a sync root. An encrypted
+    /// repository may live in cloud storage, so this applies no cloud rule.
+    static func resolvedDirectory(_ path: String) throws -> String {
+        guard SourceSyncGroup.isAbsoluteCanonical(path), let resolved = realpath(path, nil) else { throw changed() }
+        defer { free(resolved) }
+        return String(cString: resolved)
+    }
+
     public static func inventory(at path: String) throws -> SyncInventory {
         guard SourceSyncGroup.isAbsoluteCanonical(path),
-              !CloudStorageSafety.reachesCloudStorage(path) else {
+              !reachesCloudStorage(path) else {
             throw SourceSyncError.unsafeRoot("Choose an absolute local folder outside a cloud-sync provider.")
         }
         let root = try openRoot(path)
@@ -349,9 +360,11 @@ public enum SourceSyncFilesystem {
     /// descendants, or a parent that would transfer the repository tree.
     /// The standard on-disk layout is sufficient for a conservative refusal;
     /// no password or repository contents need to be read by an SSH worker.
+    /// `locks/` is not required: copies made with `--exclude locks` omit it
+    /// and restic recreates it on demand.
     private static func refuseRepository(_ fd: Int32) throws {
         let layout: [(String, mode_t)] = [("config", mode_t(S_IFREG)), ("data", mode_t(S_IFDIR)),
-            ("index", mode_t(S_IFDIR)), ("keys", mode_t(S_IFDIR)), ("locks", mode_t(S_IFDIR)), ("snapshots", mode_t(S_IFDIR))]
+            ("index", mode_t(S_IFDIR)), ("keys", mode_t(S_IFDIR)), ("snapshots", mode_t(S_IFDIR))]
         for (name, type) in layout {
             var info = stat()
             if name.withCString({ fstatat(fd, $0, &info, AT_SYMLINK_NOFOLLOW) }) != 0 {
