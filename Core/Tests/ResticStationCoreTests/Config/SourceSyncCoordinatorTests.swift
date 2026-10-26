@@ -307,6 +307,23 @@ struct SourceSyncCoordinatorTests {
         #expect(try String(contentsOf: f.peer.appendingPathComponent("from-local"), encoding: .utf8) == "local")
     }
 
+    @Test("consumed and day-old previews are removed; a fresh unconsumed one is kept")
+    func previewsAreRemoved() async throws {
+        let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
+        let previews = f.paths.root.appendingPathComponent("source-sync/\(f.group.id.uuidString)/previews")
+        func saved() throws -> [String] { try FileManager.default.contentsOfDirectory(atPath: previews.path).sorted() }
+        try f.write("local", "from-local")
+        let first = try await f.preview()
+        let stale = try #require(saved().first)
+        try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(-2 * 24 * 60 * 60)], ofItemAtPath: previews.appendingPathComponent(stale).path)
+        let second = try await f.preview()
+        // The day-old file went; only the new preview remains.
+        #expect(try saved().count == 1 && saved().first != stale)
+        #expect(first.previewToken != second.previewToken)
+        #expect(try await f.apply(second).status == "synchronized")
+        #expect(try saved().isEmpty)
+    }
+
     @Test("a repository inside either copy refuses planning, even without locks", arguments: [false, true])
     func repositoryInsideRefuses(_ onPeer: Bool) async throws {
         let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }

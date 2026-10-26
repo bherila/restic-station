@@ -114,12 +114,43 @@ struct SourceSyncStore {
         try SyncDurability.write(preview, named: SHA256Digest.hex(Data(token.utf8)) + ".json", in: index)
     }
 
+    /// Each saved preview holds both full inventories. Once consumed, the
+    /// journal keeps its own copy; once its token expires (15 minutes), no
+    /// apply can read it. Neither can authorize anything, so both go. Only
+    /// token-hash names in this private directory are ever removed.
+    func removePreview(token: String) {
+        guard let index = try? SourceSyncFilesystem.openDirectory("previews", in: directory) else { return }
+        _ = (SHA256Digest.hex(Data(token.utf8)) + ".json").withCString { unlinkat(index.descriptor, $0, 0) }
+        _ = fsync(index.descriptor)
+    }
+
+    func removePreviews(savedBefore cutoff: Date) {
+        guard let index = try? SourceSyncFilesystem.openDirectory("previews", in: directory),
+              let names = try? SourceSyncFilesystem.entryNames(in: index).filter(Self.isPreviewName) else { return }
+        for name in names {
+            var info = stat()
+            guard name.withCString({ fstatat(index.descriptor, $0, &info, AT_SYMLINK_NOFOLLOW) }) == 0,
+                  info.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG) else { continue }
+            #if canImport(Darwin)
+            let saved = Date(timeIntervalSince1970: TimeInterval(info.st_mtimespec.tv_sec))
+            #else
+            let saved = Date(timeIntervalSince1970: TimeInterval(info.st_mtim.tv_sec))
+            #endif
+            if saved < cutoff { _ = name.withCString { unlinkat(index.descriptor, $0, 0) } }
+        }
+        _ = fsync(index.descriptor)
+    }
+
     func preview(token: String) throws -> StoredSyncPreview {
         let index = try SourceSyncFilesystem.openDirectory("previews", in: directory)
         guard let result = try SyncDurability.read(StoredSyncPreview.self, named: SHA256Digest.hex(Data(token.utf8)) + ".json", in: index) else {
             throw SourceSyncError.stalePlan
         }
         return result
+    }
+
+    static func isPreviewName(_ name: String) -> Bool {
+        name.count == 69 && name.hasSuffix(".json") && name.dropLast(5).allSatisfy { $0.isHexDigit && !$0.isUppercase }
     }
 
     func operation(_ id: UUID) throws -> DirectoryHandle {

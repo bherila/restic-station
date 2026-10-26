@@ -75,6 +75,7 @@ public struct SourceSyncCoordinator: Sendable {
         let plan = try SourceSyncPlanner.plan(group: group, local: local.inventory, peer: peer.inventory, baseline: record.baseline)
         let stored = StoredSyncPreview(id: UUID(), setId: set.id, plan: plan, binding: binding, createdAt: Date(), group: group)
         var token: String?
+        store.removePreviews(savedBefore: Date().addingTimeInterval(-24 * 60 * 60))
         if plan.conflicts.isEmpty {
             let issued = try PreviewTokenStore(paths: paths).issue(
                 machineId: machineId, setId: set.id, destinations: [], config: config,
@@ -122,6 +123,7 @@ public struct SourceSyncCoordinator: Sendable {
         record.activeOperation = preview.id
         record.status = .running
         try store.save(record)
+        store.removePreview(token: token)
         return try await run(journal: journal, store: store, set: set, binding: binding, resuming: false)
     }
 
