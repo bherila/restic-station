@@ -107,6 +107,12 @@ public struct ResticCommand: Equatable, Sendable {
     /// of this one builder rather than a separate one so a dry run can never
     /// be built from a different source, exclusion or cloud-file list than
     /// the real backup it previews.
+    ///
+    /// `parent` names the snapshot restic compares file metadata against.
+    /// Only a caller whose source list differs from its earlier snapshots'
+    /// passes one (source sync adds a per-operation vault path, so restic's
+    /// own host-and-paths match never finds a parent); it changes which
+    /// unchanged files restic skips reading, never what the snapshot holds.
     public static func backup(
         repo: String,
         sources: [String],
@@ -115,12 +121,18 @@ public struct ResticCommand: Equatable, Sendable {
         excludeCloudFiles: Bool = false,
         excludeCaches: Bool = false,
         excludeLargerThan: String? = nil,
+        parent: String? = nil,
         dryRun: Bool = false
     ) -> ResticCommand {
         precondition(!sources.isEmpty, "ResticCommand.backup requires at least one source path")
         var argv = ["-r", repo, "backup", "--json"]
         if dryRun {
             argv.append("--dry-run")
+        }
+        if let parent {
+            precondition(parent.count == 64 && parent.allSatisfy(\.isHexDigit), "a parent must be a full snapshot id")
+            argv.append("--parent")
+            argv.append(parent)
         }
         if excludeCloudFiles {
             argv.append("--exclude-cloud-files")

@@ -344,6 +344,10 @@ public enum SyncEndpointService {
                     try SyncDurability.moveExclusive(candidate, from: operation, to: targetParent, as: targetName)
                 } else if !matchesInstalled(existing, change: change) {
                     throw SourceSyncError.stalePlan
+                } else {
+                    // Already installed (a retry after the move): the unused
+                    // candidate was verified empty above.
+                    _ = candidate.withCString { unlinkat(operation.descriptor, $0, AT_REMOVEDIR) }
                 }
                 journal.steps[change.path] = .installed
                 try SyncDurability.write(journal, named: "journal.json", in: operation)

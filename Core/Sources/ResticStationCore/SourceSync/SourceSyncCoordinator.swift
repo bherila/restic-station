@@ -75,6 +75,7 @@ public struct SourceSyncCoordinator: Sendable {
         let plan = try SourceSyncPlanner.plan(group: group, local: local.inventory, peer: peer.inventory, baseline: record.baseline)
         let stored = StoredSyncPreview(id: UUID(), setId: set.id, plan: plan, binding: binding, createdAt: Date(), group: group)
         var token: String?
+        store.removePreviews(savedBefore: Date().addingTimeInterval(-24 * 60 * 60))
         if plan.conflicts.isEmpty {
             let issued = try PreviewTokenStore(paths: paths).issue(
                 machineId: machineId, setId: set.id, destinations: [], config: config,
@@ -122,7 +123,9 @@ public struct SourceSyncCoordinator: Sendable {
         record.activeOperation = preview.id
         record.status = .running
         try store.save(record)
-        return try await run(journal: journal, store: store, set: set, binding: binding, resuming: false)
+        store.removePreview(token: token)
+        do { return try await run(journal: journal, store: store, set: set, binding: binding, resuming: false) }
+        catch { throw Self.pendingRecovery(error) }
     }
 
     public func recover(set: BackupSet, group: SourceSyncGroup, machineId: String, binding: String) async throws -> SourceSyncStatus {
@@ -139,7 +142,8 @@ public struct SourceSyncCoordinator: Sendable {
               journal.preview.plan.groupFingerprint == (try journal.preview.group.bindingFingerprint) else {
             throw SourceSyncError.stateInvalid("No compatible interrupted operation is available to resume.")
         }
-        return try await run(journal: journal, store: store, set: set, binding: binding, resuming: true)
+        do { return try await run(journal: journal, store: store, set: set, binding: binding, resuming: true) }
+        catch { throw Self.pendingRecovery(error) }
     }
 
     public func cancelUnstarted(set: BackupSet, group: SourceSyncGroup, machineId: String) async throws -> SourceSyncStatus {
@@ -209,6 +213,28 @@ public struct SourceSyncCoordinator: Sendable {
             }
         }
         return status
+    }
+
+    /// Names the first path, in sorted order, where a copy differs from the
+    /// agreed result, so the person knows which file to resolve.
+    static func divergence(_ copy: String, actual: [String: SyncItem], goal: [String: SyncItem]) -> SourceSyncError {
+        let path = Set(actual.keys).union(goal.keys).sorted().first { actual[$0] != goal[$0] }
+        let place = path.map { " at \"\($0)\"" } ?? ""
+        return .stateInvalid("\(copy) changed before agreement\(place). Resolve the change, then resume this operation.")
+    }
+
+    /// After a journal exists, every failure leaves the operation pending,
+    /// and preview refuses until it is recovered. An error that says to
+    /// preview again would send the user in a circle, so it names the way
+    /// out instead. Other errors keep their case and CLI code.
+    static func pendingRecovery(_ error: any Error) -> any Error {
+        guard let failure = error as? SourceSyncError else { return error }
+        let text = failure.description
+        guard text.range(of: "preview", options: .caseInsensitive) != nil, !text.contains("sync recover") else { return error }
+        let kept = failure == .stalePlan ? ["The folders changed during synchronization"]
+            : text.components(separatedBy: ". ").filter { $0.range(of: "preview", options: .caseInsensitive) == nil }
+        let reason = kept.joined(separator: ". ").trimmingCharacters(in: CharacterSet(charactersIn: ". "))
+        return SourceSyncError.stateInvalid("\(reason). This synchronization is still pending; resume it with sync recover (Resume in Sync & Back Up) before previewing again.")
     }
 
     private func run(journal initial: SourceSyncJournal, store: SourceSyncStore, set: BackupSet, binding: String, resuming: Bool) async throws -> SourceSyncStatus {
@@ -314,13 +340,13 @@ public struct SourceSyncCoordinator: Sendable {
                 // recovery must inspect that endpoint again.
                 if journal.localFinished == nil {
                     let reply = try await transport.request(endpointRequest(.finish, local: true), at: .init(path: group.localPath))
-                    guard reply.inventory.items == goal else { throw SourceSyncError.stateInvalid("The local copy changed before agreement. Resolve the change, then resume this operation.") }
+                    guard reply.inventory.items == goal else { throw Self.divergence("The local copy", actual: reply.inventory.items, goal: goal) }
                     journal.localFinished = reply
                     try persist()
                 }
                 if journal.peerFinished == nil {
                     let reply = try await transport.request(endpointRequest(.finish, local: false), at: group.peer)
-                    guard reply.inventory.items == goal else { throw SourceSyncError.stateInvalid("The other copy changed before agreement. Resolve the change, then resume this operation.") }
+                    guard reply.inventory.items == goal else { throw Self.divergence("The other copy", actual: reply.inventory.items, goal: goal) }
                     journal.peerFinished = reply
                     try persist()
                 }
@@ -397,8 +423,12 @@ public struct SourceSyncCoordinator: Sendable {
         }
     }
 
+    /// The list holds relative paths in plain text and is useless once
+    /// rsync has exited, whatever the outcome.
     private func transfer(_ paths: [String], from source: SyncEndpoint, to destination: SyncEndpoint, operation: DirectoryHandle) async throws {
-        try await transport.copy(paths: paths, from: source, to: destination, listFile: operation.path.appendingPathComponent("files-\(UUID().uuidString)"))
+        let name = "files-\(UUID().uuidString)"
+        defer { _ = name.withCString { unlinkat(operation.descriptor, $0, 0) } }
+        try await transport.copy(paths: paths, from: source, to: destination, listFile: operation.path.appendingPathComponent(name))
     }
 
     private func verifyExport(_ directory: DirectoryHandle, paths: [String], inventory: SyncInventory) throws {

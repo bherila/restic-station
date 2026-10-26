@@ -41,6 +41,13 @@ struct ResticCommandTests {
         #expect(cmd.argv == ["-r", Self.repo, "backup", "--json", "/Users/user/Documents"])
     }
 
+    @Test("backup with a parent: --parent and the full id ahead of the sources")
+    func backupParent() {
+        let parent = String(repeating: "ab", count: 32)
+        let cmd = ResticCommand.backup(repo: Self.repo, sources: ["/Users/user/proj", "/private/vault"], parent: parent)
+        #expect(cmd.argv == ["-r", Self.repo, "backup", "--json", "--parent", parent, "/Users/user/proj", "/private/vault"])
+    }
+
     /// `docs/restic-cli.md` §backup dry-run: `--dry-run` sits right after
     /// `--json`, ahead of every other flag, which is where
     /// `BackupEngine.isDryRunBackup` looks for it (#78).

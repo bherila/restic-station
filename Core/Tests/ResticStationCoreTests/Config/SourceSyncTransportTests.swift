@@ -22,6 +22,32 @@ struct SourceSyncTransportTests {
         #expect(call.env?["RESTIC_PASSWORD"] == nil)
     }
 
+    @Test("a failed peer keeps its reason", arguments: [
+        (Int32(2), #"{"ok":false,"error":{"code":"set_busy","message":"Another synchronization is already using these folders."}}"#, "busy"),
+        (Int32(1), #"{"ok":false,"error":{"code":"config_invalid","message":"Backup repositories cannot be live sync folders.\u001b[2J"}}"#, "refused"),
+        (Int32(1), #"{"ok":false,"error":{"code":"operation_not_allowed","message":"The folders changed after the preview."}}"#, "request"),
+        (Int32(255), "", "ssh"),
+        (Int32(127), "", "helper"),
+        (Int32(1), "not json", "generic"),
+    ])
+    func remoteFailureReason(exitCode: Int32, stdout: String, kind: String) async throws {
+        let group = SourceSyncGroup(name: "Notes", localPath: "/workspace/notes", peer: .init(path: "/srv/notes", sshTarget: "sync.example.test", helperPath: "/opt/rs/helper"), coordinatorMachineId: "laptop")
+        let fake = FakeProcessRunner(script: [.init(argvPrefix: ["/usr/bin/ssh"], stdoutLines: stdout.isEmpty ? [] : [stdout], exitCode: exitCode)])
+        let request = SyncEndpointRequest(action: .inventory, group: group, root: group.peer.path)
+        let error = await #expect(throws: SourceSyncError.self) { _ = try await SourceSyncClient(runner: fake).request(request, at: group.peer) }
+        let message = error?.description ?? ""
+        switch kind {
+        case "busy": #expect(error == .busy)
+        case "refused":
+            #expect(message == "The other computer refused its folder: Backup repositories cannot be live sync folders.[2J")
+            if case .unsafeRoot = error {} else { Issue.record("expected unsafeRoot, got \(String(describing: error))") }
+        case "request": #expect(message.hasSuffix("The folders changed after the preview."))
+        case "ssh": #expect(message.contains("over SSH"))
+        case "helper": #expect(message.contains("/opt/rs/helper"))
+        default: #expect(message.contains("could not complete the helper operation"))
+        }
+    }
+
     @Test("rsync gets a NUL list, no delete flag, explicit quoting and no inherited option environment")
     func rsyncBoundary() async throws {
         let base = try syncTemporaryRoot()

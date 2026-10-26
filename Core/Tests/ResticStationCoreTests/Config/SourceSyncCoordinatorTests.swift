@@ -20,6 +20,8 @@ struct SourceSyncCoordinatorTests {
             try SyncEndpointService.handle(request)
         }
         func copy(paths: [String], from source: SyncEndpoint, to destination: SyncEndpoint, listFile: URL) async throws {
+            // Like SourceSyncClient, leave a list file for the coordinator to clean.
+            try Data(paths.joined(separator: "\0").utf8).write(to: listFile, options: .withoutOverwriting)
             let sourceRoot = try SourceSyncFilesystem.openRoot(source.path)
             let targetRoot = try SourceSyncFilesystem.openRoot(destination.path)
             let inventory = try SourceSyncFilesystem.inventory(at: source.path)
@@ -307,6 +309,57 @@ struct SourceSyncCoordinatorTests {
         #expect(try String(contentsOf: f.peer.appendingPathComponent("from-local"), encoding: .utf8) == "local")
     }
 
+    @Test("a copy that diverges before agreement names the first differing path", arguments: [false, true])
+    func divergenceNamesPath(_ onPeer: Bool) async throws {
+        let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
+        try f.write("a", "a"); try f.write("b", "b"); try f.write("c", "c")
+        let preview = try await f.preview()
+        let error = await #expect(throws: SourceSyncError.self) {
+            try await SourceSyncCoordinator.$afterDurablePhase.withValue({ at in
+                if at == "installed" { try f.write("edited", "b", peer: onPeer) }
+            }) { try await f.apply(preview) }
+        }
+        #expect(error?.description == "\(onPeer ? "The other copy" : "The local copy") changed before agreement at \"b\". Resolve the change, then resume this operation.")
+    }
+
+    @Test("transfer lists and unused directory candidates do not outlive their use")
+    func privateLeftoversRemoved() async throws {
+        let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
+        try f.write("local", "made/here/note")
+        try f.write("peer", "from-peer", peer: true)
+        let preview = try await f.preview()
+        // Someone creates the same new directory first, as a retry would
+        // find it: the installed value matches and the candidate is unused.
+        let status = try await SyncEndpointService.$beforeInstall.withValue({ path in
+            if path == "made" { try FileManager.default.createDirectory(at: f.peer.appendingPathComponent("made"), withIntermediateDirectories: false) }
+        }) { try await f.apply(preview) }
+        #expect(status.status == "synchronized")
+        let state = f.paths.root.appendingPathComponent("source-sync")
+        let names = (FileManager.default.enumerator(atPath: state.path)?.allObjects as? [String] ?? []).map { ($0 as NSString).lastPathComponent }
+        #expect(!names.contains { $0.hasPrefix("files-") })
+        let endpointNames = [f.local, f.peer].flatMap { root in
+            (FileManager.default.enumerator(atPath: root.deletingLastPathComponent().path)?.allObjects as? [String] ?? []).map { ($0 as NSString).lastPathComponent }
+        }
+        #expect(!(names + endpointNames).contains { $0.hasPrefix("directory-") })
+    }
+
+    @Test("consumed and day-old previews are removed; a fresh unconsumed one is kept")
+    func previewsAreRemoved() async throws {
+        let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
+        let previews = f.paths.root.appendingPathComponent("source-sync/\(f.group.id.uuidString)/previews")
+        func saved() throws -> [String] { try FileManager.default.contentsOfDirectory(atPath: previews.path).sorted() }
+        try f.write("local", "from-local")
+        let first = try await f.preview()
+        let stale = try #require(saved().first)
+        try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(-2 * 24 * 60 * 60)], ofItemAtPath: previews.appendingPathComponent(stale).path)
+        let second = try await f.preview()
+        // The day-old file went; only the new preview remains.
+        #expect(try saved().count == 1 && saved().first != stale)
+        #expect(first.previewToken != second.previewToken)
+        #expect(try await f.apply(second).status == "synchronized")
+        #expect(try saved().isEmpty)
+    }
+
     @Test("a repository inside either copy refuses planning, even without locks", arguments: [false, true])
     func repositoryInsideRefuses(_ onPeer: Bool) async throws {
         let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
@@ -411,6 +464,25 @@ struct SourceSyncCoordinatorTests {
         #expect(result.status == "synchronized" && result.operationId == nil)
         #expect(try String(contentsOf: f.peer.appendingPathComponent("a"), encoding: .utf8) == "a")
         #expect(try await f.preview().copies == 0)
+    }
+
+    @Test("a change found after the journal points to recovery, never to a preview that would refuse")
+    func pendingOperationNamesRecovery() async throws {
+        let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
+        try f.write("a", "a")
+        let preview = try await f.preview()
+        let error = await #expect(throws: SourceSyncError.self) {
+            try await SourceSyncCoordinator.$afterDurablePhase.withValue({ at in
+                // An editor saves into the peer during the handoff.
+                if at == "protected" { try Data("edited".utf8).write(to: f.peer.appendingPathComponent("a")) }
+            }) { try await f.apply(preview) }
+        }
+        let message = error?.description ?? ""
+        #expect(message.contains("sync recover") && !message.contains("Preview the changes again"))
+        // The circle the old wording created: preview refuses while pending.
+        await #expect(throws: SourceSyncError.self) { _ = try await f.preview() }
+        try FileManager.default.removeItem(at: f.peer.appendingPathComponent("a"))
+        _ = try? await f.coordinator.recover(set: f.set, group: f.group, machineId: "laptop", binding: "fixture")
     }
 
     @Test("settings changed before installation require cancelling, then a new preview", arguments: ["reserved", "protected"])
