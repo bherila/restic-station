@@ -141,6 +141,14 @@ public enum LockingHealth {
         ).probe(createIfMissing: false).map {
             LockingHealthFailure(scope: .administrative, failure: $0)
         }
+        // Every config writer also takes config-hold.lock.
+        if administrativeFailure == nil {
+            administrativeFailure = FileLock(
+                path: paths.configHoldLockFile, trustedRoot: paths.root
+            ).probe(createIfMissing: false).map {
+                LockingHealthFailure(scope: .administrative, failure: $0)
+            }
+        }
         // Both production backends mutate under secrets.lock: the file
         // backend protects its JSON read-modify-write, and the keychain
         // backend protects multi-item capture/update/conditional rollback.

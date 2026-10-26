@@ -935,6 +935,16 @@ extension CLIFailure {
         case let configError as ConfigError:
             return classify(configError)
 
+        case let syncError as SourceSyncError:
+            let code: CLIErrorCode
+            switch syncError {
+            case .busy: code = .setBusy
+            case .invalidConfiguration, .unsafeRoot: code = .configInvalid
+            case .stalePlan, .conflict, .stateInvalid: code = .operationNotAllowed
+            case .protectionFailed, .transferFailed: code = .resticFailed
+            }
+            return CLIFailure(code: code, message: bounded(syncError.description))
+
         case let runnerError as ResticRunnerError:
             return classify(runnerError)
 
@@ -953,6 +963,8 @@ extension CLIFailure {
 
     static func classify(_ error: ConfigError) -> CLIFailure {
         switch error {
+        case .invalidSyncFolder(let setId, _):
+            return CLIFailure(code: .configInvalid, message: "A sync folder is not valid for this backup set.", details: CLIErrorDetails(setId: setId))
         case .newerVersion(let found, let supported):
             return CLIFailure(
                 code: .configInvalid,

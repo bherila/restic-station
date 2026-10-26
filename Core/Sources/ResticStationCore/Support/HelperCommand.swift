@@ -22,6 +22,10 @@ public enum HelperCommand: Equatable, Sendable {
     case tick
     /// `run-set --set <uuid> --kind backup` — "Back Up Now".
     case backUpNow(setId: UUID)
+    case syncPlan(setId: UUID, groupId: UUID)
+    case syncApply(setId: UUID, groupId: UUID, previewToken: String)
+    case syncStatus(setId: UUID, groupId: UUID)
+    case syncRecover(setId: UUID, groupId: UUID, cancelUnstarted: Bool = false)
     /// `run-set --set <uuid> --kind prune`.
     /// `run-set --set <uuid> --kind prune [--expected-config <fingerprint>]`.
     /// `expectedConfig` is the `config.json` fingerprint the caller reviewed;
@@ -73,6 +77,14 @@ public enum HelperCommand: Equatable, Sendable {
             return ["tick"]
         case .backUpNow(let setId):
             return Self.runSet(setId: setId, kind: "backup")
+        case .syncPlan(let setId, let groupId):
+            return ["sync", "plan", "--set", Self.render(setId), "--group", Self.render(groupId), "--include-paths", "--json"]
+        case .syncApply(let setId, let groupId, _):
+            return ["sync", "apply", "--set", Self.render(setId), "--group", Self.render(groupId), "--preview-token-stdin", "--json"]
+        case .syncStatus(let setId, let groupId):
+            return ["sync", "status", "--set", Self.render(setId), "--group", Self.render(groupId), "--include-paths", "--json"]
+        case .syncRecover(let setId, let groupId, let cancelUnstarted):
+            return ["sync", "recover", "--set", Self.render(setId), "--group", Self.render(groupId), "--json"] + (cancelUnstarted ? ["--cancel-unstarted"] : [])
         case .prune(let setId, let expectedConfig):
             var argv = Self.runSet(setId: setId, kind: "prune")
             // Attached form so a fingerprint can never be reparsed as an option.
@@ -114,6 +126,8 @@ public enum HelperCommand: Equatable, Sendable {
     public var invocation: HelperInvocationSpec {
         let sensitiveStdin: HelperSensitiveInput?
         switch self {
+        case .syncApply(_, _, let token):
+            sensitiveStdin = HelperSensitiveInput(token)
         case .maintenancePrune(_, _, let expectedDestination, _, _):
             sensitiveStdin = expectedDestination.map(HelperSensitiveInput.init)
         default:

@@ -42,6 +42,13 @@ private let setId = UUID(uuidString: "6B29FC40-CA47-1067-B31D-00DD010662DA")!
 private let destId = UUID(uuidString: "0B7A50D4-9C3E-4F5B-9A0E-8E1F2C3D4A5B")!
 
 @Suite struct HelperCommandArgvTests {
+    @Test func syncCapabilityStaysOffArgv() {
+        let token = String(repeating: "A", count: 43)
+        let spec = HelperCommand.syncApply(setId: setId, groupId: destId, previewToken: token).invocation
+        #expect(spec.argv == ["sync", "apply", "--set", setId.uuidString, "--group", destId.uuidString, "--preview-token-stdin", "--json"])
+        #expect(!spec.argv.joined().contains(token))
+        #expect(spec.sensitiveStdin?.data == Data(token.utf8))
+    }
     @Test func tick() {
         #expect(HelperCommand.tick.argv == ["tick"])
     }

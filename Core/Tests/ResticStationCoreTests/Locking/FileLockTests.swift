@@ -707,6 +707,7 @@ let canInjectPermissionFaults = geteuid() != 0
     func lockingHealthProbesCompanionLocks() throws {
         let lockPaths: [(String, (AppPaths) -> URL)] = [
             ("config", { $0.configLockFile }),
+            ("config hold", { $0.configHoldLockFile }),
             ("secrets", { $0.secretsLockFile }),
             ("schedule state", { $0.scheduleStateLockFile }),
             ("preview tokens", { $0.previewTokensLockFile }),
@@ -726,7 +727,7 @@ let canInjectPermissionFaults = geteuid() != 0
                 "a hostile \(name) lock must not leave locking health green"
             )
             #expect(failure.path == hostile.path)
-            let administrative = name == "config" || name == "secrets"
+            let administrative = ["config", "config hold", "secrets"].contains(name)
             #expect(failure.scope == (administrative ? .administrative : .machine))
         }
     }

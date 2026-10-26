@@ -31,17 +31,58 @@ enum SHA256Digest {
     /// Exposed unconditionally so the vectors exercise it on every platform,
     /// not only the one that lacks CryptoKit.
     static func portableDigest(_ data: Data) -> [UInt8] {
-        var message = Array(data)
-        let bitLength = UInt64(message.count) &* 8
-        message.append(0x80)
-        while message.count % 64 != 56 { message.append(0) }
-        message.append(contentsOf: withUnsafeBytes(of: bitLength.bigEndian, Array.init))
+        var stream = PortableStream()
+        stream.update(data)
+        return stream.finish()
+    }
 
-        var state: [UInt32] = [
+    /// Hashes an already-open, no-follow file without loading an archive
+    /// into memory. The caller owns the descriptor and verifies its inode
+    /// and modification stamps before/after the read.
+    static func fileHex(descriptor: Int32) throws -> String {
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: false)
+        #if canImport(CryptoKit)
+        var stream = CryptoKit.SHA256()
+        while let data = try handle.read(upToCount: 1024 * 1024), !data.isEmpty { stream.update(data: data) }
+        return stream.finalize().map { String(format: "%02x", $0) }.joined()
+        #else
+        var stream = PortableStream()
+        while let data = try handle.read(upToCount: 1024 * 1024), !data.isEmpty { stream.update(data) }
+        return stream.finish().map { String(format: "%02x", $0) }.joined()
+        #endif
+    }
+
+    struct PortableStream {
+        private var state: [UInt32] = [
             0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
             0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
         ]
-        for offset in stride(from: 0, to: message.count, by: 64) {
+        private var pending: [UInt8] = []
+        private var bytes: UInt64 = 0
+
+        mutating func update(_ data: Data) {
+            bytes &+= UInt64(data.count)
+            pending.append(contentsOf: data)
+            let consumed = pending.count / 64 * 64
+            for offset in stride(from: 0, to: consumed, by: 64) {
+                SHA256Digest.compress(pending, offset: offset, state: &state)
+            }
+            pending.removeFirst(consumed)
+        }
+
+        mutating func finish() -> [UInt8] {
+            let bitLength = bytes &* 8
+            pending.append(0x80)
+            while pending.count % 64 != 56 { pending.append(0) }
+            pending.append(contentsOf: withUnsafeBytes(of: bitLength.bigEndian, Array.init))
+            for offset in stride(from: 0, to: pending.count, by: 64) {
+                SHA256Digest.compress(pending, offset: offset, state: &state)
+            }
+            return state.flatMap { withUnsafeBytes(of: $0.bigEndian, Array.init) }
+        }
+    }
+
+    private static func compress(_ message: [UInt8], offset: Int, state: inout [UInt32]) {
             var words = Array(repeating: UInt32(0), count: 64)
             for index in 0..<16 {
                 let start = offset + index * 4
@@ -72,8 +113,6 @@ enum SHA256Digest {
             }
             state[0] &+= a; state[1] &+= b; state[2] &+= c; state[3] &+= d
             state[4] &+= e; state[5] &+= f; state[6] &+= g; state[7] &+= h
-        }
-        return state.flatMap { withUnsafeBytes(of: $0.bigEndian, Array.init) }
     }
 
     private static func rotateRight(_ value: UInt32, by count: UInt32) -> UInt32 {

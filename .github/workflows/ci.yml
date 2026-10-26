@@ -58,6 +58,11 @@ jobs:
             apt-get update -qq && apt-get install -y -qq --no-install-recommends jq
           fi
           jq --version
+      - name: Source sync over isolated loopback SSH
+        run: |
+          apt-get update -qq && apt-get install -y -qq --no-install-recommends rsync openssh-server python3
+          mkdir -p /run/sshd
+          scripts/source-sync-ssh-test.sh
       # T27 — headless CLI ergonomics (config export/import/validate/show,
       # status, sets list, runs list/show): end to end against the real
       # binary. restic is not installed in this container, so the script
@@ -168,7 +173,7 @@ jobs:
           # jump, so the backup is named for the version the file started at
           # (v1 here), not for current - 1.
           .build/debug/restic-station-helper config upgrade
-          grep -qE '"version"[[:space:]]*:[[:space:]]*5' "$RESTIC_STATION_DATA_DIR/config.json"
+          grep -qE '"version"[[:space:]]*:[[:space:]]*6' "$RESTIC_STATION_DATA_DIR/config.json"
           grep -qE '"version"[[:space:]]*:[[:space:]]*1' "$RESTIC_STATION_DATA_DIR/config.v1.backup.json"
 
           # 2. A restic on PATH is discovered and used, with no configuration
@@ -365,6 +370,14 @@ jobs:
         run: swift test --package-path Core
       - name: Run integration test
         run: scripts/integration-test.sh
+      - name: Source sync with real recovery protection
+        env:
+          RESTIC_STATION_HELPER_OVERRIDE: dd/Build/Products/Debug/Restic Station.app/Contents/MacOS/restic-station-helper
+        run: scripts/source-sync-test.sh
+      - name: Source sync over isolated loopback SSH
+        env:
+          RESTIC_STATION_HELPER_OVERRIDE: dd/Build/Products/Debug/Restic Station.app/Contents/MacOS/restic-station-helper
+        run: scripts/source-sync-ssh-test.sh
       # Forces the Linux file backend on macOS, where restic IS installed —
       # so this run also proves the acceptance criterion "restic
       # authenticates via RESTIC_PASSWORD_COMMAND against FileSecretStore",
@@ -471,7 +484,7 @@ jobs:
       - name: Install restic + jq
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends jq bzip2
+          sudo apt-get install -y -qq --no-install-recommends jq bzip2 rsync
           curl -fsSL -o /tmp/restic.bz2 \
             "https://github.com/restic/restic/releases/download/v${RESTIC_VERSION}/restic_${RESTIC_VERSION}_linux_${RESTIC_ARCH}.bz2"
           bunzip2 -f /tmp/restic.bz2
@@ -511,6 +524,8 @@ jobs:
         run: |
           RESTIC_STATION_HELPER_OVERRIDE="$PWD/dist/restic-station-linux-aarch64/restic-station-helper" \
             scripts/integration-test.sh
+          RESTIC_STATION_HELPER_OVERRIDE="$PWD/dist/restic-station-linux-aarch64/restic-station-helper" \
+            scripts/source-sync-test.sh
       # T26 verification debt (deferred by an earlier task): a real systemd
       # --user timer end to end. This runner is a bare VM (systemd IS pid 1,
       # unlike the swift:6.1 container above) — worth an honest attempt

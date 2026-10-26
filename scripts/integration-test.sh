@@ -663,13 +663,13 @@ PY
 # migrates non-destructively and keeps backing up exactly what it did before.
 # Runs after the first backup, so migration has definitely happened.
 assert_migration() {
-    local step="migration (v1 -> v5, resticPath relocated, v1 backed up)"
+    local step="migration (v1 -> v6, resticPath relocated, v1 backed up)"
     log "$step"
 
     local version restic_in_config machine_id machine_restic
     version="$(jq -r '.version' "$DATA_DIR/config.json")"
     restic_in_config="$(jq -r '.resticPath' "$DATA_DIR/config.json")"
-    [[ "$version" == "5" ]] || fail "$step" "expected config.json at version 5, got '$version'"
+    [[ "$version" == "6" ]] || fail "$step" "expected config.json at version 6, got '$version'"
     [[ "$restic_in_config" == "null" ]] || fail "$step" "expected resticPath cleared, got '$restic_in_config'"
 
     # No `machines` keys invented: absence already means "runs everywhere".

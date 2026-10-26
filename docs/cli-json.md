@@ -63,6 +63,11 @@ itself, unwrapped, because its output is meant to be fed straight back into
 | `cli status` | ✅ | `CLIInstaller.Status` |
 | `fda-check` | ✅ | `{ applicable, granted, probedPath, checkedAt, context }` |
 | `purge preview` | ✅ | array of per-destination purge plans: matched/changed/unattributed snapshots and patterns |
+| `sync plan` | ✅ | `{ setId, groupId, copies, removals, conflicts, backupSourceCount, previewToken?, changes? }`; paths/hashes only with `--include-paths`, no token when conflicts exist |
+| `sync status` | ✅ | `{ groupId, status, operationId?, lastSynchronizedAt?, canCancel, recovery? }`; local state only, recovery locations and filename mappings only with `--include-paths` |
+| `sync apply` | ✅ | same synchronization status, after token-gated reconciliation and full-scope backup |
+| `sync recover` | ✅ | same status, after resuming the recorded operation; `--cancel-unstarted` only releases an operation that never entered installation |
+| `sync endpoint` | ✅ | Hidden, versioned trusted SSH protocol; not a public automation surface. No repository credentials. |
 | `purge apply` | ✅ | `{ setId, status, children }` for the token-gated destructive purge |
 | `maintenance prune` | ✅ | `{ setId, destinationId, label, dryRun, status, confirmationBinding, destinationFingerprint }` for standalone pack reclamation; `confirmationBinding` is an opaque, short-lived token present only for a dry run that completed (`success` or `warning`), and `destinationFingerprint` binds that preview to the displayed destination |
 | `config export` | — | **Unwrapped by design.** The exported config document itself, so it round-trips into `config import`. An older-schema `config.json` is refused (exit 1, nothing written) with a pointer to `config upgrade` (#191). |
@@ -160,7 +165,7 @@ not read, because reading it would mean loading configuration).
   "capabilitiesVersion": 1,
   "application": { "name": "restic-station-helper", "version": "0.1.3" },
   "platform": "macOS",
-  "configSchema": { "current": 5 },
+  "configSchema": { "current": 6 },
   "restic": { "available": true, "version": "0.19.1", "minimumVersion": "0.17.0", "reason": null },
   "features": {
     "backupDryRun": { "available": true, "reason": null },
@@ -217,7 +222,7 @@ runs each inspecting command against an older config and fails if the file,
 | `localStateWrite` | Writes local files only: observations or bookkeeping, or an output file the caller named. Never configuration, secrets or a repository. | `probe-repo` (repo-status), `fda-check`, `purge preview` (mints a token), `config acknowledge-migration`, `config export` (`--out` writes the named file), and the repository previews `backup dry-run`, `snapshots list`, `retention preview`: no repository changes, but their secret pre-flight creates, updates or clears `secret-attention-<destId>.json` |
 | `configurationWrite` | Changes configuration, stored secrets, the exclusion list, or host integration. | `config import`/`upgrade`, `secret set`/`set-env`/`rm`, `excludes enable`/`disable`/`add`/`remove`/`set`/`reset`, `cli install`/`uninstall`, `timer install`/`uninstall` |
 | `repositoryWrite` | Writes to a repository or restores from one. | `init-secondary`, `restore`, `unlock` |
-| `destructive` | Can remove repository data. | `tick`, `run-set` (scheduled retention runs inside a backup), `purge apply`, `maintenance prune` |
+| `destructive` | Can remove repository data or replace/remove live source files. | `tick`, `run-set` (scheduled retention runs inside a backup), `purge apply`, `maintenance prune`, `sync apply`, `sync recover` |
 
 #83 proposed four classes; `configurationWrite` is the fifth, split from
 `localStateWrite` because `secret rm` or `config import` changes every later
@@ -406,10 +411,10 @@ code alone.
 
 ## Coverage today
 
-Eighteen commands, listed in the matrix above. The mutating commands remain
+The JSON-capable commands are listed in the matrix above. The mutating commands remain
 human-only and still write prose to stderr — the boundary is stated in the
-matrix rather than papered over. `purge apply` and `maintenance prune` are the
-exception: they mutate, and they carry `--json` because the app drives them.
+matrix rather than papered over. `purge apply`, `maintenance prune`, and the source-sync commands are the
+exceptions: they mutate, and they carry `--json` because the app drives them.
 
 Every defined code now has a producer. `repository_offline` was wired by #79
 and is also emitted by `purge preview`, `backup dry-run`, `snapshots list` and `retention preview` (exit 3); `operation_not_allowed` is
@@ -553,3 +558,44 @@ Four codes not in that list are defined: `secret_rejected`,
 and `run_not_found`
 (`runs show <unknown-id>` is a real failure of a `--json` command and had no
 code at all).
+
+## Source synchronization
+
+`sync plan --set <uuid> [--group <uuid>]` enrolls private control state on
+both copies and issues a short-lived single-use capability only for a
+conflict-free plan. It changes no live files or repositories. `--group`
+is optional when a set has one sync folder. `--include-paths` deliberately
+adds relative paths and version hashes; default output is counts and IDs.
+The app requests paths to show a reviewable preview.
+
+`sync apply --set <uuid> [--group <uuid>] --preview-token-stdin` consumes
+the same bounded capability input as purge apply. Never put a token in argv
+or an environment variable. The token binds inventories, endpoint epochs,
+last agreement, effective set, machine settings, configuration revision and
+restic executable. The helper holds `config-hold.lock` through apply and
+recover, so every config writer refuses meanwhile, and checks
+machine/executable evidence at destructive handoffs. It does not hold
+`config.lock`: readers wait on that lock for at most 60 seconds, and an
+apply runs full backups, so holding it would fail every scheduled tick
+and status read until the sync finished.
+
+`sync status` reads local operation state without contacting the peer or
+requiring restic; first enrollment can create private local bookkeeping.
+`sync recover` resumes the recorded operation without minting a new plan.
+Before installation starts, a changed configuration revision, machine
+settings or restic executable refuses resume, and `--cancel-unstarted` is
+the way out. After that, unrelated changes cannot strand a partly installed
+operation: recover rechecks only this set's policy and sync folder, then
+binds the rest of the run to the current revision.
+A token is already consumed and is never reused. `--cancel-unstarted` is
+accepted only before installation has started, including failed transfer
+or protection in the reservation phase. Once installation begins, recover
+must finish that same operation and retain all unexpected captured values.
+
+`status` is `ready`, `running`, `synchronized`, `needsRecovery`, or
+`backupNeedsAttention`. A failure returns the usual error envelope;
+`set_busy` means local contention, `operation_not_allowed` means stale or
+incompatible state, `config_invalid` means an unsupported root/configuration,
+and `restic_failed` means transfer or recovery protection failed. Ordinary
+`run-set --kind backup` remains available independently of peer state.
+See [source-sync.md](source-sync.md) for limits and recovery semantics.

@@ -82,10 +82,13 @@ public enum CommandRegistry {
         CommandCapability("probe-repo", json: true, .localStateWrite),
         CommandCapability("fda-check", json: true, .localStateWrite),
         CommandCapability("purge preview", json: true, .localStateWrite),
+        CommandCapability("sync status", json: true, .localStateWrite),
         CommandCapability("config acknowledge-migration", json: true, .localStateWrite),
         // `--out` creates or replaces the file the caller names.
         CommandCapability("config export", json: false, .localStateWrite),
         // Configuration and host integration.
+        // Planning enrolls endpoint control state on the peer as well.
+        CommandCapability("sync plan", json: true, .configurationWrite),
         CommandCapability("config import", json: false, .configurationWrite),
         CommandCapability("config upgrade", json: true, .configurationWrite),
         CommandCapability("secret set", json: false, .configurationWrite),
@@ -110,6 +113,9 @@ public enum CommandRegistry {
         CommandCapability("tick", json: false, .destructive),
         CommandCapability("run-set", json: false, .destructive),
         CommandCapability("purge apply", json: true, .destructive),
+        CommandCapability("sync apply", json: true, .destructive),
+        CommandCapability("sync recover", json: true, .destructive),
+        CommandCapability("sync endpoint", json: true, .destructive),
         CommandCapability("maintenance prune", json: true, .destructive),
     ]
 

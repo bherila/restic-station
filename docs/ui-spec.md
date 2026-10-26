@@ -106,3 +106,29 @@ Sheet/wizard, 4 steps, skippable except where noted: 1) Welcome + restic discove
 ## Copy/tone rules
 
 Plain, specific, no jargon-for-jargon's-sake; restic terms (snapshot, repository, prune) are used and briefly explained in captions on first use per screen. Destructive confirmations state exactly what is and is not deleted. Every error surfaced to the user includes: what failed (set/destination), the mapped reason (from ResticError), and one next step.
+
+## Optional live-folder synchronization
+
+A backup set's Sources section remains its entire backup selection. The
+optional Keep in sync section below it selects specific folders and another
+local or SSH copy. Adding a child does not narrow its parent's backup or
+require moving folders into separate sets. The folder chooser provides the
+label and coordinating machine automatically; remote helper and coordinator
+details live under Advanced. Initial support is a manual pair; sync-enabled
+sets must retain all backup history and have no purge exclusions.
+
+A configured set's primary manual action is Sync & Back Up. It opens a
+review sheet showing both scopes, directional copy/removal/conflict counts,
+and expandable relative filenames. A conflict or an unavailable peer leaves
+Back Up Only available. The action uses the same helper/opaque stdin
+capability as the CLI; no source mutation occurs in the app process.
+Interrupted work is shown before another plan is made, with Resume & Back
+Up and, only before installation, Cancel Pending Plan. The sheet stays open
+with the failure reason and a refresh action when work needs attention.
+Scheduled runs remain ordinary backups; synchronization is manual.
+
+The set list keeps Last backup and Folder sync separate. Folder sync opens
+the review/recovery sheet and distinguishes not run, synchronized, running,
+and needs attention; a successful ordinary backup does not hide an
+interrupted synchronization. Recovery details map original filenames to
+private preserved-copy locations and show the protection snapshot.

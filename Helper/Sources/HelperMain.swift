@@ -148,6 +148,7 @@ struct HelperMain: AsyncParsableCommand {
             Snapshots.self,
             Retention.self,
             Purge.self,
+            SourceSyncCommand.self,
             Maintenance.self,
             InitSecondary.self,
             Restore.self,

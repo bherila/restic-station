@@ -146,6 +146,11 @@ cli status|json|live
 fda-check|json|live
 purge preview|json|live
 purge apply|json|live
+sync plan|json|live
+sync status|json|live
+sync apply|json|live
+sync recover|json|live
+sync endpoint|json|live
 maintenance prune|json|live
 config export|nojson|live
 timer status|nojson|env
@@ -411,7 +416,7 @@ write_config() { # write_config <dir> <resticPath-or-null-json>
     local dir="$1" restic_json="$2"
     cat > "$dir/config.json" <<EOF
 {
-  "version": 5,
+  "version": 6,
   "resticPath": $restic_json,
   "showMenuBarIcon": true,
   "sets": [
@@ -1334,6 +1339,24 @@ while IFS= read -r cmd; do
     mark_cmd "$cmd"
 done <<< "$NOJSON_CMDS"
 ok "all 16 human-only commands refuse --json at exit 64 with an invalid_arguments envelope"
+
+# Source sync has a separate real-rsync/restic integration script. Here the
+# common backup-only fixture proves every new command's refusal envelope:
+# no implicit selection, no missing-token authority, no untyped endpoint RPC.
+for sync_command in plan status recover; do
+    RESTIC_STATION_DATA_DIR="$FIXTURE" run_helper_split sync "$sync_command" --set "$SET_ID" --json
+    expect_rc 1
+    assert_error_envelope "config_invalid"
+    mark_cmd "sync $sync_command"
+done
+run_helper_split sync apply --set "$SET_ID" --json
+expect_rc 1
+assert_error_envelope "invalid_arguments"
+mark_cmd "sync apply"
+run_helper_stdin '{}' sync endpoint --json
+expect_rc 1
+assert_error_envelope "invalid_arguments"
+mark_cmd "sync endpoint"
 
 # ─────────────────────────────────────────────────────────────────────────
 # PART 3 — coverage reconciliation and the secret-leak sweep.

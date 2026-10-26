@@ -243,6 +243,11 @@ public struct ConfigStore: Sendable {
             return config
         }
         guard migrationAllowed else { return config }
+        // Migration writes config.json, its backup and machine.json. Under a
+        // revision hold it is deferred, exactly like an unusable lock.
+        let hold: FileLock
+        do { hold = try acquireRevisionHold() } catch { return config }
+        defer { hold.release() }
         let migration = migrateToCurrentVersion(config, originalBytes: data)
         // Mirrors the original single-function behavior exactly: config.json
         // is never overwritten unless the v1 backup is confirmed on disk —
@@ -514,6 +519,8 @@ public struct ConfigStore: Sendable {
             throw ConfigStoreError.writeLockUnusable(failure)
         }
         defer { lock.release() }
+        let hold = try acquireRevisionHold()
+        defer { hold.release() }
 
         guard try unchangedRevisionFingerprint() == expectedFingerprint else {
             throw ConfigStoreError.changedOnDisk
@@ -523,6 +530,43 @@ public struct ConfigStore: Sendable {
             throw ConfigStoreError.changedOnDisk
         }
         return result
+    }
+
+    /// ``withUnchangedRevision(from:operation:)`` for an operation that can
+    /// outlast the readers' bounded wait (source-sync apply runs full
+    /// backups). Writers still refuse throughout, but `config.lock` stays
+    /// free, so every reader — scheduled ticks included — loads normally.
+    public func withRevisionHold<T>(
+        from expectedFingerprint: String,
+        operation: () async throws -> T
+    ) async throws -> T {
+        try paths.ensureDirectories()
+        let hold = try acquireRevisionHold()
+        defer { hold.release() }
+
+        guard try unchangedRevisionFingerprint() == expectedFingerprint else {
+            throw ConfigStoreError.changedOnDisk
+        }
+        let result = try await operation()
+        guard try unchangedRevisionFingerprint() == expectedFingerprint else {
+            throw ConfigStoreError.changedOnDisk
+        }
+        return result
+    }
+
+    /// Every writer takes this after `config.lock`, and only for the write
+    /// itself. Contention means a revision hold is active; both answers are
+    /// immediate, so lock order cannot deadlock.
+    private func acquireRevisionHold() throws -> FileLock {
+        let lock = FileLock(path: paths.configHoldLockFile, trustedRoot: paths.root)
+        switch lock.acquire() {
+        case .acquired:
+            return lock
+        case .busy:
+            throw ConfigStoreError.writeLockBusy(path: paths.configHoldLockFile.path)
+        case .failed(let failure):
+            throw ConfigStoreError.writeLockUnusable(failure)
+        }
     }
 
     /// Turns raw Foundation I/O failures into a configuration-domain error
@@ -554,6 +598,8 @@ public struct ConfigStore: Sendable {
         switch lock.acquire() {
         case .acquired:
             defer { lock.release() }
+            let hold = try acquireRevisionHold()
+            defer { hold.release() }
             return try body()
         case .busy:
             throw ConfigStoreError.writeLockBusy(path: paths.configLockFile.path)

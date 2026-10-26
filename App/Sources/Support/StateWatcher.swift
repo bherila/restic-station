@@ -743,6 +743,7 @@ public final class StateWatcher: ObservableObject {
             urls += [
                 paths.tickLockFile,
                 paths.configLockFile,
+                paths.configHoldLockFile,
                 paths.destructiveAuditLockFile,
                 paths.runPublicationLockFile,
                 paths.healthLockFile,

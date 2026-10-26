@@ -353,7 +353,7 @@ private func baseConfig() -> AppConfig {
     @Test func macResolutionIsIdenticalOnEveryHostOS() throws {
         let expected = """
         {
-          "version": 5,
+          "version": 6,
           "resticPath": null,
           "showMenuBarIcon": true,
           "sets": [
@@ -407,7 +407,7 @@ private func baseConfig() -> AppConfig {
     @Test func linuxResolutionIsIdenticalOnEveryHostOS() throws {
         let expected = """
         {
-          "version": 5,
+          "version": 6,
           "resticPath": null,
           "showMenuBarIcon": true,
           "sets": [
