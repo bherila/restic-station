@@ -157,6 +157,12 @@ continue backing up the configured sources; synchronization is manual.
 - Refuse missing mounts, root replacement, overlapping copies, unsafe
   relative paths, symlink traversal, unsupported file types and ambiguous
   case/Unicode names before mutation.
+- A sync folder is never a Restic repository, inside one, or a parent of
+  one, on either computer. Both endpoints recognize the on-disk layout
+  (`config` plus `data/`, `index/`, `keys/` and `snapshots/`; `locks/` is
+  optional because copies often exclude it) without reading repository
+  contents, so the other computer needs no password to refuse it.
+  Repositories replicate through `restic copy`, never through folder sync.
 - A sync tree stays on one filesystem. Any directory or file whose device
   differs from its parent's (a mounted volume, bind mount or network mount
   inside the folder) refuses inventory. Otherwise a baseline would include

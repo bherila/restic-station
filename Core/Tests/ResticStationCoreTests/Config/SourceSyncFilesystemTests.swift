@@ -47,12 +47,13 @@ struct SourceSyncFilesystemTests {
         try FileManager.default.removeItem(at: root.appendingPathComponent("note"))
         #expect(try SourceSyncFilesystem.inventory(at: root.path).rootIdentity == initial)
     }
-    @Test("repositories, their children and parents are never live replicas")
-    func repositoryBoundary() throws {
+    @Test("repositories, their children and parents are never live replicas", arguments: [true, false])
+    func repositoryBoundary(withLocks: Bool) throws {
         let root = try syncTemporaryRoot()
         let repo = root.appendingPathComponent("archive")
         defer { try? FileManager.default.removeItem(at: root) }
-        for name in ["data", "index", "keys", "locks", "snapshots"] {
+        // A copy made with --exclude locks is still a repository.
+        for name in ["data", "index", "keys", "snapshots"] + (withLocks ? ["locks"] : []) {
             try FileManager.default.createDirectory(at: repo.appendingPathComponent(name), withIntermediateDirectories: true)
         }
         try Data("synthetic repository config".utf8).write(to: repo.appendingPathComponent("config"))

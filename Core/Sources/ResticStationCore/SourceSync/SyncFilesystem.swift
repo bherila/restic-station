@@ -360,9 +360,11 @@ public enum SourceSyncFilesystem {
     /// descendants, or a parent that would transfer the repository tree.
     /// The standard on-disk layout is sufficient for a conservative refusal;
     /// no password or repository contents need to be read by an SSH worker.
+    /// `locks/` is not required: copies made with `--exclude locks` omit it
+    /// and restic recreates it on demand.
     private static func refuseRepository(_ fd: Int32) throws {
         let layout: [(String, mode_t)] = [("config", mode_t(S_IFREG)), ("data", mode_t(S_IFDIR)),
-            ("index", mode_t(S_IFDIR)), ("keys", mode_t(S_IFDIR)), ("locks", mode_t(S_IFDIR)), ("snapshots", mode_t(S_IFDIR))]
+            ("index", mode_t(S_IFDIR)), ("keys", mode_t(S_IFDIR)), ("snapshots", mode_t(S_IFDIR))]
         for (name, type) in layout {
             var info = stat()
             if name.withCString({ fstatat(fd, $0, &info, AT_SYMLINK_NOFOLLOW) }) != 0 {

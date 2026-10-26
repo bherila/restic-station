@@ -307,6 +307,20 @@ struct SourceSyncCoordinatorTests {
         #expect(try String(contentsOf: f.peer.appendingPathComponent("from-local"), encoding: .utf8) == "local")
     }
 
+    @Test("a repository inside either copy refuses planning, even without locks", arguments: [false, true])
+    func repositoryInsideRefuses(_ onPeer: Bool) async throws {
+        let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
+        try f.write("ordinary", "kept", peer: !onPeer)
+        let repository = (onPeer ? f.peer : f.local).appendingPathComponent("mirrors/notes.restic")
+        for name in ["data", "index", "keys", "snapshots"] {
+            try FileManager.default.createDirectory(at: repository.appendingPathComponent(name), withIntermediateDirectories: true)
+        }
+        try Data("synthetic repository config".utf8).write(to: repository.appendingPathComponent("config"))
+        await #expect(throws: SourceSyncError.self) { _ = try await f.preview() }
+        try FileManager.default.removeItem(at: repository.appendingPathComponent("keys"))
+        #expect(try await f.preview().previewToken != nil)
+    }
+
     @Test("either sync folder in cloud storage refuses planning", arguments: [false, true])
     func cloudSyncFolderRefuses(_ onPeer: Bool) async throws {
         let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
