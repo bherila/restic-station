@@ -292,6 +292,32 @@ struct SourceSyncCoordinatorTests {
         if phase == "backedUp" || phase == "complete" { #expect(await f.backups.counts().1 == before.1) }
     }
 
+    @Test("a repository in cloud storage still syncs")
+    func cloudRepositorySyncs() async throws {
+        let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
+        try f.write("local", "from-local")
+        let repository = try SourceSyncFilesystem.resolvedDirectory(f.set.destinations[0].repoURL)
+        // An encrypted repository in iCloud Drive holds no plaintext; only
+        // the overlap check reads its path.
+        try await SourceSyncFilesystem.$reachesCloudStorage.withValue({ $0 == repository || $0.hasPrefix(repository + "/") }) {
+            let preview = try await f.preview()
+            #expect(preview.copies == 1 && preview.previewToken != nil)
+            #expect(try await f.apply(preview).status == "synchronized")
+        }
+        #expect(try String(contentsOf: f.peer.appendingPathComponent("from-local"), encoding: .utf8) == "local")
+    }
+
+    @Test("either sync folder in cloud storage refuses planning", arguments: [false, true])
+    func cloudSyncFolderRefuses(_ onPeer: Bool) async throws {
+        let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
+        let root = try SourceSyncFilesystem.resolvedDirectory((onPeer ? f.peer : f.local).path)
+        await #expect(throws: SourceSyncError.self) {
+            try await SourceSyncFilesystem.$reachesCloudStorage.withValue({ $0 == root || $0.hasPrefix(root + "/") }) {
+                _ = try await f.preview()
+            }
+        }
+    }
+
     @Test("a folder on another filesystem inside either copy refuses planning", arguments: [false, true])
     func nestedFilesystemRefusesPlanning(_ onPeer: Bool) async throws {
         let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }

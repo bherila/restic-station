@@ -176,7 +176,9 @@ continue backing up the configured sources; synchronization is manual.
   always copy rather than trusting rsync's size-and-time check. Extended
   attributes and ACLs are not synchronized.
 - Keep journal/control state outside managed roots and Restic repositories.
-  Never stage plaintext live data into a cloud-sync directory.
+  Never stage plaintext live data into a cloud-sync directory. Both sync
+  folders refuse cloud storage; a set's encrypted local repository may live
+  there (for example in iCloud Drive) and is only checked for overlap.
 - Use synthetic local/SSH fixtures. Test both directions, ancestor
   conflicts, backup-exclusion refusal, corrupt/lost state, concurrent
   operations, changes at every handoff, cancellation and crashes before

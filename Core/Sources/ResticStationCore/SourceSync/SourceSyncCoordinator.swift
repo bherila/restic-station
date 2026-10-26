@@ -392,7 +392,7 @@ public struct SourceSyncCoordinator: Sendable {
         let state = try SourceSyncFilesystem.physicalDirectory(paths.root.path)
         guard !SourceSyncGroup.contains(root, state), !SourceSyncGroup.contains(state, root) else { throw SourceSyncError.stalePlan }
         for destination in set.destinations where destination.kind == .localPath {
-            let repo = try SourceSyncFilesystem.physicalDirectory(destination.repoURL)
+            let repo = try SourceSyncFilesystem.resolvedDirectory(destination.repoURL)
             guard !SourceSyncGroup.contains(root, repo), !SourceSyncGroup.contains(repo, root) else { throw SourceSyncError.stalePlan }
         }
     }
