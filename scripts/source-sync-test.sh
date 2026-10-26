@@ -20,7 +20,7 @@ MIRROR=44444444-4444-4444-8444-444444444444
 mkdir -p "$WORK/workspace/notes/nested" "$WORK/other copy" "$WORK/repo" "$WORK/mirror" "$WORK/state"
 chmod 700 "$WORK/state"
 python3 - "$WORK" "$RESTIC" "$SET" "$DEST" "$GROUP" "$MIRROR" <<'PY'
-import json, pathlib, sys
+import json, os, pathlib, sys
 base, restic, sid, did, gid, mid = sys.argv[1:]
 p = pathlib.Path(base)
 config = {"version": 6, "showMenuBarIcon": True, "sets": [{"id": sid, "name": "Workspace", "sources": [str(p/"workspace")],
@@ -37,6 +37,8 @@ config = {"version": 6, "showMenuBarIcon": True, "sets": [{"id": sid, "name": "W
 (p/"workspace/notes/read-only/note").write_text("read-only tree")
 (p/"workspace/notes/read-only").chmod(0o500)
 (p/"other copy/from peer").write_text("peer version")
+os.utime(p/"workspace/notes/nested/from local", ns=(981173106_000000000, 981173106_000000000))
+os.utime(p/"other copy/from peer", ns=(1234567890_000000000, 1234567890_000000000))
 (p/"workspace/sibling").write_text("backup only")
 PY
 printf '%s' 'synthetic-sync-password' | "$HELPER" secret set --dest "$DEST" >/dev/null
@@ -66,6 +68,10 @@ p = pathlib.Path(sys.argv[1])
 for root in [p/"workspace/notes", p/"other copy"]:
     assert stat.S_IMODE((root/"read-only").stat().st_mode) == 0o500
     assert stat.S_IMODE((root/"nested").stat().st_mode) == 0o750
+    # Real rsync carries each file's original modification time (whole
+    # seconds: openrsync speaks protocol 29, without nanosecond times).
+    assert (root/"nested/from local").stat().st_mtime_ns == 981173106_000000000
+    assert (root/"from peer").stat().st_mtime_ns == 1234567890_000000000
 # Both copies were finalized; make them writable for subsequent manual edits.
 for root in [p/"workspace/notes", p/"other copy"]:
     (root/"read-only").chmod(0o700)
@@ -119,4 +125,4 @@ PY
 plan
 if apply; then echo 'FAIL: excluded recovery vault authorized replacement' >&2; exit 1; fi
 test "$(cat "$WORK/workspace/notes/from peer")" = 'peer version'
-echo 'PASS: source sync, real restore proof, independent backup scope, deletion, replay and exclusion refusal'
+echo 'PASS: source sync, real restore proof, modification times, independent backup scope, deletion, replay and exclusion refusal'

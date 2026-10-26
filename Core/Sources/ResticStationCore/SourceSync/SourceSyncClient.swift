@@ -47,7 +47,10 @@ public struct SourceSyncClient: SourceSyncTransport {
         try list.write(to: listFile, options: .withoutOverwriting)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: listFile.path)
         let remoteShell = Self.ssh.map(ShellQuote.singleQuote).joined(separator: " ")
-        let argv = ["/usr/bin/rsync", "-rlpt", "--from0", "--files-from=\(listFile.path)", "--safe-links",
+        // Exports carry the original modification times, so rsync's default
+        // size+mtime check could keep a stale same-size staged file. Always
+        // transfer; staging is private and inventories still verify content.
+        let argv = ["/usr/bin/rsync", "-rlpt", "--ignore-times", "--from0", "--files-from=\(listFile.path)", "--safe-links",
                     "-e", remoteShell, "--", try operand(source), try operand(destination)]
         // Keep one explicit remote-shell quoting contract across openrsync
         // and GNU rsync >=3.2.4, whose default added another escaping pass.

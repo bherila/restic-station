@@ -31,12 +31,31 @@ struct SourceSyncTransportTests {
         let fake = FakeProcessRunner(script: [.init(argvPrefix: ["/usr/bin/rsync"])])
         try await SourceSyncClient(runner: fake).copy(paths: ["a\nb", "space name"], from: .init(path: "/staged"), to: .init(path: "/srv/other copy", sshTarget: "sync.example.test"), listFile: list)
         let call = try #require(fake.invocations.first)
-        #expect(call.argv.contains("--from0") && call.argv.contains("--safe-links"))
+        #expect(call.argv.contains("--from0") && call.argv.contains("--safe-links") && call.argv.contains("--ignore-times"))
         #expect(!call.argv.contains { $0.hasPrefix("--delete") })
         #expect(call.argv.suffix(2) == ["/staged/", "sync.example.test:'/srv/other copy/'"])
         #expect(call.env?["RSYNC_OLD_ARGS"] == "1" && call.env?["RSYNC_PROTECT_ARGS"] == "0")
         #expect(try Data(contentsOf: list) == Data("a\nb\0space name\0".utf8))
         #expect(call.stdin == nil)
+    }
+
+    @Test("a stale staged file with the same size and time is still replaced", .enabled(if: FileManager.default.isExecutableFile(atPath: "/usr/bin/rsync")))
+    func staleStagedFileIsReplaced() async throws {
+        let base = try syncTemporaryRoot()
+        let source = base.appendingPathComponent("export"), target = base.appendingPathComponent("incoming")
+        for directory in [source, target] { try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true) }
+        defer { try? FileManager.default.removeItem(at: base) }
+        // Exports preserve modification times, so rsync's default quick
+        // check alone would treat this differing staged value as current.
+        let time = Date(timeIntervalSince1970: 981_173_106)
+        try Data("planned".utf8).write(to: source.appendingPathComponent("note"))
+        try Data("stale!!".utf8).write(to: target.appendingPathComponent("note"))
+        for directory in [source, target] {
+            try FileManager.default.setAttributes([.modificationDate: time], ofItemAtPath: directory.appendingPathComponent("note").path)
+        }
+        try await SourceSyncClient().copy(paths: ["note"], from: .init(path: source.path), to: .init(path: target.path), listFile: base.appendingPathComponent("list"))
+        #expect(try String(contentsOf: target.appendingPathComponent("note"), encoding: .utf8) == "planned")
+        #expect(try FileManager.default.attributesOfItem(atPath: target.appendingPathComponent("note").path)[.modificationDate] as? Date == time)
     }
 
     @Test("an incomplete remote receipt cannot become an inventory")

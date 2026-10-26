@@ -87,6 +87,12 @@ struct SourceSyncCoordinatorTests {
             try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
             try Data(value.utf8).write(to: file)
         }
+        func setModified(_ date: Date, _ path: String, peer other: Bool = false) throws {
+            try FileManager.default.setAttributes([.modificationDate: date], ofItemAtPath: (other ? peer : local).appendingPathComponent(path).path)
+        }
+        func modified(_ path: String, peer other: Bool = false) throws -> Date? {
+            try FileManager.default.attributesOfItem(atPath: (other ? peer : local).appendingPathComponent(path).path)[.modificationDate] as? Date
+        }
         func preview() async throws -> SourceSyncPreview {
             try await coordinator.preview(set: set, group: group, machineId: "laptop", config: config, binding: "fixture")
         }
@@ -111,6 +117,25 @@ struct SourceSyncCoordinatorTests {
         #expect(await f.backups.protectedSources() == [[f.workspace.path]])
         #expect(await f.backups.counts().1 == 1)
         #expect(await f.backups.agreementWasBackedUp())
+    }
+
+    @Test("synced files keep their source modification time in both directions")
+    func modificationTimes() async throws {
+        let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
+        let earlier = Date(timeIntervalSince1970: 981_173_106), later = Date(timeIntervalSince1970: 1_234_567_890)
+        try f.write("local", "nested/from-local"); try f.setModified(earlier, "nested/from-local")
+        try f.write("remote", "from-peer", peer: true); try f.setModified(later, "from-peer", peer: true)
+        #expect(try await f.apply(f.preview()).status == "synchronized")
+        #expect(try f.modified("nested/from-local", peer: true) == earlier)
+        #expect(try f.modified("from-peer") == later)
+        // A replacement displaces the old value; the new one keeps its time.
+        try f.write("edited", "from-peer"); try f.setModified(earlier, "from-peer")
+        #expect(try await f.apply(f.preview()).status == "synchronized")
+        #expect(try String(contentsOf: f.peer.appendingPathComponent("from-peer"), encoding: .utf8) == "edited")
+        #expect(try f.modified("from-peer", peer: true) == earlier)
+        // Times are not identity: a time-only change is not a sync change.
+        try f.setModified(later, "from-peer")
+        #expect(try await f.preview().copies == 0)
     }
 
     @Test("read-only source directories export and install with their final modes")
@@ -295,12 +320,15 @@ struct SourceSyncCoordinatorTests {
         var set = f.set; set.syncFolders = [group]
         let config = AppConfig(sets: [set])
         let coordinator = SourceSyncCoordinator(paths: f.paths, transport: SourceSyncClient(runner: SSHFixtureRunner(config: configPath)), backups: f.backups)
-        try f.write("local", "nested/from local")
-        try f.write("remote", "from peer", peer: true)
+        let earlier = Date(timeIntervalSince1970: 981_173_106), later = Date(timeIntervalSince1970: 1_234_567_890)
+        try f.write("local", "nested/from local"); try f.setModified(earlier, "nested/from local")
+        try f.write("remote", "from peer", peer: true); try f.setModified(later, "from peer", peer: true)
         let preview = try await coordinator.preview(set: set, group: group, machineId: "laptop", config: config, binding: "ssh-fixture")
         let result = try await coordinator.apply(token: #require(preview.previewToken), set: set, group: group, machineId: "laptop", config: config, binding: "ssh-fixture")
         #expect(result.status == "synchronized")
         #expect(try String(contentsOf: f.peer.appendingPathComponent("nested/from local"), encoding: .utf8) == "local")
         #expect(try String(contentsOf: f.local.appendingPathComponent("from peer"), encoding: .utf8) == "remote")
+        #expect(try f.modified("nested/from local", peer: true) == earlier)
+        #expect(try f.modified("from peer") == later)
     }
 }

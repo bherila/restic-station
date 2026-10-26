@@ -239,6 +239,17 @@ public enum SourceSyncFilesystem {
             while let bytes = try input.read(upToCount: 1024 * 1024), !bytes.isEmpty {
                 try output.write(contentsOf: bytes)
             }
+            // Every later hop (rsync -t, exclusive rename) keeps this
+            // inode's times, so this sets the installed copy's modification
+            // time. It is never identity: content and mode decide agreement.
+            var source = stat()
+            guard fstat(inputFD, &source) == 0 else { throw changed() }
+            #if canImport(Darwin)
+            var times = [source.st_atimespec, source.st_mtimespec]
+            #else
+            var times = [source.st_atim, source.st_mtim]
+            #endif
+            guard futimens(outputFD, &times) == 0 else { throw changed() }
             guard fchmod(outputFD, mode_t(expected.mode)) == 0, fsync(outputFD) == 0 else { throw changed() }
             try output.close()
         }

@@ -161,6 +161,11 @@ continue backing up the configured sources; synchronization is manual.
   and newer GNU rsync; see the [rsync argument contract](https://www.samba.org/ftp/rsync/rsync.1.html).
 - Preserve modes explicitly and verify them after transfer. Ownership is
   not mapped through numeric IDs between different operating systems.
+- Installed files keep their source modification time (whole seconds are
+  guaranteed; openrsync's protocol 29 does not carry nanoseconds). Times are
+  never identity: a time-only change is not a sync change, and transfers
+  always copy rather than trusting rsync's size-and-time check. Extended
+  attributes and ACLs are not synchronized.
 - Keep journal/control state outside managed roots and Restic repositories.
   Never stage plaintext live data into a cloud-sync directory.
 - Use synthetic local/SSH fixtures. Test both directions, ancestor

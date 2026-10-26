@@ -56,4 +56,6 @@ export RESTIC_STATION_TEST_SSH_CONFIG="$WORK/ssh_config"
 HELPER="${RESTIC_STATION_HELPER_OVERRIDE:-$REPO/.build/debug/restic-station-helper}"
 RESTIC_STATION_TEST_SSH_HELPER="$(cd "$(dirname "$HELPER")" && pwd)/$(basename "$HELPER")"
 export RESTIC_STATION_TEST_SSH_HELPER
-swift test --package-path "$REPO/Core" --filter realSSHFixture
+# GNU rsync is installed only for this step on Linux; run the real local
+# rsync transfer check here too.
+swift test --package-path "$REPO/Core" --filter 'realSSHFixture|staleStagedFileIsReplaced'
