@@ -292,6 +292,71 @@ struct SourceSyncCoordinatorTests {
         if phase == "backedUp" || phase == "complete" { #expect(await f.backups.counts().1 == before.1) }
     }
 
+    @Test("a partly installed operation resumes after unrelated settings changes", arguments: ["installing", "installed", "agreed", "backedUp"])
+    func resumeAfterSettingsChange(_ phase: String) async throws {
+        let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
+        try f.write("a", "a")
+        let preview = try await f.preview()
+        await #expect(throws: SourceSyncError.self) {
+            try await SourceSyncCoordinator.$afterDurablePhase.withValue({ at in
+                if at == phase { throw SourceSyncError.transferFailed }
+            }) { try await f.apply(preview) }
+        }
+        // Any config.json, machine.json or restic change alters the session
+        // binding. A copy may already be half-installed, so it must finish.
+        let result = try await f.coordinator.recover(set: f.set, group: f.group, machineId: "laptop", binding: "settings changed")
+        #expect(result.status == "synchronized" && result.operationId == nil)
+        #expect(try String(contentsOf: f.peer.appendingPathComponent("a"), encoding: .utf8) == "a")
+        #expect(try await f.preview().copies == 0)
+    }
+
+    @Test("settings changed before installation require cancelling, then a new preview", arguments: ["reserved", "protected"])
+    func settingsChangeBeforeInstallation(_ phase: String) async throws {
+        let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
+        try f.write("a", "a")
+        let preview = try await f.preview()
+        await #expect(throws: SourceSyncError.self) {
+            try await SourceSyncCoordinator.$afterDurablePhase.withValue({ at in
+                if at == phase { throw SourceSyncError.transferFailed }
+            }) { try await f.apply(preview) }
+        }
+        await #expect(throws: SourceSyncError.self) {
+            try await f.coordinator.recover(set: f.set, group: f.group, machineId: "laptop", binding: "settings changed")
+        }
+        #expect(!FileManager.default.fileExists(atPath: f.peer.appendingPathComponent("a").path))
+        _ = try await f.coordinator.cancelUnstarted(set: f.set, group: f.group, machineId: "laptop")
+        #expect(try await f.apply(f.preview()).status == "synchronized")
+        #expect(try String(contentsOf: f.peer.appendingPathComponent("a"), encoding: .utf8) == "a")
+    }
+
+    @Test("resuming with changed settings still refuses a changed sync policy or folder")
+    func resumeStillChecksThisSet() async throws {
+        let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
+        try f.write("a", "a")
+        let preview = try await f.preview()
+        await #expect(throws: SourceSyncError.self) {
+            try await SourceSyncCoordinator.$afterDurablePhase.withValue({ at in
+                if at == "installing" { throw SourceSyncError.transferFailed }
+            }) { try await f.apply(preview) }
+        }
+        // Retention could forget the protection snapshot mid-operation.
+        var retained = f.set; retained.retention = RetentionPolicy(keepDaily: 7)
+        await #expect(throws: SourceSyncError.self) {
+            try await f.coordinator.recover(set: retained, group: f.group, machineId: "laptop", binding: "settings changed")
+        }
+        // A different folder is not the operation the journal describes.
+        let elsewhere = f.base.appendingPathComponent("elsewhere")
+        try FileManager.default.createDirectory(at: elsewhere, withIntermediateDirectories: true)
+        var moved = f.group; moved.peer.path = elsewhere.path
+        var repointed = f.set; repointed.syncFolders = [moved]
+        await #expect(throws: SourceSyncError.self) {
+            try await f.coordinator.recover(set: repointed, group: moved, machineId: "laptop", binding: "settings changed")
+        }
+        #expect(!FileManager.default.fileExists(atPath: f.peer.appendingPathComponent("a").path))
+        let result = try await f.coordinator.recover(set: f.set, group: f.group, machineId: "laptop", binding: "settings changed")
+        #expect(result.status == "synchronized")
+    }
+
     @Test("protection includes the displaced values from both copies in one operation")
     func simultaneousDirections() async throws {
         let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }

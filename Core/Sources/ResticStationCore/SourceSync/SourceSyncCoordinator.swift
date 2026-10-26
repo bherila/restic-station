@@ -122,7 +122,7 @@ public struct SourceSyncCoordinator: Sendable {
         record.activeOperation = preview.id
         record.status = .running
         try store.save(record)
-        return try await run(journal: journal, store: store, set: set, binding: binding)
+        return try await run(journal: journal, store: store, set: set, binding: binding, resuming: false)
     }
 
     public func recover(set: BackupSet, group: SourceSyncGroup, machineId: String, binding: String) async throws -> SourceSyncStatus {
@@ -139,7 +139,7 @@ public struct SourceSyncCoordinator: Sendable {
               journal.preview.plan.groupFingerprint == (try journal.preview.group.bindingFingerprint) else {
             throw SourceSyncError.stateInvalid("No compatible interrupted operation is available to resume.")
         }
-        return try await run(journal: journal, store: store, set: set, binding: binding)
+        return try await run(journal: journal, store: store, set: set, binding: binding, resuming: true)
     }
 
     public func cancelUnstarted(set: BackupSet, group: SourceSyncGroup, machineId: String) async throws -> SourceSyncStatus {
@@ -211,9 +211,20 @@ public struct SourceSyncCoordinator: Sendable {
         return status
     }
 
-    private func run(journal initial: SourceSyncJournal, store: SourceSyncStore, set: BackupSet, binding: String) async throws -> SourceSyncStatus {
+    private func run(journal initial: SourceSyncJournal, store: SourceSyncStore, set: BackupSet, binding: String, resuming: Bool) async throws -> SourceSyncStatus {
         var journal = initial
-        guard journal.preview.binding == binding else { throw SourceSyncError.stalePlan }
+        if journal.preview.binding != binding {
+            guard resuming else { throw SourceSyncError.stalePlan }
+            // Until installation starts, the previewed settings still bind
+            // the plan's authority, and cancelling is safe. Afterwards the
+            // operation must finish rather than strand a half-installed
+            // copy: recover has rechecked this set's policy (validate) and
+            // the journal's group fingerprint, and revalidate binds the
+            // rest of the run to the current revision instead.
+            guard journal.phase != .reserved, journal.phase != .protected else {
+                throw SourceSyncError.stateInvalid("Settings changed after this sync was previewed and before it installed any files. Cancel it with sync recover --cancel-unstarted, then preview again.")
+            }
+        }
         if journal.phase == .complete {
             var record = try store.record()
             record.status = .synchronized; record.activeOperation = nil

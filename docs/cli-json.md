@@ -582,6 +582,11 @@ and status read until the sync finished.
 `sync status` reads local operation state without contacting the peer or
 requiring restic; first enrollment can create private local bookkeeping.
 `sync recover` resumes the recorded operation without minting a new plan.
+Before installation starts, a changed configuration revision, machine
+settings or restic executable refuses resume, and `--cancel-unstarted` is
+the way out. After that, unrelated changes cannot strand a partly installed
+operation: recover rechecks only this set's policy and sync folder, then
+binds the rest of the run to the current revision.
 A token is already consumed and is never reused. `--cancel-unstarted` is
 accepted only before installation has started, including failed transfer
 or protection in the reservation phase. Once installation begins, recover

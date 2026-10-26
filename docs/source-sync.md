@@ -144,7 +144,11 @@ Use `sync plan`, `sync apply --preview-token-stdin`, `sync status`, and
 `sync recover` on Linux or macOS. A reservation that never entered
 installation can be released with `sync recover --cancel-unstarted`, after
 both endpoints confirm cancellation. Partly installed work must resume;
-reservations never expire. The macOS app presents the same flow under
+reservations never expire. Until installation starts, a changed config
+revision, machine settings file or restic executable refuses resume: cancel
+and preview again. Once installation has started, recover resumes despite
+such changes, provided this set still has no retention or purge rules and
+its sync folder is unchanged; the resumed run binds to the current revision. The macOS app presents the same flow under
 Sync & Back Up, with an independent Back Up Only action. Scheduled runs
 continue backing up the configured sources; synchronization is manual.
 
