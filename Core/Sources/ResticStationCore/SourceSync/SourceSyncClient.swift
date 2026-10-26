@@ -24,9 +24,10 @@ public struct SourceSyncClient: SourceSyncTransport {
         let argv = Self.ssh + ["--", target, ShellQuote.singleQuote(endpoint.helperPath), "sync", "endpoint", "--json"]
         let result = try await runner.run(argv, env: Self.environment, stdin: bytes, currentDirectory: nil,
                                           onStdoutLine: nil, onStderrLine: nil, timeout: 30 * 60)
-        guard result.exitCode == 0, result.outputComplete else {
-            throw SourceSyncError.stateInvalid("The other computer could not complete the helper operation. Check SSH, helper compatibility, and pending recovery.")
+        guard result.outputComplete else {
+            throw SourceSyncError.stateInvalid("The other computer's helper did not finish its reply. Check the SSH connection, then preview again.")
         }
+        guard result.exitCode == 0 else { throw Self.remoteFailure(exitCode: result.exitCode, stdout: result.stdout, helperPath: endpoint.helperPath) }
         struct Envelope: Decodable { var ok: Bool; var data: SyncEndpointReply? }
         let decoded: Envelope
         do { decoded = try ConfigStore.makeDecoder().decode(Envelope.self, from: result.stdout) }
@@ -35,6 +36,29 @@ public struct SourceSyncClient: SourceSyncTransport {
             throw SourceSyncError.stateInvalid("The other computer returned an incompatible or incomplete sync response.")
         }
         return reply
+    }
+
+    /// A failed peer keeps its own reason: a busy reservation, a refused
+    /// folder and a dropped connection need different actions. The peer's
+    /// text is untrusted display text, so it is bounded and stripped of
+    /// control characters; only its code chooses the error case.
+    static func remoteFailure(exitCode: Int32, stdout: Data, helperPath: String) -> SourceSyncError {
+        struct Failure: Decodable { struct Detail: Decodable { var code: String; var message: String }; var ok: Bool; var error: Detail }
+        if let failure = try? ConfigStore.makeDecoder().decode(Failure.self, from: stdout), !failure.ok {
+            let reason = String(String.UnicodeScalarView(failure.error.message.unicodeScalars.filter { !CharacterSet.controlCharacters.contains($0) }).prefix(300))
+            switch failure.error.code {
+            case CLIErrorCode.setBusy.rawValue: return .busy
+            case CLIErrorCode.configInvalid.rawValue: return .unsafeRoot("The other computer refused its folder: \(reason)")
+            default: return .stateInvalid("The other computer could not complete the request: \(reason)")
+            }
+        }
+        switch exitCode {
+        // ssh exits 255 for its own failures: connection, authentication, host key.
+        case 255: return .stateInvalid("Could not reach the other computer over SSH. Check that the host is up, its key is in known_hosts, and your SSH key is available.")
+        // The remote shell's codes for a helper it cannot find or execute.
+        case 126, 127: return .invalidConfiguration("The other computer could not run the helper at \(helperPath). Install a compatible Restic Station helper there or correct the folder's helper path.")
+        default: return .stateInvalid("The other computer could not complete the helper operation. Check SSH, helper compatibility, and pending recovery.")
+        }
     }
 
     public func copy(paths: [String], from source: SyncEndpoint, to destination: SyncEndpoint, listFile: URL) async throws {
