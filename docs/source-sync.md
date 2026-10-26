@@ -53,11 +53,18 @@ requires reconciliation; an unreadable directory is never an empty tree.
 Each endpoint keeps the previous scan's file digests in its private control
 directory (`hashes.json`) and reuses one only while the file's whole stat
 stamp (device, inode, size, mode, modification and change time) is
-unchanged. Any write or rename moves the change time, which an ordinary
-user cannot set back. A file changed within two seconds of a scan is never
-recorded, because a coarse-timestamp filesystem could hide a write in that
-tick. A missing or unreadable cache means hashing everything. Inventories
-of private staging, vaults and verification restores never use it.
+unchanged. A write, truncate, rename or relink moves the change time,
+which an ordinary user cannot set back. A file changed within two seconds of
+a scan is never recorded, because a coarse-timestamp filesystem could hide a
+write in that tick. A missing or unreadable cache means hashing everything.
+Inventories of private staging, vaults and verification restores never use
+it. Known gaps, shared with git and restic: a writer through a shared memory
+map can change contents before the times move, and a clock stepped backwards
+(or a network filesystem whose server clock lags) can make a recent change
+look settled. Neither can authorize a replacement or deletion, because every
+version an operation replaces or deletes is hashed again without the cache
+before it is captured; at worst such an edit elsewhere is noticed one sync
+later, or the plan refuses until the mapping is released.
 Root identity includes filesystem creation metadata as well as device and
 inode, so inode reuse cannot disguise a recreated folder as deletion of its
 contents. Filesystems/kernels without creation metadata refuse sync; ordinary

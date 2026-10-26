@@ -4,10 +4,20 @@ import Foundation
 /// is not read again by every step of one synchronization.
 ///
 /// A digest is reused only when the file's whole stat stamp is identical:
-/// device, inode, size, mode, modification time and change time. Any write
-/// or rename moves the change time, which an ordinary user cannot set back,
-/// so a stale digest needs a clock stepped backwards or root. Git and restic
-/// rely on the same property.
+/// device, inode, size, mode, modification time and change time. A write(2),
+/// truncate, rename or relink moves the change time, which an ordinary user
+/// cannot set back. Git and restic rely on the same property, and share its
+/// known gaps: a writer through a shared memory map (`MAP_SHARED`) changes
+/// contents before the kernel updates the times (APFS defers them to
+/// `msync`/`munmap`; Linux updates them at most once per writeback), and a
+/// clock stepped backwards, or a network filesystem whose server clock lags
+/// this host's, can make a recent change look settled.
+///
+/// None of these can authorize a destructive step: every version that an
+/// operation replaces or deletes is hashed again without the cache when it
+/// is exported, captured and verified, so a stale digest refuses the plan.
+/// What a stale digest can do is hide an unrelated edit from the "nothing
+/// changed since preview" checks until the mapping is released.
 ///
 /// A file whose times are within ``settleSeconds`` of the scan is never
 /// recorded ("racily clean" in git's terms): on a filesystem with coarse
