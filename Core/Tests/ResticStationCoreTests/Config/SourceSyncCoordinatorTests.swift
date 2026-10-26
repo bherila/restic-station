@@ -432,6 +432,53 @@ struct SourceSyncCoordinatorTests {
         }
     }
 
+    @Test("a cache forged to hide a real local edit cannot let the peer's version replace it")
+    func poisonedCacheFailsClosed() async throws {
+        let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
+        try f.write("original", "kept")
+        try await SyncHashCache.$settleSeconds.withValue(-3600) {
+            _ = try await f.apply(f.preview())
+            // Same size as the original, so a forged digest makes the item
+            // identical to the agreed one.
+            try f.write("tampered", "kept")
+            _ = try await f.preview()   // records the edit's real stamp and digest
+            // Forge the entry: keep the edit's real stamp, claim the old digest.
+            let control = AppPaths.sourceSyncControlDirectory(for: URL(fileURLWithPath: try SourceSyncFilesystem.physicalDirectory(f.local.path)))
+            let url = control.appendingPathComponent("hashes.json")
+            var cache = try #require(try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
+            var entries = try #require(cache["entries"] as? [String: Any])
+            var entry = try #require(entries["kept"] as? [String: Any])
+            entry["digest"] = SHA256Digest.hex(Data("original".utf8))
+            entries["kept"] = entry; cache["entries"] = entries
+            let handle = try FileHandle(forWritingTo: url)
+            try handle.truncate(atOffset: 0); try handle.write(contentsOf: JSONSerialization.data(withJSONObject: cache)); try handle.close()
+            try f.write("peer edit", "kept", peer: true)
+            // The forged digest makes the local copy look unchanged, so the
+            // plan would replace the real local edit with the peer's.
+            let preview = try await f.preview(includePaths: true)
+            #expect(preview.changes?.first { $0.path == "kept" }?.action == .copyToLocal)
+            await #expect(throws: SourceSyncError.self) { try await f.apply(preview) }
+        }
+        #expect(try String(contentsOf: f.local.appendingPathComponent("kept"), encoding: .utf8) == "tampered")
+        #expect(try String(contentsOf: f.peer.appendingPathComponent("kept"), encoding: .utf8) == "peer edit")
+    }
+
+    @Test("an interrupted create-only sync with no protection receipt resumes from protected")
+    func unprotectedResume() async throws {
+        let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
+        try f.write("a", "a")
+        let preview = try await f.preview()
+        await #expect(throws: SourceSyncError.self) {
+            try await SourceSyncCoordinator.$afterDurablePhase.withValue({ at in
+                if at == "protected" { throw SourceSyncError.transferFailed }
+            }) { try await f.apply(preview) }
+        }
+        let resumed = try await f.coordinator.recover(set: f.set, group: f.group, machineId: "laptop", binding: "fixture")
+        #expect(resumed.status == "synchronized")
+        #expect(try String(contentsOf: f.peer.appendingPathComponent("a"), encoding: .utf8) == "a")
+        #expect(await f.backups.counts().0 == 0)
+    }
+
     @Test("consumed and day-old previews are removed; a fresh unconsumed one is kept")
     func previewsAreRemoved() async throws {
         let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
