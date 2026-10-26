@@ -308,8 +308,7 @@ public struct SourceSyncCoordinator: Sendable {
                 // restore. Each endpoint still demands a receipt for any
                 // operation with a prior value (validateProtection), and the
                 // final backup still records and restore-verifies the vault.
-                let displaces = (operations(plan, local: true) + operations(plan, local: false)).contains { $0.before != nil }
-                if displaces {
+                if plan.requiresProtection {
                     let inventory = try SourceSyncFilesystem.inventory(at: vault.path.path)
                     try revalidate()
                     let proof = try await backups.protect(set: set, vault: vault.path, inventory: inventory)
