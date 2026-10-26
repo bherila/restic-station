@@ -309,6 +309,19 @@ struct SourceSyncCoordinatorTests {
         #expect(try String(contentsOf: f.peer.appendingPathComponent("from-local"), encoding: .utf8) == "local")
     }
 
+    @Test("a copy that diverges before agreement names the first differing path", arguments: [false, true])
+    func divergenceNamesPath(_ onPeer: Bool) async throws {
+        let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
+        try f.write("a", "a"); try f.write("b", "b"); try f.write("c", "c")
+        let preview = try await f.preview()
+        let error = await #expect(throws: SourceSyncError.self) {
+            try await SourceSyncCoordinator.$afterDurablePhase.withValue({ at in
+                if at == "installed" { try f.write("edited", "b", peer: onPeer) }
+            }) { try await f.apply(preview) }
+        }
+        #expect(error?.description == "\(onPeer ? "The other copy" : "The local copy") changed before agreement at \"b\". Resolve the change, then resume this operation.")
+    }
+
     @Test("transfer lists and unused directory candidates do not outlive their use")
     func privateLeftoversRemoved() async throws {
         let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }

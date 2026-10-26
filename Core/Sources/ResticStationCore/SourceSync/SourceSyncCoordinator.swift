@@ -215,6 +215,14 @@ public struct SourceSyncCoordinator: Sendable {
         return status
     }
 
+    /// Names the first path, in sorted order, where a copy differs from the
+    /// agreed result, so the person knows which file to resolve.
+    static func divergence(_ copy: String, actual: [String: SyncItem], goal: [String: SyncItem]) -> SourceSyncError {
+        let path = Set(actual.keys).union(goal.keys).sorted().first { actual[$0] != goal[$0] }
+        let place = path.map { " at \"\($0)\"" } ?? ""
+        return .stateInvalid("\(copy) changed before agreement\(place). Resolve the change, then resume this operation.")
+    }
+
     /// After a journal exists, every failure leaves the operation pending,
     /// and preview refuses until it is recovered. An error that says to
     /// preview again would send the user in a circle, so it names the way
@@ -332,13 +340,13 @@ public struct SourceSyncCoordinator: Sendable {
                 // recovery must inspect that endpoint again.
                 if journal.localFinished == nil {
                     let reply = try await transport.request(endpointRequest(.finish, local: true), at: .init(path: group.localPath))
-                    guard reply.inventory.items == goal else { throw SourceSyncError.stateInvalid("The local copy changed before agreement. Resolve the change, then resume this operation.") }
+                    guard reply.inventory.items == goal else { throw Self.divergence("The local copy", actual: reply.inventory.items, goal: goal) }
                     journal.localFinished = reply
                     try persist()
                 }
                 if journal.peerFinished == nil {
                     let reply = try await transport.request(endpointRequest(.finish, local: false), at: group.peer)
-                    guard reply.inventory.items == goal else { throw SourceSyncError.stateInvalid("The other copy changed before agreement. Resolve the change, then resume this operation.") }
+                    guard reply.inventory.items == goal else { throw Self.divergence("The other copy", actual: reply.inventory.items, goal: goal) }
                     journal.peerFinished = reply
                     try persist()
                 }
