@@ -124,7 +124,8 @@ public struct SourceSyncCoordinator: Sendable {
         record.status = .running
         try store.save(record)
         store.removePreview(token: token)
-        return try await run(journal: journal, store: store, set: set, binding: binding, resuming: false)
+        do { return try await run(journal: journal, store: store, set: set, binding: binding, resuming: false) }
+        catch { throw Self.pendingRecovery(error) }
     }
 
     public func recover(set: BackupSet, group: SourceSyncGroup, machineId: String, binding: String) async throws -> SourceSyncStatus {
@@ -141,7 +142,8 @@ public struct SourceSyncCoordinator: Sendable {
               journal.preview.plan.groupFingerprint == (try journal.preview.group.bindingFingerprint) else {
             throw SourceSyncError.stateInvalid("No compatible interrupted operation is available to resume.")
         }
-        return try await run(journal: journal, store: store, set: set, binding: binding, resuming: true)
+        do { return try await run(journal: journal, store: store, set: set, binding: binding, resuming: true) }
+        catch { throw Self.pendingRecovery(error) }
     }
 
     public func cancelUnstarted(set: BackupSet, group: SourceSyncGroup, machineId: String) async throws -> SourceSyncStatus {
@@ -211,6 +213,20 @@ public struct SourceSyncCoordinator: Sendable {
             }
         }
         return status
+    }
+
+    /// After a journal exists, every failure leaves the operation pending,
+    /// and preview refuses until it is recovered. An error that says to
+    /// preview again would send the user in a circle, so it names the way
+    /// out instead. Other errors keep their case and CLI code.
+    static func pendingRecovery(_ error: any Error) -> any Error {
+        guard let failure = error as? SourceSyncError else { return error }
+        let text = failure.description
+        guard text.range(of: "preview", options: .caseInsensitive) != nil, !text.contains("sync recover") else { return error }
+        let kept = failure == .stalePlan ? ["The folders changed during synchronization"]
+            : text.components(separatedBy: ". ").filter { $0.range(of: "preview", options: .caseInsensitive) == nil }
+        let reason = kept.joined(separator: ". ").trimmingCharacters(in: CharacterSet(charactersIn: ". "))
+        return SourceSyncError.stateInvalid("\(reason). This synchronization is still pending; resume it with sync recover (Resume in Sync & Back Up) before previewing again.")
     }
 
     private func run(journal initial: SourceSyncJournal, store: SourceSyncStore, set: BackupSet, binding: String, resuming: Bool) async throws -> SourceSyncStatus {

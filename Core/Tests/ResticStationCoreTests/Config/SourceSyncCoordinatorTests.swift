@@ -430,6 +430,25 @@ struct SourceSyncCoordinatorTests {
         #expect(try await f.preview().copies == 0)
     }
 
+    @Test("a change found after the journal points to recovery, never to a preview that would refuse")
+    func pendingOperationNamesRecovery() async throws {
+        let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
+        try f.write("a", "a")
+        let preview = try await f.preview()
+        let error = await #expect(throws: SourceSyncError.self) {
+            try await SourceSyncCoordinator.$afterDurablePhase.withValue({ at in
+                // An editor saves into the peer during the handoff.
+                if at == "protected" { try Data("edited".utf8).write(to: f.peer.appendingPathComponent("a")) }
+            }) { try await f.apply(preview) }
+        }
+        let message = error?.description ?? ""
+        #expect(message.contains("sync recover") && !message.contains("Preview the changes again"))
+        // The circle the old wording created: preview refuses while pending.
+        await #expect(throws: SourceSyncError.self) { _ = try await f.preview() }
+        try FileManager.default.removeItem(at: f.peer.appendingPathComponent("a"))
+        _ = try? await f.coordinator.recover(set: f.set, group: f.group, machineId: "laptop", binding: "fixture")
+    }
+
     @Test("settings changed before installation require cancelling, then a new preview", arguments: ["reserved", "protected"])
     func settingsChangeBeforeInstallation(_ phase: String) async throws {
         let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
