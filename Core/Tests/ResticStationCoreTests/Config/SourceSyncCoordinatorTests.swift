@@ -375,6 +375,59 @@ struct SourceSyncCoordinatorTests {
         #expect(await f.backups.counts().1 == 2)
     }
 
+    final class HashLog: @unchecked Sendable {
+        private let lock = NSLock()
+        private var paths: [String] = []
+        func add(_ path: String) { lock.lock(); paths.append(path); lock.unlock() }
+        func take() -> [String] { lock.lock(); defer { paths = []; lock.unlock() }; return paths.sorted() }
+    }
+
+    @Test("an unchanged live file is not read again; any edit, even keeping size and mtime, is")
+    func hashCacheReuse() async throws {
+        let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
+        let log = HashLog()
+        try f.write("aaaa", "same-size"); try f.write("other", "nested/other")
+        let then = Date(timeIntervalSince1970: 1_600_000_000)
+        try f.setModified(then, "same-size")
+        try await SyncHashCache.$settleSeconds.withValue(-3600) {
+            try await SourceSyncFilesystem.$hashed.withValue({ log.add($0) }) {
+                _ = try await f.preview()
+                #expect(log.take() == ["nested/other", "same-size"])
+                _ = try await f.preview()
+                #expect(log.take() == [])
+                // Same size, modification time set back: only ctime moved.
+                try f.write("bbbb", "same-size"); try f.setModified(then, "same-size")
+                let preview = try await f.preview(includePaths: true)
+                #expect(log.take() == ["same-size"])
+                let change = try #require(preview.changes?.first { $0.path == "same-size" })
+                #expect(change.local?.digest == SHA256Digest.hex(Data("bbbb".utf8)))
+                // Proof inventories never use the cache.
+                _ = try SourceSyncFilesystem.inventory(at: f.local.path)
+                #expect(log.take() == ["nested/other", "same-size"])
+            }
+        }
+    }
+
+    @Test("files changed within the settle window, and an unreadable cache, are hashed again")
+    func hashCacheFallsBack() async throws {
+        let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
+        let log = HashLog()
+        try f.write("fresh", "note")
+        try await SourceSyncFilesystem.$hashed.withValue({ log.add($0) }) {
+            // Just written: racily clean, so not recorded.
+            _ = try await f.preview(); _ = log.take()
+            _ = try await f.preview()
+            #expect(log.take() == ["note"])
+            try await SyncHashCache.$settleSeconds.withValue(-3600) {
+                _ = try await f.preview(); _ = log.take()
+                let control = AppPaths.sourceSyncControlDirectory(for: URL(fileURLWithPath: try SourceSyncFilesystem.physicalDirectory(f.local.path)))
+                try Data("not json".utf8).write(to: control.appendingPathComponent("hashes.json"))
+                _ = try await f.preview()
+                #expect(log.take() == ["note"])
+            }
+        }
+    }
+
     @Test("consumed and day-old previews are removed; a fresh unconsumed one is kept")
     func previewsAreRemoved() async throws {
         let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }

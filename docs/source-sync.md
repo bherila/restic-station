@@ -50,6 +50,14 @@ to the actual root inode and records content hashes, types, link targets
 and permissions. Timestamps are scan optimizations, never winner selection.
 Changing root identity, configuration, or losing/corrupting a baseline
 requires reconciliation; an unreadable directory is never an empty tree.
+Each endpoint keeps the previous scan's file digests in its private control
+directory (`hashes.json`) and reuses one only while the file's whole stat
+stamp (device, inode, size, mode, modification and change time) is
+unchanged. Any write or rename moves the change time, which an ordinary
+user cannot set back. A file changed within two seconds of a scan is never
+recorded, because a coarse-timestamp filesystem could hide a write in that
+tick. A missing or unreadable cache means hashing everything. Inventories
+of private staging, vaults and verification restores never use it.
 Root identity includes filesystem creation metadata as well as device and
 inode, so inode reuse cannot disguise a recreated folder as deletion of its
 contents. Filesystems/kernels without creation metadata refuse sync; ordinary

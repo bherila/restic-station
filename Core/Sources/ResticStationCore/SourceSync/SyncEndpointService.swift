@@ -69,8 +69,14 @@ public enum SyncEndpointService {
         }
 
         func inventory() throws -> SyncInventory {
-            var result = try SourceSyncFilesystem.inventory(at: root.path.path)
+            // The cache only saves reading (SyncHashCache): an unreadable one
+            // means hashing everything, and failing to save it costs the
+            // next scan time, never correctness.
+            let previous = (try? SyncDurability.read(SyncHashCache.self, named: "hashes.json", in: control)) ?? nil
+            let hashes = SyncHashCache.Session(previous: previous, rootIdentity: rootIdentity)
+            var result = try SourceSyncFilesystem.inventory(at: root.path.path, hashes: hashes)
             guard result.rootIdentity == rootIdentity else { throw SourceSyncError.stalePlan }
+            try? SyncDurability.write(hashes.result, named: "hashes.json", in: control)
             result.endpointGeneration = record.generation
             return result
         }
