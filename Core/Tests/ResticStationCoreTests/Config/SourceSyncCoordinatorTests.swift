@@ -414,10 +414,14 @@ struct SourceSyncCoordinatorTests {
         let log = HashLog()
         try f.write("fresh", "note")
         try await SourceSyncFilesystem.$hashed.withValue({ log.add($0) }) {
-            // Just written: racily clean, so not recorded.
-            _ = try await f.preview(); _ = log.take()
-            _ = try await f.preview()
-            #expect(log.take() == ["note"])
+            // Within the settle window, so not recorded. The window is
+            // widened rather than relying on this test running within the
+            // default two seconds of the write.
+            try await SyncHashCache.$settleSeconds.withValue(3600) {
+                _ = try await f.preview(); _ = log.take()
+                _ = try await f.preview()
+                #expect(log.take() == ["note"])
+            }
             try await SyncHashCache.$settleSeconds.withValue(-3600) {
                 _ = try await f.preview(); _ = log.take()
                 let control = AppPaths.sourceSyncControlDirectory(for: URL(fileURLWithPath: try SourceSyncFilesystem.physicalDirectory(f.local.path)))
