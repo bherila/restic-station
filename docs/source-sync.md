@@ -208,8 +208,9 @@ continue backing up the configured sources; synchronization is manual.
 - rsync is required on both computers, like restic on the coordinating one.
   Each side runs the first of its package-manager installs and then the
   system copy (macOS: `/opt/homebrew`, `/usr/local`, `/opt/local`, then
-  `/usr/bin`; Linux: `/usr/bin`, `/usr/local/bin`, `/bin`) whose
-  `--version` reports protocol 29 or newer. The other computer's helper
+  `/usr/bin`; Linux: `/usr/bin`, `/usr/local/bin`, `/bin`), then `PATH`
+  (on the other computer, the SSH session's), whose `--version` reports
+  protocol 29 or newer. The other computer's helper
   reports its choice on inventory and prepare replies; transfers name it
   with `--rsync-path`, so it need not be on the SSH session's PATH. Preview
   and apply refuse, before anything is reserved or backed up, when either

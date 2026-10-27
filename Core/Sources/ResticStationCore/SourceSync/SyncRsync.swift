@@ -4,7 +4,7 @@ import Foundation
 /// on both computers. Each side finds its own copy: package-manager
 /// installs first, because a GNU rsync can use the receiver's existing
 /// version as a delta basis and macOS's built-in openrsync cannot as a
-/// receiver, then the system copy. A candidate counts only after
+/// receiver, then the system copy, then `PATH`. A candidate counts only after
 /// `--version` ran and reported a supported protocol.
 ///
 /// Which rsync ran is not evidence. Every staged and installed value is
@@ -18,7 +18,7 @@ public struct SyncRsync: Codable, Equatable, Sendable {
     /// openrsync's protocol, the oldest the transfer flags are tested with.
     public static let minimumProtocol = 29
 
-    public static var candidates: [String] {
+    public static var wellKnownPaths: [String] {
         #if os(macOS)
         return ["/opt/homebrew/bin/rsync", "/usr/local/bin/rsync", "/opt/local/bin/rsync", "/usr/bin/rsync"]
         #else
@@ -26,11 +26,27 @@ public struct SyncRsync: Codable, Equatable, Sendable {
         #endif
     }
 
+    /// Well-known locations first, then each absolute `PATH` entry that
+    /// holds an executable `rsync`: on the other computer that is the SSH
+    /// session's PATH, which older helpers relied on (a NixOS or Linuxbrew
+    /// rsync lives only there). Relative entries are skipped, and the list
+    /// is bounded so a pathological PATH cannot stall a reply.
+    static func candidates(wellKnown: [String] = wellKnownPaths, path: String?,
+                           isExecutable: (String) -> Bool = { FileManager.default.isExecutableFile(atPath: $0) }) -> [String] {
+        var result: [String] = []
+        for directory in (path ?? "").split(separator: ":") where directory.hasPrefix("/") {
+            let candidate = (directory.hasSuffix("/") ? String(directory) : directory + "/") + "rsync"
+            if isExecutable(candidate) { result.append(candidate) }
+        }
+        var seen = Set<String>()
+        return (wellKnown + result).filter { seen.insert($0).inserted }.prefix(12).map { $0 }
+    }
+
     /// Tests point discovery at their own candidates.
     @TaskLocal static var searched: [String]? = nil
 
     public static func find(runner: any ProcessRunning) async -> SyncRsync? {
-        for path in searched ?? candidates {
+        for path in searched ?? candidates(path: ProcessInfo.processInfo.environment["PATH"]) {
             guard let result = try? await runner.run([path, "--version"], env: ["LC_ALL": "C"], stdin: nil, currentDirectory: nil,
                                                      onStdoutLine: nil, onStderrLine: nil, timeout: 5),
                   result.exitCode == 0,

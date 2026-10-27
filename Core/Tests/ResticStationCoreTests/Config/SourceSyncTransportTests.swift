@@ -97,8 +97,16 @@ struct SourceSyncTransportTests {
         #expect(SyncRsync.protocolVersion("usage: rsync [options]") == nil)
         #if os(macOS)
         // A package-manager GNU rsync wins over the built-in openrsync.
-        #expect(SyncRsync.candidates.first == "/opt/homebrew/bin/rsync" && SyncRsync.candidates.last == "/usr/bin/rsync")
+        #expect(SyncRsync.wellKnownPaths.first == "/opt/homebrew/bin/rsync" && SyncRsync.wellKnownPaths.last == "/usr/bin/rsync")
         #endif
+        // PATH supplies installs outside the well-known list, after it,
+        // skipping relative entries, directories without rsync and repeats.
+        let installed: Set = ["/run/current-system/sw/bin/rsync", "/usr/bin/rsync", "bin/rsync"]
+        #expect(SyncRsync.candidates(wellKnown: ["/usr/bin/rsync"], path: "bin:/run/current-system/sw/bin:/nothing/here:/usr/bin/",
+                                     isExecutable: installed.contains)
+                == ["/usr/bin/rsync", "/run/current-system/sw/bin/rsync"])
+        #expect(SyncRsync.candidates(wellKnown: [], path: nil, isExecutable: { _ in true }) == [])
+        #expect(SyncRsync.candidates(wellKnown: [], path: (0..<40).map { "/d\($0)" }.joined(separator: ":"), isExecutable: { _ in true }).count == 12)
         let fake = FakeProcessRunner(script: [
             .init(argvPrefix: ["/missing/rsync", "--version"], failure: .launchFailed("no such file")),
             Self.version("/old/rsync", "rsync  version 2.5.7  protocol version 26"),
