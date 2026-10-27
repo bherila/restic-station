@@ -167,18 +167,21 @@ struct SourceSyncTransportTests {
             }
             return try #require(fake.invocations.last).argv
         }
-        let push = try await argv(from: .init(path: "/staged"), to: remote, .init(basis: "/srv/peer's notes", remoteRsync: "/usr/local/bin/rsync"))
+        let push = try await argv(from: .init(path: "/staged"), to: remote, .init(basis: "/srv/peer's notes", remoteRsync: "/usr/local/bin/rsync", compress: true))
         #expect(push.first == "/opt/homebrew/bin/rsync")
         #expect(push.contains("--compress"))
         #expect(push.contains("--copy-dest='/srv/peer'\"'\"'s notes/'"))
         #expect(push.contains("--rsync-path='/usr/local/bin/rsync'"))
         #expect(push.suffix(2) == ["/staged/", "sync.example.test:'/srv/other copy/'"])
         // This computer never offers its own files as a sender's basis.
-        let pull = try await argv(from: remote, to: .init(path: "/staged"), .init(basis: "/workspace/my notes", remoteRsync: "/usr/bin/rsync"))
+        let pull = try await argv(from: remote, to: .init(path: "/staged"), .init(basis: "/workspace/my notes", remoteRsync: "/usr/bin/rsync", compress: true))
         #expect(pull.contains("--compress") && pull.contains("--rsync-path='/usr/bin/rsync'"))
         #expect(!pull.contains { $0.hasPrefix("--copy-dest") })
-        let local = try await argv(from: .init(path: "/staged"), to: .init(path: "/incoming"), .init(basis: "/workspace/notes", remoteRsync: "/usr/bin/rsync"))
+        let local = try await argv(from: .init(path: "/staged"), to: .init(path: "/incoming"), .init(basis: "/workspace/notes", remoteRsync: "/usr/bin/rsync", compress: true))
         #expect(!local.contains("--compress") && !local.contains { $0.hasPrefix("--copy-dest") || $0.hasPrefix("--rsync-path") })
+        // An older peer's transfers keep the earlier flags.
+        let legacy = try await argv(from: .init(path: "/staged"), to: remote, .init())
+        #expect(!legacy.contains("--compress") && !legacy.contains { $0.hasPrefix("--copy-dest") || $0.hasPrefix("--rsync-path") })
         await #expect(throws: SourceSyncError.stalePlan) { _ = try await argv(from: .init(path: "/staged"), to: remote, .init(remoteRsync: "rsync")) }
         await #expect(throws: SourceSyncError.stalePlan) { _ = try await argv(from: .init(path: "/staged"), to: remote, .init(basis: "/srv/../etc")) }
     }

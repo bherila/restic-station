@@ -15,15 +15,27 @@ struct SourceSyncCoordinatorTests {
             return try await DefaultProcessRunner().run(args, env: env, stdin: stdin, currentDirectory: currentDirectory, onStdoutLine: onStdoutLine, onStderrLine: onStderrLine, timeout: timeout)
         }
     }
+    final class CopyLog: @unchecked Sendable {
+        private let lock = NSLock()
+        private var entries: [(destination: String, options: SyncCopyOptions)] = []
+        func add(_ destination: String, _ options: SyncCopyOptions) { lock.lock(); entries.append((destination, options)); lock.unlock() }
+        var all: [(destination: String, options: SyncCopyOptions)] { lock.lock(); defer { lock.unlock() }; return entries }
+    }
     struct LocalTransport: SourceSyncTransport {
         var transferRefusal: SourceSyncError?
+        /// Stands in for a current helper's report on inventory and prepare.
+        var reportedTools: SyncTransferTools?
+        var copies: CopyLog?
         func request(_ request: SyncEndpointRequest, at endpoint: SyncEndpoint) async throws -> SyncEndpointReply {
-            try SyncEndpointService.handle(request)
+            var reply = try SyncEndpointService.handle(request)
+            if request.action == .inventory || request.action == .prepare { reply.transfer = reportedTools }
+            return reply
         }
         func checkTransfer(peer: SyncEndpointReply, at endpoint: SyncEndpoint) async throws {
             if let transferRefusal { throw transferRefusal }
         }
         func copy(paths: [String], from source: SyncEndpoint, to destination: SyncEndpoint, listFile: URL, options: SyncCopyOptions) async throws {
+            copies?.add(destination.path, options)
             // Like SourceSyncClient, leave a list file for the coordinator to clean.
             try Data(paths.joined(separator: "\0").utf8).write(to: listFile, options: .withoutOverwriting)
             let sourceRoot = try SourceSyncFilesystem.openRoot(source.path)
@@ -713,6 +725,29 @@ struct SourceSyncCoordinatorTests {
         #expect(await f.backups.counts() == (0, 0))
         // Once rsync is installed, the same reviewed plan still applies.
         #expect(try await f.apply(preview).status == "synchronized")
+    }
+
+    @Test("only a peer that reports its tools gets compression, its own rsync and a delta basis for what it receives", arguments: [false, true])
+    func copyOptionsFollowPeerReport(reported: Bool) async throws {
+        let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
+        let log = CopyLog()
+        let tools = SyncTransferTools(platform: .linux, rsync: .init(path: "/usr/local/bin/rsync", protocolVersion: 32))
+        let coordinator = SourceSyncCoordinator(paths: f.paths, transport: LocalTransport(reportedTools: reported ? tools : nil, copies: log), backups: f.backups)
+        func sync() async throws {
+            let preview = try await coordinator.preview(set: f.set, group: f.group, machineId: "laptop", config: f.config, binding: "fixture")
+            _ = try await coordinator.apply(token: #require(preview.previewToken), set: f.set, group: f.group, machineId: "laptop", config: f.config, binding: "fixture")
+        }
+        try f.write("first", "note"); try await sync()
+        let firstCount = log.all.count
+        try f.write("second", "note"); try await sync()
+        let replacement = log.all.dropFirst(firstCount)
+        #expect(try String(contentsOf: f.peer.appendingPathComponent("note"), encoding: .utf8) == "second")
+        // Exports to the vault: local, then the peer's; installs: inbound, then outbound.
+        let options = replacement.map(\.options)
+        #expect(options.count == 4)
+        let peer = reported ? SyncCopyOptions(remoteRsync: "/usr/local/bin/rsync", compress: true) : SyncCopyOptions()
+        let outbound = reported ? SyncCopyOptions(basis: f.group.peer.path, remoteRsync: "/usr/local/bin/rsync", compress: true) : SyncCopyOptions()
+        #expect(options == [SyncCopyOptions(), peer, SyncCopyOptions(), outbound])
     }
 
     @Test("the SSH endpoint reports its rsync on the replies that start a preview or an operation")

@@ -23,10 +23,13 @@ public struct SyncCopyOptions: Equatable, Sendable {
     public var basis: String?
     /// The other computer's rsync, as its helper reported it.
     public var remoteRsync: String?
+    /// Compress across SSH.
+    public var compress: Bool
 
-    public init(basis: String? = nil, remoteRsync: String? = nil) {
+    public init(basis: String? = nil, remoteRsync: String? = nil, compress: Bool = false) {
         self.basis = basis
         self.remoteRsync = remoteRsync
+        self.compress = compress
     }
 }
 
@@ -119,7 +122,7 @@ public struct SourceSyncClient: SourceSyncTransport {
         // Compression and delta bases pay off only across the network; a
         // local rsync copies whole files anyway.
         if source.sshTarget != nil || destination.sshTarget != nil {
-            argv.append("--compress")
+            if options.compress { argv.append("--compress") }
             if let basis = options.basis, destination.sshTarget != nil {
                 guard SourceSyncGroup.isAbsoluteCanonical(basis) else { throw SourceSyncError.stalePlan }
                 // The remote receiver's options pass through its shell.
