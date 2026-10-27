@@ -393,8 +393,14 @@ struct SourceSyncCoordinatorTests {
             try await SourceSyncFilesystem.$hashed.withValue({ log.add($0) }) {
                 _ = try await f.preview()
                 #expect(log.take() == ["nested/other", "same-size"])
+                let cache = AppPaths.sourceSyncControlDirectory(for: URL(fileURLWithPath: try SourceSyncFilesystem.physicalDirectory(f.local.path)))
+                    .appendingPathComponent("hashes.json").path
+                func cacheInode() -> UInt64 { var info = stat(); return stat(cache, &info) == 0 ? UInt64(info.st_ino) : 0 }
+                let written = cacheInode()
                 _ = try await f.preview()
                 #expect(log.take() == [])
+                // Nothing changed, so the cache file was not replaced.
+                #expect(written != 0 && cacheInode() == written)
                 // Same size, modification time set back: only ctime moved.
                 try f.write("bbbb", "same-size"); try f.setModified(then, "same-size")
                 let preview = try await f.preview(includePaths: true)
