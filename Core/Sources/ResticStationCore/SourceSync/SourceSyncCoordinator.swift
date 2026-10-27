@@ -231,6 +231,12 @@ public struct SourceSyncCoordinator: Sendable {
     /// out instead. Other errors keep their case and CLI code.
     static func pendingRecovery(_ error: any Error) -> any Error {
         guard let failure = error as? SourceSyncError else { return error }
+        // The journal keeps the prepare reply that lacked rsync, so resuming
+        // would refuse again: keep the install advice and cancel instead.
+        if case .rsyncNotFound(let text) = failure {
+            return SourceSyncError.rsyncNotFound(text.replacingOccurrences(
+                of: ", then preview again.", with: ", then cancel this unstarted synchronization with sync recover --cancel-unstarted and preview again."))
+        }
         let text = failure.description
         guard text.range(of: "preview", options: .caseInsensitive) != nil, !text.contains("sync recover") else { return error }
         let kept = failure == .stalePlan ? ["The folders changed during synchronization"]
@@ -302,7 +308,11 @@ public struct SourceSyncCoordinator: Sendable {
                     journal.peerPrepared = try await transport.request(endpointRequest(.prepare, local: false), at: group.peer)
                     try persist()
                 }
-                guard let l = journal.localPrepared?.exportPath, let p = journal.peerPrepared?.exportPath else { throw SourceSyncError.stalePlan }
+                guard let l = journal.localPrepared?.exportPath, let p = journal.peerPrepared?.exportPath,
+                      let peerPrepared = journal.peerPrepared else { throw SourceSyncError.stalePlan }
+                // The transfers run the rsync this reply names, so it is
+                // checked like the inventory's; still cancellable here.
+                try await transport.checkTransfer(peer: peerPrepared, at: group.peer)
                 try await transfer(exportPaths(plan, local: true), from: .init(path: l), to: .init(path: localVault.path.path), operation: operation)
                 var remoteExport = group.peer; remoteExport.path = p
                 try await transfer(exportPaths(plan, local: false), from: remoteExport, to: .init(path: peerVault.path.path), operation: operation,

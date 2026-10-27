@@ -23,6 +23,8 @@ struct SourceSyncCoordinatorTests {
     }
     struct LocalTransport: SourceSyncTransport {
         var transferRefusal: SourceSyncError?
+        /// Refuses only a prepare reply's tools (prepare replies name an export).
+        var preparedRefusal: SourceSyncError?
         /// Stands in for a current helper's report on inventory and prepare.
         var reportedTools: SyncTransferTools?
         var copies: CopyLog?
@@ -33,6 +35,7 @@ struct SourceSyncCoordinatorTests {
         }
         func checkTransfer(peer: SyncEndpointReply, at endpoint: SyncEndpoint) async throws {
             if let transferRefusal { throw transferRefusal }
+            if let preparedRefusal, peer.exportPath != nil { throw preparedRefusal }
         }
         func copy(paths: [String], from source: SyncEndpoint, to destination: SyncEndpoint, listFile: URL, options: SyncCopyOptions) async throws {
             copies?.add(destination.path, options)
@@ -725,6 +728,26 @@ struct SourceSyncCoordinatorTests {
         #expect(await f.backups.counts() == (0, 0))
         // Once rsync is installed, the same reviewed plan still applies.
         #expect(try await f.apply(preview).status == "synchronized")
+    }
+
+    @Test("the rsync a prepare reply names is checked before any transfer or protection, and the operation stays cancellable")
+    func preparedTransferChecked() async throws {
+        let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
+        try f.write("local", "note"); _ = try await f.apply(f.preview())
+        try f.write("edited", "note")
+        let missing = SyncTransferTools.missing(on: "the other computer", platform: .macOS)
+        let refusing = SourceSyncCoordinator(paths: f.paths, transport: LocalTransport(preparedRefusal: missing), backups: f.backups)
+        let preview = try await refusing.preview(set: f.set, group: f.group, machineId: "laptop", config: f.config, binding: "fixture")
+        let error = await #expect(throws: SourceSyncError.self) {
+            _ = try await refusing.apply(token: #require(preview.previewToken), set: f.set, group: f.group, machineId: "laptop", config: f.config, binding: "fixture")
+        }
+        guard case .rsyncNotFound(let message) = error else { Issue.record("expected rsyncNotFound, got \(String(describing: error))"); return }
+        #expect(message.contains("brew install rsync") && message.contains("sync recover --cancel-unstarted"))
+        #expect(await f.backups.counts().0 == 0)
+        #expect(try String(contentsOf: f.peer.appendingPathComponent("note"), encoding: .utf8) == "local")
+        _ = try await f.coordinator.cancelUnstarted(set: f.set, group: f.group, machineId: "laptop")
+        #expect(try await f.apply(f.preview()).status == "synchronized")
+        #expect(try String(contentsOf: f.peer.appendingPathComponent("note"), encoding: .utf8) == "edited")
     }
 
     @Test("only a peer that reports its tools gets compression, its own rsync and a delta basis for what it receives", arguments: [false, true])
