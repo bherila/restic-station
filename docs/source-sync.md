@@ -123,7 +123,10 @@ that only creates entries absent from both copies displaces nothing, so it
 runs no protection backup or verification restore; each endpoint still
 refuses to install any operation that has a prior value without a receipt.
 The final backup records and restore-verifies that operation's vault either
-way.
+way. Two consequences: such a plan's `recovery.json` first reaches the
+repository with the final backup, and a backup destination that is down
+is first noticed after installation, leaving the operation resumable
+(`backupNeedsAttention`) rather than cancellable.
 
 Coverage is an exact repository/snapshot/version proof, not last-backup
 time. An excluded payload is not covered. Verify protected content through

@@ -299,8 +299,11 @@ public struct SourceSyncCoordinator: Sendable {
                 try await transfer(exportPaths(plan, local: false), from: remoteExport, to: .init(path: peerVault.path.path), operation: operation)
                 try verifyExport(localVault, paths: exportPaths(plan, local: true), inventory: plan.local)
                 try verifyExport(peerVault, paths: exportPaths(plan, local: false), inventory: plan.peer)
-                // The encrypted snapshot must remain understandable even
-                // if the coordinator's local state is later lost.
+                // The encrypted snapshots must remain understandable even
+                // if the coordinator's local state is later lost. A plan that
+                // displaces nothing first reaches the repository with the
+                // final backup; until then each endpoint's journal holds its
+                // own operations, and no prior version exists to restore.
                 try SyncDurability.write(journal.preview, named: "recovery.json", in: vault)
                 // Protection preserves versions an operation would replace
                 // or delete. A plan that only creates entries absent from
