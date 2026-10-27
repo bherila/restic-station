@@ -49,6 +49,8 @@ public struct SyncEndpointReply: Codable, Sendable {
     public var completedPaths: [String]
     public var exportPath: String?
     public var lastCompletedOperation: UUID?
+    /// Set by the other computer's helper on inventory and prepare replies.
+    public var transfer: SyncTransferTools?
 
     public init(inventory: SyncInventory, stagingPath: String? = nil, recoveryPath: String? = nil, operationId: UUID? = nil, completedPaths: [String] = []) {
         self.inventory = inventory

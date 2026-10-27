@@ -2,7 +2,32 @@ import Foundation
 
 public protocol SourceSyncTransport: Sendable {
     func request(_ request: SyncEndpointRequest, at endpoint: SyncEndpoint) async throws -> SyncEndpointReply
-    func copy(paths: [String], from source: SyncEndpoint, to destination: SyncEndpoint, listFile: URL) async throws
+    /// Refuses, before anything is reserved or backed up, when either
+    /// computer cannot move file data. `peer` is the other computer's
+    /// inventory reply.
+    func checkTransfer(peer: SyncEndpointReply, at endpoint: SyncEndpoint) async throws
+    func copy(paths: [String], from source: SyncEndpoint, to destination: SyncEndpoint, listFile: URL, options: SyncCopyOptions) async throws
+}
+
+public struct SyncCopyOptions: Equatable, Sendable {
+    /// The other computer's live folder, when it receives. rsync may use the
+    /// current version of each path there as a delta basis, so an edit to a
+    /// large file sends only changed blocks. It is only read, and the staged
+    /// result is still verified against the typed inventory.
+    ///
+    /// A receiver sends its basis's block checksums to the sender and
+    /// follows symlinks to find it, so only the other computer gets one: it
+    /// reads its own folder for the coordinator, which already holds
+    /// authority over it. This computer never offers its files as a basis to
+    /// a sender (the class of rsync CVE-2024-12086).
+    public var basis: String?
+    /// The other computer's rsync, as its helper reported it.
+    public var remoteRsync: String?
+
+    public init(basis: String? = nil, remoteRsync: String? = nil) {
+        self.basis = basis
+        self.remoteRsync = remoteRsync
+    }
 }
 
 /// File data moves with rsync; inventories, reservations and commit receipts
@@ -61,12 +86,28 @@ public struct SourceSyncClient: SourceSyncTransport {
         }
     }
 
-    public func copy(paths: [String], from source: SyncEndpoint, to destination: SyncEndpoint, listFile: URL) async throws {
+    public func checkTransfer(peer: SyncEndpointReply, at endpoint: SyncEndpoint) async throws {
+        guard await SyncRsync.find(runner: runner) != nil else {
+            throw SyncTransferTools.missing(on: "this computer", platform: SyncTransferTools.thisPlatform)
+        }
+        // A folder on this computer uses this computer's rsync. An older
+        // helper reports nothing and keeps running rsync from its PATH.
+        guard endpoint.sshTarget != nil, let tools = peer.transfer else { return }
+        guard let rsync = tools.rsync else { throw SyncTransferTools.missing(on: "the other computer", platform: tools.platform) }
+        guard SyncRsync.isUsableRemotePath(rsync.path) else {
+            throw SourceSyncError.stateInvalid("The other computer reported an rsync location that cannot be used.")
+        }
+    }
+
+    public func copy(paths: [String], from source: SyncEndpoint, to destination: SyncEndpoint, listFile: URL, options: SyncCopyOptions) async throws {
         guard source.sshTarget == nil || destination.sshTarget == nil else {
             throw SourceSyncError.invalidConfiguration("This version requires the coordinating computer to participate in the transfer.")
         }
         guard paths.allSatisfy(SourceSyncPlanner.isRelativePath) else { throw SourceSyncError.stalePlan }
         if paths.isEmpty { return }
+        guard let rsync = await SyncRsync.find(runner: runner) else {
+            throw SyncTransferTools.missing(on: "this computer", platform: SyncTransferTools.thisPlatform)
+        }
         let list = Data(paths.sorted().flatMap { Array($0.utf8) + [UInt8(0)] })
         try list.write(to: listFile, options: .withoutOverwriting)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: listFile.path)
@@ -74,8 +115,22 @@ public struct SourceSyncClient: SourceSyncTransport {
         // Exports carry the original modification times, so rsync's default
         // size+mtime check could keep a stale same-size staged file. Always
         // transfer; staging is private and inventories still verify content.
-        let argv = ["/usr/bin/rsync", "-rlpt", "--ignore-times", "--from0", "--files-from=\(listFile.path)", "--safe-links",
-                    "-e", remoteShell, "--", try operand(source), try operand(destination)]
+        var argv = [rsync.path, "-rlpt", "--ignore-times", "--from0", "--files-from=\(listFile.path)", "--safe-links"]
+        // Compression and delta bases pay off only across the network; a
+        // local rsync copies whole files anyway.
+        if source.sshTarget != nil || destination.sshTarget != nil {
+            argv.append("--compress")
+            if let basis = options.basis, destination.sshTarget != nil {
+                guard SourceSyncGroup.isAbsoluteCanonical(basis) else { throw SourceSyncError.stalePlan }
+                // The remote receiver's options pass through its shell.
+                argv.append("--copy-dest=" + ShellQuote.singleQuote(basis.hasSuffix("/") ? basis : basis + "/"))
+            }
+            if let remote = options.remoteRsync {
+                guard SyncRsync.isUsableRemotePath(remote) else { throw SourceSyncError.stalePlan }
+                argv.append("--rsync-path=" + ShellQuote.singleQuote(remote))
+            }
+        }
+        argv += ["-e", remoteShell, "--", try operand(source), try operand(destination)]
         // Keep one explicit remote-shell quoting contract across openrsync
         // and GNU rsync >=3.2.4, whose default added another escaping pass.
         // Typed inventories still verify every installed value; an rsync

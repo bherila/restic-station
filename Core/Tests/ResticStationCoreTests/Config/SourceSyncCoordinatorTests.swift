@@ -9,17 +9,21 @@ struct SourceSyncCoordinatorTests {
         func run(_ argv: [String], env: [String: String]?, stdin: Data?, currentDirectory: String?, onStdoutLine: (@Sendable (String) -> Void)?, onStderrLine: (@Sendable (String) -> Void)?, timeout: TimeInterval?) async throws -> ProcessResult {
             var args = argv
             if args.first == "/usr/bin/ssh" { args.insert(contentsOf: ["-F", config], at: 1) }
-            if args.first == "/usr/bin/rsync", let e = args.firstIndex(of: "-e") {
+            if args.first?.hasSuffix("/rsync") == true, let e = args.firstIndex(of: "-e") {
                 args[e + 1] += " -F " + ShellQuote.singleQuote(config)
             }
             return try await DefaultProcessRunner().run(args, env: env, stdin: stdin, currentDirectory: currentDirectory, onStdoutLine: onStdoutLine, onStderrLine: onStderrLine, timeout: timeout)
         }
     }
     struct LocalTransport: SourceSyncTransport {
+        var transferRefusal: SourceSyncError?
         func request(_ request: SyncEndpointRequest, at endpoint: SyncEndpoint) async throws -> SyncEndpointReply {
             try SyncEndpointService.handle(request)
         }
-        func copy(paths: [String], from source: SyncEndpoint, to destination: SyncEndpoint, listFile: URL) async throws {
+        func checkTransfer(peer: SyncEndpointReply, at endpoint: SyncEndpoint) async throws {
+            if let transferRefusal { throw transferRefusal }
+        }
+        func copy(paths: [String], from source: SyncEndpoint, to destination: SyncEndpoint, listFile: URL, options: SyncCopyOptions) async throws {
             // Like SourceSyncClient, leave a list file for the coordinator to clean.
             try Data(paths.joined(separator: "\0").utf8).write(to: listFile, options: .withoutOverwriting)
             let sourceRoot = try SourceSyncFilesystem.openRoot(source.path)
@@ -691,6 +695,41 @@ struct SourceSyncCoordinatorTests {
         }
     }
 
+    @Test("a computer that cannot transfer refuses at preview and at apply, before anything is reserved or backed up")
+    func transferPreflight() async throws {
+        let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
+        try f.write("local", "from-local")
+        let missing = SyncTransferTools.missing(on: "the other computer", platform: .linux)
+        let refusing = SourceSyncCoordinator(paths: f.paths, transport: LocalTransport(transferRefusal: missing), backups: f.backups)
+        await #expect(throws: missing) {
+            _ = try await refusing.preview(set: f.set, group: f.group, machineId: "laptop", config: f.config, binding: "fixture")
+        }
+        let preview = try await f.preview()
+        await #expect(throws: missing) {
+            _ = try await refusing.apply(token: #require(preview.previewToken), set: f.set, group: f.group, machineId: "laptop", config: f.config, binding: "fixture")
+        }
+        let store = try SourceSyncStore(paths: f.paths, setId: f.set.id, groupId: f.group.id)
+        #expect(try store.record().activeOperation == nil)
+        #expect(await f.backups.counts() == (0, 0))
+        // Once rsync is installed, the same reviewed plan still applies.
+        #expect(try await f.apply(preview).status == "synchronized")
+    }
+
+    @Test("the SSH endpoint reports its rsync on the replies that start a preview or an operation")
+    func endpointReportsTransfer() async throws {
+        let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
+        let fake = FakeProcessRunner(script: [SourceSyncTransportTests.version("/usr/local/bin/rsync", "rsync  version 3.4.1  protocol version 32")])
+        let reply = try await SyncRsync.$searched.withValue(["/usr/local/bin/rsync"]) {
+            try await SyncEndpointService.serve(.init(action: .inventory, group: f.group, root: f.peer.path), runner: fake)
+        }
+        #expect(reply.transfer == SyncTransferTools(platform: SyncTransferTools.thisPlatform, rsync: .init(path: "/usr/local/bin/rsync", protocolVersion: 32)))
+        let inspected = try await SyncEndpointService.serve(.init(action: .inspect, group: f.group, root: f.peer.path), runner: FakeProcessRunner())
+        #expect(inspected.transfer == nil)
+        // Older coordinators ignore the field; older helpers omit it.
+        let decoded = try ConfigStore.makeDecoder().decode(SyncEndpointReply.self, from: ConfigStore.makeEncoder().encode(SyncEndpointReply(inventory: reply.inventory)))
+        #expect(decoded.transfer == nil)
+    }
+
     @Test("real SSH helper RPC and rsync preserve quoted paths", .enabled(if: ProcessInfo.processInfo.environment["RESTIC_STATION_TEST_SSH_CONFIG"] != nil))
     func realSSHFixture() async throws {
         let environment = ProcessInfo.processInfo.environment
@@ -712,5 +751,18 @@ struct SourceSyncCoordinatorTests {
         #expect(try String(contentsOf: f.local.appendingPathComponent("from peer"), encoding: .utf8) == "remote")
         #expect(try f.modified("nested/from local", peer: true) == earlier)
         #expect(try f.modified("from peer") == later)
+        // The peer's helper reports its own rsync, which the transfers run.
+        let inventory = try await SourceSyncClient(runner: SSHFixtureRunner(config: configPath)).request(.init(action: .inventory, group: group, root: group.peer.path), at: group.peer)
+        #expect(inventory.transfer?.rsync != nil)
+        // Replacements in both directions; the other computer receives with
+        // its live folder as the delta basis, through a quoted path
+        // ("peer's copy").
+        let large = String(repeating: "line of shared text\n", count: 20_000)
+        try f.write(large + "local edit", "nested/from local"); try f.write(large + "peer edit", "from peer", peer: true)
+        let edits = try await coordinator.preview(set: set, group: group, machineId: "laptop", config: config, binding: "ssh-fixture")
+        #expect(edits.copies == 2 && edits.conflicts == 0)
+        #expect(try await coordinator.apply(token: #require(edits.previewToken), set: set, group: group, machineId: "laptop", config: config, binding: "ssh-fixture").status == "synchronized")
+        #expect(try String(contentsOf: f.peer.appendingPathComponent("nested/from local"), encoding: .utf8) == large + "local edit")
+        #expect(try String(contentsOf: f.local.appendingPathComponent("from peer"), encoding: .utf8) == large + "peer edit")
     }
 }

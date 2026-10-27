@@ -63,6 +63,10 @@ Two honest caveats about how that output is *presented*, so this claim can be ta
   older restic deliberately, setting `resticPath` explicitly in `config.json` bypasses the
   version gate — an explicit path skips discovery's version check entirely — but you are then
   outside what this project tests against.
+- **rsync, only for [folder sync](source-sync.md).** Both computers in a sync need it, at
+  `/usr/bin`, `/usr/local/bin` or `/bin`; minimal and container images often omit it
+  (`sudo dnf install rsync` or `sudo apt install rsync`). A sync preview refuses with that
+  instruction when either side has none.
 - x86_64 or aarch64. No particular glibc version, and no Swift runtime, ICU, or any other shared
   library: the release binary is fully static (`docs/testing.md` §"Static Linux binary +
   packaging", verified to run unmodified in a `scratch` container, on Alpine, on Debian, and on a

@@ -239,7 +239,9 @@ XcodeGen (`project.yml`) generates `ResticStation.xcodeproj` (git-ignored). The 
 `SourceSyncCoordinator` in Core reconciles two inventories against a durable
 last agreement. `sync plan/apply/status/recover` expose that engine to the
 macOS app and Linux CLI. `SourceSyncClient` uses typed helper RPC over pinned
-SSH for control and rsync only for sealed private payloads. Endpoint
+SSH for control and rsync only for sealed private payloads; each computer
+finds its own rsync (`SyncRsync`), and the peer reports its choice in its
+replies. Endpoint
 reservations and journals outlive any single helper process. Workers use
 retained directory descriptors, capture actual displaced entries, and
 install without clobbering a concurrently created pathname.

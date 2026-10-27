@@ -205,6 +205,32 @@ continue backing up the configured sources; synchronization is manual.
   Required transfer options must succeed before commit. The child has an
   explicit argument-quoting environment for compatibility with openrsync
   and newer GNU rsync; see the [rsync argument contract](https://www.samba.org/ftp/rsync/rsync.1.html).
+- rsync is required on both computers, like restic on the coordinating one.
+  Each side runs the first of its package-manager installs and then the
+  system copy (macOS: `/opt/homebrew`, `/usr/local`, `/opt/local`, then
+  `/usr/bin`; Linux: `/usr/bin`, `/usr/local/bin`, `/bin`) whose
+  `--version` reports protocol 29 or newer. The other computer's helper
+  reports its choice on inventory and prepare replies; transfers name it
+  with `--rsync-path`, so it need not be on the SSH session's PATH. Preview
+  and apply refuse, before anything is reserved or backed up, when either
+  computer has none, and say how to install it there. A helper too old to
+  report keeps the earlier behavior of running `rsync` from its PATH.
+- Which rsync ran is not evidence and is not bound into previews: a
+  different or misbehaving rsync can fail a transfer but cannot authorize
+  a replacement, because every staged and installed value is verified
+  against the typed inventories.
+- Transfers across SSH compress (`--compress`). When the other computer
+  receives, its live folder is named as `--copy-dest`. With
+  `--ignore-times` that folder is never copied from as "unchanged"; it only
+  serves as each path's delta basis, so an edit to a large file sends the
+  changed blocks. A receiver follows symlinks to its basis and sends the
+  basis's block checksums to the sender, so only the other computer
+  offers one, reading its own folder for the coordinator that already holds
+  authority over it. This computer never offers its files to the other
+  computer as a basis (the class of rsync CVE-2024-12086), so files it
+  receives arrive whole. macOS's openrsync ignores a basis as a receiver,
+  so a Mac on the other side receives deltas only with GNU rsync installed
+  (for example `brew install rsync`), which discovery then prefers.
 - Preserve modes explicitly and verify them after transfer. Ownership is
   not mapped through numeric IDs between different operating systems.
 - Installed files keep their source modification time (whole seconds are
@@ -244,6 +270,8 @@ selection is independent:
 The coordinating computer needs Restic Station, rsync, restic and access to
 its configured repositories. The other computer needs rsync and a compatible
 helper accessible through SSH; it does not need repository passwords.
+macOS includes rsync; minimal Linux installs may not (`sudo dnf install
+rsync` or `sudo apt install rsync`).
 Existing SSH keys and host aliases supply authentication. Verify the host
 key through the usual SSH setup before planning. Use `config import` to
 review and apply an edited configuration on Linux; the macOS app exposes

@@ -69,6 +69,7 @@ public struct SourceSyncCoordinator: Sendable {
         }
         let local = try await transport.request(request(.inventory, group: group, local: true), at: .init(path: group.localPath))
         let peer = try await transport.request(request(.inventory, group: group, local: false), at: group.peer)
+        try await transport.checkTransfer(peer: peer, at: group.peer)
         if record.baseline == nil && (record.hasHistory || local.lastCompletedOperation != nil || peer.lastCompletedOperation != nil) {
             throw SourceSyncError.stateInvalid("The previous agreement is missing. Restore synchronization state before continuing.")
         }
@@ -111,6 +112,7 @@ public struct SourceSyncCoordinator: Sendable {
         let local = try await transport.request(request(.inventory, group: group, local: true), at: .init(path: group.localPath))
         let peer = try await transport.request(request(.inventory, group: group, local: false), at: group.peer)
         guard local.inventory == preview.plan.local, peer.inventory == preview.plan.peer else { throw SourceSyncError.stalePlan }
+        try await transport.checkTransfer(peer: peer, at: group.peer)
         let capability = try PreviewTokenStore(paths: paths).consume(token)
         guard capability.machineId == machineId, capability.setId == set.id,
               capability.patterns == ["source-sync:v1", group.id.uuidString],
@@ -269,6 +271,9 @@ public struct SourceSyncCoordinator: Sendable {
             try SyncDurability.write(journal, named: "journal.json", in: operation)
             try Self.afterDurablePhase?(journal.phase.rawValue)
         }
+        // Reported by the peer's prepare reply, which the journal keeps for
+        // resumption; nil from an older helper, whose PATH then decides.
+        var peerRsync: String? { journal.peerPrepared?.transfer?.rsync?.path }
         func endpointRequest(_ action: SyncEndpointRequest.Action, local: Bool) -> SyncEndpointRequest {
             var r = request(action, group: group, local: local)
             r.operationId = journal.preview.id
@@ -296,7 +301,8 @@ public struct SourceSyncCoordinator: Sendable {
                 guard let l = journal.localPrepared?.exportPath, let p = journal.peerPrepared?.exportPath else { throw SourceSyncError.stalePlan }
                 try await transfer(exportPaths(plan, local: true), from: .init(path: l), to: .init(path: localVault.path.path), operation: operation)
                 var remoteExport = group.peer; remoteExport.path = p
-                try await transfer(exportPaths(plan, local: false), from: remoteExport, to: .init(path: peerVault.path.path), operation: operation)
+                try await transfer(exportPaths(plan, local: false), from: remoteExport, to: .init(path: peerVault.path.path), operation: operation,
+                                   options: .init(remoteRsync: peerRsync))
                 try verifyExport(localVault, paths: exportPaths(plan, local: true), inventory: plan.local)
                 try verifyExport(peerVault, paths: exportPaths(plan, local: false), inventory: plan.peer)
                 // The encrypted snapshots must remain understandable even
@@ -330,7 +336,9 @@ public struct SourceSyncCoordinator: Sendable {
                 let outbound = operations(plan, local: false).filter { $0.after != nil }.map(\.path)
                 try await transfer(inbound, from: .init(path: peerVault.path.path), to: .init(path: localIncoming), operation: operation)
                 var remoteIncoming = group.peer; remoteIncoming.path = peerIncoming
-                try await transfer(outbound, from: .init(path: localVault.path.path), to: remoteIncoming, operation: operation)
+                // The other computer's current versions are the delta basis.
+                try await transfer(outbound, from: .init(path: localVault.path.path), to: remoteIncoming, operation: operation,
+                                   options: .init(basis: group.peer.path, remoteRsync: peerRsync))
                 try revalidate()
                 if journal.phase == .protected {
                     // Durable installation intent precedes either commit.
@@ -436,10 +444,10 @@ public struct SourceSyncCoordinator: Sendable {
 
     /// The list holds relative paths in plain text and is useless once
     /// rsync has exited, whatever the outcome.
-    private func transfer(_ paths: [String], from source: SyncEndpoint, to destination: SyncEndpoint, operation: DirectoryHandle) async throws {
+    private func transfer(_ paths: [String], from source: SyncEndpoint, to destination: SyncEndpoint, operation: DirectoryHandle, options: SyncCopyOptions = .init()) async throws {
         let name = "files-\(UUID().uuidString)"
         defer { _ = name.withCString { unlinkat(operation.descriptor, $0, 0) } }
-        try await transport.copy(paths: paths, from: source, to: destination, listFile: operation.path.appendingPathComponent(name))
+        try await transport.copy(paths: paths, from: source, to: destination, listFile: operation.path.appendingPathComponent(name), options: options)
     }
 
     private func verifyExport(_ directory: DirectoryHandle, paths: [String], inventory: SyncInventory) throws {

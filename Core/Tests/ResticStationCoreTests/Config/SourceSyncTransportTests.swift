@@ -54,9 +54,11 @@ struct SourceSyncTransportTests {
         try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: base) }
         let list = base.appendingPathComponent("list")
-        let fake = FakeProcessRunner(script: [.init(argvPrefix: ["/usr/bin/rsync"])])
-        try await SourceSyncClient(runner: fake).copy(paths: ["a\nb", "space name"], from: .init(path: "/staged"), to: .init(path: "/srv/other copy", sshTarget: "sync.example.test"), listFile: list)
-        let call = try #require(fake.invocations.first)
+        let fake = FakeProcessRunner(script: [Self.version("/usr/bin/rsync", "openrsync: protocol version 29"), .init(argvPrefix: ["/usr/bin/rsync"])])
+        try await SyncRsync.$searched.withValue(["/usr/bin/rsync"]) {
+            try await SourceSyncClient(runner: fake).copy(paths: ["a\nb", "space name"], from: .init(path: "/staged"), to: .init(path: "/srv/other copy", sshTarget: "sync.example.test"), listFile: list, options: .init())
+        }
+        let call = try #require(fake.invocations.last)
         #expect(call.argv.contains("--from0") && call.argv.contains("--safe-links") && call.argv.contains("--ignore-times"))
         #expect(!call.argv.contains { $0.hasPrefix("--delete") })
         #expect(call.argv.suffix(2) == ["/staged/", "sync.example.test:'/srv/other copy/'"])
@@ -79,9 +81,98 @@ struct SourceSyncTransportTests {
         for directory in [source, target] {
             try FileManager.default.setAttributes([.modificationDate: time], ofItemAtPath: directory.appendingPathComponent("note").path)
         }
-        try await SourceSyncClient().copy(paths: ["note"], from: .init(path: source.path), to: .init(path: target.path), listFile: base.appendingPathComponent("list"))
+        try await SourceSyncClient().copy(paths: ["note"], from: .init(path: source.path), to: .init(path: target.path), listFile: base.appendingPathComponent("list"), options: .init())
         #expect(try String(contentsOf: target.appendingPathComponent("note"), encoding: .utf8) == "planned")
         #expect(try FileManager.default.attributesOfItem(atPath: target.appendingPathComponent("note").path)[.modificationDate] as? Date == time)
+    }
+
+    static func version(_ path: String, _ line: String, exitCode: Int32 = 0) -> FakeProcessRunner.Expectation {
+        .init(argvPrefix: [path, "--version"], stdoutLines: [line], exitCode: exitCode)
+    }
+
+    @Test("rsync discovery takes the first candidate that runs and speaks protocol 29 or newer")
+    func rsyncDiscovery() async throws {
+        #expect(SyncRsync.protocolVersion("rsync  version 3.4.0  protocol version 32\nCopyright") == 32)
+        #expect(SyncRsync.protocolVersion("openrsync: protocol version 29\nrsync version 2.6.9 compatible") == 29)
+        #expect(SyncRsync.protocolVersion("usage: rsync [options]") == nil)
+        #if os(macOS)
+        // A package-manager GNU rsync wins over the built-in openrsync.
+        #expect(SyncRsync.candidates.first == "/opt/homebrew/bin/rsync" && SyncRsync.candidates.last == "/usr/bin/rsync")
+        #endif
+        let fake = FakeProcessRunner(script: [
+            .init(argvPrefix: ["/missing/rsync", "--version"], failure: .launchFailed("no such file")),
+            Self.version("/old/rsync", "rsync  version 2.5.7  protocol version 26"),
+            Self.version("/broken/rsync", "rsync  version 3.4.0  protocol version 32", exitCode: 1),
+            Self.version("/brew/rsync", "rsync  version 3.4.1  protocol version 32"),
+        ])
+        let found = await SyncRsync.$searched.withValue(["/missing/rsync", "/old/rsync", "/broken/rsync", "/brew/rsync", "/usr/bin/rsync"]) {
+            await SyncRsync.find(runner: fake)
+        }
+        #expect(found == SyncRsync(path: "/brew/rsync", protocolVersion: 32))
+        #expect(fake.invocations.count == 4)
+        #expect(fake.invocations.allSatisfy { $0.env == ["LC_ALL": "C"] })
+    }
+
+    @Test("a computer without rsync is refused at preview with how to install it")
+    func missingRsync() async throws {
+        let peer = SyncEndpoint(path: "/srv/notes", sshTarget: "sync.example.test")
+        func reply(_ transfer: SyncTransferTools?) -> SyncEndpointReply {
+            var reply = SyncEndpointReply(inventory: .init(rootIdentity: "1:2", items: [:])); reply.transfer = transfer; return reply
+        }
+        func refusal(_ peerReply: SyncEndpointReply, localRsync: Bool = true) async -> String? {
+            let fake = FakeProcessRunner(script: localRsync ? [Self.version("/usr/bin/rsync", "openrsync: protocol version 29")] : [])
+            do {
+                try await SyncRsync.$searched.withValue(localRsync ? ["/usr/bin/rsync"] : []) {
+                    try await SourceSyncClient(runner: fake).checkTransfer(peer: peerReply, at: peer)
+                }
+                return nil
+            } catch { return "\(error)" }
+        }
+        let local = await refusal(reply(nil), localRsync: false)
+        #expect(local?.contains("on this computer") == true)
+        #if os(macOS)
+        #expect(local?.contains("brew install rsync") == true)
+        #else
+        #expect(local?.contains("sudo apt install rsync") == true)
+        #endif
+        let linuxPeer = await refusal(reply(.init(platform: .linux, rsync: nil)))
+        #expect(linuxPeer?.contains("on the other computer") == true && linuxPeer?.contains("sudo dnf install rsync") == true)
+        let macPeer = await refusal(reply(.init(platform: .macOS, rsync: nil)))
+        #expect(macPeer?.contains("on the other computer") == true && macPeer?.contains("brew install rsync") == true)
+        #expect(await refusal(reply(.init(platform: .linux, rsync: .init(path: "rsync; true", protocolVersion: 32))))?.contains("cannot be used") == true)
+        // An older helper reports nothing and keeps using rsync on its PATH.
+        #expect(await refusal(reply(nil)) == nil)
+        #expect(await refusal(reply(.init(platform: .linux, rsync: .init(path: "/usr/bin/rsync", protocolVersion: 32)))) == nil)
+    }
+
+    @Test("transfers across SSH compress and run the peer's own rsync; only the other computer offers a delta basis")
+    func deltaOptions() async throws {
+        let base = try syncTemporaryRoot()
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let remote = SyncEndpoint(path: "/srv/other copy", sshTarget: "sync.example.test")
+        func argv(from source: SyncEndpoint, to destination: SyncEndpoint, _ options: SyncCopyOptions) async throws -> [String] {
+            let fake = FakeProcessRunner(script: [Self.version("/opt/homebrew/bin/rsync", "rsync  version 3.4.1  protocol version 32"), .init(argvPrefix: ["/opt/homebrew/bin/rsync"])])
+            try await SyncRsync.$searched.withValue(["/opt/homebrew/bin/rsync"]) {
+                try await SourceSyncClient(runner: fake).copy(paths: ["note"], from: source, to: destination,
+                                                              listFile: base.appendingPathComponent(UUID().uuidString), options: options)
+            }
+            return try #require(fake.invocations.last).argv
+        }
+        let push = try await argv(from: .init(path: "/staged"), to: remote, .init(basis: "/srv/peer's notes", remoteRsync: "/usr/local/bin/rsync"))
+        #expect(push.first == "/opt/homebrew/bin/rsync")
+        #expect(push.contains("--compress"))
+        #expect(push.contains("--copy-dest='/srv/peer'\"'\"'s notes/'"))
+        #expect(push.contains("--rsync-path='/usr/local/bin/rsync'"))
+        #expect(push.suffix(2) == ["/staged/", "sync.example.test:'/srv/other copy/'"])
+        // This computer never offers its own files as a sender's basis.
+        let pull = try await argv(from: remote, to: .init(path: "/staged"), .init(basis: "/workspace/my notes", remoteRsync: "/usr/bin/rsync"))
+        #expect(pull.contains("--compress") && pull.contains("--rsync-path='/usr/bin/rsync'"))
+        #expect(!pull.contains { $0.hasPrefix("--copy-dest") })
+        let local = try await argv(from: .init(path: "/staged"), to: .init(path: "/incoming"), .init(basis: "/workspace/notes", remoteRsync: "/usr/bin/rsync"))
+        #expect(!local.contains("--compress") && !local.contains { $0.hasPrefix("--copy-dest") || $0.hasPrefix("--rsync-path") })
+        await #expect(throws: SourceSyncError.stalePlan) { _ = try await argv(from: .init(path: "/staged"), to: remote, .init(remoteRsync: "rsync")) }
+        await #expect(throws: SourceSyncError.stalePlan) { _ = try await argv(from: .init(path: "/staged"), to: remote, .init(basis: "/srv/../etc")) }
     }
 
     @Test("an incomplete remote receipt cannot become an inventory")

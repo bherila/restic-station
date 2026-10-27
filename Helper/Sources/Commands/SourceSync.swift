@@ -149,6 +149,6 @@ struct SourceSyncEndpointCommand: AsyncParsableCommand, JSONRenderable {
         let request: SyncEndpointRequest
         do { request = try ConfigStore.makeDecoder().decode(SyncEndpointRequest.self, from: bytes) }
         catch { throw CLIFailure.invalidArguments("Endpoint input is invalid") }
-        CLIJSON.print(try SyncEndpointService.handle(request))
+        CLIJSON.print(try await SyncEndpointService.serve(request))
     }
 }
