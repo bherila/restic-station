@@ -77,7 +77,14 @@ public struct SyncRsync: Codable, Equatable, Sendable {
 /// computer's helper. Absent from older helpers' replies, which keep the
 /// earlier behavior of running `rsync` from the SSH session's PATH.
 public struct SyncTransferTools: Codable, Equatable, Sendable {
-    public enum Platform: String, Codable, Sendable { case macOS = "macos", linux, other }
+    public enum Platform: String, Codable, Sendable {
+        case macOS = "macos", linux, other
+        /// A platform a newer helper adds reads as `other`, so it changes
+        /// only the install hint and never makes the whole reply unreadable.
+        public init(from decoder: Decoder) throws {
+            self = Platform(rawValue: try decoder.singleValueContainer().decode(String.self)) ?? .other
+        }
+    }
     public var platform: Platform
     public var rsync: SyncRsync?
 

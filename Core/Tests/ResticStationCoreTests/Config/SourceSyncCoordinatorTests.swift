@@ -783,6 +783,9 @@ struct SourceSyncCoordinatorTests {
         #expect(reply.transfer == SyncTransferTools(platform: SyncTransferTools.thisPlatform, rsync: .init(path: "/usr/local/bin/rsync", protocolVersion: 32)))
         let inspected = try await SyncEndpointService.serve(.init(action: .inspect, group: f.group, root: f.peer.path), runner: FakeProcessRunner())
         #expect(inspected.transfer == nil)
+        // A newer helper's platform reads as other, not as an unreadable reply.
+        let future = try ConfigStore.makeDecoder().decode(SyncTransferTools.self, from: Data(#"{"platform":"freebsd","rsync":null}"#.utf8))
+        #expect(future == SyncTransferTools(platform: .other, rsync: nil))
         // Older coordinators ignore the field; older helpers omit it.
         let decoded = try ConfigStore.makeDecoder().decode(SyncEndpointReply.self, from: ConfigStore.makeEncoder().encode(SyncEndpointReply(inventory: reply.inventory)))
         #expect(decoded.transfer == nil)
