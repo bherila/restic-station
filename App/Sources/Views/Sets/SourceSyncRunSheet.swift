@@ -76,7 +76,8 @@ struct SourceSyncRunSheet: View {
             Text(group.localPath).textSelection(.enabled)
             Text("↔ \(group.peer.sshTarget.map { $0 + ":" } ?? "")\(group.peer.path)").textSelection(.enabled)
             if let error = errors[group.id] {
-                Text(error).foregroundStyle(.red).font(.callout)
+                // Selectable, so an install command in the reason can be copied.
+                Text(error).foregroundStyle(.red).font(.callout).textSelection(.enabled)
             } else if completed {
                 Label("Synchronized and backed up", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
             } else if statuses[group.id]?.operationId != nil {
