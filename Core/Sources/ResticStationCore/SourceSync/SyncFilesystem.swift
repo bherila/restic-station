@@ -65,7 +65,10 @@ public enum SourceSyncFilesystem {
         return String(cString: resolved)
     }
 
-    public static func inventory(at path: String) throws -> SyncInventory {
+    /// `hashes` lets a live root's inventory reuse digests from its last
+    /// scan (``SyncHashCache``). Proof inventories of private staging,
+    /// vaults and restores never pass one: they always read every byte.
+    public static func inventory(at path: String, hashes: SyncHashCache.Session? = nil) throws -> SyncInventory {
         guard SourceSyncGroup.isAbsoluteCanonical(path),
               !reachesCloudStorage(path) else {
             throw SourceSyncError.unsafeRoot("Choose an absolute local folder outside a cloud-sync provider.")
@@ -74,7 +77,7 @@ public enum SourceSyncFilesystem {
         let identity = try rootIdentity(root)
         var items: [String: SyncItem] = [:]
         var names: Set<String> = []
-        try scan(root, relative: "", items: &items, names: &names)
+        try scan(root, relative: "", items: &items, names: &names, hashes: hashes)
         return SyncInventory(rootIdentity: identity, items: items)
     }
 
@@ -161,7 +164,8 @@ public enum SourceSyncFilesystem {
         return try item(named: leaf, in: directory, relative: path)
     }
 
-    static func item(named name: String, in parent: DirectoryHandle, relative: String, synchronize: Bool = false) throws -> SyncItem? {
+    static func item(named name: String, in parent: DirectoryHandle, relative: String, synchronize: Bool = false,
+                     hashes: SyncHashCache.Session? = nil) throws -> SyncItem? {
         var info = stat()
         let result = name.withCString { fstatat(parent.descriptor, $0, &info, AT_SYMLINK_NOFOLLOW) }
         if result != 0 {
@@ -177,6 +181,9 @@ public enum SourceSyncFilesystem {
             guard info.st_uid == geteuid(), info.st_mode & 0o022 == 0 else {
                 throw SourceSyncError.unsafeRoot("A sync file is owned or writable by another user.")
             }
+            if let digest = hashes?.reuse(relative, stamp: stamp(info)) {
+                return SyncItem(digest: digest, bytes: UInt64(info.st_size), mode: mode)
+            }
             let fd = name.withCString { openat(parent.descriptor, $0, O_RDONLY | O_NOFOLLOW | O_CLOEXEC) }
             guard fd >= 0 else { throw changed() }
             defer { close(fd) }
@@ -188,6 +195,8 @@ public enum SourceSyncFilesystem {
             if synchronize, SyncDurability.synchronize(fd) != 0 {
                 throw SourceSyncError.stateInvalid("The incoming file could not be made durable before installation.")
             }
+            Self.hashed?(relative)
+            hashes?.record(relative, stamp: stamp(after), digest: digest)
             return SyncItem(digest: digest, bytes: UInt64(after.st_size), mode: mode)
         case mode_t(S_IFLNK):
             let target = try linkTarget(named: name, in: parent)
@@ -303,7 +312,7 @@ public enum SourceSyncFilesystem {
 
     private static func scan(
         _ directory: DirectoryHandle, relative: String,
-        items: inout [String: SyncItem], names: inout Set<String>
+        items: inout [String: SyncItem], names: inout Set<String>, hashes: SyncHashCache.Session? = nil
     ) throws {
         try refuseRepository(directory.descriptor)
         var before = stat(), after = stat()
@@ -333,16 +342,20 @@ public enum SourceSyncFilesystem {
             guard names.insert(folded).inserted else {
                 throw SourceSyncError.unsafeRoot("Two filenames differ only by case or Unicode normalization.")
             }
-            guard let value = try item(named: name, in: directory, relative: path) else { throw changed() }
+            guard let value = try item(named: name, in: directory, relative: path, hashes: hashes) else { throw changed() }
             items[path] = value
             if value.kind == .directory {
-                try scan(openDirectory(name, in: directory), relative: path, items: &items, names: &names)
+                try scan(openDirectory(name, in: directory), relative: path, items: &items, names: &names, hashes: hashes)
             }
         }
         guard fstat(directory.descriptor, &after) == 0, stamp(before) == stamp(after) else { throw changed() }
     }
 
-    private static func stamp(_ info: stat) -> [Int64] {
+    /// Called each time a file's contents are actually read and hashed.
+    /// Tests observe cache hits through it.
+    @TaskLocal static var hashed: (@Sendable (String) -> Void)?
+
+    static func stamp(_ info: stat) -> [Int64] {
         #if canImport(Darwin)
         let modified = info.st_mtimespec, changed = info.st_ctimespec
         #else

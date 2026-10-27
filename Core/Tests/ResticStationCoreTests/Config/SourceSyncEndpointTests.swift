@@ -71,6 +71,17 @@ struct SourceSyncEndpointTests {
         #expect(repeated.inventory.endpointGeneration == completed.inventory.endpointGeneration)
     }
 
+    /// The coordinator skips protection only for plans that displace
+    /// nothing. Each endpoint checks that independently: an operation with
+    /// a prior value never installs without a receipt.
+    @Test("a replacement without a protection receipt is refused and the original kept")
+    func replacementNeedsReceipt() throws {
+        let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
+        _ = try f.prepare()
+        #expect(throws: SourceSyncError.protectionFailed) { _ = try SyncEndpointService.handle(f.request(.commit)) }
+        #expect(try String(contentsOf: f.root.appendingPathComponent("note"), encoding: .utf8) == "old")
+    }
+
     @Test("a lost install receipt can resume after transport replenishes the same payload")
     func replenishedPayloadAfterLostReceipt() throws {
         let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
