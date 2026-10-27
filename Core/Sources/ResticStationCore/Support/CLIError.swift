@@ -140,6 +140,8 @@ public enum CLIErrorCode: String, Sendable, Codable, CaseIterable, Equatable {
     case resticUnsupported = "restic_unsupported"
     /// restic ran and failed.
     case resticFailed = "restic_failed"
+    /// Folder sync found no usable rsync on this computer or the other one.
+    case rsyncNotFound = "rsync_not_found"
     /// The operation exceeded the caller's timeout and was stopped
     /// (`ResticRunnerError.timedOut`) — restic never reported anything.
     ///
@@ -197,7 +199,7 @@ extension CLIErrorCode {
              .secretNotConfigured, .secretStoreUnusable,
              .repositoryNotInitialized, .cloudRepositoryNotHydrated,
              .resticNotFound, .resticUnsupported,
-             .resticFailed, .operationTimedOut, .previewExpired, .operationNotAllowed,
+             .resticFailed, .rsyncNotFound, .operationTimedOut, .previewExpired, .operationNotAllowed,
              .operationCompletedAuditFailed, .internalError:
             return .error
         }
@@ -220,7 +222,7 @@ extension CLIErrorCode {
              .destinationNotFound, .destinationDisabledHere, .runNotFound,
              .secretRejected, .secretNotConfigured, .secretStoreUnusable,
              .repositoryNotInitialized, .cloudRepositoryNotHydrated, .resticNotFound,
-             .resticUnsupported, .resticFailed, .previewExpired, .operationNotAllowed,
+             .resticUnsupported, .resticFailed, .rsyncNotFound, .previewExpired, .operationNotAllowed,
              .operationCompletedAuditFailed, .internalError:
             return false
         case .operationTimedOut:
@@ -942,6 +944,7 @@ extension CLIFailure {
             case .invalidConfiguration, .unsafeRoot: code = .configInvalid
             case .stalePlan, .conflict, .stateInvalid: code = .operationNotAllowed
             case .protectionFailed, .transferFailed: code = .resticFailed
+            case .rsyncNotFound: code = .rsyncNotFound
             }
             return CLIFailure(code: code, message: bounded(syncError.description))
 

@@ -120,6 +120,7 @@ secret_rejected|no|1|live
 restic_not_found|no|1|live
 restic_unsupported|no|1|env
 restic_failed|no|1|live
+rsync_not_found|no|1|unit:needs a sync folder whose other computer has no rsync, which the shell fixtures cannot stage (SourceSyncTransportTests and the classification tables pin it)
 operation_timed_out|yes|1|unit:needs a restic that stalls past ResticRunner timeouts — not stageable in a bounded shell test
 preview_expired|no|1|live
 operation_not_allowed|no|1|live

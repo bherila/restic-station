@@ -50,6 +50,7 @@ struct CLIErrorCodeTableTests {
         (.resticNotFound, "restic_not_found", .error, false),
         (.resticUnsupported, "restic_unsupported", .error, false),
         (.resticFailed, "restic_failed", .error, false),
+        (.rsyncNotFound, "rsync_not_found", .error, false),
         (.operationTimedOut, "operation_timed_out", .error, true),
         (.previewExpired, "preview_expired", .error, false),
         (.operationNotAllowed, "operation_not_allowed", .error, false),

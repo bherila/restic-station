@@ -87,6 +87,6 @@ public struct SyncTransferTools: Codable, Equatable, Sendable {
         case .linux: install = "Install it with the system package manager (for example sudo dnf install rsync or sudo apt install rsync)"
         case .other: install = "Install rsync"
         }
-        return .invalidConfiguration("Sync needs rsync (protocol \(SyncRsync.minimumProtocol) or newer) on \(computer), and none was found. \(install), then preview again.")
+        return .rsyncNotFound("Sync needs rsync (protocol \(SyncRsync.minimumProtocol) or newer) on \(computer), and none was found. \(install), then preview again.")
     }
 }

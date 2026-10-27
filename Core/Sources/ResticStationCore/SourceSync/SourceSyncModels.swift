@@ -105,11 +105,14 @@ public enum SourceSyncError: Error, Equatable, Sendable, CustomStringConvertible
     case busy
     case transferFailed
     case protectionFailed
+    /// One of the two computers has no usable rsync; the message says which
+    /// and how to install it there.
+    case rsyncNotFound(String)
 
     public var description: String {
         switch self {
         case .invalidConfiguration(let message), .unsafeRoot(let message),
-             .stateInvalid(let message), .conflict(let message): return message
+             .stateInvalid(let message), .conflict(let message), .rsyncNotFound(let message): return message
         case .stalePlan: return "The folders changed after the preview. Preview the changes again."
         case .busy: return "Another synchronization is already using these folders."
         case .transferFailed: return "The transfer did not complete. Existing copies have been retained."

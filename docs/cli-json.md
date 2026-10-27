@@ -283,6 +283,7 @@ never match on it. `details` is omitted entirely when empty.
 | `restic_not_found` | no | 1 | No restic binary anywhere that was searched. |
 | `restic_unsupported` | no | 1 | A restic was found and ran, but is below the minimum or is not restic. |
 | `restic_failed` | no | 1 | restic ran and failed. |
+| `rsync_not_found` | no | 1 | `sync plan` or `sync apply` found no usable rsync (protocol 29 or newer) on this computer or the other one. `message` says which computer and how to install it there; nothing was reserved or backed up. |
 | `operation_timed_out` | **yes** | 1 | The operation exceeded the caller's timeout and was told to stop; restic never reported. A child that survives the stop sequence is abandoned rather than waited out, so the helper does not hang — see `architecture.md` §DI, and #114's process-group half for reaping. A stalled network or a spinning-up remote clears on its own. |
 | `preview_expired` | no | 1 | A destructive preview token has expired. Run a fresh preview; the old token can never be applied. |
 | `operation_not_allowed` | no | 1 | Refused by a safety invariant — `forget` with an empty retention policy, `prune` on a mirror behind its primary (`architecture.md` §Invariants). |
@@ -596,6 +597,7 @@ must finish that same operation and retain all unexpected captured values.
 `backupNeedsAttention`. A failure returns the usual error envelope;
 `set_busy` means local contention, `operation_not_allowed` means stale or
 incompatible state, `config_invalid` means an unsupported root/configuration,
-and `restic_failed` means transfer or recovery protection failed. Ordinary
+`restic_failed` means transfer or recovery protection failed, and
+`rsync_not_found` means one of the computers needs rsync installed. Ordinary
 `run-set --kind backup` remains available independently of peer state.
 See [source-sync.md](source-sync.md) for limits and recovery semantics.
