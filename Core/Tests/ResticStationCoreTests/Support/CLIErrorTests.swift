@@ -58,7 +58,7 @@ private let representative: [CLIErrorCode: CLIFailure] = [
         message: "restic 0.16.4 at /usr/bin/restic is too old."
     ),
     .resticFailed: .classify(exitClass: .fatal(stderrSummary: "repository is damaged")),
-    .rsyncNotFound: .classify(SyncTransferTools.missing(on: "the other computer", platform: .linux)),
+    .rsyncNotFound: .classify(SyncTransferTools.missing(on: .other, platform: .linux)),
     .operationTimedOut: .classify(ResticRunnerError.timedOut),
     .previewExpired: .classifyPurgeOperation(PurgeApplyError.token(.expired), setId: setId),
     .operationCompletedAuditFailed: .classifyPurgeOperation(

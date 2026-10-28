@@ -179,7 +179,12 @@ reservations never expire. Until installation starts, a changed config
 revision, machine settings file or restic executable refuses resume: cancel
 and preview again. Once installation has started, recover resumes despite
 such changes, provided this set still has no retention or purge rules and
-its sync folder is unchanged; the resumed run binds to the current revision. The macOS app presents the same flow under
+its sync folder is unchanged; the resumed run binds to the current revision.
+A missing rsync names its own way out (`rsync_not_found`): this computer's
+is found again on every resume, so install it and resume. The other
+computer's prepare reply is kept in the journal and checked before the
+protection backup, so a reply that named no rsync is cancelled and
+previewed again once rsync is installed there. The macOS app presents the same flow under
 Sync & Back Up, with an independent Back Up Only action. Scheduled runs
 continue backing up the configured sources; synchronization is manual.
 

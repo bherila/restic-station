@@ -91,12 +91,12 @@ public struct SourceSyncClient: SourceSyncTransport {
 
     public func checkTransfer(peer: SyncEndpointReply, at endpoint: SyncEndpoint) async throws {
         guard await SyncRsync.find(runner: runner) != nil else {
-            throw SyncTransferTools.missing(on: "this computer", platform: SyncTransferTools.thisPlatform)
+            throw SyncTransferTools.missing(on: .this, platform: SyncTransferTools.thisPlatform)
         }
         // A folder on this computer uses this computer's rsync. An older
         // helper reports nothing and keeps running rsync from its PATH.
         guard endpoint.sshTarget != nil, let tools = peer.transfer else { return }
-        guard let rsync = tools.rsync else { throw SyncTransferTools.missing(on: "the other computer", platform: tools.platform) }
+        guard let rsync = tools.rsync else { throw SyncTransferTools.missing(on: .other, platform: tools.platform) }
         guard SyncRsync.isUsableRemotePath(rsync.path) else {
             throw SourceSyncError.stateInvalid("The other computer reported an rsync location that cannot be used.")
         }
@@ -109,7 +109,7 @@ public struct SourceSyncClient: SourceSyncTransport {
         guard paths.allSatisfy(SourceSyncPlanner.isRelativePath) else { throw SourceSyncError.stalePlan }
         if paths.isEmpty { return }
         guard let rsync = await SyncRsync.find(runner: runner) else {
-            throw SyncTransferTools.missing(on: "this computer", platform: SyncTransferTools.thisPlatform)
+            throw SyncTransferTools.missing(on: .this, platform: SyncTransferTools.thisPlatform)
         }
         let list = Data(paths.sorted().flatMap { Array($0.utf8) + [UInt8(0)] })
         try list.write(to: listFile, options: .withoutOverwriting)

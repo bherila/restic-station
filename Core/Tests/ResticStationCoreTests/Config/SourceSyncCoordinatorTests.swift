@@ -21,6 +21,12 @@ struct SourceSyncCoordinatorTests {
         func add(_ destination: String, _ options: SyncCopyOptions) { lock.lock(); entries.append((destination, options)); lock.unlock() }
         var all: [(destination: String, options: SyncCopyOptions)] { lock.lock(); defer { lock.unlock() }; return entries }
     }
+    final class Flag: @unchecked Sendable {
+        private let lock = NSLock()
+        private var raised = false
+        func raise() { lock.lock(); raised = true; lock.unlock() }
+        var value: Bool { lock.lock(); defer { lock.unlock() }; return raised }
+    }
     struct LocalTransport: SourceSyncTransport {
         var transferRefusal: SourceSyncError?
         /// Refuses only a prepare reply's tools (prepare replies name an export).
@@ -28,6 +34,9 @@ struct SourceSyncCoordinatorTests {
         /// Stands in for a current helper's report on inventory and prepare.
         var reportedTools: SyncTransferTools?
         var copies: CopyLog?
+        /// Refuses copies once armed, like a local rsync removed mid-run.
+        var copyRefusal: SourceSyncError?
+        var copyRefusalArmed: Flag?
         func request(_ request: SyncEndpointRequest, at endpoint: SyncEndpoint) async throws -> SyncEndpointReply {
             var reply = try SyncEndpointService.handle(request)
             if request.action == .inventory || request.action == .prepare { reply.transfer = reportedTools }
@@ -38,6 +47,7 @@ struct SourceSyncCoordinatorTests {
             if let preparedRefusal, peer.exportPath != nil { throw preparedRefusal }
         }
         func copy(paths: [String], from source: SyncEndpoint, to destination: SyncEndpoint, listFile: URL, options: SyncCopyOptions) async throws {
+            if let copyRefusal, copyRefusalArmed?.value ?? true { throw copyRefusal }
             copies?.add(destination.path, options)
             // Like SourceSyncClient, leave a list file for the coordinator to clean.
             try Data(paths.joined(separator: "\0").utf8).write(to: listFile, options: .withoutOverwriting)
@@ -714,7 +724,7 @@ struct SourceSyncCoordinatorTests {
     func transferPreflight() async throws {
         let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
         try f.write("local", "from-local")
-        let missing = SyncTransferTools.missing(on: "the other computer", platform: .linux)
+        let missing = SyncTransferTools.missing(on: .other, platform: .linux)
         let refusing = SourceSyncCoordinator(paths: f.paths, transport: LocalTransport(transferRefusal: missing), backups: f.backups)
         await #expect(throws: missing) {
             _ = try await refusing.preview(set: f.set, group: f.group, machineId: "laptop", config: f.config, binding: "fixture")
@@ -735,18 +745,46 @@ struct SourceSyncCoordinatorTests {
         let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
         try f.write("local", "note"); _ = try await f.apply(f.preview())
         try f.write("edited", "note")
-        let missing = SyncTransferTools.missing(on: "the other computer", platform: .macOS)
+        // The client's check says to preview again; the saved reply would
+        // refuse a resume too, so the coordinator names cancelling instead.
+        let missing = SyncTransferTools.missing(on: .other, platform: .macOS)
         let refusing = SourceSyncCoordinator(paths: f.paths, transport: LocalTransport(preparedRefusal: missing), backups: f.backups)
         let preview = try await refusing.preview(set: f.set, group: f.group, machineId: "laptop", config: f.config, binding: "fixture")
-        let error = await #expect(throws: SourceSyncError.self) {
+        let error = await #expect(throws: SyncTransferTools.missing(on: .other, platform: .macOS, next: .cancelUnstarted)) {
             _ = try await refusing.apply(token: #require(preview.previewToken), set: f.set, group: f.group, machineId: "laptop", config: f.config, binding: "fixture")
         }
-        guard case .rsyncNotFound(let message) = error else { Issue.record("expected rsyncNotFound, got \(String(describing: error))"); return }
+        let message = error?.description ?? ""
         #expect(message.contains("brew install rsync") && message.contains("sync recover --cancel-unstarted"))
         #expect(await f.backups.counts().0 == 0)
         #expect(try String(contentsOf: f.peer.appendingPathComponent("note"), encoding: .utf8) == "local")
         _ = try await f.coordinator.cancelUnstarted(set: f.set, group: f.group, machineId: "laptop")
         #expect(try await f.apply(f.preview()).status == "synchronized")
+        #expect(try String(contentsOf: f.peer.appendingPathComponent("note"), encoding: .utf8) == "edited")
+    }
+
+    @Test("this computer's missing rsync, found again on every resume, says to resume at any phase", arguments: ["prepared", "protected"])
+    func localRsyncMissingResumes(_ at: String) async throws {
+        let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
+        try f.write("local", "note"); _ = try await f.apply(f.preview())
+        try f.write("edited", "note")
+        let missing = SyncTransferTools.missing(on: .this, platform: .linux)
+        let armed = Flag()
+        // "prepared": the reserved phase's check; "protected": an install
+        // copy after the protection backup, where cancelling is refused.
+        let transport = at == "prepared" ? LocalTransport(preparedRefusal: missing)
+            : LocalTransport(copyRefusal: missing, copyRefusalArmed: armed)
+        let refusing = SourceSyncCoordinator(paths: f.paths, transport: transport, backups: f.backups)
+        let preview = try await refusing.preview(set: f.set, group: f.group, machineId: "laptop", config: f.config, binding: "fixture")
+        let error = await #expect(throws: SyncTransferTools.missing(on: .this, platform: .linux, next: .resume)) {
+            try await SourceSyncCoordinator.$afterDurablePhase.withValue({ phase in if phase == at { armed.raise() } }) {
+                _ = try await refusing.apply(token: #require(preview.previewToken), set: f.set, group: f.group, machineId: "laptop", config: f.config, binding: "fixture")
+            }
+        }
+        let message = error?.description ?? ""
+        #expect(message.contains("sync recover (Resume") && !message.contains("--cancel-unstarted") && !message.contains("preview again"))
+        #expect(try String(contentsOf: f.peer.appendingPathComponent("note"), encoding: .utf8) == "local")
+        // Once rsync is installed, resuming finishes the same operation.
+        #expect(try await f.coordinator.recover(set: f.set, group: f.group, machineId: "laptop", binding: "fixture").status == "synchronized")
         #expect(try String(contentsOf: f.peer.appendingPathComponent("note"), encoding: .utf8) == "edited")
     }
 

@@ -102,14 +102,48 @@ public struct SyncTransferTools: Codable, Equatable, Sendable {
         SyncTransferTools(platform: thisPlatform, rsync: await SyncRsync.find(runner: runner))
     }
 
-    /// The prompt shown when one computer has no usable rsync.
-    static func missing(on computer: String, platform: Platform) -> SourceSyncError {
+    /// The prompt shown when one computer has no usable rsync. A check made
+    /// before any operation exists says to preview again; the coordinator
+    /// names the way out of a pending operation instead.
+    static func missing(on computer: SyncRsyncMissing.Computer, platform: Platform,
+                        next: SyncRsyncMissing.NextStep = .previewAgain) -> SourceSyncError {
+        .rsyncNotFound(SyncRsyncMissing(computer: computer, platform: platform, next: next))
+    }
+}
+
+/// Which computer has no usable rsync, and what to do once it is installed.
+/// The next step depends on where the check failed, so it is a value the
+/// coordinator sets rather than text it rewrites.
+public struct SyncRsyncMissing: Equatable, Sendable, CustomStringConvertible {
+    public enum Computer: Sendable { case this, other }
+    public enum NextStep: Sendable {
+        /// No operation exists yet.
+        case previewAgain
+        /// This computer's rsync is found again on every resume.
+        case resume
+        /// The other computer's prepare reply is saved in the journal, so a
+        /// resume would read it again; only an operation that has not yet
+        /// run its protection backup gets this.
+        case cancelUnstarted
+    }
+    public var computer: Computer
+    public var platform: SyncTransferTools.Platform
+    public var next: NextStep
+
+    public var description: String {
         let install: String
         switch platform {
         case .macOS: install = "Install it with Homebrew (brew install rsync)"
         case .linux: install = "Install it with the system package manager (for example sudo dnf install rsync or sudo apt install rsync)"
         case .other: install = "Install rsync"
         }
-        return .rsyncNotFound("Sync needs rsync (protocol \(SyncRsync.minimumProtocol) or newer) on \(computer), and none was found. \(install), then preview again.")
+        let then: String
+        switch next {
+        case .previewAgain: then = "preview again"
+        case .resume: then = "resume this synchronization with sync recover (Resume in Sync & Back Up)"
+        case .cancelUnstarted: then = "cancel this unstarted synchronization with sync recover --cancel-unstarted and preview again"
+        }
+        let place = computer == .this ? "this computer" : "the other computer"
+        return "Sync needs rsync (protocol \(SyncRsync.minimumProtocol) or newer) on \(place), and none was found. \(install), then \(then)."
     }
 }

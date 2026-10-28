@@ -148,6 +148,8 @@ struct SourceSyncTransportTests {
         let macPeer = await refusal(reply(.init(platform: .macOS, rsync: nil)))
         #expect(macPeer?.contains("on the other computer") == true && macPeer?.contains("brew install rsync") == true)
         #expect(await refusal(reply(.init(platform: .linux, rsync: .init(path: "rsync; true", protocolVersion: 32))))?.contains("cannot be used") == true)
+        // No operation exists yet when the client checks.
+        #expect([local, linuxPeer, macPeer].allSatisfy { $0?.hasSuffix(", then preview again.") == true })
         // An older helper reports nothing and keeps using rsync on its PATH.
         #expect(await refusal(reply(nil)) == nil)
         #expect(await refusal(reply(.init(platform: .linux, rsync: .init(path: "/usr/bin/rsync", protocolVersion: 32)))) == nil)
