@@ -155,6 +155,22 @@ struct SourceSyncTransportTests {
         #expect(await refusal(reply(.init(platform: .linux, rsync: .init(path: "/usr/bin/rsync", protocolVersion: 32)))) == nil)
     }
 
+    @Test("a saved prepare reply gives peer transfers its rsync, and one reporting tools without a usable rsync refuses")
+    func peerCopyOptions() throws {
+        func reply(_ transfer: SyncTransferTools?) -> SyncEndpointReply {
+            var reply = SyncEndpointReply(inventory: .init(rootIdentity: "1:2", items: [:])); reply.transfer = transfer; return reply
+        }
+        // An older helper, or no reply: the earlier flags and the peer's PATH.
+        #expect(try SyncCopyOptions.peer(nil, basis: "/srv/notes") == SyncCopyOptions())
+        #expect(try SyncCopyOptions.peer(reply(nil), basis: "/srv/notes") == SyncCopyOptions())
+        let usable = reply(.init(platform: .linux, rsync: .init(path: "/usr/bin/rsync", protocolVersion: 32)))
+        #expect(try SyncCopyOptions.peer(usable) == SyncCopyOptions(remoteRsync: "/usr/bin/rsync", compress: true))
+        #expect(try SyncCopyOptions.peer(usable, basis: "/srv/notes") == SyncCopyOptions(basis: "/srv/notes", remoteRsync: "/usr/bin/rsync", compress: true))
+        for rsync in [nil, SyncRsync(path: "rsync", protocolVersion: 32), SyncRsync(path: "/usr/bin/rsync\n", protocolVersion: 32)] {
+            #expect(throws: SourceSyncError.self) { try SyncCopyOptions.peer(reply(.init(platform: .linux, rsync: rsync))) }
+        }
+    }
+
     @Test("transfers across SSH compress and run the peer's own rsync; only the other computer offers a delta basis")
     func deltaOptions() async throws {
         let base = try syncTemporaryRoot()

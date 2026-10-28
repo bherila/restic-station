@@ -811,6 +811,24 @@ struct SourceSyncCoordinatorTests {
         #expect(options == [SyncCopyOptions(), peer, SyncCopyOptions(), outbound])
     }
 
+    @Test("a prepare reply reporting tools without rsync never transfers with the other computer")
+    func peerToolsWithoutRsync() async throws {
+        let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
+        try f.write("local", "note"); _ = try await f.apply(f.preview())
+        try f.write("edited", "note")
+        let log = CopyLog()
+        // This transport's own check passes, as a mismatched one might.
+        let coordinator = SourceSyncCoordinator(paths: f.paths, transport: LocalTransport(reportedTools: .init(platform: .linux, rsync: nil), copies: log), backups: f.backups)
+        let preview = try await coordinator.preview(set: f.set, group: f.group, machineId: "laptop", config: f.config, binding: "fixture")
+        await #expect(throws: SourceSyncError.self) {
+            _ = try await coordinator.apply(token: #require(preview.previewToken), set: f.set, group: f.group, machineId: "laptop", config: f.config, binding: "fixture")
+        }
+        #expect(log.all.allSatisfy { $0.options == SyncCopyOptions() })
+        #expect(log.all.count <= 1)
+        #expect(await f.backups.counts().0 == 0)
+        #expect(try String(contentsOf: f.peer.appendingPathComponent("note"), encoding: .utf8) == "local")
+    }
+
     @Test("the SSH endpoint reports its rsync on the replies that start a preview or an operation")
     func endpointReportsTransfer() async throws {
         let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }

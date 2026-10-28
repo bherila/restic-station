@@ -279,11 +279,9 @@ public struct SourceSyncCoordinator: Sendable {
             try Self.afterDurablePhase?(journal.phase.rawValue)
         }
         // From the peer's prepare reply, which the journal keeps for
-        // resumption. An older helper reports no tools: its transfers keep
-        // the earlier flags and the rsync on its PATH.
-        func peerOptions(basis: String? = nil) -> SyncCopyOptions {
-            guard let tools = journal.peerPrepared?.transfer else { return .init() }
-            return .init(basis: basis, remoteRsync: tools.rsync?.path, compress: true)
+        // resumption.
+        func peerOptions(basis: String? = nil) throws -> SyncCopyOptions {
+            try SyncCopyOptions.peer(journal.peerPrepared, basis: basis)
         }
         func endpointRequest(_ action: SyncEndpointRequest.Action, local: Bool) -> SyncEndpointRequest {
             var r = request(action, group: group, local: local)
@@ -323,7 +321,7 @@ public struct SourceSyncCoordinator: Sendable {
                 try await transfer(exportPaths(plan, local: true), from: .init(path: l), to: .init(path: localVault.path.path), operation: operation)
                 var remoteExport = group.peer; remoteExport.path = p
                 try await transfer(exportPaths(plan, local: false), from: remoteExport, to: .init(path: peerVault.path.path), operation: operation,
-                                   options: peerOptions())
+                                   options: try peerOptions())
                 try verifyExport(localVault, paths: exportPaths(plan, local: true), inventory: plan.local)
                 try verifyExport(peerVault, paths: exportPaths(plan, local: false), inventory: plan.peer)
                 // The encrypted snapshots must remain understandable even
@@ -359,7 +357,7 @@ public struct SourceSyncCoordinator: Sendable {
                 var remoteIncoming = group.peer; remoteIncoming.path = peerIncoming
                 // The other computer's current versions are the delta basis.
                 try await transfer(outbound, from: .init(path: localVault.path.path), to: remoteIncoming, operation: operation,
-                                   options: peerOptions(basis: group.peer.path))
+                                   options: try peerOptions(basis: group.peer.path))
                 try revalidate()
                 if journal.phase == .protected {
                     // Durable installation intent precedes either commit.

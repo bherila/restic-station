@@ -31,6 +31,18 @@ public struct SyncCopyOptions: Equatable, Sendable {
         self.remoteRsync = remoteRsync
         self.compress = compress
     }
+
+    /// Transfers with the other computer, from its saved prepare reply. An
+    /// older helper reports no tools: its transfers keep the earlier flags
+    /// and the rsync on its PATH. A reply that reports tools without a
+    /// usable rsync refuses rather than fall back to that PATH.
+    static func peer(_ prepared: SyncEndpointReply?, basis: String? = nil) throws -> SyncCopyOptions {
+        guard let tools = prepared?.transfer else { return .init() }
+        guard let rsync = tools.rsync, SyncRsync.isUsableRemotePath(rsync.path) else {
+            throw SourceSyncError.stateInvalid("The other computer's saved reply names no usable rsync, so this synchronization cannot transfer with it.")
+        }
+        return .init(basis: basis, remoteRsync: rsync.path, compress: true)
+    }
 }
 
 /// File data moves with rsync; inventories, reservations and commit receipts
