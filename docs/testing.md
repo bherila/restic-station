@@ -14,7 +14,9 @@ The fixture uses only synthetic data and a temporary FileSecretStore.
 keys and pinned host configuration, then runs the optional Core SSH fixture.
 It never edits user SSH configuration or known_hosts. It needs the existing
 OpenSSH server and rsync tools; CI installs them in its disposable Linux
-container. The fixture covers real helper RPC, transfer and quoted paths.
+container. The fixture covers real helper RPC, transfer and quoted paths,
+including replacements in both directions, with the other computer's live
+copy as the delta basis.
 
 ## Layer 1 — unit tests (`swift test --package-path Core`; app tests through `xcodebuild test`)
 

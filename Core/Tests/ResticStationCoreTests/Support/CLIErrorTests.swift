@@ -58,6 +58,7 @@ private let representative: [CLIErrorCode: CLIFailure] = [
         message: "restic 0.16.4 at /usr/bin/restic is too old."
     ),
     .resticFailed: .classify(exitClass: .fatal(stderrSummary: "repository is damaged")),
+    .rsyncNotFound: .classify(SyncTransferTools.missing(on: .other, platform: .linux)),
     .operationTimedOut: .classify(ResticRunnerError.timedOut),
     .previewExpired: .classifyPurgeOperation(PurgeApplyError.token(.expired), setId: setId),
     .operationCompletedAuditFailed: .classifyPurgeOperation(
@@ -120,12 +121,13 @@ struct CLIErrorContractTests {
         #expect(CLIErrorCode.resticNotFound.rawValue == "restic_not_found")
         #expect(CLIErrorCode.resticUnsupported.rawValue == "restic_unsupported")
         #expect(CLIErrorCode.resticFailed.rawValue == "restic_failed")
+        #expect(CLIErrorCode.rsyncNotFound.rawValue == "rsync_not_found")
         #expect(CLIErrorCode.operationTimedOut.rawValue == "operation_timed_out")
         #expect(CLIErrorCode.previewExpired.rawValue == "preview_expired")
         #expect(CLIErrorCode.operationNotAllowed.rawValue == "operation_not_allowed")
         #expect(CLIErrorCode.operationCompletedAuditFailed.rawValue == "operation_completed_audit_failed")
         #expect(CLIErrorCode.internalError.rawValue == "internal_error")
-        #expect(CLIErrorCode.allCases.count == 24)
+        #expect(CLIErrorCode.allCases.count == 25)
     }
 
     @Test("only busy and offline leave exit 1 — the coarse shell contract is unchanged")

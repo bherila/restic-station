@@ -14,6 +14,18 @@ import Musl
 /// expiry can release a partially applied operation to another writer.
 public enum SyncEndpointService {
     @TaskLocal static var beforeInstall: (@Sendable (String) throws -> Void)?
+
+    /// The SSH endpoint's answer: the typed reply, plus this computer's
+    /// transfer tools on the replies that start a preview or an operation,
+    /// so the coordinator can refuse before protection when rsync is missing.
+    public static func serve(_ request: SyncEndpointRequest, runner: any ProcessRunning = DefaultProcessRunner()) async throws -> SyncEndpointReply {
+        var reply = try handle(request)
+        if request.action == .inventory || request.action == .prepare {
+            reply.transfer = await SyncTransferTools.current(runner: runner)
+        }
+        return reply
+    }
+
     public static func handle(_ request: SyncEndpointRequest) throws -> SyncEndpointReply {
         guard request.version == 1, MachineIdentity.isValid(request.coordinatorMachineId),
               SourceSyncGroup.isAbsoluteCanonical(request.root) else {
