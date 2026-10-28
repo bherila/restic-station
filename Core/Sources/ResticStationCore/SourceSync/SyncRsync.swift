@@ -26,20 +26,25 @@ public struct SyncRsync: Codable, Equatable, Sendable {
         #endif
     }
 
-    /// Well-known locations first, then each absolute `PATH` entry that
-    /// holds an executable `rsync`: on the other computer that is the SSH
-    /// session's PATH, which older helpers relied on (a NixOS or Linuxbrew
-    /// rsync lives only there). Relative entries are skipped, and the list
-    /// is bounded so a pathological PATH cannot stall a reply.
+    /// Well-known locations first, then each `PATH` entry that holds an
+    /// executable `rsync`: on the other computer that is the SSH session's
+    /// PATH, which older helpers relied on (a NixOS or Linuxbrew rsync lives
+    /// only there). Only entries the coordinator would accept as a reported
+    /// path count, so a relative or non-canonical one cannot shadow a later
+    /// usable one, and the scan stops at the cap so a pathological PATH
+    /// cannot stall a reply.
     static func candidates(wellKnown: [String] = wellKnownPaths, path: String?,
                            isExecutable: (String) -> Bool = { FileManager.default.isExecutableFile(atPath: $0) }) -> [String] {
-        var result: [String] = []
-        for directory in (path ?? "").split(separator: ":") where directory.hasPrefix("/") {
+        let limit = 12
+        var result: [String] = [], seen = Set<String>()
+        for candidate in wellKnown where seen.insert(candidate).inserted { result.append(candidate) }
+        for directory in (path ?? "").split(separator: ":") {
+            guard result.count < limit else { break }
             let candidate = (directory.hasSuffix("/") ? String(directory) : directory + "/") + "rsync"
-            if isExecutable(candidate) { result.append(candidate) }
+            guard isUsableRemotePath(candidate), !seen.contains(candidate), isExecutable(candidate) else { continue }
+            seen.insert(candidate); result.append(candidate)
         }
-        var seen = Set<String>()
-        return (wellKnown + result).filter { seen.insert($0).inserted }.prefix(12).map { $0 }
+        return Array(result.prefix(limit))
     }
 
     /// Tests point discovery at their own candidates.

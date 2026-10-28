@@ -106,7 +106,15 @@ struct SourceSyncTransportTests {
                                      isExecutable: installed.contains)
                 == ["/usr/bin/rsync", "/run/current-system/sw/bin/rsync"])
         #expect(SyncRsync.candidates(wellKnown: [], path: nil, isExecutable: { _ in true }) == [])
-        #expect(SyncRsync.candidates(wellKnown: [], path: (0..<40).map { "/d\($0)" }.joined(separator: ":"), isExecutable: { _ in true }).count == 12)
+        // Entries the coordinator would refuse as a reported path never
+        // shadow a later usable one.
+        #expect(SyncRsync.candidates(wellKnown: [], path: "/home/u/./bin:/opt/../bin:bin:/home/u/bin", isExecutable: { _ in true })
+                == ["/home/u/bin/rsync"])
+        // The scan stops at the cap rather than stat every entry.
+        var probed = 0
+        let capped = SyncRsync.candidates(wellKnown: ["/usr/bin/rsync"], path: (0..<40).map { "/d\($0)" }.joined(separator: ":"),
+                                          isExecutable: { _ in probed += 1; return true })
+        #expect(capped.count == 12 && probed == 11)
         let fake = FakeProcessRunner(script: [
             .init(argvPrefix: ["/missing/rsync", "--version"], failure: .launchFailed("no such file")),
             Self.version("/old/rsync", "rsync  version 2.5.7  protocol version 26"),
