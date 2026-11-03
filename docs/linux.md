@@ -1280,6 +1280,120 @@ restricts the restore to an in-snapshot path; `restore --set … --dest …` add
 `.addressable` view, so it works even for a destination this machine does not back up (the
 mirror/restore-only story above).
 
+## Servers: append-only repositories and mounted sources
+
+This setup suits a server whose backups must survive that server being compromised. The commands
+and results below come from one real deployment: two Amazon Linux 2023 hosts running this helper
+with restic 0.19.1, backing up to `rest-server` 0.14.0 on a third host, with an S3-compatible
+store mounted through rclone 1.74.2. Unlike most of this document, none of it ran in CI (see [Not
+executed in CI](#not-executed-in-ci)).
+
+### Back up to an append-only REST server
+
+Over `sftp:`, a host that can write to its repository can also delete from it. An append-only
+[`rest-server`](https://github.com/restic/rest-server) removes that ability from the backed-up
+host, and `--private-repos` keeps each login inside its own repository:
+
+```sh
+rest-server --path /srv/restic --listen 192.0.2.10:8000 --append-only --private-repos \
+    --htpasswd-file /srv/restic-secrets/htpasswd \
+    --tls --tls-cert /srv/restic-secrets/cert.pem --tls-key /srv/restic-secrets/key.pem
+```
+
+With `--private-repos`, a login named `web-prod` reaches only `/srv/restic/web-prod`. In the same
+test, using `web-staging`'s login:
+
+| Request | Result |
+|---|---|
+| Read its own `config` | 200 |
+| `DELETE` one of its own snapshots | 403, and the file was still on disk afterward |
+| Overwrite its own `config` | 403 |
+| Read another login's `config`, or list its snapshots | 401 |
+
+A restic key can read every snapshot in its repository, so give each host its own repository if
+hosts shouldn't be able to read each other's data. Deduplication doesn't cross repositories.
+
+The destination uses a `rest:` URL with no credentials in it. If the server's certificate is
+self-signed, pin it through `nonSecretEnv`. Store the password with `secret set`, and the login with
+`secret set-env`, as `{"RESTIC_REST_USERNAME":"…","RESTIC_REST_PASSWORD":"…"}`:
+
+```json
+{
+  "id": "…",
+  "label": "append-only server",
+  "repoURL": "rest:https://192.0.2.10:8000/web-prod/",
+  "isPrimary": true,
+  "nonSecretEnv": { "RESTIC_CACERT": "/etc/restic-station/server-cert.pem" }
+}
+```
+
+Three things change because the host can't delete:
+
+- **Set `"retention": null` on the backed-up host.** Removing snapshots has to happen on the server.
+- **`remoteMaintenance` doesn't apply.** It is `sftp:`-only, so schedule `restic forget --prune` and
+  `restic check` on the server itself, against the repository's local path. While a repository holds
+  fewer snapshots than a `--keep-*` count, restic keeps the oldest one as well, so two snapshots from
+  one day can both survive `--keep-daily`. That isn't a failed retention run.
+- **Initialize the repository on the server** with `restic init`, as the user that owns the files.
+  Run all server-side restic commands as that user too: a command run as root with that user's
+  `HOME` leaves a root-owned `~/.cache/restic`, and later runs as the owner stop with `unable to open
+  cache: … permission denied`.
+
+### A source on a mount
+
+There is no pre-backup hook, so anything a backup needs must already be in place when the schedule
+fires. For an object store, a read-only mount avoids keeping a second copy on disk:
+
+```sh
+rclone mount store: /home/backup/store --read-only --use-server-modtime \
+    --vfs-cache-mode off --dir-cache-time 10m --umask 0077
+```
+
+`--use-server-modtime` gives restic a stable modification time without a `HEAD` request per object.
+For a store of about 10 GiB and 8,700 objects, on the same host:
+
+| Run | Time | Data added |
+|---|---|---|
+| First backup | about 5.5 minutes | everything |
+| Nothing changed, same mount | 6.5 seconds | not measured |
+| Nothing changed, after restarting the mount | 77 seconds | about 6 MB |
+
+**Keep a mount in its own backup set.** A mount that is down looks like a missing source, and what
+that means depends on what else is in the set:
+
+| Sources in the set | `run-set` exit | Run status | `needsAttention` | Snapshot written? |
+|---|---|---|---|---|
+| All present | 0 | `success` | no | yes |
+| One missing, another present | 0 | `warning` | **no** | **yes, without the missing source** |
+| All missing | 1 | `failed` | yes | no |
+
+So a set holding both a mount and a local folder keeps "succeeding" with a warning while the mount is
+down, writing snapshots that have none of the mounted data. On its own set, the same outage is a
+failed run that asks for attention.
+
+List folders *inside* the mount as sources, not the mount point. The empty mount point still exists
+when nothing is mounted, so restic would back it up as an empty folder, while a folder inside it
+disappears and counts as missing.
+
+For a source whose contents aren't yours to judge, such as customer files, set `"usesGlobalExcludes":
+false`, so the built-in exclusion list can't skip anything that matches a cache or build pattern.
+
+### Other things to expect
+
+- **Prepare data on a separate timer.** A database dump needs its own systemd timer, ahead of the
+  set's schedule. Write to a temporary name, check the dump finished, then rename it, so a failed
+  dump leaves the last good file in place.
+- **`timer install` can start a backup within seconds.** A set that has never run is immediately due
+  ([scheduling.md](scheduling.md)), so the first tick runs it. Put prepared data and mounts in place
+  first. A `run-set` in the meantime exits with "another operation for this backup set is already
+  running".
+- **A dedicated user needs lingering and a runtime directory.** Run `sudo loginctl enable-linger
+  <user>` first, then pass the directory explicitly, because `sudo -u` doesn't set it:
+  `sudo -u <user> env HOME=/home/<user> XDG_RUNTIME_DIR=/run/user/$(id -u <user>)
+  restic-station-helper timer install`.
+- **`config.json` numbers can't have leading zeros.** `"hour": 09` fails `config import` with a
+  `DecodingError`.
+
 ## Troubleshooting
 
 **A set is silently excluded by a per-machine override.** This is the top failure mode of the
@@ -1393,8 +1507,12 @@ info: restic not configured; discovered /usr/bin/restic (version 0.18.1)
 
 ## Not executed in CI
 
-Two things this document does not claim to have observed, and why:
+Things this document does not claim to have observed in CI, and why:
 
+- **[Servers: append-only repositories and mounted
+  sources](#servers-append-only-repositories-and-mounted-sources).** It needs a separate
+  `rest-server` host and a FUSE mount. Its results were observed on one real deployment, and they
+  are not exercised by any test here.
 - **The interactive, echo-disabled `secret set` TTY prompt.** CI has no terminal attached to
   stdin; the piped form shown above exercises the same `SecretInput.read` code path with the
   same trailing-newline stripping, minus the prompt/echo behavior itself, which is a few lines of
