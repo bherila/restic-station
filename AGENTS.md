@@ -1,9 +1,7 @@
 # Agent guide
 
 Canonical working guidance for coding agents — human or AI — in this repo.
-`CLAUDE.md` is a one-line import of this file so Claude Code loads it
-automatically; other tools should read this file directly. Edit here, never
-in `CLAUDE.md`.
+Claude Code and other tools read this file directly; there is no `CLAUDE.md`.
 
 This file is a router plus the traps you must know *before* editing. The
 normative detail lives in `CONTRIBUTING.md` and `docs/` — when this file and
