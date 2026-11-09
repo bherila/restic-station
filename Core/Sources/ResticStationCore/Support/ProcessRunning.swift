@@ -206,7 +206,10 @@ public struct DefaultProcessRunner: ProcessRunning {
     /// destructive.
     private static let spawnAttempts = 3
 
-    private static func spawnWithRetry(
+    /// The runner's whole launch path, synchronous. Internal rather than
+    /// private so a test can drive it from a dedicated thread, off the
+    /// cooperative pool (#206).
+    static func spawnWithRetry(
         argv: [String],
         env: [String: String]?,
         datalessFiles: DatalessFileReads?,
