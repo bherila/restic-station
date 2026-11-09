@@ -491,7 +491,7 @@ jobs:
           sudo install -m 0755 /tmp/restic /usr/bin/restic
           restic version
         env:
-          RESTIC_VERSION: 0.18.1
+          RESTIC_VERSION: 0.19.1
           RESTIC_ARCH: arm64
       - name: Unpack the aarch64 tarball
         run: tar xzf dist/restic-station-linux-aarch64.tar.gz -C dist

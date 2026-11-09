@@ -15,9 +15,10 @@ macOS-only and irrelevant here; see `docs/architecture.md`'s components table.
 
 Every transcript in this document is real output from a real run. It comes from
 `scripts/linux-docs-transcript.sh`, which CI's `linux-integration` job
-(`.github/workflows/ci.yml`) runs against the **static** release binary and a real restic 0.18.1,
-on a genuine (non-container) Ubuntu VM — the same job that runs `scripts/integration-test.sh`'s
-Linux fixture-import scenario. Nothing below was typed by hand on a Mac and relabeled, and where
+(`.github/workflows/ci.yml`) runs against the **static** release binary and a real restic (the
+version that job pins; the transcripts below were captured with 0.18.1), on a genuine
+(non-container) Ubuntu VM — the same job that runs `scripts/integration-test.sh`'s Linux
+fixture-import scenario. Nothing below was typed by hand on a Mac and relabeled, and where
 something could not be run in CI that is stated explicitly rather than shown as if observed (see
 [Scheduling](#scheduling) and [Not executed in CI](#not-executed-in-ci)).
 
@@ -55,7 +56,7 @@ Two honest caveats about how that output is *presented*, so this claim can be ta
 
   ```sh
   curl -fsSL -o restic.bz2 \
-    https://github.com/restic/restic/releases/download/v0.18.1/restic_0.18.1_linux_amd64.bz2
+    https://github.com/restic/restic/releases/download/v0.19.1/restic_0.19.1_linux_amd64.bz2
   bunzip2 restic.bz2 && sudo install -m 0755 restic /usr/local/bin/restic
   ```
 

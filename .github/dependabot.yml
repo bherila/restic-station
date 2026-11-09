@@ -1,0 +1,13 @@
+# Weekly update PRs for what Dependabot can see. Not covered, so bumped by
+# hand: Sparkle (exact-pinned in project.yml, on the update-signature trust
+# path) and the restic version CI installs (RESTIC_VERSION in ci.yml).
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: swift
+    directory: /
+    schedule:
+      interval: weekly
