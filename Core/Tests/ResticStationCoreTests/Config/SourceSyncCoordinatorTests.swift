@@ -533,6 +533,16 @@ struct SourceSyncCoordinatorTests {
         #expect(await f.backups.counts() == (0, 0))
         #expect(!FileManager.default.fileExists(atPath: f.peer.appendingPathComponent("from-local").path))
         #expect(!FileManager.default.fileExists(atPath: f.local.appendingPathComponent("from-peer").path))
+        // Before any endpoint prepared: neither control directory holds an
+        // operation (no staging, export or recovery storage exists).
+        for root in [f.local, f.peer] {
+            let control = AppPaths.sourceSyncControlDirectory(for: URL(fileURLWithPath: try SourceSyncFilesystem.physicalDirectory(root.path)))
+            let entries = try FileManager.default.contentsOfDirectory(atPath: control.path)
+            #expect(entries.contains("root.json"), "the control directory checked is the endpoint's own")
+            #expect(entries.filter { UUID(uuidString: $0) != nil } == [], "an endpoint prepared before the repository check")
+        }
+        let pending = try SourceSyncCoordinator.status(paths: f.paths, setId: f.set.id, groupId: f.group.id)
+        #expect(pending.status == "needsRecovery" && pending.canCancel)
         // Still unstarted: resuming checks again, and cancelling is allowed.
         await #expect(throws: SourceSyncError.destinationUnavailable) {
             try await f.coordinator.recover(set: f.set, group: f.group, machineId: "laptop", binding: "fixture")
@@ -548,8 +558,11 @@ struct SourceSyncCoordinatorTests {
         try g.write("a", "a")
         await g.backups.setDestinationDown(true)
         await #expect(throws: SourceSyncError.destinationUnavailable) { try await g.apply(g.preview()) }
-        _ = try await g.coordinator.cancelUnstarted(set: g.set, group: g.group, machineId: "laptop")
+        #expect(try await g.coordinator.cancelUnstarted(set: g.set, group: g.group, machineId: "laptop").status == "ready")
         #expect(!FileManager.default.fileExists(atPath: g.peer.appendingPathComponent("a").path))
+        await g.backups.setDestinationDown(false)
+        #expect(try await g.apply(g.preview()).status == "synchronized")
+        #expect(try String(contentsOf: g.peer.appendingPathComponent("a"), encoding: .utf8) == "a")
     }
 
     @Test("a plan with protection relies on the protection backup, not the repository check (#204)")

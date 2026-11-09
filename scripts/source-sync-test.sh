@@ -124,8 +124,9 @@ printf '%s' 'created while unplugged' > "$WORK/workspace/notes/created"
 plan
 mv "$WORK/repo/config" "$WORK/repo-config"
 if apply; then echo 'FAIL: create-only sync installed with the repository unreachable' >&2; exit 1; fi
-jq -e '.ok == false and .error.code == "restic_failed" and (.error.message | test("could not be reached"))' "$WORK/result.json" >/dev/null
+jq -e '.ok == false and .error.code == "restic_failed" and (.error.message | test("did not answer"))' "$WORK/result.json" >/dev/null
 test ! -e "$WORK/other copy/created"
+"$HELPER" sync status --set "$SET" --json | jq -e '.data.status == "needsRecovery" and .data.canCancel == true' >/dev/null
 mv "$WORK/repo-config" "$WORK/repo/config"
 "$HELPER" sync recover --set "$SET" >/dev/null
 cmp "$WORK/workspace/notes/created" "$WORK/other copy/created"

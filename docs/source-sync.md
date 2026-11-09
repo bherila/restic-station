@@ -129,11 +129,13 @@ final backup.
 Without a protection backup, nothing would test the backup destination
 before either copy changed. So before any endpoint prepares, such a plan
 asks the primary repository for its identity (`cat config`): no backup, no
-restore, no snapshot (#204). If the repository does not answer with a
-well-formed ID, apply refuses with `restic_failed`, and neither folder
-changes. The operation stays in its reservation phase. It can be resumed
+restore, no snapshot (#204), bounded at 10 seconds like the reachability
+probe. If the repository does not answer with a well-formed ID in time,
+apply refuses with `restic_failed`, and neither folder changes. A missing
+secret or a restic that cannot launch refuses with its own error instead.
+Either way the operation stays in its reservation phase. It can be resumed
 once the repository answers, which checks again, or cancelled with
-`--cancel-unstarted`. The check authorizes nothing; the final backup remains
+`--cancel-unstarted`, which is the way out when the fix changes settings. The check authorizes nothing; the final backup remains
 the proof. Mirrors are not checked up front: a mirror that is down is first
 noticed by the final backup's copies, leaving the operation resumable
 (`backupNeedsAttention`) rather than cancellable, as with any other final

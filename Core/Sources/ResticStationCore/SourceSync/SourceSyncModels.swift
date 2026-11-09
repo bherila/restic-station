@@ -121,7 +121,7 @@ public enum SourceSyncError: Error, Equatable, Sendable, CustomStringConvertible
         case .busy: return "Another synchronization is already using these folders."
         case .transferFailed: return "The transfer did not complete. Existing copies have been retained."
         case .protectionFailed: return "The versions at risk could not be verified in a backup. No replacement was authorized."
-        case .destinationUnavailable: return "The backup repository could not be reached, so neither folder was changed. Fix the repository, then resume this synchronization with sync recover (Resume in Sync & Back Up), or cancel it with sync recover --cancel-unstarted (Cancel Pending Plan)."
+        case .destinationUnavailable: return "The backup repository did not answer, so neither folder was changed. Once it answers, resume this synchronization with sync recover (Resume in Sync & Back Up). If fixing it means changing settings, cancel it with sync recover --cancel-unstarted (Cancel Pending Plan) and preview again."
         }
     }
 }
