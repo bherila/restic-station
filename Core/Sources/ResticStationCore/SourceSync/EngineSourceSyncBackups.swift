@@ -35,6 +35,12 @@ public struct EngineSourceSyncBackups: SourceSyncBackingUp {
         return try SyncProtectionReceipt.verify(repositoryId: repositoryId, snapshotId: snapshot, expected: inventory, restoredAt: restored)
     }
 
+    public func checkDestination(set: BackupSet) async throws {
+        guard let primary = set.destinations.first(where: \.isPrimary) else { throw SourceSyncError.destinationUnavailable }
+        do { _ = try await identity(primary) }
+        catch { throw SourceSyncError.destinationUnavailable }
+    }
+
     public func backup(set: BackupSet, retaining vault: URL?) async throws {
         if let vault {
             do {

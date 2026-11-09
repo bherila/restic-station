@@ -64,8 +64,12 @@ struct SourceSyncCoordinatorTests {
         var finalSets: [BackupSet] = []
         var manifests: [SyncInventory] = []
         var finalHasAgreement = false
+        var destinationDown = false
+        var destinationChecks = 0
 
         func failProtection() { protectionFails = true }
+        func setDestinationDown(_ value: Bool) { destinationDown = value }
+        func checks() -> Int { destinationChecks }
         func failFinal(_ value: Bool) { finalFails = value }
         func counts() -> (Int, Int) { (protectedSets.count, finalSets.count) }
         func protectedSources() -> [[String]] { protectedSets.map(\.sources) }
@@ -79,6 +83,10 @@ struct SourceSyncCoordinatorTests {
             let restored = vault.deletingLastPathComponent().appendingPathComponent("restore-\(UUID())")
             try FileManager.default.copyItem(at: vault, to: restored)
             return try SyncProtectionReceipt.verify(repositoryId: String(repeating: "b", count: 64), snapshotId: String(repeating: "a", count: 64), expected: inventory, restoredAt: restored)
+        }
+        func checkDestination(set: BackupSet) throws {
+            destinationChecks += 1
+            if destinationDown { throw SourceSyncError.destinationUnavailable }
         }
         func backup(set: BackupSet, retaining vault: URL?) throws {
             finalSets.append(set)
@@ -512,6 +520,49 @@ struct SourceSyncCoordinatorTests {
         #expect(resumed.status == "synchronized")
         #expect(try String(contentsOf: f.peer.appendingPathComponent("a"), encoding: .utf8) == "a")
         #expect(await f.backups.counts().0 == 0)
+    }
+
+    @Test("a create-only sync checks the repository first and changes nothing while it is down (#204)")
+    func createOnlyChecksDestination() async throws {
+        let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
+        try f.write("local", "from-local"); try f.write("remote", "from-peer", peer: true)
+        await f.backups.setDestinationDown(true)
+        let preview = try await f.preview()
+        await #expect(throws: SourceSyncError.destinationUnavailable) { try await f.apply(preview) }
+        #expect(await f.backups.checks() == 1)
+        #expect(await f.backups.counts() == (0, 0))
+        #expect(!FileManager.default.fileExists(atPath: f.peer.appendingPathComponent("from-local").path))
+        #expect(!FileManager.default.fileExists(atPath: f.local.appendingPathComponent("from-peer").path))
+        // Still unstarted: resuming checks again, and cancelling is allowed.
+        await #expect(throws: SourceSyncError.destinationUnavailable) {
+            try await f.coordinator.recover(set: f.set, group: f.group, machineId: "laptop", binding: "fixture")
+        }
+        #expect(await f.backups.checks() == 2)
+        await f.backups.setDestinationDown(false)
+        let resumed = try await f.coordinator.recover(set: f.set, group: f.group, machineId: "laptop", binding: "fixture")
+        #expect(resumed.status == "synchronized")
+        #expect(await f.backups.checks() == 3)
+        #expect(try String(contentsOf: f.peer.appendingPathComponent("from-local"), encoding: .utf8) == "local")
+
+        let g = try Fixture(); defer { try? FileManager.default.removeItem(at: g.base) }
+        try g.write("a", "a")
+        await g.backups.setDestinationDown(true)
+        await #expect(throws: SourceSyncError.destinationUnavailable) { try await g.apply(g.preview()) }
+        _ = try await g.coordinator.cancelUnstarted(set: g.set, group: g.group, machineId: "laptop")
+        #expect(!FileManager.default.fileExists(atPath: g.peer.appendingPathComponent("a").path))
+    }
+
+    @Test("a plan with protection relies on the protection backup, not the repository check (#204)")
+    func protectedPlanSkipsDestinationCheck() async throws {
+        let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
+        try f.write("a", "a")
+        #expect(try await f.apply(f.preview()).status == "synchronized")
+        #expect(await f.backups.checks() == 1)
+        await f.backups.setDestinationDown(true)
+        try f.write("edited", "a")
+        #expect(try await f.apply(f.preview()).status == "synchronized")
+        #expect(await f.backups.checks() == 1)
+        #expect(await f.backups.counts().0 == 1)
     }
 
     @Test("consumed and day-old previews are removed; a fresh unconsumed one is kept")

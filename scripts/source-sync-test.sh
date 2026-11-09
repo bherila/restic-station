@@ -115,6 +115,20 @@ rm -rf "$WORK/workspace/notes/nested"
 plan
 apply
 test ! -e "$WORK/other copy/nested"
+# A plan that only creates runs no protection backup, so it asks the primary
+# repository for its identity first (#204): with the repository unreadable,
+# apply refuses before either copy changes, and the same operation resumes
+# once the repository answers again. The directory stays: a missing local
+# repository directory is already refused earlier, before any journal.
+printf '%s' 'created while unplugged' > "$WORK/workspace/notes/created"
+plan
+mv "$WORK/repo/config" "$WORK/repo-config"
+if apply; then echo 'FAIL: create-only sync installed with the repository unreachable' >&2; exit 1; fi
+jq -e '.ok == false and .error.code == "restic_failed" and (.error.message | test("could not be reached"))' "$WORK/result.json" >/dev/null
+test ! -e "$WORK/other copy/created"
+mv "$WORK/repo-config" "$WORK/repo/config"
+"$HELPER" sync recover --set "$SET" >/dev/null
+cmp "$WORK/workspace/notes/created" "$WORK/other copy/created"
 # Excluding the private protection payload must refuse before replacing a
 # live value, even when an ordinary backup snapshot can still be created.
 printf '%s' 'excluded replacement' > "$WORK/other copy/from peer"
@@ -132,4 +146,4 @@ test "$(cat "$WORK/workspace/notes/from peer")" = 'peer version'
 RESTIC_PASSWORD_COMMAND="$PASSWORD_COMMAND" "$RESTIC" -r "$WORK/repo" snapshots --json > "$WORK/snapshots.json"
 jq -e 'length >= 6 and ([.[] | select(.parent == null)] | length) == 1' "$WORK/snapshots.json" >/dev/null \
     || { echo 'FAIL: sync backups ran without a parent snapshot' >&2; jq -c '[.[] | {id: .short_id, parent}]' "$WORK/snapshots.json" >&2; exit 1; }
-echo 'PASS: source sync, real restore proof, modification times, independent backup scope, deletion, replay, exclusion refusal and parent snapshots'
+echo 'PASS: source sync, real restore proof, modification times, independent backup scope, deletion, replay, exclusion refusal, unreachable-repository refusal and parent snapshots'

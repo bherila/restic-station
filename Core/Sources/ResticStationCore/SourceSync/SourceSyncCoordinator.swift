@@ -297,6 +297,14 @@ public struct SourceSyncCoordinator: Sendable {
         do {
             if journal.phase == .reserved {
                 try revalidate()
+                // A plan that displaces nothing runs no protection backup,
+                // which was its only check of the backup destination before
+                // either copy changes. Ask the primary repository for its
+                // identity instead, before any endpoint prepares: a down
+                // repository then leaves the operation cancellable, not
+                // installed and waiting on the final backup (#204). Mirrors
+                // are still first checked by the final backup's copies.
+                if !plan.requiresProtection { try await backups.checkDestination(set: set) }
                 // A crash after a worker prepared but before its reply was
                 // saved repeats the same typed operation, never a new one.
                 if journal.localPrepared == nil {
