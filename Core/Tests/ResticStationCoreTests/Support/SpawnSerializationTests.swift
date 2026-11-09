@@ -75,6 +75,7 @@ import Musl
             } catch {
                 launchFailed.set()
                 launchDone.signal()
+                reaped.signal() // nothing to reap; do not wait out the bound
             }
         }
         let holder = Thread {
@@ -99,6 +100,6 @@ import Musl
         #expect(!launchFailed.isSet, "the runner spawn failed")
         #expect(!launchedWhileHeld.isSet, "a runner spawn launched while the serialized launch held the lock")
         #expect(launched.isSet)
-        #expect(outcome.reaped || launchFailed.isSet, "the spawned child was never reaped")
+        #expect(outcome.reaped, "the spawned child was never reaped")
     }
 }
