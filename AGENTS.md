@@ -77,7 +77,7 @@ These three rules account for the largest clusters of past review findings
 ## Environment facts
 
 - **Claude Code cloud sessions** (claude.ai/code) run on Ubuntu 24.04
-  x86_64, with Swift 6.1.3 (the `linux` CI job's toolchain), restic 0.18.1
+  x86_64, with Swift 6.1.3 (the `linux` CI job's toolchain), restic 0.19.1
   and jq from the Swift cloud environment's setup script. They can run the
   `linux` job's steps: `swift build`, `swift test`,
   `swift test --package-path Core`, `scripts/secret-cli-test.sh`. They cannot
