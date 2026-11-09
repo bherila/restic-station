@@ -63,6 +63,26 @@ struct SyncScopeTests {
         #expect(scope.isEverything)
     }
 
+    @Test("case-insensitive matching folds ASCII only, and non-ASCII folded patterns are not decidable")
+    func asciiFolding() {
+        let scope = SyncScope(caseInsensitivePatterns: ["*.TMP", "library/caches"])
+        #expect(scope.excludes("draft.tmp") && scope.excludes("Library/Caches/x"))
+        // Swift lowercases U+0130 to "i" plus a combining dot; Go to "i".
+        // Folding neither keeps the path in scope, the safe direction.
+        #expect(!SyncScope(caseInsensitivePatterns: ["ix"]).excludes("\u{130}x"))
+        let plan = GlobalExcludePlan(patterns: ["Caf\u{E9}", "build"], excludeCaches: false)
+        #expect(SyncScope.backupScope(of: Self.set(), applying: plan).caseInsensitivePatterns == ["build"])
+    }
+
+    @Test("a preview report without excluded, from an older helper, still decodes")
+    func previewDecodesWithoutExcluded() throws {
+        let json = #"{"setId":"11111111-1111-4111-8111-111111111111","groupId":"22222222-2222-4222-8222-222222222222","copies":1,"removals":0,"conflicts":0,"backupSourceCount":1}"#
+        let preview = try JSONDecoder().decode(SourceSyncPreview.self, from: Data(json.utf8))
+        #expect(preview.excluded == 0 && preview.excludedPaths == nil && preview.copies == 1)
+        let round = try JSONDecoder().decode(SourceSyncPreview.self, from: JSONEncoder().encode(preview))
+        #expect(round.excluded == 0)
+    }
+
     @Test("any negation disables the scope, since it can re-include what another pattern excluded")
     func negationDisablesScope() {
         let scope = SyncScope.backupScope(of: Self.set(excludes: ["*.pyc", "!keep.pyc"]), applying: .none)

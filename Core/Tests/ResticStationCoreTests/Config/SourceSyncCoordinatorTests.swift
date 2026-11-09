@@ -631,14 +631,98 @@ struct SourceSyncCoordinatorTests {
         #expect(try await f.apply(f.preview()).status == "synchronized")
         try f.write("bytecode", "old/__pycache__/m.pyc")
         try FileManager.default.removeItem(at: f.peer.appendingPathComponent("old"))
-        let preview = try await f.preview()
+        let preview = try await f.preview(includePaths: true)
         #expect(preview.conflicts == 2 && preview.removals == 0 && preview.previewToken == nil)
+        #expect(preview.changes?.first { $0.path == "old" }?.reason?.contains("old/__pycache__") == true)
         #expect(FileManager.default.fileExists(atPath: f.local.appendingPathComponent("old/__pycache__/m.pyc").path))
         // Removing only the in-scope file is still an ordinary removal.
         try f.write("module", "old/m.py", peer: true)
         try FileManager.default.removeItem(at: f.peer.appendingPathComponent("old/m.py"))
         let narrower = try await f.preview()
         #expect(narrower.conflicts == 0 && narrower.removals == 1)
+    }
+
+    @Test("an excluded entry that appears in a folder being removed stops the commit before anything moves (#202)")
+    func hiddenEntryAfterPreviewRefusesCommit() async throws {
+        let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
+        await f.backups.setScope(Self.pycache)
+        try f.write("module", "old/m.py")
+        #expect(try await f.apply(f.preview()).status == "synchronized")
+        try FileManager.default.removeItem(at: f.peer.appendingPathComponent("old"))
+        let preview = try await f.preview()
+        #expect(preview.removals == 2 && preview.conflicts == 0)
+        let error = await #expect(throws: SourceSyncError.self) {
+            try await SourceSyncCoordinator.$afterDurablePhase.withValue({ at in
+                if at == "protected" { try f.write("bytecode", "old/__pycache__/m.pyc") }
+            }) { try await f.apply(preview) }
+        }
+        #expect(error?.description.contains("old/__pycache__") == true)
+        #expect(error?.description.contains("sync recover") == true)
+        #expect(FileManager.default.fileExists(atPath: f.local.appendingPathComponent("old/m.py").path))
+        #expect(FileManager.default.fileExists(atPath: f.local.appendingPathComponent("old/__pycache__/m.pyc").path))
+        // Moving the entry out lets the same operation finish.
+        try FileManager.default.removeItem(at: f.local.appendingPathComponent("old/__pycache__"))
+        #expect(try await f.coordinator.recover(set: f.set, group: f.group, machineId: "laptop", binding: "fixture").status == "synchronized")
+        #expect(!FileManager.default.fileExists(atPath: f.local.appendingPathComponent("old").path))
+    }
+
+    @Test("an excluded entry that appears between preview and apply is refused at prepare, cancellably (#202)")
+    func hiddenEntryBeforeApplyRefusesPrepare() async throws {
+        let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
+        await f.backups.setScope(Self.pycache)
+        try f.write("module", "old/m.py")
+        #expect(try await f.apply(f.preview()).status == "synchronized")
+        try FileManager.default.removeItem(at: f.peer.appendingPathComponent("old"))
+        let preview = try await f.preview()
+        try f.write("bytecode", "old/__pycache__/m.pyc")
+        await #expect(throws: SourceSyncError.self) { try await f.apply(preview) }
+        #expect(await f.backups.counts().0 == 0, "refused before protection")
+        #expect(try SourceSyncCoordinator.status(paths: f.paths, setId: f.set.id, groupId: f.group.id).canCancel)
+        #expect(FileManager.default.fileExists(atPath: f.local.appendingPathComponent("old/m.py").path))
+    }
+
+    @Test("a scope that changed since the preview refuses before anything installs (#202)")
+    func changedScopeRefuses() async throws {
+        let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
+        try f.write("module", "m.py")
+        let preview = try await f.preview()
+        await f.backups.setScope(Self.pycache)
+        await #expect(throws: SourceSyncError.stalePlan) { try await f.apply(preview) }
+        #expect(!FileManager.default.fileExists(atPath: f.peer.appendingPathComponent("m.py").path))
+        // Changed while the operation waits in its reservation phase.
+        await f.backups.setScope(.everything)
+        let second = try await f.preview()
+        await #expect(throws: SourceSyncError.self) {
+            try await SourceSyncCoordinator.$afterDurablePhase.withValue({ _ in throw SourceSyncError.transferFailed }) { try await f.apply(second) }
+        }
+        await f.backups.setScope(Self.pycache)
+        let error = await #expect(throws: SourceSyncError.self) {
+            try await f.coordinator.recover(set: f.set, group: f.group, machineId: "laptop", binding: "fixture")
+        }
+        #expect(error?.description.contains("exclusions changed") == true)
+        #expect(!FileManager.default.fileExists(atPath: f.peer.appendingPathComponent("m.py").path))
+        #expect(try await f.coordinator.cancelUnstarted(set: f.set, group: f.group, machineId: "laptop").status == "ready")
+    }
+
+    @Test("an endpoint binds the scope at prepare and refuses a commit naming another (#202)")
+    func endpointBindsScope() async throws {
+        let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
+        try f.write("module", "m.py")
+        var inventory = SyncEndpointRequest(action: .inventory, group: f.group, root: f.local.path)
+        inventory.scope = Self.pycache
+        let current = try SyncEndpointService.handle(inventory)
+        #expect(current.scope == Self.pycache)
+        var prepare = SyncEndpointRequest(action: .prepare, group: f.group, root: f.local.path, operationId: UUID(), expected: current.inventory)
+        prepare.scope = Self.pycache
+        _ = try SyncEndpointService.handle(prepare)
+        var commit = prepare
+        commit.action = .commit
+        commit.scope = SyncScope(patterns: ["*.py"])
+        #expect(throws: SourceSyncError.stalePlan) { try SyncEndpointService.handle(commit) }
+        commit.scope = nil
+        #expect(throws: SourceSyncError.stalePlan) { try SyncEndpointService.handle(commit) }
+        // Repeating the prepare with its own scope is still accepted.
+        _ = try SyncEndpointService.handle(prepare)
     }
 
     @Test("an agreed path that leaves the scope is never deleted for it (#202)")

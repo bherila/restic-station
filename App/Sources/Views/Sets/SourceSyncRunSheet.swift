@@ -114,7 +114,12 @@ struct SourceSyncRunSheet: View {
                         ForEach(changes) { change in
                             HStack {
                                 Text(action(change.action)).frame(width: 120, alignment: .leading)
-                                Text(change.path).textSelection(.enabled)
+                                VStack(alignment: .leading) {
+                                    Text(change.path).textSelection(.enabled)
+                                    if let reason = change.reason {
+                                        Text(reason).font(.caption).foregroundStyle(.secondary)
+                                    }
+                                }
                             }.font(.callout)
                         }
                     }

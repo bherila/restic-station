@@ -59,7 +59,11 @@ struct SourceSyncPlanCommand: AsyncParsableCommand, JSONRenderable {
         if json { CLIJSON.print(result) }
         else {
             print("Sync: \(result.copies) copies, \(result.removals) removals, \(result.conflicts) conflicts. Backup: all \(result.backupSourceCount) configured sources.")
-            if let changes = result.changes { for change in changes { print("\(change.action.rawValue): \(change.path)") } }
+            if let changes = result.changes {
+                for change in changes { print("\(change.action.rawValue): \(change.path)" + (change.reason.map { " (\($0))" } ?? "")) }
+            }
+            if result.excluded > 0 { print("Not synchronized, excluded from backups: \(result.excluded) path(s)") }
+            for path in result.excludedPaths ?? [] { print("  \(path)") }
             if let token = result.previewToken {
                 print("Preview token: \(token)\nApply with: sync apply --set \(set) --group \(result.groupId) --preview-token-stdin")
             } else { print("Resolve conflicts in the original copies and preview again. Ordinary backup is still available.") }

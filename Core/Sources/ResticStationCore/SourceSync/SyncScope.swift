@@ -55,14 +55,28 @@ public struct SyncScope: Codable, Equatable, Sendable {
         guard !(exact + folded).contains(where: { $0.trimmingCharacters(in: .whitespaces).hasPrefix("!") }) else {
             return .everything
         }
-        return SyncScope(patterns: unique(exact.filter(isDecidable)), caseInsensitivePatterns: unique(folded.filter(isDecidable)))
+        return SyncScope(patterns: unique(exact.filter(isDecidable)),
+                         caseInsensitivePatterns: unique(folded.filter { isDecidable($0) && $0.unicodeScalars.allSatisfy(\.isASCII) }))
     }
 
     /// Whether the set's backup excludes this relative path, or a directory
     /// above it within the sync folder.
     public func excludes(_ relativePath: String) -> Bool {
         patterns.contains { GlobalExcludeAncestorSafety.matchesSourceOrAncestor(pattern: $0, sourcePath: relativePath, caseInsensitive: false) }
-            || caseInsensitivePatterns.contains { GlobalExcludeAncestorSafety.matchesSourceOrAncestor(pattern: $0, sourcePath: relativePath, caseInsensitive: true) }
+            || caseInsensitivePatterns.contains {
+                GlobalExcludeAncestorSafety.matchesSourceOrAncestor(pattern: Self.asciiLowercased($0), sourcePath: Self.asciiLowercased(relativePath), caseInsensitive: false)
+            }
+    }
+
+    /// Folds only `A`–`Z`. restic lowercases with Go's rules, which differ
+    /// from Swift's for some non-ASCII letters; folding less than restic can
+    /// only keep a path in scope that the backup excludes, which
+    /// verification then refuses, never the reverse. Non-ASCII
+    /// case-insensitive patterns are not decidable for the same reason.
+    static func asciiLowercased(_ value: String) -> String {
+        String(String.UnicodeScalarView(value.unicodeScalars.map { scalar in
+            (65...90).contains(scalar.value) ? Unicode.Scalar(scalar.value + 32)! : scalar
+        }))
     }
 
     /// A relative glob of literal components, `*`, `?` and `**`, which

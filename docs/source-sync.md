@@ -90,7 +90,9 @@ verification refused every sync until someone deleted it by hand.
 The scope is the backup's own `--exclude` and `--iexclude` lists for this
 set on the coordinating computer, after the catalogue patterns held back for
 swallowing a source. Only patterns that a relative path decides exactly as
-restic does narrow it: literal components, `*`, `?` and `**`. Anchored
+restic does narrow it: literal components, `*`, `?` and `**`, and for the
+case-insensitive list ASCII only, folded A–Z only (restic folds with Go's
+rules, which differ from Swift's for some letters). Anchored
 patterns, environment variables, character classes and escapes are ignored,
 which keeps their paths in scope, and any negation anywhere disables the
 scope, since a later `!pattern` can re-include what another excluded.
@@ -107,7 +109,10 @@ reading, hashing or descending into them, and report the topmost ones. The
 preview counts them once across both copies (`excluded`) and names the first
 ten with `--include-paths` (`excludedPaths`). The plan records the scope,
 and each endpoint binds it at prepare, so every later inventory of the
-operation means the same thing. An endpoint whose helper predates the scope
+operation means the same thing. The configuration binding does not cover
+this host's `global-excludes.json`, so apply derives the scope again and
+refuses a changed one as stale, and a resume before installation refuses it
+too, naming `--cancel-unstarted`. An endpoint whose helper predates the scope
 ignores it, so the coordinator requires each reply to echo it. With anything
 excluded, a sync with an older helper on the other computer refuses until
 that helper is updated. With nothing excluded, the two still work together
@@ -116,9 +121,13 @@ as before.
 Two cases would touch an entry the plan cannot see, and both conflict. One
 is removing a directory that holds excluded entries on the copy it is
 removed from: those entries are not in the protection backup, and removal
-would discard them. The endpoint refuses it again at prepare if one appeared
-since the preview. The other is a path whose name differs only by case or
-normalization from an excluded entry on either copy. An agreed path that
+would discard them. Such a conflict carries a `reason` naming the entry.
+Each endpoint refuses the removal again at prepare and once more at commit,
+before anything moves, if such an entry appeared since the preview; the
+error names it, and once it is moved out of the folder the operation
+resumes. The other is a path whose name differs only by case or
+normalization from an excluded entry on either copy, also with a `reason`.
+An agreed path that
 leaves the scope plans nothing. The next agreement no longer lists it, so if
 it returns to scope it is reconciled as on a first run: copied where it is
 missing, never deleted.

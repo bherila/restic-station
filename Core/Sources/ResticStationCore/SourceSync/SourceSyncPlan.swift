@@ -68,6 +68,9 @@ public struct SyncChange: Codable, Equatable, Sendable, Identifiable {
     public var action: Action
     public var local: SyncItem?
     public var peer: SyncItem?
+    /// Why a conflict is one, where the cause is not visible in the two
+    /// values: an entry the backup excludes (#202).
+    public var reason: String?
     public var id: String { path }
 }
 
@@ -143,10 +146,14 @@ public enum SourceSyncPlanner {
             } else {
                 action = .conflict
             }
+            var reason: String?
             if ambiguous.contains(path) || (l != nil && r != nil && (l?.kind != r?.kind || l?.kind == .directory)) {
                 action = .conflict
+                if let hidden = folded[fold(path)]?.first(where: { $0 != path && !paths.contains($0) }) {
+                    reason = "Differs only by case or normalization from \(hidden), which the backup excludes."
+                }
             }
-            changes.append(.init(path: path, action: action, local: l, peer: r))
+            changes.append(.init(path: path, action: action, local: l, peer: r, reason: reason))
         }
         // A conflict or structural change at a directory governs its whole
         // subtree. Never execute a child's transfer through an ancestor
@@ -169,8 +176,9 @@ public enum SourceSyncPlanner {
             let change = changes[index]
             let hidden = change.action == .removeLocal && change.local?.kind == .directory ? localExcluded
                 : change.action == .removePeer && change.peer?.kind == .directory ? peerExcluded : []
-            if hidden.contains(where: { $0.hasPrefix(change.path + "/") }) {
+            if let entry = hidden.first(where: { $0.hasPrefix(change.path + "/") }) {
                 changes[index].action = .conflict
+                changes[index].reason = "Holds \(entry), which the backup excludes and removing the folder would discard. Move it out, or remove the folder by hand."
             }
         }
         let barriers = changes.filter { $0.action == .conflict }.map(\.path)

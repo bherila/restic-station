@@ -19,6 +19,27 @@ public struct SourceSyncPreview: Codable, Sendable {
     static let excludedSampleSize = 10
 }
 
+extension SourceSyncPreview {
+    private enum CodingKeys: String, CodingKey {
+        case setId, groupId, copies, removals, conflicts, backupSourceCount, previewToken, changes, excluded, excludedPaths
+    }
+
+    /// A report from a helper older than #202 has no `excluded`.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        setId = try c.decode(UUID.self, forKey: .setId)
+        groupId = try c.decode(UUID.self, forKey: .groupId)
+        copies = try c.decode(Int.self, forKey: .copies)
+        removals = try c.decode(Int.self, forKey: .removals)
+        conflicts = try c.decode(Int.self, forKey: .conflicts)
+        backupSourceCount = try c.decode(Int.self, forKey: .backupSourceCount)
+        previewToken = try c.decodeIfPresent(String.self, forKey: .previewToken)
+        changes = try c.decodeIfPresent([SyncChange].self, forKey: .changes)
+        excluded = try c.decodeIfPresent(Int.self, forKey: .excluded) ?? 0
+        excludedPaths = try c.decodeIfPresent([String].self, forKey: .excludedPaths)
+    }
+}
+
 public struct SourceSyncStatus: Codable, Sendable {
     public var groupId: UUID
     public var status: String
@@ -122,6 +143,10 @@ public struct SourceSyncCoordinator: Sendable {
               preview.binding == binding, preview.plan.conflicts.isEmpty,
               preview.plan.baselineGeneration == record.baseline?.generation else { throw SourceSyncError.stalePlan }
         let scope = preview.plan.scope ?? .everything
+        // The binding covers the configuration and machine file, not this
+        // host's global-excludes.json, which the scope also derives from.
+        // A changed scope would install what the final backup leaves out.
+        guard try await backups.scope(for: set) == scope else { throw SourceSyncError.stalePlan }
         let local = try await transport.request(request(.inventory, group: group, local: true, scope: scope), at: .init(path: group.localPath))
         let peer = try await transport.request(request(.inventory, group: group, local: false, scope: scope), at: group.peer)
         try Self.requireScope(scope, local: local, peer: peer)
@@ -311,6 +336,11 @@ public struct SourceSyncCoordinator: Sendable {
         do {
             if journal.phase == .reserved {
                 try revalidate()
+                // As at apply: until anything installs, the plan's scope must
+                // still be what the backup excludes (#202).
+                guard try await backups.scope(for: set) == (plan.scope ?? .everything) else {
+                    throw SourceSyncError.stateInvalid("The backup's exclusions changed after this sync was previewed and before it installed any files. Cancel it with sync recover --cancel-unstarted, then preview again.")
+                }
                 // A plan that displaces nothing runs no protection backup,
                 // which was its only check of the backup destination before
                 // either copy changes. Ask the primary repository for its

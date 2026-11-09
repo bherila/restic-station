@@ -157,6 +157,7 @@ public enum SyncEndpointService {
                 if record.activeOperation == nil {
                     guard expected.endpointGeneration == record.generation,
                           try inventory() == expected else { throw SourceSyncError.stalePlan }
+                    try refuseHiddenRemovals(request.operations, excluded: excluded)
                     record.activeOperation = operationId
                     try SyncDurability.write(record, named: "root.json", in: control)
                 }
@@ -168,6 +169,10 @@ public enum SyncEndpointService {
                   current.phase == .prepared || current.phase == .applying else { throw SourceSyncError.stalePlan }
             if current.phase == .prepared {
                 guard try inventory() == current.expected else { throw SourceSyncError.stalePlan }
+                // An excluded entry can appear inside a directory this
+                // operation removes at any time before its capture. Refuse
+                // while nothing here has moved, rather than fail halfway.
+                try refuseHiddenRemovals(current.operations, excluded: excluded)
                 guard current.operations == request.operations else { throw SourceSyncError.stalePlan }
                 try validateProtection(request, expected: current.expected)
                 for change in current.operations {
@@ -276,7 +281,7 @@ public enum SyncEndpointService {
     static func refuseHiddenRemovals(_ operations: [SyncEndpointOperation], excluded: [String]) throws {
         for change in operations where change.before?.kind == .directory && change.after?.kind != .directory {
             if excluded.contains(where: { $0.hasPrefix(change.path + "/") }) {
-                throw SourceSyncError.conflict("\(change.path) holds files its backup excludes, which removing it would discard. Move them out or remove the folder by hand, then preview again.")
+                throw SourceSyncError.conflict("\(change.path) holds files the backup excludes (\(excluded.first { $0.hasPrefix(change.path + "/") } ?? change.path)), which removing it would discard. Move them out of that folder, then resume this synchronization with sync recover (Resume in Sync & Back Up).")
             }
         }
     }
