@@ -2,10 +2,28 @@ import Foundation
 import Testing
 @testable import ResticStationCore
 
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#endif
+
 /// #156, Codex on #174: a launch made outside `DefaultProcessRunner` (the
 /// app's `Foundation.Process` children) must never land inside a spawn's
 /// dataless-policy window. `SpawnSerialization.run` holds the lock those
 /// spawns take; while it is held, no runner spawn can proceed.
+///
+/// #206: nothing here waits on the Swift cooperative pool or on a GCD global
+/// queue. The earlier version spawned through `DefaultProcessRunner.run`
+/// from a detached task and polled with `Task.sleep`, so it needed free pool
+/// threads to finish, and the parallel suite on a small hosted macOS runner
+/// sometimes left none for 20 s. On macOS both pools draw on one thread
+/// budget, so a test that parks either kind of thread starves the rest of
+/// the suite as well. Every wait is on a dedicated `Thread`; the test's task
+/// only receives the outcome. The property under test is the *launch*, so
+/// the spawner calls the runner's synchronous launch path, `spawnWithRetry`.
 @Suite struct SpawnSerializationTests {
     private final class Flag: @unchecked Sendable {
         private let lock = NSLock()
@@ -14,35 +32,74 @@ import Testing
         var isSet: Bool { lock.lock(); defer { lock.unlock() }; return value }
     }
 
+    private struct Outcome: Sendable {
+        var released = false
+        var launchReturned = false
+        var reaped = false
+    }
+
+    /// Runs `body` on its own thread; the awaiting task holds no thread
+    /// meanwhile and is resumed once with the result.
+    private static func onOwnThread<T: Sendable>(_ body: @escaping @Sendable () -> T) async -> T {
+        await withCheckedContinuation { continuation in
+            Thread { continuation.resume(returning: body()) }.start()
+        }
+    }
+
     @Test("a runner spawn waits while a serialized launch holds the spawn lock")
     func runnerSpawnWaitsForSerializedLaunch() async throws {
-        let spawned = Flag()
-        let finishedWhileHeld = Flag()
-        let released = Flag()
+        let launched = Flag()
+        let launchedWhileHeld = Flag()
+        let launchFailed = Flag()
+        let released = DispatchSemaphore(value: 0)
+        let launchDone = DispatchSemaphore(value: 0)
+        let reaped = DispatchSemaphore(value: 0)
 
-        // The holder runs on its own thread so the cooperative pool is free
-        // for the spawning task.
+        let spawn: @Sendable () -> Void = {
+            let signal = TerminationSignal()
+            do {
+                let process = try DefaultProcessRunner.spawnWithRetry(
+                    argv: ["/usr/bin/true"], env: [:], datalessFiles: nil,
+                    terminationSignal: signal
+                )
+                launched.set()
+                close(process.stdinWrite)
+                close(process.stdoutRead)
+                close(process.stderrRead)
+                launchDone.signal()
+                // The runner's waiter thread reaps the child and fires
+                // `signal`; wait here so no child outlives the test.
+                let deadline = ContinuousClock.now + .seconds(60)
+                while !signal.hasFired, ContinuousClock.now < deadline { usleep(10_000) }
+                if signal.hasFired { reaped.signal() }
+            } catch {
+                launchFailed.set()
+                launchDone.signal()
+                reaped.signal() // nothing to reap; do not wait out the bound
+            }
+        }
         let holder = Thread {
             SpawnSerialization.run {
-                Task.detached {
-                    _ = try? await DefaultProcessRunner().run(
-                        ["/usr/bin/true"], env: [:], currentDirectory: nil,
-                        onStdoutLine: nil, onStderrLine: nil, timeout: 30
-                    )
-                    spawned.set()
-                }
+                Thread(block: spawn).start()
                 Thread.sleep(forTimeInterval: 0.5)
-                if spawned.isSet { finishedWhileHeld.set() }
+                if launched.isSet { launchedWhileHeld.set() }
             }
-            released.set()
+            released.signal()
         }
         holder.start()
 
-        let deadline = ContinuousClock.now + .seconds(20)
-        while !(spawned.isSet && released.isSet), ContinuousClock.now < deadline {
-            try await Task.sleep(for: .milliseconds(20))
+        let outcome = await Self.onOwnThread {
+            var outcome = Outcome()
+            outcome.released = released.wait(timeout: .now() + 60) == .success
+            outcome.launchReturned = launchDone.wait(timeout: .now() + 60) == .success
+            outcome.reaped = reaped.wait(timeout: .now() + 60) == .success
+            return outcome
         }
-        #expect(!finishedWhileHeld.isSet, "a runner spawn completed while the serialized launch held the lock")
-        #expect(spawned.isSet, "the runner spawn never completed after the lock was released")
+        #expect(outcome.released, "the serialized launch never released the lock")
+        #expect(outcome.launchReturned, "the runner spawn never returned after the lock was released")
+        #expect(!launchFailed.isSet, "the runner spawn failed")
+        #expect(!launchedWhileHeld.isSet, "a runner spawn launched while the serialized launch held the lock")
+        #expect(launched.isSet)
+        #expect(outcome.reaped, "the spawned child was never reaped")
     }
 }

@@ -145,7 +145,7 @@ On a machine (or account) that has never run the app: download the release zip, 
 
 ## Updates (Sparkle)
 
-The app updates itself with [Sparkle](https://sparkle-project.org) 2.10.0
+The app updates itself with [Sparkle](https://sparkle-project.org) 2.10.1
 (pinned exactly in `project.yml`), reading the appcast attached to the
 **latest** GitHub release:
 `https://github.com/bherila/restic-station/releases/latest/download/appcast.xml`.

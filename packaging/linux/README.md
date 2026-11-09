@@ -22,7 +22,7 @@ if you had just installed one (issue #50).
 >
 > ```sh
 > curl -fsSL -o restic.bz2 \
->   https://github.com/restic/restic/releases/download/v0.18.1/restic_0.18.1_linux_amd64.bz2
+>   https://github.com/restic/restic/releases/download/v0.19.1/restic_0.19.1_linux_amd64.bz2
 > bunzip2 restic.bz2 && sudo install -m 0755 restic /usr/local/bin/restic
 > ```
 >
