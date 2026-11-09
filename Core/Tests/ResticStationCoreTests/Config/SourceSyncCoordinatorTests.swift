@@ -37,8 +37,14 @@ struct SourceSyncCoordinatorTests {
         /// Refuses copies once armed, like a local rsync removed mid-run.
         var copyRefusal: SourceSyncError?
         var copyRefusalArmed: Flag?
+        /// The endpoint at this path behaves like a helper from before #202:
+        /// it never sees the scope and never reports one.
+        var legacyRoot: String?
         func request(_ request: SyncEndpointRequest, at endpoint: SyncEndpoint) async throws -> SyncEndpointReply {
+            var request = request
+            if request.root == legacyRoot { request.scope = nil }
             var reply = try SyncEndpointService.handle(request)
+            if request.root == legacyRoot { reply.scope = nil; reply.excluded = nil }
             if request.action == .inventory || request.action == .prepare { reply.transfer = reportedTools }
             return reply
         }
@@ -69,6 +75,9 @@ struct SourceSyncCoordinatorTests {
 
         func failProtection() { protectionFails = true }
         func setDestinationDown(_ value: Bool) { destinationDown = value }
+        var syncScope = SyncScope.everything
+        func setScope(_ value: SyncScope) { syncScope = value }
+        func scope(for set: BackupSet) -> SyncScope { syncScope }
         func checks() -> Int { destinationChecks }
         func failFinal(_ value: Bool) { finalFails = value }
         func counts() -> (Int, Int) { (protectedSets.count, finalSets.count) }
@@ -576,6 +585,104 @@ struct SourceSyncCoordinatorTests {
         #expect(try await f.apply(f.preview()).status == "synchronized")
         #expect(await f.backups.checks() == 1)
         #expect(await f.backups.counts().0 == 1)
+    }
+
+    // MARK: - #202: sync covers only what the backup covers
+
+    static let pycache = SyncScope(caseInsensitivePatterns: ["__pycache__"])
+
+    @Test("paths the backup excludes are neither copied, conflicted nor deleted (#202)")
+    func excludedPathsAreOutOfScope() async throws {
+        let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
+        await f.backups.setScope(Self.pycache)
+        try f.write("local bytecode", "pkg/__pycache__/m.pyc")
+        try f.write("peer bytecode", "pkg/__pycache__/m.pyc", peer: true)
+        try f.write("only here", "pkg/__pycache__/extra.pyc")
+        try f.write("source", "pkg/m.py")
+        let preview = try await f.coordinator.preview(set: f.set, group: f.group, machineId: "laptop", config: f.config, binding: "fixture", includePaths: true)
+        #expect(preview.conflicts == 0 && preview.copies == 1 && preview.removals == 0)
+        #expect(preview.changes?.map(\.path) == ["pkg/m.py"])
+        #expect(preview.excluded == 1 && preview.excludedPaths == ["pkg/__pycache__"])
+        #expect(try await f.apply(preview).status == "synchronized")
+        #expect(try String(contentsOf: f.peer.appendingPathComponent("pkg/m.py"), encoding: .utf8) == "source")
+        #expect(try String(contentsOf: f.local.appendingPathComponent("pkg/__pycache__/m.pyc"), encoding: .utf8) == "local bytecode")
+        #expect(try String(contentsOf: f.peer.appendingPathComponent("pkg/__pycache__/m.pyc"), encoding: .utf8) == "peer bytecode")
+        #expect(!FileManager.default.fileExists(atPath: f.peer.appendingPathComponent("pkg/__pycache__/extra.pyc").path))
+        // Nothing excluded reached the protection vault, and a replacement
+        // beside the differing bytecode is protected and applied.
+        try f.write("edited", "pkg/m.py", peer: true)
+        try f.write("regenerated", "pkg/__pycache__/m.pyc")
+        let second = try await f.preview()
+        #expect(second.conflicts == 0 && second.copies == 1)
+        #expect(try await f.apply(second).status == "synchronized")
+        #expect(await f.backups.protectedInventories().last?.items.keys.contains { $0.contains("__pycache__") } == false)
+        #expect(try String(contentsOf: f.local.appendingPathComponent("pkg/m.py"), encoding: .utf8) == "edited")
+        #expect(try String(contentsOf: f.peer.appendingPathComponent("pkg/__pycache__/m.pyc"), encoding: .utf8) == "peer bytecode")
+        // The paths are omitted without --include-paths; the count is not.
+        let quiet = try await f.preview()
+        #expect(quiet.excluded == 1 && quiet.excludedPaths == nil)
+    }
+
+    @Test("a directory holding excluded entries is not removed with them (#202)")
+    func hiddenEntriesBlockRemoval() async throws {
+        let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
+        await f.backups.setScope(Self.pycache)
+        try f.write("module", "old/m.py")
+        #expect(try await f.apply(f.preview()).status == "synchronized")
+        try f.write("bytecode", "old/__pycache__/m.pyc")
+        try FileManager.default.removeItem(at: f.peer.appendingPathComponent("old"))
+        let preview = try await f.preview()
+        #expect(preview.conflicts == 2 && preview.removals == 0 && preview.previewToken == nil)
+        #expect(FileManager.default.fileExists(atPath: f.local.appendingPathComponent("old/__pycache__/m.pyc").path))
+        // Removing only the in-scope file is still an ordinary removal.
+        try f.write("module", "old/m.py", peer: true)
+        try FileManager.default.removeItem(at: f.peer.appendingPathComponent("old/m.py"))
+        let narrower = try await f.preview()
+        #expect(narrower.conflicts == 0 && narrower.removals == 1)
+    }
+
+    @Test("an agreed path that leaves the scope is never deleted for it (#202)")
+    func agreedPathLeavingScopeIsKept() async throws {
+        let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
+        try f.write("cached", "pkg/__pycache__/m.pyc")
+        try f.write("module", "pkg/m.py")
+        #expect(try await f.apply(f.preview()).status == "synchronized")
+        await f.backups.setScope(Self.pycache)
+        try FileManager.default.removeItem(at: f.local.appendingPathComponent("pkg/__pycache__"))
+        let preview = try await f.preview()
+        #expect(preview.removals == 0 && preview.copies == 0 && preview.conflicts == 0)
+        #expect(try await f.apply(preview).status == "synchronized")
+        #expect(FileManager.default.fileExists(atPath: f.peer.appendingPathComponent("pkg/__pycache__/m.pyc").path))
+        // Back in scope, it is reconciled as a first sync: copied back to
+        // the copy that lacks it, not deleted from the one that has it.
+        await f.backups.setScope(.everything)
+        let returned = try await f.preview()
+        #expect(returned.removals == 0 && returned.copies == 2 && returned.conflicts == 0)
+    }
+
+    @Test("a name the other copy holds as an excluded entry is a conflict (#202)")
+    func excludedNameCollision() async throws {
+        let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
+        await f.backups.setScope(SyncScope(patterns: ["*.tmp"]))
+        try f.write("excluded here", "notes.tmp")
+        try f.write("in scope there", "NOTES.TMP", peer: true)
+        let preview = try await f.preview()
+        #expect(preview.conflicts == 1 && preview.previewToken == nil)
+    }
+
+    @Test("an older helper on the other computer cannot apply the scope, so preview refuses (#202)")
+    func olderPeerRefused() async throws {
+        let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
+        await f.backups.setScope(Self.pycache)
+        try f.write("module", "m.py")
+        let older = SourceSyncCoordinator(paths: f.paths, transport: LocalTransport(legacyRoot: f.peer.path), backups: f.backups)
+        let error = await #expect(throws: SourceSyncError.self) {
+            try await older.preview(set: f.set, group: f.group, machineId: "laptop", config: f.config, binding: "fixture")
+        }
+        #expect(error?.description.contains("too old") == true)
+        // With nothing excluded, the older helper still syncs as before.
+        await f.backups.setScope(.everything)
+        #expect(try await older.preview(set: f.set, group: f.group, machineId: "laptop", config: f.config, binding: "fixture").copies == 1)
     }
 
     @Test("consumed and day-old previews are removed; a fresh unconsumed one is kept")

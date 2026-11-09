@@ -95,6 +95,16 @@ struct SourceSyncRunSheet: View {
                 }
             } else if let preview = previews[group.id] {
                 Text("\(preview.copies) copies · \(preview.removals) removals · \(preview.conflicts) conflicts")
+                if preview.excluded > 0 {
+                    DisclosureGroup("\(preview.excluded) \(preview.excluded == 1 ? "path" : "paths") not synchronized: excluded from backups") {
+                        ForEach(preview.excludedPaths ?? [], id: \.self) { path in
+                            Text(path).textSelection(.enabled)
+                        }.font(.callout)
+                        if preview.excluded > (preview.excludedPaths?.count ?? 0) {
+                            Text("and \(preview.excluded - (preview.excludedPaths?.count ?? 0)) more").font(.footnote).foregroundStyle(.secondary)
+                        }
+                    }.font(.callout)
+                }
                 if preview.conflicts > 0 {
                     Text("Resolve the listed conflicts in the original folders, then refresh the preview. You can back up now.")
                         .font(.callout).foregroundStyle(.orange)

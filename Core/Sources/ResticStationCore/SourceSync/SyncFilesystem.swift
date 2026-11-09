@@ -69,6 +69,16 @@ public enum SourceSyncFilesystem {
     /// scan (``SyncHashCache``). Proof inventories of private staging,
     /// vaults and restores never pass one: they always read every byte.
     public static func inventory(at path: String, hashes: SyncHashCache.Session? = nil) throws -> SyncInventory {
+        try scopedInventory(at: path, hashes: hashes, scope: .everything).inventory
+    }
+
+    /// The inventory of the entries `scope` covers, and the topmost entries
+    /// it leaves out (#202). An excluded entry is neither inspected, hashed
+    /// nor descended into; its name still takes part in the same-directory
+    /// case and normalization check.
+    public static func scopedInventory(
+        at path: String, hashes: SyncHashCache.Session? = nil, scope: SyncScope
+    ) throws -> (inventory: SyncInventory, excluded: [String]) {
         guard SourceSyncGroup.isAbsoluteCanonical(path),
               !reachesCloudStorage(path) else {
             throw SourceSyncError.unsafeRoot("Choose an absolute local folder outside a cloud-sync provider.")
@@ -77,8 +87,9 @@ public enum SourceSyncFilesystem {
         let identity = try rootIdentity(root)
         var items: [String: SyncItem] = [:]
         var names: Set<String> = []
-        try scan(root, relative: "", items: &items, names: &names, hashes: hashes)
-        return SyncInventory(rootIdentity: identity, items: items)
+        var excluded: [String] = []
+        try scan(root, relative: "", items: &items, names: &names, hashes: hashes, scope: scope, excluded: &excluded)
+        return (SyncInventory(rootIdentity: identity, items: items), excluded.sorted())
     }
 
     static func openRoot(_ path: String) throws -> DirectoryHandle {
@@ -312,7 +323,8 @@ public enum SourceSyncFilesystem {
 
     private static func scan(
         _ directory: DirectoryHandle, relative: String,
-        items: inout [String: SyncItem], names: inout Set<String>, hashes: SyncHashCache.Session? = nil
+        items: inout [String: SyncItem], names: inout Set<String>, hashes: SyncHashCache.Session? = nil,
+        scope: SyncScope, excluded: inout [String]
     ) throws {
         try refuseRepository(directory.descriptor)
         var before = stat(), after = stat()
@@ -342,10 +354,12 @@ public enum SourceSyncFilesystem {
             guard names.insert(folded).inserted else {
                 throw SourceSyncError.unsafeRoot("Two filenames differ only by case or Unicode normalization.")
             }
+            if scope.excludes(path) { excluded.append(path); continue }
             guard let value = try item(named: name, in: directory, relative: path, hashes: hashes) else { throw changed() }
             items[path] = value
             if value.kind == .directory {
-                try scan(openDirectory(name, in: directory), relative: path, items: &items, names: &names, hashes: hashes)
+                try scan(openDirectory(name, in: directory), relative: path, items: &items, names: &names, hashes: hashes,
+                         scope: scope, excluded: &excluded)
             }
         }
         guard fstat(directory.descriptor, &after) == 0, stamp(before) == stamp(after) else { throw changed() }

@@ -130,6 +130,28 @@ test ! -e "$WORK/other copy/created"
 mv "$WORK/repo-config" "$WORK/repo/config"
 "$HELPER" sync recover --set "$SET" >/dev/null
 cmp "$WORK/workspace/notes/created" "$WORK/other copy/created"
+# Sync covers only what the backup covers (#202): bytecode the set's backup
+# excludes differs between the copies, yet a replacement beside it is
+# protected, restore-verified and applied, and neither bytecode file moves.
+python3 - "$WORK/state/config.json" <<'PY'
+import json, pathlib, sys
+p=pathlib.Path(sys.argv[1]); c=json.loads(p.read_text()); c["sets"][0]["excludes"]=["__pycache__"]; p.write_text(json.dumps(c))
+PY
+mkdir -p "$WORK/workspace/notes/pkg/__pycache__" "$WORK/other copy/pkg/__pycache__"
+printf '%s' 'local bytecode' > "$WORK/workspace/notes/pkg/__pycache__/m.pyc"
+printf '%s' 'peer bytecode' > "$WORK/other copy/pkg/__pycache__/m.pyc"
+printf '%s' 'replaced beside bytecode' > "$WORK/other copy/from peer"
+"$HELPER" sync plan --set "$SET" --include-paths --json > "$WORK/plan.json"
+jq -e '.ok and .data.conflicts == 0 and .data.excluded == 1 and .data.excludedPaths == ["pkg/__pycache__"]' "$WORK/plan.json" >/dev/null \
+    || { echo 'FAIL: excluded bytecode was planned' >&2; cat "$WORK/plan.json" >&2; exit 1; }
+apply
+test "$(cat "$WORK/workspace/notes/from peer")" = 'replaced beside bytecode'
+test "$(cat "$WORK/workspace/notes/pkg/__pycache__/m.pyc")" = 'local bytecode'
+test "$(cat "$WORK/other copy/pkg/__pycache__/m.pyc")" = 'peer bytecode'
+printf '%s' 'peer version' > "$WORK/other copy/from peer"
+plan
+apply
+test "$(cat "$WORK/workspace/notes/from peer")" = 'peer version'
 # Excluding the private protection payload must refuse before replacing a
 # live value, even when an ordinary backup snapshot can still be created.
 printf '%s' 'excluded replacement' > "$WORK/other copy/from peer"
@@ -147,4 +169,4 @@ test "$(cat "$WORK/workspace/notes/from peer")" = 'peer version'
 RESTIC_PASSWORD_COMMAND="$PASSWORD_COMMAND" "$RESTIC" -r "$WORK/repo" snapshots --json > "$WORK/snapshots.json"
 jq -e 'length >= 6 and ([.[] | select(.parent == null)] | length) == 1' "$WORK/snapshots.json" >/dev/null \
     || { echo 'FAIL: sync backups ran without a parent snapshot' >&2; jq -c '[.[] | {id: .short_id, parent}]' "$WORK/snapshots.json" >&2; exit 1; }
-echo 'PASS: source sync, real restore proof, modification times, independent backup scope, deletion, replay, exclusion refusal, unreachable-repository refusal and parent snapshots'
+echo 'PASS: source sync, real restore proof, modification times, independent backup scope, deletion, replay, exclusion refusal, unreachable-repository refusal, backup-excluded paths and parent snapshots'

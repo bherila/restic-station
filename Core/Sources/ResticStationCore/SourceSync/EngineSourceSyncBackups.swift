@@ -35,6 +35,10 @@ public struct EngineSourceSyncBackups: SourceSyncBackingUp {
         return try SyncProtectionReceipt.verify(repositoryId: repositoryId, snapshotId: snapshot, expected: inventory, restoredAt: restored)
     }
 
+    public func scope(for set: BackupSet) async throws -> SyncScope {
+        try engine.syncScope(for: set)
+    }
+
     public func checkDestination(set: BackupSet) async throws {
         guard let primary = set.destinations.first(where: \.isPrimary) else { throw SourceSyncError.destinationUnavailable }
         // Bounded like the reachability probe (docs/restic-cli.md §cat

@@ -212,6 +212,8 @@ public protocol SourceSyncBackingUp: Sendable {
     /// with no backup or restore. Throws `destinationUnavailable` otherwise.
     /// Fails a plan with no protection early (#204); it authorizes nothing.
     func checkDestination(set: BackupSet) async throws
+    /// What a sync of `set` covers: what its backups cover (#202).
+    func scope(for set: BackupSet) async throws -> SyncScope
     /// Preserve the configured backup scope and existing mirror policy.
     func backup(set: BackupSet, retaining vault: URL?) async throws
 }
