@@ -35,6 +35,18 @@ public struct EngineSourceSyncBackups: SourceSyncBackingUp {
         return try SyncProtectionReceipt.verify(repositoryId: repositoryId, snapshotId: snapshot, expected: inventory, restoredAt: restored)
     }
 
+    public func checkDestination(set: BackupSet) async throws {
+        guard let primary = set.destinations.first(where: \.isPrimary) else { throw SourceSyncError.destinationUnavailable }
+        // Bounded like the reachability probe (docs/restic-cli.md §cat
+        // config): restic's own retries against a down remote must not hold
+        // apply, its locks and the revision hold for minutes. Only "did not
+        // answer" becomes destinationUnavailable; a missing secret, a failed
+        // launch or cancellation keeps its own error and classification.
+        do { _ = try await identity(primary, timeout: Reachability.probeTimeout) }
+        catch SourceSyncError.protectionFailed { throw SourceSyncError.destinationUnavailable }
+        catch ResticRunnerError.timedOut { throw SourceSyncError.destinationUnavailable }
+    }
+
     public func backup(set: BackupSet, retaining vault: URL?) async throws {
         if let vault {
             do {
@@ -85,8 +97,8 @@ public struct EngineSourceSyncBackups: SourceSyncBackingUp {
         }
     }
 
-    private func identity(_ destination: Destination) async throws -> String {
-        let result = try await restic.run(.catConfig(repo: destination.repoURL), for: ResticInvocation(destination: destination))
+    private func identity(_ destination: Destination, timeout: TimeInterval? = nil) async throws -> String {
+        let result = try await restic.run(.catConfig(repo: destination.repoURL), for: ResticInvocation(destination: destination), timeout: timeout)
         guard result.status == .success else { throw SourceSyncError.protectionFailed }
         let config: RepositoryConfig
         do { config = try parseRepositoryConfig(Data(result.rawOutput.utf8)) }

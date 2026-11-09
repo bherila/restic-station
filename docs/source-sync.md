@@ -123,10 +123,24 @@ that only creates entries absent from both copies displaces nothing, so it
 runs no protection backup or verification restore; each endpoint still
 refuses to install any operation that has a prior value without a receipt.
 The final backup records and restore-verifies that operation's vault either
-way. Two consequences: such a plan's `recovery.json` first reaches the
-repository with the final backup, and a backup destination that is down
-is first noticed after installation, leaving the operation resumable
-(`backupNeedsAttention`) rather than cancellable.
+way, so such a plan's `recovery.json` first reaches the repository with the
+final backup.
+
+Without a protection backup, nothing would test the backup destination
+before either copy changed. So before any endpoint prepares, such a plan
+asks the primary repository for its identity (`cat config`): no backup, no
+restore, no snapshot (#204), bounded at 10 seconds like the reachability
+probe. If the repository does not answer with a well-formed ID in time,
+apply refuses with `restic_failed`, and neither folder changes. A missing
+secret or a restic that cannot launch refuses with its own error instead.
+Either way the operation stays in its reservation phase. It can be resumed
+once the repository answers, which checks again, or cancelled with
+`--cancel-unstarted`, which is the way out when the fix changes settings. The check authorizes nothing; the final backup remains
+the proof. Mirrors are not checked up front: a mirror that is down is first
+noticed by the final backup's copies, leaving the operation resumable
+(`backupNeedsAttention`) rather than cancellable, as with any other final
+backup failure. A plan with protection skips the check, because its
+protection backup already exercises the destination before installation.
 
 Coverage is an exact repository/snapshot/version proof, not last-backup
 time. An excluded payload is not covered. Verify protected content through

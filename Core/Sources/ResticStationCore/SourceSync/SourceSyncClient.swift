@@ -208,6 +208,10 @@ public protocol SourceSyncBackingUp: Sendable {
     /// Back up every configured source plus this operation's private vault,
     /// restore the vault into an empty directory, and validate its contents.
     func protect(set: BackupSet, vault: URL, inventory: SyncInventory) async throws -> SyncProtectionReceipt
+    /// Confirm the primary repository answers with a well-formed identity,
+    /// with no backup or restore. Throws `destinationUnavailable` otherwise.
+    /// Fails a plan with no protection early (#204); it authorizes nothing.
+    func checkDestination(set: BackupSet) async throws
     /// Preserve the configured backup scope and existing mirror policy.
     func backup(set: BackupSet, retaining vault: URL?) async throws
 }

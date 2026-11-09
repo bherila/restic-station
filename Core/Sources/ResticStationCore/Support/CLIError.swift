@@ -943,7 +943,7 @@ extension CLIFailure {
             case .busy: code = .setBusy
             case .invalidConfiguration, .unsafeRoot: code = .configInvalid
             case .stalePlan, .conflict, .stateInvalid: code = .operationNotAllowed
-            case .protectionFailed, .transferFailed: code = .resticFailed
+            case .protectionFailed, .transferFailed, .destinationUnavailable: code = .resticFailed
             case .rsyncNotFound: code = .rsyncNotFound
             }
             return CLIFailure(code: code, message: bounded(syncError.description))

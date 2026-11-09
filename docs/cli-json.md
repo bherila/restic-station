@@ -589,15 +589,17 @@ the way out. After that, unrelated changes cannot strand a partly installed
 operation: recover rechecks only this set's policy and sync folder, then
 binds the rest of the run to the current revision.
 A token is already consumed and is never reused. `--cancel-unstarted` is
-accepted only before installation has started, including failed transfer
-or protection in the reservation phase. Once installation begins, recover
+accepted only before installation has started, including failed transfer,
+protection or repository check in the reservation phase. Once installation begins, recover
 must finish that same operation and retain all unexpected captured values.
 
 `status` is `ready`, `running`, `synchronized`, `needsRecovery`, or
 `backupNeedsAttention`. A failure returns the usual error envelope;
 `set_busy` means local contention, `operation_not_allowed` means stale or
 incompatible state, `config_invalid` means an unsupported root/configuration,
-`restic_failed` means transfer or recovery protection failed, and
+`restic_failed` means transfer or recovery protection failed, or, for a
+plan that only creates, that the primary repository could not be reached
+before either copy changed; and
 `rsync_not_found` means one of the computers needs rsync installed. Ordinary
 `run-set --kind backup` remains available independently of peer state.
 See [source-sync.md](source-sync.md) for limits and recovery semantics.
