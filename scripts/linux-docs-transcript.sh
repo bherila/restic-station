@@ -3,7 +3,7 @@
 # `docs/linux.md` quotes, against a genuine (non-container) Linux host with
 # real restic installed: `.github/workflows/ci.yml`'s `linux-integration`
 # job, which already builds/unpacks the static release binary and installs
-# real restic 0.18.1 for T29's fixture-flow test.
+# the real restic its RESTIC_VERSION pins for T29's fixture-flow test.
 #
 # T30 (issue #32) requires every command printed in docs/linux.md to have
 # actually been run on Linux, not paraphrased or copied from a macOS
