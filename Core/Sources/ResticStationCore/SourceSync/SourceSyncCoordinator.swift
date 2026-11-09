@@ -11,6 +11,33 @@ public struct SourceSyncPreview: Codable, Sendable {
     public var backupSourceCount: Int
     public var previewToken: String?
     public var changes: [SyncChange]?
+    /// Entries left out of the sync because the set's backup excludes them
+    /// (#202): the topmost such entries on either copy, counted once each.
+    public var excluded: Int = 0
+    /// The first of those, sorted, with `--include-paths` only.
+    public var excludedPaths: [String]?
+    static let excludedSampleSize = 10
+}
+
+extension SourceSyncPreview {
+    private enum CodingKeys: String, CodingKey {
+        case setId, groupId, copies, removals, conflicts, backupSourceCount, previewToken, changes, excluded, excludedPaths
+    }
+
+    /// A report from a helper older than #202 has no `excluded`.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        setId = try c.decode(UUID.self, forKey: .setId)
+        groupId = try c.decode(UUID.self, forKey: .groupId)
+        copies = try c.decode(Int.self, forKey: .copies)
+        removals = try c.decode(Int.self, forKey: .removals)
+        conflicts = try c.decode(Int.self, forKey: .conflicts)
+        backupSourceCount = try c.decode(Int.self, forKey: .backupSourceCount)
+        previewToken = try c.decodeIfPresent(String.self, forKey: .previewToken)
+        changes = try c.decodeIfPresent([SyncChange].self, forKey: .changes)
+        excluded = try c.decodeIfPresent(Int.self, forKey: .excluded) ?? 0
+        excludedPaths = try c.decodeIfPresent([String].self, forKey: .excludedPaths)
+    }
 }
 
 public struct SourceSyncStatus: Codable, Sendable {
@@ -67,13 +94,17 @@ public struct SourceSyncCoordinator: Sendable {
         guard record.activeOperation == nil else {
             throw SourceSyncError.stateInvalid("An interrupted synchronization needs recovery before another preview.")
         }
-        let local = try await transport.request(request(.inventory, group: group, local: true), at: .init(path: group.localPath))
-        let peer = try await transport.request(request(.inventory, group: group, local: false), at: group.peer)
+        let scope = try await backups.scope(for: set)
+        let local = try await transport.request(request(.inventory, group: group, local: true, scope: scope), at: .init(path: group.localPath))
+        let peer = try await transport.request(request(.inventory, group: group, local: false, scope: scope), at: group.peer)
+        try Self.requireScope(scope, local: local, peer: peer)
         try await transport.checkTransfer(peer: peer, at: group.peer)
         if record.baseline == nil && (record.hasHistory || local.lastCompletedOperation != nil || peer.lastCompletedOperation != nil) {
             throw SourceSyncError.stateInvalid("The previous agreement is missing. Restore synchronization state before continuing.")
         }
-        let plan = try SourceSyncPlanner.plan(group: group, local: local.inventory, peer: peer.inventory, baseline: record.baseline)
+        let plan = try SourceSyncPlanner.plan(group: group, local: local.inventory, peer: peer.inventory, baseline: record.baseline,
+                                              scope: scope, localExcluded: local.excluded ?? [], peerExcluded: peer.excluded ?? [])
+        let excluded = Set(local.excluded ?? []).union(peer.excluded ?? []).sorted()
         let stored = StoredSyncPreview(id: UUID(), setId: set.id, plan: plan, binding: binding, createdAt: Date(), group: group)
         var token: String?
         store.removePreviews(savedBefore: Date().addingTimeInterval(-24 * 60 * 60))
@@ -90,7 +121,9 @@ public struct SourceSyncCoordinator: Sendable {
             copies: plan.changes.filter { $0.action == .copyToLocal || $0.action == .copyToPeer }.count,
             removals: plan.changes.filter { $0.action == .removeLocal || $0.action == .removePeer }.count,
             conflicts: plan.conflicts.count, backupSourceCount: set.sources.count,
-            previewToken: token, changes: includePaths ? plan.changes : nil
+            previewToken: token, changes: includePaths ? plan.changes : nil,
+            excluded: excluded.count,
+            excludedPaths: includePaths ? Array(excluded.prefix(SourceSyncPreview.excludedSampleSize)) : nil
         )
     }
 
@@ -109,8 +142,14 @@ public struct SourceSyncCoordinator: Sendable {
               preview.plan.groupFingerprint == (try group.bindingFingerprint),
               preview.binding == binding, preview.plan.conflicts.isEmpty,
               preview.plan.baselineGeneration == record.baseline?.generation else { throw SourceSyncError.stalePlan }
-        let local = try await transport.request(request(.inventory, group: group, local: true), at: .init(path: group.localPath))
-        let peer = try await transport.request(request(.inventory, group: group, local: false), at: group.peer)
+        let scope = preview.plan.scope ?? .everything
+        // The binding covers the configuration and machine file, not this
+        // host's global-excludes.json, which the scope also derives from.
+        // A changed scope would install what the final backup leaves out.
+        guard try await backups.scope(for: set) == scope else { throw SourceSyncError.stalePlan }
+        let local = try await transport.request(request(.inventory, group: group, local: true, scope: scope), at: .init(path: group.localPath))
+        let peer = try await transport.request(request(.inventory, group: group, local: false, scope: scope), at: group.peer)
+        try Self.requireScope(scope, local: local, peer: peer)
         guard local.inventory == preview.plan.local, peer.inventory == preview.plan.peer else { throw SourceSyncError.stalePlan }
         try await transport.checkTransfer(peer: peer, at: group.peer)
         let capability = try PreviewTokenStore(paths: paths).consume(token)
@@ -166,7 +205,7 @@ public struct SourceSyncCoordinator: Sendable {
         journal.phase = .cancelling
         try SyncDurability.write(journal, named: "journal.json", in: operation)
         for local in [true, false] {
-            var r = request(.cancel, group: group, local: local); r.operationId = id
+            var r = request(.cancel, group: group, local: local, scope: journal.preview.plan.scope); r.operationId = id
             _ = try await transport.request(r, at: local ? .init(path: group.localPath) : group.peer)
         }
         try cleanupVerificationCopies(in: operation)
@@ -284,7 +323,7 @@ public struct SourceSyncCoordinator: Sendable {
             try SyncCopyOptions.peer(journal.peerPrepared, basis: basis)
         }
         func endpointRequest(_ action: SyncEndpointRequest.Action, local: Bool) -> SyncEndpointRequest {
-            var r = request(action, group: group, local: local)
+            var r = request(action, group: group, local: local, scope: plan.scope)
             r.operationId = journal.preview.id
             r.expected = local ? plan.local : plan.peer
             r.operations = operations(plan, local: local)
@@ -297,6 +336,11 @@ public struct SourceSyncCoordinator: Sendable {
         do {
             if journal.phase == .reserved {
                 try revalidate()
+                // As at apply: until anything installs, the plan's scope must
+                // still be what the backup excludes (#202).
+                guard try await backups.scope(for: set) == (plan.scope ?? .everything) else {
+                    throw SourceSyncError.stateInvalid("The backup's exclusions changed after this sync was previewed and before it installed any files. Cancel it with sync recover --cancel-unstarted, then preview again.")
+                }
                 // A plan that displaces nothing runs no protection backup,
                 // which was its only check of the backup destination before
                 // either copy changes. Ask the primary repository for its
@@ -513,8 +557,24 @@ public struct SourceSyncCoordinator: Sendable {
         return items
     }
 
-    private func request(_ action: SyncEndpointRequest.Action, group: SourceSyncGroup, local: Bool) -> SyncEndpointRequest {
-        .init(action: action, group: group, root: local ? group.localPath : group.peer.path)
+    /// `scope` nil, as for an operation journaled before #202, sends none.
+    private func request(_ action: SyncEndpointRequest.Action, group: SourceSyncGroup, local: Bool, scope: SyncScope?) -> SyncEndpointRequest {
+        var r = SyncEndpointRequest(action: action, group: group, root: local ? group.localPath : group.peer.path)
+        r.scope = scope.flatMap { $0.isEverything ? nil : $0 }
+        return r
+    }
+
+    /// An endpoint older than #202 ignores the scope and inventories
+    /// everything. Planning against that would copy what the backup leaves
+    /// out, so refuse and name the fix.
+    static func requireScope(_ scope: SyncScope, local: SyncEndpointReply, peer: SyncEndpointReply) throws {
+        guard !scope.isEverything else { return }
+        guard local.scope == scope else {
+            throw SourceSyncError.stateInvalid("This computer's sync endpoint did not apply the backup's exclusions. Reinstall Restic Station here.")
+        }
+        guard peer.scope == scope else {
+            throw SourceSyncError.invalidConfiguration("This set's backup excludes some paths, and the other computer's Restic Station is too old to leave them out of the sync. Update it there, then preview again.")
+        }
     }
 
     private func capabilityBinding(_ preview: StoredSyncPreview) throws -> String {

@@ -63,7 +63,7 @@ itself, unwrapped, because its output is meant to be fed straight back into
 | `cli status` | ✅ | `CLIInstaller.Status` |
 | `fda-check` | ✅ | `{ applicable, granted, probedPath, checkedAt, context }` |
 | `purge preview` | ✅ | array of per-destination purge plans: matched/changed/unattributed snapshots and patterns |
-| `sync plan` | ✅ | `{ setId, groupId, copies, removals, conflicts, backupSourceCount, previewToken?, changes? }`; paths/hashes only with `--include-paths`, no token when conflicts exist |
+| `sync plan` | ✅ | `{ setId, groupId, copies, removals, conflicts, backupSourceCount, previewToken?, changes?, excluded, excludedPaths? }`; paths/hashes only with `--include-paths`, no token when conflicts exist; `excluded` counts the topmost entries left out because the set's backup excludes them, `excludedPaths` names the first 10; a change may carry a `reason` |
 | `sync status` | ✅ | `{ groupId, status, operationId?, lastSynchronizedAt?, canCancel, recovery? }`; local state only, recovery locations and filename mappings only with `--include-paths` |
 | `sync apply` | ✅ | same synchronization status, after token-gated reconciliation and full-scope backup |
 | `sync recover` | ✅ | same status, after resuming the recorded operation; `--cancel-unstarted` only releases an operation that never entered installation |
@@ -568,6 +568,11 @@ conflict-free plan. It changes no live files or repositories. `--group`
 is optional when a set has one sync folder. `--include-paths` deliberately
 adds relative paths and version hashes; default output is counts and IDs.
 The app requests paths to show a reviewable preview.
+Paths the set's backup excludes are outside the sync (`excluded`,
+`excludedPaths`; [source-sync.md](source-sync.md) §What a sync covers).
+When that scope is not empty and the other computer's helper predates it,
+`sync plan` refuses with `config_invalid` and asks for that helper to be
+updated.
 
 `sync apply --set <uuid> [--group <uuid>] --preview-token-stdin` consumes
 the same bounded capability input as purge apply. Never put a token in argv

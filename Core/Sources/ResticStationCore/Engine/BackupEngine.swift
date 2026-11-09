@@ -3297,6 +3297,16 @@ public final class BackupEngine: Sendable {
     /// 0, which is the silent-stoppage shape of issue #110 — the timer keeps
     /// reporting success while the machine never backs up again. This fault
     /// is host-local state a person has to repair, so it exits non-zero.
+    /// What a source sync of `set` covers on this host: what its backups
+    /// cover (#202). An unusable global exclusion list refuses, as the
+    /// backup it would feed does.
+    public func syncScope(for set: BackupSet) throws -> SyncScope {
+        if let refusal = globalExcludesRefusal(for: set) {
+            throw SourceSyncError.invalidConfiguration("Synchronization needs the set's backup exclusions, but \(refusal).")
+        }
+        return .backupScope(of: set, applying: globalExcludes)
+    }
+
     func globalExcludesRefusal(for set: BackupSet) -> String? {
         guard set.usesGlobalExcludes else { return nil }
         guard case .failure(let error) = globalExcludesResult else { return nil }

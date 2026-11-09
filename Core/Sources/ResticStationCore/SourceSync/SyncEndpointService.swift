@@ -80,6 +80,10 @@ public enum SyncEndpointService {
             throw SourceSyncError.stateInvalid("This folder's identity or coordinating set changed. Reconciliation is required.")
         }
 
+        // The scope every inventory below applies (#202): the request's
+        // until an operation journal binds one at prepare.
+        var scope = request.scope ?? .everything
+        var excluded: [String] = []
         func inventory() throws -> SyncInventory {
             // The cache only saves reading (SyncHashCache): an unreadable one
             // means hashing everything, and failing to save it costs the
@@ -87,7 +91,8 @@ public enum SyncEndpointService {
             // rewritten, so a quiet folder costs no write or fsync per scan.
             let previous = try? SyncDurability.read(SyncHashCache.self, named: "hashes.json", in: control)
             let hashes = SyncHashCache.Session(previous: previous, rootIdentity: rootIdentity)
-            var result = try SourceSyncFilesystem.inventory(at: root.path.path, hashes: hashes)
+            var (result, left) = try SourceSyncFilesystem.scopedInventory(at: root.path.path, hashes: hashes, scope: scope)
+            excluded = left
             guard result.rootIdentity == rootIdentity else { throw SourceSyncError.stalePlan }
             if hashes.result != previous { try? SyncDurability.write(hashes.result, named: "hashes.json", in: control) }
             result.endpointGeneration = record.generation
@@ -100,6 +105,8 @@ public enum SyncEndpointService {
             }
             var reply = SyncEndpointReply(inventory: try inventory(), operationId: record.activeOperation)
             reply.lastCompletedOperation = record.lastCompletedOperation
+            reply.scope = scope
+            reply.excluded = excluded
             return reply
         }
         guard let operationId = request.operationId else {
@@ -116,6 +123,12 @@ public enum SyncEndpointService {
             guard current.version == 1, current.operationId == operationId else {
                 throw SourceSyncError.stateInvalid("The endpoint journal is incompatible with this helper or operation.")
             }
+            // A journal from before #202 has no scope and covers everything.
+            let bound = current.scope ?? .everything
+            if request.action == .prepare || request.action == .commit {
+                guard bound == scope else { throw SourceSyncError.stalePlan }
+            }
+            scope = bound
         }
 
         switch request.action {
@@ -127,7 +140,9 @@ public enum SyncEndpointService {
                 try validateWritableParents(request.operations, expected: expected, root: root)
                 guard record.activeOperation == nil, expected.endpointGeneration == record.generation,
                       try inventory() == expected else { throw SourceSyncError.stalePlan }
+                try refuseHiddenRemovals(request.operations, excluded: excluded)
                 journal = SyncEndpointJournal(operationId: operationId, expected: expected, phase: .prepared, operations: request.operations, steps: [:])
+                journal?.scope = request.scope
                 // Intent becomes durable before the reservation. If the
                 // second write fails, recovery finds this exact journal.
                 try SyncDurability.write(journal!, named: "journal.json", in: operation)
@@ -142,6 +157,7 @@ public enum SyncEndpointService {
                 if record.activeOperation == nil {
                     guard expected.endpointGeneration == record.generation,
                           try inventory() == expected else { throw SourceSyncError.stalePlan }
+                    try refuseHiddenRemovals(request.operations, excluded: excluded)
                     record.activeOperation = operationId
                     try SyncDurability.write(record, named: "root.json", in: control)
                 }
@@ -153,6 +169,10 @@ public enum SyncEndpointService {
                   current.phase == .prepared || current.phase == .applying else { throw SourceSyncError.stalePlan }
             if current.phase == .prepared {
                 guard try inventory() == current.expected else { throw SourceSyncError.stalePlan }
+                // An excluded entry can appear inside a directory this
+                // operation removes at any time before its capture. Refuse
+                // while nothing here has moved, rather than fail halfway.
+                try refuseHiddenRemovals(current.operations, excluded: excluded)
                 guard current.operations == request.operations else { throw SourceSyncError.stalePlan }
                 try validateProtection(request, expected: current.expected)
                 for change in current.operations {
@@ -245,8 +265,25 @@ public enum SyncEndpointService {
                                  recoveryPath: recovery.path.path, operationId: operationId,
                                  completedPaths: journal?.steps.filter { $0.value == .installed }.map(\.key).sorted() ?? [])
         reply.exportPath = exported.path.path
+        reply.scope = scope
+        reply.excluded = excluded
         reply.lastCompletedOperation = record.lastCompletedOperation
         return reply
+    }
+
+    /// Removing or replacing a directory moves it, whole, into recovery
+    /// storage, and requires it empty of anything the plan did not name.
+    /// An entry the scope left out is invisible to the plan and is not in
+    /// the protection backup either, so such a removal would strand the
+    /// operation mid-install or, worse, discard an unprotected file (#202).
+    /// The planner already makes it a conflict; this refuses one that
+    /// appeared since, while the operation can still be cancelled.
+    static func refuseHiddenRemovals(_ operations: [SyncEndpointOperation], excluded: [String]) throws {
+        for change in operations where change.before?.kind == .directory && change.after?.kind != .directory {
+            if excluded.contains(where: { $0.hasPrefix(change.path + "/") }) {
+                throw SourceSyncError.conflict("\(change.path) holds files the backup excludes (\(excluded.first { $0.hasPrefix(change.path + "/") } ?? change.path)), which removing it would discard. Move them out of that folder, then resume this synchronization with sync recover (Resume in Sync & Back Up).")
+            }
+        }
     }
 
     static func child(_ name: String, in parent: DirectoryHandle) throws -> DirectoryHandle {

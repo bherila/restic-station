@@ -17,6 +17,11 @@ public struct SyncEndpointRequest: Codable, Sendable {
     public var protectedSnapshotId: String?
     public var protectedRepositoryId: String?
     public var exportPaths: [String] = []
+    /// What this sync covers (#202). Absent means everything: a request
+    /// from a coordinator older than #202, or for an operation journaled
+    /// before it. An older endpoint ignores the field, so the coordinator
+    /// requires it echoed in ``SyncEndpointReply/scope``.
+    public var scope: SyncScope?
 
     public init(action: Action, group: SourceSyncGroup, root: String, operationId: UUID? = nil, expected: SyncInventory? = nil) {
         self.action = action
@@ -51,6 +56,11 @@ public struct SyncEndpointReply: Codable, Sendable {
     public var lastCompletedOperation: UUID?
     /// Set by the other computer's helper on inventory and prepare replies.
     public var transfer: SyncTransferTools?
+    /// The scope this endpoint applied to `inventory`; absent from a helper
+    /// older than #202, which applies none.
+    public var scope: SyncScope?
+    /// The topmost entries `scope` left out of `inventory`, sorted.
+    public var excluded: [String]?
 
     public init(inventory: SyncInventory, stagingPath: String? = nil, recoveryPath: String? = nil, operationId: UUID? = nil, completedPaths: [String] = []) {
         self.inventory = inventory
@@ -82,4 +92,7 @@ struct SyncEndpointJournal: Codable {
     var steps: [String: Step]
     var protectedSnapshotId: String?
     var protectedRepositoryId: String?
+    /// Bound at prepare: every later request must name the same scope, so
+    /// the inventory compared against `expected` never changes meaning.
+    var scope: SyncScope?
 }

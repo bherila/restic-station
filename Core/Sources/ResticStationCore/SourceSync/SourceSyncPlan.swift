@@ -68,6 +68,9 @@ public struct SyncChange: Codable, Equatable, Sendable, Identifiable {
     public var action: Action
     public var local: SyncItem?
     public var peer: SyncItem?
+    /// Why a conflict is one, where the cause is not visible in the two
+    /// values: an entry the backup excludes (#202).
+    public var reason: String?
     public var id: String { path }
 }
 
@@ -78,6 +81,9 @@ public struct SourceSyncPlan: Codable, Equatable, Sendable {
     public var peer: SyncInventory
     public var baselineGeneration: UUID?
     public var changes: [SyncChange]
+    /// What both inventories and this plan cover (#202); absent in a plan
+    /// made before it, which covers everything.
+    public var scope: SyncScope?
 
     public var conflicts: [SyncChange] { changes.filter { $0.action == .conflict } }
     public var requiresProtection: Bool {
@@ -90,9 +96,12 @@ public struct SourceSyncPlan: Codable, Equatable, Sendable {
 }
 
 public enum SourceSyncPlanner {
+    /// `localExcluded` and `peerExcluded` are each copy's topmost entries
+    /// that `scope` leaves out, as its endpoint reported them.
     public static func plan(
         group: SourceSyncGroup, local: SyncInventory, peer: SyncInventory,
-        baseline: SyncBaseline?
+        baseline: SyncBaseline?, scope: SyncScope = .everything,
+        localExcluded: [String] = [], peerExcluded: [String] = []
     ) throws -> SourceSyncPlan {
         let fingerprint = try group.bindingFingerprint
         if let baseline {
@@ -104,11 +113,22 @@ public enum SourceSyncPlanner {
                 throw SourceSyncError.stateInvalid("A folder or its settings changed. Reconcile the copies before continuing.")
             }
         }
+        // Each endpoint applies the scope itself. One that returned an
+        // excluded path did not, and its inventory cannot be planned against.
+        guard !local.items.keys.contains(where: scope.excludes), !peer.items.keys.contains(where: scope.excludes) else {
+            throw SourceSyncError.stateInvalid("A copy's inventory includes paths its backup excludes. Update Restic Station on both computers.")
+        }
+        // A path outside the scope is absent from both inventories, so it
+        // plans nothing even while an older agreement still lists it. The
+        // next agreement is built from scoped inventories and drops it; if
+        // it returns to scope it is then reconciled as a first sync.
         let paths = Set(local.items.keys).union(peer.items.keys).union(baseline?.agreed.keys.map { $0 } ?? [])
         // Each tree can be unambiguous by itself while their union is not
         // ("Notes" on one copy, "notes" on the other). Refuse before either
-        // value is installed on a case-insensitive filesystem.
-        let folded = Dictionary(grouping: paths) { $0.precomposedStringWithCanonicalMapping.lowercased(with: Locale(identifier: "en_US_POSIX")) }
+        // value is installed on a case-insensitive filesystem. An excluded
+        // entry still occupies its name on its copy.
+        func fold(_ path: String) -> String { path.precomposedStringWithCanonicalMapping.lowercased(with: Locale(identifier: "en_US_POSIX")) }
+        let folded = Dictionary(grouping: paths.union(localExcluded).union(peerExcluded), by: fold)
         let ambiguous = Set(folded.values.filter { $0.count > 1 }.flatMap { $0 })
         var changes: [SyncChange] = []
         for path in paths.sorted() {
@@ -126,10 +146,14 @@ public enum SourceSyncPlanner {
             } else {
                 action = .conflict
             }
+            var reason: String?
             if ambiguous.contains(path) || (l != nil && r != nil && (l?.kind != r?.kind || l?.kind == .directory)) {
                 action = .conflict
+                if let hidden = folded[fold(path)]?.first(where: { $0 != path && !paths.contains($0) }) {
+                    reason = "Differs only by case or normalization from \(hidden), which the backup excludes."
+                }
             }
-            changes.append(.init(path: path, action: action, local: l, peer: r))
+            changes.append(.init(path: path, action: action, local: l, peer: r, reason: reason))
         }
         // A conflict or structural change at a directory governs its whole
         // subtree. Never execute a child's transfer through an ancestor
@@ -146,6 +170,17 @@ public enum SourceSyncPlanner {
                 }
             }
         }
+        // Removing a directory takes everything in it, including entries
+        // the scope hides from this plan and from the protection backup.
+        for index in changes.indices {
+            let change = changes[index]
+            let hidden = change.action == .removeLocal && change.local?.kind == .directory ? localExcluded
+                : change.action == .removePeer && change.peer?.kind == .directory ? peerExcluded : []
+            if let entry = hidden.first(where: { $0.hasPrefix(change.path + "/") }) {
+                changes[index].action = .conflict
+                changes[index].reason = "Holds \(entry), which the backup excludes and removing the folder would discard. Move it out, or remove the folder by hand."
+            }
+        }
         let barriers = changes.filter { $0.action == .conflict }.map(\.path)
         for index in changes.indices {
             if barriers.contains(where: { changes[index].path.hasPrefix($0 + "/") }) {
@@ -154,7 +189,8 @@ public enum SourceSyncPlanner {
         }
         return SourceSyncPlan(
             groupId: group.id, groupFingerprint: fingerprint, local: local, peer: peer,
-            baselineGeneration: baseline?.generation, changes: changes
+            baselineGeneration: baseline?.generation, changes: changes,
+            scope: scope.isEverything ? nil : scope
         )
     }
 

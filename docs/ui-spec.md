@@ -119,7 +119,9 @@ sets must retain all backup history and have no purge exclusions.
 
 A configured set's primary manual action is Sync & Back Up. It opens a
 review sheet showing both scopes, directional copy/removal/conflict counts,
-and expandable relative filenames. A conflict or an unavailable peer leaves
+and expandable relative filenames. When the backup excludes some entries in
+a folder, an expandable "N paths not synchronized: excluded from backups"
+row names the first ten and how many more (#202). A conflict or an unavailable peer leaves
 Back Up Only available. The action uses the same helper/opaque stdin
 capability as the CLI; no source mutation occurs in the app process.
 Interrupted work is shown before another plan is made, with Resume & Back
