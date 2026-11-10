@@ -47,6 +47,27 @@ public struct SourceSyncStatus: Codable, Sendable {
     public var lastSynchronizedAt: Date?
     public var canCancel: Bool = false
     public var recovery: SourceSyncRecovery?
+    /// Things that did not stop the sync but the person should know, such as
+    /// a backup mirror that was offline (#197).
+    public var warnings: [String] = []
+}
+
+extension SourceSyncStatus {
+    private enum CodingKeys: String, CodingKey {
+        case groupId, status, operationId, lastSynchronizedAt, canCancel, recovery, warnings
+    }
+
+    /// A report from a helper older than #197 has no `warnings`.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        groupId = try c.decode(UUID.self, forKey: .groupId)
+        status = try c.decode(String.self, forKey: .status)
+        operationId = try c.decodeIfPresent(UUID.self, forKey: .operationId)
+        lastSynchronizedAt = try c.decodeIfPresent(Date.self, forKey: .lastSynchronizedAt)
+        canCancel = try c.decodeIfPresent(Bool.self, forKey: .canCancel) ?? false
+        recovery = try c.decodeIfPresent(SourceSyncRecovery.self, forKey: .recovery)
+        warnings = try c.decodeIfPresent([String].self, forKey: .warnings) ?? []
+    }
 }
 
 public struct SourceSyncRecovery: Codable, Sendable {
@@ -240,6 +261,7 @@ public struct SourceSyncCoordinator: Sendable {
                 throw SourceSyncError.stateInvalid("The interrupted operation journal is missing or incompatible.")
             }
             status.canCancel = journal.phase == .reserved || journal.phase == .protected || journal.phase == .cancelling
+            status.warnings = journal.mirrorWarnings ?? []
             if includePaths {
                 let local = journal.localPrepared?.recoveryPath, peer = journal.peerPrepared?.recoveryPath
                 status.recovery = SourceSyncRecovery(
@@ -303,7 +325,9 @@ public struct SourceSyncCoordinator: Sendable {
             var record = try store.record()
             record.status = .synchronized; record.activeOperation = nil
             try store.save(record)
-            return report(record)
+            var done = report(record)
+            done.warnings = journal.mirrorWarnings ?? []
+            return done
         }
         guard journal.phase != .cancelling && journal.phase != .cancelled else {
             throw SourceSyncError.stateInvalid("Finish cancelling the unstarted operation before making a new plan.")
@@ -395,6 +419,7 @@ public struct SourceSyncCoordinator: Sendable {
                     guard proof.payloadFingerprint == (try inventory.fingerprint) else { throw SourceSyncError.protectionFailed }
                     journal.protectedSnapshot = proof.snapshotId
                     journal.protectedRepository = proof.repositoryId
+                    journal.mirrorWarnings = Self.nilIfEmpty(proof.mirrorWarnings)
                 }
                 journal.phase = .protected
                 try persist()
@@ -462,7 +487,10 @@ public struct SourceSyncCoordinator: Sendable {
                 try persist()
             }
             if journal.phase == .agreed {
-                try await backups.backup(set: set, retaining: vault.path)
+                // The final backup copies every snapshot a mirror lacks, so
+                // what it reports replaces the protection pass's report: a
+                // mirror that was away then and is back now is not a warning.
+                journal.mirrorWarnings = Self.nilIfEmpty(try await backups.backup(set: set, retaining: vault.path))
                 journal.phase = .backedUp
                 try persist()
             }
@@ -481,7 +509,9 @@ public struct SourceSyncCoordinator: Sendable {
             record.status = .synchronized
             record.activeOperation = nil
             try store.save(record)
-            return report(record)
+            var done = report(record)
+            done.warnings = journal.mirrorWarnings ?? []
+            return done
         } catch {
             var record = try store.record()
             record.status = journal.phase == .agreed || journal.phase == .complete ? .backupNeedsAttention : .needsRecovery
@@ -508,7 +538,13 @@ public struct SourceSyncCoordinator: Sendable {
         let state = try SourceSyncFilesystem.physicalDirectory(paths.root.path)
         guard !SourceSyncGroup.contains(root, state), !SourceSyncGroup.contains(state, root) else { throw SourceSyncError.stalePlan }
         for destination in set.destinations where destination.kind == .localPath {
-            let repo = try SourceSyncFilesystem.resolvedDirectory(destination.repoURL)
+            // A mirror's folder may be absent (an unplugged disk), which must
+            // not stop a sync (#197); where it would be is still compared.
+            // The primary is held to the strict rule: a missing primary is a
+            // refusal, not a path to guess at.
+            let repo = destination.isPrimary
+                ? try SourceSyncFilesystem.resolvedDirectory(destination.repoURL)
+                : try SourceSyncFilesystem.prospectiveDirectory(destination.repoURL)
             guard !SourceSyncGroup.contains(root, repo), !SourceSyncGroup.contains(repo, root) else { throw SourceSyncError.stalePlan }
         }
     }
@@ -580,6 +616,8 @@ public struct SourceSyncCoordinator: Sendable {
     private func capabilityBinding(_ preview: StoredSyncPreview) throws -> String {
         "source-sync:v1:" + SHA256Digest.hex(try ConfigStore.makeEncoder().encode(preview))
     }
+
+    static func nilIfEmpty(_ warnings: [String]) -> [String]? { warnings.isEmpty ? nil : warnings }
 
     private func report(_ record: SourceSyncGroupRecord) -> SourceSyncStatus {
         SourceSyncStatus(groupId: record.groupId, status: record.status.rawValue, operationId: record.activeOperation, lastSynchronizedAt: record.lastSynchronizedAt)

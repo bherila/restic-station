@@ -191,11 +191,9 @@ secret or a restic that cannot launch refuses with its own error instead.
 Either way the operation stays in its reservation phase. It can be resumed
 once the repository answers, which checks again, or cancelled with
 `--cancel-unstarted`, which is the way out when the fix changes settings. The check authorizes nothing; the final backup remains
-the proof. Mirrors are not checked up front: a mirror that is down is first
-noticed by the final backup's copies, leaving the operation resumable
-(`backupNeedsAttention`) rather than cancellable, as with any other final
-backup failure. A plan with protection skips the check, because its
-protection backup already exercises the destination before installation.
+the proof. Mirrors are not checked up front, and one that is down does not
+stop the sync (see below). A plan with protection skips the check, because
+its protection backup already exercises the destination before installation.
 
 Coverage is an exact repository/snapshot/version proof, not last-backup
 time. An excluded payload is not covered. Verify protected content through
@@ -225,15 +223,29 @@ repositories themselves. A compromised coordinator or SSH account is
 outside this boundary; a snapshot-shaped string alone is not a backup proof.
 
 After reconciliation, back up the resulting data and copy snapshots to
-the configured secondary repositories. A failed mirror is not full
-protection. An unreachable sync peer does not disable ordinary backup of
-available local data. Sync, primary backup and each backup mirror have
-separate outcomes under one user-facing set.
+the configured secondary repositories. An unreachable sync peer does not
+disable ordinary backup of available local data. Sync, primary backup and
+each backup mirror have separate outcomes under one user-facing set.
 
-The final backup must include successful copies to every configured mirror
-before cleanup. Protected plaintext payloads and restored verification
-copies are then removed through descriptor-relative private-storage
-operations. Cancelling an operation before installation also removes its
+**The primary is the whole proof (#197).** Protection and the final backup
+need the restore-verified primary snapshot and nothing from a mirror: every
+run against the primary must succeed, and the verification restore must match.
+A mirror that is offline, or whose copy fails, does not stop the sync. The
+result carries a `warnings` entry naming it, which says it catches up at the
+next ordinary backup (restic copies every snapshot the mirror lacks). The
+warning appears in the apply and recover results, in `sync status` while an
+operation waits, and in the app's review sheet; a destination's own status
+dot already shows it as offline or stale. Nothing is deleted from a mirror
+by a sync, and a sync set has no retention, so a mirror that missed a backup
+is only less complete, never unsafe. A mirror's folder may be absent, such as
+a disk that is not plugged in: preview and apply still check that where it
+would be does not overlap a sync folder, through its nearest existing
+ancestor, and refuse if a path component exists but cannot be resolved, such
+as a dangling symlink.
+
+Protected plaintext payloads and restored verification
+copies are removed after the final backup through descriptor-relative
+private-storage operations. Cancelling an operation before installation also removes its
 private verification restores, without changing either source. Captured
 versions are checked again first: an unexpected editor
 save retains recovery storage and requires attention. Small journals remain

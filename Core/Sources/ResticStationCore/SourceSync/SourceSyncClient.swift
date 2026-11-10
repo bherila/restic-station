@@ -186,6 +186,11 @@ public struct SyncProtectionReceipt: Sendable {
     public let repositoryId: String
     public let snapshotId: String
     public let payloadFingerprint: String
+    /// Backup mirrors that did not receive this backup (unreachable, or their
+    /// copy failed). Advisory: the restore-verified primary snapshot is the
+    /// whole proof, and a mirror catches up at the next ordinary backup.
+    /// Never part of what an endpoint is asked to trust.
+    public var mirrorWarnings: [String] = []
 
     private init(repositoryId: String, snapshotId: String, payloadFingerprint: String) {
         self.repositoryId = repositoryId
@@ -215,5 +220,7 @@ public protocol SourceSyncBackingUp: Sendable {
     /// What a sync of `set` covers: what its backups cover (#202).
     func scope(for set: BackupSet) async throws -> SyncScope
     /// Preserve the configured backup scope and existing mirror policy.
-    func backup(set: BackupSet, retaining vault: URL?) async throws
+    /// Returns the mirrors that did not receive it (see
+    /// ``SyncProtectionReceipt/mirrorWarnings``).
+    func backup(set: BackupSet, retaining vault: URL?) async throws -> [String]
 }

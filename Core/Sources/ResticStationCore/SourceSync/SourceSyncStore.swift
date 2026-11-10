@@ -40,6 +40,9 @@ struct SourceSyncJournal: Codable {
     var protectedRepository: String?
     var localFinished: SyncEndpointReply?
     var peerFinished: SyncEndpointReply?
+    /// Backup mirrors that missed this operation's backups. Optional, not an
+    /// empty default, so a journal written before it existed still decodes.
+    var mirrorWarnings: [String]?
 }
 
 /// All reads are strict and every authority-bearing write is durable.

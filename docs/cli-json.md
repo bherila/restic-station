@@ -64,7 +64,7 @@ itself, unwrapped, because its output is meant to be fed straight back into
 | `fda-check` | ✅ | `{ applicable, granted, probedPath, checkedAt, context }` |
 | `purge preview` | ✅ | array of per-destination purge plans: matched/changed/unattributed snapshots and patterns |
 | `sync plan` | ✅ | `{ setId, groupId, copies, removals, conflicts, backupSourceCount, previewToken?, changes?, excluded, excludedPaths? }`; paths/hashes only with `--include-paths`, no token when conflicts exist; `excluded` counts the topmost entries left out because the set's backup excludes them, `excludedPaths` names the first 10; a change may carry a `reason` |
-| `sync status` | ✅ | `{ groupId, status, operationId?, lastSynchronizedAt?, canCancel, recovery? }`; local state only, recovery locations and filename mappings only with `--include-paths` |
+| `sync status` | ✅ | `{ groupId, status, operationId?, lastSynchronizedAt?, canCancel, recovery?, warnings }`; local state only, recovery locations and filename mappings only with `--include-paths` |
 | `sync apply` | ✅ | same synchronization status, after token-gated reconciliation and full-scope backup |
 | `sync recover` | ✅ | same status, after resuming the recorded operation; `--cancel-unstarted` only releases an operation that never entered installation |
 | `sync endpoint` | ✅ | Hidden, versioned trusted SSH protocol; not a public automation surface. No repository credentials. |
@@ -573,6 +573,12 @@ Paths the set's backup excludes are outside the sync (`excluded`,
 When that scope is not empty and the other computer's helper predates it,
 `sync plan` refuses with `config_invalid` and asks for that helper to be
 updated.
+
+The `sync apply`, `sync recover` and `sync status` results carry
+`warnings`, a list of strings (empty when there is nothing to report). A
+backup mirror that was offline or whose copy failed is named there; the sync
+itself succeeded, and the mirror catches up at the next ordinary backup. An
+older helper's report has no `warnings`, which reads as empty.
 
 `sync apply --set <uuid> [--group <uuid>] --preview-token-stdin` consumes
 the same bounded capability input as purge apply. Never put a token in argv

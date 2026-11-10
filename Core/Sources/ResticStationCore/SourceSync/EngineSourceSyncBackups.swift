@@ -15,12 +15,13 @@ public struct EngineSourceSyncBackups: SourceSyncBackingUp {
         let repositoryId = try await identity(primary)
         let parent = await parentSnapshot(for: set, primary: primary)
         let result = await engine.runSet(adding(vault, to: set), trigger: .manual, parent: parent)
-        guard case .completed(let status, _, let children) = result,
-              status == .success,
-              let backup = children.first(where: { $0.kind == .backup && $0.destId == primary.id }),
-              backup.status == .success || backup.status == .warning,
-              mirrorsComplete(set, children: children),
-              let snapshot = try runs.metadata(runId: backup.runId).snapshotId else { throw SourceSyncError.protectionFailed }
+        // The primary is the whole proof: its backup and everything else the
+        // run did to it must have succeeded. A mirror that is offline or
+        // whose copy failed does not weaken it, so it is reported and the
+        // sync goes on (#197).
+        guard let proven = Self.provenOnPrimary(result, set: set, primary: primary),
+              let snapshot = try runs.metadata(runId: proven.backup.runId).snapshotId else { throw SourceSyncError.protectionFailed }
+        let warnings = proven.warnings
         // A fresh target and an exact snapshot subtree keep unrelated live
         // paths out of a recovery proof. Neither a dry-run nor a timestamp
         // can produce this receipt.
@@ -32,7 +33,9 @@ public struct EngineSourceSyncBackups: SourceSyncBackingUp {
         ))
         guard case .completed(.success) = restore else { throw SourceSyncError.protectionFailed }
         guard try await identity(primary) == repositoryId else { throw SourceSyncError.protectionFailed }
-        return try SyncProtectionReceipt.verify(repositoryId: repositoryId, snapshotId: snapshot, expected: inventory, restoredAt: restored)
+        var receipt = try SyncProtectionReceipt.verify(repositoryId: repositoryId, snapshotId: snapshot, expected: inventory, restoredAt: restored)
+        receipt.mirrorWarnings = warnings
+        return receipt
     }
 
     public func scope(for set: BackupSet) async throws -> SyncScope {
@@ -51,21 +54,21 @@ public struct EngineSourceSyncBackups: SourceSyncBackingUp {
         catch ResticRunnerError.timedOut { throw SourceSyncError.destinationUnavailable }
     }
 
-    public func backup(set: BackupSet, retaining vault: URL?) async throws {
+    public func backup(set: BackupSet, retaining vault: URL?) async throws -> [String] {
         if let vault {
             do {
                 let inventory = try SourceSyncFilesystem.inventory(at: SourceSyncFilesystem.physicalDirectory(vault.path))
-                _ = try await protect(set: set, vault: vault, inventory: inventory)
-                return
+                return try await protect(set: set, vault: vault, inventory: inventory).mirrorWarnings
             } catch {
                 throw SourceSyncError.stateInvalid("The folders synchronized, but the final backup and recovery agreement could not be verified. Inspect Runs, then resume to retry the backup.")
             }
         }
         let result = await engine.runSet(set, trigger: .manual)
-        guard case .completed(.success, _, let children) = result,
-              children.allSatisfy({ $0.status == .success }), mirrorsComplete(set, children: children) else {
-            throw SourceSyncError.stateInvalid("Synchronization finished, but the backup or a backup destination needs attention. Inspect Runs, then resume to retry the backup.")
+        guard let primary = set.destinations.first(where: \.isPrimary),
+              let proven = Self.provenOnPrimary(result, set: set, primary: primary) else {
+            throw SourceSyncError.stateInvalid("Synchronization finished, but the backup needs attention. Inspect Runs, then resume to retry the backup.")
         }
+        return proven.warnings
     }
 
     private func adding(_ vault: URL, to set: BackupSet) -> BackupSet {
@@ -95,9 +98,36 @@ public struct EngineSourceSyncBackups: SourceSyncBackingUp {
             .max { $0.time < $1.time }?.id
     }
 
-    private func mirrorsComplete(_ set: BackupSet, children: [SetRunChild]) -> Bool {
-        set.destinations.filter { !$0.isPrimary }.allSatisfy { destination in
-            children.contains { $0.kind == .copy && $0.destId == destination.id && $0.status == .success }
+    /// What a set run proved on the primary, and which mirrors missed it.
+    /// The one place a run's outcome is read for sync, for protection and
+    /// the final backup alike. The group status is deliberately not
+    /// consulted: it is the worst of every run, mirrors included, and a
+    /// mirror must not decide the primary's proof (#197).
+    static func provenOnPrimary(_ outcome: SetRunOutcome, set: BackupSet, primary: Destination) -> (backup: SetRunChild, warnings: [String])? {
+        guard case .completed(_, _, let children) = outcome,
+              let backup = primaryBackup(children, primary: primary) else { return nil }
+        return (backup, mirrorWarnings(set, children: children))
+    }
+
+    /// The primary's backup, if the primary is fully proven: that backup and
+    /// every other run against the primary succeeded. A mirror's runs are
+    /// not consulted; they only produce warnings.
+    static func primaryBackup(_ children: [SetRunChild], primary: Destination) -> SetRunChild? {
+        let mine = children.filter { $0.destId == primary.id }
+        guard mine.allSatisfy({ $0.status == .success }) else { return nil }
+        return mine.first { $0.kind == .backup }
+    }
+
+    static func warningsForTesting(_ set: BackupSet, children: [SetRunChild]) -> [String] {
+        EngineSourceSyncBackups.mirrorWarnings(set, children: children)
+    }
+
+    /// One line per mirror that has no successful copy in this run. An
+    /// unreachable mirror records no run at all, so absence is the signal.
+    static func mirrorWarnings(_ set: BackupSet, children: [SetRunChild]) -> [String] {
+        set.destinations.filter { !$0.isPrimary }.compactMap { destination in
+            children.contains { $0.kind == .copy && $0.destId == destination.id && $0.status == .success } ? nil
+                : "The backup mirror \"\(destination.label)\" did not receive this backup (it is offline, or its copy failed). It catches up at the next ordinary backup."
         }
     }
 
