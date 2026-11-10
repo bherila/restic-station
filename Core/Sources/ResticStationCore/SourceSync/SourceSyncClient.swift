@@ -88,8 +88,8 @@ public struct SourceSyncClient: SourceSyncTransport {
 
     static func requireSize(_ count: Int, limit: Int = SyncEndpointRequest.maximumEncodedBytes, peerIsOlder: Bool = false) throws {
         guard count <= limit else {
-            let older = peerIsOlder ? " The other computer's Restic Station is older and reads at most \(limit / 1_048_576) MiB; updating it raises that to \(SyncEndpointRequest.maximumEncodedBytes / 1_048_576) MiB." : ""
-            throw SourceSyncError.invalidConfiguration("This folder has too many entries to synchronize with another computer over SSH in one request (\(count / 1_048_576) MiB; the limit is \(limit / 1_048_576) MiB).\(older) Synchronize a smaller folder, or move rarely used files out of it.")
+            let older = peerIsOlder ? " The other computer's Restic Station is older and reads at most \(SyncSpace.format(UInt64(limit))); updating it raises that to \(SyncSpace.format(UInt64(SyncEndpointRequest.maximumEncodedBytes)))." : ""
+            throw SourceSyncError.invalidConfiguration("This folder has too many entries to synchronize with another computer over SSH in one request (\(SyncSpace.format(UInt64(count))); the limit is \(SyncSpace.format(UInt64(limit)))).\(older) Synchronize a smaller folder, or move rarely used files out of it.")
         }
     }
 

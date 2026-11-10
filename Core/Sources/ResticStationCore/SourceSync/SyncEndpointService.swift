@@ -107,7 +107,10 @@ public enum SyncEndpointService {
             reply.lastCompletedOperation = record.lastCompletedOperation
             reply.scope = scope
             reply.excluded = excluded
-            reply.freeBytes = SyncSpace.available(atPath: controlURL.path)
+            let space = SyncSpace.reading(atPath: controlURL.path)
+            reply.freeBytes = space.free
+            reply.volumeId = space.volume
+            reply.maxRequestBytes = SyncEndpointRequest.maximumEncodedBytes
             return reply
         }
         guard let operationId = request.operationId else {

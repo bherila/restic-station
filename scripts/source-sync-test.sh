@@ -214,7 +214,12 @@ PY
 printf '%s' 'peer version' > "$WORK/other copy/from peer"
 rm -rf "$WORK/workspace/notes/pkg/__pycache__" "$WORK/other copy/pkg/__pycache__"
 printf '%s' 'only on the other copy' > "$WORK/other copy/survivor.txt"
-rm -rf "$WORK/state/source-sync/$GROUP" "$WORK"/workspace/.restic-station-sync-* "$WORK"/.restic-station-sync-*
+# The control directory names are the documented ones, not a glob that could
+# also hit another group's directory in the same parent.
+control_name() { printf '.restic-station-sync-%s' "$(printf %s "$(cd "$1" && pwd -P)" | shasum -a 256 | cut -c1-24)"; }
+test -d "$WORK/workspace/$(control_name "$WORK/workspace/notes")" && test -d "$WORK/$(control_name "$WORK/other copy")" \
+    || { echo 'FAIL: the documented control directory names do not match the real ones' >&2; ls -a "$WORK/workspace" "$WORK" >&2; exit 1; }
+rm -rf "$WORK/state/source-sync/$GROUP" "$WORK/workspace/$(control_name "$WORK/workspace/notes")" "$WORK/$(control_name "$WORK/other copy")"
 plan
 jq -e '.ok and .data.conflicts == 0 and .data.removals == 0' "$WORK/plan.json" >/dev/null \
     || { echo 'FAIL: the documented re-enrol steps did not give a first run' >&2; cat "$WORK/plan.json" >&2; exit 1; }

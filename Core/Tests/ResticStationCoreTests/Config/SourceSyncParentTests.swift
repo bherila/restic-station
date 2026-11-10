@@ -140,6 +140,38 @@ struct SyncSpaceTests {
         #expect(protected.peer == (20 + 7) * mib + 10 * mib)
     }
 
+    @Test("a conflict adds nothing to what a plan needs")
+    func conflictsAreFree() {
+        let mib: UInt64 = 1 << 20
+        var plan = Self.plan(requiresProtection: false)
+        let base = SyncSpace.need(for: plan)
+        plan.local.items["fight"] = Self.file(500 * mib); plan.peer.items["fight"] = Self.file(600 * mib)
+        plan.changes.append(SyncChange(path: "fight", action: .conflict, local: plan.local.items["fight"], peer: plan.peer.items["fight"]))
+        #expect(SyncSpace.need(for: plan) == base)
+    }
+
+    @Test("free space is read from statvfs figures only when they can be trusted")
+    func trustedFigures() {
+        // Ordinary: 1000 free fragments of 4096 bytes.
+        #expect(SyncSpace.free(available: 1000, fragment: 4096, blocks: 5000) == 4_096_000)
+        // A full volume really is full: blocks exist and none are available.
+        #expect(SyncSpace.free(available: 0, fragment: 4096, blocks: 5000) == 0)
+        // Filesystems that report nothing (some FUSE and network mounts) say nothing, which is unknown.
+        #expect(SyncSpace.free(available: 0, fragment: 4096, blocks: 0) == nil)
+        #expect(SyncSpace.free(available: 123, fragment: 0, blocks: 5000) == nil)
+        // A sentinel that would overflow is nonsense, not a crash.
+        #expect(SyncSpace.free(available: UInt64.max, fragment: 4096, blocks: 5000) == nil)
+        // The real call reports something for a real directory.
+        #expect(SyncSpace.reading(atPath: NSTemporaryDirectory()).volume != nil)
+    }
+
+    @Test("a peer is assumed to read 32 MiB unless it says otherwise")
+    func advertisedLimit() {
+        #expect(SyncEndpointRequest.limit(peerAdvertised: nil) == 32 * 1024 * 1024)
+        #expect(SyncEndpointRequest.limit(peerAdvertised: 64 * 1024 * 1024) == 64 * 1024 * 1024)
+        #expect(SyncEndpointRequest.limit(peerAdvertised: 4096) == 4096)
+    }
+
     @Test("directories, links and removals need no space, so an empty plan needs none")
     func nothingToCopy() {
         let dir = SyncItem(kind: .directory, digest: "", mode: 0o755)
@@ -148,7 +180,7 @@ struct SyncSpaceTests {
                                   changes: [SyncChange(path: "d", action: .copyToPeer, local: dir, peer: nil)])
         #expect(SyncSpace.need(for: plan) == .init(coordinator: 0, local: 0, peer: 0))
         #expect(SyncSpace.required(0) == 0)
-        #expect(SyncSpace.shortfalls(.init(coordinator: 0, local: 0, peer: 0), coordinator: 0, local: 0, peer: 0, peerIsRemote: true).isEmpty)
+        #expect(SyncSpace.shortfalls(.init(coordinator: 0, local: 0, peer: 0), coordinator: .init(free: 0, volume: 1), local: .init(free: 0, volume: 1), peer: .init(free: 0), peerIsRemote: true).isEmpty)
     }
 
     @Test("slack is ten percent and 64 MiB; unknown is not short; the other computer is named when remote")
@@ -156,12 +188,24 @@ struct SyncSpaceTests {
         let mib: UInt64 = 1 << 20
         #expect(SyncSpace.required(100 * mib) == 110 * mib + 64 * mib)
         let need = SyncSpace.Need(coordinator: 100 * mib, local: 100 * mib, peer: 100 * mib)
-        #expect(SyncSpace.shortfalls(need, coordinator: nil, local: nil, peer: nil, peerIsRemote: true).isEmpty)
+        let unknown = SyncSpace.Reading()
+        #expect(SyncSpace.shortfalls(need, coordinator: unknown, local: unknown, peer: unknown, peerIsRemote: true).isEmpty)
         // Exactly enough is enough; one byte under is not.
         let exact = SyncSpace.required(100 * mib)
-        #expect(SyncSpace.shortfalls(need, coordinator: exact, local: exact, peer: exact, peerIsRemote: true).isEmpty)
-        let lines = SyncSpace.shortfalls(need, coordinator: exact - 1, local: exact - 1, peer: exact - 1, peerIsRemote: true)
+        func readings(_ free: UInt64) -> (SyncSpace.Reading, SyncSpace.Reading, SyncSpace.Reading) {
+            (.init(free: free, volume: 1), .init(free: free, volume: 2), .init(free: free, volume: 3))
+        }
+        var r = readings(exact)
+        #expect(SyncSpace.shortfalls(need, coordinator: r.0, local: r.1, peer: r.2, peerIsRemote: true).isEmpty)
+        r = readings(exact - 1)
+        let lines = SyncSpace.shortfalls(need, coordinator: r.0, local: r.1, peer: r.2, peerIsRemote: true)
         #expect(lines.count == 3 && lines[2].hasPrefix("beside the other computer's folder"))
+        // The same volume number on the other computer is a coincidence, not the same volume.
+        let remote = SyncSpace.shortfalls(need, coordinator: .init(free: exact, volume: 7), local: .init(free: exact, volume: 8), peer: .init(free: exact, volume: 7), peerIsRemote: true)
+        #expect(remote.isEmpty, "\(remote)")
+        // Two places that really share a volume add up: enough for each, not for both.
+        let shared = SyncSpace.shortfalls(need, coordinator: .init(free: exact, volume: 7), local: .init(free: exact, volume: 7), peer: .init(free: exact, volume: 9), peerIsRemote: true)
+        #expect(shared.count == 1 && shared[0].hasPrefix("this computer's Restic Station data and beside this computer's folder"))
         #expect(SyncSpace.format(174 * mib) == "174.0 MiB" && SyncSpace.format(3 << 30) == "3.0 GiB" && SyncSpace.format(512) == "512 B")
     }
 }
@@ -195,11 +239,11 @@ struct SyncRequestSizeTests {
     func oversizeRefused() {
         #expect(throws: Never.self) { try SourceSyncClient.requireSize(SyncEndpointRequest.maximumEncodedBytes) }
         let error = #expect(throws: SourceSyncError.self) { try SourceSyncClient.requireSize(SyncEndpointRequest.maximumEncodedBytes + 1) }
-        #expect(error?.description.contains("too many entries") == true && error?.description.contains("64 MiB") == true)
+        #expect(error?.description.contains("too many entries") == true && error?.description.contains("64.0 MiB") == true)
         let older = #expect(throws: SourceSyncError.self) {
             try SourceSyncClient.requireSize(SyncEndpointRequest.legacyMaximumEncodedBytes + 1, limit: SyncEndpointRequest.legacyMaximumEncodedBytes, peerIsOlder: true)
         }
-        #expect(older?.description.contains("is older and reads at most 32 MiB") == true && older?.description.contains("32 MiB") == true && older?.description.contains("64 MiB") == true)
+        #expect(older?.description.contains("is older and reads at most 32.0 MiB") == true && older?.description.contains("raises that to 64.0 MiB") == true)
     }
 
     /// Records what the client sends over SSH, and answers like a peer.
@@ -222,19 +266,22 @@ struct SyncRequestSizeTests {
     func clientSendsCompact() async throws {
         let group = SourceSyncGroup(name: "Notes", localPath: "/tmp/a", peer: .init(path: "/tmp/b", sshTarget: "user@host"), coordinatorMachineId: "laptop")
         var items: [String: SyncItem] = [:]
-        for index in 0..<200 { items["file-\(index)"] = SyncItem(digest: String(repeating: "b", count: 64), bytes: 1) }
+        for index in 0..<200 { items["folder/file-\(index)"] = SyncItem(digest: String(repeating: "b", count: 64), bytes: 1) }
         let request = SyncEndpointRequest(action: .prepare, group: group, root: "/tmp/b", operationId: UUID(), expected: SyncInventory(rootIdentity: "1:2:3", items: items))
         let sent = RecordingRunner.Sent()
         let client = SourceSyncClient(runner: RecordingRunner(sent: sent))
         _ = try await client.request(request, at: group.peer)
         let body = try #require(sent.all.first)
         #expect(!body.contains(UInt8(ascii: "\n")), "compact: no line breaks")
+        #expect(String(decoding: body, as: UTF8.self).contains("\"folder/file-0\""), "slashes are not escaped")
         #expect(body == (try SyncEndpointRequest.encode(request)))
-        // Oversize is refused by name and nothing is sent.
+        // Oversize is refused by name by the same call, and nothing is sent.
         let before = sent.all.count
-        let limited = #expect(throws: SourceSyncError.self) { try SourceSyncClient.encodedRequest(request, limit: 1024) }
+        let limited = await #expect(throws: SourceSyncError.self) {
+            try await SyncEndpointRequest.$limitOverride.withValue(1024) { try await client.request(request, at: group.peer) }
+        }
         #expect(limited?.description.contains("too many entries") == true)
-        #expect(sent.all.count == before)
+        #expect(sent.all.count == before, "nothing reached the runner")
     }
 }
 

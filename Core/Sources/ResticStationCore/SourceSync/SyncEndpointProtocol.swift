@@ -9,17 +9,23 @@ public struct SyncEndpointRequest: Codable, Sendable {
     /// were pretty-printed and carried each inventory twice. The coordinator
     /// checks it before sending, so a folder that is still too large fails
     /// with its own message, not as a dropped SSH session.
-    public static let maximumEncodedBytes = 64 * 1024 * 1024
-    /// What a helper from before #197 reads.
+    public static var maximumEncodedBytes: Int { limitOverride ?? 64 * 1024 * 1024 }
+    /// What a helper from before #197 reads, and so what a peer that
+    /// does not say otherwise is assumed to read.
     public static let legacyMaximumEncodedBytes = 32 * 1024 * 1024
     /// Replaced only by tests, which cannot build a 64 MiB request cheaply.
     @TaskLocal static var limitOverride: Int?
+
+    /// The most a peer reads, as it advertised on its reply. The scope echo
+    /// is no evidence of this: helpers from #202 echo it and still read 32 MiB.
+    static func limit(peerAdvertised: Int?) -> Int { peerAdvertised ?? legacyMaximumEncodedBytes }
 
     /// Compact and key-sorted. The request is machine-read and neither hashed
     /// nor displayed, so whitespace only costs bytes against the limit.
     public static func encode(_ request: SyncEndpointRequest) throws -> Data {
         let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys]
+        // Slashes unescaped: every path component would cost an extra byte.
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         return try encoder.encode(request)
     }
 
@@ -84,6 +90,12 @@ public struct SyncEndpointReply: Codable, Sendable {
     /// replies (#197). Absent from a helper that predates it, and when the
     /// volume will not say; either reads as unknown, never as full.
     public var freeBytes: UInt64?
+    /// Identifies the volume beside this folder, so the coordinator can add
+    /// up places that share one. Meaningful only on the computer that sent it.
+    public var volumeId: UInt64?
+    /// The most this helper reads from one request. Absent from a helper
+    /// older than #197, which reads 32 MiB.
+    public var maxRequestBytes: Int?
 
     public init(inventory: SyncInventory, stagingPath: String? = nil, recoveryPath: String? = nil, operationId: UUID? = nil, completedPaths: [String] = []) {
         self.inventory = inventory

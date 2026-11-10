@@ -53,7 +53,7 @@ struct SourceSyncCoordinatorTests {
             var request = request
             if request.root == legacyRoot { request.scope = nil }
             var reply = try SyncEndpointService.handle(request)
-            if request.root == legacyRoot { reply.scope = nil; reply.excluded = nil }
+            if request.root == legacyRoot { reply.scope = nil; reply.excluded = nil; reply.freeBytes = nil; reply.volumeId = nil; reply.maxRequestBytes = nil }
             if request.action == .inventory || request.action == .prepare { reply.transfer = reportedTools }
             return reply
         }
@@ -664,12 +664,13 @@ struct SourceSyncCoordinatorTests {
 
     /// Free space by place: the coordinator's application state, the local
     /// folder's volume, and the other folder's, as a test volume would report.
-    static func volumes(_ f: Fixture, coordinator: UInt64?, local: UInt64?, peer: UInt64?) -> @Sendable (String) -> UInt64? {
+    static func volumes(_ f: Fixture, coordinator: UInt64?, local: UInt64?, peer: UInt64?, sharedVolume: Bool = false) -> @Sendable (String) -> SyncSpace.Reading {
         let state = f.paths.root.path, workspace = f.workspace.path
+        // Distinct volumes unless asked: the coordinator's data, the local folder and the other folder.
         return { path in
-            if path.hasPrefix(state) { return coordinator }
-            if path.hasPrefix(workspace) { return local }
-            return peer
+            if path.hasPrefix(state) { return .init(free: coordinator, volume: 1) }
+            if path.hasPrefix(workspace) { return .init(free: local, volume: sharedVolume ? 1 : 2) }
+            return .init(free: peer, volume: sharedVolume ? 1 : 3)
         }
     }
 
@@ -687,7 +688,7 @@ struct SourceSyncCoordinatorTests {
             ("peer", gib, gib, tight, "beside the other folder"),
         ] as [(String, UInt64, UInt64, UInt64, String)] {
             let error = await #expect(throws: SourceSyncError.self, "\(label)") {
-                try await SyncSpace.$availableOverride.withValue(Self.volumes(f, coordinator: coordinator, local: local, peer: peer)) { try await f.preview() }
+                try await SyncSpace.$readingOverride.withValue(Self.volumes(f, coordinator: coordinator, local: local, peer: peer)) { try await f.preview() }
             }
             let text = error?.description ?? ""
             #expect(text.contains("not enough free space") && text.contains(expect), "\(label): \(text)")
@@ -695,8 +696,42 @@ struct SourceSyncCoordinatorTests {
         }
         // Nothing was reserved or saved: with room again, the same folders preview and sync.
         #expect(try SourceSyncCoordinator.status(paths: f.paths, setId: f.set.id, groupId: f.group.id).operationId == nil)
-        let ample = try await SyncSpace.$availableOverride.withValue(Self.volumes(f, coordinator: gib, local: gib, peer: gib)) { try await f.preview() }
+        let ample = try await SyncSpace.$readingOverride.withValue(Self.volumes(f, coordinator: gib, local: gib, peer: gib)) { try await f.preview() }
         #expect(ample.previewToken != nil && ample.copies == 2)
+    }
+
+    @Test("a plan with a conflict shows its conflicts, not a space problem, however full the volumes are")
+    func conflictsAreNotASpaceProblem() async throws {
+        let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
+        let blob = String(repeating: "x", count: 4 * 1024 * 1024)
+        try f.write(blob, "same-path"); try f.write(blob + "y", "same-path", peer: true)
+        // A large copy beside the conflict would, alone, be refused for space.
+        try f.write(blob, "big-copy")
+        let preview = try await SyncSpace.$readingOverride.withValue(Self.volumes(f, coordinator: 0, local: 0, peer: 0)) { try await f.preview() }
+        #expect(preview.conflicts == 1 && preview.previewToken == nil, "the conflict is reported")
+        // Without the conflict the same folder is refused for space.
+        try FileManager.default.removeItem(at: f.local.appendingPathComponent("same-path"))
+        try FileManager.default.removeItem(at: f.peer.appendingPathComponent("same-path"))
+        await #expect(throws: SourceSyncError.self) {
+            try await SyncSpace.$readingOverride.withValue(Self.volumes(f, coordinator: 0, local: 0, peer: 0)) { try await f.preview() }
+        }
+    }
+
+    @Test("places that share a volume are summed, so a volume that fits each alone is still short for both")
+    func sharedVolumeIsSummed() async throws {
+        let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
+        let blob = String(repeating: "x", count: 8 * 1024 * 1024)
+        try f.write(blob, "from-local"); try f.write(blob, "from-peer", peer: true)
+        // Needs: 32 MiB for the vault and its restore at the coordinator, and 16 MiB (8 exported, 8 received)
+        // beside each folder. With slack that is about 99 MiB and 82 MiB each, so 120 MiB covers any one
+        // place, but not all three on one volume (about 134 MiB together).
+        let free: UInt64 = 120 * 1024 * 1024
+        let apart = try await SyncSpace.$readingOverride.withValue(Self.volumes(f, coordinator: free, local: free, peer: free)) { try await f.preview() }
+        #expect(apart.previewToken != nil, "each volume alone has enough")
+        let error = await #expect(throws: SourceSyncError.self) {
+            try await SyncSpace.$readingOverride.withValue(Self.volumes(f, coordinator: free, local: free, peer: free, sharedVolume: true)) { try await f.preview() }
+        }
+        #expect(error?.description.contains("this computer's Restic Station data and beside this computer's folder and beside the other folder") == true, "\(error?.description ?? "")")
     }
 
     @Test("an unknown amount of free space never blocks, and neither does a sync with nothing to copy")
@@ -704,12 +739,12 @@ struct SourceSyncCoordinatorTests {
         let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
         try f.write(String(repeating: "x", count: 4 * 1024 * 1024), "big")
         // Every volume says nothing (a helper older than #197, or a filesystem that will not say).
-        let preview = try await SyncSpace.$availableOverride.withValue({ _ in nil }) { try await f.preview() }
+        let preview = try await SyncSpace.$readingOverride.withValue({ _ in SyncSpace.Reading() }) { try await f.preview() }
         #expect(preview.copies == 1 && preview.previewToken != nil)
         // Everything reported as empty, but only directories and removals: no bytes to copy, so nothing to refuse.
         let g = try Fixture(); defer { try? FileManager.default.removeItem(at: g.base) }
         try FileManager.default.createDirectory(at: g.local.appendingPathComponent("empty"), withIntermediateDirectories: true)
-        let none = try await SyncSpace.$availableOverride.withValue({ _ in 0 }) { try await g.preview() }
+        let none = try await SyncSpace.$readingOverride.withValue({ _ in .init(free: 0, volume: 1) }) { try await g.preview() }
         #expect(none.copies == 1 && none.previewToken != nil)
     }
 
@@ -735,12 +770,10 @@ struct SourceSyncCoordinatorTests {
         let error = await #expect(throws: SourceSyncError.self) {
             try await SyncEndpointRequest.$limitOverride.withValue(2048) { try await preview(legacyPeer: false) }
         }
-        #expect(error?.description.contains("too many entries") == true && error?.description.contains("is older") == false)
-        // For a peer that predates the limit, the message says why.
-        let legacy = await #expect(throws: SourceSyncError.self) {
-            try await SyncEndpointRequest.$limitOverride.withValue(2048) { try await preview(legacyPeer: true) }
-        }
-        #expect(legacy?.description.contains("is older and reads at most 2 MiB") == true || legacy?.description.contains("is older") == true)
+        #expect(error?.description.contains("too many entries") == true && error?.description.contains("is older") == false, "\(error?.description ?? "")")
+        // A peer that advertises no limit is assumed to read 32 MiB, whatever this side's limit is:
+        // the override does not reach it, so a small folder still previews.
+        #expect(try await SyncEndpointRequest.$limitOverride.withValue(2048) { try await preview(legacyPeer: true) }.copies > 0)
         // Nothing was reserved or saved by any refusal.
         #expect(try SourceSyncCoordinator.status(paths: f.paths, setId: f.set.id, groupId: f.group.id).operationId == nil)
         // A local peer has no such limit, however small.

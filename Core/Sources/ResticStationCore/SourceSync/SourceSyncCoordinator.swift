@@ -128,11 +128,16 @@ public struct SourceSyncCoordinator: Sendable {
         let excluded = Set(local.excluded ?? []).union(peer.excluded ?? []).sorted()
         // Refuse before anything is reserved when a place is known to lack the
         // room for the temporary copies this plan needs (#197).
-        let shortfalls = SyncSpace.shortfalls(
-            SyncSpace.need(for: plan), coordinator: SyncSpace.available(atPath: paths.root.path),
-            local: local.freeBytes, peer: peer.freeBytes, peerIsRemote: group.peer.sshTarget != nil
-        )
-        if !shortfalls.isEmpty { throw SyncSpace.refusal(shortfalls) }
+        // Skipped for a plan with a conflict, which is never applied: the
+        // person is shown the conflicts to resolve, not a space problem.
+        if plan.conflicts.isEmpty {
+            let shortfalls = SyncSpace.shortfalls(
+                SyncSpace.need(for: plan), coordinator: SyncSpace.reading(atPath: paths.root.path),
+                local: .init(free: local.freeBytes, volume: local.volumeId), peer: .init(free: peer.freeBytes, volume: peer.volumeId),
+                peerIsRemote: group.peer.sshTarget != nil
+            )
+            if !shortfalls.isEmpty { throw SyncSpace.refusal(shortfalls) }
+        }
         let previewId = UUID()
         try requireRequestSize(plan, group: group, peer: peer, preview: previewId)
         let stored = StoredSyncPreview(id: previewId, setId: set.id, plan: plan, binding: binding, createdAt: Date(), group: group)
@@ -621,14 +626,14 @@ public struct SourceSyncCoordinator: Sendable {
     /// Refuses at preview, before anything is reserved, a plan whose prepare
     /// request the other computer's helper would not read (#197). The
     /// largest request of an operation is its prepare, which carries the
-    /// copy's whole inventory. A peer that does not echo the scope predates
-    /// the 64 MiB limit and still reads 32 MiB.
+    /// copy's whole inventory. The limit is what the peer advertised; one
+    /// that advertises nothing predates #197 and reads 32 MiB.
     private func requireRequestSize(_ plan: SourceSyncPlan, group: SourceSyncGroup, peer: SyncEndpointReply, preview id: UUID) throws {
         guard group.peer.sshTarget != nil else { return }
         let request = makeEndpointRequest(.prepare, plan: plan, group: group, operationId: id, local: false, protectedSnapshot: nil, protectedRepository: nil)
-        let limit = SyncEndpointRequest.limitOverride
-            ?? (peer.scope == nil ? SyncEndpointRequest.legacyMaximumEncodedBytes : SyncEndpointRequest.maximumEncodedBytes)
-        try SourceSyncClient.requireSize(try SyncEndpointRequest.encode(request).count, limit: limit, peerIsOlder: peer.scope == nil)
+        // What this peer says it reads; a peer that says nothing reads 32 MiB.
+        let limit = SyncEndpointRequest.limit(peerAdvertised: peer.maxRequestBytes)
+        try SourceSyncClient.requireSize(try SyncEndpointRequest.encode(request).count, limit: limit, peerIsOlder: peer.maxRequestBytes == nil)
     }
 
     /// `scope` nil, as for an operation journaled before #202, sends none.
