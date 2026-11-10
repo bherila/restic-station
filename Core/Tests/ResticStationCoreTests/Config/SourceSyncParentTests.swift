@@ -65,6 +65,24 @@ struct SourceSyncMirrorTests {
 
 @Suite("Sync primary proof")
 struct SourceSyncPrimaryProofTests {
+    @Test("the outcome is read through the primary alone, whatever the group status says")
+    func outcomeIgnoresGroupStatus() {
+        let (set, d) = SourceSyncMirrorTests.set(mirrors: ["Offsite"])
+        let backup = SetRunChild(runId: "b", kind: .backup, destId: d[0].id, status: .success)
+        let failedCopy = SetRunChild(runId: "c", kind: .copy, destId: d[1].id, status: .failed)
+        // A failed mirror copy makes the group's status `failed`; the proof stands.
+        let proven = EngineSourceSyncBackups.provenOnPrimary(.completed(status: .failed, groupId: "g", children: [backup, failedCopy]), set: set, primary: d[0])
+        #expect(proven?.backup.runId == "b")
+        #expect(proven?.warnings.count == 1 && proven?.warnings.first?.contains("\"Offsite\"") == true)
+        // A group that claims success cannot make a failed primary backup one.
+        let failedBackup = SetRunChild(runId: "b", kind: .backup, destId: d[0].id, status: .failed)
+        #expect(EngineSourceSyncBackups.provenOnPrimary(.completed(status: .success, groupId: "g", children: [failedBackup]), set: set, primary: d[0]) == nil)
+        // Anything but a completed run is no proof.
+        #expect(EngineSourceSyncBackups.provenOnPrimary(.skipped, set: set, primary: d[0]) == nil)
+        #expect(EngineSourceSyncBackups.provenOnPrimary(.retryable(reason: "x"), set: set, primary: d[0]) == nil)
+        #expect(EngineSourceSyncBackups.provenOnPrimary(.infrastructureFailure(reason: "x"), set: set, primary: d[0]) == nil)
+    }
+
     @Test("only the primary's own runs decide the proof; a failed mirror copy never does")
     func primaryOnly() {
         let (_, d) = SourceSyncMirrorTests.set(mirrors: ["Offsite"])
@@ -117,6 +135,9 @@ struct SyncProspectiveDirectoryTests {
         try FileManager.default.createSymbolicLink(at: root.appendingPathComponent("dangling"), withDestinationURL: root.appendingPathComponent("nowhere"))
         #expect(throws: SourceSyncError.self) { try SourceSyncFilesystem.prospectiveDirectory(root.appendingPathComponent("dangling/repo").path) }
         #expect(throws: SourceSyncError.self) { try SourceSyncFilesystem.prospectiveDirectory("relative/path") }
+        // A file where a folder must be is not an absent folder.
+        try Data("x".utf8).write(to: root.appendingPathComponent("plainfile"))
+        #expect(throws: SourceSyncError.self) { try SourceSyncFilesystem.prospectiveDirectory(root.appendingPathComponent("plainfile/repo").path) }
         // The prospective path of a missing repository inside a folder is
         // still inside it, so the overlap check still catches it.
         let notes = root.appendingPathComponent("notes", isDirectory: true)

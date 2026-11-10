@@ -74,7 +74,10 @@ struct SourceSyncCoordinatorTests {
         var destinationChecks = 0
         /// Mirrors the fake reports as having missed each backup.
         var mirrorWarnings: [String] = []
-        func setMirrorWarnings(_ value: [String]) { mirrorWarnings = value }
+        /// What the final backup reports; defaults to the same as protection.
+        var finalMirrorWarnings: [String]?
+        func setMirrorWarnings(_ value: [String]) { mirrorWarnings = value; finalMirrorWarnings = nil }
+        func setFinalMirrorWarnings(_ value: [String]) { finalMirrorWarnings = value }
 
         func failProtection() { protectionFails = true }
         func setDestinationDown(_ value: Bool) { destinationDown = value }
@@ -106,7 +109,7 @@ struct SourceSyncCoordinatorTests {
             finalSets.append(set)
             if let vault { finalHasAgreement = try SourceSyncFilesystem.inventory(at: vault.path).items["agreement.json"] != nil }
             if finalFails { throw SourceSyncError.protectionFailed }
-            return mirrorWarnings
+            return finalMirrorWarnings ?? mirrorWarnings
         }
     }
 
@@ -679,6 +682,38 @@ struct SourceSyncCoordinatorTests {
         #expect(resumed.status == "synchronized" && resumed.warnings == [warning])
     }
 
+    @Test("the final backup's report replaces protection's: a mirror that came back is not a warning")
+    func finalReportReplacesProtection() async throws {
+        let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
+        try f.write("local", "a"); #expect(try await f.apply(f.preview()).status == "synchronized")
+        try f.write("edited", "a", peer: true)
+        await f.backups.setMirrorWarnings(["Offsite missed protection"])
+        await f.backups.setFinalMirrorWarnings([])
+        let result = try await f.apply(f.preview())
+        #expect(result.status == "synchronized" && result.warnings.isEmpty)
+        // And the reverse: reachable then, away now, is reported.
+        try f.write("again", "a")
+        await f.backups.setMirrorWarnings([])
+        await f.backups.setFinalMirrorWarnings(["Offsite missed the final backup"])
+        #expect(try await f.apply(f.preview()).warnings == ["Offsite missed the final backup"])
+    }
+
+    @Test("a recover that only finishes bookkeeping after the operation completed still reports its warnings")
+    func warningsSurviveCompleteBoundary() async throws {
+        let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
+        try f.write("local", "a"); #expect(try await f.apply(f.preview()).status == "synchronized")
+        try f.write("edited", "a", peer: true)
+        await f.backups.setMirrorWarnings(["Offsite is away"])
+        let preview = try await f.preview()
+        await #expect(throws: SourceSyncError.self) {
+            try await SourceSyncCoordinator.$afterDurablePhase.withValue({ at in
+                if at == "complete" { throw SourceSyncError.transferFailed }
+            }) { try await f.apply(preview) }
+        }
+        let resumed = try await f.coordinator.recover(set: f.set, group: f.group, machineId: "laptop", binding: "fixture")
+        #expect(resumed.status == "synchronized" && resumed.warnings == ["Offsite is away"])
+    }
+
     @Test("a journal written before mirror warnings existed still decodes, and so does an older status report")
     func olderStateStillDecodes() throws {
         let f = try Fixture()
@@ -693,6 +728,29 @@ struct SourceSyncCoordinatorTests {
         let json = #"{"groupId":"11111111-1111-4111-8111-111111111111","status":"synchronized","canCancel":false}"#
         let status = try ConfigStore.makeDecoder().decode(SourceSyncStatus.self, from: Data(json.utf8))
         #expect(status.warnings.isEmpty && status.status == "synchronized")
+    }
+
+    @Test("an absent mirror folder does not stop preview, an absent primary does, and a mirror that would sit inside the sync folder does")
+    func absentRepositoryFolders() async throws {
+        let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
+        try f.write("x", "x")
+        var set = f.set
+        let away = f.base.appendingPathComponent("unplugged/mirror").path
+        set.destinations.append(.init(id: UUID(), label: "Offsite", repoURL: away, isPrimary: false))
+        var config = f.config; config.sets = [set]
+        let coordinator = SourceSyncCoordinator(paths: f.paths, transport: LocalTransport(), backups: f.backups)
+        func preview(_ set: BackupSet) async throws -> SourceSyncPreview {
+            try await coordinator.preview(set: set, group: f.group, machineId: "laptop", config: config, binding: "fixture")
+        }
+        #expect(try await preview(set).copies == 1, "an unplugged mirror is not a reason to refuse")
+        // Where it would be still counts: inside the sync folder it refuses.
+        var inside = set
+        inside.destinations[1].repoURL = f.local.appendingPathComponent("not-yet/repo").path
+        await #expect(throws: SourceSyncError.self) { try await preview(inside) }
+        // An absent primary keeps the strict refusal.
+        var noPrimary = set
+        noPrimary.destinations[0].repoURL = f.base.appendingPathComponent("gone-primary").path
+        await #expect(throws: SourceSyncError.self) { try await preview(noPrimary) }
     }
 
     @Test("an excluded entry that appears in a folder being removed stops the commit before anything moves (#202)")

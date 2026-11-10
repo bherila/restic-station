@@ -86,6 +86,10 @@ struct SourceSyncRunSheet: View {
                 }
             } else if statuses[group.id]?.operationId != nil {
                 Text("An interrupted operation is ready to resume. Existing recovery copies are retained.").foregroundStyle(.orange)
+                ForEach(statuses[group.id]?.warnings ?? [], id: \.self) { warning in
+                    Label(warning, systemImage: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange).font(.callout).textSelection(.enabled)
+                }
                 if statuses[group.id]?.canCancel == true {
                     Button("Cancel Pending Plan") {
                         Task {

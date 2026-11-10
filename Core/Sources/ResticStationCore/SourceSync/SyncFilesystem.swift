@@ -74,7 +74,8 @@ public enum SourceSyncFilesystem {
     /// **Fails closed.** Only a component that is absent (`ENOENT`) is
     /// skipped. One that exists but cannot be resolved, such as a dangling
     /// symlink, which could point back into a sync folder once its target
-    /// appears, or one that cannot be inspected, refuses.
+    /// appears, one that is a file where a folder must be (`ENOTDIR`), or
+    /// one that cannot be inspected, refuses.
     static func prospectiveDirectory(_ path: String) throws -> String {
         guard SourceSyncGroup.isAbsoluteCanonical(path) else { throw changed() }
         var existing = path
@@ -86,7 +87,7 @@ public enum SourceSyncFilesystem {
                 defer { free(resolved) }
                 return tail.reversed().reduce(String(cString: resolved)) { $0 == "/" ? "/" + $1 : $0 + "/" + $1 }
             }
-            guard errno == ENOENT || errno == ENOTDIR, existing != "/" else { throw changed() }
+            guard errno == ENOENT, existing != "/" else { throw changed() }
             tail.append((existing as NSString).lastPathComponent)
             existing = (existing as NSString).deletingLastPathComponent
             if existing.isEmpty { existing = "/" }

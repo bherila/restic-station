@@ -19,10 +19,9 @@ public struct EngineSourceSyncBackups: SourceSyncBackingUp {
         // run did to it must have succeeded. A mirror that is offline or
         // whose copy failed does not weaken it, so it is reported and the
         // sync goes on (#197).
-        guard case .completed(_, _, let children) = result,
-              let backup = Self.primaryBackup(children, primary: primary),
-              let snapshot = try runs.metadata(runId: backup.runId).snapshotId else { throw SourceSyncError.protectionFailed }
-        let warnings = Self.mirrorWarnings(set, children: children)
+        guard let proven = Self.provenOnPrimary(result, set: set, primary: primary),
+              let snapshot = try runs.metadata(runId: proven.backup.runId).snapshotId else { throw SourceSyncError.protectionFailed }
+        let warnings = proven.warnings
         // A fresh target and an exact snapshot subtree keep unrelated live
         // paths out of a recovery proof. Neither a dry-run nor a timestamp
         // can produce this receipt.
@@ -66,11 +65,10 @@ public struct EngineSourceSyncBackups: SourceSyncBackingUp {
         }
         let result = await engine.runSet(set, trigger: .manual)
         guard let primary = set.destinations.first(where: \.isPrimary),
-              case .completed(_, _, let children) = result,
-              Self.primaryBackup(children, primary: primary) != nil else {
+              let proven = Self.provenOnPrimary(result, set: set, primary: primary) else {
             throw SourceSyncError.stateInvalid("Synchronization finished, but the backup needs attention. Inspect Runs, then resume to retry the backup.")
         }
-        return Self.mirrorWarnings(set, children: children)
+        return proven.warnings
     }
 
     private func adding(_ vault: URL, to set: BackupSet) -> BackupSet {
@@ -100,8 +98,17 @@ public struct EngineSourceSyncBackups: SourceSyncBackingUp {
             .max { $0.time < $1.time }?.id
     }
 
-    /// One line per mirror that has no successful copy in this run. An
-    /// unreachable mirror records no run at all, so absence is the signal.
+    /// What a set run proved on the primary, and which mirrors missed it.
+    /// The one place a run's outcome is read for sync, for protection and
+    /// the final backup alike. The group status is deliberately not
+    /// consulted: it is the worst of every run, mirrors included, and a
+    /// mirror must not decide the primary's proof (#197).
+    static func provenOnPrimary(_ outcome: SetRunOutcome, set: BackupSet, primary: Destination) -> (backup: SetRunChild, warnings: [String])? {
+        guard case .completed(_, _, let children) = outcome,
+              let backup = primaryBackup(children, primary: primary) else { return nil }
+        return (backup, mirrorWarnings(set, children: children))
+    }
+
     /// The primary's backup, if the primary is fully proven: that backup and
     /// every other run against the primary succeeded. A mirror's runs are
     /// not consulted; they only produce warnings.
@@ -115,6 +122,8 @@ public struct EngineSourceSyncBackups: SourceSyncBackingUp {
         EngineSourceSyncBackups.mirrorWarnings(set, children: children)
     }
 
+    /// One line per mirror that has no successful copy in this run. An
+    /// unreachable mirror records no run at all, so absence is the signal.
     static func mirrorWarnings(_ set: BackupSet, children: [SetRunChild]) -> [String] {
         set.destinations.filter { !$0.isPrimary }.compactMap { destination in
             children.contains { $0.kind == .copy && $0.destId == destination.id && $0.status == .success } ? nil

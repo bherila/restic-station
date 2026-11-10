@@ -325,7 +325,9 @@ public struct SourceSyncCoordinator: Sendable {
             var record = try store.record()
             record.status = .synchronized; record.activeOperation = nil
             try store.save(record)
-            return report(record)
+            var done = report(record)
+            done.warnings = journal.mirrorWarnings ?? []
+            return done
         }
         guard journal.phase != .cancelling && journal.phase != .cancelled else {
             throw SourceSyncError.stateInvalid("Finish cancelling the unstarted operation before making a new plan.")
@@ -417,7 +419,7 @@ public struct SourceSyncCoordinator: Sendable {
                     guard proof.payloadFingerprint == (try inventory.fingerprint) else { throw SourceSyncError.protectionFailed }
                     journal.protectedSnapshot = proof.snapshotId
                     journal.protectedRepository = proof.repositoryId
-                    journal.mirrorWarnings = Self.merged(journal.mirrorWarnings, proof.mirrorWarnings)
+                    journal.mirrorWarnings = Self.nilIfEmpty(proof.mirrorWarnings)
                 }
                 journal.phase = .protected
                 try persist()
@@ -485,7 +487,10 @@ public struct SourceSyncCoordinator: Sendable {
                 try persist()
             }
             if journal.phase == .agreed {
-                journal.mirrorWarnings = Self.merged(journal.mirrorWarnings, try await backups.backup(set: set, retaining: vault.path))
+                // The final backup copies every snapshot a mirror lacks, so
+                // what it reports replaces the protection pass's report: a
+                // mirror that was away then and is back now is not a warning.
+                journal.mirrorWarnings = Self.nilIfEmpty(try await backups.backup(set: set, retaining: vault.path))
                 journal.phase = .backedUp
                 try persist()
             }
@@ -535,7 +540,11 @@ public struct SourceSyncCoordinator: Sendable {
         for destination in set.destinations where destination.kind == .localPath {
             // A mirror's folder may be absent (an unplugged disk), which must
             // not stop a sync (#197); where it would be is still compared.
-            let repo = try SourceSyncFilesystem.prospectiveDirectory(destination.repoURL)
+            // The primary is held to the strict rule: a missing primary is a
+            // refusal, not a path to guess at.
+            let repo = destination.isPrimary
+                ? try SourceSyncFilesystem.resolvedDirectory(destination.repoURL)
+                : try SourceSyncFilesystem.prospectiveDirectory(destination.repoURL)
             guard !SourceSyncGroup.contains(root, repo), !SourceSyncGroup.contains(repo, root) else { throw SourceSyncError.stalePlan }
         }
     }
@@ -608,12 +617,7 @@ public struct SourceSyncCoordinator: Sendable {
         "source-sync:v1:" + SHA256Digest.hex(try ConfigStore.makeEncoder().encode(preview))
     }
 
-    /// Warnings from two backup passes, each once, in first-seen order.
-    static func merged(_ existing: [String]?, _ new: [String]) -> [String]? {
-        var seen = Set<String>()
-        let all = ((existing ?? []) + new).filter { seen.insert($0).inserted }
-        return all.isEmpty ? nil : all
-    }
+    static func nilIfEmpty(_ warnings: [String]) -> [String]? { warnings.isEmpty ? nil : warnings }
 
     private func report(_ record: SourceSyncGroupRecord) -> SourceSyncStatus {
         SourceSyncStatus(groupId: record.groupId, status: record.status.rawValue, operationId: record.activeOperation, lastSynchronizedAt: record.lastSynchronizedAt)
