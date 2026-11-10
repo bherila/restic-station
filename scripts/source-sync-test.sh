@@ -130,6 +130,22 @@ test ! -e "$WORK/other copy/created"
 mv "$WORK/repo-config" "$WORK/repo/config"
 "$HELPER" sync recover --set "$SET" >/dev/null
 cmp "$WORK/workspace/notes/created" "$WORK/other copy/created"
+# An offline backup mirror does not block a sync (#197): protection needs
+# only the restore-verified primary snapshot. The sync reports the mirror,
+# and an ordinary backup brings it up to date afterwards.
+mv "$WORK/mirror" "$WORK/mirror-away"
+printf '%s' 'edited while the mirror is away' > "$WORK/other copy/from peer"
+plan
+apply
+jq -e '.ok and .data.status == "synchronized" and (.data.warnings | length) == 1 and (.data.warnings[0] | test("Second archive"))' "$WORK/result.json" >/dev/null \
+    || { echo 'FAIL: an offline mirror blocked the sync or went unreported' >&2; cat "$WORK/result.json" >&2; exit 1; }
+test "$(cat "$WORK/workspace/notes/from peer")" = 'edited while the mirror is away'
+mv "$WORK/mirror-away" "$WORK/mirror"
+"$HELPER" run-set --set "$SET" --kind backup >/dev/null
+PRIMARY_LATEST="$(RESTIC_PASSWORD_COMMAND="$PASSWORD_COMMAND" "$RESTIC" -r "$WORK/repo" snapshots --json | jq -r 'sort_by(.time) | last | .id')"
+RESTIC_PASSWORD_COMMAND="$MIRROR_PASSWORD_COMMAND" "$RESTIC" -r "$WORK/mirror" snapshots --json \
+    | jq -e --arg id "$PRIMARY_LATEST" 'any(.[]; .id == $id or .original == $id)' >/dev/null \
+    || { echo 'FAIL: the mirror did not catch up at the next ordinary backup' >&2; exit 1; }
 # Sync covers only what the backup covers (#202): bytecode the set's backup
 # excludes differs between the copies, yet a replacement beside it is
 # protected, restore-verified and applied, and neither bytecode file moves.
@@ -169,4 +185,4 @@ test "$(cat "$WORK/workspace/notes/from peer")" = 'peer version'
 RESTIC_PASSWORD_COMMAND="$PASSWORD_COMMAND" "$RESTIC" -r "$WORK/repo" snapshots --json > "$WORK/snapshots.json"
 jq -e 'length >= 6 and ([.[] | select(.parent == null)] | length) == 1' "$WORK/snapshots.json" >/dev/null \
     || { echo 'FAIL: sync backups ran without a parent snapshot' >&2; jq -c '[.[] | {id: .short_id, parent}]' "$WORK/snapshots.json" >&2; exit 1; }
-echo 'PASS: source sync, real restore proof, modification times, independent backup scope, deletion, replay, exclusion refusal, unreachable-repository refusal, backup-excluded paths and parent snapshots'
+echo 'PASS: source sync, real restore proof, modification times, independent backup scope, deletion, replay, exclusion refusal, unreachable-repository refusal, offline mirror warning, backup-excluded paths and parent snapshots'

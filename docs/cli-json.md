@@ -574,6 +574,12 @@ When that scope is not empty and the other computer's helper predates it,
 `sync plan` refuses with `config_invalid` and asks for that helper to be
 updated.
 
+The `sync apply`, `sync recover` and `sync status` results carry
+`warnings`, a list of strings (empty when there is nothing to report). A
+backup mirror that was offline or whose copy failed is named there; the sync
+itself succeeded, and the mirror catches up at the next ordinary backup. An
+older helper's report has no `warnings`, which reads as empty.
+
 `sync apply --set <uuid> [--group <uuid>] --preview-token-stdin` consumes
 the same bounded capability input as purge apply. Never put a token in argv
 or an environment variable. The token binds inventories, endpoint epochs,

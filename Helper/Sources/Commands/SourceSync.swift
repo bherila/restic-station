@@ -85,7 +85,11 @@ struct SourceSyncApplyCommand: AsyncParsableCommand, JSONRenderable {
         let result = try await s.context.configStore.withRevisionHold(from: s.fingerprint) {
             try await s.coordinator.apply(token: token, set: s.set, group: s.group, machineId: s.context.scheduled.machineId, config: s.config, binding: s.binding)
         }
-        if json { CLIJSON.print(result) } else { print("Folders synchronized and the full backup set backed up.") }
+        if json { CLIJSON.print(result) }
+        else {
+            print("Folders synchronized and the full backup set backed up.")
+            for warning in result.warnings { print("Warning: \(warning)") }
+        }
     }
 }
 
@@ -105,7 +109,10 @@ struct SourceSyncRecoverCommand: AsyncParsableCommand, JSONRenderable {
             return try await s.coordinator.recover(set: s.set, group: s.group, machineId: s.context.scheduled.machineId, binding: s.binding)
         }
         if json { CLIJSON.print(result) }
-        else { print(cancelUnstarted ? "Unstarted plan cancelled; preview the current folders again." : "Interrupted synchronization recovered and backed up.") }
+        else {
+            print(cancelUnstarted ? "Unstarted plan cancelled; preview the current folders again." : "Interrupted synchronization recovered and backed up.")
+            for warning in result.warnings { print("Warning: \(warning)") }
+        }
     }
 }
 

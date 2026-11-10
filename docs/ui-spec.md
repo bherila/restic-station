@@ -127,6 +127,9 @@ capability as the CLI; no source mutation occurs in the app process.
 Interrupted work is shown before another plan is made, with Resume & Back
 Up and, only before installation, Cancel Pending Plan. The sheet stays open
 with the failure reason and a refresh action when work needs attention.
+When a backup mirror was offline or its copy failed, the finished folder shows
+an orange warning naming it beneath "Synchronized and backed up" (#197); the
+sync itself succeeded.
 Scheduled runs remain ordinary backups; synchronization is manual.
 
 The set list keeps Last backup and Folder sync separate. Folder sync opens

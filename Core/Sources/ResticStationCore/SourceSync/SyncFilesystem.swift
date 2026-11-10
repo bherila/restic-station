@@ -65,6 +65,34 @@ public enum SourceSyncFilesystem {
         return String(cString: resolved)
     }
 
+    /// Where `path` would resolve if its missing tail were created, for
+    /// comparing a backup repository with a sync root while the repository is
+    /// not there, such as a mirror on an unplugged disk (#197). The deepest
+    /// existing ancestor is resolved with `realpath`; the rest is appended
+    /// as written.
+    ///
+    /// **Fails closed.** Only a component that is absent (`ENOENT`) is
+    /// skipped. One that exists but cannot be resolved, such as a dangling
+    /// symlink, which could point back into a sync folder once its target
+    /// appears, or one that cannot be inspected, refuses.
+    static func prospectiveDirectory(_ path: String) throws -> String {
+        guard SourceSyncGroup.isAbsoluteCanonical(path) else { throw changed() }
+        var existing = path
+        var tail: [String] = []
+        while true {
+            var info = stat()
+            if lstat(existing, &info) == 0 {
+                guard let resolved = realpath(existing, nil) else { throw changed() }
+                defer { free(resolved) }
+                return tail.reversed().reduce(String(cString: resolved)) { $0 == "/" ? "/" + $1 : $0 + "/" + $1 }
+            }
+            guard errno == ENOENT || errno == ENOTDIR, existing != "/" else { throw changed() }
+            tail.append((existing as NSString).lastPathComponent)
+            existing = (existing as NSString).deletingLastPathComponent
+            if existing.isEmpty { existing = "/" }
+        }
+    }
+
     /// `hashes` lets a live root's inventory reuse digests from its last
     /// scan (``SyncHashCache``). Proof inventories of private staging,
     /// vaults and restores never pass one: they always read every byte.
