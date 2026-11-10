@@ -217,9 +217,14 @@ printf '%s' 'only on the other copy' > "$WORK/other copy/survivor.txt"
 # The control directory names are the documented ones, not a glob that could
 # also hit another group's directory in the same parent.
 control_name() { printf '.restic-station-sync-%s' "$(printf %s "$(cd "$1" && pwd -P)" | shasum -a 256 | cut -c1-24)"; }
-test -d "$WORK/workspace/$(control_name "$WORK/workspace/notes")" && test -d "$WORK/$(control_name "$WORK/other copy")" \
-    || { echo 'FAIL: the documented control directory names do not match the real ones' >&2; ls -a "$WORK/workspace" "$WORK" >&2; exit 1; }
-rm -rf "$WORK/state/source-sync/$GROUP" "$WORK/workspace/$(control_name "$WORK/workspace/notes")" "$WORK/$(control_name "$WORK/other copy")"
+LOCAL_CONTROL="$WORK/workspace/$(control_name "$WORK/workspace/notes")"
+PEER_CONTROL="$WORK/$(control_name "$WORK/other copy")"
+if [ ! -d "$LOCAL_CONTROL" ] || [ ! -d "$PEER_CONTROL" ]; then
+    echo 'FAIL: the documented control directory names do not match the real ones' >&2
+    ls -a "$WORK/workspace" "$WORK" >&2
+    exit 1
+fi
+rm -rf "${WORK:?}/state/source-sync/${GROUP:?}" "${LOCAL_CONTROL:?}" "${PEER_CONTROL:?}"
 plan
 jq -e '.ok and .data.conflicts == 0 and .data.removals == 0' "$WORK/plan.json" >/dev/null \
     || { echo 'FAIL: the documented re-enrol steps did not give a first run' >&2; cat "$WORK/plan.json" >&2; exit 1; }

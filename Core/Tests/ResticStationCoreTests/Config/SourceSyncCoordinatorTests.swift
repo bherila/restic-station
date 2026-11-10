@@ -46,6 +46,9 @@ struct SourceSyncCoordinatorTests {
         /// The endpoint at this path behaves like a helper from before #202:
         /// it never sees the scope and never reports one.
         var legacyRoot: String?
+        /// The endpoint at this path is a #202-#213 build: it echoes the scope
+        /// but advertises no limit, no free space and no volume.
+        var midRoot: String?
         /// Every request the coordinator sends, as sent.
         var requests: RequestLog?
         func request(_ request: SyncEndpointRequest, at endpoint: SyncEndpoint) async throws -> SyncEndpointReply {
@@ -54,6 +57,7 @@ struct SourceSyncCoordinatorTests {
             if request.root == legacyRoot { request.scope = nil }
             var reply = try SyncEndpointService.handle(request)
             if request.root == legacyRoot { reply.scope = nil; reply.excluded = nil; reply.freeBytes = nil; reply.volumeId = nil; reply.maxRequestBytes = nil }
+            if request.root == midRoot { reply.freeBytes = nil; reply.volumeId = nil; reply.maxRequestBytes = nil }
             if request.action == .inventory || request.action == .prepare { reply.transfer = reportedTools }
             return reply
         }
@@ -784,6 +788,34 @@ struct SourceSyncCoordinatorTests {
             try await coordinator.preview(set: local, group: f.group, machineId: "laptop", config: localConfig, binding: "fixture")
         }
         #expect(ok.copies > 0)
+    }
+
+    @Test("a peer that advertises no limit, with or without the scope echo, is held to the legacy limit and told why")
+    func legacyPeerRefusedAtLegacyLimit() async throws {
+        let f = try Fixture(); defer { try? FileManager.default.removeItem(at: f.base) }
+        for index in 0..<100 { try f.write("file \(index)", "bulk/file-number-\(index).txt", peer: true) }
+        var remote = f.group
+        remote.peer = .init(path: f.peer.path, sshTarget: "user@host")
+        var set = f.set; set.syncFolders = [remote]
+        var config = f.config; config.sets = [set]
+        func preview(_ transport: LocalTransport) async throws -> SourceSyncPreview {
+            try await SourceSyncCoordinator(paths: f.paths, transport: transport, backups: f.backups)
+                .preview(set: set, group: remote, machineId: "laptop", config: config, binding: "fixture")
+        }
+        // The legacy limit made small: a current peer (advertising 64 MiB) is unaffected, the others are held to it.
+        func limited(_ transport: LocalTransport) async throws -> SourceSyncPreview {
+            try await SyncEndpointRequest.$legacyLimitOverride.withValue(2048) { try await preview(transport) }
+        }
+        let current = try await limited(LocalTransport())
+        #expect(current.copies > 0)
+        for (label, transport) in [("pre-#202", LocalTransport(legacyRoot: f.peer.path)), ("#202-#213", LocalTransport(midRoot: f.peer.path))] {
+            let error = await #expect(throws: SourceSyncError.self, "\(label)") { try await limited(transport) }
+            #expect(error?.description.contains("is older and reads at most 2.0 KiB") == true, "\(label): \(error?.description ?? "")")
+        }
+        // And an absurd advertisement is read as none; a larger one than ours is clamped to ours.
+        #expect(SyncEndpointRequest.limit(peerAdvertised: -5) == SyncEndpointRequest.legacyMaximumEncodedBytes)
+        #expect(SyncEndpointRequest.limit(peerAdvertised: 0) == SyncEndpointRequest.legacyMaximumEncodedBytes)
+        #expect(SyncEndpointRequest.limit(peerAdvertised: Int.max) == SyncEndpointRequest.maximumEncodedBytes)
     }
 
     // MARK: - #197: smaller SSH requests

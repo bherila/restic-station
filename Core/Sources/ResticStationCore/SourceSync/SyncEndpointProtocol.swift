@@ -12,13 +12,19 @@ public struct SyncEndpointRequest: Codable, Sendable {
     public static var maximumEncodedBytes: Int { limitOverride ?? 64 * 1024 * 1024 }
     /// What a helper from before #197 reads, and so what a peer that
     /// does not say otherwise is assumed to read.
-    public static let legacyMaximumEncodedBytes = 32 * 1024 * 1024
+    public static var legacyMaximumEncodedBytes: Int { legacyLimitOverride ?? 32 * 1024 * 1024 }
     /// Replaced only by tests, which cannot build a 64 MiB request cheaply.
     @TaskLocal static var limitOverride: Int?
+    @TaskLocal static var legacyLimitOverride: Int?
 
     /// The most a peer reads, as it advertised on its reply. The scope echo
     /// is no evidence of this: helpers from #202 echo it and still read 32 MiB.
-    static func limit(peerAdvertised: Int?) -> Int { peerAdvertised ?? legacyMaximumEncodedBytes }
+    /// Never more than this side sends, and a figure that makes no sense (zero
+    /// or negative) is read as no advertisement at all.
+    static func limit(peerAdvertised: Int?) -> Int {
+        guard let advertised = peerAdvertised, advertised > 0 else { return legacyMaximumEncodedBytes }
+        return min(advertised, maximumEncodedBytes)
+    }
 
     /// Compact and key-sorted. The request is machine-read and neither hashed
     /// nor displayed, so whitespace only costs bytes against the limit.

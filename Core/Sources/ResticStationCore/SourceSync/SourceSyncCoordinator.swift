@@ -633,7 +633,7 @@ public struct SourceSyncCoordinator: Sendable {
         let request = makeEndpointRequest(.prepare, plan: plan, group: group, operationId: id, local: false, protectedSnapshot: nil, protectedRepository: nil)
         // What this peer says it reads; a peer that says nothing reads 32 MiB.
         let limit = SyncEndpointRequest.limit(peerAdvertised: peer.maxRequestBytes)
-        try SourceSyncClient.requireSize(try SyncEndpointRequest.encode(request).count, limit: limit, peerIsOlder: peer.maxRequestBytes == nil)
+        try SourceSyncClient.requireSize(try SyncEndpointRequest.encode(request).count, limit: limit, peerIsOlder: !(peer.maxRequestBytes.map { $0 > 0 } ?? false))
     }
 
     /// `scope` nil, as for an operation journaled before #202, sends none.

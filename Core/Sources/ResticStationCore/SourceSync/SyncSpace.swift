@@ -83,7 +83,8 @@ enum SyncSpace {
             if groupable, let volume = reading.volume, let index = byVolume.firstIndex(where: { $0.volume == volume }) {
                 byVolume[index].names.append(name)
                 byVolume[index].needed += needed
-                byVolume[index].free = byVolume[index].free ?? reading.free
+                // Quotas can make two places on one volume see different free figures; the smaller is the safe one.
+                byVolume[index].free = [byVolume[index].free, reading.free].compactMap { $0 }.min()
             } else {
                 byVolume.append((groupable ? reading.volume : nil, [name], needed, reading.free))
             }

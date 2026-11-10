@@ -200,6 +200,9 @@ struct SyncSpaceTests {
         r = readings(exact - 1)
         let lines = SyncSpace.shortfalls(need, coordinator: r.0, local: r.1, peer: r.2, peerIsRemote: true)
         #expect(lines.count == 3 && lines[2].hasPrefix("beside the other computer's folder"))
+        // Two places on a volume that disagree about free space (quotas): the smaller figure decides.
+        let quota = SyncSpace.shortfalls(need, coordinator: .init(free: exact * 4, volume: 7), local: .init(free: exact - 1, volume: 7), peer: .init(free: exact * 4, volume: 9), peerIsRemote: true)
+        #expect(quota.count == 1 && quota[0].hasPrefix("this computer's Restic Station data and beside this computer's folder"), "\(quota)")
         // The same volume number on the other computer is a coincidence, not the same volume.
         let remote = SyncSpace.shortfalls(need, coordinator: .init(free: exact, volume: 7), local: .init(free: exact, volume: 8), peer: .init(free: exact, volume: 7), peerIsRemote: true)
         #expect(remote.isEmpty, "\(remote)")
