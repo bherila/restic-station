@@ -4,6 +4,25 @@ import Foundation
 /// not through a configurable shell hook. No repository credentials cross
 /// this channel. Only protocol-versioned, typed operations are accepted.
 public struct SyncEndpointRequest: Codable, Sendable {
+    /// The most the other computer's helper reads from one request (#197).
+    /// Raised from 32 MiB, which held about 80,000 files, because requests
+    /// were pretty-printed and carried each inventory twice. The coordinator
+    /// checks it before sending, so a folder that is still too large fails
+    /// with its own message, not as a dropped SSH session.
+    public static let maximumEncodedBytes = 64 * 1024 * 1024
+    /// What a helper from before #197 reads.
+    public static let legacyMaximumEncodedBytes = 32 * 1024 * 1024
+    /// Replaced only by tests, which cannot build a 64 MiB request cheaply.
+    @TaskLocal static var limitOverride: Int?
+
+    /// Compact and key-sorted. The request is machine-read and neither hashed
+    /// nor displayed, so whitespace only costs bytes against the limit.
+    public static func encode(_ request: SyncEndpointRequest) throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return try encoder.encode(request)
+    }
+
     public enum Action: String, Codable, Sendable { case inventory, prepare, commit, finish, inspect, cancel, cleanup }
     public var version: Int = 1
     public var action: Action
@@ -61,6 +80,10 @@ public struct SyncEndpointReply: Codable, Sendable {
     public var scope: SyncScope?
     /// The topmost entries `scope` left out of `inventory`, sorted.
     public var excluded: [String]?
+    /// Free bytes on the volume beside this folder, on inventory and inspect
+    /// replies (#197). Absent from a helper that predates it, and when the
+    /// volume will not say; either reads as unknown, never as full.
+    public var freeBytes: UInt64?
 
     public init(inventory: SyncInventory, stagingPath: String? = nil, recoveryPath: String? = nil, operationId: UUID? = nil, completedPaths: [String] = []) {
         self.inventory = inventory

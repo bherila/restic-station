@@ -107,6 +107,7 @@ public enum SyncEndpointService {
             reply.lastCompletedOperation = record.lastCompletedOperation
             reply.scope = scope
             reply.excluded = excluded
+            reply.freeBytes = SyncSpace.available(atPath: controlURL.path)
             return reply
         }
         guard let operationId = request.operationId else {
@@ -329,7 +330,7 @@ public enum SyncEndpointService {
             guard SourceSyncPlanner.isRelativePath(change.path), paths.insert(change.path).inserted,
                   expected.items[change.path] == change.before else { throw SourceSyncError.stalePlan }
             if let after = change.after {
-                guard after.mode & ~UInt16(0o777) == 0, after.mode & 0o022 == 0 else { throw SourceSyncError.stalePlan }
+                guard after.mode & ~UInt16(0o777) == 0, SourceSyncFilesystem.isAcceptableMode(mode_t(after.mode)) else { throw SourceSyncError.stalePlan }
             }
             if let before = change.before {
                 guard request.protectedItems[change.path] == before,

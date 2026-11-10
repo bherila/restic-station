@@ -60,7 +60,7 @@ public struct SourceSyncClient: SourceSyncTransport {
 
     public func request(_ request: SyncEndpointRequest, at endpoint: SyncEndpoint) async throws -> SyncEndpointReply {
         guard let target = endpoint.sshTarget else { return try SyncEndpointService.handle(request) }
-        let bytes = try ConfigStore.makeEncoder().encode(request)
+        let bytes = try Self.encodedRequest(request)
         let argv = Self.ssh + ["--", target, ShellQuote.singleQuote(endpoint.helperPath), "sync", "endpoint", "--json"]
         let result = try await runner.run(argv, env: Self.environment, stdin: bytes, currentDirectory: nil,
                                           onStdoutLine: nil, onStderrLine: nil, timeout: 30 * 60)
@@ -76,6 +76,21 @@ public struct SourceSyncClient: SourceSyncTransport {
             throw SourceSyncError.stateInvalid("The other computer returned an incompatible or incomplete sync response.")
         }
         return reply
+    }
+
+    /// The request as sent: compact, and no larger than the other computer's
+    /// helper reads.
+    static func encodedRequest(_ request: SyncEndpointRequest, limit: Int = SyncEndpointRequest.maximumEncodedBytes) throws -> Data {
+        let bytes = try SyncEndpointRequest.encode(request)
+        try requireSize(bytes.count, limit: limit)
+        return bytes
+    }
+
+    static func requireSize(_ count: Int, limit: Int = SyncEndpointRequest.maximumEncodedBytes, peerIsOlder: Bool = false) throws {
+        guard count <= limit else {
+            let older = peerIsOlder ? " The other computer's Restic Station is older and reads at most \(limit / 1_048_576) MiB; updating it raises that to \(SyncEndpointRequest.maximumEncodedBytes / 1_048_576) MiB." : ""
+            throw SourceSyncError.invalidConfiguration("This folder has too many entries to synchronize with another computer over SSH in one request (\(count / 1_048_576) MiB; the limit is \(limit / 1_048_576) MiB).\(older) Synchronize a smaller folder, or move rarely used files out of it.")
+        }
     }
 
     /// A failed peer keeps its own reason: a busy reservation, a refused

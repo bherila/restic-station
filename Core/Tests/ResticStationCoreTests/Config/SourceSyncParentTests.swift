@@ -107,6 +107,137 @@ struct SourceSyncPrimaryProofTests {
     }
 }
 
+@Suite("Sync free space estimate")
+struct SyncSpaceTests {
+    static func file(_ bytes: UInt64) -> SyncItem { SyncItem(digest: String(repeating: "a", count: 64), bytes: bytes) }
+    static func plan(requiresProtection: Bool) -> SourceSyncPlan {
+        let mib: UInt64 = 1 << 20
+        var local = ["new-here": file(10 * mib)], peer = ["new-there": file(20 * mib)]
+        var changes = [
+            SyncChange(path: "new-here", action: .copyToPeer, local: local["new-here"], peer: nil),
+            SyncChange(path: "new-there", action: .copyToLocal, local: nil, peer: peer["new-there"]),
+        ]
+        if requiresProtection {
+            local["edited"] = file(5 * mib); peer["edited"] = file(7 * mib)
+            changes.append(SyncChange(path: "edited", action: .copyToLocal, local: local["edited"], peer: peer["edited"]))
+        }
+        return SourceSyncPlan(groupId: UUID(), groupFingerprint: "x", local: .init(rootIdentity: "a", items: local),
+                              peer: .init(rootIdentity: "b", items: peer), baselineGeneration: nil, changes: changes)
+    }
+
+    @Test("what each place needs: exports plus arrivals beside a folder, the vault and its restores at the coordinator")
+    func needs() {
+        let mib: UInt64 = 1 << 20
+        // Without protection: vault is the exports (10 + 20), held with one restore.
+        let plain = SyncSpace.need(for: Self.plan(requiresProtection: false))
+        #expect(plain.coordinator == 2 * 30 * mib)
+        #expect(plain.local == 10 * mib + 20 * mib, "exports its new file, receives the other's")
+        #expect(plain.peer == 20 * mib + 10 * mib)
+        // With protection the replaced versions join the vault, and two restores stay until cleanup.
+        let protected = SyncSpace.need(for: Self.plan(requiresProtection: true))
+        #expect(protected.coordinator == 3 * (10 + 5 + 20 + 7) * mib)
+        #expect(protected.local == (10 + 5) * mib + (20 + 7) * mib)
+        #expect(protected.peer == (20 + 7) * mib + 10 * mib)
+    }
+
+    @Test("directories, links and removals need no space, so an empty plan needs none")
+    func nothingToCopy() {
+        let dir = SyncItem(kind: .directory, digest: "", mode: 0o755)
+        let plan = SourceSyncPlan(groupId: UUID(), groupFingerprint: "x", local: .init(rootIdentity: "a", items: ["d": dir]),
+                                  peer: .init(rootIdentity: "b", items: [:]), baselineGeneration: nil,
+                                  changes: [SyncChange(path: "d", action: .copyToPeer, local: dir, peer: nil)])
+        #expect(SyncSpace.need(for: plan) == .init(coordinator: 0, local: 0, peer: 0))
+        #expect(SyncSpace.required(0) == 0)
+        #expect(SyncSpace.shortfalls(.init(coordinator: 0, local: 0, peer: 0), coordinator: 0, local: 0, peer: 0, peerIsRemote: true).isEmpty)
+    }
+
+    @Test("slack is ten percent and 64 MiB; unknown is not short; the other computer is named when remote")
+    func slackAndWording() {
+        let mib: UInt64 = 1 << 20
+        #expect(SyncSpace.required(100 * mib) == 110 * mib + 64 * mib)
+        let need = SyncSpace.Need(coordinator: 100 * mib, local: 100 * mib, peer: 100 * mib)
+        #expect(SyncSpace.shortfalls(need, coordinator: nil, local: nil, peer: nil, peerIsRemote: true).isEmpty)
+        // Exactly enough is enough; one byte under is not.
+        let exact = SyncSpace.required(100 * mib)
+        #expect(SyncSpace.shortfalls(need, coordinator: exact, local: exact, peer: exact, peerIsRemote: true).isEmpty)
+        let lines = SyncSpace.shortfalls(need, coordinator: exact - 1, local: exact - 1, peer: exact - 1, peerIsRemote: true)
+        #expect(lines.count == 3 && lines[2].hasPrefix("beside the other computer's folder"))
+        #expect(SyncSpace.format(174 * mib) == "174.0 MiB" && SyncSpace.format(3 << 30) == "3.0 GiB" && SyncSpace.format(512) == "512 B")
+    }
+}
+
+@Suite("Sync SSH request size")
+struct SyncRequestSizeTests {
+    @Test("a 150,000-file prepare request fits, where the old shape (pretty, inventory twice) passed 32 MiB")
+    func largeInventoryFits() throws {
+        let digest = String(repeating: "a", count: 64)
+        var items: [String: SyncItem] = [:]
+        for index in 0..<150_000 { items["projects/some/deeply/nested/folder/file-number-\(index).txt"] = SyncItem(digest: digest, bytes: 4096, mode: 0o644) }
+        let group = SourceSyncGroup(name: "Notes", localPath: "/tmp/a", peer: .init(path: "/tmp/b"), coordinatorMachineId: "laptop")
+        let inventory = SyncInventory(rootIdentity: "1:2:3", items: items)
+        var request = SyncEndpointRequest(action: .prepare, group: group, root: "/tmp/a", operationId: UUID(), expected: inventory)
+        // What the coordinator sends now: the inventory once, compactly.
+        let now = try SyncEndpointRequest.encode(request)
+        #expect(now.count < SyncEndpointRequest.maximumEncodedBytes)
+        #expect(now.count < 32 * 1024 * 1024)
+        // What it sent before: the same inventory again as protectedItems, pretty-printed.
+        request.protectedItems = items
+        let before = try ConfigStore.makeEncoder().encode(request)
+        #expect(before.count > 32 * 1024 * 1024, "the old shape should have been over the old limit")
+        #expect(now.count * 5 < before.count * 2, "now \(now.count) vs before \(before.count)")
+        // The peer decodes the compact form with its usual decoder.
+        request.protectedItems = [:]
+        let decoded = try ConfigStore.makeDecoder().decode(SyncEndpointRequest.self, from: try SyncEndpointRequest.encode(request))
+        #expect(decoded.expected?.items.count == 150_000 && decoded.operationId == request.operationId)
+    }
+
+    @Test("a request over the limit is refused before it is sent, by name; an older peer's smaller limit is explained")
+    func oversizeRefused() {
+        #expect(throws: Never.self) { try SourceSyncClient.requireSize(SyncEndpointRequest.maximumEncodedBytes) }
+        let error = #expect(throws: SourceSyncError.self) { try SourceSyncClient.requireSize(SyncEndpointRequest.maximumEncodedBytes + 1) }
+        #expect(error?.description.contains("too many entries") == true && error?.description.contains("64 MiB") == true)
+        let older = #expect(throws: SourceSyncError.self) {
+            try SourceSyncClient.requireSize(SyncEndpointRequest.legacyMaximumEncodedBytes + 1, limit: SyncEndpointRequest.legacyMaximumEncodedBytes, peerIsOlder: true)
+        }
+        #expect(older?.description.contains("is older and reads at most 32 MiB") == true && older?.description.contains("32 MiB") == true && older?.description.contains("64 MiB") == true)
+    }
+
+    /// Records what the client sends over SSH, and answers like a peer.
+    struct RecordingRunner: ProcessRunning {
+        final class Sent: @unchecked Sendable {
+            private let lock = NSLock(); private var value: [Data] = []
+            func add(_ data: Data) { lock.lock(); value.append(data); lock.unlock() }
+            var all: [Data] { lock.lock(); defer { lock.unlock() }; return value }
+        }
+        let sent: Sent
+        func run(_ argv: [String], env: [String: String]?, stdin: Data?, currentDirectory: String?, onStdoutLine: (@Sendable (String) -> Void)?, onStderrLine: (@Sendable (String) -> Void)?, timeout: TimeInterval?) async throws -> ProcessResult {
+            sent.add(stdin ?? Data())
+            struct Envelope: Encodable { var ok = true; var data: SyncEndpointReply }
+            let reply = SyncEndpointReply(inventory: SyncInventory(rootIdentity: "1:2:3", items: [:]))
+            return ProcessResult(exitCode: 0, stdout: try ConfigStore.makeEncoder().encode(Envelope(data: reply)), stderr: Data())
+        }
+    }
+
+    @Test("the client sends the compact request over SSH, and refuses one over the limit without sending it")
+    func clientSendsCompact() async throws {
+        let group = SourceSyncGroup(name: "Notes", localPath: "/tmp/a", peer: .init(path: "/tmp/b", sshTarget: "user@host"), coordinatorMachineId: "laptop")
+        var items: [String: SyncItem] = [:]
+        for index in 0..<200 { items["file-\(index)"] = SyncItem(digest: String(repeating: "b", count: 64), bytes: 1) }
+        let request = SyncEndpointRequest(action: .prepare, group: group, root: "/tmp/b", operationId: UUID(), expected: SyncInventory(rootIdentity: "1:2:3", items: items))
+        let sent = RecordingRunner.Sent()
+        let client = SourceSyncClient(runner: RecordingRunner(sent: sent))
+        _ = try await client.request(request, at: group.peer)
+        let body = try #require(sent.all.first)
+        #expect(!body.contains(UInt8(ascii: "\n")), "compact: no line breaks")
+        #expect(body == (try SyncEndpointRequest.encode(request)))
+        // Oversize is refused by name and nothing is sent.
+        let before = sent.all.count
+        let limited = #expect(throws: SourceSyncError.self) { try SourceSyncClient.encodedRequest(request, limit: 1024) }
+        #expect(limited?.description.contains("too many entries") == true)
+        #expect(sent.all.count == before)
+    }
+}
+
 @Suite("Sync repository path while absent")
 struct SyncProspectiveDirectoryTests {
     @Test("an existing path resolves as before; a missing tail is appended to the deepest existing ancestor")
