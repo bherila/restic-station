@@ -151,7 +151,7 @@ struct SourceSyncEndpointCommand: AsyncParsableCommand, JSONRenderable {
     @Flag(name: .long) var json = false
     func run() async throws {
         guard json else { throw CLIFailure.invalidArguments("The endpoint protocol requires --json") }
-        let limit = 32 * 1024 * 1024
+        let limit = SyncEndpointRequest.maximumEncodedBytes
         var bytes = Data()
         while let chunk = try FileHandle.standardInput.read(upToCount: min(65536, limit + 1 - bytes.count)), !chunk.isEmpty {
             bytes.append(chunk)

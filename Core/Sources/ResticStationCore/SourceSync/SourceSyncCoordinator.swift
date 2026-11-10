@@ -126,7 +126,21 @@ public struct SourceSyncCoordinator: Sendable {
         let plan = try SourceSyncPlanner.plan(group: group, local: local.inventory, peer: peer.inventory, baseline: record.baseline,
                                               scope: scope, localExcluded: local.excluded ?? [], peerExcluded: peer.excluded ?? [])
         let excluded = Set(local.excluded ?? []).union(peer.excluded ?? []).sorted()
-        let stored = StoredSyncPreview(id: UUID(), setId: set.id, plan: plan, binding: binding, createdAt: Date(), group: group)
+        // Refuse before anything is reserved when a place is known to lack the
+        // room for the temporary copies this plan needs (#197).
+        // Skipped for a plan with a conflict, which is never applied: the
+        // person is shown the conflicts to resolve, not a space problem.
+        if plan.conflicts.isEmpty {
+            let shortfalls = SyncSpace.shortfalls(
+                SyncSpace.need(for: plan), coordinator: SyncSpace.reading(atPath: paths.root.path),
+                local: .init(free: local.freeBytes, volume: local.volumeId), peer: .init(free: peer.freeBytes, volume: peer.volumeId),
+                peerIsRemote: group.peer.sshTarget != nil
+            )
+            if !shortfalls.isEmpty { throw SyncSpace.refusal(shortfalls) }
+        }
+        let previewId = UUID()
+        try requireRequestSize(plan, group: group, peer: peer, preview: previewId)
+        let stored = StoredSyncPreview(id: previewId, setId: set.id, plan: plan, binding: binding, createdAt: Date(), group: group)
         var token: String?
         store.removePreviews(savedBefore: Date().addingTimeInterval(-24 * 60 * 60))
         if plan.conflicts.isEmpty {
@@ -347,15 +361,8 @@ public struct SourceSyncCoordinator: Sendable {
             try SyncCopyOptions.peer(journal.peerPrepared, basis: basis)
         }
         func endpointRequest(_ action: SyncEndpointRequest.Action, local: Bool) -> SyncEndpointRequest {
-            var r = request(action, group: group, local: local, scope: plan.scope)
-            r.operationId = journal.preview.id
-            r.expected = local ? plan.local : plan.peer
-            r.operations = operations(plan, local: local)
-            r.exportPaths = exportPaths(plan, local: local)
-            r.protectedSnapshotId = journal.protectedSnapshot
-            r.protectedRepositoryId = journal.protectedRepository
-            r.protectedItems = (local ? plan.local : plan.peer).items
-            return r
+            makeEndpointRequest(action, plan: plan, group: group, operationId: journal.preview.id, local: local,
+                            protectedSnapshot: journal.protectedSnapshot, protectedRepository: journal.protectedRepository)
         }
         do {
             if journal.phase == .reserved {
@@ -591,6 +598,42 @@ public struct SourceSyncCoordinator: Sendable {
         var items = plan.local.items
         for change in operations(plan, local: true) { items[change.path] = change.after }
         return items
+    }
+
+    /// The request an operation sends to an endpoint. Shared by the run and
+    /// by preview's size check, so the check measures what will be sent.
+    private func makeEndpointRequest(
+        _ action: SyncEndpointRequest.Action, plan: SourceSyncPlan, group: SourceSyncGroup, operationId: UUID, local: Bool,
+        protectedSnapshot: String?, protectedRepository: String?
+    ) -> SyncEndpointRequest {
+        var r = request(action, group: group, local: local, scope: plan.scope)
+        r.operationId = operationId
+        // Only prepare reads the full inventory; sending it with every
+        // later action multiplied the request for no reader (#197).
+        r.expected = action == .prepare ? (local ? plan.local : plan.peer) : nil
+        r.operations = operations(plan, local: local)
+        r.exportPaths = exportPaths(plan, local: local)
+        r.protectedSnapshotId = protectedSnapshot
+        r.protectedRepositoryId = protectedRepository
+        // What each replaced or removed entry was, which is all an endpoint
+        // looks up (validateProtection); not the whole inventory.
+        r.protectedItems = Dictionary(uniqueKeysWithValues: r.operations.compactMap { operation in
+            operation.before.map { (operation.path, $0) }
+        })
+        return r
+    }
+
+    /// Refuses at preview, before anything is reserved, a plan whose prepare
+    /// request the other computer's helper would not read (#197). The
+    /// largest request of an operation is its prepare, which carries the
+    /// copy's whole inventory. The limit is what the peer advertised; one
+    /// that advertises nothing predates #197 and reads 32 MiB.
+    private func requireRequestSize(_ plan: SourceSyncPlan, group: SourceSyncGroup, peer: SyncEndpointReply, preview id: UUID) throws {
+        guard group.peer.sshTarget != nil else { return }
+        let request = makeEndpointRequest(.prepare, plan: plan, group: group, operationId: id, local: false, protectedSnapshot: nil, protectedRepository: nil)
+        // What this peer says it reads; a peer that says nothing reads 32 MiB.
+        let limit = SyncEndpointRequest.limit(peerAdvertised: peer.maxRequestBytes)
+        try SourceSyncClient.requireSize(try SyncEndpointRequest.encode(request).count, limit: limit, peerIsOlder: !(peer.maxRequestBytes.map { $0 > 0 } ?? false))
     }
 
     /// `scope` nil, as for an operation journaled before #202, sends none.

@@ -57,6 +57,31 @@ struct SourceSyncEndpointTests {
         }
     }
 
+    /// A planned result that others could write is never installed, whatever
+    /// the coordinator asked for: the endpoint repeats the rule for itself.
+    @Test("an endpoint refuses to install an entry writable by its group or by others")
+    func refusesWritableAfterMode() throws {
+        for mode: UInt16 in [0o664, 0o666, 0o646, 0o620] {
+            let f = try Fixture()
+            defer { try? FileManager.default.removeItem(at: f.base) }
+            // The operation is prepared with the unacceptable mode from the
+            // start (prepare does not look at it), and the staged file carries
+            // it, so nothing but the endpoint's own rule can refuse the commit.
+            let operations = [SyncEndpointOperation(path: "note", before: f.before, after: SyncItem(digest: f.after.digest, bytes: 3, mode: mode))]
+            var prepare = f.request(.prepare)
+            prepare.operations = operations
+            let prepared = try SyncEndpointService.handle(prepare)
+            let staged = URL(fileURLWithPath: try #require(prepared.stagingPath)).appendingPathComponent("note")
+            try Data("new".utf8).write(to: staged)
+            try FileManager.default.setAttributes([.posixPermissions: Int(mode)], ofItemAtPath: staged.path)
+            var commit = f.protectedRequest()
+            commit.operations = operations
+            #expect(throws: SourceSyncError.stalePlan, "mode \(String(mode, radix: 8))") { try SyncEndpointService.handle(commit) }
+            // Nothing was installed: the live file is still the old one.
+            #expect(try String(contentsOf: f.root.appendingPathComponent("note"), encoding: .utf8) == "old")
+        }
+    }
+
     @Test("the actual displaced version survives successful installation")
     func protectedInstall() throws {
         let f = try Fixture()

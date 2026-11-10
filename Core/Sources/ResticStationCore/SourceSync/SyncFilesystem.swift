@@ -37,6 +37,20 @@ public enum SourceSyncFilesystem {
         }
     }
 
+    /// An entry writable by anyone but its owner is refused (#197). Group
+    /// write is refused too, however common under umask 002: the mode would be
+    /// copied to the other computer but not the group, so the copy could end
+    /// up writable by whatever group that computer assigns; a group-writable
+    /// parent would let a member move the private recovery storage aside; and
+    /// a member could swap an entry between scan and install. The message
+    /// names the entry and the remedy instead.
+    static func isAcceptableMode(_ mode: mode_t) -> Bool { mode & 0o022 == 0 }
+
+    /// What to tell the person about an entry this rule refused.
+    static func writableByOthers(_ what: String, at path: String) -> SourceSyncError {
+        .unsafeRoot("\(what) \(path) is writable by its group or by others, or is owned by another user. Sync needs entries only its owner can change. Run `chmod -R go-w` on the folder once (creating files with umask 022 keeps them that way), then preview again.")
+    }
+
     static func rootIdentity(_ root: DirectoryHandle) throws -> String {
         guard let identity = root.identity else { throw changed() }
         // Inode numbers may be reused after a directory is removed. Its
@@ -135,9 +149,9 @@ public enum SourceSyncFilesystem {
             catch { close(fd); throw error }
         }
         var info = stat()
-        guard fstat(fd, &info) == 0, info.st_uid == geteuid(), info.st_mode & 0o022 == 0 else {
+        guard fstat(fd, &info) == 0, info.st_uid == geteuid(), isAcceptableMode(info.st_mode) else {
             close(fd)
-            throw SourceSyncError.unsafeRoot("The sync folder must be owned by this user and not writable by other users.")
+            throw writableByOthers("The sync folder", at: path)
         }
         return DirectoryHandle.adopting(descriptor: fd, path: URL(fileURLWithPath: path))
     }
@@ -146,9 +160,9 @@ public enum SourceSyncFilesystem {
         let fd = name.withCString { openat(parent.descriptor, $0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) }
         guard fd >= 0 else { throw changed() }
         var info = stat()
-        guard fstat(fd, &info) == 0, info.st_uid == geteuid(), info.st_mode & 0o022 == 0 else {
+        guard fstat(fd, &info) == 0, info.st_uid == geteuid(), isAcceptableMode(info.st_mode) else {
             close(fd)
-            throw SourceSyncError.unsafeRoot("A sync subfolder is writable by another user or cannot be inspected safely.")
+            throw writableByOthers("The sync subfolder", at: parent.path.appendingPathComponent(name).path)
         }
         do { try requireSameFilesystem(info, as: parent) }
         catch { close(fd); throw error }
@@ -158,7 +172,7 @@ public enum SourceSyncFilesystem {
     /// Both sealed exports and installed directory candidates must carry
     /// the manifest mode independently of the helper's process umask.
     static func createDirectory(_ name: String, in parent: DirectoryHandle, mode: UInt16) throws -> DirectoryHandle {
-        guard mode & ~UInt16(0o777) == 0, mode & 0o022 == 0 else { throw changed() }
+        guard mode & ~UInt16(0o777) == 0, isAcceptableMode(mode_t(mode)) else { throw changed() }
         let result = name.withCString { mkdirat(parent.descriptor, $0, 0o700) }
         guard result == 0 || errno == EEXIST else { throw changed() }
         let directory = try openDirectory(name, in: parent)
@@ -218,8 +232,8 @@ public enum SourceSyncFilesystem {
         case mode_t(S_IFDIR):
             return SyncItem(kind: .directory, digest: "", mode: mode)
         case mode_t(S_IFREG):
-            guard info.st_uid == geteuid(), info.st_mode & 0o022 == 0 else {
-                throw SourceSyncError.unsafeRoot("A sync file is owned or writable by another user.")
+            guard info.st_uid == geteuid(), isAcceptableMode(info.st_mode) else {
+                throw writableByOthers("The sync file", at: parent.path.appendingPathComponent(name).path)
             }
             if let digest = hashes?.reuse(relative, stamp: stamp(info)) {
                 return SyncItem(digest: digest, bytes: UInt64(info.st_size), mode: mode)

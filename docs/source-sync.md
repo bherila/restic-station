@@ -33,6 +33,87 @@ read-only target directory refuses before capture; make that target writable
 before retrying. Private staging is made writable only for construction and
 cleanup, independently of the live source permissions.
 
+**Permissions.** Every entry must be owned by the user running sync and
+writable by no one else, group included: a sync folder with group or other
+write is refused, naming the entry (#197). Group write is common under
+umask 002 (the default on distributions with user-private groups, which
+create files 0664), and is refused anyway, deliberately. The mode would be
+copied to the other computer but not the group, so the copy could end up
+writable by whatever group that computer gives new files; a group-writable
+parent would let a member move the private recovery storage aside; and a
+member could swap an entry between scan and install. The remedy is once,
+`chmod -R go-w` on the folder, and creating files with umask 022 afterwards.
+Each computer applies the rule to its own folder.
+
+**Size over SSH.** The other computer's helper reads each request from SSH
+up to 64 MiB, and says so on its inventory reply. Only `prepare` carries a
+copy's full inventory, and a request names just the entries it replaces or
+removes, so the limit holds a few hundred thousand files (roughly 175 bytes
+each, compactly encoded). Before #197 each request was pretty-printed,
+carried the inventory twice, and the limit was 32 MiB, about 80,000 files.
+Preview measures the real prepare request against the limit the other
+computer advertised and refuses a folder over it, before anything is
+reserved, with a message saying so. A helper that advertises nothing predates
+#197, is assumed to read 32 MiB, and the message says that updating it raises
+the limit. Local-to-local sync has no such cap.
+
+**Free space.** A first sync of a large folder needs several temporary
+copies, so preview estimates the need from the plan and refuses, before
+anything is reserved, when a volume is known to lack it, naming each place
+with the amount needed and the amount free. The estimate counts file bytes
+plus ten percent and 64 MiB: the coordinating computer's Restic Station data
+holds the vault and, with protection, two verification restores (three times
+the vault; two times without protection), and each folder's volume holds what
+that copy exports and receives in its private sibling storage. Moved-aside
+versions are renames and need no more. Places on the same volume are added
+together, which is the usual case on one Mac (data directory and folder
+together), and the other computer's volume is never added to this one's.
+Entries that conflict are not counted, and a plan with a conflict is shown
+with its conflicts, not refused for space, since it cannot be applied.
+
+A computer that cannot report its free space (a helper from before #197, or
+a filesystem that reports no blocks or no block size, as some FUSE and
+network mounts do) is not blocked, since unknown is not full; a volume that
+has blocks and none available really is full. A plan with nothing to copy
+needs none. The estimate is made at preview; space used by something else
+before apply can still run a sync out of room, which is recoverable like any
+interrupted operation. On macOS, APFS may free purgeable space on demand
+that the figure does not include, so a nearly full Mac can be refused with
+space it could have recovered; free some space and preview again.
+
+**Re-enrolling after an identity change.** If a sync folder is restored from
+a backup, migrated, or loses its private control directory, sync refuses
+("a folder or its settings changed", "identity or coordinating set changed",
+or "endpoint state is missing") rather than guess which copy is right. The
+other computer's helper then refuses every request for that folder,
+`sync recover` included, so this cannot be undone with commands; it is done
+by hand, once, on purpose. First resolve anything that can still be resolved
+(`sync status`; `sync recover`, or `sync recover --cancel-unstarted`). Then,
+with nothing running:
+
+1. On the coordinating computer, remove the group's state: the directory
+   `source-sync/<group id>` inside the helper's data directory.
+2. On each computer, remove that folder's private control directory, a
+   sibling of the folder named `.restic-station-sync-` plus the first 24 hex
+   digits of the SHA-256 of the folder's resolved path. Print it with
+   `printf %s "$(cd /path/to/folder && pwd -P)" | shasum -a 256 | cut -c1-24`
+   (`sha256sum` on Linux). Remove only that name: other sync folders that
+   share a parent have their own, and removing theirs strands them.
+
+The control directory also holds recovery copies of files a sync replaced.
+Move out anything you want first; the protection snapshots stay in the backup
+repository either way. The next preview is a first run: identical paths
+agree, a path on only one copy is offered for copying, and a path that
+differs conflicts, so no copy is chosen for you and nothing is deleted. Make
+differing files agree, then apply.
+
+**Metadata that is not synchronized.** Contents, types, link targets and
+permission bits are carried; extended attributes (Finder tags, quarantine
+flags, custom attributes) and ACLs are not, so a synced copy loses them, and
+the other copy keeps its own. Modification times are carried in whole seconds
+when either computer uses openrsync (protocol 29), which has no sub-second
+times. Times never decide a winner either way.
+
 The first version requires `retention: null` and no purge exclusions on a
 sync-enabled set. It must exclusively own its backup repositories: no
 other set, independently configured computer, external retention tool, or

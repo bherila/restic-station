@@ -146,6 +146,21 @@ PRIMARY_LATEST="$(RESTIC_PASSWORD_COMMAND="$PASSWORD_COMMAND" "$RESTIC" -r "$WOR
 RESTIC_PASSWORD_COMMAND="$MIRROR_PASSWORD_COMMAND" "$RESTIC" -r "$WORK/mirror" snapshots --json \
     | jq -e --arg id "$PRIMARY_LATEST" 'any(.[]; .id == $id or .original == $id)' >/dev/null \
     || { echo 'FAIL: the mirror did not catch up at the next ordinary backup' >&2; exit 1; }
+# An entry its group or others could write is refused by name, with the
+# remedy (#197); making it owner-writable only lets the sync go on.
+mkdir -p "$WORK/workspace/notes/shared"
+printf '%s' 'group file' > "$WORK/workspace/notes/shared/team.txt"
+chmod 0664 "$WORK/workspace/notes/shared/team.txt"
+if "$HELPER" sync plan --set "$SET" --json > "$WORK/plan.json" 2>/dev/null; then
+    echo 'FAIL: a group-writable file was accepted' >&2; exit 1
+fi
+jq -e '.ok == false and (.error.message | contains("shared/team.txt") and contains("chmod -R go-w"))' "$WORK/plan.json" >/dev/null \
+    || { echo 'FAIL: the refusal does not name the entry and the remedy' >&2; cat "$WORK/plan.json" >&2; exit 1; }
+chmod 0644 "$WORK/workspace/notes/shared/team.txt"
+plan
+apply
+test "$(cat "$WORK/other copy/shared/team.txt")" = 'group file'
+
 # Sync covers only what the backup covers (#202): bytecode the set's backup
 # excludes differs between the copies, yet a replacement beside it is
 # protected, restore-verified and applied, and neither bytecode file moves.
@@ -185,4 +200,35 @@ test "$(cat "$WORK/workspace/notes/from peer")" = 'peer version'
 RESTIC_PASSWORD_COMMAND="$PASSWORD_COMMAND" "$RESTIC" -r "$WORK/repo" snapshots --json > "$WORK/snapshots.json"
 jq -e 'length >= 6 and ([.[] | select(.parent == null)] | length) == 1' "$WORK/snapshots.json" >/dev/null \
     || { echo 'FAIL: sync backups ran without a parent snapshot' >&2; jq -c '[.[] | {id: .short_id, parent}]' "$WORK/snapshots.json" >&2; exit 1; }
-echo 'PASS: source sync, real restore proof, modification times, independent backup scope, deletion, replay, exclusion refusal, unreachable-repository refusal, offline mirror warning, backup-excluded paths and parent snapshots'
+# Re-enrolling after an identity change (#197), the documented manual steps
+# (docs/source-sync.md §Re-enrolling): with the exclusion removed again and
+# nothing pending, drop the group's state on the coordinator and each folder's
+# private control directory, and the next preview is a first run. A first run
+# never deletes: identical paths agree and a path on only one side is copied.
+python3 - "$WORK/state/config.json" <<'PY'
+import json, pathlib, sys
+p=pathlib.Path(sys.argv[1]); c=json.loads(p.read_text()); c["sets"][0]["excludes"]=[]; p.write_text(json.dumps(c))
+PY
+"$HELPER" sync status --set "$SET" --json | jq -e '.data.operationId == null' >/dev/null
+# Copies that differ conflict on a first run, whichever is newer; make them agree.
+printf '%s' 'peer version' > "$WORK/other copy/from peer"
+rm -rf "$WORK/workspace/notes/pkg/__pycache__" "$WORK/other copy/pkg/__pycache__"
+printf '%s' 'only on the other copy' > "$WORK/other copy/survivor.txt"
+# The control directory names are the documented ones, not a glob that could
+# also hit another group's directory in the same parent.
+control_name() { printf '.restic-station-sync-%s' "$(printf %s "$(cd "$1" && pwd -P)" | shasum -a 256 | cut -c1-24)"; }
+LOCAL_CONTROL="$WORK/workspace/$(control_name "$WORK/workspace/notes")"
+PEER_CONTROL="$WORK/$(control_name "$WORK/other copy")"
+if [ ! -d "$LOCAL_CONTROL" ] || [ ! -d "$PEER_CONTROL" ]; then
+    echo 'FAIL: the documented control directory names do not match the real ones' >&2
+    ls -a "$WORK/workspace" "$WORK" >&2
+    exit 1
+fi
+rm -rf "${WORK:?}/state/source-sync/${GROUP:?}" "${LOCAL_CONTROL:?}" "${PEER_CONTROL:?}"
+plan
+jq -e '.ok and .data.conflicts == 0 and .data.removals == 0' "$WORK/plan.json" >/dev/null \
+    || { echo 'FAIL: the documented re-enrol steps did not give a first run' >&2; cat "$WORK/plan.json" >&2; exit 1; }
+apply
+cmp "$WORK/workspace/notes/survivor.txt" "$WORK/other copy/survivor.txt"
+test "$(cat "$WORK/workspace/notes/from peer")" = 'peer version'
+echo 'PASS: source sync, real restore proof, modification times, independent backup scope, deletion, replay, exclusion refusal, unreachable-repository refusal, offline mirror warning, writable-by-others refusal, backup-excluded paths, re-enrolment and parent snapshots'

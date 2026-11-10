@@ -4,6 +4,37 @@ import Foundation
 /// not through a configurable shell hook. No repository credentials cross
 /// this channel. Only protocol-versioned, typed operations are accepted.
 public struct SyncEndpointRequest: Codable, Sendable {
+    /// The most the other computer's helper reads from one request (#197).
+    /// Raised from 32 MiB, which held about 80,000 files, because requests
+    /// were pretty-printed and carried each inventory twice. The coordinator
+    /// checks it before sending, so a folder that is still too large fails
+    /// with its own message, not as a dropped SSH session.
+    public static var maximumEncodedBytes: Int { limitOverride ?? 64 * 1024 * 1024 }
+    /// What a helper from before #197 reads, and so what a peer that
+    /// does not say otherwise is assumed to read.
+    public static var legacyMaximumEncodedBytes: Int { legacyLimitOverride ?? 32 * 1024 * 1024 }
+    /// Replaced only by tests, which cannot build a 64 MiB request cheaply.
+    @TaskLocal static var limitOverride: Int?
+    @TaskLocal static var legacyLimitOverride: Int?
+
+    /// The most a peer reads, as it advertised on its reply. The scope echo
+    /// is no evidence of this: helpers from #202 echo it and still read 32 MiB.
+    /// Never more than this side sends, and a figure that makes no sense (zero
+    /// or negative) is read as no advertisement at all.
+    static func limit(peerAdvertised: Int?) -> Int {
+        guard let advertised = peerAdvertised, advertised > 0 else { return legacyMaximumEncodedBytes }
+        return min(advertised, maximumEncodedBytes)
+    }
+
+    /// Compact and key-sorted. The request is machine-read and neither hashed
+    /// nor displayed, so whitespace only costs bytes against the limit.
+    public static func encode(_ request: SyncEndpointRequest) throws -> Data {
+        let encoder = JSONEncoder()
+        // Slashes unescaped: every path component would cost an extra byte.
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        return try encoder.encode(request)
+    }
+
     public enum Action: String, Codable, Sendable { case inventory, prepare, commit, finish, inspect, cancel, cleanup }
     public var version: Int = 1
     public var action: Action
@@ -61,6 +92,16 @@ public struct SyncEndpointReply: Codable, Sendable {
     public var scope: SyncScope?
     /// The topmost entries `scope` left out of `inventory`, sorted.
     public var excluded: [String]?
+    /// Free bytes on the volume beside this folder, on inventory and inspect
+    /// replies (#197). Absent from a helper that predates it, and when the
+    /// volume will not say; either reads as unknown, never as full.
+    public var freeBytes: UInt64?
+    /// Identifies the volume beside this folder, so the coordinator can add
+    /// up places that share one. Meaningful only on the computer that sent it.
+    public var volumeId: UInt64?
+    /// The most this helper reads from one request. Absent from a helper
+    /// older than #197, which reads 32 MiB.
+    public var maxRequestBytes: Int?
 
     public init(inventory: SyncInventory, stagingPath: String? = nil, recoveryPath: String? = nil, operationId: UUID? = nil, completedPaths: [String] = []) {
         self.inventory = inventory
